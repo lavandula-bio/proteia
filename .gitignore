@@ -1,0 +1,53 @@
+# ─── Private / never publish ──────────────────────────────────────────────────
+# Strategy, brand, IP, trademark, revenue, accounts, evidence. Local-only.
+# This repository is public; _local/ must never be committed or pushed.
+_local/
+
+# ─── Internal development docs (kept local, not published) ──────────────────────
+# Written for the developer, not the public. CLAUDE.md must stay at repo root so
+# Claude Code auto-loads it; development notes live under _local/ (ignored above).
+/CLAUDE.md
+
+# ─── Environment & Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+secrets/
+
+# ─── Claude Code ──────────────────────────────────────────────────────────────
+# Local session data, memory, and credentials — never share
+.claude/
+
+# ─── IDE & Editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.project
+.classpath
+*.sublime-project
+*.sublime-workspace
+
+# ─── OS Generated ─────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Language-specific (added in Phase 1 when code begins) ──────────────────────
+# Python entries (e.g. __pycache__/, *.egg-info/, .venv/) will be appended here
+# once the project stack is established.
