@@ -48,6 +48,16 @@ desktop.ini
 *.log
 logs/
 
-# ─── Language-specific (added in Phase 1 when code begins) ──────────────────────
-# Python entries (e.g. __pycache__/, *.egg-info/, .venv/) will be appended here
-# once the project stack is established.
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+# Note: uv.lock IS tracked (reproducible environments) — do not ignore it.
