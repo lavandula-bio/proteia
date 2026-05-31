@@ -9,6 +9,7 @@ authors = [{ name = "Roger Huang" }]
 dependencies = [
     "napari[pyside6]>=0.7",
     "numpy>=2.1",
+    "pydantic>=2.13.4",
     "scikit-image>=0.25",
     "scipy>=1.14",
     "tifffile>=2024.8",

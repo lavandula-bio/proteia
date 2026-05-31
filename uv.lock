@@ -1079,6 +1079,7 @@ source = { editable = "." }
 dependencies = [
     { name = "napari", extra = ["pyside6"] },
     { name = "numpy" },
+    { name = "pydantic" },
     { name = "scikit-image" },
     { name = "scipy" },
     { name = "tifffile" },
@@ -1094,6 +1095,7 @@ dev = [
 requires-dist = [
     { name = "napari", extras = ["pyside6"], specifier = ">=0.7" },
     { name = "numpy", specifier = ">=2.1" },
+    { name = "pydantic", specifier = ">=2.13.4" },
     { name = "scikit-image", specifier = ">=0.25" },
     { name = "scipy", specifier = ">=1.14" },
     { name = "tifffile", specifier = ">=2024.8" },
