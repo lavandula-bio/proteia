@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""napari GUI: grow equal-area ROI boxes from clicks and read their net signal.
+"""napari GUI: a project quantifies several proteins against shared lanes.
 
-Workflow (seed-grow): Ctrl+click a band and a box is grown to fit it. The shared,
+Quantify each protein as a repeatable step: Ctrl+click its bands, name it, pick
+its role (target / loading control), and "Add protein" to capture its net per
+lane (by left-to-right position) and clear the canvas for the next. Conditions
+(one sample label per lane) are filled once at the end — after measuring you know
+how many lanes there are — and label the positions in the results. Role is just a
+label here; normalization consumes it later.
+
+Per-protein placement (seed-grow): Ctrl+click a band and a box is grown to fit it.
+The shared,
 locked box size is the largest extent across every band clicked so far (so the
 order of clicking does not matter and the biggest band is still fully captured);
 every box uses that one size, keeping the measurement equal-area. Clicking the
@@ -82,7 +90,15 @@ def _pad_limits(base_dim: int) -> tuple[int, int, int]:
 def launch(image_path: str | None = None) -> None:
     """Open napari with seed-grow ROI placement and net-signal readout."""
     import napari
-    from magicgui.widgets import CheckBox, Container, Label, PushButton, SpinBox
+    from magicgui.widgets import (
+        CheckBox,
+        ComboBox,
+        Container,
+        Label,
+        LineEdit,
+        PushButton,
+        SpinBox,
+    )
     from napari.utils.notifications import show_info
 
     image = _load_image(image_path)
@@ -100,22 +116,33 @@ def launch(image_path: str | None = None) -> None:
     # ``size`` is what is drawn = base + padding. ``valid`` keeps click order.
     base0 = _initial_size(image)
     state: dict = {
-        "valid": [], "base": base0, "size": base0, "pad_w": 0, "pad_h": 0, "syncing": False
+        "valid": [], "base": base0, "size": base0, "pad_w": 0, "pad_h": 0,
+        "lanes": [], "proteins": [], "syncing": False,
     }
 
     readout = Label(value="")
-    width_in = SpinBox(value=base0.width, min=2, max=iw, label="base width")
-    height_in = SpinBox(value=base0.height, min=2, max=ih, label="base height")
+    proteins_lbl = Label(value="")
+    # Project spine: one condition/sample label per lane, left-to-right.
+    conditions_in = LineEdit(value="", label="conditions")
+    width_in = SpinBox(value=base0.width, min=2, max=iw, label="box W")
+    height_in = SpinBox(value=base0.height, min=2, max=ih, label="box H")
     # Width/height buffered independently, in pixels per side (symmetric). Bounds
     # and step are set from the base by _configure_padding_inputs (step scales with
     # size; the inputs pin at +-50%/+200% so there is no endless pressing).
-    padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="padding W (px/side)")
-    padding_h_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="padding H (px/side)")
-    dark_on_light = CheckBox(value=True, label="dark band on light")
-    clear_btn = PushButton(text="Clear all")
+    padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad W")
+    padding_h_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad H")
+    dark_on_light = CheckBox(value=True, label="dark on light")
+    protein_in = LineEdit(value="", label="protein")
+    mw_in = LineEdit(value="", label="MW (kDa)")
+    role_in = ComboBox(choices=["target", "loading control"], value="target", label="role")
+    add_btn = PushButton(text="Add protein")
+    remove_protein_btn = PushButton(text="Remove last protein")
+    clear_btn = PushButton(text="Clear all (boxes)")
     panel = Container(
         widgets=[
-            width_in, height_in, padding_w_in, padding_h_in, dark_on_light, clear_btn, readout
+            conditions_in, width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
+            protein_in, mw_in, role_in, add_btn, remove_protein_btn, clear_btn,
+            readout, proteins_lbl,
         ],
         labels=True,
     )
@@ -303,6 +330,57 @@ def launch(image_path: str | None = None) -> None:
             _write_boxes(state["valid"])
             _refresh_readout()
 
+    def _refresh_proteins() -> None:
+        # Compact, one short line per protein (a "folded" view); the full per-lane
+        # values are shown while placing (readout) and in the table increment.
+        lanes = state["lanes"]
+        n = max((len(p["boxes"]) for p in state["proteins"]), default=0)
+        hint = "  (one condition per lane)" if n and len(lanes) != n else ""
+        lines = [f"lanes measured: {n}  |  conditions: {len(lanes)}{hint}"]
+        if not state["proteins"]:
+            lines.append("proteins: (none yet)")
+        else:
+            lines.append("proteins:")
+            for p in state["proteins"]:
+                mw = f" mw={p['mw']}" if p.get("mw") else ""
+                lines.append(f"  {p['name']} [{p['role']}]{mw} - {len(p['boxes'])} lanes")
+        proteins_lbl.value = "\n".join(lines)
+
+    def on_conditions_change(*_) -> None:
+        state["lanes"] = [s.strip() for s in conditions_in.value.split(",") if s.strip()]
+        _refresh_proteins()
+
+    def _add_protein(*_) -> None:
+        if not state["valid"]:
+            show_info("No boxes to capture.")
+            return
+        name = protein_in.value.strip() or f"protein {len(state['proteins']) + 1}"
+        sz, invert, img = state["size"], bool(dark_on_light.value), image_layer.data
+        # Store nets ordered left-to-right; conditions label these positions later.
+        boxes = sorted(
+            (
+                (bx0, net_signal(img, Box(x=bx0, y=by0), sz, background, dark_on_light=invert))
+                for (bx0, by0, _, _) in state["valid"]
+            ),
+            key=lambda bn: bn[0],
+        )
+        state["proteins"].append(
+            {"name": name, "role": role_in.value, "mw": mw_in.value.strip(), "boxes": boxes}
+        )
+        state["valid"] = []  # clear the canvas for the next protein
+        _write_boxes([])
+        _refresh_readout()
+        _refresh_proteins()
+        show_info(f"Captured {name} ({role_in.value}, {len(boxes)} lanes); canvas cleared.")
+
+    def _remove_last_protein(*_) -> None:
+        if state["proteins"]:
+            removed = state["proteins"].pop()
+            _refresh_proteins()
+            show_info(f"Removed protein {removed['name']}.")
+        else:
+            show_info("No captured proteins to remove.")
+
     viewer.mouse_drag_callbacks.append(on_mouse)
     shapes.events.data.connect(on_edit)
     width_in.changed.connect(on_size_change)
@@ -311,11 +389,15 @@ def launch(image_path: str | None = None) -> None:
     padding_h_in.changed.connect(on_padding_change)
     dark_on_light.changed.connect(lambda *_: _refresh_readout())
     clear_btn.changed.connect(_clear)
+    conditions_in.changed.connect(on_conditions_change)
+    add_btn.changed.connect(_add_protein)
+    remove_protein_btn.changed.connect(_remove_last_protein)
     viewer.bind_key("Control-Z", _undo, overwrite=True)
 
     _configure_padding_inputs(base0)  # set padding bounds/step from the initial base
     _refresh_readout()
-    show_info("Ctrl+click a band to grow a box; right-click to remove; Ctrl+Z to undo.")
+    _refresh_proteins()
+    show_info("Ctrl+click bands, name + Add protein (repeat); fill conditions at the end.")
     napari.run()
 
 
