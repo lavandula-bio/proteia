@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 Rect = tuple[int, int, int, int]
 
 
-def _overlaps(a: Rect, b: Rect) -> bool:
+def overlaps(a: Rect, b: Rect) -> bool:
     """True if two axis-aligned rectangles share any area."""
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
@@ -134,7 +134,7 @@ class Analysis(BaseModel):
         rects = self.all_rects()
         for i in range(len(rects)):
             for j in range(i + 1, len(rects)):
-                if _overlaps(rects[i], rects[j]):
+                if overlaps(rects[i], rects[j]):
                     raise ValueError("boxes must not overlap")
 
         return self
