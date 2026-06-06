@@ -71,14 +71,31 @@ def _overlaps_any(rects: Sequence[Rect | None], i: int) -> bool:
     return any(b is not None and overlaps(a, b) for j, b in enumerate(rects) if j != i)
 
 
-def resize_all(rects: Sequence[Rect], size: BoxSize) -> list[Rect] | None:
-    """Re-snap every box to a new global ``size`` (top-left anchored).
+def resize_all(
+    rects: Sequence[Rect],
+    size: BoxSize,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+) -> list[Rect] | None:
+    """Re-size every box to a new global ``size``, keeping each box *centred*.
 
-    Enforces the "one shared size, changing it resizes all" invariant. Returns
-    the resized boxes, or ``None`` if the new size would force any overlap — in
-    which case the caller should reject the size change and keep the old size.
+    Enforces the "one shared size, changing it resizes all" invariant. Boxes grow
+    or shrink around their own centre (so a box stays on the band it was placed
+    on), not their top-left corner. ``width`` / ``height``, if given, clamp boxes
+    inside the image. Returns the resized boxes, or ``None`` if the new size would
+    force any overlap — in which case the caller should keep the old size.
     """
-    resized: list[Rect] = [snap_to_size(r, size) for r in rects]
+    resized: list[Rect] = []
+    for x0, y0, x1, y1 in rects:
+        # Integer centre (not round(.../2)) so repeated resizes don't drift sideways.
+        nx0 = (x0 + x1) // 2 - size.width // 2
+        ny0 = (y0 + y1) // 2 - size.height // 2
+        if width is not None:
+            nx0 = max(0, min(nx0, width - size.width))
+        if height is not None:
+            ny0 = max(0, min(ny0, height - size.height))
+        resized.append((nx0, ny0, nx0 + size.width, ny0 + size.height))
     for i in range(len(resized)):
         if _overlaps_any(resized, i):
             return None
