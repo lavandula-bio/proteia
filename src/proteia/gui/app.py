@@ -25,7 +25,7 @@ import numpy as np
 
 from proteia.core.boxes import normalize_corners, reconcile, resize_all
 from proteia.core.model import Box, BoxSize
-from proteia.core.quantify import integrate_box
+from proteia.core.quantify import estimate_background, integrate_box, net_signal
 
 # (x0, y0, x1, y1), half-open on the high edge — matches proteia.core.model.Rect.
 Rect = tuple[int, int, int, int]
@@ -62,12 +62,13 @@ def _initial_size(image: np.ndarray) -> BoxSize:
 def launch(image_path: str | None = None) -> None:
     """Open napari with the image and an ROI layer governed by the box rules."""
     import napari
-    from magicgui.widgets import Container, Label, SpinBox
+    from magicgui.widgets import CheckBox, Container, Label, SpinBox
     from napari.utils.notifications import show_info
 
     image = _load_image(image_path)
     ih, iw = int(image.shape[0]), int(image.shape[1])
     size = _initial_size(image)
+    background = estimate_background(image)  # membrane baseline to subtract
 
     viewer = napari.Viewer()
     image_layer = viewer.add_image(image, name="blot")
@@ -91,7 +92,8 @@ def launch(image_path: str | None = None) -> None:
     readout = Label(value="")
     width_in = SpinBox(value=size.width, min=2, max=iw, label="box width")
     height_in = SpinBox(value=size.height, min=2, max=ih, label="box height")
-    panel = Container(widgets=[width_in, height_in, readout], labels=True)
+    dark_on_light = CheckBox(value=True, label="dark band on light")
+    panel = Container(widgets=[width_in, height_in, dark_on_light, readout], labels=True)
     viewer.window.add_dock_widget(panel, area="right", name="Quantify")
 
     def _write_boxes(rects: list[Rect]) -> None:
@@ -106,13 +108,22 @@ def launch(image_path: str | None = None) -> None:
 
     def _refresh_readout() -> None:
         sz = state["size"]
-        lines = [f"box size: {sz.width} x {sz.height} (locked, equal area)"]
+        invert = bool(dark_on_light.value)
+        direction = "dark-on-light" if invert else "light-on-dark"
+        lines = [
+            f"box size: {sz.width} x {sz.height} (locked, equal area)",
+            f"background level: {background:.0f}  ({direction})",
+        ]
         if not state["valid"]:
             lines.append("no boxes — draw one on the image")
         for i, (bx0, by0, _, _) in enumerate(state["valid"]):
             try:
-                raw = integrate_box(image_layer.data, Box(x=bx0, y=by0), sz)
-                lines.append(f"  box {i}: raw = {raw:.1f}  at x={bx0}, y={by0}")
+                img = image_layer.data
+                net = net_signal(
+                    img, Box(x=bx0, y=by0), sz, background, dark_on_light=invert
+                )
+                raw = integrate_box(img, Box(x=bx0, y=by0), sz)
+                lines.append(f"  box {i}: net = {net:.0f}  (raw {raw:.0f})  at x={bx0}, y={by0}")
             except Exception as exc:  # noqa: BLE001  (surface any failure to the user)
                 lines.append(f"  box {i}: cannot quantify ({exc})")
         readout.value = "\n".join(lines)
@@ -151,6 +162,7 @@ def launch(image_path: str | None = None) -> None:
     shapes.events.data.connect(on_edit)
     width_in.changed.connect(on_resize)
     height_in.changed.connect(on_resize)
+    dark_on_light.changed.connect(lambda *_: _refresh_readout())
 
     _refresh_readout()  # initial value for the default box
     show_info("Boxes share one locked size and cannot overlap; move or draw more.")
