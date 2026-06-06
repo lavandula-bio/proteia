@@ -1,48 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 """napari GUI: a project quantifies several proteins against shared lanes.
 
-Quantify each protein as a repeatable step: Ctrl+click its bands, name it, pick
-its role (target / loading control), and "Add protein" to capture its net per
-lane (by left-to-right position) and clear the canvas for the next. Conditions
-(one sample label per lane) are filled once at the end — after measuring you know
-how many lanes there are — and label the positions in the results. Role is just a
-label here; normalization consumes it later.
+Encapsulated, repeatable per-protein flow:
+- "New protein" begins an editing session (a fresh protein, given a colour).
+- While editing, set name / MW / role and Ctrl+click bands (drawn in the
+  protein's colour); right-click removes a box; "Confirm protein" ends the
+  session.
+- An "editing" selector re-enters an existing protein to add/remove its boxes.
+- Outside an editing session (IDLE), Ctrl+click does nothing.
 
-Per-protein placement (seed-grow): Ctrl+click a band and a box is grown to fit it.
-The shared,
-locked box size is the largest extent across every band clicked so far (so the
-order of clicking does not matter and the biggest band is still fully captured);
-every box uses that one size, keeping the measurement equal-area. Clicking the
-same molecular weight across lanes yields one comparable value per condition.
-
-A padding control adds an equal-area buffer (a percentage) around the auto-fitted
-size without disturbing the detected base size. Boxes cannot overlap. Remove
-boxes with a right-click (any box), Ctrl+Z (the last one), or the Clear all
-button. Existing boxes can be dragged; an edit that breaks the size or overlap is
-corrected. The readout is ordered left-to-right by position, not click order.
+Captured proteins stay on the image in their colours; selecting a box and moving
+it re-quantifies it live. Conditions label the result-table columns. Colour is
+protein identity only.
 
     uv run python -m proteia.gui.app [IMAGE_PATH]
 
-If no path is given, a synthetic image is shown. napari/Qt and magicgui imports
-are local so importing this module stays headless-safe.
+napari/Qt and magicgui imports are local so importing this module stays
+headless-safe.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from proteia.core.boxes import normalize_corners, reconcile, resize_all
+from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.grow import grow_box
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.project import align_to_lanes
-from proteia.core.quantify import estimate_background, integrate_box, net_signal
+from proteia.core.quantify import estimate_background, net_signal
 
-# (x0, y0, x1, y1), half-open on the high edge — matches proteia.core.model.Rect.
 Rect = tuple[int, int, int, int]
+PALETTE = ["#ff4d4d", "#4dd2ff", "#ffe14d", "#7cfc00", "#ff66ff", "#ffa64d", "#66b3ff", "#b39ddb"]
+NONE_CHOICE = "(idle — New protein to start)"
 
 
 def _synthetic_image() -> np.ndarray:
-    """A small grayscale image with a few bright 'bands' to draw boxes over."""
     img = np.full((120, 200), 20.0)
     for cx in (40, 90, 140):
         img[50:70, cx : cx + 30] += 200.0
@@ -58,38 +50,35 @@ def _load_image(path: str | None) -> np.ndarray:
 
 
 def _rect_to_corners(rect: Rect) -> np.ndarray:
-    """A rect as napari rectangle vertices, in (row, col) = (y, x) order."""
     x0, y0, x1, y1 = rect
     return np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
 
 
 def _initial_size(image: np.ndarray) -> BoxSize:
-    """A starting base box size proportional to the image (until the first grow)."""
     ih, iw = int(image.shape[0]), int(image.shape[1])
     return BoxSize(width=max(4, iw // 8), height=max(4, ih // 12))
 
 
 def _padded(base: BoxSize, px_w: int, px_h: int) -> BoxSize:
-    """The base size buffered by ``px_w`` / ``px_h`` pixels *per side*.
-
-    Per side, so the change is always symmetric (both edges move together). The
-    50%-200% bounds are enforced by the input widgets, whose step scales with the
-    base so a tweak is fine on a small band and coarse on a large one.
-    """
     return BoxSize(width=max(2, base.width + 2 * px_w), height=max(2, base.height + 2 * px_h))
 
 
 def _pad_limits(base_dim: int) -> tuple[int, int, int]:
-    """(min, max, step) for a per-side padding input given a base dimension.
-
-    min/max keep the box within [50%, 200%] of base; step scales with the base
-    (~5% per side) so large bands are not adjusted one pixel at a time.
-    """
     return -round(base_dim * 0.25), round(base_dim * 0.5), max(1, round(base_dim * 0.05))
 
 
+def _center_snap(rect: Rect, size: BoxSize, iw: int, ih: int) -> Rect:
+    x0, y0, x1, y1 = rect
+    nx0 = max(0, min((x0 + x1) // 2 - size.width // 2, iw - size.width))
+    ny0 = max(0, min((y0 + y1) // 2 - size.height // 2, ih - size.height))
+    return (nx0, ny0, nx0 + size.width, ny0 + size.height)
+
+
+def _protein_size(p: dict) -> BoxSize:
+    return _padded(p["base"], p["pad_w"], p["pad_h"])
+
+
 def launch(image_path: str | None = None) -> None:
-    """Open napari with seed-grow ROI placement and net-signal readout."""
     import napari
     from magicgui.widgets import (
         CheckBox,
@@ -102,134 +91,212 @@ def launch(image_path: str | None = None) -> None:
         Table,
     )
     from napari.utils.notifications import show_info
+    from qtpy.QtCore import QTimer
 
     image = _load_image(image_path)
     ih, iw = int(image.shape[0]), int(image.shape[1])
-    background = estimate_background(image)  # membrane baseline to subtract
+    background = estimate_background(image)
 
     viewer = napari.Viewer()
     image_layer = viewer.add_image(image, name="blot")
-    shapes = viewer.add_shapes(
-        name="ROI", edge_color="red", face_color="transparent", ndim=2
-    )
-    shapes.mode = "select"  # boxes can be moved, not free-drawn; grow adds them
+    shapes = viewer.add_shapes(name="ROI", face_color="transparent", ndim=2)
+    shapes.mode = "select"
 
-    # Source of truth. ``base`` is the detected size (max over clicked bands);
-    # ``size`` is what is drawn = base + padding. ``valid`` keeps click order.
-    base0 = _initial_size(image)
-    state: dict = {
-        "valid": [], "base": base0, "size": base0, "pad_w": 0, "pad_h": 0,
-        "lanes": [], "proteins": [], "syncing": False,
-    }
+    # placed: every box, tagged with its protein id. proteins: list by id, each
+    # {name, role, mw, color, base, pad_w, pad_h, confirmed}. editing: pid or None.
+    state: dict = {"placed": [], "proteins": [], "lanes": [], "editing": None, "syncing": False}
 
+    # --- widgets ---
     readout = Label(value="")
     status_lbl = Label(value="")
     results_table = Table(value={"data": [], "columns": [], "index": []})
-    # Project spine: one condition/sample label per lane, left-to-right.
     conditions_in = LineEdit(value="", label="conditions")
-    width_in = SpinBox(value=base0.width, min=2, max=iw, label="box W")
-    height_in = SpinBox(value=base0.height, min=2, max=ih, label="box H")
-    # Width/height buffered independently, in pixels per side (symmetric). Bounds
-    # and step are set from the base by _configure_padding_inputs (step scales with
-    # size; the inputs pin at +-50%/+200% so there is no endless pressing).
-    padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad W")
-    padding_h_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad H")
-    dark_on_light = CheckBox(value=True, label="dark on light")
+    edit_combo = ComboBox(choices=[NONE_CHOICE], value=NONE_CHOICE, label="editing")
     protein_in = LineEdit(value="", label="protein")
     mw_in = LineEdit(value="", label="MW (kDa)")
     role_in = ComboBox(choices=["target", "loading control"], value="target", label="role")
-    add_btn = PushButton(text="Add protein")
+    width_in = SpinBox(value=64, min=2, max=iw, label="box W")
+    height_in = SpinBox(value=20, min=2, max=ih, label="box H")
+    padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad W")
+    padding_h_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad H")
+    dark_on_light = CheckBox(value=True, label="dark on light")
+    new_btn = PushButton(text="New protein")
+    confirm_btn = PushButton(text="Confirm protein")
     remove_protein_btn = PushButton(text="Remove last protein")
-    clear_btn = PushButton(text="Clear all (boxes)")
+    clear_btn = PushButton(text="Clear this protein's boxes")
     panel = Container(
         widgets=[
-            conditions_in, width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
-            protein_in, mw_in, role_in, add_btn, remove_protein_btn, clear_btn,
+            conditions_in, edit_combo, protein_in, mw_in, role_in,
+            width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
+            new_btn, confirm_btn, remove_protein_btn, clear_btn,
             readout, status_lbl, results_table,
         ],
         labels=True,
     )
     viewer.window.add_dock_widget(panel, area="right", name="Quantify")
 
-    def _write_boxes(rects: list[Rect]) -> None:
-        """Push the authoritative boxes back to the layer (suppressing events)."""
+    # --- helpers ---
+    def _ep() -> dict | None:
+        return None if state["editing"] is None else state["proteins"][state["editing"]]
+
+    def _pid_rects(pid: int) -> list[Rect]:
+        return [pl["rect"] for pl in state["placed"] if pl["pid"] == pid]
+
+    def _redraw() -> None:
         state["syncing"] = True
         try:
-            shapes.selected_data = set()  # drop stale highlight before replacing data
+            shapes.mode = "pan_zoom"  # drop selection/highlight before rebuilding
+            shapes.selected_data = set()
             shapes.data = []
-            if rects:
-                shapes.add([_rect_to_corners(r) for r in rects], shape_type="rectangle")
+            if state["placed"]:
+                shapes.add(
+                    [_rect_to_corners(pl["rect"]) for pl in state["placed"]],
+                    shape_type="rectangle",
+                )
+                shapes.edge_color = [PALETTE[pl["pid"] % len(PALETTE)] for pl in state["placed"]]
+                shapes.face_color = "transparent"
             shapes.selected_data = set()
             shapes.mode = "select"
         finally:
             state["syncing"] = False
 
-    def _set_size_inputs(base: BoxSize) -> None:
+    def _protein_boxes(pid: int) -> list[tuple[int, float]]:
+        invert = bool(dark_on_light.value)
+        size = _protein_size(state["proteins"][pid])
+        img = image_layer.data
+        boxes = []
+        for rect in _pid_rects(pid):
+            x0, y0 = rect[0], rect[1]
+            net = net_signal(img, Box(x=x0, y=y0), size, background, dark_on_light=invert)
+            boxes.append((x0, net))
+        return sorted(boxes, key=lambda b: b[0])
+
+    def _load_controls(p: dict) -> None:
         state["syncing"] = True
         try:
-            width_in.value, height_in.value = base.width, base.height
+            protein_in.value, mw_in.value, role_in.value = p["name"], p["mw"], p["role"]
+            width_in.value, height_in.value = p["base"].width, p["base"].height
+            for spin, dim, val in (
+                (padding_w_in, p["base"].width, p["pad_w"]),
+                (padding_h_in, p["base"].height, p["pad_h"]),
+            ):
+                lo, hi, step = _pad_limits(dim)
+                spin.min, spin.max, spin.step = lo, hi, step
+                spin.value = min(max(int(val), lo), hi)
         finally:
             state["syncing"] = False
 
-    def _configure_padding_inputs(base: BoxSize) -> None:
-        """Set each padding input's bounds/step from the base, clamping its value.
-
-        Bounds pin the box to [50%, 200%] of base (no endless pressing); the step
-        scales with the base so adjustment stays usable on a 1000px band.
-        """
+    def _sync_combo() -> None:
         state["syncing"] = True
         try:
-            for spin, dim in ((padding_w_in, base.width), (padding_h_in, base.height)):
-                lo, hi, step = _pad_limits(dim)
-                spin.min, spin.max, spin.step = lo, hi, step
-                spin.value = min(max(int(spin.value), lo), hi)
+            choices = [NONE_CHOICE] + [
+                f"{i}: {p['name'] or '(unnamed)'}" for i, p in enumerate(state["proteins"])
+            ]
+            edit_combo.choices = choices
+            ed = state["editing"]
+            edit_combo.value = NONE_CHOICE if ed is None else choices[ed + 1]
         finally:
             state["syncing"] = False
 
     def _refresh_readout() -> None:
-        sz = state["size"]
+        p = _ep()
         invert = bool(dark_on_light.value)
         direction = "dark-on-light" if invert else "light-on-dark"
-        b = state["base"]
+        if p is None:
+            readout.value = (
+                f"background: {background:.0f}  ({direction})\n"
+                "IDLE — press New protein (or pick one in 'editing') to place boxes."
+            )
+            return
+        sz = _protein_size(p)
         lines = [
-            f"box size: {sz.width} x {sz.height} (base {b.width}x{b.height} + "
-            f"{int(padding_w_in.value)}/{int(padding_h_in.value)} px/side)",
+            f"editing: {p['name'] or '(unnamed)'} [{p['role']}]  colour {p['color']}",
+            f"box: {sz.width} x {sz.height} (base {p['base'].width}x{p['base'].height} + "
+            f"{p['pad_w']}/{p['pad_h']} px/side)",
             f"background: {background:.0f}  ({direction})",
-            "Ctrl+click a band to add a box; right-click to remove; Ctrl+Z to undo.",
+            "Ctrl+click bands; right-click a box to remove; Confirm when done.",
         ]
-        if not state["valid"]:
-            lines.append("no boxes yet")
-        # Order left-to-right by position, not click order.
-        for i, (bx0, by0, _, _) in enumerate(sorted(state["valid"], key=lambda r: (r[0], r[1]))):
-            try:
-                img = image_layer.data
-                net = net_signal(img, Box(x=bx0, y=by0), sz, background, dark_on_light=invert)
-                raw = integrate_box(img, Box(x=bx0, y=by0), sz)
-                lines.append(f"  {i}: net = {net:.0f}  (raw {raw:.0f})  at x={bx0}, y={by0}")
-            except Exception as exc:  # noqa: BLE001  (surface any failure to the user)
-                lines.append(f"  {i}: cannot quantify ({exc})")
+        rects = sorted(_pid_rects(state["editing"]), key=lambda r: r[0])
+        for i, (bx0, by0, _, _) in enumerate(rects):
+            net = net_signal(
+                image_layer.data, Box(x=bx0, y=by0), sz, background, dark_on_light=invert
+            )
+            lines.append(f"  {i}: net = {net:.0f}  at x={bx0}")
         readout.value = "\n".join(lines)
 
-    def _apply_size() -> bool:
-        """Resize all boxes to base+padding; return False (and warn) on overlap."""
-        eff = _padded(state["base"], padding_w_in.value, padding_h_in.value)
-        resized = resize_all(state["valid"], eff, width=iw, height=ih)
-        if resized is None:
-            show_info("Size rejected: it would make boxes overlap.")
-            return False
-        state["size"] = eff
-        state["valid"] = resized
-        _write_boxes(resized)
-        _refresh_readout()
-        return True
+    def _refresh_table() -> None:
+        proteins, lanes = state["proteins"], state["lanes"]
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
+        max_boxes = max((len(b) for b in per), default=0)
+        hint = "  (one condition per lane)" if max_boxes and len(lanes) != max_boxes else ""
+        status_lbl.value = f"lanes: {max_boxes}  |  conditions: {len(lanes)}{hint}"
+        if lanes:
+            columns = list(lanes)
+            aligned = align_to_lanes(per, len(lanes))
+            data = [[round(v) if v is not None else "" for v in row] for row in aligned]
+        else:
+            columns = [f"#{j + 1}" for j in range(max_boxes)]
+            data = [[round(b[j][1]) if j < len(b) else "" for j in range(max_boxes)] for b in per]
+        index = []
+        for p in proteins:
+            mw = f" mw={p['mw']}" if p.get("mw") else ""
+            mark = "" if p["confirmed"] else " *"
+            index.append(f"{p['name'] or '(unnamed)'} [{p['role']}]{mw}{mark}")
+        results_table.value = {"data": data, "columns": columns, "index": index}
 
-    def _click_data_xy(event) -> tuple[int, int] | None:
-        """Click position in integer image (x, y), or None if outside the image."""
+    def _refresh_all() -> None:
+        _redraw()
+        _refresh_readout()
+        _refresh_table()
+
+    # --- editing session ---
+    def _set_editing(pid: int | None) -> None:
+        state["editing"] = pid
+        if pid is not None:
+            _load_controls(state["proteins"][pid])
+        _sync_combo()
+        _refresh_readout()
+
+    def _new_protein(*_) -> None:
+        pid = len(state["proteins"])
+        state["proteins"].append({
+            "name": "", "role": role_in.value, "mw": "", "color": PALETTE[pid % len(PALETTE)],
+            "base": _initial_size(image), "pad_w": 0, "pad_h": 0, "confirmed": False,
+        })
+        state["syncing"] = True
+        try:
+            protein_in.value, mw_in.value = "", ""
+        finally:
+            state["syncing"] = False
+        _set_editing(pid)
+        _refresh_table()
+        show_info("New protein: set name / MW / role, Ctrl+click bands, then Confirm.")
+
+    def _confirm_protein(*_) -> None:
+        p = _ep()
+        if p is None:
+            show_info("Not editing a protein.")
+            return
+        if not _pid_rects(state["editing"]):
+            show_info("No boxes for this protein yet.")
+            return
+        p["confirmed"] = True
+        _set_editing(None)
+        _refresh_table()
+        show_info(f"Confirmed {p['name'] or '(unnamed)'}.")
+
+    # --- interactions ---
+    def _click_xy(event) -> tuple[int, int] | None:
         row, col = image_layer.world_to_data(event.position)[:2]
         x, y = int(round(col)), int(round(row))
         return (x, y) if (0 <= x < iw and 0 <= y < ih) else None
 
     def _seed_grow(x: int, y: int) -> None:
+        if state["editing"] is None:
+            show_info("Press New protein (or pick one in 'editing') before placing boxes.")
+            return
+        pid = state["editing"]
+        p = state["proteins"][pid]
         invert = bool(dark_on_light.value)
         box = grow_box(image_layer.data, (x, y), background, dark_on_light=invert)
         if box is None:
@@ -237,16 +304,15 @@ def launch(image_path: str | None = None) -> None:
             return
         gx0, gy0, gx1, gy1 = box
         gw, gh = max(2, gx1 - gx0), max(2, gy1 - gy0)
-        # The shared base is the largest band seen, so click order does not matter.
-        if not state["valid"]:
-            new_base = BoxSize(width=gw, height=gh)
+        rects = _pid_rects(pid)
+        if not rects:
+            p["base"] = BoxSize(width=gw, height=gh)
         else:
-            cur = state["base"]
-            new_base = BoxSize(width=max(cur.width, gw), height=max(cur.height, gh))
-        eff = _padded(new_base, padding_w_in.value, padding_h_in.value)
-        resized = resize_all(state["valid"], eff, width=iw, height=ih)  # existing at new size
+            p["base"] = BoxSize(width=max(p["base"].width, gw), height=max(p["base"].height, gh))
+        eff = _protein_size(p)
+        resized = resize_all(rects, eff, width=iw, height=ih)
         if resized is None:
-            show_info("Cannot grow the shared box size here without overlap; skipped.")
+            show_info("Cannot grow this protein's box size here without overlap; skipped.")
             return
         w, h = eff.width, eff.height
         cx, cy = (gx0 + gx1) // 2, (gy0 + gy1) // 2
@@ -254,161 +320,157 @@ def launch(image_path: str | None = None) -> None:
         ny0 = min(max(0, cy - h // 2), ih - h)
         rect = (nx0, ny0, nx0 + w, ny0 + h)
         if any(overlaps(rect, r) for r in resized):
-            show_info("Box would overlap an existing one; skipped.")
+            show_info("Box would overlap one of this protein's boxes; skipped.")
             return
-        state["base"] = new_base
-        state["size"] = eff
-        state["valid"] = resized + [rect]
-        _set_size_inputs(new_base)
-        _configure_padding_inputs(new_base)  # base grew -> widen padding bounds/step
-        _write_boxes(state["valid"])
-        _refresh_readout()
+        others = [pl for pl in state["placed"] if pl["pid"] != pid]
+        kept = [{"rect": r, "pid": pid} for r in (*resized, rect)]
+        state["placed"] = others + kept
+        _load_controls(p)
+        _refresh_all()
 
     def _remove_at(x: int, y: int) -> None:
-        for i, (rx0, ry0, rx1, ry1) in enumerate(state["valid"]):
+        # Only act while editing a protein, and only on that protein's boxes
+        # (IDLE right-click does nothing; you cannot delete another protein's box).
+        if state["editing"] is None:
+            return
+        pid = state["editing"]
+        for i, pl in enumerate(state["placed"]):
+            if pl["pid"] != pid:
+                continue
+            rx0, ry0, rx1, ry1 = pl["rect"]
             if rx0 <= x < rx1 and ry0 <= y < ry1:
-                del state["valid"][i]
-                _write_boxes(state["valid"])
-                _refresh_readout()
+                del state["placed"][i]
+                _refresh_all()
                 return
 
     def on_mouse(_viewer, event) -> None:
-        """Ctrl+left-click grows a box; right-click removes the box under it."""
-        ctrl = "Control" in event.modifiers
-        if event.button == 1 and ctrl:
-            xy = _click_data_xy(event)
-            if xy:
-                _seed_grow(*xy)
-        elif event.button == 2:
-            xy = _click_data_xy(event)
-            if xy:
-                _remove_at(*xy)
+        add = event.button == 1 and "Control" in event.modifiers
+        remove = event.button == 2
+        if not (add or remove):
+            return
+        if state["editing"] is None:
+            QTimer.singleShot(
+                0, lambda: show_info("Press New protein (or pick one in 'editing') first.")
+            )
+            return
+        xy = _click_xy(event)
+        if not xy:
+            return
+        # Defer the mutation so we don't rebuild the layer *during* napari's own
+        # handling of this click (which leaves a stale selection index).
+        QTimer.singleShot(0, lambda: (_seed_grow(*xy) if add else _remove_at(*xy)))
 
     def on_edit(*_) -> None:
-        """Re-apply the box rules after a manual drag, then refresh values."""
         if state["syncing"]:
             return
         new = [normalize_corners(np.asarray(c)) for c in shapes.data]
-        corrected = reconcile(state["valid"], new, state["size"])
-        if corrected != new:
-            _write_boxes(corrected)
-        state["valid"] = corrected
-        _refresh_readout()
-
-    def on_size_change(*_) -> None:
-        """Manual base width/height override."""
-        if state["syncing"]:
+        if len(new) != len(state["placed"]):
+            _redraw()
             return
-        prev = state["base"]
-        state["base"] = BoxSize(width=int(width_in.value), height=int(height_in.value))
-        _configure_padding_inputs(state["base"])  # rescale padding bounds/step to new base
-        if not _apply_size():
-            state["base"] = prev
-            _set_size_inputs(prev)
-            _configure_padding_inputs(prev)
+        cand = [
+            _center_snap(new[i], _protein_size(state["proteins"][pl["pid"]]), iw, ih)
+            for i, pl in enumerate(state["placed"])
+        ]
+        by_pid: dict[int, list[int]] = {}
+        for i, pl in enumerate(state["placed"]):
+            by_pid.setdefault(pl["pid"], []).append(i)
+        for idxs in by_pid.values():
+            rects = [cand[i] for i in idxs]
+            pairs = ((a, b) for a in range(len(rects)) for b in range(a + 1, len(rects)))
+            if any(overlaps(rects[a], rects[b]) for a, b in pairs):
+                for i in idxs:
+                    cand[i] = state["placed"][i]["rect"]
+        for i, pl in enumerate(state["placed"]):
+            pl["rect"] = cand[i]
+        _refresh_all()
 
-    def on_padding_change(*_) -> None:
-        if state["syncing"]:
+    def _remove_last_protein(*_) -> None:
+        if not state["proteins"]:
+            show_info("No proteins.")
             return
-        if _apply_size():
-            state["pad_w"] = int(padding_w_in.value)
-            state["pad_h"] = int(padding_h_in.value)
-        else:
-            # Overlap: keep the last working padding rather than resetting.
-            state["syncing"] = True
-            try:
-                padding_w_in.value = state["pad_w"]
-                padding_h_in.value = state["pad_h"]
-            finally:
-                state["syncing"] = False
+        pid = len(state["proteins"]) - 1
+        state["placed"] = [pl for pl in state["placed"] if pl["pid"] != pid]
+        removed = state["proteins"].pop()
+        if state["editing"] == pid:
+            state["editing"] = None
+        _set_editing(state["editing"])
+        _refresh_all()
+        show_info(f"Removed protein {removed['name'] or '(unnamed)'}.")
 
-    def _clear(*_) -> None:
-        state["valid"] = []
-        _write_boxes([])
-        _refresh_readout()
+    def _clear_boxes(*_) -> None:
+        if state["editing"] is None:
+            show_info("Not editing a protein.")
+            return
+        pid = state["editing"]
+        state["placed"] = [pl for pl in state["placed"] if pl["pid"] != pid]
+        _refresh_all()
 
     def _undo(_viewer=None) -> None:
-        if state["valid"]:
-            state["valid"].pop()
-            _write_boxes(state["valid"])
-            _refresh_readout()
+        if state["editing"] is None:
+            return
+        pid = state["editing"]
+        idxs = [i for i, pl in enumerate(state["placed"]) if pl["pid"] == pid]
+        if idxs:
+            del state["placed"][idxs[-1]]
+            _refresh_all()
 
-    def _refresh_proteins() -> None:
-        # Results as a table: rows = proteins, columns = lanes (condition headers).
-        # With conditions set, cells are aligned to a shared x-grid so a missing
-        # band lands in its true column; otherwise fall back to position order.
-        proteins, lanes = state["proteins"], state["lanes"]
-        max_boxes = max((len(p["boxes"]) for p in proteins), default=0)
-        hint = "  (one condition per lane)" if max_boxes and len(lanes) != max_boxes else ""
-        status_lbl.value = f"lanes measured: {max_boxes}  |  conditions: {len(lanes)}{hint}"
-        if lanes:
-            columns = list(lanes)
-            aligned = align_to_lanes([p["boxes"] for p in proteins], len(lanes))
-            data = [[round(v) if v is not None else "" for v in row] for row in aligned]
-        else:
-            columns = [f"#{j + 1}" for j in range(max_boxes)]
-            data = [
-                [round(p["boxes"][j][1]) if j < len(p["boxes"]) else "" for j in range(max_boxes)]
-                for p in proteins
-            ]
-        index = []
-        for p in proteins:
-            mw = f" mw={p['mw']}" if p.get("mw") else ""
-            index.append(f"{p['name']} [{p['role']}]{mw}")
-        results_table.value = {"data": data, "columns": columns, "index": index}
+    def on_size_change(*_) -> None:
+        if state["syncing"] or state["editing"] is None:
+            return
+        pid = state["editing"]
+        p = state["proteins"][pid]
+        prev = (p["base"], p["pad_w"], p["pad_h"])
+        p["base"] = BoxSize(width=int(width_in.value), height=int(height_in.value))
+        p["pad_w"], p["pad_h"] = int(padding_w_in.value), int(padding_h_in.value)
+        resized = resize_all(_pid_rects(pid), _protein_size(p), width=iw, height=ih)
+        if resized is None:
+            show_info("Size rejected: it would make this protein's boxes overlap.")
+            p["base"], p["pad_w"], p["pad_h"] = prev
+            _load_controls(p)
+            return
+        others = [pl for pl in state["placed"] if pl["pid"] != pid]
+        state["placed"] = others + [{"rect": r, "pid": pid} for r in resized]
+        _load_controls(p)
+        _refresh_all()
+
+    def on_meta_change(*_) -> None:
+        if state["syncing"] or state["editing"] is None:
+            return
+        p = state["proteins"][state["editing"]]
+        p["name"], p["mw"], p["role"] = protein_in.value.strip(), mw_in.value.strip(), role_in.value
+        _sync_combo()
+        _refresh_table()
+
+    def on_combo_change(*_) -> None:
+        if state["syncing"]:
+            return
+        val = edit_combo.value
+        _set_editing(None if val == NONE_CHOICE else int(val.split(":", 1)[0]))
 
     def on_conditions_change(*_) -> None:
         state["lanes"] = [s.strip() for s in conditions_in.value.split(",") if s.strip()]
-        _refresh_proteins()
+        _refresh_table()
 
-    def _add_protein(*_) -> None:
-        if not state["valid"]:
-            show_info("No boxes to capture.")
-            return
-        name = protein_in.value.strip() or f"protein {len(state['proteins']) + 1}"
-        sz, invert, img = state["size"], bool(dark_on_light.value), image_layer.data
-        # Store nets ordered left-to-right; conditions label these positions later.
-        boxes = sorted(
-            (
-                (bx0, net_signal(img, Box(x=bx0, y=by0), sz, background, dark_on_light=invert))
-                for (bx0, by0, _, _) in state["valid"]
-            ),
-            key=lambda bn: bn[0],
-        )
-        state["proteins"].append(
-            {"name": name, "role": role_in.value, "mw": mw_in.value.strip(), "boxes": boxes}
-        )
-        state["valid"] = []  # clear the canvas for the next protein
-        _write_boxes([])
-        _refresh_readout()
-        _refresh_proteins()
-        show_info(f"Captured {name} ({role_in.value}, {len(boxes)} lanes); canvas cleared.")
-
-    def _remove_last_protein(*_) -> None:
-        if state["proteins"]:
-            removed = state["proteins"].pop()
-            _refresh_proteins()
-            show_info(f"Removed protein {removed['name']}.")
-        else:
-            show_info("No captured proteins to remove.")
-
-    viewer.mouse_drag_callbacks.append(on_mouse)
     shapes.events.data.connect(on_edit)
+    viewer.mouse_drag_callbacks.append(on_mouse)
     width_in.changed.connect(on_size_change)
     height_in.changed.connect(on_size_change)
-    padding_w_in.changed.connect(on_padding_change)
-    padding_h_in.changed.connect(on_padding_change)
-    dark_on_light.changed.connect(lambda *_: _refresh_readout())
-    clear_btn.changed.connect(_clear)
+    padding_w_in.changed.connect(on_size_change)
+    padding_h_in.changed.connect(on_size_change)
+    protein_in.changed.connect(on_meta_change)
+    mw_in.changed.connect(on_meta_change)
+    role_in.changed.connect(on_meta_change)
+    dark_on_light.changed.connect(lambda *_: _refresh_all())
     conditions_in.changed.connect(on_conditions_change)
-    add_btn.changed.connect(_add_protein)
+    edit_combo.changed.connect(on_combo_change)
+    new_btn.changed.connect(_new_protein)
+    confirm_btn.changed.connect(_confirm_protein)
     remove_protein_btn.changed.connect(_remove_last_protein)
+    clear_btn.changed.connect(_clear_boxes)
     viewer.bind_key("Control-Z", _undo, overwrite=True)
 
-    _configure_padding_inputs(base0)  # set padding bounds/step from the initial base
-    _refresh_readout()
-    _refresh_proteins()
-    show_info("Ctrl+click bands, name + Add protein (repeat); fill conditions at the end.")
+    _refresh_all()
+    show_info("Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm.")
     napari.run()
 
 
