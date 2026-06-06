@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""napari GUI for placing equal-area ROI boxes and reading their intensity.
+"""napari GUI: grow equal-area ROI boxes from clicks and read their net signal.
 
-Every box shares one global, locked size (equal area) and no two boxes may
-overlap. The user edits boxes freely; after each edit the constraints are
-re-applied ("validate-and-correct", Route A — see :mod:`proteia.core.boxes`):
+Workflow (seed-grow): Ctrl+click a band and a box is grown to fit it. The shared,
+locked box size is the largest extent across every band clicked so far (so the
+order of clicking does not matter and the biggest band is still fully captured);
+every box uses that one size, keeping the measurement equal-area. Clicking the
+same molecular weight across lanes yields one comparable value per condition.
 
-* a resized box snaps back to the locked size,
-* a box moved onto another reverts to its last valid position,
-* a newly drawn box that would overlap is dropped.
-
-A width/height control changes the one shared size and resizes every box at
-once; the change is rejected if it would force an overlap. Run:
+A padding control adds an equal-area buffer (a percentage) around the auto-fitted
+size without disturbing the detected base size. Boxes cannot overlap. Remove
+boxes with a right-click (any box), Ctrl+Z (the last one), or the Clear all
+button. Existing boxes can be dragged; an edit that breaks the size or overlap is
+corrected. The readout is ordered left-to-right by position, not click order.
 
     uv run python -m proteia.gui.app [IMAGE_PATH]
 
-If no path is given, a synthetic image is shown so the loop can be tried
-without a file. napari/Qt and magicgui imports are local so importing this
-module stays headless-safe (importing it must not require a display).
+If no path is given, a synthetic image is shown. napari/Qt and magicgui imports
+are local so importing this module stays headless-safe.
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ from __future__ import annotations
 import numpy as np
 
 from proteia.core.boxes import normalize_corners, reconcile, resize_all
-from proteia.core.model import Box, BoxSize
+from proteia.core.grow import grow_box
+from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.quantify import estimate_background, integrate_box, net_signal
 
 # (x0, y0, x1, y1), half-open on the high edge — matches proteia.core.model.Rect.
@@ -54,55 +55,104 @@ def _rect_to_corners(rect: Rect) -> np.ndarray:
 
 
 def _initial_size(image: np.ndarray) -> BoxSize:
-    """A starting locked box size proportional to the image."""
+    """A starting base box size proportional to the image (until the first grow)."""
     ih, iw = int(image.shape[0]), int(image.shape[1])
     return BoxSize(width=max(4, iw // 8), height=max(4, ih // 12))
 
 
+def _padded(base: BoxSize, px_w: int, px_h: int) -> BoxSize:
+    """The base size buffered by ``px_w`` / ``px_h`` pixels *per side*.
+
+    Per side, so the change is always symmetric (both edges move together). The
+    50%-200% bounds are enforced by the input widgets, whose step scales with the
+    base so a tweak is fine on a small band and coarse on a large one.
+    """
+    return BoxSize(width=max(2, base.width + 2 * px_w), height=max(2, base.height + 2 * px_h))
+
+
+def _pad_limits(base_dim: int) -> tuple[int, int, int]:
+    """(min, max, step) for a per-side padding input given a base dimension.
+
+    min/max keep the box within [50%, 200%] of base; step scales with the base
+    (~5% per side) so large bands are not adjusted one pixel at a time.
+    """
+    return -round(base_dim * 0.25), round(base_dim * 0.5), max(1, round(base_dim * 0.05))
+
+
 def launch(image_path: str | None = None) -> None:
-    """Open napari with the image and an ROI layer governed by the box rules."""
+    """Open napari with seed-grow ROI placement and net-signal readout."""
     import napari
-    from magicgui.widgets import CheckBox, Container, Label, SpinBox
+    from magicgui.widgets import CheckBox, Container, Label, PushButton, SpinBox
     from napari.utils.notifications import show_info
 
     image = _load_image(image_path)
     ih, iw = int(image.shape[0]), int(image.shape[1])
-    size = _initial_size(image)
     background = estimate_background(image)  # membrane baseline to subtract
 
     viewer = napari.Viewer()
     image_layer = viewer.add_image(image, name="blot")
-
-    # One default box so the loop works immediately; the user can move it,
-    # resize it (it snaps back), or draw more.
-    x0, y0 = int(iw * 0.30), int(ih * 0.40)
-    default = (x0, y0, x0 + size.width, y0 + size.height)
     shapes = viewer.add_shapes(
-        [_rect_to_corners(default)],
-        shape_type="rectangle",
-        name="ROI",
-        edge_color="red",
-        face_color="transparent",
+        name="ROI", edge_color="red", face_color="transparent", ndim=2
     )
-    viewer.layers.selection = {shapes}
+    shapes.mode = "select"  # boxes can be moved, not free-drawn; grow adds them
 
-    # Source of truth: the last configuration that satisfied every invariant.
-    state: dict = {"valid": [default], "size": size, "syncing": False}
+    # Source of truth. ``base`` is the detected size (max over clicked bands);
+    # ``size`` is what is drawn = base + padding. ``valid`` keeps click order.
+    base0 = _initial_size(image)
+    state: dict = {
+        "valid": [], "base": base0, "size": base0, "pad_w": 0, "pad_h": 0, "syncing": False
+    }
 
     readout = Label(value="")
-    width_in = SpinBox(value=size.width, min=2, max=iw, label="box width")
-    height_in = SpinBox(value=size.height, min=2, max=ih, label="box height")
+    width_in = SpinBox(value=base0.width, min=2, max=iw, label="base width")
+    height_in = SpinBox(value=base0.height, min=2, max=ih, label="base height")
+    # Width/height buffered independently, in pixels per side (symmetric). Bounds
+    # and step are set from the base by _configure_padding_inputs (step scales with
+    # size; the inputs pin at +-50%/+200% so there is no endless pressing).
+    padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="padding W (px/side)")
+    padding_h_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="padding H (px/side)")
     dark_on_light = CheckBox(value=True, label="dark band on light")
-    panel = Container(widgets=[width_in, height_in, dark_on_light, readout], labels=True)
+    clear_btn = PushButton(text="Clear all")
+    panel = Container(
+        widgets=[
+            width_in, height_in, padding_w_in, padding_h_in, dark_on_light, clear_btn, readout
+        ],
+        labels=True,
+    )
     viewer.window.add_dock_widget(panel, area="right", name="Quantify")
 
     def _write_boxes(rects: list[Rect]) -> None:
         """Push the authoritative boxes back to the layer (suppressing events)."""
         state["syncing"] = True
         try:
+            shapes.selected_data = set()  # drop stale highlight before replacing data
             shapes.data = []
             if rects:
                 shapes.add([_rect_to_corners(r) for r in rects], shape_type="rectangle")
+            shapes.selected_data = set()
+            shapes.mode = "select"
+        finally:
+            state["syncing"] = False
+
+    def _set_size_inputs(base: BoxSize) -> None:
+        state["syncing"] = True
+        try:
+            width_in.value, height_in.value = base.width, base.height
+        finally:
+            state["syncing"] = False
+
+    def _configure_padding_inputs(base: BoxSize) -> None:
+        """Set each padding input's bounds/step from the base, clamping its value.
+
+        Bounds pin the box to [50%, 200%] of base (no endless pressing); the step
+        scales with the base so adjustment stays usable on a 1000px band.
+        """
+        state["syncing"] = True
+        try:
+            for spin, dim in ((padding_w_in, base.width), (padding_h_in, base.height)):
+                lo, hi, step = _pad_limits(dim)
+                spin.min, spin.max, spin.step = lo, hi, step
+                spin.value = min(max(int(spin.value), lo), hi)
         finally:
             state["syncing"] = False
 
@@ -110,62 +160,162 @@ def launch(image_path: str | None = None) -> None:
         sz = state["size"]
         invert = bool(dark_on_light.value)
         direction = "dark-on-light" if invert else "light-on-dark"
+        b = state["base"]
         lines = [
-            f"box size: {sz.width} x {sz.height} (locked, equal area)",
-            f"background level: {background:.0f}  ({direction})",
+            f"box size: {sz.width} x {sz.height} (base {b.width}x{b.height} + "
+            f"{int(padding_w_in.value)}/{int(padding_h_in.value)} px/side)",
+            f"background: {background:.0f}  ({direction})",
+            "Ctrl+click a band to add a box; right-click to remove; Ctrl+Z to undo.",
         ]
         if not state["valid"]:
-            lines.append("no boxes — draw one on the image")
-        for i, (bx0, by0, _, _) in enumerate(state["valid"]):
+            lines.append("no boxes yet")
+        # Order left-to-right by position, not click order.
+        for i, (bx0, by0, _, _) in enumerate(sorted(state["valid"], key=lambda r: (r[0], r[1]))):
             try:
                 img = image_layer.data
-                net = net_signal(
-                    img, Box(x=bx0, y=by0), sz, background, dark_on_light=invert
-                )
+                net = net_signal(img, Box(x=bx0, y=by0), sz, background, dark_on_light=invert)
                 raw = integrate_box(img, Box(x=bx0, y=by0), sz)
-                lines.append(f"  box {i}: net = {net:.0f}  (raw {raw:.0f})  at x={bx0}, y={by0}")
+                lines.append(f"  {i}: net = {net:.0f}  (raw {raw:.0f})  at x={bx0}, y={by0}")
             except Exception as exc:  # noqa: BLE001  (surface any failure to the user)
-                lines.append(f"  box {i}: cannot quantify ({exc})")
+                lines.append(f"  {i}: cannot quantify ({exc})")
         readout.value = "\n".join(lines)
 
+    def _apply_size() -> bool:
+        """Resize all boxes to base+padding; return False (and warn) on overlap."""
+        eff = _padded(state["base"], padding_w_in.value, padding_h_in.value)
+        resized = resize_all(state["valid"], eff, width=iw, height=ih)
+        if resized is None:
+            show_info("Size rejected: it would make boxes overlap.")
+            return False
+        state["size"] = eff
+        state["valid"] = resized
+        _write_boxes(resized)
+        _refresh_readout()
+        return True
+
+    def _click_data_xy(event) -> tuple[int, int] | None:
+        """Click position in integer image (x, y), or None if outside the image."""
+        row, col = image_layer.world_to_data(event.position)[:2]
+        x, y = int(round(col)), int(round(row))
+        return (x, y) if (0 <= x < iw and 0 <= y < ih) else None
+
+    def _seed_grow(x: int, y: int) -> None:
+        invert = bool(dark_on_light.value)
+        box = grow_box(image_layer.data, (x, y), background, dark_on_light=invert)
+        if box is None:
+            show_info("No band detected at that point.")
+            return
+        gx0, gy0, gx1, gy1 = box
+        gw, gh = max(2, gx1 - gx0), max(2, gy1 - gy0)
+        # The shared base is the largest band seen, so click order does not matter.
+        if not state["valid"]:
+            new_base = BoxSize(width=gw, height=gh)
+        else:
+            cur = state["base"]
+            new_base = BoxSize(width=max(cur.width, gw), height=max(cur.height, gh))
+        eff = _padded(new_base, padding_w_in.value, padding_h_in.value)
+        resized = resize_all(state["valid"], eff, width=iw, height=ih)  # existing at new size
+        if resized is None:
+            show_info("Cannot grow the shared box size here without overlap; skipped.")
+            return
+        w, h = eff.width, eff.height
+        cx, cy = (gx0 + gx1) // 2, (gy0 + gy1) // 2
+        nx0 = min(max(0, cx - w // 2), iw - w)
+        ny0 = min(max(0, cy - h // 2), ih - h)
+        rect = (nx0, ny0, nx0 + w, ny0 + h)
+        if any(overlaps(rect, r) for r in resized):
+            show_info("Box would overlap an existing one; skipped.")
+            return
+        state["base"] = new_base
+        state["size"] = eff
+        state["valid"] = resized + [rect]
+        _set_size_inputs(new_base)
+        _configure_padding_inputs(new_base)  # base grew -> widen padding bounds/step
+        _write_boxes(state["valid"])
+        _refresh_readout()
+
+    def _remove_at(x: int, y: int) -> None:
+        for i, (rx0, ry0, rx1, ry1) in enumerate(state["valid"]):
+            if rx0 <= x < rx1 and ry0 <= y < ry1:
+                del state["valid"][i]
+                _write_boxes(state["valid"])
+                _refresh_readout()
+                return
+
+    def on_mouse(_viewer, event) -> None:
+        """Ctrl+left-click grows a box; right-click removes the box under it."""
+        ctrl = "Control" in event.modifiers
+        if event.button == 1 and ctrl:
+            xy = _click_data_xy(event)
+            if xy:
+                _seed_grow(*xy)
+        elif event.button == 2:
+            xy = _click_data_xy(event)
+            if xy:
+                _remove_at(*xy)
+
     def on_edit(*_) -> None:
-        """Re-apply the box rules after any user edit, then refresh values."""
+        """Re-apply the box rules after a manual drag, then refresh values."""
         if state["syncing"]:
             return
         new = [normalize_corners(np.asarray(c)) for c in shapes.data]
         corrected = reconcile(state["valid"], new, state["size"])
         if corrected != new:
-            _write_boxes(corrected)  # an edit was rejected/snapped
+            _write_boxes(corrected)
         state["valid"] = corrected
         _refresh_readout()
 
-    def on_resize(*_) -> None:
-        """Change the one shared size; resize every box, or reject on overlap."""
+    def on_size_change(*_) -> None:
+        """Manual base width/height override."""
         if state["syncing"]:
             return
-        new_size = BoxSize(width=int(width_in.value), height=int(height_in.value))
-        resized = resize_all(state["valid"], new_size)
-        if resized is None:
-            show_info("Size rejected: it would make boxes overlap.")
-            state["syncing"] = True  # revert the spinboxes without re-triggering
+        prev = state["base"]
+        state["base"] = BoxSize(width=int(width_in.value), height=int(height_in.value))
+        _configure_padding_inputs(state["base"])  # rescale padding bounds/step to new base
+        if not _apply_size():
+            state["base"] = prev
+            _set_size_inputs(prev)
+            _configure_padding_inputs(prev)
+
+    def on_padding_change(*_) -> None:
+        if state["syncing"]:
+            return
+        if _apply_size():
+            state["pad_w"] = int(padding_w_in.value)
+            state["pad_h"] = int(padding_h_in.value)
+        else:
+            # Overlap: keep the last working padding rather than resetting.
+            state["syncing"] = True
             try:
-                width_in.value = state["size"].width
-                height_in.value = state["size"].height
+                padding_w_in.value = state["pad_w"]
+                padding_h_in.value = state["pad_h"]
             finally:
                 state["syncing"] = False
-            return
-        state["size"] = new_size
-        state["valid"] = resized
-        _write_boxes(resized)
+
+    def _clear(*_) -> None:
+        state["valid"] = []
+        _write_boxes([])
         _refresh_readout()
 
-    shapes.events.data.connect(on_edit)
-    width_in.changed.connect(on_resize)
-    height_in.changed.connect(on_resize)
-    dark_on_light.changed.connect(lambda *_: _refresh_readout())
+    def _undo(_viewer=None) -> None:
+        if state["valid"]:
+            state["valid"].pop()
+            _write_boxes(state["valid"])
+            _refresh_readout()
 
-    _refresh_readout()  # initial value for the default box
-    show_info("Boxes share one locked size and cannot overlap; move or draw more.")
+    viewer.mouse_drag_callbacks.append(on_mouse)
+    shapes.events.data.connect(on_edit)
+    width_in.changed.connect(on_size_change)
+    height_in.changed.connect(on_size_change)
+    padding_w_in.changed.connect(on_padding_change)
+    padding_h_in.changed.connect(on_padding_change)
+    dark_on_light.changed.connect(lambda *_: _refresh_readout())
+    clear_btn.changed.connect(_clear)
+    viewer.bind_key("Control-Z", _undo, overwrite=True)
+
+    _configure_padding_inputs(base0)  # set padding bounds/step from the initial base
+    _refresh_readout()
+    show_info("Ctrl+click a band to grow a box; right-click to remove; Ctrl+Z to undo.")
     napari.run()
 
 

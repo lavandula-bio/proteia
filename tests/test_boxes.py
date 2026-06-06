@@ -61,10 +61,23 @@ def test_reconcile_accepts_deletion():
     assert reconcile(prev, new, SIZE) == [(0, 0, 10, 4)]
 
 
-def test_resize_all_applies_when_no_overlap():
-    rects = [(0, 0, 10, 4), (50, 0, 60, 4)]
+def test_resize_all_grows_around_each_center():
+    # Boxes centred at (15, 12) and (55, 12); growing keeps the centres.
+    rects = [(10, 10, 20, 14), (50, 10, 60, 14)]
     bigger = BoxSize(width=20, height=8)
-    assert resize_all(rects, bigger) == [(0, 0, 20, 8), (50, 0, 70, 8)]
+    assert resize_all(rects, bigger) == [(5, 8, 25, 16), (45, 8, 65, 16)]
+
+
+def test_resize_all_can_shrink_around_center():
+    rects = [(10, 10, 20, 14)]  # centre (15, 12)
+    smaller = BoxSize(width=4, height=2)
+    assert resize_all(rects, smaller) == [(13, 11, 17, 13)]
+
+
+def test_resize_all_clamps_to_image_bounds():
+    rects = [(0, 0, 10, 4)]  # centre (5, 2); growing would go negative
+    bigger = BoxSize(width=20, height=8)
+    assert resize_all(rects, bigger, width=100, height=100) == [(0, 0, 20, 8)]
 
 
 def test_resize_all_rejects_when_it_forces_overlap():
