@@ -98,6 +98,7 @@ def launch(image_path: str | None = None) -> None:
         LineEdit,
         PushButton,
         SpinBox,
+        Table,
     )
     from napari.utils.notifications import show_info
 
@@ -121,7 +122,8 @@ def launch(image_path: str | None = None) -> None:
     }
 
     readout = Label(value="")
-    proteins_lbl = Label(value="")
+    status_lbl = Label(value="")
+    results_table = Table(value={"data": [], "columns": [], "index": []})
     # Project spine: one condition/sample label per lane, left-to-right.
     conditions_in = LineEdit(value="", label="conditions")
     width_in = SpinBox(value=base0.width, min=2, max=iw, label="box W")
@@ -142,7 +144,7 @@ def launch(image_path: str | None = None) -> None:
         widgets=[
             conditions_in, width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
             protein_in, mw_in, role_in, add_btn, remove_protein_btn, clear_btn,
-            readout, proteins_lbl,
+            readout, status_lbl, results_table,
         ],
         labels=True,
     )
@@ -331,20 +333,21 @@ def launch(image_path: str | None = None) -> None:
             _refresh_readout()
 
     def _refresh_proteins() -> None:
-        # Compact, one short line per protein (a "folded" view); the full per-lane
-        # values are shown while placing (readout) and in the table increment.
-        lanes = state["lanes"]
-        n = max((len(p["boxes"]) for p in state["proteins"]), default=0)
-        hint = "  (one condition per lane)" if n and len(lanes) != n else ""
-        lines = [f"lanes measured: {n}  |  conditions: {len(lanes)}{hint}"]
-        if not state["proteins"]:
-            lines.append("proteins: (none yet)")
-        else:
-            lines.append("proteins:")
-            for p in state["proteins"]:
-                mw = f" mw={p['mw']}" if p.get("mw") else ""
-                lines.append(f"  {p['name']} [{p['role']}]{mw} - {len(p['boxes'])} lanes")
-        proteins_lbl.value = "\n".join(lines)
+        # Results as a table: rows = proteins, columns = lanes (condition headers),
+        # cells = net per lane by position; a missing box shows as a blank cell.
+        proteins, lanes = state["proteins"], state["lanes"]
+        max_boxes = max((len(p["boxes"]) for p in proteins), default=0)
+        ncols = max(len(lanes), max_boxes)
+        hint = "  (one condition per lane)" if max_boxes and len(lanes) != max_boxes else ""
+        status_lbl.value = f"lanes measured: {max_boxes}  |  conditions: {len(lanes)}{hint}"
+        columns = [lanes[j] if j < len(lanes) else f"#{j + 1}" for j in range(ncols)]
+        index, data = [], []
+        for p in proteins:
+            mw = f" mw={p['mw']}" if p.get("mw") else ""
+            index.append(f"{p['name']} [{p['role']}]{mw}")
+            boxes = p["boxes"]
+            data.append([round(boxes[j][1]) if j < len(boxes) else "" for j in range(ncols)])
+        results_table.value = {"data": data, "columns": columns, "index": index}
 
     def on_conditions_change(*_) -> None:
         state["lanes"] = [s.strip() for s in conditions_in.value.split(",") if s.strip()]
