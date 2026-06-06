@@ -34,6 +34,7 @@ import numpy as np
 from proteia.core.boxes import normalize_corners, reconcile, resize_all
 from proteia.core.grow import grow_box
 from proteia.core.model import Box, BoxSize, overlaps
+from proteia.core.project import align_to_lanes
 from proteia.core.quantify import estimate_background, integrate_box, net_signal
 
 # (x0, y0, x1, y1), half-open on the high edge — matches proteia.core.model.Rect.
@@ -333,20 +334,27 @@ def launch(image_path: str | None = None) -> None:
             _refresh_readout()
 
     def _refresh_proteins() -> None:
-        # Results as a table: rows = proteins, columns = lanes (condition headers),
-        # cells = net per lane by position; a missing box shows as a blank cell.
+        # Results as a table: rows = proteins, columns = lanes (condition headers).
+        # With conditions set, cells are aligned to a shared x-grid so a missing
+        # band lands in its true column; otherwise fall back to position order.
         proteins, lanes = state["proteins"], state["lanes"]
         max_boxes = max((len(p["boxes"]) for p in proteins), default=0)
-        ncols = max(len(lanes), max_boxes)
         hint = "  (one condition per lane)" if max_boxes and len(lanes) != max_boxes else ""
         status_lbl.value = f"lanes measured: {max_boxes}  |  conditions: {len(lanes)}{hint}"
-        columns = [lanes[j] if j < len(lanes) else f"#{j + 1}" for j in range(ncols)]
-        index, data = [], []
+        if lanes:
+            columns = list(lanes)
+            aligned = align_to_lanes([p["boxes"] for p in proteins], len(lanes))
+            data = [[round(v) if v is not None else "" for v in row] for row in aligned]
+        else:
+            columns = [f"#{j + 1}" for j in range(max_boxes)]
+            data = [
+                [round(p["boxes"][j][1]) if j < len(p["boxes"]) else "" for j in range(max_boxes)]
+                for p in proteins
+            ]
+        index = []
         for p in proteins:
             mw = f" mw={p['mw']}" if p.get("mw") else ""
             index.append(f"{p['name']} [{p['role']}]{mw}")
-            boxes = p["boxes"]
-            data.append([round(boxes[j][1]) if j < len(boxes) else "" for j in range(ncols)])
         results_table.value = {"data": data, "columns": columns, "index": index}
 
     def on_conditions_change(*_) -> None:
