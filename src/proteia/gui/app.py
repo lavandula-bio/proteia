@@ -1,21 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Minimal napari GUI: load an image, draw a box, integrate its intensity.
+"""napari GUI for placing equal-area ROI boxes and reading their intensity.
 
-Walking skeleton — proves the napari <-> core loop end to end. Run:
+Every box shares one global, locked size (equal area) and no two boxes may
+overlap. The user edits boxes freely; after each edit the constraints are
+re-applied ("validate-and-correct", Route A — see :mod:`proteia.core.boxes`):
+
+* a resized box snaps back to the locked size,
+* a box moved onto another reverts to its last valid position,
+* a newly drawn box that would overlap is dropped.
+
+A width/height control changes the one shared size and resizes every box at
+once; the change is rejected if it would force an overlap. Run:
 
     uv run python -m proteia.gui.app [IMAGE_PATH]
 
-If no path is given, a synthetic image is shown so the loop can be tried without
-a file. napari/Qt and magicgui imports are local so importing this module stays
-headless-safe (importing it must not require a display).
+If no path is given, a synthetic image is shown so the loop can be tried
+without a file. napari/Qt and magicgui imports are local so importing this
+module stays headless-safe (importing it must not require a display).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from proteia.core.boxes import normalize_corners, reconcile, resize_all
 from proteia.core.model import Box, BoxSize
 from proteia.core.quantify import integrate_box
+
+# (x0, y0, x1, y1), half-open on the high edge — matches proteia.core.model.Rect.
+Rect = tuple[int, int, int, int]
 
 
 def _synthetic_image() -> np.ndarray:
@@ -34,23 +47,37 @@ def _load_image(path: str | None) -> np.ndarray:
     return io.imread(path)
 
 
+def _rect_to_corners(rect: Rect) -> np.ndarray:
+    """A rect as napari rectangle vertices, in (row, col) = (y, x) order."""
+    x0, y0, x1, y1 = rect
+    return np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
+
+
+def _initial_size(image: np.ndarray) -> BoxSize:
+    """A starting locked box size proportional to the image."""
+    ih, iw = int(image.shape[0]), int(image.shape[1])
+    return BoxSize(width=max(4, iw // 8), height=max(4, ih // 12))
+
+
 def launch(image_path: str | None = None) -> None:
-    """Open napari with the image and a ROI layer; the box raw intensity updates live."""
+    """Open napari with the image and an ROI layer governed by the box rules."""
     import napari
-    from magicgui.widgets import Label
+    from magicgui.widgets import Container, Label, SpinBox
     from napari.utils.notifications import show_info
 
     image = _load_image(image_path)
+    ih, iw = int(image.shape[0]), int(image.shape[1])
+    size = _initial_size(image)
+
     viewer = napari.Viewer()
     image_layer = viewer.add_image(image, name="blot")
-    # Start with one default rectangle so the loop works with a single click;
-    # the user can move, resize, or draw more.
-    ih, iw = image.shape[0], image.shape[1]
-    dy0, dy1 = int(ih * 0.40), int(ih * 0.55)
-    dx0, dx1 = int(iw * 0.30), int(iw * 0.45)
-    default_box = np.array([[dy0, dx0], [dy0, dx1], [dy1, dx1], [dy1, dx0]])
+
+    # One default box so the loop works immediately; the user can move it,
+    # resize it (it snaps back), or draw more.
+    x0, y0 = int(iw * 0.30), int(ih * 0.40)
+    default = (x0, y0, x0 + size.width, y0 + size.height)
     shapes = viewer.add_shapes(
-        [default_box],
+        [_rect_to_corners(default)],
         shape_type="rectangle",
         name="ROI",
         edge_color="red",
@@ -58,42 +85,82 @@ def launch(image_path: str | None = None) -> None:
     )
     viewer.layers.selection = {shapes}
 
-    result = Label(value="raw intensity: (draw or move a box)")
-    viewer.window.add_dock_widget(result, area="right", name="Quantify")
+    # Source of truth: the last configuration that satisfied every invariant.
+    state: dict = {"valid": [default], "size": size, "syncing": False}
 
-    def update(*_) -> None:
-        # Quantify the most recently drawn/edited box. Runs automatically whenever
-        # the ROI layer changes, so no button click is needed.
-        if len(shapes.data) == 0:
-            result.value = "raw intensity: no box"
-            return
-        # napari shape vertices are (row, col) = (y, x); use the last shape.
-        corners = np.asarray(shapes.data[-1])
-        ys, xs = corners[:, 0], corners[:, 1]
-        x0, y0 = int(round(xs.min())), int(round(ys.min()))
-        w, h = int(round(xs.max() - xs.min())), int(round(ys.max() - ys.min()))
-        if w <= 0 or h <= 0:
-            result.value = "raw intensity: box has zero area"
-            return
+    readout = Label(value="")
+    width_in = SpinBox(value=size.width, min=2, max=iw, label="box width")
+    height_in = SpinBox(value=size.height, min=2, max=ih, label="box height")
+    panel = Container(widgets=[width_in, height_in, readout], labels=True)
+    viewer.window.add_dock_widget(panel, area="right", name="Quantify")
+
+    def _write_boxes(rects: list[Rect]) -> None:
+        """Push the authoritative boxes back to the layer (suppressing events)."""
+        state["syncing"] = True
         try:
-            raw = integrate_box(image_layer.data, Box(x=x0, y=y0), BoxSize(width=w, height=h))
-        except Exception as exc:  # noqa: BLE001  (surface any failure to the user)
-            result.value = f"raw intensity: cannot quantify ({exc})"
-            return
-        text = f"raw = {raw:.1f}  (box {w}x{h} at x={x0}, y={y0})"
-        result.value = text
-        show_info(text)  # also logged to the console
+            shapes.data = []
+            if rects:
+                shapes.add([_rect_to_corners(r) for r in rects], shape_type="rectangle")
+        finally:
+            state["syncing"] = False
 
-    shapes.events.data.connect(update)
-    update()  # initial value for the default box
-    show_info("Draw or move a box on the image; the value updates automatically.")
+    def _refresh_readout() -> None:
+        sz = state["size"]
+        lines = [f"box size: {sz.width} x {sz.height} (locked, equal area)"]
+        if not state["valid"]:
+            lines.append("no boxes — draw one on the image")
+        for i, (bx0, by0, _, _) in enumerate(state["valid"]):
+            try:
+                raw = integrate_box(image_layer.data, Box(x=bx0, y=by0), sz)
+                lines.append(f"  box {i}: raw = {raw:.1f}  at x={bx0}, y={by0}")
+            except Exception as exc:  # noqa: BLE001  (surface any failure to the user)
+                lines.append(f"  box {i}: cannot quantify ({exc})")
+        readout.value = "\n".join(lines)
+
+    def on_edit(*_) -> None:
+        """Re-apply the box rules after any user edit, then refresh values."""
+        if state["syncing"]:
+            return
+        new = [normalize_corners(np.asarray(c)) for c in shapes.data]
+        corrected = reconcile(state["valid"], new, state["size"])
+        if corrected != new:
+            _write_boxes(corrected)  # an edit was rejected/snapped
+        state["valid"] = corrected
+        _refresh_readout()
+
+    def on_resize(*_) -> None:
+        """Change the one shared size; resize every box, or reject on overlap."""
+        if state["syncing"]:
+            return
+        new_size = BoxSize(width=int(width_in.value), height=int(height_in.value))
+        resized = resize_all(state["valid"], new_size)
+        if resized is None:
+            show_info("Size rejected: it would make boxes overlap.")
+            state["syncing"] = True  # revert the spinboxes without re-triggering
+            try:
+                width_in.value = state["size"].width
+                height_in.value = state["size"].height
+            finally:
+                state["syncing"] = False
+            return
+        state["size"] = new_size
+        state["valid"] = resized
+        _write_boxes(resized)
+        _refresh_readout()
+
+    shapes.events.data.connect(on_edit)
+    width_in.changed.connect(on_resize)
+    height_in.changed.connect(on_resize)
+
+    _refresh_readout()  # initial value for the default box
+    show_info("Boxes share one locked size and cannot overlap; move or draw more.")
     napari.run()
 
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Proteia walking skeleton")
+    parser = argparse.ArgumentParser(description="Proteia ROI quantification")
     parser.add_argument("image", nargs="?", default=None, help="image file (optional)")
     args = parser.parse_args()
     launch(args.image)
