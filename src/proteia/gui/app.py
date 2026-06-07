@@ -38,7 +38,11 @@ from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.grow import grow_box
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
-from proteia.core.project import align_to_lanes
+from proteia.core.project import (
+    align_to_lanes,
+    spine_axes,
+    spine_from_labels,
+)
 from proteia.core.quantify import estimate_background, net_signal
 
 Rect = tuple[int, int, int, int]
@@ -117,8 +121,8 @@ def launch(image_path: str | None = None) -> None:
     # placed: every box, tagged with its protein id. proteins: list by id, each
     # {name, role, mw, color, base, pad_w, pad_h, confirmed}. editing: pid or None.
     state: dict = {
-        "placed": [], "proteins": [], "lanes": [], "editing": None,
-        "syncing": False, "plot_dock": None,
+        "placed": [], "proteins": [], "lanes": [], "spine": [], "editing": None,
+        "syncing": False, "plot_dock": None, "last_spec": None,
     }
 
     # --- widgets ---
@@ -126,6 +130,12 @@ def launch(image_path: str | None = None) -> None:
     status_lbl = Label(value="")
     results_table = Table(value={"data": [], "columns": [], "index": []})
     conditions_in = LineEdit(value="", label="conditions")
+    # Data card: one row per lane. condition seeds from `conditions`; sample +
+    # include are editable. Lanes sharing a (condition, sample) are technical
+    # repeats (averaged, not counted as n); include=no drops a lane from stats.
+    card_table = Table(
+        value={"data": [], "columns": ["condition", "sample", "include"], "index": []}
+    )
     edit_combo = ComboBox(choices=[NONE_CHOICE], value=NONE_CHOICE, label="editing")
     protein_in = LineEdit(value="", label="protein")
     mw_in = LineEdit(value="", label="MW (kDa)")
@@ -139,17 +149,21 @@ def launch(image_path: str | None = None) -> None:
     confirm_btn = PushButton(text="Confirm protein")
     remove_protein_btn = PushButton(text="Remove last protein")
     clear_btn = PushButton(text="Clear this protein's boxes")
-    control_in = LineEdit(value="", label="control cond.")
+    # The reference condition is the fold-change denominator (=1); by role, not
+    # name — it need not be called "control". It sits leftmost on the chart.
+    control_in = LineEdit(value="", label="reference")
     error_in = ComboBox(
         choices=[e.value for e in ErrorType], value=ErrorType.SD.value, label="error bar"
     )
     plot_btn = PushButton(text="Plot")
+    save_chart_btn = PushButton(text="Save chart…")
+    export_csv_btn = PushButton(text="Export table (CSV)…")
     panel = Container(
         widgets=[
-            conditions_in, edit_combo, protein_in, mw_in, role_in,
+            conditions_in, card_table, edit_combo, protein_in, mw_in, role_in,
             width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
             new_btn, confirm_btn, remove_protein_btn, clear_btn,
-            control_in, error_in, plot_btn,
+            control_in, error_in, plot_btn, save_chart_btn, export_csv_btn,
             readout, status_lbl, results_table,
         ],
         labels=True,
@@ -245,15 +259,38 @@ def launch(image_path: str | None = None) -> None:
             lines.append(f"  {i}: net = {net:.0f}  at x={bx0}")
         readout.value = "\n".join(lines)
 
+    def _rebuild_spine() -> None:
+        """Regenerate the lane spine from the declared conditions, then redraw the
+        data card. Resets per-lane sample/include edits — conditions is the bulk
+        declaration; fine-tune samples/include in the card afterwards.
+        """
+        state["spine"] = spine_from_labels(state["lanes"])
+        _refresh_card()
+
+    def _refresh_card() -> None:
+        spine = state["spine"]
+        state["syncing"] = True
+        try:
+            data = [[lane.label, lane.sample or "", "yes" if lane.included else "no"]
+                    for lane in spine]
+            index = [str(lane.index) for lane in spine]
+            card_table.value = {
+                "data": data, "columns": ["condition", "sample", "include"], "index": index
+            }
+        finally:
+            state["syncing"] = False
+
     def _refresh_table() -> None:
-        proteins, lanes = state["proteins"], state["lanes"]
+        proteins, spine = state["proteins"], state["spine"]
         per = [_protein_boxes(pid) for pid in range(len(proteins))]
         max_boxes = max((len(b) for b in per), default=0)
-        hint = "  (one condition per lane)" if max_boxes and len(lanes) != max_boxes else ""
-        status_lbl.value = f"lanes: {max_boxes}  |  conditions: {len(lanes)}{hint}"
-        if lanes:
-            columns = list(lanes)
-            aligned = align_to_lanes(per, len(lanes))
+        n = len(spine)
+        hint = "  (one condition per lane)" if max_boxes and n != max_boxes else ""
+        status_lbl.value = f"lanes: {max_boxes}  |  conditions: {n}{hint}"
+        if spine:
+            conditions, _samples, _included = spine_axes(spine)
+            columns = list(conditions)
+            aligned = align_to_lanes(per, n)
             data = [[round(v) if v is not None else "" for v in row] for row in aligned]
         else:
             columns = [f"#{j + 1}" for j in range(max_boxes)]
@@ -470,6 +507,32 @@ def launch(image_path: str | None = None) -> None:
 
     def on_conditions_change(*_) -> None:
         state["lanes"] = [s.strip() for s in conditions_in.value.split(",") if s.strip()]
+        _rebuild_spine()
+        _refresh_table()
+
+    def _sync_spine_from_card() -> None:
+        """Pull the data card's current cells into the lane spine.
+
+        condition / sample are free text; include is yes/no (anything not
+        affirmative reads as excluded). Marking two lanes the same (condition,
+        sample) makes them technical repeats; set include=no to drop a lane. Read
+        on demand (also at plot time) so edits land even if the table widget does
+        not emit a change event per cell.
+        """
+        spine = state["spine"]
+        rows = (card_table.value or {}).get("data", [])
+        if len(rows) != len(spine):
+            return  # stale / mid-rebuild; ignore
+        for lane, row in zip(spine, rows, strict=True):
+            label, sample, include = (str(c).strip() for c in row)
+            lane.label = label
+            lane.sample = sample or None
+            lane.included = include.lower() in ("yes", "y", "true", "1")
+
+    def on_card_change(*_) -> None:
+        if state["syncing"]:
+            return
+        _sync_spine_from_card()
         _refresh_table()
 
     def _show_figure(spec) -> None:
@@ -497,20 +560,38 @@ def launch(image_path: str | None = None) -> None:
         state["plot_dock"] = dock
 
     def on_plot(*_) -> None:
-        proteins, lanes = state["proteins"], state["lanes"]
-        if not lanes:
+        proteins, spine = state["proteins"], state["spine"]
+        if not spine:
             show_info("Set conditions first (comma-separated; repeats = replicates).")
             return
-        # Each protein's nets aligned to the shared lane spine, by box position.
+        _sync_spine_from_card()  # honour the latest card edits even without a change event
+        n = len(spine)
+        conditions, samples, included = spine_axes(spine)
         per = [_protein_boxes(pid) for pid in range(len(proteins))]
-        aligned = align_to_lanes(per, len(lanes))
-        # Position alignment is only reliable when boxes fill the lanes exactly; a
-        # missing box shifts the inferred grid and silently misassigns lanes. Warn
-        # until the metadata table assigns lanes by explicit number (2b).
+        # Drawing more bands than declared conditions is ambiguous (which band is
+        # the orphan?), so we refuse rather than silently collide two into one slot.
+        overfilled = [
+            f"{p['name'] or '(unnamed)'} ({len(b)} boxes)"
+            for p, b in zip(proteins, per, strict=True)
+            if len(b) > n
+        ]
+        if overfilled:
+            show_info(
+                f"More boxes than the {n} declared conditions: {', '.join(overfilled)}. "
+                "Add the missing condition(s) so every band has a lane."
+            )
+            return
+        # A band's lane is proposed from its x position, anchored across *all*
+        # proteins: a fully-drawn loading control fixes the grid so a missing
+        # target band lands in its real empty slot. Per-box explicit lane numbers
+        # (next UI step) will remove the guess entirely.
+        aligned = align_to_lanes(per, n)
+        # Fewer boxes than lanes is fine (a gap) but warn — anchoring can still
+        # misplace if the protein anchoring the grid is itself short.
         mismatched = [
             f"{p['name'] or '(unnamed)'} ({len(b)})"
             for p, b in zip(proteins, per, strict=True)
-            if b and len(b) != len(lanes)
+            if b and len(b) != n
         ]
         pnets = [
             ProteinNets(
@@ -522,7 +603,7 @@ def launch(image_path: str | None = None) -> None:
         ]
         control = control_in.value.strip() or None
         try:
-            batch = Batch(list(lanes), pnets, control_condition=control)
+            batch = Batch(conditions, pnets, control_condition=control)
         except ValueError as exc:
             show_info(f"Cannot plot: {exc}")
             return
@@ -537,14 +618,16 @@ def launch(image_path: str | None = None) -> None:
             show_info(f"Multiple targets; plotting {targets[0].name}, ignoring: {ignored}")
         target, loading = targets[0], batch.loading_control()
         norm = normalize_lane(target.nets, loading.nets)
+        # Provenance: condition -> its included source lanes (for later cropping/audit).
         provenance: dict[str, list[int]] = {}
-        for i, cond in enumerate(lanes):
-            provenance.setdefault(cond, []).append(i)
+        for i, cond in enumerate(conditions):
+            if included[i]:
+                provenance.setdefault(cond, []).append(i)
         error_type = ErrorType(error_in.value)
 
         if control:
             try:
-                values = fold_change_lane(norm, lanes, control)
+                values = fold_change_lane(norm, conditions, control)
             except ValueError as exc:
                 show_info(f"Cannot plot fold-change: {exc}")
                 return
@@ -553,30 +636,80 @@ def launch(image_path: str | None = None) -> None:
         else:
             values, kind = norm, ValueKind.LOADING_NORMALIZED
             title = f"{target.name} / {loading.name}"
-        # samples=None: each lane is its own biological sample (no technical-repeat
-        # info yet). The sample-aware collapse activates once the metadata table
-        # supplies sample ids; the pipeline is already correct for that.
-        reduction = reduce_samples(values, lanes)
+        # Sample-aware: lanes sharing (condition, sample) are averaged before stats
+        # (technical repeats don't inflate n); include=no lanes are dropped.
+        reduction = reduce_samples(values, conditions, samples, included=included)
         groups = reduction.groups
-        # Control condition sits leftmost (convention); free reordering is a 2b feature.
+        # Reference condition sits leftmost (it is the fold-change denominator).
         spec = build_plotspec(
             groups, describe(groups), compare(groups),
             value_kind=kind, error_type=error_type, title=title,
             lane_indices=provenance, first_label=control,
         )
+        state["last_spec"] = spec  # remember for "Save chart"
         _show_figure(spec)
         notes = comp.warnings + reduction.warnings
         if mismatched:
             notes.append(
-                f"box count != conditions ({len(lanes)}) for {', '.join(mismatched)}; "
-                "lanes assigned by position and may be misaligned"
+                f"box count != conditions ({n}) for {', '.join(mismatched)}; "
+                "lane numbers proposed by position and may be misaligned"
             )
-        # Honesty: with no sample ids every lane counts as an independent
-        # biological replicate; technical-repeat averaging arrives in 2b.
-        if any(len(v) > 1 for v in groups.values()):
-            notes.append("repeats counted as biological samples (no technical-repeat grouping yet)")
         if notes:
             show_info("; ".join(notes))
+
+    def _save_path(caption: str, file_filter: str) -> str | None:
+        from qtpy.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getSaveFileName(panel.native, caption, "", file_filter)
+        return path or None
+
+    def on_save_chart(*_) -> None:
+        spec = state["last_spec"]
+        if spec is None:
+            show_info("Plot a chart first, then save it.")
+            return
+        path = _save_path("Save chart", "Image (*.png *.pdf *.svg)")
+        if not path:
+            return
+        from proteia.viz import save_figure
+
+        save_figure(spec, path)
+        show_info(f"Saved chart to {path}")
+
+    def on_export_csv(*_) -> None:
+        """Export the raw per-lane table: lane identity + each protein's net.
+
+        This is the first ("raw") staged output — one row per lane, columns for
+        condition / sample / include and every protein's net signal aligned to the
+        spine. Empty cells are gaps (no box for that protein on that lane).
+        """
+        proteins, spine = state["proteins"], state["spine"]
+        if not spine:
+            show_info("Set conditions first.")
+            return
+        _sync_spine_from_card()
+        n = len(spine)
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
+        if any(len(b) > n for b in per):
+            show_info("More boxes than conditions; fix the data card before exporting.")
+            return
+        aligned = align_to_lanes(per, n)
+        conditions, samples, included = spine_axes(spine)
+        path = _save_path("Export table", "CSV (*.csv)")
+        if not path:
+            return
+        import csv
+
+        names = [p["name"] or f"protein{i}" for i, p in enumerate(proteins)]
+        with open(path, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["lane", "condition", "sample", "include", *names])
+            for i in range(n):
+                row = [i, conditions[i], samples[i] or "", "yes" if included[i] else "no"]
+                row += ["" if aligned[pid][i] is None else round(aligned[pid][i], 3)
+                        for pid in range(len(proteins))]
+                writer.writerow(row)
+        show_info(f"Exported {n} lanes x {len(proteins)} proteins to {path}")
 
     shapes.events.data.connect(on_edit)
     viewer.mouse_drag_callbacks.append(on_mouse)
@@ -589,12 +722,15 @@ def launch(image_path: str | None = None) -> None:
     role_in.changed.connect(on_meta_change)
     dark_on_light.changed.connect(lambda *_: _refresh_all())
     conditions_in.changed.connect(on_conditions_change)
+    card_table.changed.connect(on_card_change)
     edit_combo.changed.connect(on_combo_change)
     new_btn.changed.connect(_new_protein)
     confirm_btn.changed.connect(_confirm_protein)
     remove_protein_btn.changed.connect(_remove_last_protein)
     clear_btn.changed.connect(_clear_boxes)
     plot_btn.changed.connect(on_plot)
+    save_chart_btn.changed.connect(on_save_chart)
+    export_csv_btn.changed.connect(on_export_csv)
     viewer.bind_key("Control-Z", _undo, overwrite=True)
 
     _refresh_all()
