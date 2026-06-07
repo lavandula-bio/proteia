@@ -51,11 +51,18 @@ class Tier(StrEnum):
 
 @dataclass(frozen=True)
 class ProteinNets:
-    """One protein's per-lane nets within a batch, plus its role."""
+    """One protein's per-lane nets within a batch, plus its role.
+
+    For a target, ``loadings`` names the loading control(s) it is normalized
+    against (by name). Empty means "use the batch default" — the single loading
+    control if there is exactly one. A target may name several loading controls
+    (a deliberate comparison), yielding one normalized series per pairing.
+    """
 
     name: str
     role: Role
     nets: LaneNets
+    loadings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,11 +91,29 @@ class Batch:
     def targets(self) -> list[ProteinNets]:
         return [p for p in self.proteins if p.role is Role.TARGET]
 
+    def loading_controls(self) -> list[ProteinNets]:
+        return [p for p in self.proteins if p.role is Role.LOADING_CONTROL]
+
     def loading_control(self) -> ProteinNets | None:
-        for p in self.proteins:
-            if p.role is Role.LOADING_CONTROL:
-                return p
-        return None
+        """The first loading control (convenience for the common single-control
+        batch). Per-target resolution should use :meth:`resolve_loadings`."""
+        lcs = self.loading_controls()
+        return lcs[0] if lcs else None
+
+    def resolve_loadings(self, target: ProteinNets) -> list[ProteinNets]:
+        """Which loading control(s) a target is normalized against.
+
+        Explicit ``target.loadings`` win (each must name an existing loading
+        control). With none given, default to the batch's single loading control.
+        Returns ``[]`` when unresolvable: no loading control at all, an ambiguous
+        choice (2+ controls and no explicit pick), or a named control that does
+        not exist / is not a loading control.
+        """
+        lcs = self.loading_controls()
+        by_name = {p.name: p for p in lcs}
+        if target.loadings:
+            return [by_name[name] for name in target.loadings if name in by_name]
+        return [lcs[0]] if len(lcs) == 1 else []
 
 
 @dataclass(frozen=True)
@@ -138,6 +163,41 @@ def normalize_lane(target: LaneNets, loading: LaneNets) -> LaneNets:
         else:
             out.append(t / lo)
     return out
+
+
+@dataclass(frozen=True)
+class NormalizedSeries:
+    """One target normalized against one loading control: per-lane ratio.
+
+    ``target``/``loading`` are protein names; ``values`` is the per-lane
+    target/loading ratio (``None`` where either is missing). One series per
+    (target, loading) pairing.
+    """
+
+    target: str
+    loading: str
+    values: LaneNets
+
+
+def normalize_batch(batch: Batch) -> tuple[list[NormalizedSeries], list[str]]:
+    """Exhaustive normalization: every target against each of its loading
+    control(s), for all lanes — independent of which conditions get plotted later.
+
+    Returns one :class:`NormalizedSeries` per (target, loading) pairing, plus
+    warnings naming targets that could not be resolved to a loading control. This
+    is the analysis layer's "compute everything" step; selecting a target /
+    loading / condition subset to chart happens downstream.
+    """
+    series: list[NormalizedSeries] = []
+    warnings: list[str] = []
+    for t in batch.targets():
+        loadings = batch.resolve_loadings(t)
+        if not loadings:
+            warnings.append(f"target {t.name!r} has no resolvable loading control")
+            continue
+        for lc in loadings:
+            series.append(NormalizedSeries(t.name, lc.name, normalize_lane(t.nets, lc.nets)))
+    return series, warnings
 
 
 def group_by_condition(values: LaneNets, conditions: list[str]) -> dict[str, list[float]]:
