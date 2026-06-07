@@ -502,7 +502,16 @@ def launch(image_path: str | None = None) -> None:
             show_info("Set conditions first (comma-separated; repeats = replicates).")
             return
         # Each protein's nets aligned to the shared lane spine, by box position.
-        aligned = align_to_lanes([_protein_boxes(pid) for pid in range(len(proteins))], len(lanes))
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
+        aligned = align_to_lanes(per, len(lanes))
+        # Position alignment is only reliable when boxes fill the lanes exactly; a
+        # missing box shifts the inferred grid and silently misassigns lanes. Warn
+        # until the metadata table assigns lanes by explicit number (2b).
+        mismatched = [
+            f"{p['name'] or '(unnamed)'} ({len(b)})"
+            for p, b in zip(proteins, per, strict=True)
+            if b and len(b) != len(lanes)
+        ]
         pnets = [
             ProteinNets(
                 p["name"] or "(unnamed)",
@@ -557,6 +566,11 @@ def launch(image_path: str | None = None) -> None:
         )
         _show_figure(spec)
         notes = comp.warnings + reduction.warnings
+        if mismatched:
+            notes.append(
+                f"box count != conditions ({len(lanes)}) for {', '.join(mismatched)}; "
+                "lanes assigned by position and may be misaligned"
+            )
         # Honesty: with no sample ids every lane counts as an independent
         # biological replicate; technical-repeat averaging arrives in 2b.
         if any(len(v) > 1 for v in groups.values()):
