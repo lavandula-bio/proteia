@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 license = "Apache-2.0"
 authors = [{ name = "Roger Huang" }]
 dependencies = [
+    "matplotlib>=3.9",
     "napari[pyside6]>=0.7",
     "numpy>=2.1",
     "pydantic>=2.13.4",

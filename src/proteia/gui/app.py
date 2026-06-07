@@ -23,9 +23,21 @@ from __future__ import annotations
 
 import numpy as np
 
+from proteia.core.analyze import (
+    Batch,
+    ProteinNets,
+    Role,
+    assess,
+    compare,
+    describe,
+    fold_change_lane,
+    normalize_lane,
+    reduce_samples,
+)
 from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.grow import grow_box
 from proteia.core.model import Box, BoxSize, overlaps
+from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
 from proteia.core.project import align_to_lanes
 from proteia.core.quantify import estimate_background, net_signal
 
@@ -104,7 +116,10 @@ def launch(image_path: str | None = None) -> None:
 
     # placed: every box, tagged with its protein id. proteins: list by id, each
     # {name, role, mw, color, base, pad_w, pad_h, confirmed}. editing: pid or None.
-    state: dict = {"placed": [], "proteins": [], "lanes": [], "editing": None, "syncing": False}
+    state: dict = {
+        "placed": [], "proteins": [], "lanes": [], "editing": None,
+        "syncing": False, "plot_dock": None,
+    }
 
     # --- widgets ---
     readout = Label(value="")
@@ -124,11 +139,17 @@ def launch(image_path: str | None = None) -> None:
     confirm_btn = PushButton(text="Confirm protein")
     remove_protein_btn = PushButton(text="Remove last protein")
     clear_btn = PushButton(text="Clear this protein's boxes")
+    control_in = LineEdit(value="", label="control cond.")
+    error_in = ComboBox(
+        choices=[e.value for e in ErrorType], value=ErrorType.SD.value, label="error bar"
+    )
+    plot_btn = PushButton(text="Plot")
     panel = Container(
         widgets=[
             conditions_in, edit_combo, protein_in, mw_in, role_in,
             width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
             new_btn, confirm_btn, remove_protein_btn, clear_btn,
+            control_in, error_in, plot_btn,
             readout, status_lbl, results_table,
         ],
         labels=True,
@@ -451,6 +472,112 @@ def launch(image_path: str | None = None) -> None:
         state["lanes"] = [s.strip() for s in conditions_in.value.split(",") if s.strip()]
         _refresh_table()
 
+    def _show_figure(spec) -> None:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+
+        from proteia.viz import render_figure
+
+        if state["plot_dock"] is not None:
+            # The user may have closed the previous chart; its Qt object is then
+            # already gone, so removing it raises. Guard and reset either way.
+            try:
+                viewer.window.remove_dock_widget(state["plot_dock"])
+            except (RuntimeError, KeyError, ValueError, AttributeError):
+                pass
+            state["plot_dock"] = None
+        canvas = FigureCanvasQTAgg(render_figure(spec))
+        dock = viewer.window.add_dock_widget(canvas, area="bottom", name="Chart")
+        # Float it so the chart is a movable, resizable window instead of being
+        # trapped in the cramped bottom dock.
+        try:
+            dock.setFloating(True)
+            dock.resize(720, 560)
+        except (AttributeError, RuntimeError):
+            pass
+        state["plot_dock"] = dock
+
+    def on_plot(*_) -> None:
+        proteins, lanes = state["proteins"], state["lanes"]
+        if not lanes:
+            show_info("Set conditions first (comma-separated; repeats = replicates).")
+            return
+        # Each protein's nets aligned to the shared lane spine, by box position.
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
+        aligned = align_to_lanes(per, len(lanes))
+        # Position alignment is only reliable when boxes fill the lanes exactly; a
+        # missing box shifts the inferred grid and silently misassigns lanes. Warn
+        # until the metadata table assigns lanes by explicit number (2b).
+        mismatched = [
+            f"{p['name'] or '(unnamed)'} ({len(b)})"
+            for p, b in zip(proteins, per, strict=True)
+            if b and len(b) != len(lanes)
+        ]
+        pnets = [
+            ProteinNets(
+                p["name"] or "(unnamed)",
+                Role.LOADING_CONTROL if p["role"] == "loading control" else Role.TARGET,
+                nets,
+            )
+            for p, nets in zip(proteins, aligned, strict=True)
+        ]
+        control = control_in.value.strip() or None
+        try:
+            batch = Batch(list(lanes), pnets, control_condition=control)
+        except ValueError as exc:
+            show_info(f"Cannot plot: {exc}")
+            return
+        comp = assess(batch)
+        if not comp.can_pool:
+            show_info("Export only — " + "; ".join(comp.warnings))
+            return
+
+        targets = batch.targets()
+        if len(targets) > 1:
+            ignored = ", ".join(t.name for t in targets[1:])
+            show_info(f"Multiple targets; plotting {targets[0].name}, ignoring: {ignored}")
+        target, loading = targets[0], batch.loading_control()
+        norm = normalize_lane(target.nets, loading.nets)
+        provenance: dict[str, list[int]] = {}
+        for i, cond in enumerate(lanes):
+            provenance.setdefault(cond, []).append(i)
+        error_type = ErrorType(error_in.value)
+
+        if control:
+            try:
+                values = fold_change_lane(norm, lanes, control)
+            except ValueError as exc:
+                show_info(f"Cannot plot fold-change: {exc}")
+                return
+            kind = ValueKind.FOLD_CHANGE
+            title = f"{target.name} fold-change vs {control}"
+        else:
+            values, kind = norm, ValueKind.LOADING_NORMALIZED
+            title = f"{target.name} / {loading.name}"
+        # samples=None: each lane is its own biological sample (no technical-repeat
+        # info yet). The sample-aware collapse activates once the metadata table
+        # supplies sample ids; the pipeline is already correct for that.
+        reduction = reduce_samples(values, lanes)
+        groups = reduction.groups
+        # Control condition sits leftmost (convention); free reordering is a 2b feature.
+        spec = build_plotspec(
+            groups, describe(groups), compare(groups),
+            value_kind=kind, error_type=error_type, title=title,
+            lane_indices=provenance, first_label=control,
+        )
+        _show_figure(spec)
+        notes = comp.warnings + reduction.warnings
+        if mismatched:
+            notes.append(
+                f"box count != conditions ({len(lanes)}) for {', '.join(mismatched)}; "
+                "lanes assigned by position and may be misaligned"
+            )
+        # Honesty: with no sample ids every lane counts as an independent
+        # biological replicate; technical-repeat averaging arrives in 2b.
+        if any(len(v) > 1 for v in groups.values()):
+            notes.append("repeats counted as biological samples (no technical-repeat grouping yet)")
+        if notes:
+            show_info("; ".join(notes))
+
     shapes.events.data.connect(on_edit)
     viewer.mouse_drag_callbacks.append(on_mouse)
     width_in.changed.connect(on_size_change)
@@ -467,6 +594,7 @@ def launch(image_path: str | None = None) -> None:
     confirm_btn.changed.connect(_confirm_protein)
     remove_protein_btn.changed.connect(_remove_last_protein)
     clear_btn.changed.connect(_clear_boxes)
+    plot_btn.changed.connect(on_plot)
     viewer.bind_key("Control-Z", _undo, overwrite=True)
 
     _refresh_all()

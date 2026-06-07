@@ -56,10 +56,21 @@ class Lane(BaseModel):
     ``index`` is the stable key used downstream to join analyses (e.g. a target
     against its loading control) by sample. ``label`` is a human-facing name
     (a lane number or a condition name).
+
+    ``sample`` names the *biological* sample this lane belongs to: lanes sharing
+    the same ``(label, sample)`` are *technical* repeats of one sample and are
+    averaged before statistics, so they do not inflate n. Lanes with the same
+    ``label`` but different ``sample`` are biological replicates (the real n).
+    ``included`` excludes presentation-only lanes from quantification. ``metadata``
+    carries arbitrary ``item: content`` annotations (any may become a grouping
+    axis later).
     """
 
     index: int = Field(ge=0)
     label: str
+    sample: str | None = None
+    included: bool = True
+    metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class Box(BaseModel):
