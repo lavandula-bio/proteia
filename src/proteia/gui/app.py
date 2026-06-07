@@ -484,7 +484,15 @@ def launch(image_path: str | None = None) -> None:
                 pass
             state["plot_dock"] = None
         canvas = FigureCanvasQTAgg(render_figure(spec))
-        state["plot_dock"] = viewer.window.add_dock_widget(canvas, area="bottom", name="Chart")
+        dock = viewer.window.add_dock_widget(canvas, area="bottom", name="Chart")
+        # Float it so the chart is a movable, resizable window instead of being
+        # trapped in the cramped bottom dock.
+        try:
+            dock.setFloating(True)
+            dock.resize(720, 560)
+        except (AttributeError, RuntimeError):
+            pass
+        state["plot_dock"] = dock
 
     def on_plot(*_) -> None:
         proteins, lanes = state["proteins"], state["lanes"]
@@ -530,6 +538,10 @@ def launch(image_path: str | None = None) -> None:
         # supplies sample ids; the pipeline is already correct for that.
         reduction = reduce_samples(values, lanes)
         groups = reduction.groups
+        # Convention: the control condition sits leftmost. Free reordering is a
+        # later (2b) feature; this is a sensible default when a control is set.
+        if control and control in groups:
+            groups = {control: groups[control], **{k: v for k, v in groups.items() if k != control}}
         spec = build_plotspec(
             groups, describe(groups), compare(groups),
             value_kind=kind, error_type=error_type, title=title, lane_indices=provenance,
