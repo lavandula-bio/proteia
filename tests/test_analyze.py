@@ -16,6 +16,7 @@ from proteia.core.analyze import (
     describe,
     fold_change_lane,
     group_by_condition,
+    normalize_batch,
     normalize_lane,
     reduce_samples,
 )
@@ -225,3 +226,83 @@ def test_full_chain_normalize_group_compare():
     res = compare(groups)
     assert res.test == "anova_oneway"
     assert res.p_value < 0.05  # ctl~1, A~2, B~0.55 are clearly different
+
+
+# --- per-target loading control (A) ---
+
+LANES4 = ["ctl", "ctl", "A", "A"]
+
+
+def _b(*proteins, control=None):
+    return Batch(LANES4, list(proteins), control_condition=control)
+
+
+def test_resolve_defaults_to_single_loading_control():
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4])
+    gapdh = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    b = _b(t, gapdh)
+    assert [lc.name for lc in b.resolve_loadings(t)] == ["GAPDH"]
+
+
+def test_resolve_ambiguous_with_two_controls_and_no_pick():
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4])
+    g1 = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    g2 = ProteinNets("Actin", Role.LOADING_CONTROL, [2, 2, 2, 2])
+    b = _b(t, g1, g2)
+    assert b.resolve_loadings(t) == []  # must pick when 2+ controls
+
+
+def test_resolve_explicit_pick_among_several():
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4], loadings=("Actin",))
+    g1 = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    g2 = ProteinNets("Actin", Role.LOADING_CONTROL, [2, 2, 2, 2])
+    assert [lc.name for lc in _b(t, g1, g2).resolve_loadings(t)] == ["Actin"]
+
+
+def test_resolve_unknown_name_is_dropped():
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4], loadings=("Nope",))
+    g1 = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    assert _b(t, g1).resolve_loadings(t) == []
+
+
+def test_normalize_batch_single_pair():
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4])
+    gapdh = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    series, warnings = normalize_batch(_b(t, gapdh))
+    assert warnings == []
+    assert len(series) == 1
+    assert (series[0].target, series[0].loading) == ("Tub", "GAPDH")
+    assert series[0].values == [2.0, 2.0, 4.0, 4.0]
+
+
+def test_normalize_batch_target_against_multiple_loadings():
+    # A deliberate comparison: one target, two loading controls -> two series.
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4], loadings=("GAPDH", "Actin"))
+    g1 = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    g2 = ProteinNets("Actin", Role.LOADING_CONTROL, [2, 2, 2, 2])
+    series, warnings = normalize_batch(_b(t, g1, g2))
+    assert warnings == []
+    assert {(s.target, s.loading) for s in series} == {("Tub", "GAPDH"), ("Tub", "Actin")}
+    actin = next(s for s in series if s.loading == "Actin")
+    assert actin.values == [1.0, 1.0, 2.0, 2.0]  # target / 2
+
+
+def test_normalize_batch_multiple_loading_controls_each_target_picks():
+    # 10-protein-style case: two loading controls, two targets each on its own.
+    t1 = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4], loadings=("GAPDH",))
+    t2 = ProteinNets("p53", Role.TARGET, [3, 3, 6, 6], loadings=("Actin",))
+    g1 = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    g2 = ProteinNets("Actin", Role.LOADING_CONTROL, [3, 3, 3, 3])
+    series, warnings = normalize_batch(_b(t1, t2, g1, g2))
+    assert warnings == []
+    pairs = {(s.target, s.loading) for s in series}
+    assert pairs == {("Tub", "GAPDH"), ("p53", "Actin")}
+
+
+def test_normalize_batch_warns_unresolvable_target():
+    t = ProteinNets("Tub", Role.TARGET, [2, 2, 4, 4])  # no pick
+    g1 = ProteinNets("GAPDH", Role.LOADING_CONTROL, [1, 1, 1, 1])
+    g2 = ProteinNets("Actin", Role.LOADING_CONTROL, [2, 2, 2, 2])
+    series, warnings = normalize_batch(_b(t, g1, g2))
+    assert series == []
+    assert any("Tub" in w and "loading control" in w for w in warnings)
