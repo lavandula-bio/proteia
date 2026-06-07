@@ -58,23 +58,33 @@ def _synthetic_image() -> np.ndarray:
 
 
 def _load_image(path: str | None) -> np.ndarray:
-    """Load an image as a 2D grayscale array.
-
-    Western densitometry works on grayscale intensity, and a consistent ndim
-    across every image in a batch is required so the viewer can swap between them
-    (mixing 2D grayscale and 3D RGB crashes napari's dims handling). RGB/RGBA
-    sources are converted to grayscale; alpha is dropped.
-    """
+    """Read raw pixels (2D grayscale or 3D RGB/RGBA) from disk."""
     if path is None:
         return _synthetic_image()
     from skimage import io
 
-    img = io.imread(path)
-    if img.ndim == 3:
+    return io.imread(path)
+
+
+def _to_gray(raw: np.ndarray) -> np.ndarray:
+    """The analysis array: 2D grayscale intensity (densitometry works on this, and
+    a consistent ndim lets the viewer swap images without a napari dims crash)."""
+    if raw.ndim == 3:
         from skimage.color import rgb2gray
 
-        img = rgb2gray(img[..., :3]) * 255.0  # rgb2gray is [0,1]; keep an 8-bit-like range
-    return img
+        return rgb2gray(raw[..., :3]) * 255.0  # rgb2gray is [0,1]; keep 8-bit-like range
+    return raw
+
+
+def _to_rgb(raw: np.ndarray) -> np.ndarray:
+    """The display array: a uint8 RGB view of the original (colour survives for
+    fluorescence). Grayscale sources are stacked to 3 channels."""
+    rgb = raw[..., :3] if raw.ndim == 3 else np.stack([raw, raw, raw], axis=-1)
+    if rgb.dtype != np.uint8:
+        r = rgb.astype(float)
+        lo, hi = float(r.min()), float(r.max())
+        rgb = ((r - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else rgb.astype(np.uint8)
+    return rgb
 
 
 def _rect_to_corners(rect: Rect) -> np.ndarray:
@@ -87,15 +97,18 @@ def _initial_size(image: np.ndarray) -> BoxSize:
     return BoxSize(width=max(4, iw // 8), height=max(4, ih // 12))
 
 
-def _make_image(array: np.ndarray, name: str, path: str | None) -> dict:
-    """One member of a batch's image set: the pixels plus its own background and
-    dimensions. Each protein references one of these by index; net signal is
-    always computed against the protein's *own* image, so a target and a loading
-    control on different membranes still join correctly by lane."""
+def _make_image(raw: np.ndarray, name: str, path: str | None) -> dict:
+    """One member of a batch's image set: a grayscale ``array`` (analysis) plus an
+    RGB ``original`` (display), its background and dimensions. Net signal is always
+    computed against the protein's own ``array``, so a target and a loading control
+    on different membranes still join correctly by lane; ``original`` only feeds the
+    optional 'show original' display toggle."""
+    array = _to_gray(raw)
     return {
         "name": name,
         "path": path,
         "array": array,
+        "original": _to_rgb(raw),
         "background": estimate_background(array),
         "iw": int(array.shape[1]),
         "ih": int(array.shape[0]),
@@ -137,22 +150,26 @@ def launch(image_path: str | None = None) -> None:
     from napari.utils.notifications import show_info
     from qtpy.QtCore import QTimer
 
-    first = _load_image(image_path)
-    first_name = image_path.split("/")[-1] if image_path else "(demo)"
-
     viewer = napari.Viewer()
-    image_layer = viewer.add_image(first, name="blot")
+    # Two image layers for the same membrane: a colour "raw" view (display only) and
+    # the grayscale "blot" used for analysis. The 'show original' toggle flips which
+    # is visible; the ROI layer sits on top of both, so boxes stay put either way.
+    raw_layer = viewer.add_image(
+        np.zeros((1, 1, 3), dtype=np.uint8), name="raw", rgb=True, visible=False
+    )
+    image_layer = viewer.add_image(np.zeros((1, 1), dtype=float), name="blot")
     shapes = viewer.add_shapes(name="ROI", face_color="transparent", ndim=2)
     shapes.mode = "select"
 
     # A batch holds an image set; each protein binds to one image (by index), so a
     # target on image A and a loading control on image B join later by lane.
-    # placed: every box {rect, pid}. proteins: list by id, each carries "image"
-    # (its image index). editing: pid or None. active: the displayed image.
+    # The app starts with NO image (like a document app); the user imports one or
+    # more, so active is None until then. placed: every box {rect, pid}. proteins:
+    # list by id, each carries "image" (its image index). editing: pid or None.
     state: dict = {
         "placed": [], "proteins": [], "lanes": [], "spine": [], "editing": None,
         "syncing": False, "plot_docks": [], "last_specs": [],
-        "images": [_make_image(first, first_name, image_path)], "active": 0,
+        "images": [], "active": None,
     }
 
     # --- widgets ---
@@ -160,7 +177,7 @@ def launch(image_path: str | None = None) -> None:
     status_lbl = Label(value="")
     results_table = Table(value={"data": [], "columns": [], "index": []})
     open_image_btn = PushButton(text="Import image…")
-    image_combo = ComboBox(choices=[f"0: {first_name}"], value=f"0: {first_name}", label="image")
+    image_combo = ComboBox(choices=["(no image)"], value="(no image)", label="image")
     remove_image_btn = PushButton(text="Remove this image")
     conditions_in = LineEdit(value="", label="conditions")
     # Data card: one row per lane. condition seeds from `conditions`; sample +
@@ -173,12 +190,13 @@ def launch(image_path: str | None = None) -> None:
     protein_in = LineEdit(value="", label="protein")
     mw_in = LineEdit(value="", label="MW (kDa)")
     role_in = ComboBox(choices=["target", "loading control"], value="target", label="role")
-    width_in = SpinBox(value=64, min=2, max=int(first.shape[1]), label="box W")
-    height_in = SpinBox(value=20, min=2, max=int(first.shape[0]), label="box H")
+    width_in = SpinBox(value=64, min=2, max=10000, label="box W")  # max retuned per image
+    height_in = SpinBox(value=20, min=2, max=10000, label="box H")
     padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad W")
     padding_h_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad H")
     dark_on_light = CheckBox(value=True, label="dark on light")
     manual_box = CheckBox(value=False, label="manual box (no auto-grow)")
+    show_original = CheckBox(value=False, label="show original (raw)")
     new_btn = PushButton(text="New protein")
     confirm_btn = PushButton(text="Confirm protein")
     remove_protein_btn = PushButton(text="Remove last protein")
@@ -196,7 +214,8 @@ def launch(image_path: str | None = None) -> None:
         widgets=[
             open_image_btn, image_combo, remove_image_btn,
             conditions_in, card_table, edit_combo, protein_in, mw_in, role_in,
-            width_in, height_in, padding_w_in, padding_h_in, dark_on_light, manual_box,
+            width_in, height_in, padding_w_in, padding_h_in,
+            dark_on_light, manual_box, show_original,
             new_btn, confirm_btn, remove_protein_btn, clear_btn,
             control_in, error_in, plot_btn, save_chart_btn, export_csv_btn,
             readout, status_lbl, results_table,
@@ -212,15 +231,16 @@ def launch(image_path: str | None = None) -> None:
     def _pid_rects(pid: int) -> list[Rect]:
         return [pl["rect"] for pl in state["placed"] if pl["pid"] == pid]
 
-    def _active() -> dict:
-        return state["images"][state["active"]]
+    def _active() -> dict | None:
+        i = state["active"]
+        return state["images"][i] if i is not None else None
 
     def _img_of(pid: int) -> dict:
         return state["images"][state["proteins"][pid]["image"]]
 
     def _adims() -> tuple[int, int]:
         a = _active()
-        return a["iw"], a["ih"]
+        return (a["iw"], a["ih"]) if a else (0, 0)
 
     def _active_placed() -> list[dict]:
         """Boxes whose protein lives on the currently displayed image. Only these
@@ -250,17 +270,40 @@ def launch(image_path: str | None = None) -> None:
     def _sync_image_combo() -> None:
         state["syncing"] = True
         try:
-            choices = [f"{i}: {img['name']}" for i, img in enumerate(state["images"])]
-            image_combo.choices = choices
-            image_combo.value = choices[state["active"]]
+            if state["images"]:
+                choices = [f"{i}: {img['name']}" for i, img in enumerate(state["images"])]
+                image_combo.choices = choices
+                image_combo.value = choices[state["active"]]
+            else:
+                image_combo.choices = ["(no image)"]
+                image_combo.value = "(no image)"
         finally:
             state["syncing"] = False
 
-    def _set_active_image(idx: int) -> None:
+    def _set_active_image(idx: int | None) -> None:
+        if not state["images"] or idx is None:
+            state["active"] = None
+            state["syncing"] = True
+            try:
+                image_layer.data = np.zeros((1, 1), dtype=float)  # blank: no image
+                raw_layer.data = np.zeros((1, 1, 3), dtype=np.uint8)
+            finally:
+                state["syncing"] = False
+            _sync_image_combo()
+            _redraw()
+            return
         a = state["images"][idx]
         state["syncing"] = True
         try:
             image_layer.data = a["array"]
+            raw_layer.data = a["original"]
+            # Swapping .data keeps the previous contrast limits (the blank 1x1
+            # placeholder's near-[0,0]), which renders a real image almost all
+            # white; recompute them for the new image.
+            try:
+                image_layer.reset_contrast_limits()
+            except (AttributeError, ValueError, RuntimeError):
+                pass
             width_in.max, height_in.max = a["iw"], a["ih"]
             dark_on_light.value = a["dark"]  # polarity is per image
         finally:
@@ -331,6 +374,9 @@ def launch(image_path: str | None = None) -> None:
             state["syncing"] = False
 
     def _refresh_readout() -> None:
+        if not state["images"]:
+            readout.value = "No image. Press Import image… to start."
+            return
         p = _ep()
         img_d = _img_of(state["editing"]) if p is not None else _active()
         invert = img_d["dark"]
@@ -392,10 +438,11 @@ def launch(image_path: str | None = None) -> None:
         n = len(spine)
         a = _active()
         hint = "  (one condition per lane)" if max_boxes and n != max_boxes else ""
-        status_lbl.value = (
+        where = (
             f"image: {a['name']} ({state['active'] + 1}/{len(state['images'])})  |  "
-            f"lanes: {max_boxes}  |  conditions: {n}{hint}"
+            if a else "no image  |  "
         )
+        status_lbl.value = f"{where}lanes: {max_boxes}  |  conditions: {n}{hint}"
         if not spine:
             columns = [f"#{j + 1}" for j in range(max_boxes)]
             data = [[round(b[j][1]) if j < len(b) else "" for j in range(max_boxes)] for b in per]
@@ -456,7 +503,7 @@ def launch(image_path: str | None = None) -> None:
         show_info(f"Opened {name}. New proteins you add now bind to this image.")
 
     def on_image_combo_change(*_) -> None:
-        if state["syncing"]:
+        if state["syncing"] or not state["images"]:
             return
         idx = int(image_combo.value.split(":", 1)[0])
         # Switching away from the image the edited protein lives on stops editing,
@@ -468,8 +515,8 @@ def launch(image_path: str | None = None) -> None:
         _refresh_readout()
 
     def on_remove_image(*_) -> None:
-        if len(state["images"]) <= 1:
-            show_info("Cannot remove the only image.")
+        if state["active"] is None:
+            show_info("No image to remove.")
             return
         idx = state["active"]
         name = state["images"][idx]["name"]
@@ -500,12 +547,22 @@ def launch(image_path: str | None = None) -> None:
         show_info(f"Removed image {name}{extra}.")
 
     def on_dark_change(*_) -> None:
-        if state["syncing"]:
+        if state["syncing"] or _active() is None:
             return
         _active()["dark"] = bool(dark_on_light.value)  # polarity is per image
         _refresh_all()
 
+    def on_show_original(*_) -> None:
+        # Display-only: flip which membrane layer is visible. ROIs and all analysis
+        # stay on the grayscale array regardless.
+        show = bool(show_original.value)
+        raw_layer.visible = show
+        image_layer.visible = not show
+
     def _new_protein(*_) -> None:
+        if state["active"] is None:
+            show_info("Import an image first (Import image…).")
+            return
         pid = len(state["proteins"])
         state["proteins"].append({
             "name": "", "role": role_in.value, "mw": "", "color": PALETTE[pid % len(PALETTE)],
@@ -955,6 +1012,7 @@ def launch(image_path: str | None = None) -> None:
     mw_in.changed.connect(on_meta_change)
     role_in.changed.connect(on_meta_change)
     dark_on_light.changed.connect(on_dark_change)
+    show_original.changed.connect(on_show_original)
     open_image_btn.changed.connect(on_open_image)
     image_combo.changed.connect(on_image_combo_change)
     remove_image_btn.changed.connect(on_remove_image)
@@ -970,8 +1028,19 @@ def launch(image_path: str | None = None) -> None:
     export_csv_btn.changed.connect(on_export_csv)
     viewer.bind_key("Control-Z", _undo, overwrite=True)
 
+    # A path on the command line is imported as the first image; otherwise the app
+    # opens empty and the user imports.
+    if image_path:
+        state["images"].append(
+            _make_image(_load_image(image_path), image_path.split("/")[-1], image_path)
+        )
+        _set_active_image(0)
     _refresh_all()
-    show_info("Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm.")
+    show_info(
+        "Import an image to start (Import image…)."
+        if not state["images"]
+        else "Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm."
+    )
     napari.run()
 
 
