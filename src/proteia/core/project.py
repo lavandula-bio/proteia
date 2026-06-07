@@ -79,6 +79,25 @@ def build_spine(declaration: Sequence[tuple[str, int]]) -> list[Lane]:
     return lanes
 
 
+def spine_from_labels(labels: Sequence[str]) -> list[Lane]:
+    """Build a spine from a per-lane condition list (the "assign in order" form).
+
+    Where :func:`build_spine` takes ``(condition, count)`` and lays conditions out
+    in contiguous blocks, this takes the already-expanded per-lane labels (e.g.
+    ``["ctl", "A", "ctl"]``) and keeps their exact order, so non-contiguous
+    layouts survive. Each lane's auto sample id is its condition plus a running
+    ordinal *within that condition* (``ctl1`` ... ``ctl2`` even when interleaved),
+    i.e. biological replicates by default; technical repeats are marked later by
+    sharing a sample id.
+    """
+    counts: dict[str, int] = {}
+    lanes: list[Lane] = []
+    for position, label in enumerate(labels):
+        counts[label] = counts.get(label, 0) + 1
+        lanes.append(Lane(index=position, label=label, sample=f"{label}{counts[label]}"))
+    return lanes
+
+
 def propose_positions(boxes: Sequence[tuple[int, float]]) -> list[tuple[int, float]]:
     """Propose a lane position for each box by left-to-right x order.
 

@@ -11,6 +11,7 @@ from proteia.core.project import (
     lane_nets,
     propose_positions,
     spine_axes,
+    spine_from_labels,
 )
 
 
@@ -102,6 +103,23 @@ def test_build_spine_rejects_duplicate_labels():
 def test_build_spine_rejects_nonpositive_count():
     with pytest.raises(ValueError, match=">= 1"):
         build_spine([("A", 0)])
+
+
+# --- spine_from_labels: per-lane list preserves order, auto-numbers samples ---
+
+
+def test_spine_from_labels_keeps_order_and_numbers_per_condition():
+    spine = spine_from_labels(["ctl", "A", "ctl", "A"])  # interleaved
+    assert [(lane.index, lane.label, lane.sample) for lane in spine] == [
+        (0, "ctl", "ctl1"),
+        (1, "A", "A1"),
+        (2, "ctl", "ctl2"),  # running count is per condition, not per position
+        (3, "A", "A2"),
+    ]
+
+
+def test_spine_from_labels_empty():
+    assert spine_from_labels([]) == []
 
 
 # --- propose_positions: x-order demoted to an editable proposal ---
