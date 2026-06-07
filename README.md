@@ -1,49 +1,41 @@
 # Proteia
 
-> Western blot analysis from raw scan to publication-ready insight, with PhD-grade reasoning at every step.
+> Interactive Western blot quantification that is fast to use, reproducible, and entirely local — from raw scan to a publication-style chart.
 
-**Status**: Pre-alpha (Phase 0)
+**Status**: Phase 1 — Western quantification MVP, in active development (pre-alpha)
 
 Part of the [Lavandula](https://github.com/lavandula-bio) open-source ecosystem for biomedical research.
 
 ---
 
-## What is this?
+## What it does today
 
-Proteia takes Western blot data through a complete reasoning workflow:
+Proteia turns a Western blot scan into quantified, replicate-aware results without leaving the app:
 
-1. **Input** — Raw blot scan plus experimental metadata
-2. **QC** — Domain-encoded rules check saturation, lane alignment, and loading control consistency
-3. **Quantification** — Reproducible band detection and normalization
-4. **Reasoning** — Cross-reference with protein interaction networks and relevant literature
-5. **Output** — Publication-ready figure, statistics, method paragraph, and reviewer-grade interpretation, with a full audit trail
+1. **Place ROIs fast** — click a band and a region-grow step auto-fits an equal-area box; all boxes share one size, with a matched background box for subtraction.
+2. **Define the experiment** — a lane spine / data card holds each lane's condition, biological sample, and include flag. Lanes sharing a sample are treated as technical repeats.
+3. **Quantify** — background-subtracted net signal per band, normalized to a loading control, expressed as fold-change versus a chosen reference condition.
+4. **Analyze correctly** — technical repeats are averaged before statistics (so they do not inflate *n*), then Welch's *t*-test (2 groups) or one-way ANOVA + Tukey HSD (3+).
+5. **Output** — a bar chart with individual points and significance brackets, plus CSV export of the per-lane table and chart export (PNG/PDF/SVG).
 
-## Why this exists
+Everything runs on your machine. **No telemetry. Your data stays local.**
 
-Modern biomedical research generates raw data that is hours away from publishable insight. The ImageJ → Excel → Prism → Word workflow is fragmented, hard to reproduce, and easy to get wrong. Existing AI tools either reproduce errors confidently or generate plausible-sounding but unfounded interpretations.
+## Why it exists
 
-Proteia encodes domain expertise into a deterministic and AI-augmented reasoning pipeline that:
+The ImageJ → Excel → Prism → Word path is fragmented, hard to reproduce, and easy to get wrong — and a common, quiet mistake is counting technical repeats as independent replicates. Proteia keeps quantification, normalization, and replicate-aware statistics in one reproducible flow, and is built so the analysis core stays independent of the UI.
 
-- Catches QC errors a PhD reviewer would catch
-- Generates interpretation grounded in real literature and curated knowledge databases (UniProt, Reactome, PubMed)
-- Maintains a full reproducibility audit trail
+## Roadmap
 
-## Status
+Planned, **not yet built** — listed as direction, not current capability:
 
-**Phase 0 — Validation** (Q2-Q3 2026)
-
-- Reasoning template design
-- Baseline evaluation across LLM-only, deterministic-only, and hybrid approaches
-- Architecture design for the core pipeline
-
-**Phase 1 — Western pipeline MVP** starts Q4 2026.
+- **QC gates** — saturation / over-exposure detection, loading-control checks.
+- **Explicit lane numbering** — click a band to set its lane, removing position-based guessing.
+- **Tamper-evident reproducibility bundle** — input hash, parameters, and an auditable trail for each result.
+- **Reasoning layer (experimental, optional, BYOK)** — entity extraction → curated knowledge (UniProt, Reactome, PubMed) → targeted literature → reviewer-style interpretation. This is a research direction to be validated *after* the core tool ships; it is off by default and never required to use Proteia.
 
 ## Get involved
 
-Alpha tester recruitment opens at the start of Phase 1. We are particularly interested in:
-
-- Researchers running regular Western blot in molecular biology, neuroscience, or related fields
-- PhD students, postdocs, and analysts who feel the raw-data-to-paper friction
+Alpha testing is not open yet. If you run Western blots regularly (molecular biology, neuroscience, or related) and would like to hear when a testable build is ready, get in touch.
 
 Contact: **hello@lavandula.bio**
 
