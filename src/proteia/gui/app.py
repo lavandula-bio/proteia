@@ -140,7 +140,9 @@ def launch(image_path: str | None = None) -> None:
     remove_protein_btn = PushButton(text="Remove last protein")
     clear_btn = PushButton(text="Clear this protein's boxes")
     control_in = LineEdit(value="", label="control cond.")
-    error_in = ComboBox(choices=["SD", "SEM"], value="SD", label="error bar")
+    error_in = ComboBox(
+        choices=[e.value for e in ErrorType], value=ErrorType.SD.value, label="error bar"
+    )
     plot_btn = PushButton(text="Plot")
     panel = Container(
         widgets=[
@@ -520,15 +522,24 @@ def launch(image_path: str | None = None) -> None:
             show_info("Export only — " + "; ".join(comp.warnings))
             return
 
-        target, loading = batch.targets()[0], batch.loading_control()
+        targets = batch.targets()
+        if len(targets) > 1:
+            ignored = ", ".join(t.name for t in targets[1:])
+            show_info(f"Multiple targets; plotting {targets[0].name}, ignoring: {ignored}")
+        target, loading = targets[0], batch.loading_control()
         norm = normalize_lane(target.nets, loading.nets)
         provenance: dict[str, list[int]] = {}
         for i, cond in enumerate(lanes):
             provenance.setdefault(cond, []).append(i)
-        error_type = ErrorType.SEM if error_in.value == "SEM" else ErrorType.SD
+        error_type = ErrorType(error_in.value)
 
         if control:
-            values, kind = fold_change_lane(norm, lanes, control), ValueKind.FOLD_CHANGE
+            try:
+                values = fold_change_lane(norm, lanes, control)
+            except ValueError as exc:
+                show_info(f"Cannot plot fold-change: {exc}")
+                return
+            kind = ValueKind.FOLD_CHANGE
             title = f"{target.name} fold-change vs {control}"
         else:
             values, kind = norm, ValueKind.LOADING_NORMALIZED
@@ -538,16 +549,18 @@ def launch(image_path: str | None = None) -> None:
         # supplies sample ids; the pipeline is already correct for that.
         reduction = reduce_samples(values, lanes)
         groups = reduction.groups
-        # Convention: the control condition sits leftmost. Free reordering is a
-        # later (2b) feature; this is a sensible default when a control is set.
-        if control and control in groups:
-            groups = {control: groups[control], **{k: v for k, v in groups.items() if k != control}}
+        # Control condition sits leftmost (convention); free reordering is a 2b feature.
         spec = build_plotspec(
             groups, describe(groups), compare(groups),
-            value_kind=kind, error_type=error_type, title=title, lane_indices=provenance,
+            value_kind=kind, error_type=error_type, title=title,
+            lane_indices=provenance, first_label=control,
         )
         _show_figure(spec)
         notes = comp.warnings + reduction.warnings
+        # Honesty: with no sample ids every lane counts as an independent
+        # biological replicate; technical-repeat averaging arrives in 2b.
+        if any(len(v) > 1 for v in groups.values()):
+            notes.append("repeats counted as biological samples (no technical-repeat grouping yet)")
         if notes:
             show_info("; ".join(notes))
 

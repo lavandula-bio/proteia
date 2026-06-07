@@ -92,12 +92,14 @@ def build_plotspec(
     error_type: ErrorType = ErrorType.SD,
     title: str = "",
     lane_indices: dict[str, list[int]] | None = None,
+    first_label: str | None = None,
 ) -> PlotSpec:
     """Assemble a :class:`PlotSpec` from grouped values and computed statistics.
 
     ``error_type`` selects which precomputed error to surface — never hardcoded.
     ``lane_indices`` optionally carries provenance (condition -> source lanes).
-    Only significant pairwise comparisons (p < 0.05) become brackets.
+    ``first_label`` (e.g. the control condition) is moved leftmost, the rest keep
+    their order. Only significant pairwise comparisons (p < 0.05) become brackets.
     """
     bars: list[Bar] = []
     for gs in stats:
@@ -112,6 +114,9 @@ def build_plotspec(
                 lane_indices=(lane_indices or {}).get(gs.label, []),
             )
         )
+
+    if first_label is not None:
+        bars.sort(key=lambda b: b.label != first_label)  # stable: first_label to front
 
     comparisons = [
         Significance(group_a=pw.group_a, group_b=pw.group_b, p_value=pw.p_value)

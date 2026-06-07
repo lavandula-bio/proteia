@@ -60,3 +60,23 @@ def test_save_figure_writes_file(tmp_path):
     out = tmp_path / "chart.png"
     save_figure(_spec(), str(out))
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_first_label_moves_to_front():
+    groups = {"A": [1.0, 1.1], "ctl": [1.0, 0.9], "B": [2.0, 2.1]}
+    spec = build_plotspec(
+        groups, describe(groups), compare(groups),
+        value_kind=ValueKind.FOLD_CHANGE, first_label="ctl",
+    )
+    assert [b.label for b in spec.bars] == ["ctl", "A", "B"]  # control leftmost, rest in order
+
+
+def test_render_handles_empty_group_without_crashing():
+    # A condition with no values (all-None lanes) yields a zero-point bar; the
+    # renderer must not raise on it (regression for the strict-zip crash).
+    groups = {"a": [1.0, 2.0], "empty": []}
+    spec = build_plotspec(
+        groups, describe(groups), compare(groups), value_kind=ValueKind.LOADING_NORMALIZED
+    )
+    fig = render_figure(spec)
+    assert len(fig.axes) == 1

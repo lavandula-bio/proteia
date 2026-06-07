@@ -19,7 +19,9 @@ _POINT = "#0f172a"
 
 def _point_xs(center: float, n: int, spread: float = 0.18) -> list[float]:
     """Deterministic horizontal spread for individual points (no RNG)."""
-    if n <= 1:
+    if n == 0:
+        return []
+    if n == 1:
         return [center]
     step = (2 * spread) / (n - 1)
     return [center - spread + i * step for i in range(n)]
@@ -71,7 +73,7 @@ def _draw_significance(ax, spec: PlotSpec) -> None:
             continue
         x1, x2 = sorted((label_to_x[comp.group_a], label_to_x[comp.group_b]))
         y = ceiling + gap * level
-        ax.plot([x1, x1, x2, x2], [y - gap * 0.3, y, y, y - gap * 0.3], color="#334155", lw=1.0)
+        ax.plot([x1, x1, x2, x2], [y - gap * 0.3, y, y, y - gap * 0.3], color=_BAR_EDGE, lw=1.0)
         ax.text((x1 + x2) / 2, y, comp.stars, ha="center", va="bottom", fontsize=10)
         level += 1
     ax.set_ylim(top=ceiling + gap * (level + 0.5))
