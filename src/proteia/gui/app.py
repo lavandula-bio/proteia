@@ -39,8 +39,7 @@ from proteia.core.grow import grow_box
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
 from proteia.core.project import (
-    join_to_spine,
-    propose_positions,
+    align_to_lanes,
     spine_axes,
     spine_from_labels,
 )
@@ -123,7 +122,7 @@ def launch(image_path: str | None = None) -> None:
     # {name, role, mw, color, base, pad_w, pad_h, confirmed}. editing: pid or None.
     state: dict = {
         "placed": [], "proteins": [], "lanes": [], "spine": [], "editing": None,
-        "syncing": False, "plot_dock": None,
+        "syncing": False, "plot_dock": None, "last_spec": None,
     }
 
     # --- widgets ---
@@ -157,12 +156,14 @@ def launch(image_path: str | None = None) -> None:
         choices=[e.value for e in ErrorType], value=ErrorType.SD.value, label="error bar"
     )
     plot_btn = PushButton(text="Plot")
+    save_chart_btn = PushButton(text="Save chart…")
+    export_csv_btn = PushButton(text="Export table (CSV)…")
     panel = Container(
         widgets=[
             conditions_in, card_table, edit_combo, protein_in, mw_in, role_in,
             width_in, height_in, padding_w_in, padding_h_in, dark_on_light,
             new_btn, confirm_btn, remove_protein_btn, clear_btn,
-            control_in, error_in, plot_btn,
+            control_in, error_in, plot_btn, save_chart_btn, export_csv_btn,
             readout, status_lbl, results_table,
         ],
         labels=True,
@@ -281,7 +282,7 @@ def launch(image_path: str | None = None) -> None:
 
     def _refresh_table() -> None:
         proteins, spine = state["proteins"], state["spine"]
-        per = [propose_positions(_protein_boxes(pid)) for pid in range(len(proteins))]
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
         max_boxes = max((len(b) for b in per), default=0)
         n = len(spine)
         hint = "  (one condition per lane)" if max_boxes and n != max_boxes else ""
@@ -289,7 +290,7 @@ def launch(image_path: str | None = None) -> None:
         if spine:
             conditions, _samples, _included = spine_axes(spine)
             columns = list(conditions)
-            aligned = join_to_spine(per, n)
+            aligned = align_to_lanes(per, n)
             data = [[round(v) if v is not None else "" for v in row] for row in aligned]
         else:
             columns = [f"#{j + 1}" for j in range(max_boxes)]
@@ -566,13 +567,27 @@ def launch(image_path: str | None = None) -> None:
         _sync_spine_from_card()  # honour the latest card edits even without a change event
         n = len(spine)
         conditions, samples, included = spine_axes(spine)
-        # Each protein's nets joined to the spine by its boxes' proposed positions
-        # (sorted left-to-right). A missing box leaves an empty slot, not a shift.
-        per = [propose_positions(_protein_boxes(pid)) for pid in range(len(proteins))]
-        aligned = join_to_spine(per, n)
-        # Per-box lane numbers are still proposed from x order, so a missing box can
-        # still mis-propose. Warn on count mismatch until boxes carry explicit,
-        # user-editable lane numbers (2b per-box numbering).
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
+        # Drawing more bands than declared conditions is ambiguous (which band is
+        # the orphan?), so we refuse rather than silently collide two into one slot.
+        overfilled = [
+            f"{p['name'] or '(unnamed)'} ({len(b)} boxes)"
+            for p, b in zip(proteins, per, strict=True)
+            if len(b) > n
+        ]
+        if overfilled:
+            show_info(
+                f"More boxes than the {n} declared conditions: {', '.join(overfilled)}. "
+                "Add the missing condition(s) so every band has a lane."
+            )
+            return
+        # A band's lane is proposed from its x position, anchored across *all*
+        # proteins: a fully-drawn loading control fixes the grid so a missing
+        # target band lands in its real empty slot. Per-box explicit lane numbers
+        # (next UI step) will remove the guess entirely.
+        aligned = align_to_lanes(per, n)
+        # Fewer boxes than lanes is fine (a gap) but warn — anchoring can still
+        # misplace if the protein anchoring the grid is itself short.
         mismatched = [
             f"{p['name'] or '(unnamed)'} ({len(b)})"
             for p, b in zip(proteins, per, strict=True)
@@ -631,6 +646,7 @@ def launch(image_path: str | None = None) -> None:
             value_kind=kind, error_type=error_type, title=title,
             lane_indices=provenance, first_label=control,
         )
+        state["last_spec"] = spec  # remember for "Save chart"
         _show_figure(spec)
         notes = comp.warnings + reduction.warnings
         if mismatched:
@@ -640,6 +656,60 @@ def launch(image_path: str | None = None) -> None:
             )
         if notes:
             show_info("; ".join(notes))
+
+    def _save_path(caption: str, file_filter: str) -> str | None:
+        from qtpy.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getSaveFileName(panel.native, caption, "", file_filter)
+        return path or None
+
+    def on_save_chart(*_) -> None:
+        spec = state["last_spec"]
+        if spec is None:
+            show_info("Plot a chart first, then save it.")
+            return
+        path = _save_path("Save chart", "Image (*.png *.pdf *.svg)")
+        if not path:
+            return
+        from proteia.viz import save_figure
+
+        save_figure(spec, path)
+        show_info(f"Saved chart to {path}")
+
+    def on_export_csv(*_) -> None:
+        """Export the raw per-lane table: lane identity + each protein's net.
+
+        This is the first ("raw") staged output — one row per lane, columns for
+        condition / sample / include and every protein's net signal aligned to the
+        spine. Empty cells are gaps (no box for that protein on that lane).
+        """
+        proteins, spine = state["proteins"], state["spine"]
+        if not spine:
+            show_info("Set conditions first.")
+            return
+        _sync_spine_from_card()
+        n = len(spine)
+        per = [_protein_boxes(pid) for pid in range(len(proteins))]
+        if any(len(b) > n for b in per):
+            show_info("More boxes than conditions; fix the data card before exporting.")
+            return
+        aligned = align_to_lanes(per, n)
+        conditions, samples, included = spine_axes(spine)
+        path = _save_path("Export table", "CSV (*.csv)")
+        if not path:
+            return
+        import csv
+
+        names = [p["name"] or f"protein{i}" for i, p in enumerate(proteins)]
+        with open(path, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["lane", "condition", "sample", "include", *names])
+            for i in range(n):
+                row = [i, conditions[i], samples[i] or "", "yes" if included[i] else "no"]
+                row += ["" if aligned[pid][i] is None else round(aligned[pid][i], 3)
+                        for pid in range(len(proteins))]
+                writer.writerow(row)
+        show_info(f"Exported {n} lanes x {len(proteins)} proteins to {path}")
 
     shapes.events.data.connect(on_edit)
     viewer.mouse_drag_callbacks.append(on_mouse)
@@ -659,6 +729,8 @@ def launch(image_path: str | None = None) -> None:
     remove_protein_btn.changed.connect(_remove_last_protein)
     clear_btn.changed.connect(_clear_boxes)
     plot_btn.changed.connect(on_plot)
+    save_chart_btn.changed.connect(on_save_chart)
+    export_csv_btn.changed.connect(on_export_csv)
     viewer.bind_key("Control-Z", _undo, overwrite=True)
 
     _refresh_all()
