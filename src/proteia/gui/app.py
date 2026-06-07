@@ -31,7 +31,7 @@ from proteia.core.analyze import (
     compare,
     describe,
     fold_change_lane,
-    normalize_lane,
+    normalize_batch,
     reduce_samples,
 )
 from proteia.core.boxes import normalize_corners, resize_all
@@ -144,6 +144,7 @@ def launch(image_path: str | None = None) -> None:
         Label,
         LineEdit,
         PushButton,
+        Select,
         SpinBox,
         Table,
     )
@@ -190,6 +191,9 @@ def launch(image_path: str | None = None) -> None:
     protein_in = LineEdit(value="", label="protein")
     mw_in = LineEdit(value="", label="MW (kDa)")
     role_in = ComboBox(choices=["target", "loading control"], value="target", label="role")
+    # For a target: which loading control(s) to normalize against (only needed when
+    # the batch has 2+ loading controls; one auto-resolves). Multi-select.
+    target_loadings = Select(choices=[], label="loading ctrl")
     width_in = SpinBox(value=64, min=2, max=10000, label="box W")  # max retuned per image
     height_in = SpinBox(value=20, min=2, max=10000, label="box H")
     padding_w_in = SpinBox(value=0, min=-1000, max=1000, step=1, label="pad W")
@@ -207,6 +211,9 @@ def launch(image_path: str | None = None) -> None:
     error_in = ComboBox(
         choices=[e.value for e in ErrorType], value=ErrorType.SD.value, label="error bar"
     )
+    # Which conditions to show in the chart (empty = all). Analysis is exhaustive;
+    # this only selects what gets plotted.
+    plot_conditions = Select(choices=[], label="plot conditions")
     plot_btn = PushButton(text="Plot")
     save_chart_btn = PushButton(text="Save chart…")
     export_csv_btn = PushButton(text="Export table (CSV)…")
@@ -214,15 +221,25 @@ def launch(image_path: str | None = None) -> None:
         widgets=[
             open_image_btn, image_combo, remove_image_btn,
             conditions_in, card_table, edit_combo, protein_in, mw_in, role_in,
+            target_loadings,
             width_in, height_in, padding_w_in, padding_h_in,
             dark_on_light, manual_box, show_original,
             new_btn, confirm_btn, remove_protein_btn, clear_btn,
-            control_in, error_in, plot_btn, save_chart_btn, export_csv_btn,
+            control_in, error_in, plot_conditions, plot_btn, save_chart_btn, export_csv_btn,
             readout, status_lbl, results_table,
         ],
         labels=True,
     )
-    viewer.window.add_dock_widget(panel, area="right", name="Quantify")
+    # The panel is tall; wrap it in a scroll area so widgets never overflow the
+    # dock, and cap the multi-select lists so they don't dominate the height.
+    from qtpy.QtWidgets import QScrollArea
+
+    target_loadings.native.setMaximumHeight(80)
+    plot_conditions.native.setMaximumHeight(80)
+    _scroll = QScrollArea()
+    _scroll.setWidgetResizable(True)
+    _scroll.setWidget(panel.native)
+    viewer.window.add_dock_widget(_scroll, area="right", name="Quantify")
 
     # --- helpers ---
     def _ep() -> dict | None:
@@ -346,6 +363,17 @@ def launch(image_path: str | None = None) -> None:
                 rows[pid] = aligned[k]
         return rows
 
+    def _sync_loading_picker(p: dict) -> None:
+        # Choices = other proteins marked loading control. Shown only for a target
+        # with 2+ controls to choose between (one auto-resolves). Caller guards sync.
+        lc_names = [
+            q["name"] for q in state["proteins"]
+            if q["role"] == "loading control" and q["name"] and q is not p
+        ]
+        target_loadings.choices = lc_names
+        target_loadings.value = [nm for nm in p.get("loadings", ()) if nm in lc_names]
+        target_loadings.visible = p["role"] == "target" and len(lc_names) >= 2
+
     def _load_controls(p: dict) -> None:
         state["syncing"] = True
         try:
@@ -358,6 +386,7 @@ def launch(image_path: str | None = None) -> None:
                 lo, hi, step = _pad_limits(dim)
                 spin.min, spin.max, spin.step = lo, hi, step
                 spin.value = min(max(int(val), lo), hi)
+            _sync_loading_picker(p)
         finally:
             state["syncing"] = False
 
@@ -412,6 +441,18 @@ def launch(image_path: str | None = None) -> None:
         """
         state["spine"] = spine_from_labels(state["lanes"])
         _refresh_card()
+        _sync_plot_conditions()
+
+    def _sync_plot_conditions() -> None:
+        # Distinct conditions (in lane order) as the "plot conditions" choices;
+        # keep any still-valid current selection. Empty selection = plot all.
+        distinct: list[str] = []
+        for lane in state["spine"]:
+            if lane.label not in distinct:
+                distinct.append(lane.label)
+        keep = [c for c in plot_conditions.value if c in distinct]
+        plot_conditions.choices = distinct
+        plot_conditions.value = keep
 
     def _refresh_card() -> None:
         spine = state["spine"]
@@ -485,6 +526,8 @@ def launch(image_path: str | None = None) -> None:
             if state["active"] != p["image"]:
                 _set_active_image(p["image"])  # show the image this protein lives on
             _load_controls(p)
+        else:
+            target_loadings.visible = False  # nothing to pick when idle
         _sync_combo()
         _refresh_readout()
 
@@ -568,6 +611,7 @@ def launch(image_path: str | None = None) -> None:
             "name": "", "role": role_in.value, "mw": "", "color": PALETTE[pid % len(PALETTE)],
             "base": _initial_size(_active()["array"]), "pad_w": 0, "pad_h": 0,
             "confirmed": False, "image": state["active"],  # bind to the displayed image
+            "loadings": (),  # target -> chosen loading control name(s); empty = default
         })
         state["syncing"] = True
         try:
@@ -771,6 +815,17 @@ def launch(image_path: str | None = None) -> None:
         p = state["proteins"][state["editing"]]
         p["name"], p["mw"], p["role"] = protein_in.value.strip(), mw_in.value.strip(), role_in.value
         _sync_combo()
+        state["syncing"] = True
+        try:
+            _sync_loading_picker(p)  # role/name change can change available controls
+        finally:
+            state["syncing"] = False
+        _refresh_table()
+
+    def on_target_loadings_change(*_) -> None:
+        if state["syncing"] or state["editing"] is None:
+            return
+        state["proteins"][state["editing"]]["loadings"] = tuple(target_loadings.value)
         _refresh_table()
 
     def on_combo_change(*_) -> None:
@@ -807,6 +862,7 @@ def launch(image_path: str | None = None) -> None:
         if state["syncing"]:
             return
         _sync_spine_from_card()
+        _sync_plot_conditions()  # card edits can rename conditions
         _refresh_table()
 
     def _show_figures(named_specs: list[tuple[str, object]]) -> None:
@@ -871,6 +927,7 @@ def launch(image_path: str | None = None) -> None:
                 p["name"] or "(unnamed)",
                 Role.LOADING_CONTROL if p["role"] == "loading control" else Role.TARGET,
                 nets,
+                loadings=tuple(p.get("loadings", ())),  # target -> chosen loading control(s)
             )
             for p, nets in zip(proteins, aligned, strict=True)
         ]
@@ -885,46 +942,51 @@ def launch(image_path: str | None = None) -> None:
             show_info("Export only — " + "; ".join(comp.warnings))
             return
 
-        loading = batch.loading_control()
-        # Provenance: condition -> its included source lanes (for later cropping/audit).
-        provenance: dict[str, list[int]] = {}
-        for i, cond in enumerate(conditions):
-            if included[i]:
-                provenance.setdefault(cond, []).append(i)
         error_type = ErrorType(error_in.value)
-
-        # One figure per target, all normalized to the batch's single loading control.
+        chosen = set(plot_conditions.value)  # empty = plot all conditions
+        # Exhaustive analysis: one series per (target x its loading control); we then
+        # plot each, restricted to the chosen conditions.
+        series, norm_warnings = normalize_batch(batch)
         named_specs: list[tuple[str, object]] = []
-        notes = list(comp.warnings)
-        for target in batch.targets():
-            norm = normalize_lane(target.nets, loading.nets)
+        notes = list(comp.warnings) + list(norm_warnings)
+        for s in series:
+            values = s.values
             if control:
                 try:
-                    values = fold_change_lane(norm, conditions, control)
+                    values = fold_change_lane(values, conditions, control)
                 except ValueError as exc:
-                    notes.append(f"{target.name}: {exc}")
+                    notes.append(f"{s.target}/{s.loading}: {exc}")
                     continue
                 kind = ValueKind.FOLD_CHANGE
-                title = f"{target.name} fold-change vs {control}"
+                title = f"{s.target} fold-change vs {control}  (/{s.loading})"
             else:
-                values, kind = norm, ValueKind.LOADING_NORMALIZED
-                title = f"{target.name} / {loading.name}"
-            # Sample-aware: lanes sharing (condition, sample) are averaged before
-            # stats (technical repeats don't inflate n); include=no lanes dropped.
-            reduction = reduce_samples(values, conditions, samples, included=included)
+                kind = ValueKind.LOADING_NORMALIZED
+                title = f"{s.target} / {s.loading}"
+            # A lane counts if it is included in the spine AND in the chosen
+            # conditions. Sample-aware reduction then averages technical repeats.
+            eff_included = [
+                inc and (not chosen or cond in chosen)
+                for inc, cond in zip(included, conditions, strict=True)
+            ]
+            provenance: dict[str, list[int]] = {}
+            for i, cond in enumerate(conditions):
+                if eff_included[i]:
+                    provenance.setdefault(cond, []).append(i)
+            reduction = reduce_samples(values, conditions, samples, included=eff_included)
             groups = reduction.groups
-            # Reference condition sits leftmost (it is the fold-change denominator).
             spec = build_plotspec(
                 groups, describe(groups), compare(groups),
                 value_kind=kind, error_type=error_type, title=title,
                 lane_indices=provenance, first_label=control,
             )
-            named_specs.append((target.name, spec))
+            named_specs.append((f"{s.target} / {s.loading}", spec))
             for w in reduction.warnings:
                 if w not in notes:
                     notes.append(w)
         if not named_specs:
-            show_info("Nothing to plot: " + ("; ".join(notes) or "no usable target"))
+            show_info(
+                "Nothing to plot: " + ("; ".join(notes) or "no usable (target, loading) pair")
+            )
             return
         state["last_specs"] = named_specs  # remember for "Save chart"
         _show_figures(named_specs)
@@ -1011,6 +1073,7 @@ def launch(image_path: str | None = None) -> None:
     protein_in.changed.connect(on_meta_change)
     mw_in.changed.connect(on_meta_change)
     role_in.changed.connect(on_meta_change)
+    target_loadings.changed.connect(on_target_loadings_change)
     dark_on_light.changed.connect(on_dark_change)
     show_original.changed.connect(on_show_original)
     open_image_btn.changed.connect(on_open_image)
