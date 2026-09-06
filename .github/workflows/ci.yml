@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Install locked environment
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest -q
+
+  # Single summary job so branch protection can require one check name ("ci")
+  # regardless of how the matrix above changes.
+  ci:
+    name: ci
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any test job did not succeed
+        run: |
+          echo "test result: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = "success"
