@@ -42,9 +42,9 @@ jobs:
   # regardless of how the matrix above changes.
   ci:
     needs: test
-    # Run on success and failure, but not when the run was cancelled (a
-    # superseded push), so a cancelled run shows as cancelled, not as a failure.
-    if: ${{ !cancelled() }}
+    # always(): a required check that is skipped counts as passing for branch
+    # protection, so this job must run (and fail) even when test was cancelled.
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
