@@ -45,11 +45,19 @@ the analysis code.
 
 ## Workflow
 
-- Branch from `develop`: `feature/<short-description>` (kebab-case).
+Proteia uses trunk-based development: `main` is the only long-lived branch and
+every change reaches it through a short-lived branch and a pull request.
+
+- Start from an issue. Open one (or pick an existing one) before you branch, so
+  the work has a number to reference.
+- Branch from `main`: `<type>/<issue>-<short-description>` in kebab-case, where
+  `<type>` is the Conventional Commits type of the work (`feat`, `fix`, `docs`,
+  `chore`, `refactor`, `test`). Example: `feat/42-csv-export`.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) in English.
   Keep commits atomic.
-- Open a pull request against `develop`. `main` and `develop` are protected and
-  do not accept direct pushes.
+- Open a pull request against `main` and reference the issue in the description
+  (`Closes #42`). `main` is protected and does not accept direct pushes.
+- Delete the branch after the pull request is merged.
 - Releases are tagged on `main` using SemVer.
 
 ## License
