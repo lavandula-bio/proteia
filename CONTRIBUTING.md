@@ -58,19 +58,25 @@ every change reaches it through a short-lived branch and a pull request.
   `chore`, `refactor`, `test`). Example: `feat/42-csv-export`. The type
   follows the work, not the label: a `feature` issue becomes a `feat/` branch,
   a `bug` issue becomes a `fix/` branch.
-- One logical change per pull request; it becomes exactly one commit on
-  `main`. Use [Conventional Commits](https://www.conventionalcommits.org/) in
-  English on the branch and keep those commits atomic.
-- Open a pull request against `main` (it is protected; no direct pushes), fill
-  in every section of the pull request template, and reference the issue with
-  `Closes #42`. Pull requests are squash-merged with the PR title as the commit
-  subject and the PR body as the commit body, so the title must be a valid
-  Conventional Commits subject (`feat(export): add per-lane CSV export`) and
-  the body is what future readers of `git log` will see.
-- A pull request is merged only when the `ci` check is green and it has had
-  one review by someone other than its author. Review can be a person or an
-  automated review pass; either way its findings are resolved before merge.
-- The branch is deleted automatically when the pull request is merged.
+- One logical change per pull request. Write branch commits, the pull request
+  title, and the pull request body in English, using
+  [Conventional Commits](https://www.conventionalcommits.org/) for commit
+  messages; keep branch commits atomic.
+- Open a pull request against `main` (it is protected; no direct pushes) and
+  fill in every section of the pull request template. Reference the issue
+  with `Closes #42`, or `Refs #42` when the issue stays open for further
+  pull requests.
+- Pull requests are squash-merged into one commit on `main`: the PR title
+  (plus GitHub's ` (#N)` suffix) becomes the commit subject, so it must be a
+  valid Conventional Commits subject such as
+  `feat(export): add per-lane CSV export`; the PR body becomes the commit
+  body, so write it for `git log`: prose and short lines, since GitHub
+  reflows it at 72 columns, and delete the template's comment prompts.
+- The maintainer merges only after the `ci` check is green and an
+  independent review (a person, or an automated review pass run by the
+  maintainer) whose findings have been resolved.
+- Branches in this repository are deleted automatically on merge; delete
+  branches in your own fork yourself.
 - Releases are tagged on `main` using SemVer.
 
 ## License
