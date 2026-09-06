@@ -4,14 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pushes on a pull request cancel the older run; pushes to main
+  # always finish so every main commit keeps a completed test record.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -35,8 +39,11 @@ jobs:
   # regardless of how the matrix above changes.
   ci:
     needs: test
-    if: always()
+    # Run on success and failure, but not when the run was cancelled (a
+    # superseded push), so a cancelled run shows as cancelled, not as a failure.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - if: needs.test.result != 'success'
         run: |
