@@ -55,16 +55,28 @@ every change reaches it through a short-lived branch and a pull request.
   release.
 - Branch from `main`: `<type>/<issue>-<short-description>` in kebab-case, where
   `<type>` is the Conventional Commits type of the work (`feat`, `fix`, `docs`,
-  `chore`, `refactor`, `test`). Example: `feat/42-csv-export`.
-- Use [Conventional Commits](https://www.conventionalcommits.org/) in English.
-  Keep commits atomic.
-- Open a pull request against `main` (it is protected; no direct pushes), fill
-  in every section of the pull request template, and reference the issue with
-  `Closes #42`. Pull requests are squash-merged, so the PR title must itself be
-  a valid Conventional Commits subject, e.g. `feat(export): add per-lane CSV export`.
-- Every pull request is reviewed by someone other than its author before it is
-  merged.
-- Delete the branch after the pull request is merged.
+  `chore`, `refactor`, `test`). Example: `feat/42-csv-export`. The type
+  follows the work, not the label: a `feature` issue becomes a `feat/` branch,
+  a `bug` issue becomes a `fix/` branch.
+- One logical change per pull request. Write branch commits, the pull request
+  title, and the pull request body in English, using
+  [Conventional Commits](https://www.conventionalcommits.org/) for commit
+  messages; keep branch commits atomic.
+- Open a pull request against `main` (it is protected; no direct pushes) and
+  fill in every section of the pull request template. Reference the issue
+  with `Closes #42`, or `Refs #42` when the issue stays open for further
+  pull requests.
+- Pull requests are squash-merged into one commit on `main`: the PR title
+  (plus GitHub's ` (#N)` suffix) becomes the commit subject, so it must be a
+  valid Conventional Commits subject such as
+  `feat(export): add per-lane CSV export`; the PR body becomes the commit
+  body, so write it for `git log`: prose and short lines, since GitHub
+  reflows it at 72 columns, and delete the template's comment prompts.
+- The maintainer merges only after the `ci` check is green and an
+  independent review (a person, or an automated review pass run by the
+  maintainer) whose findings have been resolved.
+- Branches in this repository are deleted automatically on merge; delete
+  branches in your own fork yourself.
 - Releases are tagged on `main` using SemVer.
 
 ## License
