@@ -56,8 +56,18 @@ every change reaches it through a short-lived branch and a pull request.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) in English.
   Keep commits atomic.
 - Open a pull request against `main` and reference the issue in the description
-  (`Closes #42`). `main` is protected and does not accept direct pushes.
+  (`Closes #42`). `main` is protected and does not accept direct pushes. The
+  pull request template asks for Why / What changed / Verification / Related
+  issues; fill in all four.
+- Pull requests are squash-merged, so the PR title becomes the commit subject on
+  `main` and must itself be a valid Conventional Commits subject
+  (`feat(export): add per-lane CSV export`).
+- Every pull request gets one independent review before merge. The reviewer is
+  not the author of the change; for a solo maintainer that means an automated
+  review pass whose findings are read and resolved before merging.
 - Delete the branch after the pull request is merged.
+- Work is tracked with issues (use the task or bug report template), the
+  existing labels (type plus `priority:*`), and one milestone per release.
 - Releases are tagged on `main` using SemVer.
 
 ## License
