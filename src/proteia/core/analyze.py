@@ -303,8 +303,7 @@ def reduce_samples(
     if averaged:
         what = "averaged" if method is ReduceMethod.MEAN else "kept one lane of"
         warnings.append(
-            f"{what} {len(averaged)} sample(s) with technical repeats "
-            "(repeats do not count as n)"
+            f"{what} {len(averaged)} sample(s) with technical repeats (repeats do not count as n)"
         )
     return SampleReduction(groups=groups, averaged=averaged, warnings=warnings)
 

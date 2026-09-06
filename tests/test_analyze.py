@@ -27,9 +27,7 @@ def _batch(control_condition=None, with_loading=True, with_target=True):
     conditions = ["ctl", "ctl", "ctl", "A", "A", "A", "B", "B"]
     proteins = []
     if with_target:
-        proteins.append(
-            ProteinNets("p53", Role.TARGET, [100, 110, 105, 200, 210, 190, 50, 60])
-        )
+        proteins.append(ProteinNets("p53", Role.TARGET, [100, 110, 105, 200, 210, 190, 50, 60]))
     if with_loading:
         proteins.append(
             ProteinNets("GAPDH", Role.LOADING_CONTROL, [100, 100, 100, 100, 100, 100, 100, 100])

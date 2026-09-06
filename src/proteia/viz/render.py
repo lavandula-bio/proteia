@@ -37,8 +37,15 @@ def render_figure(spec: PlotSpec) -> Figure:
     errs = [b.error for b in spec.bars]
 
     ax.bar(
-        xs, means, yerr=errs, capsize=5, width=0.6,
-        color=_BAR_FACE, edgecolor=_BAR_EDGE, linewidth=1.0, zorder=1,
+        xs,
+        means,
+        yerr=errs,
+        capsize=5,
+        width=0.6,
+        color=_BAR_FACE,
+        edgecolor=_BAR_EDGE,
+        linewidth=1.0,
+        zorder=1,
     )
     for x, bar in zip(xs, spec.bars, strict=True):
         for px, val in zip(_point_xs(x, len(bar.points)), bar.points, strict=True):
