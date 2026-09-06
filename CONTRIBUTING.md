@@ -55,16 +55,22 @@ every change reaches it through a short-lived branch and a pull request.
   release.
 - Branch from `main`: `<type>/<issue>-<short-description>` in kebab-case, where
   `<type>` is the Conventional Commits type of the work (`feat`, `fix`, `docs`,
-  `chore`, `refactor`, `test`). Example: `feat/42-csv-export`.
-- Use [Conventional Commits](https://www.conventionalcommits.org/) in English.
-  Keep commits atomic.
+  `chore`, `refactor`, `test`). Example: `feat/42-csv-export`. The type
+  follows the work, not the label: a `feature` issue becomes a `feat/` branch,
+  a `bug` issue becomes a `fix/` branch.
+- One logical change per pull request; it becomes exactly one commit on
+  `main`. Use [Conventional Commits](https://www.conventionalcommits.org/) in
+  English on the branch and keep those commits atomic.
 - Open a pull request against `main` (it is protected; no direct pushes), fill
   in every section of the pull request template, and reference the issue with
-  `Closes #42`. Pull requests are squash-merged, so the PR title must itself be
-  a valid Conventional Commits subject, e.g. `feat(export): add per-lane CSV export`.
-- Every pull request is reviewed by someone other than its author before it is
-  merged.
-- Delete the branch after the pull request is merged.
+  `Closes #42`. Pull requests are squash-merged with the PR title as the commit
+  subject and the PR body as the commit body, so the title must be a valid
+  Conventional Commits subject (`feat(export): add per-lane CSV export`) and
+  the body is what future readers of `git log` will see.
+- A pull request is merged only when the `ci` check is green and it has had
+  one review by someone other than its author. Review can be a person or an
+  automated review pass; either way its findings are resolved before merge.
+- The branch is deleted automatically when the pull request is merged.
 - Releases are tagged on `main` using SemVer.
 
 ## License
