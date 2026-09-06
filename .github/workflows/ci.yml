@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -12,7 +11,6 @@ concurrency:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -21,9 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
-        with:
-          enable-cache: true
+      # setup-uv publishes only exact tags (no floating major), so pin one.
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - name: Install locked environment
         run: uv sync --locked
@@ -37,12 +34,11 @@ jobs:
   # Single summary job so branch protection can require one check name ("ci")
   # regardless of how the matrix above changes.
   ci:
-    name: ci
     needs: test
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if any test job did not succeed
+      - if: needs.test.result != 'success'
         run: |
           echo "test result: ${{ needs.test.result }}"
-          test "${{ needs.test.result }}" = "success"
+          exit 1
