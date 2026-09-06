@@ -8,12 +8,12 @@ assignees: ""
 
 ## Purpose
 
-(What problem this solves or what changes once it is done, and why it is worth doing.)
+<!-- What problem this solves or what changes once it is done, and why it is worth doing. -->
 
 ## Done when
 
-(Verifiable conditions. What must be true, what test or output shows it.)
+<!-- Verifiable conditions: what must be true, and which test or output shows it. -->
 
 ## Scope and notes
 
-(Boundaries, non-goals, dependencies, known risks. Say what this issue is waiting on, if anything.)
+<!-- Boundaries, non-goals, dependencies, known risks. Say what this issue is waiting on, if anything. -->

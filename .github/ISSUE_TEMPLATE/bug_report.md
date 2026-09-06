@@ -8,21 +8,26 @@ assignees: ""
 
 ## Description
 
-(What went wrong, in one or two sentences.)
+<!-- What went wrong, in one or two sentences. -->
 
 ## Steps to reproduce
 
-1. (Input image or project used; attach or describe it.)
-2. (Actions taken in the GUI or on the command line.)
-3. (Where the problem appears.)
+<!-- Input image or project used (attach or describe), the actions taken, and where the problem appears. -->
+
+1.
+2.
+3.
 
 ## Expected vs actual
 
-- Expected: (what should have happened)
-- Actual: (what happened instead; paste the traceback if there is one)
+<!-- What should have happened, and what happened instead. Paste the traceback if there is one. -->
+
+- Expected:
+- Actual:
 
 ## Environment
 
-- Proteia version or commit:
-- OS and Python version (`uv run python --version`):
-- Install method (`uv sync`, other):
+<!-- Commit: run `git rev-parse --short HEAD` in the repository. Python: run `uv run python --version`. -->
+
+- Commit:
+- OS and Python version:

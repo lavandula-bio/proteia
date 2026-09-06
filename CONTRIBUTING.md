@@ -48,26 +48,23 @@ the analysis code.
 Proteia uses trunk-based development: `main` is the only long-lived branch and
 every change reaches it through a short-lived branch and a pull request.
 
-- Start from an issue. Open one (or pick an existing one) before you branch, so
-  the work has a number to reference.
+- Start from an issue. Open one with the task or bug report template (or pick
+  an existing one) before you branch, so the work has a number to reference.
+  The maintainer labels it (`bug`, `feature`, `docs`, `refactor`, `chore`,
+  `test`, plus `priority:*`) and assigns it to the milestone of the next
+  release.
 - Branch from `main`: `<type>/<issue>-<short-description>` in kebab-case, where
   `<type>` is the Conventional Commits type of the work (`feat`, `fix`, `docs`,
   `chore`, `refactor`, `test`). Example: `feat/42-csv-export`.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) in English.
   Keep commits atomic.
-- Open a pull request against `main` and reference the issue in the description
-  (`Closes #42`). `main` is protected and does not accept direct pushes. The
-  pull request template asks for Why / What changed / Verification / Related
-  issues; fill in all four.
-- Pull requests are squash-merged, so the PR title becomes the commit subject on
-  `main` and must itself be a valid Conventional Commits subject
-  (`feat(export): add per-lane CSV export`).
-- Every pull request gets one independent review before merge. The reviewer is
-  not the author of the change; for a solo maintainer that means an automated
-  review pass whose findings are read and resolved before merging.
+- Open a pull request against `main` (it is protected; no direct pushes), fill
+  in every section of the pull request template, and reference the issue with
+  `Closes #42`. Pull requests are squash-merged, so the PR title must itself be
+  a valid Conventional Commits subject, e.g. `feat(export): add per-lane CSV export`.
+- Every pull request is reviewed by someone other than its author before it is
+  merged.
 - Delete the branch after the pull request is merged.
-- Work is tracked with issues (use the task or bug report template), the
-  existing labels (type plus `priority:*`), and one milestone per release.
 - Releases are tagged on `main` using SemVer.
 
 ## License
