@@ -168,9 +168,16 @@ def launch(image_path: str | None = None) -> None:
     # more, so active is None until then. placed: every box {rect, pid}. proteins:
     # list by id, each carries "image" (its image index). editing: pid or None.
     state: dict = {
-        "placed": [], "proteins": [], "lanes": [], "spine": [], "editing": None,
-        "syncing": False, "plot_docks": [], "last_specs": [],
-        "images": [], "active": None,
+        "placed": [],
+        "proteins": [],
+        "lanes": [],
+        "spine": [],
+        "editing": None,
+        "syncing": False,
+        "plot_docks": [],
+        "last_specs": [],
+        "images": [],
+        "active": None,
     }
 
     # --- widgets ---
@@ -219,14 +226,36 @@ def launch(image_path: str | None = None) -> None:
     export_csv_btn = PushButton(text="Export table (CSV)…")
     panel = Container(
         widgets=[
-            open_image_btn, image_combo, remove_image_btn,
-            conditions_in, card_table, edit_combo, protein_in, mw_in, role_in,
+            open_image_btn,
+            image_combo,
+            remove_image_btn,
+            conditions_in,
+            card_table,
+            edit_combo,
+            protein_in,
+            mw_in,
+            role_in,
             target_loadings,
-            width_in, height_in, padding_w_in, padding_h_in,
-            dark_on_light, manual_box, show_original,
-            new_btn, confirm_btn, remove_protein_btn, clear_btn,
-            control_in, error_in, plot_conditions, plot_btn, save_chart_btn, export_csv_btn,
-            readout, status_lbl, results_table,
+            width_in,
+            height_in,
+            padding_w_in,
+            padding_h_in,
+            dark_on_light,
+            manual_box,
+            show_original,
+            new_btn,
+            confirm_btn,
+            remove_protein_btn,
+            clear_btn,
+            control_in,
+            error_in,
+            plot_conditions,
+            plot_btn,
+            save_chart_btn,
+            export_csv_btn,
+            readout,
+            status_lbl,
+            results_table,
         ],
         labels=True,
     )
@@ -367,7 +396,8 @@ def launch(image_path: str | None = None) -> None:
         # Choices = other proteins marked loading control. Shown only for a target
         # with 2+ controls to choose between (one auto-resolves). Caller guards sync.
         lc_names = [
-            q["name"] for q in state["proteins"]
+            q["name"]
+            for q in state["proteins"]
             if q["role"] == "loading control" and q["name"] and q is not p
         ]
         target_loadings.choices = lc_names
@@ -458,11 +488,14 @@ def launch(image_path: str | None = None) -> None:
         spine = state["spine"]
         state["syncing"] = True
         try:
-            data = [[lane.label, lane.sample or "", "yes" if lane.included else "no"]
-                    for lane in spine]
+            data = [
+                [lane.label, lane.sample or "", "yes" if lane.included else "no"] for lane in spine
+            ]
             index = [str(lane.index) for lane in spine]
             card_table.value = {
-                "data": data, "columns": ["condition", "sample", "include"], "index": index
+                "data": data,
+                "columns": ["condition", "sample", "include"],
+                "index": index,
             }
         finally:
             state["syncing"] = False
@@ -481,14 +514,17 @@ def launch(image_path: str | None = None) -> None:
         hint = "  (one condition per lane)" if max_boxes and n != max_boxes else ""
         where = (
             f"image: {a['name']} ({state['active'] + 1}/{len(state['images'])})  |  "
-            if a else "no image  |  "
+            if a
+            else "no image  |  "
         )
         status_lbl.value = f"{where}lanes: {max_boxes}  |  conditions: {n}{hint}"
         if not spine:
             columns = [f"#{j + 1}" for j in range(max_boxes)]
             data = [[round(b[j][1]) if j < len(b) else "" for j in range(max_boxes)] for b in per]
             results_table.value = {
-                "data": data, "columns": columns, "index": [_raw_label(p) for p in proteins]
+                "data": data,
+                "columns": columns,
+                "index": [_raw_label(p) for p in proteins],
             }
             return
         # Master table: raw detection rows (net per lane), then a ratio row per
@@ -576,9 +612,7 @@ def launch(image_path: str | None = None) -> None:
             remap[i] = len(kept)
             kept.append(p)
         state["placed"] = [
-            {**pl, "pid": remap[pl["pid"]]}
-            for pl in state["placed"]
-            if pl["pid"] not in removed
+            {**pl, "pid": remap[pl["pid"]]} for pl in state["placed"] if pl["pid"] not in removed
         ]
         state["proteins"] = kept
         del state["images"][idx]
@@ -607,12 +641,20 @@ def launch(image_path: str | None = None) -> None:
             show_info("Import an image first (Import image…).")
             return
         pid = len(state["proteins"])
-        state["proteins"].append({
-            "name": "", "role": role_in.value, "mw": "", "color": PALETTE[pid % len(PALETTE)],
-            "base": _initial_size(_active()["array"]), "pad_w": 0, "pad_h": 0,
-            "confirmed": False, "image": state["active"],  # bind to the displayed image
-            "loadings": (),  # target -> chosen loading control name(s); empty = default
-        })
+        state["proteins"].append(
+            {
+                "name": "",
+                "role": role_in.value,
+                "mw": "",
+                "color": PALETTE[pid % len(PALETTE)],
+                "base": _initial_size(_active()["array"]),
+                "pad_w": 0,
+                "pad_h": 0,
+                "confirmed": False,
+                "image": state["active"],  # bind to the displayed image
+                "loadings": (),  # target -> chosen loading control name(s); empty = default
+            }
+        )
         state["syncing"] = True
         try:
             protein_in.value, mw_in.value = "", ""
@@ -727,23 +769,27 @@ def launch(image_path: str | None = None) -> None:
             return
         # Defer the mutation so we don't rebuild the layer *during* napari's own
         # handling of this click (which leaves a stale selection index).
-        QTimer.singleShot(0, lambda: (_seed_grow(*xy) if add else _remove_at(*xy)))
+        QTimer.singleShot(0, lambda: _seed_grow(*xy) if add else _remove_at(*xy))
 
     def on_edit(*_) -> None:
         if state["syncing"]:
             return
         # The shapes layer only carries the active image's boxes; map edits back to
         # those entries by their index in state["placed"].
-        gidx = [i for i, pl in enumerate(state["placed"])
-                if state["proteins"][pl["pid"]]["image"] == state["active"]]
+        gidx = [
+            i
+            for i, pl in enumerate(state["placed"])
+            if state["proteins"][pl["pid"]]["image"] == state["active"]
+        ]
         new = [normalize_corners(np.asarray(c)) for c in shapes.data]
         if len(new) != len(gidx):
             _redraw()
             return
         iw, ih = _adims()
         cand = {
-            gi: _center_snap(new[k], _protein_size(state["proteins"][state["placed"][gi]["pid"]]),
-                             iw, ih)
+            gi: _center_snap(
+                new[k], _protein_size(state["proteins"][state["placed"][gi]["pid"]]), iw, ih
+            )
             for k, gi in enumerate(gidx)
         }
         by_pid: dict[int, list[int]] = {}
@@ -975,9 +1021,14 @@ def launch(image_path: str | None = None) -> None:
             reduction = reduce_samples(values, conditions, samples, included=eff_included)
             groups = reduction.groups
             spec = build_plotspec(
-                groups, describe(groups), compare(groups),
-                value_kind=kind, error_type=error_type, title=title,
-                lane_indices=provenance, first_label=control,
+                groups,
+                describe(groups),
+                compare(groups),
+                value_kind=kind,
+                error_type=error_type,
+                title=title,
+                lane_indices=provenance,
+                first_label=control,
             )
             named_specs.append((f"{s.target} / {s.loading}", spec))
             for w in reduction.warnings:
@@ -1059,8 +1110,10 @@ def launch(image_path: str | None = None) -> None:
             writer.writerow(["lane", "condition", "sample", "include", *names])
             for i in range(n):
                 row = [i, conditions[i], samples[i] or "", "yes" if included[i] else "no"]
-                row += ["" if aligned[pid][i] is None else round(aligned[pid][i], 3)
-                        for pid in range(len(proteins))]
+                row += [
+                    "" if aligned[pid][i] is None else round(aligned[pid][i], 3)
+                    for pid in range(len(proteins))
+                ]
                 writer.writerow(row)
         show_info(f"Exported {n} lanes x {len(proteins)} proteins to {path}")
 

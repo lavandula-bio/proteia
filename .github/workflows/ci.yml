@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded pushes on a pull request cancel the older run; pushes to main
+  # always finish so every main commit keeps a completed test record.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-uv publishes only exact tags (no floating major), so pin one.
+      - uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install locked environment
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Test
+        run: uv run pytest -q
+
+  # Single summary job so branch protection can require one check name ("ci")
+  # regardless of how the matrix above changes.
+  ci:
+    needs: test
+    # always(): a required check that is skipped counts as passing for branch
+    # protection, so this job must run (and fail) even when test was cancelled.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - if: needs.test.result != 'success'
+        run: |
+          echo "test result: ${{ needs.test.result }}"
+          exit 1
