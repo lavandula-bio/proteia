@@ -75,6 +75,7 @@ class NoticeCode(StrEnum):
     UNKNOWN_PLOT_CONDITION = "unknown_plot_condition"  # ignored: a stale selection must not break
     REFERENCE_NOT_PLOTTED = "reference_not_plotted"  # the baseline still comes from it
     EXTRA_BANDS_IGNORED = "extra_bands_ignored"  # band_index > 0 is not quantified yet
+    CLIPPED = "clipped"  # bands with pixels at the detector limit: over-exposed, still included
 
 
 class Level(StrEnum):
@@ -120,6 +121,7 @@ class ProteinColumn(BaseModel, frozen=True):
     image_id: str
     nets: list[float | None]  # joined on the stored lane_index; None = no box
     band_ids: list[str | None]
+    clipped: list[bool | None]  # per lane: over-exposed; None = no box, or not checked
 
 
 class SeriesResult(BaseModel, frozen=True):
@@ -166,18 +168,14 @@ class Results(BaseModel, frozen=True):
         return self
 
 
-def _join(protein: model.Protein, n: int) -> tuple[LaneNets, list[str | None]]:
-    """A protein's band-index-0 nets and band ids per lane, by stored lane index.
+def _join(protein: model.Protein, n: int) -> list[model.Band | None]:
+    """A protein's band-index-0 band per lane, by stored lane index.
 
     The same join as :func:`~proteia.core.project.join_to_spine`: a lane with no box
     is ``None`` and shifts nothing. The model allows one band-index-0 band per lane.
     """
     by_lane = {band.lane_index: band for band in protein.bands if band.band_index == 0}
-    picked = [by_lane.get(i) for i in range(n)]
-    return (
-        [None if band is None else band.net for band in picked],
-        [None if band is None else band.id for band in picked],
-    )
+    return [by_lane.get(i) for i in range(n)]
 
 
 def lane_nets(batch: model.Batch) -> dict[str, LaneNets]:
@@ -187,7 +185,20 @@ def lane_nets(batch: model.Batch) -> dict[str, LaneNets]:
     only): a lane with no box is ``None``. With no lanes, every protein has ``[]``.
     """
     n = len(batch.lanes)
-    return {protein.id: _join(protein, n)[0] for protein in batch.proteins}
+    return {
+        protein.id: [None if b is None else b.net for b in _join(protein, n)]
+        for protein in batch.proteins
+    }
+
+
+def lane_clipped(batch: model.Batch) -> dict[str, list[bool | None]]:
+    """Each protein's clipping flags per lane, keyed like :func:`lane_nets`: None
+    where there is no box, or where the band was not checked."""
+    n = len(batch.lanes)
+    return {
+        protein.id: [None if b is None else b.clipped for b in _join(protein, n)]
+        for protein in batch.proteins
+    }
 
 
 def _listed(values: Collection[object]) -> str:
@@ -294,7 +305,7 @@ def _compute(
         for lane in batch.lanes
     ]
     joined = {protein.id: _join(protein, n) for protein in batch.proteins}
-    nets = {protein_id: pair[0] for protein_id, pair in joined.items()}
+    nets = {pid: [None if b is None else b.net for b in bands] for pid, bands in joined.items()}
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -302,10 +313,21 @@ def _compute(
             role=p.role,
             image_id=p.image_id,
             nets=nets[p.id],
-            band_ids=joined[p.id][1],
+            band_ids=[None if b is None else b.id for b in joined[p.id]],
+            clipped=[None if b is None else b.clipped for b in joined[p.id]],
         )
         for p in batch.proteins
     ]
+    for column in columns:
+        over = tuple(i for i, flag in enumerate(column.clipped) if flag)
+        if over:
+            note(
+                NoticeCode.CLIPPED,
+                f"{column.name!r} is over-exposed in lane(s) {_listed(over)}: pixels at the"
+                " detector limit make its net an under-estimate; it stays in the results",
+                protein_ids=(column.protein_id,),
+                lane_indices=over,
+            )
     extra = tuple(p.id for p in batch.proteins if any(b.band_index > 0 for b in p.bands))
     if extra:
         note(

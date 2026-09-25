@@ -20,11 +20,11 @@ then autosaves. So an edit is all or nothing:
 
 Stored values that depend on pixels or geometry are recomputed by the operation
 that invalidates them: :func:`_quantify` is the one place a band's net is
-computed (it resets the pixel-derived ``clipped`` flag), and :func:`_set_box` the
+computed, with its ``clipped`` flag, and :func:`_set_box` the
 one place a box moves (it clears the position-derived ``apparent_mw``). A size
 change or a polarity change recomputes every affected net, so every stored net
 always equals ``net_signal`` of the stored pixels, box, size, background and
-polarity.
+polarity, and every stored ``clipped`` flag ``is_clipped`` of the same.
 
 Functions return ids or small frozen dataclasses, never model objects. Typed text
 follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxes`.
@@ -79,7 +79,7 @@ from proteia.core.names import (
 )
 from proteia.core.plotspec import ErrorType
 from proteia.core.project import propose_lane, spine_axes
-from proteia.core.quantify import estimate_background, net_signal
+from proteia.core.quantify import estimate_background, is_clipped, net_signal
 from proteia.core.results import Results
 from proteia.core.session import (
     ErrorCode,
@@ -204,15 +204,23 @@ def _apply[T](
 
 
 def _quantify(band: Band, protein: Protein, image: ImageRef, array: np.ndarray) -> None:
-    """The one place a stored net is computed (#44 adds the clipping flag here)."""
+    """The one place a stored net and its clipping flag are computed. An image with
+    no fixed detector limit (``bit_depth`` None) leaves the band unchecked (None)."""
+    dark_on_light = image.polarity.dark_on_light
     band.net = net_signal(
-        array,
-        band.box,
-        protein.box_size,
-        image.background,
-        dark_on_light=image.polarity.dark_on_light,
+        array, band.box, protein.box_size, image.background, dark_on_light=dark_on_light
     )
-    band.clipped = None  # pixel-derived; stale once the net is recomputed
+    band.clipped = (
+        None
+        if image.bit_depth is None
+        else is_clipped(
+            array,
+            band.box,
+            protein.box_size,
+            bit_depth=image.bit_depth,
+            dark_on_light=dark_on_light,
+        )
+    )
 
 
 def _set_box(band: Band, rect: Rect) -> None:
@@ -1053,7 +1061,8 @@ def compute(
 def export_lane_table(session: ProjectSession) -> Path:
     """Write the raw per-lane table to ``exports/lane-table.csv`` and return its path.
 
-    The same stored-index nets the results table shows, in UTF-8 with a BOM.
+    The same stored-index nets the results table shows, each followed by its
+    clipping flags, in UTF-8 with a BOM.
     ``OSError`` propagates (with Excel holding the file, nothing is truncated).
     Not a state change: no autosave.
     """
@@ -1064,9 +1073,14 @@ def export_lane_table(session: ProjectSession) -> Path:
     exports.mkdir(parents=True, exist_ok=True)
     path = exports / LANE_TABLE_FILE
     conditions, samples, included = spine_axes(batch.lanes)
-    nets = results.lane_nets(batch)
+    nets, clipped = results.lane_nets(batch), results.lane_clipped(batch)
     write_lane_table(
-        path, conditions, samples, included, [(p.name, nets[p.id]) for p in batch.proteins]
+        path,
+        conditions,
+        samples,
+        included,
+        [(p.name, nets[p.id]) for p in batch.proteins],
+        clipped={p.name: clipped[p.id] for p in batch.proteins},
     )
     return path
 
