@@ -261,8 +261,9 @@ def reduce_samples(
         raise ValueError("included and conditions length mismatch")
 
     # Collect each (condition, sample)'s lane values, preserving first-seen order.
-    # An unnamed lane is its own sample, keyed by its int position so it can never
-    # merge with a sample the user named with a digit (e.g. "2").
+    # An unnamed lane (None or a blank name) is its own sample, keyed by its int
+    # position so it can never merge with a sample the user named with a digit
+    # (e.g. "2") or with another unnamed lane.
     buckets: dict[tuple[str, str | int], list[float]] = {}
     order: list[tuple[str, str | int]] = []
     for i in range(n):
@@ -270,7 +271,9 @@ def reduce_samples(
             continue
         if values[i] is None:
             continue
-        key = (conditions[i], str(samples[i]) if samples[i] is not None else i)
+        name = samples[i]
+        named = name is not None and str(name).strip() != ""
+        key = (conditions[i], str(name) if named else i)
         if key not in buckets:
             buckets[key] = []
             order.append(key)
@@ -319,7 +322,9 @@ def fold_change_lane(
     reduction = reduce_samples(values, conditions, samples, included=included, method=method)
     control_vals = reduction.groups.get(control_condition, [])
     if not control_vals:
-        raise ValueError(f"control condition {control_condition!r} has no included values")
+        raise ValueError(
+            f"control condition {control_condition!r} has no value in any included lane"
+        )
     baseline = float(np.mean(control_vals))
     if baseline <= 0:
         raise ValueError("control condition mean is non-positive; cannot form fold-change")
