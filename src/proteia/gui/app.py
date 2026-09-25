@@ -21,6 +21,8 @@ headless-safe.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from proteia.core.analyze import (
@@ -37,7 +39,7 @@ from proteia.core.analyze import (
 from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.export import write_lane_table
 from proteia.core.grow import grow_box
-from proteia.core.imaging import LoadedImage, from_pixels, load_image, preview
+from proteia.core.imaging import LoadedImage, display_rgb, load_image
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
 from proteia.core.project import (
@@ -50,30 +52,6 @@ from proteia.core.quantify import estimate_background, net_signal
 Rect = tuple[int, int, int, int]
 PALETTE = ["#ff4d4d", "#4dd2ff", "#ffe14d", "#7cfc00", "#ff66ff", "#ffa64d", "#66b3ff", "#b39ddb"]
 NONE_CHOICE = "(idle — New protein to start)"
-
-
-def _synthetic_image() -> np.ndarray:
-    img = np.full((120, 200), 20.0)
-    for cx in (40, 90, 140):
-        img[50:70, cx : cx + 30] += 200.0
-    return img
-
-
-def _load_image(path: str | None) -> LoadedImage:
-    """Read an image file (or the synthetic demo image) through the core loader:
-    a 2D analysis array in the file's own value scale, plus import warnings."""
-    if path is None:
-        return from_pixels(_synthetic_image())
-    return load_image(path)
-
-
-def _to_rgb(pixels: np.ndarray) -> np.ndarray:
-    """The display array: a uint8 RGB view of the original (colour survives for
-    fluorescence). Grayscale sources are stacked to 3 channels."""
-    if pixels.ndim == 3 and pixels.shape[-1] >= 3:
-        return preview(pixels[..., :3])
-    view = preview(pixels if pixels.ndim == 2 else pixels[..., 0])  # gray, or gray + alpha
-    return np.stack([view, view, view], axis=-1)
 
 
 def _rect_to_corners(rect: Rect) -> np.ndarray:
@@ -97,11 +75,13 @@ def _make_image(loaded: LoadedImage, name: str, path: str | None) -> dict:
         "name": name,
         "path": path,
         "array": array,
-        "original": _to_rgb(loaded.pixels),
+        "original": display_rgb(loaded.pixels),  # colour survives for fluorescence
         "background": estimate_background(array),
         "iw": loaded.width,
         "ih": loaded.height,
         "dark": True,  # dark-on-light polarity, per image (chemi vs fluorescence differ)
+        "bit_depth": loaded.bit_depth,  # detector limit for the over-exposure check
+        "warnings": loaded.warnings,  # import warnings, kept with the image
     }
 
 
@@ -564,11 +544,11 @@ def launch(image_path: str | None = None) -> None:
         )
         if not path:
             return
-        name = path.split("/")[-1]
+        name = Path(path).name
         try:
-            loaded = _load_image(path)
+            loaded = load_image(path)
         except (OSError, ValueError) as exc:
-            show_info(f"Cannot open {name}: {exc}")
+            show_info(f"Cannot open the image. {exc}")
             return
         state["images"].append(_make_image(loaded, name, path))
         _set_active_image(len(state["images"]) - 1)
@@ -1145,11 +1125,11 @@ def launch(image_path: str | None = None) -> None:
     # opens empty and the user imports.
     startup_note = ""
     if image_path:
-        name = image_path.split("/")[-1]
+        name = Path(image_path).name
         try:
-            loaded = _load_image(image_path)
+            loaded = load_image(image_path)
         except (OSError, ValueError) as exc:
-            startup_note = f"Cannot open {name}: {exc}. "
+            startup_note = f"Cannot open the image. {exc}. "
         else:
             state["images"].append(_make_image(loaded, name, image_path))
             _set_active_image(0)

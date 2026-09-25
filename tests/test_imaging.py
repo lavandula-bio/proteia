@@ -9,6 +9,7 @@ import tifffile
 from skimage import io
 
 from proteia.core.imaging import (
+    display_rgb,
     from_pixels,
     load_image,
     preview,
@@ -107,7 +108,7 @@ def test_multi_page_tiff_is_refused(tmp_path):
     with tifffile.TiffWriter(path) as tif:
         for page in stack:
             tif.write(page)
-    with pytest.raises(ValueError, match="multi-page"):
+    with pytest.raises(ValueError, match="stacks"):
         read_pixels(path)
 
 
@@ -218,3 +219,48 @@ def test_jpeg_compressed_tiff_records_a_lossy_format_warning(tmp_path):
     path = tmp_path / "jpeg inside.tif"
     tifffile.imwrite(path, _gray(np.uint8, 255), compression="jpeg")
     assert _codes(load_image(path)) == ["lossy_format"]
+
+
+def test_multi_channel_composite_is_refused(tmp_path):
+    path = tmp_path / "composite.tif"
+    data = np.zeros((3, 6, 8), dtype=np.uint16)
+    tifffile.imwrite(path, data, photometric="minisblack", metadata={"axes": "CYX"})
+    with pytest.raises(ValueError, match="composites"):
+        read_pixels(path)
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [("truncated.tif", b"II*\x00"), ("truncated.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00")],
+)
+def test_damaged_file_is_a_value_error(tmp_path, name, data):
+    path = tmp_path / name
+    path.write_bytes(data)
+    with pytest.raises((ValueError, OSError)):
+        load_image(path)
+
+
+def test_lzw_tiff_reads_or_explains_the_missing_decoder(tmp_path):
+    from PIL import Image
+
+    path = tmp_path / "lzw 16-bit.tif"
+    pixels = _gray(np.uint16, 65535)
+    Image.fromarray(pixels).save(path, compression="tiff_lzw")
+    try:
+        import imagecodecs  # noqa: F401
+    except ImportError:
+        with pytest.raises(ValueError, match="uncompressed TIFF"):
+            load_image(path)
+    else:
+        np.testing.assert_array_equal(load_image(path).array, pixels.astype(np.float64))
+
+
+def test_display_rgb_views():
+    gray16 = np.array([[0, 65535]], dtype=np.uint16)
+    assert display_rgb(gray16).tolist() == [[[0, 0, 0], [255, 255, 255]]]
+    la = np.zeros((1, 2, 2), dtype=np.uint8)
+    la[..., 0], la[..., 1] = [10, 20], 255
+    assert display_rgb(la).tolist() == [[[10, 10, 10], [20, 20, 20]]]
+    rgba = np.zeros((1, 1, 4), dtype=np.uint8)
+    rgba[..., :3], rgba[..., 3] = [1, 2, 3], 255
+    assert display_rgb(rgba).tolist() == [[[1, 2, 3]]]

@@ -29,8 +29,9 @@ from proteia.core.quantify import to_grayscale
 
 TIFF_SUFFIXES = (".tif", ".tiff")
 LOSSY_SUFFIXES = (".jpg", ".jpeg", ".jpe", ".jfif")
-# TIFF compression schemes that change pixel values (old-style and new-style JPEG).
-_LOSSY_TIFF_COMPRESSION = (6, 7)
+# TIFF compression schemes that can change pixel values: old- and new-style JPEG,
+# lossy JPEG (DNG), JPEG 2000, JPEG XR, WebP and JPEG XL.
+_LOSSY_TIFF_COMPRESSION = frozenset({6, 7, 34892, 33003, 33005, 34712, 22610, 50001, 34927, 50002})
 # Axes of a single 2-D image as tifffile reports them: gray, or samples last/first.
 _SINGLE_IMAGE_AXES = ("YX", "YXS", "SYX")
 _BIT_DEPTHS = {np.dtype(np.uint8): 8, np.dtype(np.uint16): 16}
@@ -38,7 +39,8 @@ _BIT_DEPTHS = {np.dtype(np.uint8): 8, np.dtype(np.uint16): 16}
 # Warning codes and messages recorded on import.
 WARNINGS = {
     "lossy_format": (
-        "JPEG compression changes pixel values; quantify the original TIFF if you have it."
+        "JPEG-type compression can change pixel values; quantify an uncompressed or"
+        " losslessly compressed original if you have it."
     ),
     "color_channels_differ": (
         "The red, green and blue channels differ; they were averaged into one gray channel."
@@ -75,17 +77,32 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool]:
     """The pixels of a single-image TIFF (channels last), and whether it is lossy.
 
     Extra pages that are only a reduced-resolution thumbnail of the image are
-    fine; a stack of several images is refused rather than mistaken for color.
+    fine; a stack or a multi-channel composite is refused rather than mistaken
+    for color.
     """
     with tifffile.TiffFile(path) as tif:
         series = tif.series
-        if len(series) != 1 or series[0].axes not in _SINGLE_IMAGE_AXES:
-            raise ValueError(f"{path.name}: multi-page TIFF stacks are not supported")
-        pixels = series[0].asarray()
-        # Planar color stores the channels first.
-        if series[0].axes == "SYX" and pixels.ndim == 3 and pixels.shape[0] in (2, 3, 4):
-            pixels = np.moveaxis(pixels, 0, -1)
-        lossy = int(tif.pages[0].compression) in _LOSSY_TIFF_COMPRESSION
+        axes = series[0].axes if series else ""
+        if len(series) != 1 or axes not in _SINGLE_IMAGE_AXES:
+            raise ValueError(
+                f"{path.name}: holds {len(series)} image series with axes {axes!r};"
+                " only a single 2-D gray or color image can be quantified"
+                " (stacks and multi-channel composites are not supported)"
+            )
+        keyframe = series[0].keyframe
+        lossy = int(keyframe.compression) in _LOSSY_TIFF_COMPRESSION
+        try:
+            pixels = series[0].asarray()
+        except ValueError as exc:
+            if "imagecodecs" not in str(exc):
+                raise
+            raise ValueError(
+                f"{path.name}: {keyframe.compression.name} compression cannot be decoded"
+                " by this installation; save the image as an uncompressed TIFF"
+            ) from exc
+    # Planar color stores the channels first.
+    if axes == "SYX" and pixels.ndim == 3 and pixels.shape[0] in (2, 3, 4):
+        pixels = np.moveaxis(pixels, 0, -1)
     return pixels, lossy
 
 
@@ -98,12 +115,18 @@ def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
 
 
 def _read(path: Path) -> tuple[np.ndarray, bool]:
-    if path.suffix.lower() in TIFF_SUFFIXES:
-        pixels, lossy = _read_tiff(path)
-    else:
-        from skimage import io
+    """Read a file; every failure to read it becomes a ``ValueError`` or ``OSError``."""
+    try:
+        if path.suffix.lower() in TIFF_SUFFIXES:
+            pixels, lossy = _read_tiff(path)
+        else:
+            from skimage import io
 
-        pixels, lossy = io.imread(path), path.suffix.lower() in LOSSY_SUFFIXES
+            pixels, lossy = io.imread(path), path.suffix.lower() in LOSSY_SUFFIXES
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:  # a damaged file: struct.error, SyntaxError from Pillow, ...
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     _check_layout(pixels, path.name)
     return pixels, lossy
 
@@ -170,12 +193,29 @@ def preview(pixels: np.ndarray) -> np.ndarray:
     """
     if pixels.dtype == np.uint8:
         return pixels.copy()
-    values = pixels.astype(np.float64)
-    finite = np.isfinite(values)
-    if not finite.any():
-        return np.zeros(pixels.shape, dtype=np.uint8)
-    lo, hi = float(values[finite].min()), float(values[finite].max())
+    if np.issubdtype(pixels.dtype, np.integer):  # every value is finite
+        lo, hi = float(pixels.min()), float(pixels.max())
+        finite = None
+    else:
+        finite = np.isfinite(pixels)
+        valid = pixels[finite]
+        if valid.size == 0:
+            return np.zeros(pixels.shape, dtype=np.uint8)
+        lo, hi = float(valid.min()), float(valid.max())
     if hi <= lo:
         return np.zeros(pixels.shape, dtype=np.uint8)
-    scaled = np.where(finite, (values - lo) / (hi - lo) * 255.0, 0.0)
+    # float32 halves the working memory of a large 16-bit scan.
+    scaled = (pixels.astype(np.float32) - np.float32(lo)) * np.float32(255.0 / (hi - lo))
+    if finite is not None:
+        scaled = np.where(finite, scaled, np.float32(0.0))
     return np.round(np.clip(scaled, 0.0, 255.0)).astype(np.uint8)
+
+
+def display_rgb(pixels: np.ndarray) -> np.ndarray:
+    """A ``uint8`` RGB view for display: color keeps its channels (alpha dropped);
+    gray, with or without alpha, is repeated in three channels."""
+    _check_layout(pixels, "image")
+    if pixels.ndim == 3 and pixels.shape[-1] >= 3:
+        return preview(pixels[..., :3])
+    view = preview(to_grayscale(pixels))
+    return np.stack([view, view, view], axis=-1)
