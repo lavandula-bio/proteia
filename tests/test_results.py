@@ -426,8 +426,10 @@ def test_each_series_is_reduced_once(monkeypatch):
     monkeypatch.setattr(results, "reduce_samples", counting)
     batch = _batch(_loading_ids("prot-8", "prot-9"))
     compute_results(batch, plot_conditions=["vehicle"])
-    assert len(calls) == 2  # two series, one reduction each
-    assert all(included == [True, True, True, False] for included in calls)  # the lane table's
+    # Two series, one reduction each, in each of the two sets (lane 3 is excluded).
+    assert len(calls) == 4
+    assert calls[:2] == [[True, True, True, False]] * 2  # the lane table's
+    assert calls[2:] == [[True, True, True, True]] * 2  # every lane
 
 
 def test_compute_leaves_the_batch_unchanged():
@@ -606,3 +608,50 @@ def test_series_without_a_value_in_the_plotted_conditions_says_so():
     [series] = res.series
     assert series.chart is None and series.groups  # values exist, just not plotted
     assert _one(res, NoticeCode.NO_PLOTTED_VALUES).protein_ids == ("prot-7", "prot-8")
+
+
+# --- #71: results with and without excluded lanes ---
+
+
+def test_without_excluded_lanes_there_is_one_set():
+    res = compute_results(_batch(_lane(3, included=True)))
+    assert res.excluded_lanes == []
+    assert res.all_lanes is None
+
+
+def test_excluded_lanes_come_with_an_all_lanes_set():
+    res = compute_results(_batch())  # lane 3 (10 µM, sample a2) is include=no
+    assert res.excluded_lanes == [3]
+    everything = res.all_lanes
+    assert everything is not None
+    assert (everything.excluded_lanes, everything.all_lanes) == ([], None)
+    [applied], [all_lanes] = res.series, everything.series
+    assert "10 µM" not in applied.groups  # its only β-catenin value is in lane 3
+    assert len(all_lanes.groups["10 µM"]) == 1
+    assert all_lanes.chart is not None
+    assert [bar.label for bar in all_lanes.chart.bars] == ["vehicle", "10 µM"]
+    # Both sets use their own lanes for the fold-change baseline: here the same.
+    assert applied.baseline == all_lanes.baseline
+    assert everything.lanes == [row.model_copy(update={"included": True}) for row in res.lanes]
+
+
+def test_excluding_the_reference_keeps_the_fold_change_in_the_all_lanes_set():
+    res = compute_results(_batch(_lane(0, included=False), _lane(1, included=False)))
+    assert NoticeCode.REFERENCE_ALL_EXCLUDED in _codes(res)
+    assert [s.fold_change for s in res.series] == [None]
+    [series] = res.all_lanes.series
+    assert series.value_kind is ValueKind.FOLD_CHANGE
+    assert series.chart is not None
+    assert NoticeCode.REFERENCE_ALL_EXCLUDED not in _codes(res.all_lanes)
+
+
+def test_too_few_samples_give_a_chart_without_statistics():
+    # Lane 1 excluded, lane 3 included: vehicle and 10 µM have one sample each.
+    res = compute_results(_batch(_lane(1, included=False), _lane(3, included=True)))
+    [series] = res.series
+    chart = series.chart
+    assert chart is not None
+    assert [bar.n for bar in chart.bars] == [1, 1]
+    assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
+    # The all-lanes set has vehicle n = 2, still too few groups with two samples to test.
+    assert res.all_lanes.series[0].chart is not None

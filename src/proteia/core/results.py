@@ -133,7 +133,13 @@ class SeriesResult(BaseModel, frozen=True):
 
 
 class Results(BaseModel, frozen=True):
-    """Everything :func:`compute_results` gives, with the arguments it used."""
+    """Everything :func:`compute_results` gives, with the arguments it used.
+
+    ``excluded_lanes`` names the lanes this set leaves out (include=no); empty
+    means every lane is in. When it is not empty, ``all_lanes`` holds the same
+    results with every lane included, so what an exclusion changes is always
+    visible, and each set can be shown or exported on its own.
+    """
 
     lanes: list[LaneRow]
     tier: Tier
@@ -144,6 +150,8 @@ class Results(BaseModel, frozen=True):
     plot_conditions: list[str] | None  # resolved to stored labels; None = all
     error_type: ErrorType
     method: ReduceMethod
+    excluded_lanes: list[int] = []
+    all_lanes: Results | None = None
 
 
 def _join(protein: model.Protein, n: int) -> tuple[LaneNets, list[str | None]]:
@@ -212,6 +220,33 @@ def compute_results(
     method: ReduceMethod = ReduceMethod.MEAN,
 ) -> Results:
     """Everything the results view shows, from the stored batch alone.
+
+    See :func:`_compute` for one result set. When the lane table excludes lanes
+    (include=no), the returned set applies the exclusions and its ``all_lanes``
+    is the same computation with every lane included: an exclusion is never
+    hidden. A set whose groups are too small for a test still has its charts,
+    with no test result and no brackets.
+    """
+    results = _compute(batch, plot_conditions=plot_conditions, error_type=error_type, method=method)
+    if not results.excluded_lanes:
+        return results
+    every_lane = batch.model_copy(
+        update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
+    )
+    all_lanes = _compute(
+        every_lane, plot_conditions=plot_conditions, error_type=error_type, method=method
+    )
+    return results.model_copy(update={"all_lanes": all_lanes})
+
+
+def _compute(
+    batch: model.Batch,
+    *,
+    plot_conditions: Collection[str] | None,
+    error_type: ErrorType,
+    method: ReduceMethod,
+) -> Results:
+    """One result set, over the lane table's included lanes.
 
     ``plot_conditions`` chooses the charted conditions (None or empty: all); each
     is resolved against the lane labels (:func:`~proteia.core.names.resolve_label`),
@@ -473,4 +508,5 @@ def compute_results(
         plot_conditions=chosen,
         error_type=error_type,
         method=method,
+        excluded_lanes=[i for i in range(n) if not included[i]],
     )
