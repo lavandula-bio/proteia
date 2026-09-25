@@ -3,9 +3,10 @@
 
 GUI-independent. The analysis array is always 2-D float64 in the file's own
 value scale: a 16-bit scan keeps values up to 65535, so a saturated 16-bit pixel
-stays distinguishable from a mid-range one. RGB input is reduced to gray by the
-unweighted channel mean, (R+G+B)/3, which matches ImageJ's default conversion;
-an alpha channel is ignored.
+stays distinguishable from a mid-range one. Color is reduced to gray by
+:func:`proteia.core.quantify.to_grayscale`: the unweighted mean of the red, green
+and blue channels, (R+G+B)/3, which matches ImageJ's default conversion; an alpha
+channel is ignored, and gray plus alpha keeps the gray channel.
 
 ``bit_depth`` is the container depth of unsigned integer data (8 or 16), which
 sets the detector limit for the over-exposure check. Other pixel types (float,
@@ -24,9 +25,14 @@ import numpy as np
 import tifffile
 
 from proteia.core.model import ImageWarning
+from proteia.core.quantify import to_grayscale
 
 TIFF_SUFFIXES = (".tif", ".tiff")
-LOSSY_SUFFIXES = (".jpg", ".jpeg")
+LOSSY_SUFFIXES = (".jpg", ".jpeg", ".jpe", ".jfif")
+# TIFF compression schemes that change pixel values (old-style and new-style JPEG).
+_LOSSY_TIFF_COMPRESSION = (6, 7)
+# Axes of a single 2-D image as tifffile reports them: gray, or samples last/first.
+_SINGLE_IMAGE_AXES = ("YX", "YXS", "SYX")
 _BIT_DEPTHS = {np.dtype(np.uint8): 8, np.dtype(np.uint16): 16}
 
 # Warning codes and messages recorded on import.
@@ -49,10 +55,10 @@ def _warning(code: str) -> ImageWarning:
 
 @dataclass(frozen=True)
 class LoadedImage:
-    """An image file read for analysis."""
+    """An image read for analysis."""
 
     array: np.ndarray  # 2-D float64 analysis array, original value scale
-    pixels: np.ndarray  # the pixels as stored (2-D, or 3-D with 3/4 channels), for display
+    pixels: np.ndarray  # the pixels as stored (2-D, or 3-D with channels last), for display
     bit_depth: int | None  # container depth of unsigned integer data; None otherwise
     warnings: list[ImageWarning] = field(default_factory=list)
 
@@ -65,42 +71,67 @@ class LoadedImage:
         return int(self.array.shape[1])
 
 
-def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
-    """Read the stored pixels: 2-D grayscale, or 3-D with 3 or 4 channels last.
+def _read_tiff(path: Path) -> tuple[np.ndarray, bool]:
+    """The pixels of a single-image TIFF (channels last), and whether it is lossy.
 
-    TIFF files are read with tifffile, and a multi-page stack is refused rather
-    than mistaken for a color image. Other formats go through scikit-image.
+    Extra pages that are only a reduced-resolution thumbnail of the image are
+    fine; a stack of several images is refused rather than mistaken for color.
     """
-    path = Path(path)
+    with tifffile.TiffFile(path) as tif:
+        series = tif.series
+        if len(series) != 1 or series[0].axes not in _SINGLE_IMAGE_AXES:
+            raise ValueError(f"{path.name}: multi-page TIFF stacks are not supported")
+        pixels = series[0].asarray()
+        # Planar color stores the channels first.
+        if series[0].axes == "SYX" and pixels.ndim == 3 and pixels.shape[0] in (2, 3, 4):
+            pixels = np.moveaxis(pixels, 0, -1)
+        lossy = int(tif.pages[0].compression) in _LOSSY_TIFF_COMPRESSION
+    return pixels, lossy
+
+
+def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
+    """Read the stored pixels: 2-D gray, or 3-D with 2, 3 or 4 channels last.
+
+    TIFF files are read with tifffile; other formats go through scikit-image.
+    """
+    return _read(Path(path))[0]
+
+
+def _read(path: Path) -> tuple[np.ndarray, bool]:
     if path.suffix.lower() in TIFF_SUFFIXES:
-        with tifffile.TiffFile(path) as tif:
-            if len(tif.pages) > 1:
-                raise ValueError(f"{path.name}: multi-page TIFF stacks are not supported")
-            pixels = tif.asarray()
+        pixels, lossy = _read_tiff(path)
     else:
         from skimage import io
 
-        pixels = io.imread(path)
+        pixels, lossy = io.imread(path), path.suffix.lower() in LOSSY_SUFFIXES
     _check_layout(pixels, path.name)
-    return pixels
+    return pixels, lossy
 
 
 def _check_layout(pixels: np.ndarray, name: str) -> None:
-    if pixels.ndim == 2 or (pixels.ndim == 3 and pixels.shape[-1] in (3, 4)):
+    if pixels.ndim == 2 or (pixels.ndim == 3 and pixels.shape[-1] in (2, 3, 4)):
         return
     raise ValueError(f"{name}: unsupported image layout {pixels.shape}")
 
 
 def to_analysis_array(pixels: np.ndarray) -> tuple[np.ndarray, list[ImageWarning]]:
-    """The 2-D float64 analysis array, and warnings about the conversion."""
+    """The 2-D float64 analysis array, and warnings about the conversion.
+
+    Refuses NaN or infinite pixels: they would make the background and every
+    net signal meaningless.
+    """
     _check_layout(pixels, "image")
-    if pixels.ndim == 2:
-        return pixels.astype(np.float64), []
-    rgb = pixels[..., :3]
     warnings: list[ImageWarning] = []
-    if not (np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(rgb[..., 0], rgb[..., 2])):
-        warnings.append(_warning("color_channels_differ"))
-    return rgb.astype(np.float64).mean(axis=-1), warnings
+    if pixels.ndim == 3 and pixels.shape[-1] >= 3:
+        rgb = pixels[..., :3]
+        if not (
+            np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(rgb[..., 0], rgb[..., 2])
+        ):
+            warnings.append(_warning("color_channels_differ"))
+    array = to_grayscale(pixels).astype(np.float64)
+    if not np.isfinite(array).all():
+        raise ValueError("image has NaN or infinite pixel values")
+    return array, warnings
 
 
 def bit_depth_of(pixels: np.ndarray) -> int | None:
@@ -108,17 +139,25 @@ def bit_depth_of(pixels: np.ndarray) -> int | None:
     return _BIT_DEPTHS.get(pixels.dtype)
 
 
-def load_image(path: str | os.PathLike[str]) -> LoadedImage:
-    """Read an image file into an analysis array, with its bit depth and warnings."""
-    path = Path(path)
-    pixels = read_pixels(path)
+def from_pixels(pixels: np.ndarray, *, lossy: bool = False) -> LoadedImage:
+    """A :class:`LoadedImage` from pixels already in memory (e.g. generated)."""
     array, warnings = to_analysis_array(pixels)
     depth = bit_depth_of(pixels)
     if depth is None:
         warnings.append(_warning("unknown_bit_depth"))
-    if path.suffix.lower() in LOSSY_SUFFIXES:
+    if lossy:
         warnings.insert(0, _warning("lossy_format"))
     return LoadedImage(array=array, pixels=pixels, bit_depth=depth, warnings=warnings)
+
+
+def load_image(path: str | os.PathLike[str]) -> LoadedImage:
+    """Read an image file into an analysis array, with its bit depth and warnings.
+
+    ``lossy_format`` is recorded for JPEG files and for TIFF files that use JPEG
+    compression.
+    """
+    pixels, lossy = _read(Path(path))
+    return from_pixels(pixels, lossy=lossy)
 
 
 def preview(pixels: np.ndarray) -> np.ndarray:
@@ -126,12 +165,17 @@ def preview(pixels: np.ndarray) -> np.ndarray:
 
     8-bit data is shown as stored. Anything else is stretched linearly from its
     minimum to its maximum, so 16-bit levels above 255 stay distinguishable; a
-    constant image becomes black. For display only: analysis never uses it.
+    constant image becomes black, and NaN pixels black. For display only:
+    analysis never uses it.
     """
     if pixels.dtype == np.uint8:
         return pixels.copy()
     values = pixels.astype(np.float64)
-    lo, hi = float(values.min()), float(values.max())
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.zeros(pixels.shape, dtype=np.uint8)
+    lo, hi = float(values[finite].min()), float(values[finite].max())
     if hi <= lo:
         return np.zeros(pixels.shape, dtype=np.uint8)
-    return np.round((values - lo) / (hi - lo) * 255.0).astype(np.uint8)
+    scaled = np.where(finite, (values - lo) / (hi - lo) * 255.0, 0.0)
+    return np.round(np.clip(scaled, 0.0, 255.0)).astype(np.uint8)

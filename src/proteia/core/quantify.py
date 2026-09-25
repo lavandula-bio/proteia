@@ -9,7 +9,8 @@ level. ``estimate_background`` gives a robust membrane baseline. (A raw pixel su
 is not comparable on its own: it conflates signal, box area, and how much
 background the box happens to include.)
 
-Multi-channel images are reduced to a single grayscale channel by averaging.
+Multi-channel images are reduced to a single grayscale channel by
+:func:`to_grayscale`, the one place that rule lives.
 """
 
 from __future__ import annotations
@@ -20,12 +21,19 @@ from proteia.core.model import Box, BoxSize
 
 
 def to_grayscale(image: np.ndarray) -> np.ndarray:
-    """Reduce an image to a 2D grayscale array (average across channels if RGB)."""
+    """Reduce an image to a 2D grayscale array.
+
+    Color (3 or 4 channels last) becomes the unweighted mean of red, green and
+    blue, which matches ImageJ's default conversion; alpha is ignored. Gray plus
+    alpha (2 channels) keeps the gray channel.
+    """
     if image.ndim == 2:
         return image
-    if image.ndim == 3:
-        return image.mean(axis=-1)
-    raise ValueError(f"unsupported image with {image.ndim} dimensions")
+    if image.ndim == 3 and image.shape[-1] == 2:
+        return image[..., 0]
+    if image.ndim == 3 and image.shape[-1] in (3, 4):
+        return image[..., :3].mean(axis=-1)
+    raise ValueError(f"unsupported image layout {image.shape}")
 
 
 def _box_pixels(image: np.ndarray, box: Box, size: BoxSize) -> np.ndarray:

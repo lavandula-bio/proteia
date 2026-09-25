@@ -19,6 +19,21 @@ def test_to_grayscale_reduces_rgb():
     assert gray[0, 0] == 1.0
 
 
+def test_to_grayscale_ignores_alpha_and_keeps_gray_of_gray_alpha():
+    rgba = np.zeros((2, 2, 4))
+    rgba[..., :3] = [30.0, 60.0, 90.0]
+    rgba[..., 3] = 255.0
+    assert to_grayscale(rgba)[0, 0] == 60.0  # (30 + 60 + 90) / 3; alpha ignored
+    la = np.zeros((2, 2, 2))
+    la[..., 0], la[..., 1] = 42.0, 255.0
+    assert to_grayscale(la)[0, 0] == 42.0
+
+
+def test_to_grayscale_refuses_other_layouts():
+    with pytest.raises(ValueError, match="unsupported image layout"):
+        to_grayscale(np.zeros((2, 2, 5)))
+
+
 def test_estimate_background_is_membrane_median():
     img = np.full((10, 10), 200.0)  # uniform "membrane"
     img[4:6, 4:6] = 50.0  # a small dark band

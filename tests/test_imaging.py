@@ -8,7 +8,13 @@ import pytest
 import tifffile
 from skimage import io
 
-from proteia.core.imaging import load_image, preview, read_pixels, to_analysis_array
+from proteia.core.imaging import (
+    from_pixels,
+    load_image,
+    preview,
+    read_pixels,
+    to_analysis_array,
+)
 from proteia.core.model import ImageKind, ImageRef, Polarity, Project
 from proteia.core.storage import load_project, save_project, store_image
 
@@ -68,8 +74,9 @@ def test_alpha_channel_is_ignored():
     assert warnings == []
 
 
-def test_jpeg_import_records_a_lossy_format_warning(tmp_path):
-    path = tmp_path / "blot β.jpg"
+@pytest.mark.parametrize("suffix", [".jpg", ".JPEG", ".jpe"])
+def test_jpeg_import_records_a_lossy_format_warning(tmp_path, suffix):
+    path = tmp_path / f"blot β{suffix}"
     io.imsave(path, _gray(np.uint8, 255), check_contrast=False)
     loaded = load_image(path)
     assert loaded.bit_depth == 8
@@ -104,7 +111,7 @@ def test_multi_page_tiff_is_refused(tmp_path):
         read_pixels(path)
 
 
-@pytest.mark.parametrize("shape", [(4, 5, 2), (4, 5, 6), (2, 4, 5, 3)])
+@pytest.mark.parametrize("shape", [(4, 5, 5), (4, 5, 6), (2, 4, 5, 3)])
 def test_unsupported_layout_is_refused(shape):
     with pytest.raises(ValueError, match="unsupported image layout"):
         to_analysis_array(np.zeros(shape, dtype=np.uint8))
@@ -155,3 +162,59 @@ def test_import_warnings_survive_save_and_load(tmp_path):
     reloaded = load_project(folder)
     assert reloaded == project
     assert [w.code for w in reloaded.batch.find_image("img-1").import_warnings] == ["lossy_format"]
+
+
+def test_tiff_with_a_thumbnail_page_is_one_image(tmp_path):
+    path = tmp_path / "scan with thumbnail.tif"
+    main = _gray(np.uint16, 65535)
+    with tifffile.TiffWriter(path) as tif:
+        tif.write(main)
+        tif.write(main[::2, ::2], subfiletype=1)  # reduced-resolution thumbnail
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.array, main.astype(np.float64))
+    assert loaded.bit_depth == 16
+
+
+def test_planar_rgb_tiff_is_read_channels_last(tmp_path):
+    gray = _gray(np.uint8, 255)
+    rgb = np.stack([gray, gray // 2, gray // 4], axis=-1)
+    path = tmp_path / "planar.tif"
+    # A planar file stores the channels first; tifffile writes (S, Y, X) input as is.
+    tifffile.imwrite(path, np.moveaxis(rgb, -1, 0), photometric="rgb", planarconfig="separate")
+    pixels = read_pixels(path)
+    assert pixels.shape == (6, 8, 3)
+    np.testing.assert_array_equal(pixels, rgb)
+
+
+def test_gray_plus_alpha_keeps_the_gray_channel():
+    la = np.zeros((3, 3, 2), dtype=np.uint8)
+    la[..., 0], la[..., 1] = 70, 255
+    array, warnings = to_analysis_array(la)
+    np.testing.assert_array_equal(array, np.full((3, 3), 70.0))
+    assert warnings == []
+
+
+def test_non_finite_pixels_are_refused():
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        to_analysis_array(np.array([[0.0, 1.0, np.nan]], dtype=np.float32))
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        to_analysis_array(np.array([[0.0, np.inf]]))
+
+
+def test_preview_ignores_nan_pixels():
+    view = preview(np.array([[0.0, 1.0, np.nan]], dtype=np.float32))
+    assert view.tolist() == [[0, 255, 0]]
+
+
+def test_pixels_in_memory_follow_the_same_rules():
+    loaded = from_pixels(np.full((4, 6), 20.0))  # float, like a generated demo image
+    assert loaded.bit_depth is None
+    assert _codes(loaded) == ["unknown_bit_depth"]
+    assert _codes(from_pixels(_gray(np.uint8, 255), lossy=True)) == ["lossy_format"]
+
+
+def test_jpeg_compressed_tiff_records_a_lossy_format_warning(tmp_path):
+    pytest.importorskip("imagecodecs")  # tifffile needs it to write JPEG compression
+    path = tmp_path / "jpeg inside.tif"
+    tifffile.imwrite(path, _gray(np.uint8, 255), compression="jpeg")
+    assert _codes(load_image(path)) == ["lossy_format"]

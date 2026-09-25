@@ -37,7 +37,7 @@ from proteia.core.analyze import (
 from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.export import write_lane_table
 from proteia.core.grow import grow_box
-from proteia.core.imaging import LoadedImage, load_image, preview, to_analysis_array
+from proteia.core.imaging import LoadedImage, from_pixels, load_image, preview
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
 from proteia.core.project import (
@@ -63,17 +63,17 @@ def _load_image(path: str | None) -> LoadedImage:
     """Read an image file (or the synthetic demo image) through the core loader:
     a 2D analysis array in the file's own value scale, plus import warnings."""
     if path is None:
-        pixels = _synthetic_image()
-        array, warnings = to_analysis_array(pixels)
-        return LoadedImage(array=array, pixels=pixels, bit_depth=None, warnings=warnings)
+        return from_pixels(_synthetic_image())
     return load_image(path)
 
 
 def _to_rgb(pixels: np.ndarray) -> np.ndarray:
     """The display array: a uint8 RGB view of the original (colour survives for
     fluorescence). Grayscale sources are stacked to 3 channels."""
-    view = preview(pixels[..., :3] if pixels.ndim == 3 else pixels)
-    return view if view.ndim == 3 else np.stack([view, view, view], axis=-1)
+    if pixels.ndim == 3 and pixels.shape[-1] >= 3:
+        return preview(pixels[..., :3])
+    view = preview(pixels if pixels.ndim == 2 else pixels[..., 0])  # gray, or gray + alpha
+    return np.stack([view, view, view], axis=-1)
 
 
 def _rect_to_corners(rect: Rect) -> np.ndarray:
@@ -1143,16 +1143,26 @@ def launch(image_path: str | None = None) -> None:
 
     # A path on the command line is imported as the first image; otherwise the app
     # opens empty and the user imports.
+    startup_note = ""
     if image_path:
-        state["images"].append(
-            _make_image(_load_image(image_path), image_path.split("/")[-1], image_path)
-        )
-        _set_active_image(0)
+        name = image_path.split("/")[-1]
+        try:
+            loaded = _load_image(image_path)
+        except (OSError, ValueError) as exc:
+            startup_note = f"Cannot open {name}: {exc}. "
+        else:
+            state["images"].append(_make_image(loaded, name, image_path))
+            _set_active_image(0)
+            notes = " ".join(w.message for w in loaded.warnings)
+            startup_note = f"Note: {notes} " if notes else ""
     _refresh_all()
     show_info(
-        "Import an image to start (Import image…)."
-        if not state["images"]
-        else "Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm."
+        startup_note
+        + (
+            "Import an image to start (Import image…)."
+            if not state["images"]
+            else "Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm."
+        )
     )
     napari.run()
 
