@@ -20,7 +20,7 @@ from proteia.core.names import (
 )
 
 MICRO, MU = "µ", "μ"
-ZWSP = "​"  # zero-width space: a format (Cf) character
+ZWSP = "\u200b"  # zero-width space: a format (Cf) character
 
 
 # --- clean_text: the stored form ---
@@ -30,10 +30,10 @@ ZWSP = "​"  # zero-width space: a format (Cf) character
     ("text", "stored"),
     [
         ("  é ", "é"),  # the ends are trimmed
-        ("é", "é"),  # NFC composes e + combining acute
-        ("a 　b\tc", "a b c"),  # ideographic space and tab collapse to one space
+        ("e\u0301", "é"),  # NFC composes e + combining acute
+        ("a \u3000b\tc", "a b c"),  # ideographic space and tab collapse to one space
         ("GAPDH" + ZWSP, "GAPDH"),  # format characters are dropped
-        ("β-actin \n 10 µM", "β-actin 10 µM"),  # NBSP and newline
+        ("β-actin\u00a0\n 10 µM", "β-actin 10 µM"),  # NBSP and newline
         ("Na⁺/K⁺-ATPase", "Na⁺/K⁺-ATPase"),  # visible text is never rewritten (no NFKC)
         ("10 μM", "10 μM"),  # the Greek mu stays: only the keys merge it with µ
     ],
@@ -42,7 +42,7 @@ def test_clean_text_stores_invisible_changes_only(text, stored):
     assert clean_text(text) == stored
 
 
-@pytest.mark.parametrize("text", ["", "   ", "  " + ZWSP + " ", "　\t\n"])
+@pytest.mark.parametrize("text", ["", "   ", "  " + ZWSP + " ", "\u3000\t\n"])
 def test_clean_text_refuses_blank_text(text):
     with pytest.raises(TextError) as info:
         clean_text(text)
@@ -72,7 +72,7 @@ def test_text_key_merges_look_alikes_and_keeps_case():
     assert text_key(f"10 {MICRO}M") == text_key(f"10 {MU}M")
     assert text_key("Ctrl") != text_key("ctrl")
     assert text_key("GAPDH" + ZWSP) == text_key("GAPDH")  # NFKC alone keeps U+200B
-    assert text_key(" a　 b ") == "a b"
+    assert text_key(" a\u3000 b ") == "a b"
 
 
 def test_text_key_never_raises():
@@ -132,7 +132,7 @@ def test_resolve_label_exact_then_key_then_none():
 
 def test_clean_text_is_nfc_after_dropping_a_joiner():
     # A zero-width joiner between "e" and a combining acute blocks composition.
-    cleaned = clean_text("e‍́")
+    cleaned = clean_text("e\u200d\u0301")
     assert cleaned == "é"
     assert unicodedata.is_normalized("NFC", cleaned)
 
