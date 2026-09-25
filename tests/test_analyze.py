@@ -158,7 +158,7 @@ def test_fold_change_unaffected_by_plot_subset_without_reference():
 
 
 def test_fold_change_all_control_lanes_excluded_raises():
-    with pytest.raises(ValueError, match="has no values"):
+    with pytest.raises(ValueError, match="has no included values"):
         fold_change_lane([2, 4, 6], ["c", "c", "x"], "c", included=[False, False, True])
 
 
@@ -194,6 +194,13 @@ def test_reduce_representative_keeps_first_repeat():
         method=ReduceMethod.REPRESENTATIVE,
     )
     assert r.groups["a"] == [100.0, 80.0]  # first lane of s1, not the mean
+
+
+def test_reduce_unnamed_lane_never_merges_with_a_digit_sample_name():
+    # Lane 2 has no sample name; it must stay its own sample, not join the one named "2".
+    r = reduce_samples([1.0, 2.0, 6.0], ["c", "c", "c"], ["1", "2", None])
+    assert r.groups == {"c": [1.0, 2.0, 6.0]}
+    assert r.averaged == []
 
 
 def test_reduce_excludes_presentation_only_lanes():

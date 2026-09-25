@@ -254,21 +254,23 @@ def reduce_samples(
     if len(values) != n:
         raise ValueError("values and conditions length mismatch")
     if samples is None:
-        samples = [str(i) for i in range(n)]
+        samples = [None] * n
     elif len(samples) != n:
         raise ValueError("samples and conditions length mismatch")
     if included is not None and len(included) != n:
         raise ValueError("included and conditions length mismatch")
 
     # Collect each (condition, sample)'s lane values, preserving first-seen order.
-    buckets: dict[tuple[str, str], list[float]] = {}
-    order: list[tuple[str, str]] = []
+    # An unnamed lane is its own sample, keyed by its int position so it can never
+    # merge with a sample the user named with a digit (e.g. "2").
+    buckets: dict[tuple[str, str | int], list[float]] = {}
+    order: list[tuple[str, str | int]] = []
     for i in range(n):
         if included is not None and not included[i]:
             continue
         if values[i] is None:
             continue
-        key = (conditions[i], str(samples[i]) if samples[i] is not None else str(i))
+        key = (conditions[i], str(samples[i]) if samples[i] is not None else i)
         if key not in buckets:
             buckets[key] = []
             order.append(key)
@@ -277,12 +279,12 @@ def reduce_samples(
     groups: dict[str, list[float]] = {}
     averaged: list[tuple[str, str]] = []
     for key in order:
-        cond, _sample = key
+        cond, sample = key
         vals = buckets[key]
         reduced = float(np.mean(vals)) if method is ReduceMethod.MEAN else vals[0]
         groups.setdefault(cond, []).append(reduced)
-        if len(vals) > 1:
-            averaged.append(key)
+        if len(vals) > 1:  # only named samples can span several lanes
+            averaged.append((cond, str(sample)))
 
     warnings: list[str] = []
     if averaged:
@@ -317,7 +319,7 @@ def fold_change_lane(
     reduction = reduce_samples(values, conditions, samples, included=included, method=method)
     control_vals = reduction.groups.get(control_condition, [])
     if not control_vals:
-        raise ValueError(f"control condition {control_condition!r} has no values")
+        raise ValueError(f"control condition {control_condition!r} has no included values")
     baseline = float(np.mean(control_vals))
     if baseline <= 0:
         raise ValueError("control condition mean is non-positive; cannot form fold-change")
