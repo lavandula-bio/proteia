@@ -8,12 +8,12 @@ refuses a size that would force an overlap; :func:`normalize_corners` reads
 napari shape vertices.
 
 The placement rules of the napari app's box handlers are lifted here so the
-GUI-independent project operations apply them too: :func:`centered_rect` places
-a box of the shared size on a point, clamped into the image; :func:`center_snap`
-reads an edited rect by its centre (napari's ``_center_snap``);
-:func:`initial_box_size` is a new protein's default size (``_initial_size``);
-and :func:`grow_to_fit` fits the shared size to a seed-grown band
-(``_seed_grow``). Only one protein's own boxes must not overlap
+project operations (:mod:`proteia.core.operations`) apply them too:
+:func:`centered_rect` places a box of the shared size on a point, clamped into
+the image; :func:`center_snap` reads an edited rect by its centre (napari's
+``_center_snap``); :func:`initial_box_size` is a new protein's default size
+(``_initial_size``); and :func:`grow_to_fit` fits the shared size to a
+seed-grown band (``_seed_grow``). Only one protein's own boxes must not overlap
 (:func:`overlaps_any`); boxes of different proteins may.
 
 Coordinates use the model's :data:`~proteia.core.model.Rect` convention:

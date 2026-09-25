@@ -10,15 +10,23 @@ visible-light marker and a reprobe of the same blot; ``mem-5`` holds one JPEG on
 light-on-dark. The target β-catenin (``img-2``) normalizes against α-tubulin on
 the other membrane; GAPDH is measured on the reprobe. Lane 2 has no β-catenin
 band, and band lists are given out of order.
+
+Image helpers for tests that read real pixels: :func:`write_tiff` and
+:func:`synthetic_blot`.
 """
 
 import hashlib
+from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import pytest
+import tifffile
 
 from proteia.core.model import Project
 from proteia.core.storage import image_path
+
+MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
 
 
 def image_bytes(image_id: str) -> bytes:
@@ -199,3 +207,36 @@ def write_image_files(folder: Path, project: Project) -> None:
         path = image_path(folder, image)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(image_bytes(image.id))
+
+
+# --- Real pixels ---
+
+
+def write_tiff(path: Path, pixels: np.ndarray) -> Path:
+    """Write ``pixels`` as an uncompressed single-image TIFF (parents created)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(path, pixels)
+    return path
+
+
+def synthetic_blot(
+    shape: tuple[int, int],
+    bands: Sequence[tuple[float, float, float, float, float]],
+    *,
+    dtype: type = np.uint16,
+) -> np.ndarray:
+    """A flat membrane at :data:`MEMBRANE_LEVEL` darkened by Gaussian bands.
+
+    ``shape`` is ``(height, width)``; each band is ``(cx, cy, sx, sy, depth)``:
+    its centre, its horizontal and vertical 1/e half-widths in pixels, and how
+    much darker its centre is. Integer types are rounded and clipped to their range.
+    """
+    height, width = shape
+    y, x = np.mgrid[0:height, 0:width].astype(float)
+    image = np.full(shape, MEMBRANE_LEVEL)
+    for cx, cy, sx, sy, depth in bands:
+        image -= depth * np.exp(-(((x - cx) / sx) ** 2) - ((y - cy) / sy) ** 2)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        image = np.clip(np.round(image), info.min, info.max)
+    return image.astype(dtype)
