@@ -14,8 +14,8 @@ parts:
   :func:`build_spine` (condition counts) — declare-first: generate the N lanes
   (stable positions + auto sample ids). This fixes N before any box is drawn, so
   a missing box becomes an empty slot rather than a shift.
-* :func:`propose_positions` — the left-to-right heuristic, demoted from
-  source-of-truth to an *editable proposal* of each box's lane position.
+* :func:`propose_lane` — position demoted from source of truth to a
+  *proposal* of a new box's lane, anchored on the boxes already placed.
 * :func:`join_to_spine` — reads the *explicit* lane positions and scatters each
   protein's nets into the spine. A gap is a ``None`` slot that does not move its
   neighbours — this is what cures the position-inference scramble (see the legacy
@@ -27,7 +27,8 @@ auto-detect / OCR are just smarter proposers feeding the same explicit identity.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import itertools
+from collections.abc import Collection, Sequence
 
 from proteia.core.model import Lane
 
@@ -89,19 +90,66 @@ def spine_from_labels(labels: Sequence[str]) -> list[Lane]:
     return lanes
 
 
-def propose_positions(boxes: Sequence[tuple[int, float]]) -> list[tuple[int, float]]:
-    """Propose a lane position for each box by left-to-right x order.
+def propose_lane(
+    x: float,
+    anchors: Sequence[tuple[float, int]],
+    n_lanes: int,
+    width: int,
+    free: Collection[int],
+) -> int | None:
+    """Propose the lane of a box whose centre is at ``x`` on an image ``width`` wide.
 
-    ``boxes`` is ``(x, net)``; returns ``(position, net)`` with positions
-    ``0, 1, 2, ...`` in ascending x. This is the #20 heuristic demoted to a
-    *proposer*: its output is an editable suggestion of each box's identity, not
-    the truth. Once a user corrects it (e.g. marks a slot empty), the explicit
-    position is stored and :func:`join_to_spine` reads it directly — nothing is
-    re-inferred on later refreshes, which is what the old grid inference got
-    wrong when a box was missing.
+    ``anchors`` are ``(centre x, stored lane index)`` of the boxes already placed
+    on the same image, of any protein: the lanes are the same columns of the
+    membrane. From them the lane is estimated as a fractional index:
+
+    * two or more anchored lanes: piecewise-linear between the lanes' mean
+      centres, and past the outermost ones along the nearest pair, so uneven
+      spacing (a smiling gel) is followed; if the centres do not rise with the
+      lane index, a least-squares line instead;
+    * one anchored lane: that lane plus the distance in lane pitches, taking the
+      pitch as ``width / n_lanes``;
+    * none: lanes spread evenly across the image.
+
+    Returns the lane in ``free`` nearest the estimate (the left one on a tie), or
+    None when no lane is free. It is only a proposal: once stored, a band's lane
+    is identity and never follows its x again (:func:`join_to_spine`).
     """
-    ordered = sorted(boxes, key=lambda bn: bn[0])
-    return [(i, net) for i, (_x, net) in enumerate(ordered)]
+    if n_lanes < 1:
+        raise ValueError("n_lanes must be >= 1")
+    candidates = sorted(lane for lane in free if 0 <= lane < n_lanes)
+    if not candidates:
+        return None
+    pitch = width / n_lanes
+    by_lane: dict[int, list[float]] = {}
+    for cx, lane in anchors:
+        by_lane.setdefault(lane, []).append(cx)
+    points = sorted((lane, sum(xs) / len(xs)) for lane, xs in by_lane.items())
+    if not points:
+        estimate = x / pitch - 0.5  # lane i is centred at (i + 0.5) * pitch
+    elif len(points) == 1:
+        lane, cx = points[0]
+        estimate = lane + (x - cx) / pitch
+    else:
+        estimate = _estimate_lane(x, points)
+    return min(candidates, key=lambda lane: (abs(lane - estimate), lane))
+
+
+def _estimate_lane(x: float, points: list[tuple[int, float]]) -> float:
+    """A fractional lane at ``x`` from two or more ``(lane, centre x)`` points."""
+    lanes = [lane for lane, _ in points]
+    xs = [cx for _, cx in points]
+    if all(a < b for a, b in itertools.pairwise(xs)):
+        # The segment holding x, or the end segment that x lies beyond.
+        i = next((k for k in range(len(xs) - 1) if x <= xs[k + 1]), len(xs) - 2)
+        slope = (lanes[i + 1] - lanes[i]) / (xs[i + 1] - xs[i])
+        return lanes[i] + (x - xs[i]) * slope
+    mean_x, mean_lane = sum(xs) / len(xs), sum(lanes) / len(lanes)
+    spread = sum((cx - mean_x) ** 2 for cx in xs)
+    if spread == 0:
+        return mean_lane
+    slope = sum((cx - mean_x) * (lane - mean_lane) for lane, cx in points) / spread
+    return mean_lane + (x - mean_x) * slope
 
 
 def join_to_spine(
@@ -110,7 +158,7 @@ def join_to_spine(
     """Scatter each protein's nets into an ``n_lanes``-slot spine by explicit position.
 
     Each protein is a sequence of ``(position, net)`` where ``position`` is the
-    box's stored lane identity (from :func:`propose_positions` or a user edit).
+    box's stored lane identity (from :func:`propose_lane` or a user edit).
     The net is placed at exactly that slot; a slot with no box stays ``None`` and
     does **not** shift its neighbours. Positions outside ``[0, n_lanes)`` are
     dropped; if two boxes claim one slot the later one wins.

@@ -78,7 +78,7 @@ from proteia.core.names import (
     unify_spellings,
 )
 from proteia.core.plotspec import ErrorType
-from proteia.core.project import spine_axes
+from proteia.core.project import propose_lane, spine_axes
 from proteia.core.quantify import estimate_background, net_signal
 from proteia.core.results import Results
 from proteia.core.session import (
@@ -366,6 +366,18 @@ def _pin_single_loading_control(batch: Batch) -> None:
     for protein in batch.proteins:
         if protein.role is Role.TARGET and not protein.loading_control_ids:
             protein.loading_control_ids = list(only)
+
+
+def _lane_anchors(batch: Batch, image_id: str) -> list[tuple[float, int]]:
+    """``(centre x, stored lane)`` of every first band on an image, of any protein."""
+    anchors = []
+    for protein in batch.proteins:
+        if protein.image_id == image_id:
+            for band in protein.bands:
+                if band.band_index == 0:
+                    x0, _, x1, _ = band.box.rect(protein.box_size)
+                    anchors.append(((x0 + x1) / 2, band.lane_index))
+    return anchors
 
 
 def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> list[str]:
@@ -798,10 +810,22 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
 
 @_locked
 def place_box(
-    session: ProjectSession, protein_id: str, x: int, y: int, *, lane_index: int, grow: bool
+    session: ProjectSession,
+    protein_id: str,
+    x: int,
+    y: int,
+    *,
+    lane_index: int | None = None,
+    grow: bool,
 ) -> str:
     """Place a box of a protein in a lane at the image point ``(x, y)``; return
     the band id.
+
+    Without ``lane_index``, the lane is proposed from the box's position
+    (:func:`~proteia.core.project.propose_lane`), anchored on the boxes already
+    on the image, among the lanes where the protein has no box yet. Either way
+    the lane is stored with the band, and moving or removing other boxes never
+    changes it.
 
     ``grow=True`` is a seed click: the band is grown from the point and the
     protein's shared size fitted to it (the first box sets the size, later ones
@@ -812,22 +836,29 @@ def place_box(
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     x, y = _int(x, "x"), _int(y, "y")
-    lane_index = _int(lane_index, "lane index")
+    lane_index = None if lane_index is None else _int(lane_index, "lane index")
     if not isinstance(grow, bool):
         raise _invalid(f"grow must be True or False, not {grow!r}")
     n = len(batch.lanes)
     if n == 0:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before placing boxes")
-    if not 0 <= lane_index < n:
+    taken = {b.lane_index: b.id for b in protein.bands if b.band_index == 0}
+    if lane_index is None:
+        if len(taken) >= n:
+            raise OperationError(
+                ErrorCode.LANE_OCCUPIED,
+                f"{protein.name!r} already has a box in every lane",
+                ids=list(taken.values()),
+            )
+    elif not 0 <= lane_index < n:
         raise OperationError(
             ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane_index} is not one of the {n} lanes"
         )
-    occupied = [b.id for b in protein.bands if b.lane_index == lane_index and b.band_index == 0]
-    if occupied:
+    elif lane_index in taken:
         raise OperationError(
             ErrorCode.LANE_OCCUPIED,
             f"{protein.name!r} already has a box in lane {lane_index}",
-            ids=occupied,
+            ids=[taken[lane_index]],
         )
     image = batch.find_image(protein.image_id)
     width, height = image.width, image.height
@@ -860,6 +891,15 @@ def place_box(
                 ErrorCode.OVERLAP, "the box would overlap another box of this protein", ids=hits
             )
         source = ProposalSource.MANUAL
+    if lane_index is None:
+        lane_index = propose_lane(
+            (rect[0] + rect[2]) / 2,
+            _lane_anchors(batch, image.id),
+            n,
+            width,
+            free=[lane for lane in range(n) if lane not in taken],
+        )
+        assert lane_index is not None  # a free lane exists: checked above
 
     def change(draft: Project) -> str:
         edited = draft.batch.find_protein(protein_id)

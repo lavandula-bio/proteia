@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from conftest import make_project, synthetic_blot, write_image_files, write_tiff
-from proteia.core import boxes, storage
+from proteia.core import boxes, results, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
@@ -1272,3 +1272,67 @@ def test_a_hook_error_after_the_commit_keeps_the_committed_cache(tmp_path):
         ops.remove_image(s, image)
     assert image not in {i.id for i in s.project.batch.iter_images()}  # committed
     assert image not in s._pixels  # the removed image's pixels do not come back
+
+
+# --- #43: lane identity when boxes are placed without a lane ---
+
+LANES = 6
+LANE_W, LANE_H = 360, 60  # six lanes centred at 30, 90, ..., 330
+LANE_ROW = 30
+
+
+def lane_x(lane: int) -> int:
+    return 30 + 60 * lane
+
+
+def lanes_session(tmp_path: Path) -> tuple[ProjectSession, str]:
+    """Six declared lanes, one blot with a band in every lane, one target."""
+    s = session_on(tmp_path)
+    bands = [(lane_x(i), LANE_ROW, 6.0, 3.0, 30000.0) for i in range(LANES)]
+    image = import_blot(s, synthetic_blot((LANE_H, LANE_W), bands))
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(LANES)])
+    return s, ops.add_protein(s, "β-catenin", Role.TARGET, image)
+
+
+@pytest.mark.parametrize(
+    "lanes",
+    [[1, 2, 3, 4, 5], [0, 1, 3, 4, 5], [0, 1, 2, 3, 4], [1, 2, 3, 4], [4, 1, 3, 2]],
+    ids=["missing-first", "missing-middle", "missing-last", "missing-first-and-last", "any-order"],
+)
+@pytest.mark.parametrize("grow", [True, False], ids=["seed-click", "fixed-box"])
+def test_boxes_placed_without_a_lane_land_in_their_lanes(tmp_path, lanes, grow):
+    # No other protein anchors the grid: the lanes come from the position alone.
+    s, protein = lanes_session(tmp_path)
+    for lane in lanes:
+        band = ops.place_box(s, protein, lane_x(lane), LANE_ROW, grow=grow)
+        assert band_of(s, band).lane_index == lane
+    nets = results.lane_nets(s.project.batch)[protein]
+    assert [i for i, net in enumerate(nets) if net is not None] == sorted(lanes)
+
+
+def test_moving_or_removing_a_box_never_changes_another_lane(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    bands = {
+        lane: ops.place_box(s, protein, lane_x(lane), LANE_ROW, grow=False) for lane in (0, 2, 4, 5)
+    }
+    ops.remove_box(s, bands[2])
+    ops.move_box(s, bands[4], (lane_x(4) - 9, 20, lane_x(4) + 1, 40))  # nudged left
+    kept = (bands[0], bands[4], bands[5])
+    assert [band_of(s, band_id).lane_index for band_id in kept] == [0, 4, 5]
+    # The next box without a lane is proposed among the free lanes, anchored on the rest.
+    new = ops.place_box(s, protein, lane_x(2), LANE_ROW, grow=False)
+    assert band_of(s, new).lane_index == 2
+    # Dragging a box over another lane's position keeps its lane: identity, not x.
+    ops.move_box(s, bands[5], (lane_x(3) - 5, 20, lane_x(3) + 5, 40))
+    assert band_of(s, bands[5]).lane_index == 5
+    assert [band_of(s, band_id).lane_index for band_id in (bands[0], bands[4], new)] == [0, 4, 2]
+
+
+def test_a_protein_with_a_box_in_every_lane_refuses_one_more(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    for lane in range(LANES):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(0), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_OCCUPIED
+    assert len(info.value.ids) == LANES

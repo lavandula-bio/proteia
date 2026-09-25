@@ -8,7 +8,7 @@ from proteia.core.project import (
     align_to_lanes,
     build_spine,
     join_to_spine,
-    propose_positions,
+    propose_lane,
     spine_axes,
     spine_from_labels,
 )
@@ -100,15 +100,43 @@ def test_spine_from_labels_empty():
     assert spine_from_labels([]) == []
 
 
-# --- propose_positions: x-order demoted to an editable proposal ---
+# --- propose_lane: position proposes a new box's lane; stored lanes anchor it ---
+
+W, N = 800, 8  # lanes centred at 50, 150, ..., 750 when evenly spread
+ALL = range(N)
 
 
-def test_propose_positions_assigns_sequential_by_x():
-    assert propose_positions([(50, 8.0), (10, 3.0), (90, 5.0)]) == [
-        (0, 3.0),
-        (1, 8.0),
-        (2, 5.0),
-    ]
+def test_propose_lane_without_anchors_spreads_lanes_evenly():
+    assert [propose_lane(50 + 100 * i, [], N, W, ALL) for i in range(N)] == list(ALL)
+    assert propose_lane(0, [], N, W, ALL) == 0
+    assert propose_lane(W - 1, [], N, W, ALL) == N - 1
+
+
+def test_propose_lane_follows_one_anchor_by_lane_pitch():
+    # Lane 2 sits at x=300 instead of 250: neighbours shift with it.
+    assert propose_lane(400, [(300.0, 2)], N, W, ALL) == 3
+    assert propose_lane(200, [(300.0, 2)], N, W, ALL) == 1
+
+
+def test_propose_lane_interpolates_uneven_spacing_between_anchors():
+    # A smiling gel: lanes 0 and 4 at 50 and 530 (pitch 120), lane 7 at 800 (pitch 90).
+    anchors = [(50.0, 0), (530.0, 4), (800.0, 7)]
+    assert propose_lane(290, anchors, N, 900, ALL) == 2
+    assert propose_lane(710, anchors, N, 900, ALL) == 6
+    assert propose_lane(-40, anchors, N, 900, ALL) == 0  # extrapolated, clamped to lane 0
+
+
+def test_propose_lane_averages_anchors_of_one_lane_and_skips_taken_lanes():
+    anchors = [(140.0, 1), (160.0, 1), (350.0, 3)]  # two proteins' boxes in lane 1
+    assert propose_lane(150, anchors, N, W, ALL) == 1
+    assert propose_lane(150, anchors, N, W, [0, 2, 3]) == 0  # nearest free, left on a tie
+    assert propose_lane(150, anchors, N, W, []) is None
+
+
+def test_propose_lane_falls_back_to_a_line_when_centres_do_not_rise():
+    # Stored lanes that contradict their x order (a user correction): fit a line.
+    anchors = [(100.0, 0), (300.0, 2), (250.0, 3)]
+    assert propose_lane(400, anchors, N, W, ALL) in range(N)
 
 
 # --- join_to_spine: scatter by explicit identity, gaps don't shift ---
