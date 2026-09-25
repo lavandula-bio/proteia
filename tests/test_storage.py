@@ -39,6 +39,7 @@ from proteia.core.storage import (
     image_path,
     load_project,
     migrate,
+    orphan_files,
     project_from_json,
     project_to_json,
     save_project,
@@ -281,6 +282,12 @@ def test_load_rejects_malformed_file(data):
         project_from_json(data)
 
 
+def test_load_rejects_absurdly_deep_nesting():
+    # A corrupt file must be a format error, not a RecursionError.
+    with pytest.raises(ProjectFormatError):
+        project_from_json(b"[" * 100_000 + b"]" * 100_000)
+
+
 def test_load_accepts_bom_and_crlf():
     project = make_project()
     data = b"\xef\xbb\xbf" + project_to_json(project).replace(b"\n", b"\r\n")
@@ -489,3 +496,30 @@ def test_verify_images_reports_changed_and_missing(tmp_path):
     changed.write_bytes(bytes(data))
     (tmp_path / "images" / "img-6.jpg").unlink()
     assert verify_images(project, tmp_path) == ["img-2", "img-6"]
+
+
+def test_orphan_files_lists_unreferenced_files(tmp_path):
+    project = make_project()
+    assert orphan_files(project, tmp_path) == []  # no images/ folder yet
+    write_image_files(tmp_path, project)
+    assert orphan_files(project, tmp_path) == []
+    # An import that was never saved, and a temp file left by a crash.
+    store_image(tmp_path, "img-19", "unsaved α.tif", io.BytesIO(b"pixels"))
+    stale = tmp_path / "images" / ".img-20.tif.abc.part"
+    stale.write_bytes(b"partial")
+    assert orphan_files(project, tmp_path) == [stale, tmp_path / "images" / "img-19.tif"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_saved_files_get_default_permissions(tmp_path):
+    umask = os.umask(0)
+    os.umask(umask)
+    expected = 0o666 & ~umask
+    project = make_project()
+    path = _saved(tmp_path, project)
+    assert path.stat().st_mode & 0o777 == expected  # not mkstemp's owner-only 0600
+    path.chmod(0o640)
+    save_project(project, tmp_path)
+    assert path.stat().st_mode & 0o777 == 0o640  # a replaced file keeps its mode
+    stored = store_image(tmp_path, "img-19", "new β.tif", io.BytesIO(b"pixels"))
+    assert (tmp_path / "images" / stored.file).stat().st_mode & 0o777 == expected

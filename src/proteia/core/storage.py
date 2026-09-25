@@ -12,7 +12,9 @@ Stored names come only from validated ids plus a whitelisted suffix; an image's
 ``original_name`` never becomes a path. A crash can leave orphan files (a temp
 file, or an image no saved project references) but never a dangling reference:
 an image is stored before the model references it, and a file is deleted only
-after a saved ``project.json`` no longer references it.
+after a saved ``project.json`` no longer references it. An orphan image can hold
+an id that a failed or unsaved import gave back, so importing removes
+:func:`orphan_files` before storing a new image.
 
 Canonical form. ``project.json`` is ``json.dumps`` of the re-validated model's
 JSON-mode dump with sorted keys, ``indent=1``, ``ensure_ascii=False`` and
@@ -169,7 +171,9 @@ def project_from_json(data: bytes) -> Project:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
         )
-    except ValueError as exc:  # includes UnicodeDecodeError and JSONDecodeError
+    # ValueError includes UnicodeDecodeError and JSONDecodeError; RecursionError
+    # comes from absurdly deep nesting in a corrupt file.
+    except (ValueError, RecursionError) as exc:
         raise ProjectFormatError(f"project.json is not valid JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise ProjectFormatError("project.json must hold a JSON object")
@@ -243,12 +247,12 @@ def _missing_images(project: Project, folder: str | os.PathLike[str]) -> list[st
     ]
 
 
-def _replace(src: str, dst: Path) -> None:
-    """``os.replace``, retried while Windows reports a sharing violation."""
+def _replace(src: Path, dst: Path) -> None:
+    """``Path.replace``, retried while Windows reports a sharing violation."""
     delay = REPLACE_DELAY
     for attempt in range(REPLACE_ATTEMPTS):
         try:
-            os.replace(src, dst)
+            src.replace(dst)
             return
         except PermissionError:
             if attempt == REPLACE_ATTEMPTS - 1:
@@ -258,33 +262,58 @@ def _replace(src: str, dst: Path) -> None:
 
 
 def _fsync_dir(directory: Path) -> None:
+    """Best effort: make a rename in ``directory`` durable (POSIX only)."""
     if os.name == "nt":  # Windows cannot open a directory to fsync it
         return
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    # The rename already succeeded, and some filesystems (network or FUSE mounts)
+    # refuse to fsync a directory.
+    with contextlib.suppress(OSError):
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _file_mode(target: Path) -> int | None:
+    """The permission bits a new file should get on POSIX (``None`` on Windows).
+
+    ``mkstemp`` creates owner-only (0600) files, which would lock other users out
+    of a project folder on a shared volume: keep the replaced file's mode, or use
+    the default mode for new files under the current umask.
+    """
+    if os.name == "nt":
+        return None
+    with contextlib.suppress(OSError):
+        return target.stat().st_mode & 0o777
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+def _temp_file(directory: Path, name: str, suffix: str) -> tuple[int, Path]:
+    # The same directory means the same volume, so the later replace is atomic.
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{name}.", suffix=suffix)
+    return fd, Path(tmp)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
     """Replace ``path`` with ``data`` so a reader sees either the old or the new bytes."""
-    # The same directory means the same volume, so the replace is atomic.
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    mode = _file_mode(path)
+    fd, tmp = _temp_file(path.parent, path.name, ".tmp")
     try:
         # Closed before the replace: Windows cannot replace with an open file.
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        if mode is not None:
+            tmp.chmod(mode)
         _replace(tmp, path)
-        # Best effort: the replace already succeeded, and some filesystems (network
-        # or FUSE mounts) refuse to fsync a directory.
-        with contextlib.suppress(OSError):
-            _fsync_dir(path.parent)
+        _fsync_dir(path.parent)
     finally:
         with contextlib.suppress(OSError):  # already gone after a successful replace
-            os.unlink(tmp)
+            tmp.unlink(missing_ok=True)
 
 
 def save_project(project: Project, folder: str | os.PathLike[str]) -> Path:
@@ -352,9 +381,10 @@ def store_image(
     file = image_id + suffix
     target = images / file
     if target.exists():
-        raise FileExistsError(f"{target} already exists")
+        raise FileExistsError(f"{target} already exists (remove orphan_files first)")
     images.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=images, prefix=f".{file}.", suffix=".part")
+    mode = _file_mode(target)
+    fd, tmp = _temp_file(images, file, ".part")
     digest = hashlib.sha256()
     size = 0
     try:
@@ -369,11 +399,31 @@ def store_image(
                 raise ValueError(f"image {original_name!r} is empty")
             out.flush()
             os.fsync(out.fileno())
+        if mode is not None:
+            tmp.chmod(mode)
         _replace(tmp, target)
+        # The image must be durable before a saved project.json can reference it.
+        _fsync_dir(images)
     finally:
         with contextlib.suppress(OSError):
-            os.unlink(tmp)
+            tmp.unlink(missing_ok=True)
     return StoredImage(file=file, sha256=digest.hexdigest(), size=size)
+
+
+def orphan_files(project: Project, folder: str | os.PathLike[str]) -> list[Path]:
+    """Files in ``images/`` that ``project`` does not reference, sorted by name.
+
+    These are left by a crash or by an import that was never saved: stale
+    ``.part``/``.tmp`` files, and images whose id the project may hand out again.
+    The import operation removes them before storing a new image.
+    """
+    images = Path(folder) / IMAGES_DIR
+    if not images.is_dir():
+        return []
+    referenced = {image.file for image in project.batch.iter_images()}
+    return sorted(
+        path for path in images.iterdir() if path.is_file() and path.name not in referenced
+    )
 
 
 def verify_images(project: Project, folder: str | os.PathLike[str]) -> list[str]:
