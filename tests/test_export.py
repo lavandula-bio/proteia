@@ -44,5 +44,8 @@ def test_lane_table_rounds_nets_to_three_decimals(tmp_path):
 def test_lane_table_rejects_misaligned_columns(tmp_path):
     with pytest.raises(ValueError, match="same length"):
         write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1"], [True, True], [])
+    with pytest.raises(ValueError, match="same length"):
+        write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1", "s2"], [True], [])
+    assert not (tmp_path / "t.csv").exists()  # checked before the file is opened
     with pytest.raises(ValueError, match="2 lanes"):
         write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1", "s2"], [True, True], [("p", [1])])

@@ -1108,9 +1108,13 @@ def launch(image_path: str | None = None) -> None:
         if not path:
             return
         names = [p["name"] or f"protein{i}" for i, p in enumerate(proteins)]
-        write_lane_table(
-            path, conditions, samples, included, list(zip(names, aligned, strict=True))
-        )
+        try:
+            write_lane_table(
+                path, conditions, samples, included, list(zip(names, aligned, strict=True))
+            )
+        except OSError as exc:  # e.g. the file is still open (locked) in Excel
+            show_info(f"Could not write {path}: {exc.strerror or exc}. Close it and retry.")
+            return
         show_info(f"Exported {n} lanes x {len(proteins)} proteins to {path}")
 
     shapes.events.data.connect(on_edit)
