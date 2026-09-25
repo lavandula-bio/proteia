@@ -14,6 +14,7 @@ example via `pip-licenses`). The principal runtime dependencies are:
 | SciPy | BSD-3-Clause |
 | scikit-image | BSD-3-Clause |
 | tifffile | BSD-3-Clause |
+| Pillow | MIT-CMU (formerly HPND) |
 
 **License hygiene note.** The Qt binding is **PySide6 (LGPL)**, not PyQt
 (GPL), to keep Proteia's dependency graph compatible with permissive

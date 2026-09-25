@@ -91,25 +91,51 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool]:
             )
         keyframe = series[0].keyframe
         lossy = int(keyframe.compression) in _LOSSY_TIFF_COMPRESSION
+        shape, dtype, codec = series[0].shape, keyframe.dtype, keyframe.compression.name
         try:
             pixels = series[0].asarray()
         except ValueError as exc:
             if "imagecodecs" not in str(exc):
                 raise
-            raise ValueError(
-                f"{path.name}: {keyframe.compression.name} compression cannot be decoded"
-                " by this installation; save the image as an uncompressed TIFF"
-            ) from exc
+            pixels = None  # tifffile has no decoder for this compression
+    if pixels is None:
+        # Pillow returns channels last; its result must match what the file declares.
+        expected = (shape[1], shape[2], shape[0]) if axes == "SYX" else tuple(shape)
+        return _read_tiff_with_pillow(path, codec, expected, dtype), lossy
     # Planar color stores the channels first.
     if axes == "SYX" and pixels.ndim == 3 and pixels.shape[0] in (2, 3, 4):
         pixels = np.moveaxis(pixels, 0, -1)
     return pixels, lossy
 
 
+def _read_tiff_with_pillow(
+    path: Path, codec: str, shape: tuple[int, ...], dtype: np.dtype
+) -> np.ndarray:
+    """Decode a TIFF whose compression (LZW, Deflate, JPEG, ...) tifffile cannot
+    decode on its own. Pillow reads 8- and 16-bit gray and 8-bit color; anything
+    it would convert (16-bit color, for one) is refused, never read with a
+    changed scale."""
+    from PIL import Image
+
+    refusal = (
+        f"{path.name}: {codec} compression of a {'x'.join(map(str, shape))} {dtype} image"
+        " cannot be decoded by this installation; save the image as an uncompressed TIFF"
+    )
+    try:
+        with Image.open(path) as image:
+            pixels = np.asarray(image)
+    except Exception as exc:  # Pillow's decoder errors are not all OSError
+        raise ValueError(refusal) from exc
+    if pixels.shape != shape or pixels.dtype != dtype:
+        raise ValueError(refusal)
+    return pixels
+
+
 def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
     """Read the stored pixels: 2-D gray, or 3-D with 2, 3 or 4 channels last.
 
-    TIFF files are read with tifffile; other formats go through scikit-image.
+    TIFF files are read with tifffile (with Pillow for compressions tifffile cannot
+    decode on its own); other formats go through scikit-image.
     """
     return _read(Path(path))[0]
 

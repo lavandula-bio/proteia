@@ -10,6 +10,7 @@ dependencies = [
     "matplotlib>=3.9",
     "napari[pyside6]>=0.7",
     "numpy>=2.1",
+    "pillow>=12",
     "pydantic>=2.13.4",
     "scikit-image>=0.25",
     "scipy>=1.14",

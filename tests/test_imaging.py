@@ -6,9 +6,11 @@ import hashlib
 import numpy as np
 import pytest
 import tifffile
+from PIL import Image
 from skimage import io
 
 from proteia.core.imaging import (
+    _read_tiff_with_pillow,
     display_rgb,
     from_pixels,
     load_image,
@@ -215,10 +217,11 @@ def test_pixels_in_memory_follow_the_same_rules():
 
 
 def test_jpeg_compressed_tiff_records_a_lossy_format_warning(tmp_path):
-    pytest.importorskip("imagecodecs")  # tifffile needs it to write JPEG compression
     path = tmp_path / "jpeg inside.tif"
-    tifffile.imwrite(path, _gray(np.uint8, 255), compression="jpeg")
-    assert _codes(load_image(path)) == ["lossy_format"]
+    Image.fromarray(_gray(np.uint8, 255)).save(path, compression="jpeg")
+    loaded = load_image(path)
+    assert loaded.bit_depth == 8
+    assert _codes(loaded) == ["lossy_format"]
 
 
 def test_multi_channel_composite_is_refused(tmp_path):
@@ -240,19 +243,38 @@ def test_damaged_file_is_a_value_error(tmp_path, name, data):
         load_image(path)
 
 
-def test_lzw_tiff_reads_or_explains_the_missing_decoder(tmp_path):
-    from PIL import Image
+def _rgb8() -> np.ndarray:
+    gray = _gray(np.uint8, 255)
+    return np.stack([gray, gray // 2, gray // 3], axis=-1)
 
-    path = tmp_path / "lzw 16-bit.tif"
-    pixels = _gray(np.uint16, 65535)
-    Image.fromarray(pixels).save(path, compression="tiff_lzw")
-    try:
-        import imagecodecs  # noqa: F401
-    except ImportError:
-        with pytest.raises(ValueError, match="uncompressed TIFF"):
-            load_image(path)
-    else:
-        np.testing.assert_array_equal(load_image(path).array, pixels.astype(np.float64))
+
+@pytest.mark.parametrize(
+    ("pixels", "depth", "compression"),
+    [
+        (_gray(np.uint16, 65535), 16, "tiff_lzw"),
+        (_gray(np.uint8, 255), 8, "tiff_lzw"),
+        (_gray(np.uint16, 65535), 16, "tiff_adobe_deflate"),
+        (_rgb8(), 8, "tiff_lzw"),
+    ],
+    ids=["lzw-16-bit", "lzw-8-bit", "deflate-16-bit", "lzw-rgb"],
+)
+def test_compressed_tiff_is_read_exactly(tmp_path, pixels, depth, compression):
+    # tifffile needs imagecodecs for LZW; Pillow decodes it with the same values.
+    path = tmp_path / f"{compression} µ.tif"
+    Image.fromarray(pixels).save(path, compression=compression)
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, pixels)
+    assert loaded.bit_depth == depth
+
+
+def test_a_pillow_read_that_changes_the_pixels_is_refused(tmp_path):
+    # Pillow must return exactly what the file declares (e.g. never 8-bit for 16-bit).
+    path = tmp_path / "lzw.tif"
+    Image.fromarray(_gray(np.uint8, 255)).save(path, compression="tiff_lzw")
+    with pytest.raises(ValueError, match="uncompressed TIFF"):
+        _read_tiff_with_pillow(path, "LZW", (6, 8), np.dtype(np.uint16))
+    with pytest.raises(ValueError, match="uncompressed TIFF"):
+        _read_tiff_with_pillow(path, "LZW", (6, 8, 3), np.dtype(np.uint8))
 
 
 def test_display_rgb_views():
