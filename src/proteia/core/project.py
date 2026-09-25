@@ -98,10 +98,12 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     ``anchors`` are ``(centre x, stored lane index)`` of boxes already placed on
     the same image, of any protein: the lanes are the same columns of the
     membrane. Each lane's anchor is the median of its boxes' centres, and only
-    anchors whose centres rise with the lane index are kept (the longest such
-    run), so a box dragged far from its lane is ignored. A proposal needs the
-    lane pitch, so it needs two kept lanes; with fewer the answer is None and the
-    lane must be chosen. An image's margins and its first lane's offset are never
+    anchors whose centres move steadily with the lane index are kept (the longest
+    such run, left to right or, on a mirrored image, right to left), so a box
+    dragged far from its lane is ignored. (A lane anchored by just two boxes, one
+    of them dragged far, is anchored on their mean.) A proposal needs the lane
+    pitch, so it needs two kept lanes; with fewer the answer is None and the lane
+    must be chosen. An image's margins and its first lane's offset are never
     guessed.
 
     Between two neighbouring kept lanes the lane is interpolated, so uneven
@@ -113,7 +115,13 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     by_lane: dict[int, list[float]] = {}
     for cx, lane in anchors:
         by_lane.setdefault(lane, []).append(cx)
-    points = _rising(sorted((lane, statistics.median(xs)) for lane, xs in by_lane.items()))
+    medians = sorted((lane, statistics.median(xs)) for lane, xs in by_lane.items())
+    rising = _rising(medians)
+    falling = _rising([(lane, -cx) for lane, cx in medians])  # lanes numbered right to left
+    if len(falling) > len(rising):
+        points, x = falling, -x
+    else:
+        points = rising
     if len(points) < 2:
         return None
     pairs = list(itertools.pairwise(points))

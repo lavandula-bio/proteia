@@ -149,6 +149,12 @@ def test_the_dragged_box_is_dropped_not_its_neighbours(anchors):
     assert propose_lane(150, anchors) == 2  # lane 2's own place
 
 
+def test_propose_lane_on_a_mirrored_image():
+    # Lane 0 is on the right: the centres fall as the lane index rises.
+    anchors = [(330.0, 0), (270.0, 1)]
+    assert [propose_lane(330 - 60 * lane, anchors) for lane in range(6)] == list(range(6))
+
+
 # --- join_to_spine: scatter by explicit identity, gaps don't shift ---
 
 

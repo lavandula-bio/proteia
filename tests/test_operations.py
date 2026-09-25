@@ -1436,3 +1436,36 @@ def test_a_box_dragged_out_of_order_does_not_capture_other_lanes(tmp_path):
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
     band = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
     assert band_of(s, band).lane_index == 4
+
+
+def _grows_to(monkeypatch, rect) -> None:
+    """Make every seed click grow to ``rect``, to pin where the band lies."""
+    monkeypatch.setattr(ops, "grow_box", lambda *args, **kwargs: rect)
+
+
+def test_a_seed_click_takes_the_lane_of_the_band_not_of_the_click(tmp_path, monkeypatch):
+    # The click on the band's flank lies over occupied lane 3; the band is in lane 4.
+    s, protein = lanes_session(tmp_path)
+    for lane in (1, 3):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    _grows_to(monkeypatch, (lane_x(4) - 10, 25, lane_x(4) + 11, 36))
+    band = ops.place_box(s, protein, lane_x(3) + 5, 12, grow=True)
+    assert band_of(s, band).lane_index == 4
+
+
+def test_a_band_cut_by_the_image_edge_is_proposed_from_the_click(tmp_path, monkeypatch):
+    # The band runs off the left edge, so its visible centre sits a lane too far left.
+    s, protein = lanes_session(tmp_path)
+    for lane in (2, 4):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    _grows_to(monkeypatch, (0, 25, 100, 36))  # centre 50: lane 0 by the band, lane 1 by the click
+    band = ops.place_box(s, protein, 85, LANE_ROW, grow=True)
+    assert band_of(s, band).lane_index == 1
+
+
+def test_a_click_outside_the_image_is_out_of_image_with_or_without_a_lane(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    for lane_index in (None, 0):
+        with pytest.raises(OperationError) as info:
+            ops.place_box(s, protein, -1, LANE_ROW, lane_index=lane_index, grow=False)
+        assert info.value.code is ErrorCode.OUT_OF_IMAGE
