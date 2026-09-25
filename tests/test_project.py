@@ -128,10 +128,25 @@ def test_propose_lane_uses_the_median_centre_of_each_lane():
     assert propose_lane(250, anchors) == 2
 
 
-def test_one_box_far_from_its_lane_skews_only_its_neighbourhood():
+def test_a_box_dragged_out_of_order_is_ignored():
     anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]  # lanes 0-6 in place
     anchors.append((150.0, 7))  # lane 7 dragged over lane 2
     assert [propose_lane(30 + 60 * lane, anchors) for lane in range(7)] == list(range(7))
+
+
+@pytest.mark.parametrize(
+    "anchors",
+    [
+        [(30.0, 0), (90.0, 1), (330.0, 2), (210.0, 3)],  # lane 2 dragged right, a tie in length
+        [(30.0, 0), (90.0, 1), (400.0, 2), (210.0, 3), (270.0, 4)],
+    ],
+    ids=["tie", "longer-run"],
+)
+def test_the_dragged_box_is_dropped_not_its_neighbours(anchors):
+    # Clicks at lanes 4 and 5 (x = 270, 330) must not be captured by the dragged lane 2.
+    assert propose_lane(270, anchors) == 4
+    assert propose_lane(330, anchors) == 5
+    assert propose_lane(150, anchors) == 2  # lane 2's own place
 
 
 # --- join_to_spine: scatter by explicit identity, gaps don't shift ---

@@ -95,35 +95,62 @@ def spine_from_labels(labels: Sequence[str]) -> list[Lane]:
 def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     """Propose the lane of a box whose centre is at ``x``, or None when unsure.
 
-    ``anchors`` are ``(centre x, stored lane index)`` of the boxes already placed
-    on the same image, of any protein: the lanes are the same columns of the
-    membrane. A proposal needs the lane pitch, so it needs boxes in at least two
-    lanes whose centres rise with the lane index; with fewer the answer is None
-    and the lane must be chosen. An image's margins and its first lane's offset
-    are never guessed.
+    ``anchors`` are ``(centre x, stored lane index)`` of boxes already placed on
+    the same image, of any protein: the lanes are the same columns of the
+    membrane. Each lane's anchor is the median of its boxes' centres, and only
+    anchors whose centres rise with the lane index are kept (the longest such
+    run), so a box dragged far from its lane is ignored. A proposal needs the
+    lane pitch, so it needs two kept lanes; with fewer the answer is None and the
+    lane must be chosen. An image's margins and its first lane's offset are never
+    guessed.
 
-    Each lane's anchor is the median of its boxes' centres. Between two anchored
-    lanes whose centres rise, the lane is interpolated, so uneven spacing (a
-    smiling gel) is followed; elsewhere it steps from the nearest anchored lane
-    by the typical pitch (the median of the rising neighbour pitches), so one box
-    dragged far from its lane skews only its own neighbourhood. The result is
-    rounded and may lie outside the declared lanes: the caller checks it. It is
-    only a proposal: once stored, a band's lane never follows its x again
-    (:func:`join_to_spine`).
+    Between two neighbouring kept lanes the lane is interpolated, so uneven
+    spacing (a smiling gel) is followed; elsewhere it steps from the nearest kept
+    lane by the median pitch. The result is rounded and may lie outside the
+    declared lanes: the caller checks it. It is only a proposal: once stored, a
+    band's lane never follows its x again (:func:`join_to_spine`).
     """
     by_lane: dict[int, list[float]] = {}
     for cx, lane in anchors:
         by_lane.setdefault(lane, []).append(cx)
-    points = sorted((lane, statistics.median(xs)) for lane, xs in by_lane.items())
-    pairs = list(itertools.pairwise(points))
-    pitches = [(bx - ax) / (bl - al) for (al, ax), (bl, bx) in pairs if bx > ax]
-    if not pitches:
+    points = _rising(sorted((lane, statistics.median(xs)) for lane, xs in by_lane.items()))
+    if len(points) < 2:
         return None
+    pairs = list(itertools.pairwise(points))
     for (al, ax), (bl, bx) in pairs:
-        if ax <= x <= bx and bx > ax:
+        if ax <= x <= bx:
             return math.floor(al + (x - ax) * (bl - al) / (bx - ax) + 0.5)
+    pitch = statistics.median((bx - ax) / (bl - al) for (al, ax), (bl, bx) in pairs)
     lane, cx = min(points, key=lambda point: abs(point[1] - x))
-    return math.floor(lane + (x - cx) / statistics.median(pitches) + 0.5)
+    return math.floor(lane + (x - cx) / pitch + 0.5)
+
+
+def _rising(points: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """The longest run of ``(lane, centre x)`` points, in lane order, whose centres
+    strictly rise. Among equally long runs, the one whose lane pitches stay closest
+    to the typical pitch (the median over every rising pair of points) wins, so a
+    box dragged out of place is the one dropped, not a neighbour in place."""
+    if not points:
+        return []
+    rising_pitches = [
+        (xb - xa) / (lb - la) for (la, xa), (lb, xb) in itertools.combinations(points, 2) if xb > xa
+    ]
+    typical = statistics.median(rising_pitches) if rising_pitches else 1.0
+    # best[i]: (run length, pitch misfit) of the best run ending at point i.
+    best = [(1, 0.0)] * len(points)
+    previous = [-1] * len(points)
+    for i, (li, xi) in enumerate(points):
+        for j, (lj, xj) in enumerate(points[:i]):
+            if xj < xi:
+                misfit = best[j][1] + abs(math.log((xi - xj) / (li - lj) / typical))
+                if (best[j][0] + 1, -misfit) > (best[i][0], -best[i][1]):
+                    best[i], previous[i] = (best[j][0] + 1, misfit), j
+    i = min(range(len(points)), key=lambda k: (-best[k][0], best[k][1]))
+    run = []
+    while i != -1:
+        run.append(points[i])
+        i = previous[i]
+    return run[::-1]
 
 
 def join_to_spine(

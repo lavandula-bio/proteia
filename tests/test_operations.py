@@ -1389,9 +1389,50 @@ def test_moving_or_removing_a_box_never_changes_another_lane(tmp_path):
 
 def test_a_protein_with_a_box_in_every_lane_refuses_one_more(tmp_path):
     s, protein = lanes_session(tmp_path)
-    for lane in range(LANES):
+    bands = [
         ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+        for lane in range(LANES)
+    ]
     with pytest.raises(OperationError) as info:
-        ops.place_box(s, protein, lane_x(0), LANE_ROW, grow=False)
+        ops.place_box(s, protein, lane_x(2), 8, grow=False)  # another row, over lane 2
     assert info.value.code is ErrorCode.LANE_OCCUPIED
-    assert len(info.value.ids) == LANES
+    assert info.value.ids == (bands[2],)
+
+
+def test_the_lane_is_required_before_any_pixel_work(tmp_path, monkeypatch):
+    # A seed click on background with no lanes to anchor on asks for the lane,
+    # not "no band found": choosing the lane is what the user must do.
+    s, protein = lanes_session(tmp_path)
+    monkeypatch.setattr(ops, "grow_box", lambda *a, **k: pytest.fail("grew before asking"))
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, 5, 5, grow=True)
+    assert info.value.code is ErrorCode.LANE_REQUIRED
+
+
+def test_a_seed_click_at_the_edge_is_proposed_from_the_band(tmp_path):
+    # A wide shared box is shifted inside the image at the right edge; the lane
+    # comes from the grown band's own centre, and the shifted box anchors nothing.
+    s, protein = lanes_session(tmp_path)
+    ops.set_box_size(s, protein, BoxSize(width=150, height=10))
+    ops.place_box(s, protein, lane_x(1), LANE_ROW, lane_index=1, grow=False)
+    ops.place_box(s, protein, lane_x(3), 8, lane_index=3, grow=False)  # another row
+    band = ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=True)
+    assert band_of(s, band).box.x + protein_of(s, protein).box_size.width == LANE_W
+    assert band_of(s, band).lane_index == 5
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
+    ops.place_box(s, other, lane_x(0), LANE_ROW, lane_index=0, grow=False)
+    ops.place_box(s, other, lane_x(2), LANE_ROW, lane_index=2, grow=False)
+    fourth = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
+    assert band_of(s, fourth).lane_index == 4  # not skewed by the shifted lane-5 box
+
+
+def test_a_box_dragged_out_of_order_does_not_capture_other_lanes(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    bands = {
+        lane: ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+        for lane in (0, 1, 2, 3)
+    }
+    ops.move_box(s, bands[2], (lane_x(5) - 5, 20, lane_x(5) + 5, 40))  # lane 2 dragged right
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
+    band = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
+    assert band_of(s, band).lane_index == 4

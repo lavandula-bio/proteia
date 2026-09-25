@@ -393,14 +393,18 @@ def _proposed_lane(
     return lane
 
 
-def _lane_anchors(batch: Batch, image_id: str) -> list[tuple[float, int]]:
-    """``(centre x, stored lane)`` of every first band on an image, of any protein."""
+def _lane_anchors(batch: Batch, image: ImageRef) -> list[tuple[float, int]]:
+    """``(centre x, stored lane)`` of the first bands on an image, of any protein.
+
+    A box touching the left or right edge is left out: it may have been shifted
+    inside the image, so its centre need not be its lane's.
+    """
     anchors = []
     for protein in batch.proteins:
-        if protein.image_id == image_id:
+        if protein.image_id == image.id:
             for band in protein.bands:
-                if band.band_index == 0:
-                    x0, _, x1, _ = band.box.rect(protein.box_size)
+                x0, _, x1, _ = band.box.rect(protein.box_size)
+                if band.band_index == 0 and x0 > 0 and x1 < image.width:
                     anchors.append(((x0 + x1) / 2, band.lane_index))
     return anchors
 
@@ -871,29 +875,28 @@ def place_box(
     if n == 0:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before placing boxes")
     taken = {b.lane_index: b.id for b in protein.bands if b.band_index == 0}
-    if lane_index is None:
-        if len(taken) >= n:
+    if lane_index is not None:  # otherwise proposed once the box's position is known
+        if not 0 <= lane_index < n:
+            raise OperationError(
+                ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane_index} is not one of the {n} lanes"
+            )
+        if lane_index in taken:
             raise OperationError(
                 ErrorCode.LANE_OCCUPIED,
-                f"{protein.name!r} already has a box in every lane",
-                ids=list(taken.values()),
+                f"{protein.name!r} already has a box in lane {lane_index}",
+                ids=[taken[lane_index]],
             )
-    elif not 0 <= lane_index < n:
-        raise OperationError(
-            ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane_index} is not one of the {n} lanes"
-        )
-    elif lane_index in taken:
-        raise OperationError(
-            ErrorCode.LANE_OCCUPIED,
-            f"{protein.name!r} already has a box in lane {lane_index}",
-            ids=[taken[lane_index]],
-        )
     image = batch.find_image(protein.image_id)
     width, height = image.width, image.height
     if not (0 <= x < width and 0 <= y < height):
         raise OperationError(
             ErrorCode.OUT_OF_IMAGE, f"({x}, {y}) is outside the {width}x{height} image"
         )
+    anchors = _lane_anchors(batch, image)
+    if lane_index is None:
+        # Refuse before any pixel work when no lane can be proposed or the click
+        # lies in a lane that cannot take the box.
+        _proposed_lane(protein, x, anchors, n, taken)
 
     array = session.pixels(image.id)
     rects = [band.box.rect(protein.box_size) for band in protein.bands]
@@ -920,10 +923,10 @@ def place_box(
             )
         source = ProposalSource.MANUAL
     if lane_index is None:
-        # The grown band's centre, or where the user clicked: a fixed box is shifted
+        # The grown band's own centre, or where the user clicked: a box is shifted
         # inside the image at the edges, so its centre can sit in the next lane.
-        at = (rect[0] + rect[2]) / 2 if grow else x
-        lane_index = _proposed_lane(protein, at, _lane_anchors(batch, image.id), n, taken)
+        at = (grown[0] + grown[2]) / 2 if grow else x
+        lane_index = _proposed_lane(protein, at, anchors, n, taken)
 
     def change(draft: Project) -> str:
         edited = draft.batch.find_protein(protein_id)
