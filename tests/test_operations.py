@@ -911,9 +911,11 @@ def test_add_protein(tmp_path):
 
 
 def test_edit_and_remove_protein(tmp_path):
-    s, image, _ = boxed(tmp_path)
+    s, image, beta = boxed(tmp_path)
     gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    assert protein_of(s, beta).loading_control_ids == []  # GAPDH is used implicitly
     tubulin = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, image)
+    assert protein_of(s, beta).loading_control_ids == [gapdh]  # made explicit, not ambiguous
     target = ops.add_protein(
         s, "β-actin", Role.TARGET, image, expected_mw=42, loading_control_ids=[gapdh]
     )
@@ -926,7 +928,7 @@ def test_edit_and_remove_protein(tmp_path):
     with pytest.raises(OperationError) as info:
         ops.edit_protein(s, gapdh, role=Role.TARGET)
     assert info.value.code is ErrorCode.LOADING_CONTROL_IN_USE
-    assert info.value.ids == (target,)
+    assert info.value.ids == (beta, target)
     with pytest.raises(OperationError) as info:
         ops.edit_protein(s, target, role=Role.LOADING_CONTROL, loading_control_ids=[tubulin])
     assert info.value.code is ErrorCode.INVALID_INPUT
@@ -934,6 +936,7 @@ def test_edit_and_remove_protein(tmp_path):
     ops.edit_protein(s, target, role=Role.LOADING_CONTROL)  # its own list is cleared
     edited = protein_of(s, target)
     assert (edited.role, edited.loading_control_ids) == (Role.LOADING_CONTROL, [])
+    ops.edit_protein(s, beta, loading_control_ids=[tubulin])
     ops.edit_protein(s, gapdh, role=Role.TARGET, loading_control_ids=[tubulin, target])
     assert protein_of(s, gapdh).loading_control_ids == [tubulin, target]
 
@@ -944,7 +947,7 @@ def test_edit_and_remove_protein(tmp_path):
     cascade = ops.remove_protein(s, tubulin)
     assert cascade == Cascade(
         removed=(tubulin, *bands),
-        detached_targets=(gapdh,),
+        detached_targets=(beta, gapdh),
         unpaired_images=(),
         unfitted_membranes=(),
     )
@@ -1223,3 +1226,49 @@ def test_export_lane_table(tmp_path):
     with pytest.raises(OperationError) as info:
         ops.export_lane_table(empty)
     assert info.value.code is ErrorCode.NO_LANES
+
+
+# --- review of #70 ---
+
+
+def test_removing_the_only_loading_control_reports_its_implicit_users(tmp_path):
+    s, image, beta = boxed(tmp_path)  # beta chose no loading control
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    cascade = ops.remove_protein(s, gapdh)
+    assert cascade.detached_targets == (beta,)
+
+    other = import_blot(s, blot(), "GAPDH blot.tif")
+    ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, other)
+    cascade = ops.remove_image(s, other)
+    assert cascade.detached_targets == (beta,)
+
+
+def test_orphan_cleanup_keeps_files_that_only_start_like_proteia_names(tmp_path):
+    s = session_on(tmp_path, save_to_folder)
+    import_blot(s, blot(), "β.tif")  # img-1
+    images = s.folder / "images"
+    for name in ("img-1.tif.bak", "img-2.orig.png", "img-01.tif", "notes.txt"):
+        (images / name).write_bytes(b"the user's own file")
+    (images / "IMG-9.TIF").write_bytes(b"a Proteia file in other case, no longer referenced")
+    ops.save(s)
+    assert listing(s) == ["img-01.tif", "img-1.tif", "img-1.tif.bak", "img-2.orig.png", "notes.txt"]
+
+
+def test_an_expected_mw_too_large_for_a_float_is_refused(tmp_path):
+    s, _, beta = boxed(tmp_path)
+    with pytest.raises(OperationError) as info:
+        ops.edit_protein(s, beta, expected_mw=10**400)
+    assert info.value.code is ErrorCode.INVALID_INPUT
+
+
+def test_a_hook_error_after_the_commit_keeps_the_committed_cache(tmp_path):
+    def broken_hook(session: ProjectSession) -> None:
+        raise KeyError("a bug in a custom autosave hook")
+
+    s, image, _ = boxed(tmp_path)
+    s.autosave = broken_hook
+    s.pixels(image)
+    with pytest.raises(KeyError):
+        ops.remove_image(s, image)
+    assert image not in {i.id for i in s.project.batch.iter_images()}  # committed
+    assert image not in s._pixels  # the removed image's pixels do not come back

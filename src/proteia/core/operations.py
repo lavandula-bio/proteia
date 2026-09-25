@@ -172,14 +172,8 @@ def _locked[**P, R](
 
     @functools.wraps(fn)
     def locked(session: ProjectSession, /, *args: P.args, **kwargs: P.kwargs) -> R:
-        with session.lock:
-            cached = dict(session._pixels)
-            try:
-                return fn(session, *args, **kwargs)
-            except (OperationError, LookupError):
-                session._pixels.clear()
-                session._pixels.update(cached)
-                raise
+        with session.transaction():
+            return fn(session, *args, **kwargs)
 
     return locked
 
@@ -302,14 +296,15 @@ def _protein_name(batch: Batch, name: object, *, protein_id: str | None = None) 
 def _expected_mw(value: object) -> float | None:
     if value is None:
         return None
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int | float)
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+    number: float | None = None
+    if not isinstance(value, bool) and isinstance(value, int | float):
+        try:
+            number = float(value)  # an int too large for a float raises OverflowError
+        except OverflowError:
+            number = None
+    if number is None or not math.isfinite(number) or number <= 0:
         raise _invalid(f"expected molecular weight must be a positive number of kDa, not {value!r}")
-    return float(value)
+    return number
 
 
 def _loading_controls(batch: Batch, protein_id: str | None, role: Role, ids: object) -> list[str]:
@@ -341,6 +336,36 @@ def _fitting_size(size: object, image: ImageRef) -> BoxSize:
             f" {image.width}x{image.height} image {image.id}",
         )
     return size
+
+
+def _loading_control_ids(batch: Batch) -> list[str]:
+    return [p.id for p in batch.proteins if p.role is Role.LOADING_CONTROL]
+
+
+def _implicit_users(batch: Batch, protein_id: str) -> list[str]:
+    """Targets that normalize against ``protein_id`` without naming it: it is the
+    batch's only loading control, and they chose none."""
+    if _loading_control_ids(batch) != [protein_id]:
+        return []
+    return [p.id for p in batch.proteins if p.role is Role.TARGET and not p.loading_control_ids]
+
+
+def _users(batch: Batch, protein_id: str) -> list[str]:
+    """Every target normalized against ``protein_id``, named or implicit."""
+    named = [p.id for p in batch.proteins if protein_id in p.loading_control_ids]
+    return named + _implicit_users(batch, protein_id)
+
+
+def _pin_single_loading_control(batch: Batch) -> None:
+    """Before a second loading control appears, write the single one into the
+    targets that use it implicitly, so their normalization does not change (with
+    two loading controls and none chosen, a target is not normalized at all)."""
+    only = _loading_control_ids(batch)
+    if len(only) != 1:
+        return
+    for protein in batch.proteins:
+        if protein.role is Role.TARGET and not protein.loading_control_ids:
+            protein.loading_control_ids = list(only)
 
 
 def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> list[str]:
@@ -390,7 +415,7 @@ def import_image(
 
     # An orphan may hold the id this import gets (an import that was never saved).
     session._remove_orphans()
-    image_id = session.project.model_copy().new_id("img")  # a peek: the copy is dropped
+    image_id = f"img-{session.project.next_id}"  # the id the change below will take
     try:
         stored = storage.store_image(
             session.folder, image_id, original_name, source, max_bytes=max_bytes
@@ -454,8 +479,8 @@ def import_image(
 def remove_image(session: ProjectSession, image_id: str) -> Cascade:
     """Remove an image with the proteins and bands on it.
 
-    Targets naming a removed loading control are detached (the model's fallback
-    then applies), marker pairings to the image are cleared, and calibration
+    Targets using a removed loading control, by name or as the batch's only
+    one, are detached and reported, marker pairings to the image are cleared, and calibration
     points on it are dropped, which clears the membrane's fit and its bands'
     apparent MWs. A membrane left with no image is removed. The file is deleted
     after the next successful save.
@@ -467,6 +492,8 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
         gone = [p for p in batch.proteins if p.image_id == image_id]
         gone_ids = {p.id for p in gone}
         removed = [image_id, *(p.id for p in gone), *(b.id for p in gone for b in p.bands)]
+        # Targets using a removed loading control without naming it lose it too.
+        implicit = {t for p in gone for t in _implicit_users(batch, p.id)} - gone_ids
         batch.proteins = [p for p in batch.proteins if p.id not in gone_ids]
 
         detached = []
@@ -474,6 +501,8 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
             kept = [i for i in protein.loading_control_ids if i not in gone_ids]
             if len(kept) != len(protein.loading_control_ids):
                 protein.loading_control_ids = kept
+                detached.append(protein.id)
+            elif protein.id in implicit:
                 detached.append(protein.id)
 
         unpaired = []
@@ -541,8 +570,10 @@ def set_lanes(
 ) -> LanesUpdate:
     """Declare or replace the whole lane table; row i is lane i.
 
-    Text is cleaned (:func:`~proteia.core.names.clean_text`), and a look-alike
-    spelling of a condition or sample already in the table takes that spelling.
+    Text is cleaned (:func:`~proteia.core.names.clean_text`). Look-alike spellings
+    (equal NFKC key, e.g. the micro sign and Greek mu) are unified: where the new
+    table mixes them, the spelling already in the table wins; a look-alike typed
+    for every lane of a condition renames it. Case differences are kept.
     Lanes holding a box cannot be dropped (``LANES_IN_USE``); band lane indices
     are never remapped. Each kept lane keeps its metadata.
 
@@ -644,7 +675,9 @@ def add_protein(
     The name is stored cleaned and must be unique ignoring case and look-alike
     characters. ``loading_control_ids`` (targets only) keeps its order, the series
     order. ``box_size`` defaults to :func:`~proteia.core.boxes.initial_box_size`;
-    the first grown box replaces it. The image cannot be changed later.
+    the first grown box replaces it. The image cannot be changed later. Adding a
+    second loading control writes the first into the targets that used it
+    without naming it, so their results do not change.
     """
     batch = session.project.batch
     role = _member(Role, role, "role")
@@ -664,6 +697,8 @@ def add_protein(
         size = _fitting_size(box_size, image)
 
     def change(draft: Project) -> str:
+        if role is Role.LOADING_CONTROL:
+            _pin_single_loading_control(draft.batch)
         protein_id = draft.new_id("prot")
         draft.batch.proteins.append(
             Protein(
@@ -693,10 +728,11 @@ def edit_protein(
 ) -> None:
     """Edit a protein's fields; ``KEEP`` leaves one unchanged. No net changes.
 
-    A target turned into a loading control loses its own loading controls. A
-    loading control that targets name cannot become a target
-    (``LOADING_CONTROL_IN_USE``, with those targets): choose other loading
-    controls for them first.
+    A target turned into a loading control loses its own loading controls; if it
+    becomes the second one, the first is written into the targets that used it
+    without naming it. A loading control that targets use, by name or as the
+    batch's only one, cannot become a target (``LOADING_CONTROL_IN_USE``, with
+    those targets): choose other loading controls for them first.
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
@@ -704,7 +740,7 @@ def edit_protein(
     new_role = protein.role if role is KEEP else _member(Role, role, "role")
     mw = protein.expected_mw if expected_mw is KEEP else _expected_mw(expected_mw)
     if protein.role is Role.LOADING_CONTROL and new_role is Role.TARGET:
-        users = [p.id for p in batch.proteins if protein_id in p.loading_control_ids]
+        users = _users(batch, protein_id)
         if users:
             raise OperationError(
                 ErrorCode.LOADING_CONTROL_IN_USE,
@@ -718,6 +754,8 @@ def edit_protein(
         controls = _loading_controls(batch, protein_id, new_role, loading_control_ids)
 
     def change(draft: Project) -> None:
+        if protein.role is Role.TARGET and new_role is Role.LOADING_CONTROL:
+            _pin_single_loading_control(draft.batch)
         edited = draft.batch.find_protein(protein_id)
         edited.name = new_name
         edited.role = new_role
@@ -729,17 +767,21 @@ def edit_protein(
 
 @_locked
 def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
-    """Remove a protein and its bands; targets naming it are detached."""
+    """Remove a protein and its bands; targets using it as their loading control,
+    by name or as the batch's only one, are detached and reported."""
     session.project.batch.find_protein(protein_id)
 
     def change(draft: Project) -> Cascade:
         batch = draft.batch
         removed = (protein_id, *(band.id for band in batch.find_protein(protein_id).bands))
+        implicit = set(_implicit_users(batch, protein_id))
         batch.proteins = [p for p in batch.proteins if p.id != protein_id]
         detached = []
         for protein in batch.proteins:
             if protein_id in protein.loading_control_ids:
                 protein.loading_control_ids.remove(protein_id)
+                detached.append(protein.id)
+            elif protein.id in implicit:
                 detached.append(protein.id)
         return Cascade(
             removed=removed,

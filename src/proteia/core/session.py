@@ -32,7 +32,7 @@ import logging
 import os
 import re
 import threading
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 
@@ -40,13 +40,19 @@ import numpy as np
 
 from proteia.core import storage
 from proteia.core.imaging import load_image
-from proteia.core.model import Project
+from proteia.core.model import IMAGE_SUFFIXES, Project
 
 _log = logging.getLogger(__name__)
 
-# Proteia's image names (img-N.<suffix>) and their temp files (.img-N.<suffix>.*.part):
-# the only orphans cleanup may delete.
-_ORPHAN_NAME = re.compile(r"^\.?img-[1-9][0-9]{0,8}\.")
+# Proteia's image names (img-N.<suffix>) and the temp files storage writes while
+# storing or saving (.img-N.<suffix>.<random>.part/.tmp): the only orphans cleanup
+# may delete. The whole name must match, so a user's img-1.tif.bak survives; case
+# is ignored because Windows file names ignore it.
+_SUFFIXES = "|".join(re.escape(suffix.removeprefix(".")) for suffix in IMAGE_SUFFIXES)
+_ORPHAN_NAME = re.compile(
+    rf"^\.?img-[1-9][0-9]{{0,8}}\.(?:{_SUFFIXES})(?:\.[a-z0-9_]+\.(?:part|tmp))?$",
+    re.IGNORECASE,
+)
 
 
 class ErrorCode(StrEnum):
@@ -230,12 +236,27 @@ class ProjectSession:
                     "autosave after %s failed; the change is kept in memory: %s", action, exc
                 )
 
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Run one operation under the lock. If it is refused (``OperationError``
+        or ``LookupError``) before anything was committed, the pixel cache is put
+        back as it was, even if the operation read pixels first."""
+        with self.lock:
+            project, cached = self._project, dict(self._pixels)
+            try:
+                yield
+            except (OperationError, LookupError):
+                if self._project is project:
+                    self._pixels = cached
+                raise
+
     def _remove_orphans(self) -> None:
         """Delete unreferenced Proteia files in ``images/`` that the saved
         ``project.json`` does not reference either (best effort: a file held open
-        on Windows stays)."""
+        on Windows stays). Names compare ignoring case, as Windows does."""
+        keep = {name.lower() for name in self._saved_files | _referenced_files(self._project)}
         for path in storage.orphan_files(self._project, self._folder):
-            if path.name in self._saved_files or not _ORPHAN_NAME.match(path.name):
+            if path.name.lower() in keep or not _ORPHAN_NAME.match(path.name):
                 continue
             with contextlib.suppress(OSError):
                 path.unlink()
