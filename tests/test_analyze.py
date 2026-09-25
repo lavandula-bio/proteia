@@ -6,6 +6,7 @@ import math
 import pytest
 
 from proteia.core.analyze import (
+    BaselineError,
     Batch,
     ProteinNets,
     ReduceMethod,
@@ -18,6 +19,7 @@ from proteia.core.analyze import (
     normalize_batch,
     normalize_lane,
     reduce_samples,
+    reference_baseline,
 )
 
 
@@ -141,6 +143,51 @@ def test_fold_change_unaffected_by_plot_subset_without_reference():
 def test_fold_change_all_control_lanes_excluded_raises():
     with pytest.raises(ValueError, match="has no value in any included lane"):
         fold_change_lane([2, 4, 6], ["c", "c", "x"], "c", included=[False, False, True])
+
+
+# --- reference baseline ---
+
+
+def test_reference_baseline_is_the_mean_of_the_reduced_reference_group():
+    # s1 is loaded twice: the baseline sees the sample mean (1 + 1) / 2 once.
+    conditions = ["c", "c", "c", "x"]
+    samples = ["s1", "s1", "s2", "s3"]
+    groups = reduce_samples([1, 1, 4, 5], conditions, samples).groups
+    assert reference_baseline(groups, "c") == 2.5
+    assert reference_baseline({"c": [0.5, 3.5]}, "c") == 2.0
+
+
+@pytest.mark.parametrize(
+    ("groups", "reason", "message"),
+    [
+        ({"x": [1.0]}, "no_value", "control condition 'c' has no value in any included lane"),
+        ({"c": [], "x": [1.0]}, "no_value", "control condition 'c' has no value"),
+        ({"c": [0.0, 0.0]}, "not_positive", "control condition mean is non-positive"),
+    ],
+)
+def test_reference_baseline_refuses_an_unusable_reference(groups, reason, message):
+    with pytest.raises(BaselineError, match=message) as info:
+        reference_baseline(groups, "c")
+    assert info.value.reason == reason
+    assert isinstance(info.value, ValueError)  # callers catching ValueError still work
+
+
+@pytest.mark.parametrize("method", list(ReduceMethod))
+def test_fold_change_lane_divides_by_the_reference_baseline(method):
+    conditions = ["c", "c", "c", "c", "x", "x"]
+    samples = ["s1", "s1", "s2", "s3", "s4", "s5"]
+    included = [True, True, True, False, True, True]
+    values = [3.1, 5.3, 2.2, 50.0, None, 9.7]
+    fc = fold_change_lane(values, conditions, "c", samples, included=included, method=method)
+    groups = reduce_samples(values, conditions, samples, included=included, method=method).groups
+    baseline = reference_baseline(groups, "c")
+    assert fc == [None if v is None else v / baseline for v in values]  # bit for bit
+
+
+def test_fold_change_lane_raises_the_baseline_error():
+    with pytest.raises(BaselineError) as info:
+        fold_change_lane([0, 0, 6], ["c", "c", "x"], "c")
+    assert info.value.reason == "not_positive"
 
 
 # --- sample reduction (technical vs biological replicates) ---

@@ -25,8 +25,10 @@ ratios, or fold-changes. Statistics and plotting treat them the same; only the
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Literal
 
 import numpy as np
 from scipy import stats
@@ -284,6 +286,39 @@ def reduce_samples(
     return SampleReduction(groups=groups, averaged=averaged, warnings=warnings)
 
 
+BaselineReason = Literal["no_value", "not_positive"]
+
+
+class BaselineError(ValueError):
+    """The control condition gives no usable fold-change baseline; ``reason`` says why."""
+
+    def __init__(self, reason: BaselineReason, message: str) -> None:
+        super().__init__(message)
+        self.reason: BaselineReason = reason
+
+
+def reference_baseline(groups: Mapping[str, Sequence[float]], control_condition: str) -> float:
+    """The fold-change baseline: the mean of the control condition's reduced values.
+
+    ``groups`` is a :class:`SampleReduction`'s ``groups``, so the baseline sees the
+    same included samples, with technical repeats collapsed, as the statistics.
+    Raises :class:`BaselineError` (a ``ValueError``) if the control condition has
+    no value (``no_value``) or its mean is not positive (``not_positive``).
+    """
+    control_vals = groups.get(control_condition, [])
+    if not control_vals:
+        raise BaselineError(
+            "no_value",
+            f"control condition {control_condition!r} has no value in any included lane",
+        )
+    baseline = float(np.mean(control_vals))
+    if baseline <= 0:
+        raise BaselineError(
+            "not_positive", "control condition mean is non-positive; cannot form fold-change"
+        )
+    return baseline
+
+
 def fold_change_lane(
     values: LaneNets,
     conditions: list[str],
@@ -303,17 +338,11 @@ def fold_change_lane(
     the baseline must not depend on which conditions are charted.
 
     Keeps the per-lane shape (so individual points survive), dividing every lane
-    by the baseline. Returns ``None`` lanes unchanged.
+    by the baseline. Returns ``None`` lanes unchanged. Raises :class:`BaselineError`
+    when :func:`reference_baseline` finds no usable baseline.
     """
     reduction = reduce_samples(values, conditions, samples, included=included, method=method)
-    control_vals = reduction.groups.get(control_condition, [])
-    if not control_vals:
-        raise ValueError(
-            f"control condition {control_condition!r} has no value in any included lane"
-        )
-    baseline = float(np.mean(control_vals))
-    if baseline <= 0:
-        raise ValueError("control condition mean is non-positive; cannot form fold-change")
+    baseline = reference_baseline(reduction.groups, control_condition)
     return [None if v is None else v / baseline for v in values]
 
 
