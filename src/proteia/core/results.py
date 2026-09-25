@@ -43,11 +43,12 @@ from proteia.core.analyze import (
     normalize_batch,
     reduce_samples,
     reference_baseline,
+    repeats_message,
 )
 from proteia.core.model import Role
 from proteia.core.names import name_key, resolve_label
 from proteia.core.plotspec import ErrorType, PlotSpec, ValueKind, build_plotspec
-from proteia.core.project import join_to_spine, spine_axes
+from proteia.core.project import spine_axes
 
 
 class NoticeCode(StrEnum):
@@ -62,6 +63,7 @@ class NoticeCode(StrEnum):
     REFERENCE_UNUSABLE = "reference_unusable"  # per series: no included value, or mean <= 0
     LOADING_NOT_POSITIVE = "loading_not_positive"  # target has a value, loading net <= 0
     NO_VALUES = "no_values"  # a series with no included value at all
+    NO_PLOTTED_VALUES = "no_plotted_values"  # a series with no value in the plotted conditions
     TECHNICAL_REPEATS = "technical_repeats"  # repeats averaged, or one repeat kept per sample
     SIMILAR_CONDITIONS = "similar_conditions"  # labels equal except for case (name_key)
     UNKNOWN_PLOT_CONDITION = "unknown_plot_condition"  # ignored: a stale selection must not break
@@ -145,12 +147,13 @@ class Results(BaseModel, frozen=True):
 
 
 def _join(protein: model.Protein, n: int) -> tuple[LaneNets, list[str | None]]:
-    """A protein's band-index-0 nets and band ids per lane, from one join by stored lane index."""
-    if n == 0:
-        return [], []
-    bands = [band for band in protein.bands if band.band_index == 0]
-    [slots] = join_to_spine([[(band.lane_index, k) for k, band in enumerate(bands)]], n)
-    picked = [None if k is None else bands[int(k)] for k in slots]
+    """A protein's band-index-0 nets and band ids per lane, by stored lane index.
+
+    The same join as :func:`~proteia.core.project.join_to_spine`: a lane with no box
+    is ``None`` and shifts nothing. The model allows one band-index-0 band per lane.
+    """
+    by_lane = {band.lane_index: band for band in protein.bands if band.band_index == 0}
+    picked = [by_lane.get(i) for i in range(n)]
     return (
         [None if band is None else band.net for band in picked],
         [None if band is None else band.id for band in picked],
@@ -173,9 +176,7 @@ def _listed(values: Collection[object]) -> str:
 
 def _chart(
     groups: dict[str, list[float]],
-    values: LaneNets,
-    conditions: list[str],
-    included: list[bool],
+    point_lanes: dict[str, list[list[int]]],
     *,
     chosen: list[str] | None,
     kind: ValueKind,
@@ -187,11 +188,9 @@ def _chart(
     shown = {c: g for c, g in groups.items() if chosen is None or c in chosen}
     if not shown:
         return None
-    lanes = range(len(conditions))
-    lane_indices = {
-        c: [i for i in lanes if included[i] and conditions[i] == c and values[i] is not None]
-        for c in shown
-    }
+    # Provenance parallel to the points: each sample's first lane (the lane a
+    # representative reduction keeps; technical repeats share one point).
+    lane_indices = {c: [lanes[0] for lanes in point_lanes[c]] for c in shown}
     # Statistics run on the plotted subset, as the napari chart does.
     return build_plotspec(
         shown,
@@ -329,6 +328,8 @@ def compute_results(
     # 5. The statistics input: loading-control ids become names.
     abatch = analyze.Batch(conditions, protein_nets, control_condition=ref)
     tier = assess(abatch).tier
+    if tier is Tier.FOLD_CHANGE and reference_all_excluded:
+        tier = Tier.NORMALIZED  # no series can form a fold-change
 
     # 6. The plotted subset.
     chosen: list[str] | None = None
@@ -349,7 +350,7 @@ def compute_results(
             )
         if resolved:
             chosen = [label for label in labels if label in resolved]
-    if ref is not None and chosen is not None and ref not in chosen:
+    if tier is Tier.FOLD_CHANGE and chosen is not None and ref not in chosen:
         note(
             NoticeCode.REFERENCE_NOT_PLOTTED,
             f"the reference condition {ref!r} is not plotted;"
@@ -369,7 +370,8 @@ def compute_results(
             not_positive = tuple(
                 i
                 for i in range(n)
-                if target_nets[i] is not None
+                if included[i]
+                and target_nets[i] is not None
                 and loading_nets[i] is not None
                 and loading_nets[i] <= 0
             )
@@ -424,15 +426,19 @@ def compute_results(
                     title = f"{s.target} / {s.loading}"
                 chart = _chart(
                     groups,
-                    s.values,
-                    conditions,
-                    included,
+                    red.lanes,
                     chosen=chosen,
                     kind=kind,
                     error_type=error_type,
                     title=title,
                     reference=ref,
                 )
+                if chart is None:
+                    note(
+                        NoticeCode.NO_PLOTTED_VALUES,
+                        f"{s.target!r} / {s.loading!r} has no value in the plotted conditions",
+                        protein_ids=pair_ids,
+                    )
             series.append(
                 SeriesResult(
                     target_id=target_id,
@@ -451,10 +457,9 @@ def compute_results(
 
     # 8. Technical repeats, once for all series.
     if averaged:
-        what = "averaged" if method is ReduceMethod.MEAN else "kept one lane of"
         note(
             NoticeCode.TECHNICAL_REPEATS,
-            f"{what} {len(averaged)} sample(s) with technical repeats (repeats do not count as n)",
+            repeats_message(len(averaged), method),
             conditions=tuple(dict.fromkeys(c for c, _ in averaged)),
         )
 

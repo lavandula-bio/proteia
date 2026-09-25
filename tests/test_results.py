@@ -570,3 +570,39 @@ def test_compute_matches_the_regression_baseline(method, reference, kind, golden
         ]
         expected = _golden_chart_stats(reduced[case])
         _assert_close(_chart_stats(*charts), expected, rel, abs_, case)
+
+
+# --- review of #69: provenance, notices that must not mislead, tier ---
+
+
+@pytest.mark.parametrize("method", list(ReduceMethod))
+def test_chart_lanes_stay_parallel_to_points_with_technical_repeats(method):
+    # Lanes 0 and 1 are one sample loaded twice: one point, whose lane is lane 0.
+    res = compute_results(_batch(_lane(1, sample="v1")), method=method)
+    bars = {bar.label: bar for bar in res.series[0].chart.bars}
+    for bar in bars.values():
+        assert len(bar.lane_indices) == len(bar.points)
+    assert bars["vehicle"].lane_indices == [0]
+
+
+def test_loading_net_of_zero_in_an_excluded_lane_is_not_a_warning():
+    res = compute_results(_batch(_net("band-16", 0.0)))  # α-tubulin, lane 3, include=no
+    assert NoticeCode.LOADING_NOT_POSITIVE not in _codes(res)
+    res = compute_results(_batch(_net("band-13", 0.0)))  # α-tubulin, lane 0, included
+    assert _one(res, NoticeCode.LOADING_NOT_POSITIVE).lane_indices == (0,)
+
+
+def test_no_fold_change_means_no_unplotted_reference_notice_and_a_lower_tier():
+    excluded = _batch(_lane(0, included=False), _lane(1, included=False))
+    res = compute_results(excluded, plot_conditions=["10 µM"])
+    assert NoticeCode.REFERENCE_ALL_EXCLUDED in _codes(res)
+    assert NoticeCode.REFERENCE_NOT_PLOTTED not in _codes(res)
+    assert res.tier is Tier.NORMALIZED  # no series can form a fold-change
+
+
+def test_series_without_a_value_in_the_plotted_conditions_says_so():
+    # β-catenin has no included 10 µM value (lane 2 empty, lane 3 excluded).
+    res = compute_results(_batch(), plot_conditions=["10 µM"])
+    [series] = res.series
+    assert series.chart is None and series.groups  # values exist, just not plotted
+    assert _one(res, NoticeCode.NO_PLOTTED_VALUES).protein_ids == ("prot-7", "prot-8")

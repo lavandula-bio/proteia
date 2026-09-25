@@ -5,6 +5,8 @@
 different input methods; the keys merge them, the stored form keeps what was typed.
 """
 
+import unicodedata
+
 import pytest
 
 from proteia.core.names import (
@@ -123,3 +125,24 @@ def test_resolve_label_exact_then_key_then_none():
     assert resolve_label(" vehicle ", labels) == "vehicle"  # whitespace is part of the key
     assert resolve_label("Vehicle", labels) is None  # case-sensitive
     assert resolve_label("DMSO", labels) is None
+
+
+# --- review of #69 ---
+
+
+def test_clean_text_is_nfc_after_dropping_a_joiner():
+    # A zero-width joiner between "e" and a combining acute blocks composition.
+    cleaned = clean_text("e‍́")
+    assert cleaned == "é"
+    assert unicodedata.is_normalized("NFC", cleaned)
+
+
+@pytest.mark.parametrize("char", ["\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\x07", "\x00"])
+def test_clean_text_refuses_separator_controls_that_split_would_hide(char):
+    with pytest.raises(TextError) as info:
+        clean_text(f"a{char}b")
+    assert info.value.code == "control_character"
+
+
+def test_clean_text_still_collapses_tabs_and_line_breaks():
+    assert clean_text(" a\tb\nc\r\n\x0bd\x0c ") == "a b c d"

@@ -20,6 +20,7 @@ from proteia.core.analyze import (
     normalize_lane,
     reduce_samples,
     reference_baseline,
+    repeats_message,
 )
 
 
@@ -407,3 +408,15 @@ def test_normalize_batch_warns_unresolvable_target():
     series, warnings = normalize_batch(_b(t, g1, g2))
     assert series == []
     assert any("Tub" in w and "loading control" in w for w in warnings)
+
+
+def test_reduce_records_the_lanes_behind_each_value():
+    r = reduce_samples(
+        [100, 120, None, 80, 50],
+        ["a", "a", "a", "a", "b"],
+        ["s1", "s1", "s3", "s2", "s4"],
+        included=[True, True, True, True, False],
+    )
+    assert r.groups == {"a": [110.0, 80.0]}
+    assert r.lanes == {"a": [[0, 1], [3]]}  # parallel to groups; None and excluded lanes out
+    assert r.warnings == [repeats_message(1, ReduceMethod.MEAN)]

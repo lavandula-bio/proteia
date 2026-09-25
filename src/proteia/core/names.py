@@ -36,6 +36,10 @@ class TextError(ValueError):
         self.code: TextErrorCode = code
 
 
+# Control characters that are ordinary whitespace in typed text: collapsed, not refused.
+_WHITESPACE_CONTROLS = frozenset("\t\n\v\f\r")
+
+
 def _drop_format(text: str) -> str:
     return "".join(c for c in text if unicodedata.category(c) != "Cf")
 
@@ -43,17 +47,24 @@ def _drop_format(text: str) -> str:
 def clean_text(text: str) -> str:
     """The stored form of typed text.
 
-    NFC, format characters dropped, whitespace (tab, newline, NBSP, U+3000, ...)
+    Format characters dropped, then NFC (in that order, so a dropped joiner cannot
+    leave text that is not NFC), then whitespace (tab, newline, NBSP, U+3000, ...)
     trimmed and collapsed to single ASCII spaces. Raises :class:`TextError`
-    (``blank_text``) if nothing is left, or (``control_character``) if a control
-    character such as BEL remains.
+    (``control_character``) for a control character other than tab, newline,
+    vertical tab, form feed or carriage return, such as BEL or the separators
+    U+001C-U+001F and U+0085 that ``str.split`` would treat as spaces; or
+    (``blank_text``) if nothing is left.
     """
-    cleaned = " ".join(_drop_format(unicodedata.normalize("NFC", text)).split())
-    if not cleaned:
-        raise TextError("blank_text", "must not be blank")
-    bad = next((c for c in cleaned if unicodedata.category(c) == "Cc"), None)
+    text = unicodedata.normalize("NFC", _drop_format(text))
+    bad = next(
+        (c for c in text if unicodedata.category(c) == "Cc" and c not in _WHITESPACE_CONTROLS),
+        None,
+    )
     if bad is not None:
         raise TextError("control_character", f"must not contain the control character {bad!r}")
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        raise TextError("blank_text", "must not be blank")
     return cleaned
 
 
