@@ -18,6 +18,7 @@ records, which the project keeps with the image.
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -91,25 +92,86 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool]:
             )
         keyframe = series[0].keyframe
         lossy = int(keyframe.compression) in _LOSSY_TIFF_COMPRESSION
-        try:
+        if keyframe.compression not in tifffile.TIFF.DECOMPRESSORS:
+            # No decoder here without imagecodecs (LZW, JPEG): Pillow decodes it.
+            # Pillow returns channels last; its result must match the declaration.
+            shape = tuple(series[0].shape)
+            expected = (shape[1], shape[2], shape[0]) if axes == "SYX" else shape
+            declared = _Declared(
+                keyframe.compression.name,
+                expected,
+                keyframe.dtype,
+                keyframe.photometric,
+                keyframe.samplesperpixel,
+            )
+            pixels = None
+        else:
             pixels = series[0].asarray()
-        except ValueError as exc:
-            if "imagecodecs" not in str(exc):
-                raise
-            raise ValueError(
-                f"{path.name}: {keyframe.compression.name} compression cannot be decoded"
-                " by this installation; save the image as an uncompressed TIFF"
-            ) from exc
+    if pixels is None:
+        return _read_tiff_with_pillow(path, declared), lossy
     # Planar color stores the channels first.
     if axes == "SYX" and pixels.ndim == 3 and pixels.shape[0] in (2, 3, 4):
         pixels = np.moveaxis(pixels, 0, -1)
     return pixels, lossy
 
 
+@dataclass(frozen=True)
+class _Declared:
+    """What a TIFF's first image declares about its pixels."""
+
+    codec: str
+    shape: tuple[int, ...]  # channels last
+    dtype: np.dtype
+    photometric: tifffile.PHOTOMETRIC
+    samples: int
+
+
+def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
+    """Decode a TIFF whose compression tifffile cannot decode on its own.
+
+    Only the layouts Pillow reads with the same values as tifffile are accepted:
+    8- or 16-bit black-is-zero gray and 8-bit RGB without alpha. Pillow inverts
+    white-is-zero gray and un-premultiplies associated alpha, and it narrows
+    16-bit color, so those, and any result whose shape or pixel type differs
+    from the declaration, are refused rather than read with changed values.
+    """
+    from PIL import Image
+
+    refusal = (
+        f"{path.name}: {declared.codec} compression of this"
+        f" {'x'.join(map(str, declared.shape))} {declared.dtype}"
+        f" {declared.photometric.name} image cannot be decoded by this installation;"
+        " save the image as an uncompressed TIFF"
+    )
+    gray = declared.photometric is tifffile.PHOTOMETRIC.MINISBLACK and declared.samples == 1
+    color = declared.photometric is tifffile.PHOTOMETRIC.RGB and declared.samples == 3
+    if not (gray or color):
+        raise ValueError(refusal)
+    try:
+        with warnings.catch_warnings():
+            # Local files the user chose: Pillow's size guard is for untrusted input.
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                pixels = np.asarray(image)
+    except Image.DecompressionBombError as exc:
+        raise ValueError(
+            f"{path.name}: this compressed TIFF has more pixels than the compressed-TIFF"
+            " reader accepts; save the image as an uncompressed TIFF"
+        ) from exc
+    except Exception as exc:  # Pillow's decoder errors are not all OSError
+        raise ValueError(refusal) from exc
+    if not pixels.dtype.isnative:  # e.g. a big-endian ("MM") 16-bit file
+        pixels = pixels.astype(pixels.dtype.newbyteorder("="))
+    if pixels.shape != declared.shape or pixels.dtype != declared.dtype.newbyteorder("="):
+        raise ValueError(refusal)
+    return pixels
+
+
 def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
     """Read the stored pixels: 2-D gray, or 3-D with 2, 3 or 4 channels last.
 
-    TIFF files are read with tifffile; other formats go through scikit-image.
+    TIFF files are read with tifffile (with Pillow for compressions tifffile cannot
+    decode on its own); other formats go through scikit-image.
     """
     return _read(Path(path))[0]
 
