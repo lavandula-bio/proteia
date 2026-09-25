@@ -10,6 +10,7 @@ from PIL import Image
 from skimage import io
 
 from proteia.core.imaging import (
+    _Declared,
     _read_tiff_with_pillow,
     display_rgb,
     from_pixels,
@@ -253,28 +254,52 @@ def _rgb8() -> np.ndarray:
     [
         (_gray(np.uint16, 65535), 16, "tiff_lzw"),
         (_gray(np.uint8, 255), 8, "tiff_lzw"),
-        (_gray(np.uint16, 65535), 16, "tiff_adobe_deflate"),
+        (_gray(np.uint16, 65535).astype(">u2"), 16, "tiff_lzw"),
         (_rgb8(), 8, "tiff_lzw"),
     ],
-    ids=["lzw-16-bit", "lzw-8-bit", "deflate-16-bit", "lzw-rgb"],
+    ids=["lzw-16-bit", "lzw-8-bit", "lzw-16-bit-big-endian", "lzw-rgb"],
 )
 def test_compressed_tiff_is_read_exactly(tmp_path, pixels, depth, compression):
     # tifffile needs imagecodecs for LZW; Pillow decodes it with the same values.
     path = tmp_path / f"{compression} µ.tif"
     Image.fromarray(pixels).save(path, compression=compression)
     loaded = load_image(path)
-    np.testing.assert_array_equal(loaded.pixels, pixels)
+    np.testing.assert_array_equal(loaded.pixels, pixels)  # values, whatever the byte order
+    assert loaded.pixels.dtype.isnative
     assert loaded.bit_depth == depth
 
 
-def test_a_pillow_read_that_changes_the_pixels_is_refused(tmp_path):
-    # Pillow must return exactly what the file declares (e.g. never 8-bit for 16-bit).
+def _declared(photometric, samples, shape=(6, 8), dtype=np.uint8) -> _Declared:
+    return _Declared("LZW", shape, np.dtype(dtype), photometric, samples)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        # Pillow would change these values: it inverts white-is-zero gray and
+        # un-premultiplies associated alpha.
+        _declared(tifffile.PHOTOMETRIC.MINISWHITE, 1),
+        _declared(tifffile.PHOTOMETRIC.RGB, 4, (6, 8, 4)),
+        _declared(tifffile.PHOTOMETRIC.PALETTE, 1),
+        # A result that differs from the declaration: never read with another scale.
+        _declared(tifffile.PHOTOMETRIC.MINISBLACK, 1, dtype=np.uint16),
+        _declared(tifffile.PHOTOMETRIC.RGB, 3, (6, 8, 3)),
+    ],
+    ids=["min-is-white", "rgba", "palette", "other-bit-depth", "other-shape"],
+)
+def test_pillow_is_used_only_where_it_reads_the_same_values(tmp_path, declared):
     path = tmp_path / "lzw.tif"
     Image.fromarray(_gray(np.uint8, 255)).save(path, compression="tiff_lzw")
     with pytest.raises(ValueError, match="uncompressed TIFF"):
-        _read_tiff_with_pillow(path, "LZW", (6, 8), np.dtype(np.uint16))
-    with pytest.raises(ValueError, match="uncompressed TIFF"):
-        _read_tiff_with_pillow(path, "LZW", (6, 8, 3), np.dtype(np.uint8))
+        _read_tiff_with_pillow(path, declared)
+
+
+def test_a_compressed_tiff_over_pillows_size_limit_says_so(tmp_path, monkeypatch):
+    path = tmp_path / "large lzw.tif"
+    Image.fromarray(_gray(np.uint16, 65535)).save(path, compression="tiff_lzw")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)  # 48 pixels is over twice the limit
+    with pytest.raises(ValueError, match="more pixels than the compressed-TIFF reader"):
+        load_image(path)
 
 
 def test_display_rgb_views():
