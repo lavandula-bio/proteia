@@ -28,7 +28,9 @@ auto-detect / OCR are just smarter proposers feeding the same explicit identity.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Collection, Sequence
+import math
+import statistics
+from collections.abc import Sequence
 
 from proteia.core.model import Lane
 
@@ -90,66 +92,38 @@ def spine_from_labels(labels: Sequence[str]) -> list[Lane]:
     return lanes
 
 
-def propose_lane(
-    x: float,
-    anchors: Sequence[tuple[float, int]],
-    n_lanes: int,
-    width: int,
-    free: Collection[int],
-) -> int | None:
-    """Propose the lane of a box whose centre is at ``x`` on an image ``width`` wide.
+def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
+    """Propose the lane of a box whose centre is at ``x``, or None when unsure.
 
     ``anchors`` are ``(centre x, stored lane index)`` of the boxes already placed
     on the same image, of any protein: the lanes are the same columns of the
-    membrane. From them the lane is estimated as a fractional index:
+    membrane. A proposal needs the lane pitch, so it needs boxes in at least two
+    lanes whose centres rise with the lane index; with fewer the answer is None
+    and the lane must be chosen. An image's margins and its first lane's offset
+    are never guessed.
 
-    * two or more anchored lanes: piecewise-linear between the lanes' mean
-      centres, and past the outermost ones along the nearest pair, so uneven
-      spacing (a smiling gel) is followed; if the centres do not rise with the
-      lane index, a least-squares line instead;
-    * one anchored lane: that lane plus the distance in lane pitches, taking the
-      pitch as ``width / n_lanes``;
-    * none: lanes spread evenly across the image.
-
-    Returns the lane in ``free`` nearest the estimate (the left one on a tie), or
-    None when no lane is free. It is only a proposal: once stored, a band's lane
-    is identity and never follows its x again (:func:`join_to_spine`).
+    Each lane's anchor is the median of its boxes' centres. Between two anchored
+    lanes whose centres rise, the lane is interpolated, so uneven spacing (a
+    smiling gel) is followed; elsewhere it steps from the nearest anchored lane
+    by the typical pitch (the median of the rising neighbour pitches), so one box
+    dragged far from its lane skews only its own neighbourhood. The result is
+    rounded and may lie outside the declared lanes: the caller checks it. It is
+    only a proposal: once stored, a band's lane never follows its x again
+    (:func:`join_to_spine`).
     """
-    if n_lanes < 1:
-        raise ValueError("n_lanes must be >= 1")
-    candidates = sorted(lane for lane in free if 0 <= lane < n_lanes)
-    if not candidates:
-        return None
-    pitch = width / n_lanes
     by_lane: dict[int, list[float]] = {}
     for cx, lane in anchors:
         by_lane.setdefault(lane, []).append(cx)
-    points = sorted((lane, sum(xs) / len(xs)) for lane, xs in by_lane.items())
-    if not points:
-        estimate = x / pitch - 0.5  # lane i is centred at (i + 0.5) * pitch
-    elif len(points) == 1:
-        lane, cx = points[0]
-        estimate = lane + (x - cx) / pitch
-    else:
-        estimate = _estimate_lane(x, points)
-    return min(candidates, key=lambda lane: (abs(lane - estimate), lane))
-
-
-def _estimate_lane(x: float, points: list[tuple[int, float]]) -> float:
-    """A fractional lane at ``x`` from two or more ``(lane, centre x)`` points."""
-    lanes = [lane for lane, _ in points]
-    xs = [cx for _, cx in points]
-    if all(a < b for a, b in itertools.pairwise(xs)):
-        # The segment holding x, or the end segment that x lies beyond.
-        i = next((k for k in range(len(xs) - 1) if x <= xs[k + 1]), len(xs) - 2)
-        slope = (lanes[i + 1] - lanes[i]) / (xs[i + 1] - xs[i])
-        return lanes[i] + (x - xs[i]) * slope
-    mean_x, mean_lane = sum(xs) / len(xs), sum(lanes) / len(lanes)
-    spread = sum((cx - mean_x) ** 2 for cx in xs)
-    if spread == 0:
-        return mean_lane
-    slope = sum((cx - mean_x) * (lane - mean_lane) for lane, cx in points) / spread
-    return mean_lane + (x - mean_x) * slope
+    points = sorted((lane, statistics.median(xs)) for lane, xs in by_lane.items())
+    pairs = list(itertools.pairwise(points))
+    pitches = [(bx - ax) / (bl - al) for (al, ax), (bl, bx) in pairs if bx > ax]
+    if not pitches:
+        return None
+    for (al, ax), (bl, bx) in pairs:
+        if ax <= x <= bx and bx > ax:
+            return math.floor(al + (x - ax) * (bl - al) / (bx - ax) + 0.5)
+    lane, cx = min(points, key=lambda point: abs(point[1] - x))
+    return math.floor(lane + (x - cx) / statistics.median(pitches) + 0.5)
 
 
 def join_to_spine(

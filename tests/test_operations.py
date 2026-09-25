@@ -1296,24 +1296,83 @@ def lanes_session(tmp_path: Path) -> tuple[ProjectSession, str]:
 
 @pytest.mark.parametrize(
     "lanes",
-    [[1, 2, 3, 4, 5], [0, 1, 3, 4, 5], [0, 1, 2, 3, 4], [1, 2, 3, 4], [4, 1, 3, 2]],
+    [[1, 2, 3, 4, 5], [0, 1, 3, 4, 5], [0, 1, 2, 3, 4], [1, 2, 3, 4], [4, 1, 3, 2, 5]],
     ids=["missing-first", "missing-middle", "missing-last", "missing-first-and-last", "any-order"],
 )
 @pytest.mark.parametrize("grow", [True, False], ids=["seed-click", "fixed-box"])
 def test_boxes_placed_without_a_lane_land_in_their_lanes(tmp_path, lanes, grow):
-    # No other protein anchors the grid: the lanes come from the position alone.
+    # No other protein anchors the grid: the first two lanes are chosen, the rest proposed.
     s, protein = lanes_session(tmp_path)
-    for lane in lanes:
+    first, second, *rest = lanes
+    ops.place_box(s, protein, lane_x(first), LANE_ROW, lane_index=first, grow=grow)
+    ops.place_box(s, protein, lane_x(second), LANE_ROW, lane_index=second, grow=grow)
+    for lane in rest:
         band = ops.place_box(s, protein, lane_x(lane), LANE_ROW, grow=grow)
         assert band_of(s, band).lane_index == lane
     nets = results.lane_nets(s.project.batch)[protein]
     assert [i for i, net in enumerate(nets) if net is not None] == sorted(lanes)
 
 
+def test_a_lane_is_required_until_two_lanes_show_the_spacing(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(2), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_REQUIRED  # no box on the image yet
+    ops.place_box(s, protein, lane_x(2), LANE_ROW, lane_index=2, grow=False)
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(3), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_REQUIRED  # one lane: no spacing yet
+    ops.place_box(s, protein, lane_x(3), LANE_ROW, lane_index=3, grow=False)
+    band = ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=False)
+    assert band_of(s, band).lane_index == 5
+
+
+def test_lanes_are_proposed_on_an_image_with_margins(tmp_path):
+    # Six lanes from x=200 with a pitch of 70 on a 900-pixel-wide image.
+    s = session_on(tmp_path)
+    xs = [200 + 70 * i for i in range(LANES)]
+    blot = synthetic_blot((LANE_H, 900), [(x, LANE_ROW, 6.0, 3.0, 30000.0) for x in xs])
+    image = import_blot(s, blot)
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(LANES)])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    ops.place_box(s, protein, xs[0], LANE_ROW, lane_index=0, grow=True)
+    ops.place_box(s, protein, xs[1], LANE_ROW, lane_index=1, grow=True)
+    placed = [ops.place_box(s, protein, x, LANE_ROW, grow=True) for x in xs[2:]]
+    assert [band_of(s, band).lane_index for band in placed] == [2, 3, 4, 5]
+
+
+def test_a_proposal_never_moves_a_box_to_another_lane(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(4)])  # the blot shows six
+    for lane in (0, 1, 2):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    # Another box over lane 1 (a second band, or a misclick) is refused, not moved.
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(1), 8, grow=False)
+    assert info.value.code is ErrorCode.LANE_OCCUPIED
+    # A box beyond the declared lanes is refused too, though lane 3 is free.
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_OUT_OF_RANGE
+
+
+def test_a_fixed_box_at_the_edge_is_proposed_from_the_click(tmp_path):
+    # A box wider than two lanes is shifted inside the image at the right edge;
+    # its lane still comes from where the user clicked.
+    s, protein = lanes_session(tmp_path)
+    ops.set_box_size(s, protein, BoxSize(width=150, height=10))
+    ops.place_box(s, protein, lane_x(1), LANE_ROW, lane_index=1, grow=False)
+    ops.place_box(s, protein, lane_x(3), 8, lane_index=3, grow=False)  # another row
+    band = ops.place_box(s, protein, lane_x(5), 50, grow=False)
+    assert band_of(s, band).box.x == LANE_W - 150  # shifted inside the image
+    assert band_of(s, band).lane_index == 5
+
+
 def test_moving_or_removing_a_box_never_changes_another_lane(tmp_path):
     s, protein = lanes_session(tmp_path)
     bands = {
-        lane: ops.place_box(s, protein, lane_x(lane), LANE_ROW, grow=False) for lane in (0, 2, 4, 5)
+        lane: ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+        for lane in (0, 2, 4, 5)
     }
     ops.remove_box(s, bands[2])
     ops.move_box(s, bands[4], (lane_x(4) - 9, 20, lane_x(4) + 1, 40))  # nudged left

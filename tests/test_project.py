@@ -100,43 +100,38 @@ def test_spine_from_labels_empty():
     assert spine_from_labels([]) == []
 
 
-# --- propose_lane: position proposes a new box's lane; stored lanes anchor it ---
-
-W, N = 800, 8  # lanes centred at 50, 150, ..., 750 when evenly spread
-ALL = range(N)
+# --- propose_lane: position proposes a new box's lane from anchored lanes ---
 
 
-def test_propose_lane_without_anchors_spreads_lanes_evenly():
-    assert [propose_lane(50 + 100 * i, [], N, W, ALL) for i in range(N)] == list(ALL)
-    assert propose_lane(0, [], N, W, ALL) == 0
-    assert propose_lane(W - 1, [], N, W, ALL) == N - 1
+def test_propose_lane_needs_two_anchored_lanes():
+    assert propose_lane(150, []) is None
+    assert propose_lane(150, [(100.0, 1), (104.0, 1)]) is None  # one lane: no pitch
+    assert propose_lane(150, [(100.0, 1), (100.0, 2)]) is None  # no rising pitch
 
 
-def test_propose_lane_follows_one_anchor_by_lane_pitch():
-    # Lane 2 sits at x=300 instead of 250: neighbours shift with it.
-    assert propose_lane(400, [(300.0, 2)], N, W, ALL) == 3
-    assert propose_lane(200, [(300.0, 2)], N, W, ALL) == 1
+def test_propose_lane_ignores_image_margins():
+    # Ten lanes start at x=150 with a pitch of 78, inside a wider image.
+    anchors = [(150.0, 0), (228.0, 1)]
+    assert [propose_lane(150 + 78 * i, anchors) for i in range(10)] == list(range(10))
 
 
 def test_propose_lane_interpolates_uneven_spacing_between_anchors():
     # A smiling gel: lanes 0 and 4 at 50 and 530 (pitch 120), lane 7 at 800 (pitch 90).
     anchors = [(50.0, 0), (530.0, 4), (800.0, 7)]
-    assert propose_lane(290, anchors, N, 900, ALL) == 2
-    assert propose_lane(710, anchors, N, 900, ALL) == 6
-    assert propose_lane(-40, anchors, N, 900, ALL) == 0  # extrapolated, clamped to lane 0
+    assert propose_lane(290, anchors) == 2
+    assert propose_lane(710, anchors) == 6
+    assert propose_lane(-40, anchors) == -1  # left of lane 0: the caller refuses it
 
 
-def test_propose_lane_averages_anchors_of_one_lane_and_skips_taken_lanes():
-    anchors = [(140.0, 1), (160.0, 1), (350.0, 3)]  # two proteins' boxes in lane 1
-    assert propose_lane(150, anchors, N, W, ALL) == 1
-    assert propose_lane(150, anchors, N, W, [0, 2, 3]) == 0  # nearest free, left on a tie
-    assert propose_lane(150, anchors, N, W, []) is None
+def test_propose_lane_uses_the_median_centre_of_each_lane():
+    anchors = [(140.0, 1), (160.0, 1), (500.0, 1), (350.0, 3)]  # an outlier in lane 1
+    assert propose_lane(250, anchors) == 2
 
 
-def test_propose_lane_falls_back_to_a_line_when_centres_do_not_rise():
-    # Stored lanes that contradict their x order (a user correction): fit a line.
-    anchors = [(100.0, 0), (300.0, 2), (250.0, 3)]
-    assert propose_lane(400, anchors, N, W, ALL) in range(N)
+def test_one_box_far_from_its_lane_skews_only_its_neighbourhood():
+    anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]  # lanes 0-6 in place
+    anchors.append((150.0, 7))  # lane 7 dragged over lane 2
+    assert [propose_lane(30 + 60 * lane, anchors) for lane in range(7)] == list(range(7))
 
 
 # --- join_to_spine: scatter by explicit identity, gaps don't shift ---

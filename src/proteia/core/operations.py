@@ -368,6 +368,31 @@ def _pin_single_loading_control(batch: Batch) -> None:
             protein.loading_control_ids = list(only)
 
 
+def _proposed_lane(
+    protein: Protein, x: float, anchors: list[tuple[float, int]], n: int, taken: dict[int, str]
+) -> int:
+    """The lane :func:`~proteia.core.project.propose_lane` gives, or the refusal."""
+    lane = propose_lane(x, anchors)
+    if lane is None:
+        raise OperationError(
+            ErrorCode.LANE_REQUIRED,
+            "choose the lane: position proposes one only once boxes in two lanes of this"
+            " image show the lane spacing",
+        )
+    if not 0 <= lane < n:
+        raise OperationError(
+            ErrorCode.LANE_OUT_OF_RANGE,
+            f"the box lies outside the {n} declared lanes (at lane {lane}); choose the lane",
+        )
+    if lane in taken:
+        raise OperationError(
+            ErrorCode.LANE_OCCUPIED,
+            f"{protein.name!r} already has a box in lane {lane}, where this box lies",
+            ids=[taken[lane]],
+        )
+    return lane
+
+
 def _lane_anchors(batch: Batch, image_id: str) -> list[tuple[float, int]]:
     """``(centre x, stored lane)`` of every first band on an image, of any protein."""
     anchors = []
@@ -821,11 +846,14 @@ def place_box(
     """Place a box of a protein in a lane at the image point ``(x, y)``; return
     the band id.
 
-    Without ``lane_index``, the lane is proposed from the box's position
-    (:func:`~proteia.core.project.propose_lane`), anchored on the boxes already
-    on the image, among the lanes where the protein has no box yet. Either way
-    the lane is stored with the band, and moving or removing other boxes never
-    changes it.
+    Without ``lane_index``, the lane is proposed from the position
+    (:func:`~proteia.core.project.propose_lane`): the clicked x for a fixed box,
+    the grown band's centre for a seed click. It needs boxes in at least two
+    lanes on the image to know the lane pitch (``LANE_REQUIRED`` otherwise), and
+    a proposed lane outside the table (``LANE_OUT_OF_RANGE``) or already holding
+    a box of the protein (``LANE_OCCUPIED``) is refused, never moved elsewhere.
+    Either way the lane is stored with the band, and moving or removing other
+    boxes never changes it.
 
     ``grow=True`` is a seed click: the band is grown from the point and the
     protein's shared size fitted to it (the first box sets the size, later ones
@@ -892,14 +920,10 @@ def place_box(
             )
         source = ProposalSource.MANUAL
     if lane_index is None:
-        lane_index = propose_lane(
-            (rect[0] + rect[2]) / 2,
-            _lane_anchors(batch, image.id),
-            n,
-            width,
-            free=[lane for lane in range(n) if lane not in taken],
-        )
-        assert lane_index is not None  # a free lane exists: checked above
+        # The grown band's centre, or where the user clicked: a fixed box is shifted
+        # inside the image at the edges, so its centre can sit in the next lane.
+        at = (rect[0] + rect[2]) / 2 if grow else x
+        lane_index = _proposed_lane(protein, at, _lane_anchors(batch, image.id), n, taken)
 
     def change(draft: Project) -> str:
         edited = draft.batch.find_protein(protein_id)
