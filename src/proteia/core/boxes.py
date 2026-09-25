@@ -3,10 +3,11 @@
 keep equal area, and forbid overlap.
 
 These are pure functions over rectangles so the rules can be unit-tested
-without a GUI. The napari layer calls :func:`reconcile` after every user edit
-and writes the corrected boxes back — the "validate-and-correct" approach
-(Route A): the user edits freely, then any edit that breaks an invariant is
-snapped or reverted.
+without a GUI. :func:`resize_all` enforces the shared size when it changes and
+refuses a size that would force an overlap; :func:`normalize_corners` reads
+napari shape vertices. (The napari app's own edit handler re-centres edited
+boxes to the shared size and restores the previous boxes of a protein when an
+edit makes any two of them overlap.)
 
 Coordinates use the model's :data:`~proteia.core.model.Rect` convention:
 ``(x0, y0, x1, y1)`` in image pixels, half-open on the high edge, with the box
@@ -34,41 +35,9 @@ def normalize_corners(corners: Sequence[Sequence[float]]) -> Rect:
     return (int(x0), int(y0), int(x1), int(y1))
 
 
-def snap_to_size(rect: Rect, size: BoxSize) -> Rect:
-    """Force a rect to the locked size, keeping its top-left (min) corner."""
-    x0, y0, _, _ = rect
-    return (x0, y0, x0 + size.width, y0 + size.height)
-
-
-def reconcile(prev: Sequence[Rect], new: Sequence[Rect], size: BoxSize) -> list[Rect]:
-    """Return a corrected box list that respects the locked size and no-overlap.
-
-    ``prev`` is the last valid configuration; ``new`` is the user's edited rects
-    (already normalized via :func:`normalize_corners`). Every box is snapped to
-    the locked ``size`` first. Then any box that *changed* relative to ``prev``
-    and now overlaps another is reverted to its previous position, or dropped if
-    it was newly added (no previous position to fall back to).
-
-    Assumes a single box changes per edit, which holds for interactive
-    single-mouse editing in napari. Boxes are matched to ``prev`` by index;
-    napari appends newly drawn shapes, so existing boxes keep their index.
-    """
-    snapped: list[Rect | None] = [snap_to_size(r, size) for r in new]
-    for i in range(len(snapped)):
-        changed = i >= len(prev) or snapped[i] != prev[i]
-        if not changed:
-            continue
-        if _overlaps_any(snapped, i):
-            snapped[i] = prev[i] if i < len(prev) else None  # revert, or drop a new box
-    return [r for r in snapped if r is not None]
-
-
-def _overlaps_any(rects: Sequence[Rect | None], i: int) -> bool:
-    """True if ``rects[i]`` overlaps any other (non-dropped) rect."""
-    a = rects[i]
-    if a is None:
-        return False
-    return any(b is not None and overlaps(a, b) for j, b in enumerate(rects) if j != i)
+def _overlaps_any(rects: Sequence[Rect], i: int) -> bool:
+    """True if ``rects[i]`` overlaps any other rect."""
+    return any(overlaps(rects[i], b) for j, b in enumerate(rects) if j != i)
 
 
 def resize_all(

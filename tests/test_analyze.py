@@ -15,7 +15,6 @@ from proteia.core.analyze import (
     compare,
     describe,
     fold_change_lane,
-    group_by_condition,
     normalize_batch,
     normalize_lane,
     reduce_samples,
@@ -79,24 +78,6 @@ def test_normalize_lane_guards_against_bad_loading():
 def test_normalize_lane_length_mismatch_raises():
     with pytest.raises(ValueError):
         normalize_lane([1, 2], [1])
-
-
-# --- grouping (replicates = shared label) ---
-
-
-def test_group_by_condition_pools_replicates():
-    groups = group_by_condition([1, 2, 3, 4], ["a", "a", "b", "b"])
-    assert groups == {"a": [1, 2], "b": [3, 4]}
-
-
-def test_group_by_condition_skips_none_but_keeps_group():
-    groups = group_by_condition([1, None, 3], ["a", "a", "b"])
-    assert groups == {"a": [1], "b": [3]}
-
-
-def test_group_preserves_left_to_right_order():
-    groups = group_by_condition([1, 2, 3], ["b", "a", "b"])
-    assert list(groups) == ["b", "a"]
 
 
 # --- fold change ---
@@ -163,6 +144,18 @@ def test_fold_change_all_control_lanes_excluded_raises():
 
 
 # --- sample reduction (technical vs biological replicates) ---
+
+
+def test_reduce_skips_lanes_without_a_value():
+    r = reduce_samples([1.0, None, 3.0], ["a", "a", "b"])
+    assert r.groups == {"a": [1.0], "b": [3.0]}
+
+
+def test_reduce_keeps_first_appearance_order_of_conditions():
+    # Interleaved conditions read left-to-right like the gel.
+    r = reduce_samples([1.0, 2.0, 3.0], ["b", "a", "b"])
+    assert list(r.groups) == ["b", "a"]
+    assert r.groups["b"] == [1.0, 3.0]
 
 
 def test_reduce_no_samples_treats_each_lane_as_biological():
@@ -281,7 +274,7 @@ def test_full_chain_normalize_group_compare():
     target = batch.targets()[0].nets
     loading = batch.loading_control().nets
     norm = normalize_lane(target, loading)
-    groups = group_by_condition(norm, batch.conditions)
+    groups = reduce_samples(norm, batch.conditions).groups  # no sample names: one per lane
     assert set(groups) == {"ctl", "A", "B"}
     assert [len(v) for v in groups.values()] == [3, 3, 2]
     res = compare(groups)

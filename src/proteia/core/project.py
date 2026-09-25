@@ -10,9 +10,10 @@ position) and an *identity* (which lane it is). Identity is the source of truth;
 geometry is only one way to *propose* it. So the pipeline is three separable
 parts:
 
-* :func:`build_spine` — declare-first: from a condition structure, generate the
-  N lanes (stable positions + auto sample ids). This fixes N before any box is
-  drawn, so a missing box becomes an empty slot rather than a shift.
+* :func:`spine_from_labels` (per-lane condition list, used by the napari app) or
+  :func:`build_spine` (condition counts) — declare-first: generate the N lanes
+  (stable positions + auto sample ids). This fixes N before any box is drawn, so
+  a missing box becomes an empty slot rather than a shift.
 * :func:`propose_positions` — the left-to-right heuristic, demoted from
   source-of-truth to an *editable proposal* of each box's lane position.
 * :func:`join_to_spine` — reads the *explicit* lane positions and scatters each
@@ -35,19 +36,6 @@ from proteia.core.model import Lane
 LaneNets = list[float | None]
 
 
-def lane_nets(
-    boxes: Sequence[tuple[int, float]], lane_labels: Sequence[str]
-) -> list[tuple[str, float]]:
-    """Pair each box's net signal to a lane label by left-to-right position.
-
-    ``boxes`` is a sequence of ``(x_left, net)``. Boxes are ordered by ``x_left``
-    and zipped with ``lane_labels``; boxes beyond the available lanes are dropped,
-    and lanes beyond the available boxes are simply absent.
-    """
-    ordered = sorted(boxes, key=lambda bn: bn[0])
-    return [(lane_labels[i], net) for i, (_, net) in enumerate(ordered) if i < len(lane_labels)]
-
-
 def build_spine(declaration: Sequence[tuple[str, int]]) -> list[Lane]:
     """Generate the lane spine from a declared condition structure (declare-first).
 
@@ -64,6 +52,9 @@ def build_spine(declaration: Sequence[tuple[str, int]]) -> list[Lane]:
     contiguous here; a non-contiguous layout is expressed by editing the spine
     afterwards (its lanes are freely mutable). Condition labels must be distinct
     and every count must be >= 1.
+
+    The napari app builds its spine with :func:`spine_from_labels` instead; this
+    form is kept for a lane table that is declared as condition counts.
     """
     labels = [cond for cond, _ in declaration]
     if len(set(labels)) != len(labels):
