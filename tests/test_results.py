@@ -654,4 +654,37 @@ def test_too_few_samples_give_a_chart_without_statistics():
     assert [bar.n for bar in chart.bars] == [1, 1]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
     # The all-lanes set has vehicle n = 2, still too few groups with two samples to test.
-    assert res.all_lanes.series[0].chart is not None
+    all_chart = res.all_lanes.series[0].chart
+    assert all_chart is not None
+    assert (all_chart.test_name, all_chart.test_p, all_chart.comparisons) == (None, None, [])
+
+
+def test_excluded_lanes_without_values_add_no_second_set():
+    # A ladder or empty lane marked include=no removes no data point.
+    def empty_lane_3(draft: Project) -> None:
+        for protein in draft.batch.proteins:
+            protein.bands = [b for b in protein.bands if b.lane_index != 3]
+
+    res = compute_results(_batch(empty_lane_3))
+    assert res.excluded_lanes == [3]
+    assert res.all_lanes is None
+
+
+def test_notices_shared_by_both_sets_appear_once():
+    res = compute_results(_batch(), plot_conditions=["vehicle", "no such condition"])
+    assert NoticeCode.UNKNOWN_PLOT_CONDITION in _codes(res)
+    assert NoticeCode.UNKNOWN_PLOT_CONDITION not in _codes(res.all_lanes)
+
+
+def test_reference_all_excluded_says_the_set_is_the_included_lanes():
+    res = compute_results(_batch(_lane(0, included=False), _lane(1, included=False)))
+    notice = _one(res, NoticeCode.REFERENCE_ALL_EXCLUDED)
+    assert "from the included lanes" in notice.message
+
+
+def test_the_all_lanes_set_has_no_set_of_its_own():
+    dump = compute_results(_batch()).model_dump()
+    assert dump["all_lanes"] is not None
+    # Nesting the whole result (which has its own all-lanes set) one level deeper.
+    with pytest.raises(ValueError, match="no all-lanes set of its own"):
+        results.Results.model_validate({**dump, "all_lanes": dump})

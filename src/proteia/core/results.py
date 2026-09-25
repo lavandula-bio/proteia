@@ -13,14 +13,20 @@ One call gives:
 * typed :class:`Notice` objects, built from the model directly, never by parsing
   warning strings.
 
-Each series is reduced once (:func:`~proteia.core.analyze.reduce_samples` with
-the lane table's include flags). The fold-change baseline comes from that
-reduction and the chart's groups are that reduction divided by the baseline, so
-the table and the chart of a series use one loading control and one baseline,
-and the plotted subset of conditions, applied afterwards, never moves the
-baseline. Dividing the reduced values (rather than reducing per-lane fold values)
-is equal in exact arithmetic, bit-identical for representative repeats and single
-lanes, and can differ in the last ulp only for averaged technical repeats.
+Within a result set, each series is reduced once
+(:func:`~proteia.core.analyze.reduce_samples` with that set's include flags). The
+fold-change baseline comes from that reduction and the chart's groups are that
+reduction divided by the baseline, so the table and the chart of a series use
+one loading control and one baseline, and the plotted subset of conditions,
+applied afterwards, never moves the baseline. Dividing the reduced values
+(rather than reducing per-lane fold values) is equal in exact arithmetic,
+bit-identical for representative repeats and single lanes, and can differ in the
+last ulp only for averaged technical repeats.
+
+When excluded lanes (include=no) hold values, a second result set is computed
+with every lane included (:attr:`Results.all_lanes`), so removing data points is
+never hidden; lanes excluded without any value (a ladder, an empty lane) add no
+second set.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from enum import StrEnum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from proteia.core import analyze, model
 from proteia.core.analyze import (
@@ -153,6 +159,12 @@ class Results(BaseModel, frozen=True):
     excluded_lanes: list[int] = []
     all_lanes: Results | None = None
 
+    @model_validator(mode="after")
+    def _one_level(self) -> Results:
+        if self.all_lanes is not None and self.all_lanes.all_lanes is not None:
+            raise ValueError("the all-lanes result set has no all-lanes set of its own")
+        return self
+
 
 def _join(protein: model.Protein, n: int) -> tuple[LaneNets, list[str | None]]:
     """A protein's band-index-0 nets and band ids per lane, by stored lane index.
@@ -221,14 +233,20 @@ def compute_results(
 ) -> Results:
     """Everything the results view shows, from the stored batch alone.
 
-    See :func:`_compute` for one result set. When the lane table excludes lanes
-    (include=no), the returned set applies the exclusions and its ``all_lanes``
-    is the same computation with every lane included: an exclusion is never
-    hidden. A set whose groups are too small for a test still has its charts,
-    with no test result and no brackets.
+    See :func:`_compute` for one result set. When lanes the lane table excludes
+    (include=no) hold a value for any protein, the returned set applies the
+    exclusions and its ``all_lanes`` is the same computation with every lane
+    included: removing data points is never hidden. Excluded lanes without any
+    value (a ladder, an empty lane) change nothing, so they add no second set.
+    Notices the two sets share are kept only in the first. A set whose groups
+    are too small for a test still has its charts, with no test result and no
+    brackets.
     """
     results = _compute(batch, plot_conditions=plot_conditions, error_type=error_type, method=method)
-    if not results.excluded_lanes:
+    removed_values = any(
+        column.nets[i] is not None for column in results.proteins for i in results.excluded_lanes
+    )
+    if not removed_values:
         return results
     every_lane = batch.model_copy(
         update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
@@ -236,7 +254,8 @@ def compute_results(
     all_lanes = _compute(
         every_lane, plot_conditions=plot_conditions, error_type=error_type, method=method
     )
-    return results.model_copy(update={"all_lanes": all_lanes})
+    own = [notice for notice in all_lanes.notices if notice not in results.notices]
+    return results.model_copy(update={"all_lanes": all_lanes.model_copy(update={"notices": own})})
 
 
 def _compute(
@@ -355,7 +374,7 @@ def _compute(
         note(
             NoticeCode.REFERENCE_ALL_EXCLUDED,
             f"every lane of the reference condition {ref!r} is excluded:"
-            " no fold-change can be formed",
+            " no fold-change can be formed from the included lanes",
             lane_indices=reference_lanes,
             conditions=(ref,),
         )
