@@ -214,21 +214,6 @@ def group_by_condition(values: LaneNets, conditions: list[str]) -> dict[str, lis
     return groups
 
 
-def fold_change_lane(values: LaneNets, conditions: list[str], control_condition: str) -> LaneNets:
-    """Express each lane as a fold-change vs the control condition's mean.
-
-    Keeps the per-lane shape (so individual points survive), dividing every lane
-    by the mean of the control group. Returns ``None`` lanes unchanged.
-    """
-    control_vals = group_by_condition(values, conditions).get(control_condition, [])
-    if not control_vals:
-        raise ValueError(f"control condition {control_condition!r} has no values")
-    baseline = float(np.mean(control_vals))
-    if baseline <= 0:
-        raise ValueError("control condition mean is non-positive; cannot form fold-change")
-    return [None if v is None else v / baseline for v in values]
-
-
 class ReduceMethod(StrEnum):
     MEAN = "mean"  # average technical repeats (force-merge; the safe default)
     REPRESENTATIVE = "representative"  # keep one repeat per sample, drop the rest
@@ -306,6 +291,37 @@ def reduce_samples(
             f"{what} {len(averaged)} sample(s) with technical repeats (repeats do not count as n)"
         )
     return SampleReduction(groups=groups, averaged=averaged, warnings=warnings)
+
+
+def fold_change_lane(
+    values: LaneNets,
+    conditions: list[str],
+    control_condition: str,
+    samples: list[str | None] | None = None,
+    *,
+    included: list[bool] | None = None,
+    method: ReduceMethod = ReduceMethod.MEAN,
+) -> LaneNets:
+    """Express each lane as a fold-change vs the control condition's baseline.
+
+    The baseline is the mean of the control condition's *sample* values, reduced
+    exactly as the statistics see them (:func:`reduce_samples`): ``included=False``
+    lanes are dropped and technical repeats collapse to one value per sample. So
+    the control group's reduced fold-changes average to 1.0 and its n matches the
+    statistics. Pass the lane table's ``included``, not a plot's condition subset:
+    the baseline must not depend on which conditions are charted.
+
+    Keeps the per-lane shape (so individual points survive), dividing every lane
+    by the baseline. Returns ``None`` lanes unchanged.
+    """
+    reduction = reduce_samples(values, conditions, samples, included=included, method=method)
+    control_vals = reduction.groups.get(control_condition, [])
+    if not control_vals:
+        raise ValueError(f"control condition {control_condition!r} has no values")
+    baseline = float(np.mean(control_vals))
+    if baseline <= 0:
+        raise ValueError("control condition mean is non-positive; cannot form fold-change")
+    return [None if v is None else v / baseline for v in values]
 
 
 @dataclass(frozen=True)
