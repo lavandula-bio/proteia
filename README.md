@@ -12,11 +12,11 @@ Part of the [Lavandula](https://github.com/lavandula-bio) open-source ecosystem 
 
 Proteia turns a Western blot scan into quantified, replicate-aware results without leaving the app:
 
-1. **Place ROIs fast** — Ctrl+click a band and a region-grow step fits a box to it; all boxes for one protein share one size (large enough for the widest and tallest fitted bands, and adjustable), so each of its lanes is measured over the same area.
-2. **Define the experiment** — list one condition per lane; a data card then holds each lane's condition, biological sample (by default, each lane is its own sample), and include flag. Lanes that share both condition and sample are treated as technical repeats. Boxes are matched to lanes by their horizontal position.
+1. **Place ROIs fast** — while editing a protein, Ctrl+click a band and a region-grow step fits a box to it (in manual-box mode, a fixed-size box is dropped on the click instead); all boxes for one protein share one size, which starts from the largest fitted band and can be adjusted by hand, so each of its lanes is measured over the same area.
+2. **Define the experiment** — list one condition per lane; a data card then holds each lane's condition, biological sample (by default, each lane is its own sample), and include flag. Lanes that share both condition and sample are treated as technical repeats. Boxes are matched to lanes by their horizontal position within each image, which can misplace lanes when a band is missing; Proteia warns when a protein has fewer boxes than lanes.
 3. **Quantify** — each image gets a single background level, the median of its grayscale pixels (there is no separate background box per band). A band's net signal is the sum, over its box, of how much darker each pixel is than that level (or brighter, for an image you set as light-on-dark, such as fluorescence); pixels on the background side count as zero. Net signals are normalized per lane to a loading control and, if you choose a reference condition, expressed as fold-change versus that condition.
 4. **Analyze correctly** — technical repeats are averaged before statistics (so they do not inflate *n*), then Welch's *t*-test (2 groups) or one-way ANOVA + Tukey HSD (3+).
-5. **Output** — a bar chart of group means with SD or SEM error bars, one point per biological sample, and significance brackets for pairs with *p* < 0.05, plus CSV export of the per-lane table (condition, sample, include flag, and each protein's net signal) and chart export (PNG/PDF/SVG).
+5. **Output** — a bar chart of group means with SD or SEM error bars, one point per biological sample, and significance brackets for pairs with *p* < 0.05, plus CSV export of the per-lane table (lane, condition, sample, include flag, and each protein's net signal) and chart export (PNG/PDF/SVG).
 
 Everything runs on your machine. **No telemetry. Your data stays local.**
 
@@ -34,7 +34,7 @@ Planned, **not yet built** — listed as direction, not current capability:
 - **Explicit lane identity** — each band stores the declared lane it belongs to, so a missing band leaves an empty slot instead of shifting its neighbors; horizontal position only proposes a lane.
 - **Row-based band detection** — drag one box around a row of bands; Proteia finds one band per declared lane, places an equal-size box on each, and leaves lanes without a band empty. Clicking individual bands remains available as a fallback.
 - **Molecular-weight guidance** — calibrate each membrane against its protein ladder (for example, from a marker image taken without moving the membrane) and place each protein's row at its expected molecular weight.
-- **Domain rules** — deterministic checks that flag problems in the results: over-exposed (clipped) bands, molecular-weight consistency (apparent versus expected), band count (found versus expected), and pseudoreplication (technical repeats standing in for biological replicates).
+- **Domain rules** — deterministic checks that flag problems in the results: over-exposed (clipped) bands, molecular-weight consistency (apparent versus expected), band count (found versus expected), pseudoreplication (technical repeats standing in for biological replicates), and loading-control checks.
 
 ## Get involved
 
