@@ -43,11 +43,12 @@ Visualization), so an installer would also have to leave them out.
 
 **What does not change.** The application stays local-first and works offline: no
 telemetry, and data stays on the user's machine. ADR 0001 met this with no server
-at all; this ADR keeps the same guarantees with a server that is reachable only
-from the same machine. The analysis core is already GUI-independent, as ADR 0001
-required: `proteia.core` does not import napari or Qt. Application state and the
-orchestration of user actions, however, still live in the napari module
-(`proteia.gui.app`), so they cannot be tested or reused without it.
+at all; this ADR keeps the same guarantees with a server that listens only on the
+loopback interface and admits only the user who launched it. The analysis core is
+already GUI-independent, as ADR 0001 required: `proteia.core` does not import
+napari or Qt. Application state and the orchestration of user actions, however,
+still live in the napari module (`proteia.gui.app`), so they cannot be tested or
+reused without it.
 
 ## Decision
 
@@ -56,22 +57,33 @@ machine does all the work, and the user's own browser displays the interface.
 
 **Server**
 
-- A Python server (FastAPI on Uvicorn) binds to `127.0.0.1` only, on a random free
-  port chosen at startup. It makes no outbound network connections.
-- Each session gets its own access token: every launch generates a new random
-  token, the launcher opens the default browser at `http://127.0.0.1:<port>/` with
-  the token in the URL, and the server rejects requests without a valid token.
-- Other web pages must not be able to use the token. The client presents it
-  explicitly, for example in a request header, rather than relying on anything the
-  browser attaches on its own. If a cookie is used as well, it is HttpOnly and
-  SameSite=Strict, and the server rejects state-changing requests whose `Origin`
-  is not the application's own.
-- The server also rejects requests whose `Host` header does not name the loopback
+- A Python server (FastAPI on Uvicorn) binds to `127.0.0.1` only. It binds to port
+  0 and reads back the port the operating system assigned, so no other process can
+  take the port between choosing and binding. It makes no outbound network
+  connections.
+- Every launch generates a new random access token. The page shell and its static
+  files (HTML, CSS, JavaScript) hold no user data and are served without it; every
+  other route, including image previews, requires it. The token check is middleware
+  in front of all routes, so a new route cannot skip it. FastAPI's generated API
+  description (`/openapi.json`) and its documentation pages (`/docs`, `/redoc`,
+  which also load scripts from a CDN) are turned off.
+- The client sends the token explicitly in a request header and fetches previews
+  with that header. Nothing relies on credentials the browser attaches on its own:
+  there is no session cookie, because cookies are not scoped by port and pages from
+  other local servers could trigger them.
+- Other accounts on the same computer can reach the loopback port, so the token,
+  not the loopback binding, is what keeps them out, and it must not be exposed to
+  them. The launcher opens a temporary redirect file that only the current user can
+  read, instead of passing the token on a command line that other local users can
+  list, and the token travels in the URL fragment, which the browser does not send
+  to the server.
+- The server rejects requests whose `Host` header does not name the loopback
   address and port it is serving, which blocks DNS-rebinding attacks from web
   pages. Requests that other pages send straight to the loopback port carry a valid
   `Host` header; the token is what stops them.
-- FastAPI's interactive API documentation pages (`/docs` and `/redoc`) are turned
-  off, since they load their scripts and styles from a CDN.
+- A lock file that only the current user can read records the running instance's
+  port and token, so launching Proteia again opens the running instance instead of
+  starting a second server.
 - All computation and image rendering happen on the server: quantification,
   statistics, charts, and display previews of the scans (including mapping 16-bit
   data to a displayable range). Analysis always uses the full-resolution image
@@ -86,8 +98,11 @@ machine does all the work, and the user's own browser displays the interface.
 - A project is stored as a project folder: a `project.json` file with the project
   data, plus the imported images and exports.
 - The browser sends each imported image to the server as a raw request body, one
-  file per request, and the server copies it into the project folder, so no
-  multipart form parser is needed.
+  file per request, so no multipart form parser is needed. The server streams the
+  body to disk with a size limit rather than holding it in memory, and stores it in
+  the project folder under a name it generates itself. The original file name is
+  sent percent-encoded, so names such as `β-actin 10 µM.tif` survive, and is kept
+  only as metadata: a name from the client never becomes a path.
 
 **Client**
 
@@ -164,14 +179,15 @@ separate ADR.
   arrives as file contents only, and choosing where a project folder lives needs
   its own design (for example, a projects directory managed by the application, or
   a folder picker that the application serves).
-- A local server is an attack surface on the user's machine. Loopback binding, the
-  per-session token, and the Host-header check are required, and tests must show
-  that requests without the token, with a foreign `Host` header, or sent cross-site
-  by another page are rejected. Exposing the server beyond loopback would need a
-  new decision.
+- A local server is an attack surface on the user's machine, including for other
+  accounts on a shared computer. Loopback binding, the per-launch token, and the
+  Host-header check are required, and tests must show that requests without the
+  token, with a foreign `Host` header, or sent cross-site by another page are
+  rejected, and that an upload name cannot write outside the project folder.
+  Exposing the server beyond loopback would need a new decision.
 - The application lifecycle needs explicit handling: closing the browser tab does
-  not stop the server, so the app needs a clear way to quit, and launching it again
-  while it is running must behave predictably.
+  not stop the server, so the app needs a clear way to quit, and a stale lock file
+  left by a crashed instance must not block the next launch.
 - Until the web UI reaches parity, two front-ends coexist and napari remains a
   dependency.
 
