@@ -113,6 +113,55 @@ def test_fold_change_missing_control_raises():
         fold_change_lane([1, 2], ["x", "x"], "c")
 
 
+def test_fold_change_baseline_skips_excluded_control_lane():
+    # The excluded control lane (8) must not enter the baseline: 2, not mean(2, 2, 8) = 4.
+    conditions = ["c", "c", "c", "x"]
+    included = [True, True, False, True]
+    fc = fold_change_lane([2, 2, 8, 4], conditions, "c", included=included)
+    assert fc == [1.0, 1.0, 4.0, 2.0]  # per-lane shape kept, excluded lane included
+    groups = reduce_samples(fc, conditions, included=included).groups
+    assert groups["c"] == [1.0, 1.0]  # the reference bar reads 1.0
+
+
+def test_fold_change_baseline_counts_technical_repeats_once():
+    # s1 is loaded twice: baseline = mean(s1 = 1, s2 = 4) = 2.5, not the lane mean 2.0.
+    conditions = ["c", "c", "c", "x"]
+    samples = ["s1", "s1", "s2", "s3"]
+    fc = fold_change_lane([1, 1, 4, 5], conditions, "c", samples)
+    assert fc == pytest.approx([0.4, 0.4, 1.6, 2.0])
+    groups = reduce_samples(fc, conditions, samples).groups
+    assert groups["c"] == pytest.approx([0.4, 1.6])
+    assert float(sum(groups["c"]) / len(groups["c"])) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("method", list(ReduceMethod))
+def test_fold_change_reference_bar_is_one_for_each_reduce_method(method):
+    conditions = ["c", "c", "c", "c", "x", "x"]
+    samples = ["s1", "s1", "s2", "s3", "s4", "s5"]
+    included = [True, True, True, False, True, True]
+    values = [3, 5, 2, 50, 6, 9]
+    fc = fold_change_lane(values, conditions, "c", samples, included=included, method=method)
+    groups = reduce_samples(fc, conditions, samples, included=included, method=method).groups
+    assert float(sum(groups["c"]) / len(groups["c"])) == pytest.approx(1.0)
+
+
+def test_fold_change_unaffected_by_plot_subset_without_reference():
+    # Charting only "x" must not move the baseline: it comes from the lane table's
+    # included lanes, and the plot subset is applied afterwards.
+    conditions = ["c", "c", "x", "x"]
+    samples = ["s1", "s2", "s3", "s4"]
+    included = [True, True, True, True]
+    fc = fold_change_lane([2, 4, 6, 9], conditions, "c", samples, included=included)
+    plotted = [inc and cond == "x" for inc, cond in zip(included, conditions, strict=True)]
+    groups = reduce_samples(fc, conditions, samples, included=plotted).groups
+    assert groups == {"x": [2.0, 3.0]}  # baseline mean(2, 4) = 3
+
+
+def test_fold_change_all_control_lanes_excluded_raises():
+    with pytest.raises(ValueError, match="has no value in any included lane"):
+        fold_change_lane([2, 4, 6], ["c", "c", "x"], "c", included=[False, False, True])
+
+
 # --- sample reduction (technical vs biological replicates) ---
 
 
@@ -145,6 +194,20 @@ def test_reduce_representative_keeps_first_repeat():
         method=ReduceMethod.REPRESENTATIVE,
     )
     assert r.groups["a"] == [100.0, 80.0]  # first lane of s1, not the mean
+
+
+def test_reduce_unnamed_lane_never_merges_with_a_digit_sample_name():
+    # Lane 2 has no sample name; it must stay its own sample, not join the one named "2".
+    r = reduce_samples([1.0, 2.0, 6.0], ["c", "c", "c"], ["1", "2", None])
+    assert r.groups == {"c": [1.0, 2.0, 6.0]}
+    assert r.averaged == []
+
+
+def test_reduce_blank_sample_names_are_unnamed_lanes():
+    # Blank names (a lane table built outside the GUI card) must not merge lanes.
+    r = reduce_samples([1.0, 2.0, 6.0], ["c", "c", "c"], ["", " ", ""])
+    assert r.groups == {"c": [1.0, 2.0, 6.0]}
+    assert r.averaged == []
 
 
 def test_reduce_excludes_presentation_only_lanes():

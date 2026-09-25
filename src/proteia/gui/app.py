@@ -999,7 +999,11 @@ def launch(image_path: str | None = None) -> None:
             values = s.values
             if control:
                 try:
-                    values = fold_change_lane(values, conditions, control)
+                    # Baseline from the lane table's included samples, not the
+                    # plotted subset, so the reference reads 1.0 in every chart.
+                    values = fold_change_lane(
+                        values, conditions, control, samples, included=included
+                    )
                 except ValueError as exc:
                     notes.append(f"{s.target}/{s.loading}: {exc}")
                     continue

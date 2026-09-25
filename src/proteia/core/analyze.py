@@ -214,21 +214,6 @@ def group_by_condition(values: LaneNets, conditions: list[str]) -> dict[str, lis
     return groups
 
 
-def fold_change_lane(values: LaneNets, conditions: list[str], control_condition: str) -> LaneNets:
-    """Express each lane as a fold-change vs the control condition's mean.
-
-    Keeps the per-lane shape (so individual points survive), dividing every lane
-    by the mean of the control group. Returns ``None`` lanes unchanged.
-    """
-    control_vals = group_by_condition(values, conditions).get(control_condition, [])
-    if not control_vals:
-        raise ValueError(f"control condition {control_condition!r} has no values")
-    baseline = float(np.mean(control_vals))
-    if baseline <= 0:
-        raise ValueError("control condition mean is non-positive; cannot form fold-change")
-    return [None if v is None else v / baseline for v in values]
-
-
 class ReduceMethod(StrEnum):
     MEAN = "mean"  # average technical repeats (force-merge; the safe default)
     REPRESENTATIVE = "representative"  # keep one repeat per sample, drop the rest
@@ -269,21 +254,26 @@ def reduce_samples(
     if len(values) != n:
         raise ValueError("values and conditions length mismatch")
     if samples is None:
-        samples = [str(i) for i in range(n)]
+        samples = [None] * n
     elif len(samples) != n:
         raise ValueError("samples and conditions length mismatch")
     if included is not None and len(included) != n:
         raise ValueError("included and conditions length mismatch")
 
     # Collect each (condition, sample)'s lane values, preserving first-seen order.
-    buckets: dict[tuple[str, str], list[float]] = {}
-    order: list[tuple[str, str]] = []
+    # An unnamed lane (None or a blank name) is its own sample, keyed by its int
+    # position so it can never merge with a sample the user named with a digit
+    # (e.g. "2") or with another unnamed lane.
+    buckets: dict[tuple[str, str | int], list[float]] = {}
+    order: list[tuple[str, str | int]] = []
     for i in range(n):
         if included is not None and not included[i]:
             continue
         if values[i] is None:
             continue
-        key = (conditions[i], str(samples[i]) if samples[i] is not None else str(i))
+        name = samples[i]
+        named = name is not None and str(name).strip() != ""
+        key = (conditions[i], str(name) if named else i)
         if key not in buckets:
             buckets[key] = []
             order.append(key)
@@ -292,12 +282,12 @@ def reduce_samples(
     groups: dict[str, list[float]] = {}
     averaged: list[tuple[str, str]] = []
     for key in order:
-        cond, _sample = key
+        cond, sample = key
         vals = buckets[key]
         reduced = float(np.mean(vals)) if method is ReduceMethod.MEAN else vals[0]
         groups.setdefault(cond, []).append(reduced)
-        if len(vals) > 1:
-            averaged.append(key)
+        if len(vals) > 1:  # only named samples can span several lanes
+            averaged.append((cond, str(sample)))
 
     warnings: list[str] = []
     if averaged:
@@ -306,6 +296,39 @@ def reduce_samples(
             f"{what} {len(averaged)} sample(s) with technical repeats (repeats do not count as n)"
         )
     return SampleReduction(groups=groups, averaged=averaged, warnings=warnings)
+
+
+def fold_change_lane(
+    values: LaneNets,
+    conditions: list[str],
+    control_condition: str,
+    samples: list[str | None] | None = None,
+    *,
+    included: list[bool] | None = None,
+    method: ReduceMethod = ReduceMethod.MEAN,
+) -> LaneNets:
+    """Express each lane as a fold-change vs the control condition's baseline.
+
+    The baseline is the mean of the control condition's *sample* values, reduced
+    exactly as the statistics see them (:func:`reduce_samples`): ``included=False``
+    lanes are dropped and technical repeats collapse to one value per sample. So
+    the control group's reduced fold-changes average to 1.0 and its n matches the
+    statistics. Pass the lane table's ``included``, not a plot's condition subset:
+    the baseline must not depend on which conditions are charted.
+
+    Keeps the per-lane shape (so individual points survive), dividing every lane
+    by the baseline. Returns ``None`` lanes unchanged.
+    """
+    reduction = reduce_samples(values, conditions, samples, included=included, method=method)
+    control_vals = reduction.groups.get(control_condition, [])
+    if not control_vals:
+        raise ValueError(
+            f"control condition {control_condition!r} has no value in any included lane"
+        )
+    baseline = float(np.mean(control_vals))
+    if baseline <= 0:
+        raise ValueError("control condition mean is non-positive; cannot form fold-change")
+    return [None if v is None else v / baseline for v in values]
 
 
 @dataclass(frozen=True)
