@@ -1,6 +1,6 @@
 # ADR 0001: GUI foundation — napari desktop application
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0002](0002-gui-local-web-app.md)
 - **Date**: 2026-05-31
 - **Deciders**: Roger Huang
 
