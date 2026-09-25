@@ -49,3 +49,39 @@ def test_lane_table_rejects_misaligned_columns(tmp_path):
     assert not (tmp_path / "t.csv").exists()  # checked before the file is opened
     with pytest.raises(ValueError, match="2 lanes"):
         write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1", "s2"], [True, True], [("p", [1])])
+
+
+def test_lane_table_marks_clipped_bands(tmp_path):
+    path = tmp_path / "clipped.csv"
+    write_lane_table(
+        path,
+        ["a", "a", "b"],
+        ["s1", "s2", "s3"],
+        [True, True, True],
+        [("β-actin", [1.0, 2.0, None]), ("α-tubulin", [3.0, 4.0, 5.0])],
+        clipped={"β-actin": [True, False, None]},
+    )
+    rows = _read_rows(path)
+    assert rows[0] == [
+        "lane",
+        "condition",
+        "sample",
+        "include",
+        "β-actin",
+        "β-actin clipped",
+        "α-tubulin",
+    ]
+    assert [row[5] for row in rows[1:]] == ["yes", "no", ""]
+    with pytest.raises(ValueError, match="2 clipping flags but there are 1 lanes"):
+        write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.0])], clipped={"p": [True, False]})
+    with pytest.raises(ValueError, match="not in the table"):
+        write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.0])], clipped={"q": [True]})
+    with pytest.raises(ValueError, match="share a name"):
+        write_lane_table(
+            path,
+            ["a"],
+            ["s1"],
+            [True],
+            [("p", [1.0]), ("p clipped", [2.0])],
+            clipped={"p": [True]},
+        )

@@ -83,3 +83,45 @@ def net_signal(
     else:
         contribution = np.maximum(pixels - background, 0.0)
     return float(contribution.sum())
+
+
+# A band is flagged as clipped when at least this many pixels inside its box sit
+# at the detector limit (maintainer decision on #44: any pixel). Flagged bands stay
+# in the statistics; the user decides whether to exclude the lane.
+CLIPPED_PIXELS_THRESHOLD = 1
+
+
+def detector_limit(bit_depth: int, *, dark_on_light: bool) -> int:
+    """The pixel value a saturated detector leaves in a ``bit_depth`` image.
+
+    Signal makes a light-on-dark image brighter, so saturation pins it at the
+    maximum, ``2**bit_depth - 1``; a dark-on-light image shows signal as darkness,
+    so saturation pins it at the minimum, 0.
+    """
+    return 0 if dark_on_light else 2**bit_depth - 1
+
+
+def clipped_pixels(
+    image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int, dark_on_light: bool
+) -> int:
+    """How many pixels inside the box sit at the detector limit.
+
+    Densitometry holds only while the detector responds linearly: a band with
+    pixels at the limit is flat-topped, and its net under-estimates it. Raises
+    ValueError if the box extends beyond the image bounds.
+    """
+    limit = detector_limit(bit_depth, dark_on_light=dark_on_light)
+    return int(np.count_nonzero(_box_pixels(image, box, size) == limit))
+
+
+def is_clipped(
+    image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int | None, dark_on_light: bool
+) -> bool | None:
+    """Whether a band is over-exposed: :data:`CLIPPED_PIXELS_THRESHOLD` or more
+    pixels of its box at the detector limit. None (not checked, never "passed")
+    when ``bit_depth`` is None: the image has no limit the check can trust
+    (:func:`proteia.core.imaging.clipping_depth`)."""
+    if bit_depth is None:
+        return None
+    count = clipped_pixels(image, box, size, bit_depth=bit_depth, dark_on_light=dark_on_light)
+    return count >= CLIPPED_PIXELS_THRESHOLD

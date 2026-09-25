@@ -6,7 +6,10 @@ import pytest
 
 from proteia.core.model import Box, BoxSize
 from proteia.core.quantify import (
+    clipped_pixels,
+    detector_limit,
     estimate_background,
+    is_clipped,
     net_signal,
     to_grayscale,
 )
@@ -77,3 +80,46 @@ def test_net_signal_out_of_bounds_raises():
     img = np.ones((10, 10))
     with pytest.raises(ValueError, match="bounds"):
         net_signal(img, Box(x=8, y=0), BoxSize(width=5, height=2), background=0.5)
+
+
+# --- over-exposure (clipping) ---
+
+
+def test_detector_limit_follows_bit_depth_and_polarity():
+    assert detector_limit(16, dark_on_light=False) == 65535
+    assert detector_limit(8, dark_on_light=False) == 255
+    assert detector_limit(16, dark_on_light=True) == 0
+
+
+def test_a_band_at_the_detector_limit_is_clipped():
+    # Light on dark, 16-bit: two pixels of the band hit 65535.
+    img = np.full((10, 10), 1000.0)
+    img[4:6, 4:7] = 40000.0
+    img[5, 5] = img[4, 5] = 65535.0
+    box, size = Box(x=3, y=3), BoxSize(width=5, height=4)
+    assert clipped_pixels(img, box, size, bit_depth=16, dark_on_light=False) == 2
+    assert is_clipped(img, box, size, bit_depth=16, dark_on_light=False)
+    img[5, 5] = img[4, 5] = 65534.0  # one level below the limit: not clipped
+    assert not is_clipped(img, box, size, bit_depth=16, dark_on_light=False)
+
+
+def test_a_dark_band_pinned_at_zero_is_clipped():
+    # Dark on light, 8-bit: saturation shows as black.
+    img = np.full((10, 10), 200.0)
+    img[4:6, 4:7] = 0.0
+    box, size = Box(x=3, y=3), BoxSize(width=5, height=4)
+    assert is_clipped(img, box, size, bit_depth=8, dark_on_light=True)
+    assert not is_clipped(img, box, size, bit_depth=8, dark_on_light=False)  # 255 never reached
+    assert not is_clipped(
+        img, Box(x=0, y=0), BoxSize(width=3, height=3), bit_depth=8, dark_on_light=True
+    )
+
+
+def test_is_clipped_without_a_trusted_limit_is_not_checked():
+    img = np.zeros((4, 4))
+    assert (
+        is_clipped(
+            img, Box(x=0, y=0), BoxSize(width=2, height=2), bit_depth=None, dark_on_light=True
+        )
+        is None
+    )
