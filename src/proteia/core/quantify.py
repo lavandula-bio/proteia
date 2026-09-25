@@ -115,9 +115,13 @@ def clipped_pixels(
 
 
 def is_clipped(
-    image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int, dark_on_light: bool
-) -> bool:
+    image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int | None, dark_on_light: bool
+) -> bool | None:
     """Whether a band is over-exposed: :data:`CLIPPED_PIXELS_THRESHOLD` or more
-    pixels of its box at the detector limit."""
+    pixels of its box at the detector limit. None (not checked, never "passed")
+    when ``bit_depth`` is None: the image has no limit the check can trust
+    (:func:`proteia.core.imaging.clipping_depth`)."""
+    if bit_depth is None:
+        return None
     count = clipped_pixels(image, box, size, bit_depth=bit_depth, dark_on_light=dark_on_light)
     return count >= CLIPPED_PIXELS_THRESHOLD

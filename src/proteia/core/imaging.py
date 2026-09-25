@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -233,6 +234,21 @@ def from_pixels(pixels: np.ndarray, *, lossy: bool = False) -> LoadedImage:
     if lossy:
         warnings.insert(0, _warning("lossy_format"))
     return LoadedImage(array=array, pixels=pixels, bit_depth=depth, warnings=warnings)
+
+
+def clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> int | None:
+    """The bit depth whose detector limit the over-exposure check may trust, or None.
+
+    None when the depth is unknown (float data), when lossy compression moved
+    saturated pixels off the limit (``lossy_format``), or when color was averaged
+    into gray (``color_channels_differ``): a channel saturated alone never brings
+    the mean to the limit. A 12- or 14-bit camera writing a 16-bit file is checked
+    against the container limit, so its saturation goes unseen (a known limit).
+    """
+    untrusted = {"lossy_format", "color_channels_differ"}
+    if bit_depth is None or any(w.code in untrusted for w in warnings):
+        return None
+    return bit_depth
 
 
 def load_image(path: str | os.PathLike[str]) -> LoadedImage:

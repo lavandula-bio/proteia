@@ -28,6 +28,7 @@ from proteia.core import boxes, results, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
+from proteia.core.imaging import clipping_depth
 from proteia.core.model import (
     Box,
     BoxSize,
@@ -136,16 +137,9 @@ def assert_nets_current(session: ProjectSession) -> None:
                 pixels, band.box, protein.box_size, image.background, dark_on_light=dark
             )
             assert band.net == expected, band.id
-            clipped = (
-                None
-                if image.bit_depth is None
-                else is_clipped(
-                    pixels,
-                    band.box,
-                    protein.box_size,
-                    bit_depth=image.bit_depth,
-                    dark_on_light=dark,
-                )
+            depth = clipping_depth(image.bit_depth, image.import_warnings)
+            clipped = is_clipped(
+                pixels, band.box, protein.box_size, bit_depth=depth, dark_on_light=dark
             )
             assert band.clipped is clipped, band.id
 
@@ -693,12 +687,12 @@ def test_set_polarity_recomputes_the_nets_on_that_image(tmp_path):
         ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
         ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=False)
 
-    def mark_checked(draft: Project) -> None:  # #44 will set the flag
+    def mark_clipped(draft: Project) -> None:  # a stale flag the polarity change must redo
         for protein in draft.batch.proteins:
             for band in protein.bands:
-                band.clipped = False
+                band.clipped = True
 
-    plant(s, mark_checked)
+    plant(s, mark_clipped)
     background = s.project.batch.find_image(bright).background
     dark_bands = protein_of(s, on_dark).bands
 
@@ -1529,3 +1523,57 @@ def test_an_image_without_a_detector_limit_is_not_checked(tmp_path):
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     band = ops.place_box(s, protein, lane_x(0), LANE_ROW, lane_index=0, grow=False)
     assert band_of(s, band).clipped is None
+
+
+@pytest.mark.parametrize(
+    ("name", "pixels"),
+    [
+        ("color blot.tif", "rgb"),  # color averaged into gray
+        ("lossy blot.jpg", "jpeg"),  # compression moves saturated pixels off the limit
+    ],
+)
+def test_images_whose_limit_cannot_be_trusted_are_not_checked(tmp_path, name, pixels):
+    s = session_on(tmp_path)
+    gray = synthetic_blot((LANE_H, LANE_W), [(lane_x(0), LANE_ROW, 6.0, 3.0, 60000.0)])
+    gray8 = (gray // 257).astype(np.uint8)
+    source = tmp_path / "sources" / name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    if pixels == "rgb":
+        write_tiff(source, np.stack([gray8, gray8 // 2, gray8 // 3], axis=-1))
+    else:
+        from skimage import io as skio
+
+        skio.imsave(source, gray8, check_contrast=False)
+    with source.open("rb") as f:
+        image = ops.import_image(s, f, name, kind=CHEMI, polarity=DARK)
+    ops.set_lanes(s, [LaneInput("c0")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    band = ops.place_box(s, protein, lane_x(0), LANE_ROW, lane_index=0, grow=False)
+    assert band_of(s, band).clipped is None
+
+
+def test_the_clipped_notice_lists_only_included_lanes(tmp_path):
+    s = session_on(tmp_path)
+    bands = [(lane_x(i), LANE_ROW, 6.0, 3.0, 60000.0) for i in range(2)]
+    image = import_blot(s, synthetic_blot((LANE_H, LANE_W), bands))
+    ops.set_lanes(s, [LaneInput("c0"), LaneInput("c1", included=False)])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    for lane in range(2):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    res = ops.compute(s)
+    [notice] = [n for n in res.notices if n.code is NoticeCode.CLIPPED]
+    assert notice.lane_indices == (0,)  # lane 1 is excluded: the user already acted
+    [all_lanes] = [n for n in res.all_lanes.notices if n.code is NoticeCode.CLIPPED]
+    assert all_lanes.lane_indices == (0, 1)  # every lane is included in the all-lanes set
+
+
+def test_a_protein_name_that_would_clash_with_a_clipped_column_is_refused(tmp_path):
+    s, image, _ = boxed(tmp_path)  # β-catenin
+    for name in ("β-catenin clipped", "β-CATENIN  clipped"):
+        with pytest.raises(OperationError) as info:
+            ops.add_protein(s, name, Role.TARGET, image)
+        assert info.value.code is ErrorCode.RESERVED_NAME
+    ops.add_protein(s, "GAPDH clipped", Role.LOADING_CONTROL, image)
+    with pytest.raises(OperationError) as info:
+        ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    assert info.value.code is ErrorCode.RESERVED_NAME

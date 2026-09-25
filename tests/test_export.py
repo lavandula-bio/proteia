@@ -72,5 +72,16 @@ def test_lane_table_marks_clipped_bands(tmp_path):
         "α-tubulin",
     ]
     assert [row[5] for row in rows[1:]] == ["yes", "no", ""]
-    with pytest.raises(ValueError, match="lanes"):
+    with pytest.raises(ValueError, match="2 clipping flags but there are 1 lanes"):
         write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.0])], clipped={"p": [True, False]})
+    with pytest.raises(ValueError, match="not in the table"):
+        write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.0])], clipped={"q": [True]})
+    with pytest.raises(ValueError, match="share a name"):
+        write_lane_table(
+            path,
+            ["a"],
+            ["s1"],
+            [True],
+            [("p", [1.0]), ("p clipped", [2.0])],
+            clipped={"p": [True]},
+        )

@@ -24,7 +24,8 @@ computed, with its ``clipped`` flag, and :func:`_set_box` the
 one place a box moves (it clears the position-derived ``apparent_mw``). A size
 change or a polarity change recomputes every affected net, so every stored net
 always equals ``net_signal`` of the stored pixels, box, size, background and
-polarity, and every stored ``clipped`` flag ``is_clipped`` of the same.
+polarity, and every clipping flag these operations store is ``is_clipped`` of
+the same.
 
 Functions return ids or small frozen dataclasses, never model objects. Typed text
 follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxes`.
@@ -48,7 +49,7 @@ from proteia.core import boxes, results, storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import LANE_COLUMNS, write_lane_table
 from proteia.core.grow import grow_box
-from proteia.core.imaging import load_image
+from proteia.core.imaging import clipping_depth, load_image
 from proteia.core.model import (
     IMAGE_SUFFIXES,
     Band,
@@ -204,22 +205,18 @@ def _apply[T](
 
 
 def _quantify(band: Band, protein: Protein, image: ImageRef, array: np.ndarray) -> None:
-    """The one place a stored net and its clipping flag are computed. An image with
-    no fixed detector limit (``bit_depth`` None) leaves the band unchecked (None)."""
+    """The one place a stored net and its clipping flag are computed. An image
+    without a limit the check can trust leaves the band unchecked (None)."""
     dark_on_light = image.polarity.dark_on_light
     band.net = net_signal(
         array, band.box, protein.box_size, image.background, dark_on_light=dark_on_light
     )
-    band.clipped = (
-        None
-        if image.bit_depth is None
-        else is_clipped(
-            array,
-            band.box,
-            protein.box_size,
-            bit_depth=image.bit_depth,
-            dark_on_light=dark_on_light,
-        )
+    band.clipped = is_clipped(
+        array,
+        band.box,
+        protein.box_size,
+        bit_depth=clipping_depth(image.bit_depth, image.import_warnings),
+        dark_on_light=dark_on_light,
     )
 
 
@@ -298,6 +295,18 @@ def _protein_name(batch: Batch, name: object, *, protein_id: str | None = None) 
         raise OperationError(
             ErrorCode.RESERVED_NAME, f"{cleaned!r} is the name of a lane-table column"
         )
+    # The lane table follows each protein's column with "<name> clipped".
+    for other in batch.proteins:
+        if other.id != protein_id and (
+            key == name_key(f"{other.name} clipped")
+            or name_key(f"{cleaned} clipped") == name_key(other.name)
+        ):
+            raise OperationError(
+                ErrorCode.RESERVED_NAME,
+                f"{cleaned!r} and {other.name!r} would collide in the lane table, which"
+                " names each protein's clipping column '<name> clipped'",
+                ids=[other.id],
+            )
     return cleaned
 
 

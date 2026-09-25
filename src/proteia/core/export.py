@@ -45,14 +45,23 @@ def write_lane_table(
         raise ValueError("conditions, samples, and included must have the same length")
     flags = clipped or {}
     for name, nets in proteins:
-        if len(nets) != n or len(flags.get(name, nets)) != n:
+        if len(nets) != n:
             raise ValueError(f"protein {name!r} has {len(nets)} nets but there are {n} lanes")
+        if name in flags and len(flags[name]) != n:
+            raise ValueError(
+                f"protein {name!r} has {len(flags[name])} clipping flags but there are {n} lanes"
+            )
+    unknown = set(flags) - {name for name, _ in proteins}
+    if unknown:
+        raise ValueError(f"clipping flags for proteins not in the table: {sorted(unknown)}")
 
     with Path(path).open("w", encoding=CSV_ENCODING, newline="") as fh:
         writer = csv.writer(fh)
         header = list(LANE_COLUMNS)
         for name, _ in proteins:
             header += [name, f"{name} clipped"] if name in flags else [name]
+        if len(set(header)) != len(header):
+            raise ValueError(f"two lane-table columns would share a name: {header}")
         writer.writerow(header)
         for i in range(n):
             row = [i, conditions[i], samples[i] or "", "yes" if included[i] else "no"]

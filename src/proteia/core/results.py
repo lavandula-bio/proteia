@@ -168,6 +168,11 @@ class Results(BaseModel, frozen=True):
         return self
 
 
+def _field(bands: list[model.Band | None], attr: str) -> list:
+    """One attribute of joined bands, None where a lane has no band."""
+    return [None if band is None else getattr(band, attr) for band in bands]
+
+
 def _join(protein: model.Protein, n: int) -> list[model.Band | None]:
     """A protein's band-index-0 band per lane, by stored lane index.
 
@@ -185,20 +190,14 @@ def lane_nets(batch: model.Batch) -> dict[str, LaneNets]:
     only): a lane with no box is ``None``. With no lanes, every protein has ``[]``.
     """
     n = len(batch.lanes)
-    return {
-        protein.id: [None if b is None else b.net for b in _join(protein, n)]
-        for protein in batch.proteins
-    }
+    return {protein.id: _field(_join(protein, n), "net") for protein in batch.proteins}
 
 
 def lane_clipped(batch: model.Batch) -> dict[str, list[bool | None]]:
     """Each protein's clipping flags per lane, keyed like :func:`lane_nets`: None
     where there is no box, or where the band was not checked."""
     n = len(batch.lanes)
-    return {
-        protein.id: [None if b is None else b.clipped for b in _join(protein, n)]
-        for protein in batch.proteins
-    }
+    return {protein.id: _field(_join(protein, n), "clipped") for protein in batch.proteins}
 
 
 def _listed(values: Collection[object]) -> str:
@@ -305,7 +304,7 @@ def _compute(
         for lane in batch.lanes
     ]
     joined = {protein.id: _join(protein, n) for protein in batch.proteins}
-    nets = {pid: [None if b is None else b.net for b in bands] for pid, bands in joined.items()}
+    nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -313,21 +312,11 @@ def _compute(
             role=p.role,
             image_id=p.image_id,
             nets=nets[p.id],
-            band_ids=[None if b is None else b.id for b in joined[p.id]],
-            clipped=[None if b is None else b.clipped for b in joined[p.id]],
+            band_ids=_field(joined[p.id], "id"),
+            clipped=_field(joined[p.id], "clipped"),
         )
         for p in batch.proteins
     ]
-    for column in columns:
-        over = tuple(i for i, flag in enumerate(column.clipped) if flag)
-        if over:
-            note(
-                NoticeCode.CLIPPED,
-                f"{column.name!r} is over-exposed in lane(s) {_listed(over)}: pixels at the"
-                " detector limit make its net an under-estimate; it stays in the results",
-                protein_ids=(column.protein_id,),
-                lane_indices=over,
-            )
     extra = tuple(p.id for p in batch.proteins if any(b.band_index > 0 for b in p.bands))
     if extra:
         note(
@@ -369,6 +358,16 @@ def _compute(
 
     # 3-4. The lane axes, and what the model accepts on purpose but the user should see.
     conditions, samples, included = spine_axes(batch.lanes)
+    for column in columns:  # over-exposed bands in lanes this set includes
+        over = tuple(i for i, flag in enumerate(column.clipped) if flag and included[i])
+        if over:
+            note(
+                NoticeCode.CLIPPED,
+                f"{column.name!r} is over-exposed in lane(s) {_listed(over)}: pixels at the"
+                " detector limit make its net an under-estimate; the lanes stay included",
+                protein_ids=(column.protein_id,),
+                lane_indices=over,
+            )
     labels = list(dict.fromkeys(conditions))  # distinct, in lane order
     similar: dict[str, list[str]] = {}
     for label in labels:

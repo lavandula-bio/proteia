@@ -113,3 +113,13 @@ def test_a_dark_band_pinned_at_zero_is_clipped():
     assert not is_clipped(
         img, Box(x=0, y=0), BoxSize(width=3, height=3), bit_depth=8, dark_on_light=True
     )
+
+
+def test_is_clipped_without_a_trusted_limit_is_not_checked():
+    img = np.zeros((4, 4))
+    assert (
+        is_clipped(
+            img, Box(x=0, y=0), BoxSize(width=2, height=2), bit_depth=None, dark_on_light=True
+        )
+        is None
+    )
