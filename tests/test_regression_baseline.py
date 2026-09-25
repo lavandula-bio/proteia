@@ -14,6 +14,7 @@ and the pull request that does so says why the numbers moved.
 """
 
 import dataclasses
+import functools
 import json
 import os
 from pathlib import Path
@@ -43,15 +44,17 @@ GOLDEN = Path(__file__).parent / "data" / "regression_baseline.json"
 HEIGHT, WIDTH = 150, 340
 MEMBRANE = 200.0
 LANE_X = [30 + 40 * i for i in range(8)]  # band centres
-ROW_Y = {"p53": 50, "GAPDH": 105}  # row centres
+# Non-ASCII names on purpose: labels travel through the analysis and the JSON file.
+TARGET, LOADING = "β-catenin", "α-tubulin"
+ROW_Y = {TARGET: 50, LOADING: 105}  # row centres
 DARKNESS = {
-    "p53": [60.0, 66.0, 54.0, 118.0, 126.0, 40.0, 31.0, 35.0],
-    "GAPDH": [100.0, 94.0, 104.0, 98.0, 103.0, 100.0, 96.0, 102.0],
+    TARGET: [60.0, 66.0, 54.0, 118.0, 126.0, 40.0, 31.0, 35.0],
+    LOADING: [100.0, 94.0, 104.0, 98.0, 103.0, 100.0, 96.0, 102.0],
 }
-CONDITIONS = ["ctl", "ctl", "ctl", "A", "A", "A", "B", "B"]
-SAMPLES = ["c1", "c1", "c2", "a1", "a2", "a3", "b1", "b2"]  # c1 is loaded twice
+REFERENCE, LOW, HIGH = "vehicle", "10 µM", "50 µM"
+CONDITIONS = [REFERENCE] * 3 + [LOW] * 3 + [HIGH] * 2
+SAMPLES = ["v1", "v1", "v2", "a1", "a2", "a3", "b1", "b2"]  # v1 is loaded twice
 INCLUDED = [True, True, True, True, True, False, True, True]  # a3 is presentation-only
-REFERENCE = "ctl"
 BOX_SIZE = BoxSize(width=24, height=14)
 
 
@@ -91,6 +94,7 @@ def _stats(groups: dict[str, list[float]]) -> dict:
     }
 
 
+@functools.cache
 def _compute() -> dict:
     dark = _blot()
     light = 255.0 - dark  # the same blot as a light-on-dark image
@@ -107,25 +111,23 @@ def _compute() -> dict:
     batch = Batch(
         CONDITIONS,
         [
-            ProteinNets("p53", Role.TARGET, nets["p53"]),
-            ProteinNets("GAPDH", Role.LOADING_CONTROL, nets["GAPDH"]),
+            ProteinNets(TARGET, Role.TARGET, nets[TARGET]),
+            ProteinNets(LOADING, Role.LOADING_CONTROL, nets[LOADING]),
         ],
         control_condition=REFERENCE,
     )
     series, warnings = normalize_batch(batch)
     assert not warnings and len(series) == 1
     normalized = series[0].values
-    values = {
-        "normalized": normalized,
-        "fold_change": fold_change_lane(
-            normalized, CONDITIONS, REFERENCE, SAMPLES, included=INCLUDED
-        ),
-    }
-    out["lanes"] = values
-
+    out["lanes"] = {"normalized": normalized}
     out["reduced"] = {}
-    for kind, lane_values in values.items():
-        for method in ReduceMethod:
+    for method in ReduceMethod:
+        # The baseline is reduced with the same method as the statistics.
+        fold = fold_change_lane(
+            normalized, CONDITIONS, REFERENCE, SAMPLES, included=INCLUDED, method=method
+        )
+        out["lanes"][f"fold_change/{method}"] = fold
+        for kind, lane_values in (("normalized", normalized), ("fold_change", fold)):
             reduction = reduce_samples(
                 lane_values, CONDITIONS, SAMPLES, included=INCLUDED, method=method
             )
@@ -134,7 +136,7 @@ def _compute() -> dict:
                 "groups": groups,
                 "averaged": reduction.averaged,
                 "all": _stats(groups),  # 3 groups: one-way ANOVA + Tukey HSD
-                "ctl_vs_A": _stats({k: groups[k] for k in ("ctl", "A")}),  # Welch's t
+                "two": _stats({k: groups[k] for k in (REFERENCE, LOW)}),  # Welch's t
             }
     # Round-trip through JSON so tuples, enums and floats compare like the file.
     return json.loads(json.dumps(out))
@@ -153,18 +155,27 @@ def _assert_close(actual, expected, rel: float, abs_: float, where: str = "$") -
     elif isinstance(expected, float) or (
         isinstance(expected, int) and not isinstance(expected, bool) and isinstance(actual, float)
     ):
-        assert actual == pytest.approx(expected, rel=rel, abs=abs_), where
+        assert actual == pytest.approx(expected, rel=rel, abs=abs_, nan_ok=True), where
     else:
         assert actual == expected, where
+
+
+def _rewrite_golden(actual: dict) -> None:
+    if os.environ.get("CI"):
+        pytest.fail("PROTEIA_UPDATE_BASELINE is set in CI; update the baseline locally, on purpose")
+    if not GOLDEN.exists():
+        pytest.fail(f"{GOLDEN} is missing; restore it from git (its tolerance is kept on update)")
+    golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    golden["values"] = actual
+    # LF on every platform, like the rest of the working tree.
+    text = json.dumps(golden, indent=1, ensure_ascii=False) + "\n"
+    GOLDEN.write_text(text, encoding="utf-8", newline="\n")
 
 
 def test_quantification_chain_matches_the_regression_baseline():
     actual = _compute()
     if os.environ.get("PROTEIA_UPDATE_BASELINE") == "1":
-        golden = json.loads(GOLDEN.read_text(encoding="utf-8")) if GOLDEN.exists() else {}
-        golden["values"] = actual
-        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        GOLDEN.write_text(json.dumps(golden, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+        _rewrite_golden(actual)
         pytest.skip(f"rewrote {GOLDEN.name}; commit it with the reason for the change")
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
     tolerance = golden["tolerance"]
@@ -174,9 +185,10 @@ def test_quantification_chain_matches_the_regression_baseline():
 def test_baseline_fixture_exercises_repeats_exclusion_and_the_reference():
     # Keep the fixture meaningful: a technical repeat is collapsed, the
     # presentation-only lane is dropped, and the reference reads 1.0.
-    reduced = _compute()["reduced"]["fold_change/mean"]
-    assert reduced["averaged"] == [["ctl", "c1"]]
-    assert [len(v) for v in reduced["groups"].values()] == [2, 2, 2]  # a3 excluded
-    assert np.mean(reduced["groups"]["ctl"]) == pytest.approx(1.0)
-    assert reduced["all"]["compare"]["test"] == "anova_oneway"
-    assert reduced["ctl_vs_A"]["compare"]["test"] == "welch_t"
+    for method in ReduceMethod:
+        reduced = _compute()["reduced"][f"fold_change/{method}"]
+        assert reduced["averaged"] == [[REFERENCE, "v1"]]
+        assert [len(v) for v in reduced["groups"].values()] == [2, 2, 2]  # a3 excluded
+        assert np.mean(reduced["groups"][REFERENCE]) == pytest.approx(1.0)
+        assert reduced["all"]["compare"]["test"] == "anova_oneway"
+        assert reduced["two"]["compare"]["test"] == "welch_t"
