@@ -1,23 +1,143 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Core data model for single-image band quantification.
+"""Core data model: the project as it is saved in ``project.json``.
 
-GUI-independent (see ``docs/adr/0001``). One :class:`Analysis` = one image
-quantified for one protein, producing a raw net signal per lane. This is the
-atomic unit of work: analysing one image to obtain pixel values is the "raw
-data".
+GUI-independent (see ``docs/adr/0001``), with no filesystem access and no numpy;
+saving, loading and the content hash live in :mod:`proteia.core.storage`.
 
-Normalization (loading-control ratio, condition-control ratio) combines the raw
-output of *several* analyses and belongs to a separate downstream layer, not
-here.
+Hierarchy. A :class:`Project` holds one :class:`Batch` (one run): its lane table,
+the reference condition, its membranes and its proteins. A :class:`Membrane` is one
+physical blot: its images (chemiluminescence exposures, reprobes, the visible-light
+marker, merged overlays) and one molecular-weight calibration. A :class:`Protein`
+is one protein quantified on one image, with one :class:`Band` (box) per lane and
+expected band; a reprobe is simply another image of the same membrane. Objects
+refer to each other by stable, project-unique ids (``mem-N``, ``img-N``,
+``prot-N``, ``band-N``) and to lanes by index, never by list position or name.
+
+The stored numbers (each band's net, each image's background) are the raw data.
+Normalization and statistics combine several proteins downstream in
+:mod:`proteia.core.analyze`, whose ``Batch`` is built from this module's ``Batch``.
+
+Models are mutable. Edits go through :func:`apply_change`, which works on a copy
+and re-validates the whole tree, so a failed edit leaves the project untouched.
 
 Geometry convention: boxes are axis-aligned and anchored at their top-left
-corner in image pixel coordinates (numpy ``image[y, x]``). All boxes share one
-global size, so they have equal area; only their positions vary.
+corner in image pixel coordinates (numpy ``image[y, x]``). All boxes of one
+protein share its box size, so they have equal area; only their positions vary.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
+import itertools
+from collections.abc import Callable, Iterator
+from enum import StrEnum
+from typing import Annotated, Final, Literal
+
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
+
+# Bumped, with a registered migration, by every change to the saved form after
+# the v0.1 tag (see proteia.core.storage). Stays 1 until then.
+SCHEMA_VERSION: Final = 1
+# Stored image suffixes: what the import dialog accepts today (#45 may change it).
+IMAGE_SUFFIXES: Final = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
+
+
+class _Model(BaseModel):
+    """Base of every saved class: unknown keys and NaN/Infinity are rejected."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+def _positive_zero(v: float) -> float:
+    # -0.0 -> 0.0, so equal models give equal bytes and hashes.
+    return v + 0.0
+
+
+def _non_blank(v: str) -> str:
+    if not v.strip():
+        raise ValueError("must not be blank")
+    return v
+
+
+def _plain_file_name(v: str) -> str:
+    # A base name only: it is metadata and never becomes a path.
+    if not v.strip() or any(c in v for c in "/\\\x00") or v in {".", ".."}:
+        raise ValueError("original name must be a plain file name")
+    return v
+
+
+Finite = Annotated[float, AfterValidator(_positive_zero)]  # finiteness comes from the config
+NonNegative = Annotated[Finite, Field(ge=0)]
+Kda = Annotated[Finite, Field(gt=0)]  # molecular weight in kDa
+# Ids are lowercase (Windows file names ignore case) and hold no path characters.
+# The default (Rust) regex engine does not let ``$`` match before a trailing newline.
+_N = r"[1-9][0-9]{0,8}"
+MembraneId = Annotated[str, StringConstraints(pattern=rf"^mem-{_N}$")]
+ImageId = Annotated[str, StringConstraints(pattern=rf"^img-{_N}$")]
+ProteinId = Annotated[str, StringConstraints(pattern=rf"^prot-{_N}$")]
+BandId = Annotated[str, StringConstraints(pattern=rf"^band-{_N}$")]
+IdPrefix = Literal["mem", "img", "prot", "band"]
+Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+WarningCode = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+# Text is stored exactly as given: no Unicode normalization or trimming here.
+ProteinName = Annotated[str, AfterValidator(_non_blank)]
+OriginalName = Annotated[str, StringConstraints(max_length=255), AfterValidator(_plain_file_name)]
+
+
+class UnknownIdError(LookupError):
+    """No object with this id in the batch."""
+
+
+# --- Enums: their values are the file format ---
+
+
+class Role(StrEnum):
+    TARGET = "target"
+    LOADING_CONTROL = "loading control"
+
+
+class ImageKind(StrEnum):
+    CHEMILUMINESCENCE = "chemiluminescence"
+    VISIBLE_MARKER = "visible_marker"  # visible-light photo of the ladder and membrane
+    MERGED = "merged"  # imager overlay of chemiluminescence and marker
+
+
+class Polarity(StrEnum):
+    DARK_ON_LIGHT = "dark_on_light"
+    LIGHT_ON_DARK = "light_on_dark"
+
+    @property
+    def dark_on_light(self) -> bool:
+        """The flag ``quantify.net_signal`` and ``grow.grow_box`` take."""
+        return self is Polarity.DARK_ON_LIGHT
+
+
+class ProposalSource(StrEnum):
+    """How a band's box was placed."""
+
+    CLICK = "click"  # seed click grown by grow.grow_box
+    ROW_BOX = "row_box"  # detection inside a dragged row box (#51)
+    MW_GUIDED = "mw_guided"  # detection inside the row the calibration predicts (#58)
+    MANUAL = "manual"  # placed or drawn by the user with no detection
+
+
+class CalibrationPointSource(StrEnum):
+    VISIBLE_MARKER = "visible_marker"  # ladder band on a visible-light marker (or merged) image
+    CHEMILUMINESCENCE_MARKER = "chemiluminescence_marker"  # faint marker on a signal image
+    STRIP_EDGE = "strip_edge"  # known-MW edge of a cut membrane strip
+
+
+class FitMethod(StrEnum):
+    LOG_LINEAR = "log_linear"  # log(MW) fitted linearly against vertical position (#58)
+
+
+# --- Geometry and the lane table ---
 
 # (x0, y0, x1, y1), half-open on the high edge.
 Rect = tuple[int, int, int, int]
@@ -30,17 +150,8 @@ def overlaps(a: Rect, b: Rect) -> bool:
     return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
 
 
-class ImageRef(BaseModel):
-    """Reference to the analysed image, recorded for reproducibility."""
-
-    path: str
-    sha256: str
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
-
-
-class BoxSize(BaseModel):
-    """The global, uniform ROI box size shared by every box (equal area)."""
+class BoxSize(_Model):
+    """The uniform ROI box size shared by every box of one protein (equal area)."""
 
     width: int = Field(gt=0)
     height: int = Field(gt=0)
@@ -50,7 +161,7 @@ class BoxSize(BaseModel):
         return self.width * self.height
 
 
-class Lane(BaseModel):
+class Lane(_Model):
     """One gel lane.
 
     ``index`` is the stable key used downstream to join analyses (e.g. a target
@@ -73,7 +184,7 @@ class Lane(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
-class Box(BaseModel):
+class Box(_Model):
     """An axis-aligned box anchored at its top-left corner (image coords)."""
 
     x: int = Field(ge=0)
@@ -83,69 +194,323 @@ class Box(BaseModel):
         return self.x, self.y, self.x + size.width, self.y + size.height
 
 
-class Band(BaseModel):
-    """A lane's measurement = a fixed-size box plus a same-size background box.
-
-    Intensities are filled in by the quantification step; ``net`` is derived.
-    """
-
-    lane_index: int = Field(ge=0)
-    box: Box
-    background: Box
-    raw: float | None = None  # sum of measurement-box pixels
-    background_signal: float | None = None  # sum of background-box pixels
-
-    @property
-    def net(self) -> float | None:
-        if self.raw is None or self.background_signal is None:
-            return None
-        return self.raw - self.background_signal
+# --- Images and the molecular-weight calibration ---
 
 
-class Analysis(BaseModel):
-    """One image quantified for one protein: the raw-data unit.
+class ImageWarning(_Model):
+    """A problem found when the image was imported (codes are defined by #45)."""
 
-    Serializing an ``Analysis`` (``model_dump_json``) yields the reproducibility
-    bundle: the image hash, the protein, the box size, and every box position.
-    Whether this analysis is a target or a loading control is decided downstream
-    when analyses are combined.
-    """
+    code: WarningCode  # e.g. "lossy_format", "color_channels_differ"
+    message: Annotated[str, StringConstraints(min_length=1)]
 
-    image: ImageRef
-    protein: str
-    expected_mw: float | None = Field(default=None, gt=0)  # kDa
-    box_size: BoxSize
-    lanes: list[Lane] = Field(default_factory=list)
-    bands: list[Band] = Field(default_factory=list)
 
-    def all_rects(self) -> list[Rect]:
-        """Every box (measurement + background) as a rectangle."""
-        rects: list[Rect] = []
-        for band in self.bands:
-            rects.append(band.box.rect(self.box_size))
-            rects.append(band.background.rect(self.box_size))
-        return rects
+class ImageRef(_Model):
+    """One image of a membrane; its pixels live in ``images/<file>`` in the project folder."""
+
+    id: ImageId
+    file: str  # stored name: the id plus a lowercase suffix from IMAGE_SUFFIXES
+    original_name: OriginalName  # the imported file's name, e.g. "β-actin 10 µM.tif"; metadata
+    kind: ImageKind
+    marker_image_id: ImageId | None = None  # chemiluminescence image -> the marker taken with it
+    sha256: Sha256  # of the stored file's bytes
+    width: int = Field(gt=0)  # of the analysis array, in pixels
+    height: int = Field(gt=0)
+    bit_depth: int | None = Field(default=None, ge=8, le=16)  # None = not recorded yet (#45)
+    polarity: Polarity  # required: the import chooses it; there is no silent default
+    background: Finite  # quantify.estimate_background of the analysis array
+    import_warnings: list[ImageWarning] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _check_invariants(self) -> Analysis:
-        # Bands must reference existing lanes.
-        lane_ids = {lane.index for lane in self.lanes}
-        for band in self.bands:
-            if band.lane_index not in lane_ids:
-                raise ValueError(f"band references unknown lane index {band.lane_index}")
-
-        # Every box must lie within the image bounds.
-        for band in self.bands:
-            for box in (band.box, band.background):
-                _, _, x1, y1 = box.rect(self.box_size)
-                if x1 > self.image.width or y1 > self.image.height:
-                    raise ValueError("box extends beyond the image bounds")
-
-        # No box (measurement or background) may overlap another.
-        rects = self.all_rects()
-        for i in range(len(rects)):
-            for j in range(i + 1, len(rects)):
-                if overlaps(rects[i], rects[j]):
-                    raise ValueError("boxes must not overlap")
-
+    def _check_file_and_marker(self) -> ImageRef:
+        if self.file not in {self.id + suffix for suffix in IMAGE_SUFFIXES}:
+            raise ValueError(
+                f"image {self.id}: file name must be the image id plus an image suffix"
+            )
+        if self.marker_image_id is not None:
+            if self.kind is not ImageKind.CHEMILUMINESCENCE:
+                raise ValueError(
+                    f"image {self.id}: only a chemiluminescence image has a marker image"
+                )
+            if self.marker_image_id == self.id:
+                raise ValueError(f"image {self.id}: an image cannot be its own marker image")
         return self
+
+
+class CalibrationPoint(_Model):
+    """One known molecular weight at a vertical position."""
+
+    image_id: ImageId  # the image whose pixel rows y is measured in (same membrane)
+    y: NonNegative  # pixels from the top of that image; sub-pixel allowed
+    mw: Kda
+    source: CalibrationPointSource
+
+
+class MwCalibration(_Model):
+    """A membrane's molecular-weight calibration: ladder points and the fit (#58)."""
+
+    ladder: str | None = None  # ladder product: a preset key or a custom name
+    points: list[CalibrationPoint] = Field(default_factory=list)
+    fit_method: FitMethod = FitMethod.LOG_LINEAR
+    fit_quality: Finite | None = None  # set by #58; None = no curve fitted
+
+    @model_validator(mode="after")
+    def _canonical_points(self) -> MwCalibration:
+        # Point order carries no meaning: sort so equal calibrations give equal bytes.
+        self.points.sort(key=lambda p: (p.y, p.mw, p.source.value, p.image_id))
+        if self.fit_quality is not None and len(self.points) < 2:
+            raise ValueError("a calibration fit needs at least two points")
+        return self
+
+
+class Membrane(_Model):
+    """One physical blot: its images (exposures, reprobes, marker, merged) and one
+    molecular-weight calibration, which applies to every image of the membrane."""
+
+    id: MembraneId
+    images: list[ImageRef] = Field(default_factory=list)
+    calibration: MwCalibration = Field(default_factory=MwCalibration)
+
+    @model_validator(mode="after")
+    def _check_references(self) -> Membrane:
+        images = {image.id: image for image in self.images}
+        for image in self.images:
+            if image.marker_image_id is None:
+                continue
+            marker = images.get(image.marker_image_id)
+            if marker is None or marker.kind is not ImageKind.VISIBLE_MARKER:
+                raise ValueError(
+                    f"image {image.id}: marker image {image.marker_image_id!r} is not"
+                    f" a visible-light marker image of membrane {self.id}"
+                )
+        for point in self.calibration.points:
+            image = images.get(point.image_id)
+            if image is None:
+                raise ValueError(
+                    f"membrane {self.id}: calibration point on {point.image_id!r},"
+                    " which is not an image of this membrane"
+                )
+            if point.y > image.height:
+                raise ValueError(
+                    f"membrane {self.id}: calibration point at y={point.y}"
+                    f" is below the bottom of {image.id}"
+                )
+        return self
+
+
+# --- Proteins and their bands ---
+
+
+class Band(_Model):
+    """One box of one protein in one lane."""
+
+    id: BandId
+    lane_index: int = Field(ge=0)  # index into Batch.lanes: the band's stored identity
+    band_index: int = Field(default=0, ge=0)  # which expected band; 0 for single-band proteins
+    box: Box  # top-left in the protein's image; its size is Protein.box_size
+    net: NonNegative  # quantify.net_signal at placement; load never recomputes it
+    apparent_mw: Kda | None = None  # from the calibration (#58); None = not computed
+    clipped: bool | None = None  # #44; None = not checked (not "passed")
+    source: ProposalSource
+    manually_edited: bool = False  # moved or edited by the user after it was proposed
+
+
+class Protein(_Model):
+    """One protein quantified on one image (the successor of ``Analysis``).
+
+    Every band shares ``box_size``, the effective size that was quantified. A
+    target normalizes against ``loading_control_ids``; an empty list means the
+    batch's single loading control.
+    """
+
+    id: ProteinId
+    name: ProteinName  # unique in the batch (exact match)
+    role: Role
+    image_id: ImageId  # an image of any membrane of the batch
+    loading_control_ids: list[ProteinId] = Field(default_factory=list)  # targets only
+    expected_mw: Kda | None = None
+    expected_band_count: int = Field(default=1, ge=1)
+    mw_tolerance: Annotated[Finite, Field(gt=0, lt=1)] = 0.10  # relative: 0.10 = ±10%
+    box_size: BoxSize
+    bands: list[Band] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_bands_and_loading_controls(self) -> Protein:
+        # Band order carries no meaning: sort so equal proteins give equal bytes.
+        # No band_index < expected_band_count check: #58 stores extra bands to flag them.
+        self.bands.sort(key=lambda band: (band.lane_index, band.band_index))
+        for a, b in itertools.pairwise(self.bands):
+            if (a.lane_index, a.band_index) == (b.lane_index, b.band_index):
+                raise ValueError(
+                    f"protein {self.id}: two bands in lane {a.lane_index}"
+                    f" with band index {a.band_index}"
+                )
+        # Boxes of one protein must not overlap; other proteins' boxes may.
+        rects = [(band.id, band.box.rect(self.box_size)) for band in self.bands]
+        for i, (a_id, a_rect) in enumerate(rects):
+            for b_id, b_rect in rects[i + 1 :]:
+                if overlaps(a_rect, b_rect):
+                    raise ValueError(f"protein {self.id}: boxes of {a_id} and {b_id} overlap")
+
+        ids = self.loading_control_ids
+        if self.role is Role.LOADING_CONTROL and ids:
+            raise ValueError(f"protein {self.id}: a loading control cannot list loading controls")
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"protein {self.id}: a loading control is listed twice")
+        if self.id in ids:
+            raise ValueError(f"protein {self.id}: a protein cannot be its own loading control")
+        return self
+
+
+# --- Batch and project ---
+
+
+class Batch(_Model):
+    """One run as stored: its lane table, membranes and proteins.
+
+    Its statistics input is :class:`proteia.core.analyze.Batch`, which the compute
+    step builds from it (loading-control ids become protein names).
+    """
+
+    lanes: list[Lane] = Field(default_factory=list)
+    reference_condition: str | None = None  # a lane label: the fold-change reference
+    membranes: list[Membrane] = Field(default_factory=list)
+    proteins: list[Protein] = Field(default_factory=list)
+
+    def iter_images(self) -> Iterator[ImageRef]:
+        """Every image of every membrane, in membrane then image order."""
+        for membrane in self.membranes:
+            yield from membrane.images
+
+    def find_image(self, image_id: str) -> ImageRef:
+        for image in self.iter_images():
+            if image.id == image_id:
+                return image
+        raise UnknownIdError(f"unknown image {image_id!r}")
+
+    def membrane_of(self, image_id: str) -> Membrane:
+        for membrane in self.membranes:
+            if any(image.id == image_id for image in membrane.images):
+                return membrane
+        raise UnknownIdError(f"unknown image {image_id!r}")
+
+    def find_protein(self, protein_id: str) -> Protein:
+        for protein in self.proteins:
+            if protein.id == protein_id:
+                return protein
+        raise UnknownIdError(f"unknown protein {protein_id!r}")
+
+    def find_band(self, band_id: str) -> tuple[Protein, Band]:
+        for protein in self.proteins:
+            for band in protein.bands:
+                if band.id == band_id:
+                    return protein, band
+        raise UnknownIdError(f"unknown band {band_id!r}")
+
+    @model_validator(mode="after")
+    def _check_references(self) -> Batch:
+        # join_to_spine needs lane indices 0..n-1, in list order.
+        if any(lane.index != i for i, lane in enumerate(self.lanes)):
+            raise ValueError("lane indices must be 0, 1, 2, ... in list order")
+        if self.reference_condition is not None and self.reference_condition not in {
+            lane.label for lane in self.lanes
+        }:
+            raise ValueError(
+                f"reference condition {self.reference_condition!r} is not a lane condition"
+            )
+
+        images = {image.id: image for image in self.iter_images()}
+        roles = {protein.id: protein.role for protein in self.proteins}
+        names: set[str] = set()
+        for protein in self.proteins:
+            if protein.name in names:
+                raise ValueError(f"duplicate protein name {protein.name!r}")
+            names.add(protein.name)
+            image = images.get(protein.image_id)
+            if image is None:
+                raise ValueError(f"protein {protein.id}: unknown image {protein.image_id!r}")
+            if image.kind is ImageKind.VISIBLE_MARKER:
+                raise ValueError(
+                    f"protein {protein.id}: {image.id} is a visible-light marker image,"
+                    " not a signal image"
+                )
+            size = protein.box_size
+            if size.width > image.width or size.height > image.height:
+                raise ValueError(
+                    f"protein {protein.id}: box size {size.width}x{size.height}"
+                    f" exceeds the bounds of image {image.id}"
+                )
+            for lc_id in protein.loading_control_ids:
+                if lc_id not in roles:
+                    raise ValueError(f"protein {protein.id}: unknown loading control {lc_id!r}")
+                if roles[lc_id] is not Role.LOADING_CONTROL:
+                    raise ValueError(f"protein {protein.id}: {lc_id} is not a loading control")
+            for band in protein.bands:
+                if band.lane_index >= len(self.lanes):
+                    raise ValueError(
+                        f"protein {protein.id}: band {band.id} references"
+                        f" unknown lane index {band.lane_index}"
+                    )
+                _, _, x1, y1 = band.box.rect(size)
+                if x1 > image.width or y1 > image.height:
+                    raise ValueError(
+                        f"protein {protein.id}: box of {band.id}"
+                        f" extends beyond the bounds of image {image.id}"
+                    )
+        return self
+
+
+class Project(_Model):
+    """The whole saved project: ``project.json`` is its JSON form."""
+
+    schema_version: Literal[1] = SCHEMA_VERSION
+    # Bookkeeping, excluded from the content hash: the number of the next new id.
+    next_id: int = Field(default=1, ge=1, le=10**9)
+    batch: Batch = Field(default_factory=Batch)
+
+    def iter_ids(self) -> Iterator[str]:
+        """Every object id: membranes, images, proteins, bands."""
+        batch = self.batch
+        yield from (membrane.id for membrane in batch.membranes)
+        yield from (image.id for image in batch.iter_images())
+        yield from (protein.id for protein in batch.proteins)
+        yield from (band.id for protein in batch.proteins for band in protein.bands)
+
+    def new_id(self, prefix: IdPrefix) -> str:
+        """A fresh id such as ``img-7``.
+
+        Numbers come from one counter, so they are unique across kinds, never
+        reused after a deletion, and the same under replay. Call it inside
+        :func:`apply_change`, so a failed change consumes no number.
+        """
+        new = f"{prefix}-{self.next_id}"
+        self.next_id += 1
+        return new
+
+    @model_validator(mode="after")
+    def _check_ids(self) -> Project:
+        seen: dict[int, str] = {}
+        for obj_id in self.iter_ids():
+            number = int(obj_id.rsplit("-", 1)[1])
+            if number in seen:
+                raise ValueError(f"duplicate id number {number}: {seen[number]} and {obj_id}")
+            if number >= self.next_id:
+                raise ValueError(f"id {obj_id} is not below next_id {self.next_id}")
+            seen[number] = obj_id
+        return self
+
+
+def revalidate(project: Project) -> Project:
+    """A freshly validated copy: reruns every nested validator on the current values."""
+    return Project.model_validate(project.model_dump())
+
+
+def apply_change[T](project: Project, change: Callable[[Project], T]) -> tuple[Project, T]:
+    """Run ``change`` on a deep copy, then re-validate the whole tree.
+
+    A ``ValidationError`` leaves ``project`` untouched (``next_id`` included).
+    ``change`` should return ids or plain values, not model objects: the returned
+    project is a fresh copy.
+    """
+    draft = project.model_copy(deep=True)
+    result = change(draft)
+    return revalidate(draft), result

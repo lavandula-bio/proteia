@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batch-level analysis: normalize, group by condition, and run statistics.
 
-GUI-independent. The atomic unit upstream is an :class:`~proteia.core.model.Analysis`
+GUI-independent. The atomic unit upstream is a :class:`~proteia.core.model.Protein`
 (one protein on one image). A *batch* is one experiment: several proteins sharing
 the same lane spine, where one protein is the loading control. This module turns a
 batch into per-condition value groups and descriptive/inferential statistics.
@@ -31,14 +31,11 @@ from enum import StrEnum
 import numpy as np
 from scipy import stats
 
+from proteia.core.model import Role
+
 # A protein's net signal per lane, aligned to the shared lane spine. ``None`` marks
 # a lane where this protein has no box (a gap). Length == number of lanes.
 LaneNets = list[float | None]
-
-
-class Role(StrEnum):
-    TARGET = "target"
-    LOADING_CONTROL = "loading control"
 
 
 class Tier(StrEnum):
@@ -72,6 +69,9 @@ class Batch:
     ``conditions`` gives the condition label of each lane (repeats == replicates);
     every protein's ``nets`` is aligned to it by index. ``control_condition`` names
     the reference group for fold-change, if any.
+
+    The stored form of a run is :class:`proteia.core.model.Batch`; the compute step
+    builds this statistics input from it.
     """
 
     conditions: list[str]
