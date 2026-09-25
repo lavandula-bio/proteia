@@ -35,6 +35,7 @@ from proteia.core.analyze import (
     reduce_samples,
 )
 from proteia.core.boxes import normalize_corners, resize_all
+from proteia.core.export import write_lane_table
 from proteia.core.grow import grow_box
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
@@ -1106,19 +1107,14 @@ def launch(image_path: str | None = None) -> None:
         path = _save_path("Export table", "CSV (*.csv)")
         if not path:
             return
-        import csv
-
         names = [p["name"] or f"protein{i}" for i, p in enumerate(proteins)]
-        with open(path, "w", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["lane", "condition", "sample", "include", *names])
-            for i in range(n):
-                row = [i, conditions[i], samples[i] or "", "yes" if included[i] else "no"]
-                row += [
-                    "" if aligned[pid][i] is None else round(aligned[pid][i], 3)
-                    for pid in range(len(proteins))
-                ]
-                writer.writerow(row)
+        try:
+            write_lane_table(
+                path, conditions, samples, included, list(zip(names, aligned, strict=True))
+            )
+        except OSError as exc:  # e.g. the file is still open (locked) in Excel
+            show_info(f"Could not write {path}: {exc.strerror or exc}. Close it and retry.")
+            return
         show_info(f"Exported {n} lanes x {len(proteins)} proteins to {path}")
 
     shapes.events.data.connect(on_edit)
