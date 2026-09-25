@@ -25,8 +25,10 @@ ratios, or fold-changes. Statistics and plotting treat them the same; only the
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Literal
 
 import numpy as np
 from scipy import stats
@@ -210,13 +212,22 @@ class SampleReduction:
     """Per-condition lists of *sample* values, after collapsing technical repeats.
 
     ``groups`` feeds the statistics: each value is one biological sample, so its
-    length is the correct n. ``averaged`` lists the ``(condition, sample)`` keys
-    that had more than one lane (i.e. were collapsed), for transparency.
+    length is the correct n. ``lanes`` is parallel to ``groups``: the lanes behind
+    each value (several for collapsed technical repeats; the first is the one a
+    representative reduction keeps). ``averaged`` lists the ``(condition, sample)``
+    keys that had more than one lane (i.e. were collapsed), for transparency.
     """
 
     groups: dict[str, list[float]]
     averaged: list[tuple[str, str]]
     warnings: list[str] = field(default_factory=list)
+    lanes: dict[str, list[list[int]]] = field(default_factory=dict)
+
+
+def repeats_message(count: int, method: ReduceMethod) -> str:
+    """How :func:`reduce_samples` reports ``count`` samples with technical repeats."""
+    what = "averaged" if method is ReduceMethod.MEAN else "kept one lane of"
+    return f"{what} {count} sample(s) with technical repeats (repeats do not count as n)"
 
 
 def reduce_samples(
@@ -251,6 +262,7 @@ def reduce_samples(
     # position so it can never merge with a sample the user named with a digit
     # (e.g. "2") or with another unnamed lane.
     buckets: dict[tuple[str, str | int], list[float]] = {}
+    bucket_lanes: dict[tuple[str, str | int], list[int]] = {}
     order: list[tuple[str, str | int]] = []
     for i in range(n):
         if included is not None and not included[i]:
@@ -262,26 +274,58 @@ def reduce_samples(
         key = (conditions[i], str(name) if named else i)
         if key not in buckets:
             buckets[key] = []
+            bucket_lanes[key] = []
             order.append(key)
         buckets[key].append(values[i])
+        bucket_lanes[key].append(i)
 
     groups: dict[str, list[float]] = {}
+    lanes: dict[str, list[list[int]]] = {}
     averaged: list[tuple[str, str]] = []
     for key in order:
         cond, sample = key
         vals = buckets[key]
         reduced = float(np.mean(vals)) if method is ReduceMethod.MEAN else vals[0]
         groups.setdefault(cond, []).append(reduced)
+        lanes.setdefault(cond, []).append(bucket_lanes[key])
         if len(vals) > 1:  # only named samples can span several lanes
             averaged.append((cond, str(sample)))
 
-    warnings: list[str] = []
-    if averaged:
-        what = "averaged" if method is ReduceMethod.MEAN else "kept one lane of"
-        warnings.append(
-            f"{what} {len(averaged)} sample(s) with technical repeats (repeats do not count as n)"
+    warnings = [repeats_message(len(averaged), method)] if averaged else []
+    return SampleReduction(groups=groups, averaged=averaged, warnings=warnings, lanes=lanes)
+
+
+BaselineReason = Literal["no_value", "not_positive"]
+
+
+class BaselineError(ValueError):
+    """The control condition gives no usable fold-change baseline; ``reason`` says why."""
+
+    def __init__(self, reason: BaselineReason, message: str) -> None:
+        super().__init__(message)
+        self.reason: BaselineReason = reason
+
+
+def reference_baseline(groups: Mapping[str, Sequence[float]], control_condition: str) -> float:
+    """The fold-change baseline: the mean of the control condition's reduced values.
+
+    ``groups`` is a :class:`SampleReduction`'s ``groups``, so the baseline sees the
+    same included samples, with technical repeats collapsed, as the statistics.
+    Raises :class:`BaselineError` (a ``ValueError``) if the control condition has
+    no value (``no_value``) or its mean is not positive (``not_positive``).
+    """
+    control_vals = groups.get(control_condition, [])
+    if not control_vals:
+        raise BaselineError(
+            "no_value",
+            f"control condition {control_condition!r} has no value in any included lane",
         )
-    return SampleReduction(groups=groups, averaged=averaged, warnings=warnings)
+    baseline = float(np.mean(control_vals))
+    if baseline <= 0:
+        raise BaselineError(
+            "not_positive", "control condition mean is non-positive; cannot form fold-change"
+        )
+    return baseline
 
 
 def fold_change_lane(
@@ -303,17 +347,11 @@ def fold_change_lane(
     the baseline must not depend on which conditions are charted.
 
     Keeps the per-lane shape (so individual points survive), dividing every lane
-    by the baseline. Returns ``None`` lanes unchanged.
+    by the baseline. Returns ``None`` lanes unchanged. Raises :class:`BaselineError`
+    when :func:`reference_baseline` finds no usable baseline.
     """
     reduction = reduce_samples(values, conditions, samples, included=included, method=method)
-    control_vals = reduction.groups.get(control_condition, [])
-    if not control_vals:
-        raise ValueError(
-            f"control condition {control_condition!r} has no value in any included lane"
-        )
-    baseline = float(np.mean(control_vals))
-    if baseline <= 0:
-        raise ValueError("control condition mean is non-positive; cannot form fold-change")
+    baseline = reference_baseline(reduction.groups, control_condition)
     return [None if v is None else v / baseline for v in values]
 
 

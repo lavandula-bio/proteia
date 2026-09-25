@@ -13,10 +13,13 @@ from __future__ import annotations
 import csv
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Final
 
 from proteia.core.analyze import LaneNets
 
 CSV_ENCODING = "utf-8-sig"
+# The lane-identity columns that lead the lane table, before one column per protein.
+LANE_COLUMNS: Final = ("lane", "condition", "sample", "include")
 
 
 def write_lane_table(
@@ -41,7 +44,7 @@ def write_lane_table(
 
     with Path(path).open("w", encoding=CSV_ENCODING, newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["lane", "condition", "sample", "include", *(name for name, _ in proteins)])
+        writer.writerow([*LANE_COLUMNS, *(name for name, _ in proteins)])
         for i in range(n):
             row = [i, conditions[i], samples[i] or "", "yes" if included[i] else "no"]
             row += ["" if nets[i] is None else round(nets[i], 3) for _, nets in proteins]
