@@ -8,7 +8,7 @@ from proteia.core.project import (
     align_to_lanes,
     build_spine,
     join_to_spine,
-    propose_positions,
+    propose_lane,
     spine_axes,
     spine_from_labels,
 )
@@ -100,15 +100,59 @@ def test_spine_from_labels_empty():
     assert spine_from_labels([]) == []
 
 
-# --- propose_positions: x-order demoted to an editable proposal ---
+# --- propose_lane: position proposes a new box's lane from anchored lanes ---
 
 
-def test_propose_positions_assigns_sequential_by_x():
-    assert propose_positions([(50, 8.0), (10, 3.0), (90, 5.0)]) == [
-        (0, 3.0),
-        (1, 8.0),
-        (2, 5.0),
-    ]
+def test_propose_lane_needs_two_anchored_lanes():
+    assert propose_lane(150, []) is None
+    assert propose_lane(150, [(100.0, 1), (104.0, 1)]) is None  # one lane: no pitch
+    assert propose_lane(150, [(100.0, 1), (100.0, 2)]) is None  # no rising pitch
+
+
+def test_propose_lane_ignores_image_margins():
+    # Ten lanes start at x=150 with a pitch of 78, inside a wider image.
+    anchors = [(150.0, 0), (228.0, 1)]
+    assert [propose_lane(150 + 78 * i, anchors) for i in range(10)] == list(range(10))
+
+
+def test_propose_lane_interpolates_uneven_spacing_between_anchors():
+    # A smiling gel: lanes 0 and 4 at 50 and 530 (pitch 120), lane 7 at 800 (pitch 90).
+    anchors = [(50.0, 0), (530.0, 4), (800.0, 7)]
+    assert propose_lane(290, anchors) == 2
+    assert propose_lane(710, anchors) == 6
+    assert propose_lane(-40, anchors) == -1  # left of lane 0: the caller refuses it
+
+
+def test_propose_lane_uses_the_median_centre_of_each_lane():
+    anchors = [(140.0, 1), (160.0, 1), (500.0, 1), (350.0, 3)]  # an outlier in lane 1
+    assert propose_lane(250, anchors) == 2
+
+
+def test_a_box_dragged_out_of_order_is_ignored():
+    anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]  # lanes 0-6 in place
+    anchors.append((150.0, 7))  # lane 7 dragged over lane 2
+    assert [propose_lane(30 + 60 * lane, anchors) for lane in range(7)] == list(range(7))
+
+
+@pytest.mark.parametrize(
+    "anchors",
+    [
+        [(30.0, 0), (90.0, 1), (330.0, 2), (210.0, 3)],  # lane 2 dragged right, a tie in length
+        [(30.0, 0), (90.0, 1), (400.0, 2), (210.0, 3), (270.0, 4)],
+    ],
+    ids=["tie", "longer-run"],
+)
+def test_the_dragged_box_is_dropped_not_its_neighbours(anchors):
+    # Clicks at lanes 4 and 5 (x = 270, 330) must not be captured by the dragged lane 2.
+    assert propose_lane(270, anchors) == 4
+    assert propose_lane(330, anchors) == 5
+    assert propose_lane(150, anchors) == 2  # lane 2's own place
+
+
+def test_propose_lane_on_a_mirrored_image():
+    # Lane 0 is on the right: the centres fall as the lane index rises.
+    anchors = [(330.0, 0), (270.0, 1)]
+    assert [propose_lane(330 - 60 * lane, anchors) for lane in range(6)] == list(range(6))
 
 
 # --- join_to_spine: scatter by explicit identity, gaps don't shift ---

@@ -68,6 +68,7 @@ class ErrorCode(StrEnum):
     NO_LANES = "no_lanes"
     LANE_OUT_OF_RANGE = "lane_out_of_range"
     LANE_OCCUPIED = "lane_occupied"
+    LANE_REQUIRED = "lane_required"  # position cannot propose the lane yet
     LANES_IN_USE = "lanes_in_use"
     UNKNOWN_CONDITION = "unknown_condition"
     OUT_OF_IMAGE = "out_of_image"

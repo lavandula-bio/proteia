@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from conftest import make_project, synthetic_blot, write_image_files, write_tiff
-from proteia.core import boxes, storage
+from proteia.core import boxes, results, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
@@ -1272,3 +1272,200 @@ def test_a_hook_error_after_the_commit_keeps_the_committed_cache(tmp_path):
         ops.remove_image(s, image)
     assert image not in {i.id for i in s.project.batch.iter_images()}  # committed
     assert image not in s._pixels  # the removed image's pixels do not come back
+
+
+# --- #43: lane identity when boxes are placed without a lane ---
+
+LANES = 6
+LANE_W, LANE_H = 360, 60  # six lanes centred at 30, 90, ..., 330
+LANE_ROW = 30
+
+
+def lane_x(lane: int) -> int:
+    return 30 + 60 * lane
+
+
+def lanes_session(tmp_path: Path) -> tuple[ProjectSession, str]:
+    """Six declared lanes, one blot with a band in every lane, one target."""
+    s = session_on(tmp_path)
+    bands = [(lane_x(i), LANE_ROW, 6.0, 3.0, 30000.0) for i in range(LANES)]
+    image = import_blot(s, synthetic_blot((LANE_H, LANE_W), bands))
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(LANES)])
+    return s, ops.add_protein(s, "β-catenin", Role.TARGET, image)
+
+
+@pytest.mark.parametrize(
+    "lanes",
+    [[1, 2, 3, 4, 5], [0, 1, 3, 4, 5], [0, 1, 2, 3, 4], [1, 2, 3, 4], [4, 1, 3, 2, 5]],
+    ids=["missing-first", "missing-middle", "missing-last", "missing-first-and-last", "any-order"],
+)
+@pytest.mark.parametrize("grow", [True, False], ids=["seed-click", "fixed-box"])
+def test_boxes_placed_without_a_lane_land_in_their_lanes(tmp_path, lanes, grow):
+    # No other protein anchors the grid: the first two lanes are chosen, the rest proposed.
+    s, protein = lanes_session(tmp_path)
+    first, second, *rest = lanes
+    ops.place_box(s, protein, lane_x(first), LANE_ROW, lane_index=first, grow=grow)
+    ops.place_box(s, protein, lane_x(second), LANE_ROW, lane_index=second, grow=grow)
+    for lane in rest:
+        band = ops.place_box(s, protein, lane_x(lane), LANE_ROW, grow=grow)
+        assert band_of(s, band).lane_index == lane
+    nets = results.lane_nets(s.project.batch)[protein]
+    assert [i for i, net in enumerate(nets) if net is not None] == sorted(lanes)
+
+
+def test_a_lane_is_required_until_two_lanes_show_the_spacing(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(2), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_REQUIRED  # no box on the image yet
+    ops.place_box(s, protein, lane_x(2), LANE_ROW, lane_index=2, grow=False)
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(3), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_REQUIRED  # one lane: no spacing yet
+    ops.place_box(s, protein, lane_x(3), LANE_ROW, lane_index=3, grow=False)
+    band = ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=False)
+    assert band_of(s, band).lane_index == 5
+
+
+def test_lanes_are_proposed_on_an_image_with_margins(tmp_path):
+    # Six lanes from x=200 with a pitch of 70 on a 900-pixel-wide image.
+    s = session_on(tmp_path)
+    xs = [200 + 70 * i for i in range(LANES)]
+    blot = synthetic_blot((LANE_H, 900), [(x, LANE_ROW, 6.0, 3.0, 30000.0) for x in xs])
+    image = import_blot(s, blot)
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(LANES)])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    ops.place_box(s, protein, xs[0], LANE_ROW, lane_index=0, grow=True)
+    ops.place_box(s, protein, xs[1], LANE_ROW, lane_index=1, grow=True)
+    placed = [ops.place_box(s, protein, x, LANE_ROW, grow=True) for x in xs[2:]]
+    assert [band_of(s, band).lane_index for band in placed] == [2, 3, 4, 5]
+
+
+def test_a_proposal_never_moves_a_box_to_another_lane(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(4)])  # the blot shows six
+    for lane in (0, 1, 2):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    # Another box over lane 1 (a second band, or a misclick) is refused, not moved.
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(1), 8, grow=False)
+    assert info.value.code is ErrorCode.LANE_OCCUPIED
+    # A box beyond the declared lanes is refused too, though lane 3 is free.
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=False)
+    assert info.value.code is ErrorCode.LANE_OUT_OF_RANGE
+
+
+def test_a_fixed_box_at_the_edge_is_proposed_from_the_click(tmp_path):
+    # A box wider than two lanes is shifted inside the image at the right edge;
+    # its lane still comes from where the user clicked.
+    s, protein = lanes_session(tmp_path)
+    ops.set_box_size(s, protein, BoxSize(width=150, height=10))
+    ops.place_box(s, protein, lane_x(1), LANE_ROW, lane_index=1, grow=False)
+    ops.place_box(s, protein, lane_x(3), 8, lane_index=3, grow=False)  # another row
+    band = ops.place_box(s, protein, lane_x(5), 50, grow=False)
+    assert band_of(s, band).box.x == LANE_W - 150  # shifted inside the image
+    assert band_of(s, band).lane_index == 5
+
+
+def test_moving_or_removing_a_box_never_changes_another_lane(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    bands = {
+        lane: ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+        for lane in (0, 2, 4, 5)
+    }
+    ops.remove_box(s, bands[2])
+    ops.move_box(s, bands[4], (lane_x(4) - 9, 20, lane_x(4) + 1, 40))  # nudged left
+    kept = (bands[0], bands[4], bands[5])
+    assert [band_of(s, band_id).lane_index for band_id in kept] == [0, 4, 5]
+    # The next box without a lane is proposed among the free lanes, anchored on the rest.
+    new = ops.place_box(s, protein, lane_x(2), LANE_ROW, grow=False)
+    assert band_of(s, new).lane_index == 2
+    # Dragging a box over another lane's position keeps its lane: identity, not x.
+    ops.move_box(s, bands[5], (lane_x(3) - 5, 20, lane_x(3) + 5, 40))
+    assert band_of(s, bands[5]).lane_index == 5
+    assert [band_of(s, band_id).lane_index for band_id in (bands[0], bands[4], new)] == [0, 4, 2]
+
+
+def test_a_protein_with_a_box_in_every_lane_refuses_one_more(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    bands = [
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+        for lane in range(LANES)
+    ]
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, lane_x(2), 8, grow=False)  # another row, over lane 2
+    assert info.value.code is ErrorCode.LANE_OCCUPIED
+    assert info.value.ids == (bands[2],)
+
+
+def test_the_lane_is_required_before_any_pixel_work(tmp_path, monkeypatch):
+    # A seed click on background with no lanes to anchor on asks for the lane,
+    # not "no band found": choosing the lane is what the user must do.
+    s, protein = lanes_session(tmp_path)
+    monkeypatch.setattr(ops, "grow_box", lambda *a, **k: pytest.fail("grew before asking"))
+    with pytest.raises(OperationError) as info:
+        ops.place_box(s, protein, 5, 5, grow=True)
+    assert info.value.code is ErrorCode.LANE_REQUIRED
+
+
+def test_a_seed_click_at_the_edge_is_proposed_from_the_band(tmp_path):
+    # A wide shared box is shifted inside the image at the right edge; the lane
+    # comes from the grown band's own centre, and the shifted box anchors nothing.
+    s, protein = lanes_session(tmp_path)
+    ops.set_box_size(s, protein, BoxSize(width=150, height=10))
+    ops.place_box(s, protein, lane_x(1), LANE_ROW, lane_index=1, grow=False)
+    ops.place_box(s, protein, lane_x(3), 8, lane_index=3, grow=False)  # another row
+    band = ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=True)
+    assert band_of(s, band).box.x + protein_of(s, protein).box_size.width == LANE_W
+    assert band_of(s, band).lane_index == 5
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
+    ops.place_box(s, other, lane_x(0), LANE_ROW, lane_index=0, grow=False)
+    ops.place_box(s, other, lane_x(2), LANE_ROW, lane_index=2, grow=False)
+    fourth = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
+    assert band_of(s, fourth).lane_index == 4  # not skewed by the shifted lane-5 box
+
+
+def test_a_box_dragged_out_of_order_does_not_capture_other_lanes(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    bands = {
+        lane: ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+        for lane in (0, 1, 2, 3)
+    }
+    ops.move_box(s, bands[2], (lane_x(5) - 5, 20, lane_x(5) + 5, 40))  # lane 2 dragged right
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
+    band = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
+    assert band_of(s, band).lane_index == 4
+
+
+def _grows_to(monkeypatch, rect) -> None:
+    """Make every seed click grow to ``rect``, to pin where the band lies."""
+    monkeypatch.setattr(ops, "grow_box", lambda *args, **kwargs: rect)
+
+
+def test_a_seed_click_takes_the_lane_of_the_band_not_of_the_click(tmp_path, monkeypatch):
+    # The click on the band's flank lies over occupied lane 3; the band is in lane 4.
+    s, protein = lanes_session(tmp_path)
+    for lane in (1, 3):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    _grows_to(monkeypatch, (lane_x(4) - 10, 25, lane_x(4) + 11, 36))
+    band = ops.place_box(s, protein, lane_x(3) + 5, 12, grow=True)
+    assert band_of(s, band).lane_index == 4
+
+
+def test_a_band_cut_by_the_image_edge_is_proposed_from_the_click(tmp_path, monkeypatch):
+    # The band runs off the left edge, so its visible centre sits a lane too far left.
+    s, protein = lanes_session(tmp_path)
+    for lane in (2, 4):
+        ops.place_box(s, protein, lane_x(lane), LANE_ROW, lane_index=lane, grow=False)
+    _grows_to(monkeypatch, (0, 25, 100, 36))  # centre 50: lane 0 by the band, lane 1 by the click
+    band = ops.place_box(s, protein, 85, LANE_ROW, grow=True)
+    assert band_of(s, band).lane_index == 1
+
+
+def test_a_click_outside_the_image_is_out_of_image_with_or_without_a_lane(tmp_path):
+    s, protein = lanes_session(tmp_path)
+    for lane_index in (None, 0):
+        with pytest.raises(OperationError) as info:
+            ops.place_box(s, protein, -1, LANE_ROW, lane_index=lane_index, grow=False)
+        assert info.value.code is ErrorCode.OUT_OF_IMAGE
