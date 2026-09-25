@@ -5,8 +5,9 @@ keep equal area, and forbid overlap.
 These are pure functions over rectangles so the rules can be unit-tested
 without a GUI. :func:`resize_all` enforces the shared size when it changes and
 refuses a size that would force an overlap; :func:`normalize_corners` reads
-napari shape vertices. (The napari app snaps a moved box and reverts an
-overlapping move in its own edit handler.)
+napari shape vertices. (The napari app's own edit handler re-centres edited
+boxes to the shared size and restores the previous boxes of a protein when an
+edit makes any two of them overlap.)
 
 Coordinates use the model's :data:`~proteia.core.model.Rect` convention:
 ``(x0, y0, x1, y1)`` in image pixels, half-open on the high edge, with the box
@@ -34,12 +35,9 @@ def normalize_corners(corners: Sequence[Sequence[float]]) -> Rect:
     return (int(x0), int(y0), int(x1), int(y1))
 
 
-def _overlaps_any(rects: Sequence[Rect | None], i: int) -> bool:
-    """True if ``rects[i]`` overlaps any other (non-dropped) rect."""
-    a = rects[i]
-    if a is None:
-        return False
-    return any(b is not None and overlaps(a, b) for j, b in enumerate(rects) if j != i)
+def _overlaps_any(rects: Sequence[Rect], i: int) -> bool:
+    """True if ``rects[i]`` overlaps any other rect."""
+    return any(overlaps(rects[i], b) for j, b in enumerate(rects) if j != i)
 
 
 def resize_all(

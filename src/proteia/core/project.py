@@ -10,9 +10,10 @@ position) and an *identity* (which lane it is). Identity is the source of truth;
 geometry is only one way to *propose* it. So the pipeline is three separable
 parts:
 
-* :func:`build_spine` — declare-first: from a condition structure, generate the
-  N lanes (stable positions + auto sample ids). This fixes N before any box is
-  drawn, so a missing box becomes an empty slot rather than a shift.
+* :func:`spine_from_labels` (per-lane condition list, used by the napari app) or
+  :func:`build_spine` (condition counts) — declare-first: generate the N lanes
+  (stable positions + auto sample ids). This fixes N before any box is drawn, so
+  a missing box becomes an empty slot rather than a shift.
 * :func:`propose_positions` — the left-to-right heuristic, demoted from
   source-of-truth to an *editable proposal* of each box's lane position.
 * :func:`join_to_spine` — reads the *explicit* lane positions and scatters each

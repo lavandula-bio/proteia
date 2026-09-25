@@ -146,6 +146,18 @@ def test_fold_change_all_control_lanes_excluded_raises():
 # --- sample reduction (technical vs biological replicates) ---
 
 
+def test_reduce_skips_lanes_without_a_value():
+    r = reduce_samples([1.0, None, 3.0], ["a", "a", "b"])
+    assert r.groups == {"a": [1.0], "b": [3.0]}
+
+
+def test_reduce_keeps_first_appearance_order_of_conditions():
+    # Interleaved conditions read left-to-right like the gel.
+    r = reduce_samples([1.0, 2.0, 3.0], ["b", "a", "b"])
+    assert list(r.groups) == ["b", "a"]
+    assert r.groups["b"] == [1.0, 3.0]
+
+
 def test_reduce_no_samples_treats_each_lane_as_biological():
     # default: every lane is its own sample -> same as plain grouping, n = lanes
     r = reduce_samples([1, 2, 3, 4], ["a", "a", "b", "b"])
@@ -262,7 +274,7 @@ def test_full_chain_normalize_group_compare():
     target = batch.targets()[0].nets
     loading = batch.loading_control().nets
     norm = normalize_lane(target, loading)
-    groups = reduce_samples(norm, batch.conditions).groups  # each lane its own sample
+    groups = reduce_samples(norm, batch.conditions).groups  # no sample names: one per lane
     assert set(groups) == {"ctl", "A", "B"}
     assert [len(v) for v in groups.values()] == [3, 3, 2]
     res = compare(groups)
