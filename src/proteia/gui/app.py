@@ -21,6 +21,8 @@ headless-safe.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from proteia.core.analyze import (
@@ -37,6 +39,7 @@ from proteia.core.analyze import (
 from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.export import write_lane_table
 from proteia.core.grow import grow_box
+from proteia.core.imaging import LoadedImage, display_rgb, load_image
 from proteia.core.model import Box, BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
 from proteia.core.project import (
@@ -51,43 +54,6 @@ PALETTE = ["#ff4d4d", "#4dd2ff", "#ffe14d", "#7cfc00", "#ff66ff", "#ffa64d", "#6
 NONE_CHOICE = "(idle — New protein to start)"
 
 
-def _synthetic_image() -> np.ndarray:
-    img = np.full((120, 200), 20.0)
-    for cx in (40, 90, 140):
-        img[50:70, cx : cx + 30] += 200.0
-    return img
-
-
-def _load_image(path: str | None) -> np.ndarray:
-    """Read raw pixels (2D grayscale or 3D RGB/RGBA) from disk."""
-    if path is None:
-        return _synthetic_image()
-    from skimage import io
-
-    return io.imread(path)
-
-
-def _to_gray(raw: np.ndarray) -> np.ndarray:
-    """The analysis array: 2D grayscale intensity (densitometry works on this, and
-    a consistent ndim lets the viewer swap images without a napari dims crash)."""
-    if raw.ndim == 3:
-        from skimage.color import rgb2gray
-
-        return rgb2gray(raw[..., :3]) * 255.0  # rgb2gray is [0,1]; keep 8-bit-like range
-    return raw
-
-
-def _to_rgb(raw: np.ndarray) -> np.ndarray:
-    """The display array: a uint8 RGB view of the original (colour survives for
-    fluorescence). Grayscale sources are stacked to 3 channels."""
-    rgb = raw[..., :3] if raw.ndim == 3 else np.stack([raw, raw, raw], axis=-1)
-    if rgb.dtype != np.uint8:
-        r = rgb.astype(float)
-        lo, hi = float(r.min()), float(r.max())
-        rgb = ((r - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else rgb.astype(np.uint8)
-    return rgb
-
-
 def _rect_to_corners(rect: Rect) -> np.ndarray:
     x0, y0, x1, y1 = rect
     return np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
@@ -98,22 +64,24 @@ def _initial_size(image: np.ndarray) -> BoxSize:
     return BoxSize(width=max(4, iw // 8), height=max(4, ih // 12))
 
 
-def _make_image(raw: np.ndarray, name: str, path: str | None) -> dict:
+def _make_image(loaded: LoadedImage, name: str, path: str | None) -> dict:
     """One member of a batch's image set: a grayscale ``array`` (analysis) plus an
     RGB ``original`` (display), its background and dimensions. Net signal is always
     computed against the protein's own ``array``, so a target and a loading control
     on different membranes still join correctly by lane; ``original`` only feeds the
     optional 'show original' display toggle."""
-    array = _to_gray(raw)
+    array = loaded.array  # 2D gray, so the viewer swaps images without a dims crash
     return {
         "name": name,
         "path": path,
         "array": array,
-        "original": _to_rgb(raw),
+        "original": display_rgb(loaded.pixels),  # colour survives for fluorescence
         "background": estimate_background(array),
-        "iw": int(array.shape[1]),
-        "ih": int(array.shape[0]),
+        "iw": loaded.width,
+        "ih": loaded.height,
         "dark": True,  # dark-on-light polarity, per image (chemi vs fluorescence differ)
+        "bit_depth": loaded.bit_depth,  # detector limit for the over-exposure check
+        "warnings": loaded.warnings,  # import warnings, kept with the image
     }
 
 
@@ -576,11 +544,20 @@ def launch(image_path: str | None = None) -> None:
         )
         if not path:
             return
-        name = path.split("/")[-1]
-        state["images"].append(_make_image(_load_image(path), name, path))  # normalized to 2D gray
+        name = Path(path).name
+        try:
+            loaded = load_image(path)
+        except (OSError, ValueError) as exc:
+            show_info(f"Cannot open the image. {exc}")
+            return
+        state["images"].append(_make_image(loaded, name, path))
         _set_active_image(len(state["images"]) - 1)
         _refresh_all()
-        show_info(f"Opened {name}. New proteins you add now bind to this image.")
+        notes = " ".join(w.message for w in loaded.warnings)
+        show_info(
+            f"Opened {name}. New proteins you add now bind to this image."
+            + (f" Note: {notes}" if notes else "")
+        )
 
     def on_image_combo_change(*_) -> None:
         if state["syncing"] or not state["images"]:
@@ -1146,16 +1123,26 @@ def launch(image_path: str | None = None) -> None:
 
     # A path on the command line is imported as the first image; otherwise the app
     # opens empty and the user imports.
+    startup_note = ""
     if image_path:
-        state["images"].append(
-            _make_image(_load_image(image_path), image_path.split("/")[-1], image_path)
-        )
-        _set_active_image(0)
+        name = Path(image_path).name
+        try:
+            loaded = load_image(image_path)
+        except (OSError, ValueError) as exc:
+            startup_note = f"Cannot open the image. {exc}. "
+        else:
+            state["images"].append(_make_image(loaded, name, image_path))
+            _set_active_image(0)
+            notes = " ".join(w.message for w in loaded.warnings)
+            startup_note = f"Note: {notes} " if notes else ""
     _refresh_all()
     show_info(
-        "Import an image to start (Import image…)."
-        if not state["images"]
-        else "Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm."
+        startup_note
+        + (
+            "Import an image to start (Import image…)."
+            if not state["images"]
+            else "Press New protein to start; set name/MW/role, Ctrl+click bands, then Confirm."
+        )
     )
     napari.run()
 
