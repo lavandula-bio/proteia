@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pixel-level quantification: integrate intensity within a box.
 
-Two quantities live here:
-
-* ``integrate_box`` — the *raw* sum of grayscale pixels inside a box. Useful for
-  inspection, but not comparable on its own: it conflates signal, box area, and
-  how much background the box happens to include.
-* ``net_signal`` — the densitometry quantity: integrated intensity *above a
-  background level*, with the signal direction handled. On a dark-band-on-light
-  image (chemiluminescence/colorimetric) a darker band must read as *more*
-  signal, so the contribution of each pixel is its darkness relative to the
-  background level. ``estimate_background`` gives a robust membrane baseline.
+``net_signal`` is the densitometry quantity: integrated intensity *above a
+background level*, with the signal direction handled. On a dark-band-on-light
+image (chemiluminescence/colorimetric) a darker band must read as *more* signal,
+so the contribution of each pixel is its darkness relative to the background
+level. ``estimate_background`` gives a robust membrane baseline. (A raw pixel sum
+is not comparable on its own: it conflates signal, box area, and how much
+background the box happens to include.)
 
 Multi-channel images are reduced to a single grayscale channel by averaging.
 """
@@ -42,11 +39,6 @@ def _box_pixels(image: np.ndarray, box: Box, size: BoxSize) -> np.ndarray:
     if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
         raise ValueError("box extends beyond the image bounds")
     return gray[y0:y1, x0:x1]
-
-
-def integrate_box(image: np.ndarray, box: Box, size: BoxSize) -> float:
-    """Sum of raw grayscale pixel intensities inside the box."""
-    return float(_box_pixels(image, box, size).sum())
 
 
 def estimate_background(image: np.ndarray) -> float:

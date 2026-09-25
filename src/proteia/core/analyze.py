@@ -200,20 +200,6 @@ def normalize_batch(batch: Batch) -> tuple[list[NormalizedSeries], list[str]]:
     return series, warnings
 
 
-def group_by_condition(values: LaneNets, conditions: list[str]) -> dict[str, list[float]]:
-    """Pool per-lane values into replicate lists keyed by condition label.
-
-    Lanes with a ``None`` value are skipped. Insertion order of first appearance
-    is preserved so groups read left-to-right like the gel.
-    """
-    groups: dict[str, list[float]] = {}
-    for cond, val in zip(conditions, values, strict=True):
-        groups.setdefault(cond, [])
-        if val is not None:
-            groups[cond].append(val)
-    return groups
-
-
 class ReduceMethod(StrEnum):
     MEAN = "mean"  # average technical repeats (force-merge; the safe default)
     REPRESENTATIVE = "representative"  # keep one repeat per sample, drop the rest

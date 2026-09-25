@@ -15,7 +15,6 @@ from proteia.core.analyze import (
     compare,
     describe,
     fold_change_lane,
-    group_by_condition,
     normalize_batch,
     normalize_lane,
     reduce_samples,
@@ -79,24 +78,6 @@ def test_normalize_lane_guards_against_bad_loading():
 def test_normalize_lane_length_mismatch_raises():
     with pytest.raises(ValueError):
         normalize_lane([1, 2], [1])
-
-
-# --- grouping (replicates = shared label) ---
-
-
-def test_group_by_condition_pools_replicates():
-    groups = group_by_condition([1, 2, 3, 4], ["a", "a", "b", "b"])
-    assert groups == {"a": [1, 2], "b": [3, 4]}
-
-
-def test_group_by_condition_skips_none_but_keeps_group():
-    groups = group_by_condition([1, None, 3], ["a", "a", "b"])
-    assert groups == {"a": [1], "b": [3]}
-
-
-def test_group_preserves_left_to_right_order():
-    groups = group_by_condition([1, 2, 3], ["b", "a", "b"])
-    assert list(groups) == ["b", "a"]
 
 
 # --- fold change ---
@@ -281,7 +262,7 @@ def test_full_chain_normalize_group_compare():
     target = batch.targets()[0].nets
     loading = batch.loading_control().nets
     norm = normalize_lane(target, loading)
-    groups = group_by_condition(norm, batch.conditions)
+    groups = reduce_samples(norm, batch.conditions).groups  # each lane its own sample
     assert set(groups) == {"ctl", "A", "B"}
     assert [len(v) for v in groups.values()] == [3, 3, 2]
     res = compare(groups)
