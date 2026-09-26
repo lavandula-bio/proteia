@@ -285,16 +285,21 @@ class Instance:
         self.server = _server(app)
 
     def serve(self) -> None:
-        """Serve until stopped, save what an autosave could not, then :meth:`close`."""
+        """Serve until stopped, save what an autosave could not, close the open
+        project (deleting the image files only its undo history kept), then
+        :meth:`close`."""
         try:
             with _stop_on_signals(self.stop):
                 self.server.run(sockets=[self.sock])
         finally:
             try:
-                self.workspace.flush()
-            except UnsavedChangesError as exc:
-                print(f"Proteia stopped, but {exc}", file=sys.stderr)
-            self.close()
+                try:
+                    self.workspace.flush()
+                except UnsavedChangesError as exc:
+                    print(f"Proteia stopped, but {exc}", file=sys.stderr)
+                self.workspace.close()
+            finally:
+                self.close()
 
     def stop(self) -> None:
         self.server.should_exit = True

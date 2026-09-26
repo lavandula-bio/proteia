@@ -815,6 +815,12 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["PUT /api/proteins/{protein_id}/box-size"] = client.ok(
         "PUT", f"/api/proteins/{protein}/box-size", {"width": 16, "height": 12}
     )
+    answers["POST /api/undo"] = client.ok("POST", "/api/undo")
+    answers["POST /api/redo"] = client.ok("POST", "/api/redo")
+    plant_records(client, protein, _record(1), bands=1)
+    answers["DELETE /api/proteins/{protein_id}/boxes"] = client.ok(
+        "DELETE", f"/api/proteins/{protein}/boxes"
+    )
     plant_records(client, protein, _record(1), bands=1)
     answers["DELETE /api/proteins/{protein_id}/undetected/{lane_index}"] = client.ok(
         "DELETE", f"/api/proteins/{protein}/undetected/1"
@@ -1336,3 +1342,197 @@ def test_an_unpaired_surrogate_in_typed_text_is_refused_as_json(client, tmp_path
     # A whole pair is one character, a mathematical bold beta here: stored as typed.
     answer = client.ok("PATCH", f"/api/proteins/{protein}", {"name": "\U0001d6c3-actin"})
     assert protein_of(answer, protein)["name"] == "\U0001d6c3-actin"
+
+
+# --- Undo, redo and clearing a protein's boxes (#52) ---
+
+RESTORED = ["action", "seq", "removed", "restored", "undetected_removed", "undetected_restored"]
+
+
+def history(answer: dict) -> dict:
+    return answer["project"]["history"]
+
+
+def test_undo_and_redo_answer_what_they_took_back_and_did_again(client, tmp_path):
+    created = client.ok("POST", "/api/projects", {"name": "Blot"})
+    assert history(created) == {"undo": None, "redo": None}
+    assert unchanged_refusal(client, "POST", "/api/undo") == ("nothing_to_undo", [])
+    assert unchanged_refusal(client, "POST", "/api/redo") == ("nothing_to_redo", [])
+    assert client.refused("POST", "/api/undo")[:2] == (422, "nothing_to_undo")
+    assert client.refused("POST", "/api/redo")[:2] == (422, "nothing_to_redo")
+
+    _, imported = upload(client, blot_bytes(tmp_path))
+    assert history(imported) == {"undo": {"seq": 2, "action": "import_image"}, "redo": None}
+    lanes = [{"condition": f"c{i}"} for i in range(len(LANE_X))]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes})
+    body = {"name": "β-actin", "role": "target", "image_id": imported["image_id"]}
+    protein = client.ok("POST", "/api/proteins", body)["protein_id"]
+    body = {"protein_id": protein, "x": LANE_X[0], "y": ROW, "lane_index": 0, "grow": True}
+    placed = client.ok("POST", "/api/boxes", body)
+    assert history(placed) == {"undo": {"seq": 5, "action": "place_box"}, "redo": None}
+    assert column(placed, protein)["nets"][0] is not None
+
+    undone = client.ok("POST", "/api/undo")
+    assert set(undone) == {*RESTORED, "project", "results"}
+    assert {name: undone[name] for name in RESTORED} == {
+        "action": "place_box",
+        "seq": 5,
+        "removed": [placed["band_id"]],
+        "restored": [],
+        "undetected_removed": [],
+        "undetected_restored": [],
+    }
+    assert undone["project"]["revision"] == 6  # an undo is a logged change
+    assert history(undone) == {
+        "undo": {"seq": 4, "action": "add_protein"},
+        "redo": {"seq": 5, "action": "place_box"},
+    }
+    assert column(undone, protein)["nets"][0] is None  # the results follow
+    path = f"/api/boxes/{placed['band_id']}/lane"
+    assert unchanged_refusal(client, "PUT", path, {"lane_index": 1})[0] == "unknown_id"
+
+    redone = client.ok("POST", "/api/redo")
+    assert {name: redone[name] for name in RESTORED} == {
+        "action": "place_box",
+        "seq": 5,
+        "removed": [],
+        "restored": [placed["band_id"]],
+        "undetected_removed": [],
+        "undetected_restored": [],
+    }
+    assert history(redone) == {"undo": {"seq": 5, "action": "place_box"}, "redo": None}
+    assert redone["project"]["proteins"] == placed["project"]["proteins"]
+    assert redone["results"]["proteins"] == placed["results"]["proteins"]
+    assert unchanged_refusal(client, "POST", "/api/redo") == ("nothing_to_redo", [])
+    assert logged(client)[-2:] == ["undo", "redo"]
+
+
+def test_clearing_a_proteins_boxes_answers_what_went_and_undo_brings_it_back(client, tmp_path):
+    _, protein = ready(client, tmp_path)
+    for lane in (0, 1):
+        body = {"protein_id": protein, "x": LANE_X[lane], "y": ROW, "lane_index": lane}
+        client.ok("POST", "/api/boxes", {**body, "grow": lane == 0})
+    plant_records(client, protein, _record(2), bands=1)
+    before = client.ok("GET", "/api/project")
+    band_ids = [band["id"] for band in protein_of(before, protein)["bands"]]
+
+    answer = client.ok("DELETE", f"/api/proteins/{protein}/boxes")
+    assert set(answer) == {"removed", "dropped_undetected", "project", "results"}
+    assert (answer["removed"], answer["dropped_undetected"]) == (band_ids, [[2, 0]])
+    state = protein_of(answer, protein)
+    assert (state["bands"], state["undetected"]) == ([], [])
+    assert state["box_size"] == protein_of(before, protein)["box_size"]  # kept
+    assert column(answer, protein)["nets"] == [None] * len(LANE_X)
+    revision = answer["project"]["revision"]
+    assert history(answer)["undo"] == {"seq": revision, "action": "clear_boxes"}
+    assert logged(client)[-1] == "clear_boxes"
+    path = "/api/proteins/prot-99/boxes"
+    assert unchanged_refusal(client, "DELETE", path) == ("unknown_id", [])
+    again = client.ok("DELETE", f"/api/proteins/{protein}/boxes")  # nothing left: a no-op
+    assert (again["removed"], again["dropped_undetected"]) == ([], [])
+    assert again["project"]["revision"] == revision
+
+    undone = client.ok("POST", "/api/undo")
+    assert (undone["action"], undone["restored"]) == ("clear_boxes", band_ids)
+    assert undone["undetected_restored"] == [[protein, 2, 0]]
+    assert undone["project"]["proteins"] == before["project"]["proteins"]
+    assert undone["results"]["proteins"] == before["results"]["proteins"]
+
+
+def blot_upload(session: api.ProjectSession, tmp_path: Path, name: str) -> str:
+    with io.BytesIO(blot_bytes(tmp_path)) as stream:
+        return api.ops.import_image(
+            session, stream, name, kind="chemiluminescence", polarity="dark_on_light"
+        )
+
+
+def test_a_switch_closes_the_old_project_and_deletes_what_only_its_history_kept(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    first = workspace.create("A µ")
+    kept = blot_upload(first, tmp_path, "kept α.tif")
+    gone = blot_upload(first, tmp_path, "gone β.tif")
+    api.ops.remove_image(first, gone)
+    images = first.folder / storage.IMAGES_DIR
+    assert sorted(p.name for p in images.iterdir()) == [f"{kept}.tif", f"{gone}.tif"]
+
+    with pytest.raises(api.projects.ProjectExistsError):
+        workspace.create("a µ")  # the switch fails: A stays open, and so does its history
+    assert workspace.current() is first and first.undo_step is not None
+    assert (images / f"{gone}.tif").exists()
+
+    workspace.create("B")
+    assert sorted(p.name for p in images.iterdir()) == [f"{kept}.tif"]
+    assert (first.undo_step, first.redo_step) == (None, None)
+    reopened = workspace.open("A µ")
+    assert reopened.project == first.project
+    assert reopened.undo_step is None  # the history is per session
+
+
+def test_reopening_the_open_project_deletes_no_file_the_new_session_stored(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    first = workspace.create("A µ")
+    gone = blot_upload(first, tmp_path, "gone β.tif")
+    api.ops.remove_image(first, gone)  # only the history keeps its file
+    held, release = threading.Event(), threading.Event()
+
+    def running() -> None:  # a request on the old session, e.g. a preview of a large image
+        with first.lock:
+            held.set()
+            release.wait(10)
+
+    request = threading.Thread(target=running)
+    request.start()
+    assert held.wait(10)
+    switch = threading.Thread(target=workspace.open, args=("A µ",))
+    switch.start()
+    deadline = time.monotonic() + 10
+    while workspace.current() is first:  # the switch then waits for the old one's lock
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    second = workspace.current()
+    stored = blot_upload(second, tmp_path, "stored α.tif")  # an upload that reached it
+    release.set()
+    request.join(10)
+    switch.join(10)
+    assert not switch.is_alive()
+
+    assert (first.undo_step, first.redo_step) == (None, None)  # closed
+    images = second.folder / storage.IMAGES_DIR
+    assert sorted(p.name for p in images.iterdir()) == [f"{stored}.tif"]
+    assert storage.load_project(second.folder) == second.project
+    api.ops.set_lanes(second, [api.ops.LaneInput("vehicle")])  # saves again
+    assert storage.load_project(second.folder) == second.project
+
+
+def test_reading_the_project_never_waits_for_a_running_operation(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    blot_upload(session, tmp_path, "α.tif")
+    answers: list[dict[str, Any]] = []
+    reader = threading.Thread(target=lambda: answers.append(api.get_project(workspace)))
+    with session.lock:  # as an operation holds it while it runs, e.g. a large import
+        reader.start()
+        reader.join(10)
+        assert not reader.is_alive()  # answered without waiting for it
+    assert history(answers[0]) == {"undo": {"seq": 2, "action": "import_image"}, "redo": None}
+
+
+def test_stopping_the_server_closes_the_open_project(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    instance = launch.start(folder=tmp_path / "state", opener=lambda url: True, workspace=workspace)
+    thread = threading.Thread(target=instance.serve, daemon=True)
+    thread.start()
+    session = workspace.create("A µ")
+    gone = blot_upload(session, tmp_path, "gone β.tif")
+    api.ops.remove_image(session, gone)
+    file = session.folder / storage.IMAGES_DIR / f"{gone}.tif"
+    assert file.exists()
+    deadline = time.monotonic() + 10
+    while not instance.server.started:
+        assert thread.is_alive() and time.monotonic() < deadline
+        time.sleep(0.01)
+    instance.stop()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert not file.exists()  # closed after the flush
+    assert storage.load_project(session.folder) == session.project

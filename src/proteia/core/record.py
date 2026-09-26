@@ -22,6 +22,16 @@ numbers came from and how:
 Nothing is sent anywhere, and no platform, host name, user or path is recorded.
 A record serializes canonically (sorted keys, no NaN), so a later signature can
 cover ``canonical_json(record)`` without a format change.
+
+Undo and redo are changes in the log like any other (actions ``undo`` and
+``redo``), so an undone change stays in it: which changes are in effect is
+read from the ``undone_seq`` and ``redone_seq`` entries. An undo or redo
+restores a state whole, and its entry's ``content_hash`` equals that of the
+entry it names by ``returns_to_seq``. Its params list the ids and the
+not-detected record keys (protein id, lane index, band index) that went or came
+back, not field changes: an object in both states whose fields changed (a moved
+box, a replaced record) is audited through ``returns_to_seq``, that entry and
+the content hash.
 """
 
 from __future__ import annotations
@@ -36,10 +46,12 @@ from pydantic import JsonValue, TypeAdapter
 
 import proteia
 from proteia.core import export, grow, quantify, rowdetect, storage
-from proteia.core.model import Project, Timestamp
+from proteia.core.model import LogEntry, Project, Timestamp
 from proteia.core.results import Results
 
 RECORD_FORMAT: Final = 1
+# The actions of entries that restore a state of the undo history.
+_RESTORING_ACTIONS: Final = frozenset({"undo", "redo"})
 # The libraries core computes or decodes pixels with, by distribution name.
 _DISTRIBUTIONS: Final = ("numpy", "scipy", "scikit-image", "pillow", "tifffile")
 _TIMESTAMP = TypeAdapter(Timestamp)
@@ -89,6 +101,19 @@ def results_settings(results: Results) -> dict[str, JsonValue]:
     }
 
 
+def _undo_mismatch(log: tuple[LogEntry, ...]) -> bool:
+    """Whether an undo or redo entry names no earlier entry by ``returns_to_seq``,
+    or left other content than the entry it names."""
+    left: dict[int, str] = {}  # seq -> content hash, of the entries so far
+    for entry in log:
+        if entry.action in _RESTORING_ACTIONS:
+            seq = entry.params.get("returns_to_seq")
+            if type(seq) is not int or left.get(seq) != entry.content_hash:
+                return True
+        left[entry.seq] = entry.content_hash
+    return False
+
+
 def _history_issues(project: Project, digest: str) -> list[str]:
     if not project.log:
         return ["no_history"]
@@ -97,6 +122,8 @@ def _history_issues(project: Project, digest: str) -> list[str]:
         issues.append("history_starts_late")
     if project.log[-1].content_hash != digest:
         issues.append("content_changed_outside_log")
+    if _undo_mismatch(project.log):
+        issues.append("undo_mismatch")
     return issues
 
 
@@ -106,7 +133,10 @@ def history_issues(project: Project) -> list[str]:
     * ``no_history``: the project has no log (made before the log existed);
     * ``history_starts_late``: the log does not begin with the project's creation;
     * ``content_changed_outside_log``: the content differs from what the last
-      entry left (``project.json`` edited by hand, or an unlogged change).
+      entry left (``project.json`` edited by hand, or an unlogged change);
+    * ``undo_mismatch``: an undo or redo restored content that no earlier entry
+      left, as its ``returns_to_seq`` should name (``project.json`` was edited
+      by hand before the session whose undo went back past the edit).
     """
     return _history_issues(project, storage.content_hash(project))
 
