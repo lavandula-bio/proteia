@@ -245,6 +245,56 @@ def test_a_refused_upload_leaves_no_file(client, tmp_path, monkeypatch):
     assert not (client.root / "escape.tif").exists()
 
 
+def test_an_import_joins_the_membrane_it_names(client, tmp_path):
+    # The page's "Membrane" choice: a new membrane, or the one an earlier image is on.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    data = blot_bytes(tmp_path)
+    _, first = upload(client, data)
+    (image,) = first["project"]["images"]
+    membrane = image["membrane_id"]
+    status, reprobe = upload(client, data, name="reprobe α 10 µM.tif", membrane_id=membrane)
+    assert status == 201, reprobe
+    _, other = upload(client, data, name="other.tif")  # none named: a membrane of its own
+    images = {i["id"]: i["membrane_id"] for i in other["project"]["images"]}
+    assert images[reprobe["image_id"]] == membrane
+    assert images[other["image_id"]] != membrane
+    project = storage.load_project(client.root / "Blot")
+    assert [[i.id for i in m.images] for m in project.batch.membranes] == [
+        [image["id"], reprobe["image_id"]],
+        [other["image_id"]],
+    ]
+    joined = project.log[-2]
+    assert (joined.action, joined.params["membrane_id"], joined.params["new_membrane"]) == (
+        "import_image",
+        membrane,
+        False,
+    )
+
+    # An unknown membrane is refused before the file is stored: 404, nothing changes.
+    before = client.ok("GET", "/api/project")
+    stored = sorted(p.name for p in (client.root / "Blot").rglob("*"))
+    status, answer = upload(client, data, name="lost.tif", membrane_id="mem-99")
+    assert (status, answer["code"]) == (404, "unknown_id")
+    assert client.ok("GET", "/api/project") == before
+    assert sorted(p.name for p in (client.root / "Blot").rglob("*")) == stored
+
+
+def test_an_import_answers_the_warnings_found_in_the_file(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, blot_bytes(tmp_path))  # a 16-bit TIFF: nothing to report
+    assert status == 201 and answer["project"]["images"][0]["warnings"] == []
+    pixels = np.full((H, W), 200, dtype=np.uint8)
+    jpeg = io.BytesIO()
+    Image.fromarray(pixels).save(jpeg, format="JPEG")
+    status, answer = upload(client, jpeg.getvalue(), name="blot β.jpg")
+    assert status == 201, answer
+    image = next(i for i in answer["project"]["images"] if i["id"] == answer["image_id"])
+    (warning,) = image["warnings"]
+    assert warning["code"] == "lossy_format"
+    assert warning["message"].startswith("JPEG-type compression can change pixel values")
+    assert client.ok("GET", "/api/project")["project"]["images"][1] == image  # and it stays
+
+
 def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
     image_id, _ = ready(client, tmp_path)
     answer = client.ok("PUT", f"/api/images/{image_id}/polarity", {"polarity": "light_on_dark"})

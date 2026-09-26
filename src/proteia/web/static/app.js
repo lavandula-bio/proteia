@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // The page: keeps this launch's access token, talks to the local server, and
-// shows the open project's images and boxes. Every edit goes to the server,
-// which answers with the stored project; the page only draws what it is given.
+// shows the open project's images, proteins, boxes and checks. Every edit goes
+// to the server, which answers with the stored project and its results; the
+// page only draws what it is given.
+import { $, isolate, rebuild, span } from "/static/dom.js";
+import { colorOf, ProteinPanel } from "/static/proteins.js";
 import { ImageView, MISSING_COLOR } from "/static/view.js";
 
 const TOKEN_KEY = "proteia-token";
-const PROTEIN_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#17becf", "#bcbd22"];
 const NEEDS_LAUNCH =
   "This page needs the link Proteia opens when it starts. Start Proteia again to open it.";
 
@@ -21,7 +23,6 @@ function takeToken() {
 }
 
 const token = takeToken();
-const $ = (id) => document.getElementById(id);
 
 // --- Talking to the server ---
 
@@ -69,8 +70,10 @@ async function call(method, path, json) {
 
 const state = {
   project: null, // the last project state the server sent
+  results: null, // the results computed from that same state
+  answered: null, // {open_id, revision} of that state
   imageId: null,
-  proteinId: null,
+  proteinId: null, // the protein a click on the image places a box of
   boxId: null,
   bitmaps: new Map(), // image id -> Promise of its preview's ImageBitmap
   shownImageId: null, // the image the view shows (null while a preview loads)
@@ -97,26 +100,94 @@ function report(error) {
   showStatus(error.message);
 }
 
-// Run an edit; its answer replaces the project state.
+// Answers can arrive out of order: one is shown only if it is not older than
+// the one shown, by (open_id, revision). The open id counts the server's
+// creates and opens, so an answer about an earlier opening is older whatever
+// its revision, and the answer of the latest open is newer than all before it.
+function isCurrent(project) {
+  const shown = state.answered;
+  return (
+    shown === null ||
+    project.open_id > shown.open_id ||
+    (project.open_id === shown.open_id && project.revision >= shown.revision)
+  );
+}
+
+// Whether an answer is about the project opening the page shows (at any revision).
+function sameOpening(answer) {
+  return state.answered !== null && answer.project.open_id === state.answered.open_id;
+}
+
+// Show an answer's state and results; `choose` sets page state along with it
+// (such as the image or protein it made). False if the answer was older. The
+// choice still applies to an older answer about the opening shown: what it
+// made is in the newer state too, or select() drops it.
+function applyAnswer(answer, { choose = {} } = {}) {
+  const current = isCurrent(answer.project);
+  if (current) {
+    state.answered = { open_id: answer.project.open_id, revision: answer.project.revision };
+    state.project = answer.project;
+    state.results = answer.results;
+  } else if (!sameOpening(answer) || !Object.keys(choose).length) {
+    return false;
+  }
+  Object.assign(state, choose);
+  select();
+  render();
+  return current;
+}
+
+// The open id of the project shown. What an edit does after its answer (a
+// status line, a lane question) is dropped once another project is shown.
+function shownOpening() {
+  return state.answered && state.answered.open_id;
+}
+
+// Send an edit; its answer replaces the project state. Gives the answer, or
+// null if it is about a project opened before the one shown now.
+async function send(method, path, json) {
+  const answer = await call(method, path, json);
+  applyAnswer(answer);
+  if (!sameOpening(answer)) {
+    return null;
+  }
+  showStatus("");
+  return answer;
+}
+
+// Send an edit and show a refusal in the status line (unless another project
+// is shown by then).
 async function edit(method, path, json) {
+  const opened = shownOpening();
   try {
-    const answer = await call(method, path, json);
-    showStatus("");
-    applyProject(answer.project);
-    return answer;
+    return await send(method, path, json);
   } catch (error) {
-    report(error);
+    if (opened === shownOpening()) {
+      report(error);
+    }
     throw error;
   }
 }
 
 const view = new ImageView($("view"), {
-  place: (x, y, options) => placeBox(x, y, options),
+  place: (x, y, options) =>
+    placeBox(x, y, options, options.laneIndex, options.proteinId || state.proteinId),
   move: (boxId, rect) => edit("PUT", `/api/boxes/${boxId}`, { rect }).catch(() => {}),
   select: (boxId) => {
     state.boxId = boxId;
     render();
   },
+});
+
+const proteinPanel = new ProteinPanel({
+  send,
+  choose: (proteinId) => {
+    state.proteinId = proteinId;
+    select();
+    render();
+  },
+  status: showStatus,
+  laneName: (index) => laneName(state.project, index),
 });
 
 // --- Projects ---
@@ -143,9 +214,37 @@ async function showProjects() {
   }
 }
 
+// One create or open at a time: while it runs the dialog stays open and takes
+// no other choice, so no two opens race and no edit is made from the page
+// until the server's newly open project is shown.
+let opening = null; // the name being opened, or null
+
+function setOpening(name) {
+  opening = name;
+  const dialog = $("projects-dialog");
+  dialog.setAttribute("aria-busy", String(name !== null));
+  const line = $("projects-state");
+  line.textContent = name === null ? "" : `Opening ${name}…`;
+  line.hidden = name === null;
+}
+
 async function openProject(path, name) {
+  if (opening !== null) {
+    return;
+  }
+  setOpening(name);
+  $("projects-error").textContent = "";
   try {
+    // The panel's edits end in the project they were made in, their refusals
+    // shown (the dialog is modal: no edit is made meanwhile). Then, before
+    // asking, none may reach the project opened next: ids repeat across projects.
+    await proteinPanel.settled();
+    proteinPanel.invalidateEdits();
     const answer = await call("POST", path, { name });
+    if (!isCurrent(answer.project)) {
+      $("projects-error").textContent = "Another project was opened meanwhile.";
+      return;
+    }
     // Image ids repeat across projects (img-1 in each): drop everything shown.
     view.setImage(null, 0, 0);
     view.setOverlay([], [], null);
@@ -153,14 +252,15 @@ async function openProject(path, name) {
     for (const id of [...state.bitmaps.keys()]) {
       forgetBitmap(id);
     }
-    state.imageId = null;
-    state.proteinId = null;
-    state.boxId = null;
-    applyProject(answer.project);
+    proteinPanel.forgetTyped();
+    $("lane-picker").hidden = true; // its retry places a box in the project it asked about
+    applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
     $("projects-dialog").close();
     showStatus("");
   } catch (error) {
     $("projects-error").textContent = error.message;
+  } finally {
+    setOpening(null);
   }
 }
 
@@ -168,10 +268,14 @@ $("new-project").addEventListener("submit", (event) => {
   event.preventDefault();
   openProject("/api/projects", $("new-project-name").value);
 });
-$("projects-close").addEventListener("click", () => $("projects-dialog").close());
+$("projects-close").addEventListener("click", () => {
+  if (opening === null) {
+    $("projects-dialog").close();
+  }
+});
 $("projects-dialog").addEventListener("cancel", (event) => {
-  if (!state.project) {
-    event.preventDefault(); // a project must be open to work
+  if (!state.project || opening !== null) {
+    event.preventDefault(); // a project must be open to work, and the open must finish
   }
 });
 $("switch-project").addEventListener("click", () => showProjects().catch(report));
@@ -179,8 +283,9 @@ $("reveal").addEventListener("click", () => call("POST", "/api/project/reveal").
 
 // --- Applying the server's state ---
 
-function applyProject(project) {
-  state.project = project;
+// Keep the chosen image, protein and box while they exist; otherwise the first.
+function select() {
+  const project = state.project;
   const images = project.images;
   if (!images.some((image) => image.id === state.imageId)) {
     state.imageId = images.length ? images[0].id : null;
@@ -198,7 +303,6 @@ function applyProject(project) {
       forgetBitmap(id);
     }
   }
-  render();
 }
 
 function laneName(project, index) {
@@ -222,76 +326,84 @@ function render() {
     : project.saved
       ? "Saved"
       : "Saving…";
-  renderImages(project);
-  renderProteins(project);
+  const image = project.images.find((i) => i.id === state.imageId) || null;
+  renderImages(project, image);
+  proteinPanel.render(project, image, state.proteinId);
   renderBox(project);
   renderNotices(project);
+  renderHint(project, image);
   renderView(project);
 }
 
-function choice(list, label, selected, onChoose, swatch) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = selected ? "chosen" : "";
-  button.setAttribute("aria-pressed", String(selected));
-  if (swatch) {
-    const mark = document.createElement("span");
-    mark.className = "swatch";
-    mark.style.backgroundColor = swatch;
-    button.append(mark);
-  }
-  button.append(label);
-  button.addEventListener("click", onChoose);
-  const item = document.createElement("li");
-  item.append(button);
-  list.append(item);
-}
-
-function renderImages(project) {
-  const list = $("images");
-  list.replaceChildren();
-  for (const image of project.images) {
-    choice(list, image.original_name, image.id === state.imageId, () => {
-      state.imageId = image.id;
-      state.boxId = null;
-      applyProject(state.project);
-    });
-  }
-  const image = project.images.find((i) => i.id === state.imageId);
+function renderImages(project, image) {
+  rebuild($("images"), () => {
+    for (const each of project.images) {
+      const chosen = each === image;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.key = each.id;
+      button.className = chosen ? "chosen" : "";
+      button.setAttribute("aria-pressed", String(chosen));
+      button.textContent = each.original_name;
+      button.addEventListener("click", () => {
+        state.imageId = each.id;
+        state.boxId = null;
+        select();
+        render();
+      });
+      const item = document.createElement("li");
+      item.append(button);
+      $("images").append(item);
+    }
+  });
   $("image-controls").hidden = !image;
+  const warnings = $("image-warnings");
+  warnings.replaceChildren();
   if (image) {
     $("polarity").value = image.polarity;
+    for (const warning of image.warnings) {
+      const item = document.createElement("li");
+      item.className = "warning";
+      item.textContent = warning.message;
+      warnings.append(item);
+    }
   }
+  renderMembranes(project);
 }
 
-function colorOf(project, proteinId) {
-  const index = project.proteins.findIndex((p) => p.id === proteinId);
-  return PROTEIN_COLORS[index % PROTEIN_COLORS.length];
-}
+let membranesOpening = null; // the open id the Membrane choice was made in
 
-function renderProteins(project) {
-  const list = $("proteins");
-  list.replaceChildren();
-  const proteins = project.proteins.filter((p) => p.image_id === state.imageId);
-  for (const protein of proteins) {
-    const role = protein.role === "loading control" ? " (loading control)" : "";
-    choice(
-      list,
-      `${protein.name}${role}`,
-      protein.id === state.proteinId,
-      () => {
-        state.proteinId = protein.id;
-        render();
-      },
-      colorOf(project, protein.id),
-    );
+// The import's membrane: a new one, or one an earlier image is on. A choice
+// made in another project never carries over (membrane ids repeat across
+// projects, mem-2 in each).
+function renderMembranes(project) {
+  const select = $("import-membrane");
+  const kept = membranesOpening === project.open_id ? select.value : "";
+  membranesOpening = project.open_id;
+  const membranes = new Map(); // membrane id -> its images
+  for (const image of project.images) {
+    if (!membranes.has(image.membrane_id)) {
+      membranes.set(image.membrane_id, []);
+    }
+    membranes.get(image.membrane_id).push(image);
   }
-  if (!proteins.length) {
-    const item = document.createElement("li");
-    item.className = "hint";
-    item.textContent = "No protein on this image yet.";
-    list.append(item);
+  const firstNames = [...membranes.values()].map((images) => images[0].original_name);
+  const options = [new Option("New membrane", "")];
+  for (const [id, images] of membranes) {
+    const first = images[0];
+    const notes = [];
+    if (firstNames.filter((name) => name === first.original_name).length > 1) {
+      // Two membranes named by the same file name: which image, by its place in the list.
+      notes.push(`image ${project.images.indexOf(first) + 1}`);
+    }
+    if (images.length > 1) {
+      notes.push(`and ${images.length - 1} more`);
+    }
+    const more = notes.length ? ` (${notes.join(", ")})` : "";
+    options.push(new Option(`Same as ${isolate(first.original_name)}${more}`, id));
   }
+  select.replaceChildren(...options);
+  select.value = membranes.has(kept) ? kept : "";
 }
 
 function findBox(project, boxId) {
@@ -304,6 +416,29 @@ function findBox(project, boxId) {
   return null;
 }
 
+const PLACED_BY = {
+  click: "Click, grown from the band",
+  manual: "Shift+click, fixed size",
+  row_box: "Row box detection",
+  mw_guided: "Molecular-weight guide",
+};
+const WHOLE = new Intl.NumberFormat("en", { maximumFractionDigits: 0 });
+const SMALL = new Intl.NumberFormat("en", { maximumSignificantDigits: 4 });
+
+// The box's net from the results: the lane whose band is this box.
+function netText(protein, band) {
+  const column = state.results.proteins.find((c) => c.protein_id === protein.id);
+  const lane = column ? column.band_ids.indexOf(band.id) : -1;
+  if (lane < 0) {
+    return band.band_index > 0 ? "Not quantified (an extra band)" : "—";
+  }
+  const net = column.nets[lane];
+  if (net === null) {
+    return "—";
+  }
+  return Math.abs(net) >= 100 ? WHOLE.format(net) : SMALL.format(net);
+}
+
 function renderBox(project) {
   const found = state.boxId ? findBox(project, state.boxId) : null;
   $("box-panel").hidden = !found;
@@ -311,45 +446,79 @@ function renderBox(project) {
     return;
   }
   const { protein, band } = found;
-  const clipped =
-    band.clipped === true ? " Over-exposed." : band.clipped === null ? " Not checked." : "";
-  $("box-summary").textContent = `${protein.name}, ${laneName(project, band.lane_index)}.${clipped}`;
+  $("box-summary").textContent = `${protein.name}, ${laneName(project, band.lane_index)}`;
+  $("box-clipped").textContent =
+    band.clipped === true
+      ? "Yes: pixels at the detector limit, so the net is an under-estimate"
+      : band.clipped === null
+        ? "Not checked"
+        : "No";
+  $("box-net").textContent = netText(protein, band);
+  const edited = band.manually_edited ? "; moved or re-laned by hand since" : "";
+  $("box-source").textContent = `${PLACED_BY[band.source] || band.source}${edited}`;
   const select = $("box-lane");
   select.replaceChildren();
   for (const lane of project.lanes) {
-    const option = document.createElement("option");
-    option.value = String(lane.index);
-    option.textContent = laneName(project, lane.index);
-    select.append(option);
+    select.append(new Option(laneName(project, lane.index), String(lane.index)));
   }
   select.value = String(band.lane_index);
 }
 
+// A core notice as a sentence: capitalized, with a full stop.
+function sentence(text) {
+  const capital = text.charAt(0).toUpperCase() + text.slice(1);
+  return /[.!?]$/.test(capital) ? capital : `${capital}.`;
+}
+
 function renderNotices(project) {
+  const warnings = [];
+  const infos = [];
+  for (const set of state.results.sets) {
+    const prefix = set.id === "all_lanes" ? "All lanes: " : "";
+    for (const notice of set.notices) {
+      const line = [`${prefix}${sentence(notice.message)}`, notice.level];
+      (notice.level === "warning" ? warnings : infos).push(line);
+    }
+  }
+  const missing = [];
+  for (const protein of project.proteins.filter((p) => p.image_id === state.imageId)) {
+    if (protein.missing_lanes.length && protein.bands.length) {
+      const lanes = protein.missing_lanes.map((m) => m.lane_index + 1);
+      const which = `lane${lanes.length > 1 ? "s" : ""} ${lanes.join(", ")}`;
+      missing.push([`${protein.name}: no box in ${which}.`, "missing"]);
+    }
+  }
   const list = $("notices");
   list.replaceChildren();
-  const add = (text, kind) => {
+  const lines = [...warnings, ...missing, ...infos];
+  if (!lines.length) {
+    lines.push(["No problems found.", "ok"]);
+  }
+  for (const [text, kind] of lines) {
     const item = document.createElement("li");
     item.className = kind;
     item.textContent = text;
     list.append(item);
-  };
-  if (!project.lanes.length) {
-    add("No lanes are declared yet.", "warning");
   }
-  for (const protein of project.proteins.filter((p) => p.image_id === state.imageId)) {
-    const clipped = protein.bands.filter((b) => b.clipped === true);
-    if (clipped.length) {
-      const lanes = clipped.map((b) => b.lane_index + 1).join(", ");
-      add(`${protein.name}: over-exposed in lane ${lanes}.`, "clipped");
-    }
-    if (protein.missing_lanes.length && protein.bands.length) {
-      const lanes = protein.missing_lanes.map((m) => m.lane_index + 1).join(", ");
-      add(`${protein.name}: no box in lane ${lanes}.`, "missing");
-    }
+}
+
+function renderHint(project, image) {
+  const hint = $("view-hint");
+  hint.hidden = !image;
+  if (!image) {
+    return;
   }
-  if (!list.children.length) {
-    add("No problems found.", "ok");
+  const protein = project.proteins.find((p) => p.id === state.proteinId);
+  if (image.kind === "visible_marker") {
+    hint.textContent = "A marker image: boxes are placed on signal images.";
+  } else if (!protein) {
+    hint.textContent = "Add a protein to place boxes on this image.";
+  } else {
+    hint.replaceChildren(
+      "Boxes go to ",
+      span("hint-target", protein.name),
+      " · Click a band: one box · Shift+click: fixed box · Drag: pan · Wheel: zoom",
+    );
   }
 }
 
@@ -385,6 +554,7 @@ function renderView(project) {
   }
   const boxes = [];
   const ghosts = [];
+  const marks = [];
   for (const protein of project.proteins.filter((p) => p.image_id === image.id)) {
     const color = colorOf(project, protein.id);
     for (const band of protein.bands) {
@@ -407,6 +577,19 @@ function renderView(project) {
         rect: [x0, y0, x0 + width, y0 + height],
         color: MISSING_COLOR,
         label: `${missing.lane_index + 1}: no box`,
+        proteinId: protein.id,
+        laneIndex: missing.lane_index,
+      });
+    }
+    for (const record of protein.undetected) {
+      const band = record.band_index ? ` band ${record.band_index + 1}` : "";
+      marks.push({
+        rect: record.region,
+        color,
+        label: `${record.lane_index + 1}${band}: n.d.`,
+        proteinId: protein.id,
+        // A click there places a first-band box in that lane.
+        laneIndex: record.band_index === 0 ? record.lane_index : null,
       });
     }
   }
@@ -417,7 +600,7 @@ function renderView(project) {
       }
       view.setImage(bitmap, image.width, image.height);
       state.shownImageId = image.id;
-      view.setOverlay(boxes, ghosts, state.boxId);
+      view.setOverlay(boxes, ghosts, state.boxId, marks);
     })
     .catch(report);
 }
@@ -431,22 +614,41 @@ const LANE_QUESTIONS = {
   lane_out_of_range: "This position lies outside the declared lanes.",
 };
 
-async function placeBox(x, y, options, laneIndex = null, proteinId = state.proteinId) {
+// A box of `proteinId` at the image point: grown from the band there, or of the
+// protein's size (`options.grow`); in `laneIndex`, or in the lane the server
+// proposes from the position.
+async function placeBox(x, y, options, laneIndex, proteinId) {
   if (!proteinId) {
-    showStatus("Choose a protein on this image first.");
+    const image = state.project.images.find((i) => i.id === state.imageId);
+    showStatus(
+      image && image.kind === "visible_marker"
+        ? "This is a marker image: boxes are placed on signal images."
+        : "Add a protein to this image first (Proteins on this image).",
+    );
     return;
   }
   const { grow, clientX, clientY } = options;
   const body = { protein_id: proteinId, x, y, lane_index: laneIndex, grow };
+  const opened = shownOpening();
   try {
     const answer = await call("POST", "/api/boxes", body);
-    showStatus(""); // not selected, so the next click places the next box
-    applyProject(answer.project);
+    applyAnswer(answer, { choose: { proteinId } }); // it stays the click target
+    if (sameOpening(answer)) {
+      showStatus(""); // not selected, so the next click places the next box
+    }
   } catch (error) {
+    if (opened !== shownOpening()) {
+      return; // about the project shown before: its lanes are not the ones shown now
+    }
     const why = LANE_QUESTIONS[error.code];
     if (why && laneIndex === null) {
       const retry = (lane) => placeBox(x, y, options, lane, proteinId);
       askLane(why, proteinId, retry, clientX, clientY);
+    } else if (error.code === "no_band_found") {
+      showStatus(
+        "No band found where you clicked. Click on a band, or Shift+click to place a box" +
+          " of the protein's box size.",
+      );
     } else {
       report(error);
     }
@@ -504,7 +706,7 @@ $("polarity").addEventListener("change", (event) => {
 });
 $("remove-image").addEventListener("click", () => {
   const image = state.project.images.find((i) => i.id === state.imageId);
-  if (image && window.confirm(`Remove ${image.original_name} and its boxes?`)) {
+  if (image && window.confirm(`Remove ${isolate(image.original_name)} and its boxes?`)) {
     edit("DELETE", `/api/images/${image.id}`).catch(() => {});
   }
 });
@@ -520,18 +722,35 @@ $("import-file").addEventListener("change", async (event) => {
     kind: $("import-kind").value,
     polarity: $("import-polarity").value, // chosen before the file input is enabled
   });
-  showStatus(`Importing ${file.name}…`);
+  const membrane = $("import-membrane").value;
+  if (membrane) {
+    query.set("membrane_id", membrane);
+  }
+  const opened = shownOpening();
+  showStatus(`Importing ${isolate(file.name)}…`);
   try {
     const response = await request("POST", `/api/images?${query}`, {
       body: file,
       contentType: "application/octet-stream",
     });
     const answer = await response.json();
-    state.imageId = answer.image_id;
-    showStatus("");
-    applyProject(answer.project);
+    applyAnswer(answer, { choose: { imageId: answer.image_id, boxId: null } });
+    const image = answer.project.images.find((i) => i.id === answer.image_id);
+    const name = isolate(image ? image.original_name : file.name);
+    if (!sameOpening(answer)) {
+      // The import went into the project open when it started, not the one shown.
+      showStatus(`${name} was imported into ${isolate(answer.project.name)}, which is not open now.`);
+      return;
+    }
+    // Each import starts a new membrane unless the user chooses otherwise for it.
+    $("import-membrane").value = "";
+    // What the import found about the file, until it is dismissed by the next action.
+    const found = image ? image.warnings.map((warning) => warning.message) : [];
+    showStatus(found.length ? `Imported ${name}. ${found.join(" ")}` : "");
   } catch (error) {
-    report(error);
+    if (opened === shownOpening()) {
+      report(error);
+    }
   }
 });
 
@@ -606,7 +825,7 @@ async function start() {
     $("quit").hidden = false;
     showStatus("");
     if (listing.open) {
-      applyProject((await call("GET", "/api/project")).project);
+      applyAnswer(await call("GET", "/api/project"));
     } else {
       await showProjects();
     }

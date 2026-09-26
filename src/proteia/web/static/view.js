@@ -17,8 +17,11 @@ function inside(rect, x, y) {
 }
 
 export class ImageView {
-  // handlers: place(x, y, {grow, clientX, clientY}), move(boxId, rect),
-  // select(boxId or null).
+  // handlers: place(x, y, {grow, clientX, clientY, proteinId, laneIndex}),
+  // move(boxId, rect), select(boxId or null). A click on the membrane grows a
+  // box from the band under it and Shift+click drops a box of the protein's
+  // size; inside a lane's placeholder or n.d. mark, the click names its protein
+  // and lane (otherwise both are null).
   constructor(canvas, handlers) {
     this.canvas = canvas;
     this.context = canvas.getContext("2d");
@@ -30,7 +33,8 @@ export class ImageView {
     this.offsetX = 0; // the image point at the canvas's top-left corner
     this.offsetY = 0;
     this.boxes = []; // {id, rect, color, label, clipped}
-    this.ghosts = []; // {rect, color, label}: declared lanes without a box
+    this.ghosts = []; // {rect, color, label, proteinId, laneIndex}: lanes without a box
+    this.marks = []; // {rect, color, label, proteinId, laneIndex}: not-detected records
     this.selectedId = null;
     this.gesture = null;
     this.bindEvents();
@@ -50,9 +54,10 @@ export class ImageView {
     this.draw();
   }
 
-  setOverlay(boxes, ghosts, selectedId) {
+  setOverlay(boxes, ghosts, selectedId, marks = []) {
     this.boxes = boxes;
     this.ghosts = ghosts;
+    this.marks = marks;
     this.selectedId = selectedId;
     this.draw();
   }
@@ -128,6 +133,9 @@ export class ImageView {
     for (const ghost of this.ghosts) {
       this.drawRect(ghost.rect, ghost.color, { dashed: true, label: ghost.label });
     }
+    for (const mark of this.marks) {
+      this.drawRect(mark.rect, mark.color, { dotted: true, label: mark.label });
+    }
     const moving = this.gesture && this.gesture.kind === "move" ? this.gesture : null;
     for (const box of this.boxes) {
       let rect = box.rect;
@@ -146,7 +154,11 @@ export class ImageView {
     return [(x - this.offsetX) * this.scale, (y - this.offsetY) * this.scale];
   }
 
-  drawRect(rect, color, { dashed = false, selected = false, label = "", clipped = false }) {
+  drawRect(
+    rect,
+    color,
+    { dashed = false, dotted = false, selected = false, label = "", clipped = false },
+  ) {
     const ctx = this.context;
     const [x0, y0] = this.toScreen(rect[0], rect[1]);
     const [x1, y1] = this.toScreen(rect[2], rect[3]);
@@ -158,8 +170,15 @@ export class ImageView {
     }
     ctx.lineWidth = selected ? 3 : 2;
     ctx.strokeStyle = color;
-    ctx.setLineDash(dashed ? [5, 4] : []);
+    ctx.setLineDash(dashed ? [5, 4] : dotted ? [2, 3] : []);
     ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    if (dotted) {
+      // A not-detected mark: a light wash sets it apart from a lane's placeholder.
+      ctx.globalAlpha = 0.15;
+      ctx.fillStyle = color;
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.globalAlpha = 1;
+    }
     if (clipped) {
       // A filled corner: over-exposure reads without relying on colour alone.
       ctx.fillStyle = color;
@@ -188,6 +207,19 @@ export class ImageView {
     for (let i = this.boxes.length - 1; i >= 0; i -= 1) {
       if (inside(this.boxes[i].rect, point.x, point.y)) {
         return this.boxes[i];
+      }
+    }
+    return null;
+  }
+
+  // The protein and lane under a point: a lane's placeholder, or an n.d. mark
+  // of a first band; null elsewhere.
+  laneAt(point) {
+    const shapes = [...this.ghosts, ...this.marks];
+    for (let i = shapes.length - 1; i >= 0; i -= 1) {
+      const shape = shapes[i];
+      if (shape.laneIndex !== null && inside(shape.rect, point.x, point.y)) {
+        return { proteinId: shape.proteinId, laneIndex: shape.laneIndex };
       }
     }
     return null;
@@ -268,10 +300,13 @@ export class ImageView {
         if (this.selectedId !== null) {
           this.handlers.select(null); // a click away from a selected box only deselects
         } else if (x >= 0 && y >= 0 && x < this.width && y < this.height) {
+          const lane = this.laneAt(g.start);
           this.handlers.place(x, y, {
-            grow: event.shiftKey,
+            grow: !event.shiftKey,
             clientX: event.clientX,
             clientY: event.clientY,
+            proteinId: lane ? lane.proteinId : null,
+            laneIndex: lane ? lane.laneIndex : null,
           });
         } else {
           this.handlers.select(null);

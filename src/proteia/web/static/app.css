@@ -8,10 +8,24 @@
   --muted: color-mix(in srgb, CanvasText 60%, Canvas);
   --chosen: color-mix(in srgb, Highlight 22%, Canvas);
   --stage: #2b2b2b;
+  --warn: #9a5b00;
+  --error: #c2185b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --warn: #f0b429;
+    --error: #ff6b9f;
+  }
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* An element with its own display rule still hides. */
+[hidden] {
+  display: none !important;
 }
 
 html,
@@ -43,9 +57,31 @@ button,
   cursor: pointer;
 }
 
-.button-like.disabled {
+.button-like.disabled,
+button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.button-like {
+  position: relative;
+}
+
+/* Out of sight but focusable: the label shows it, and shows its focus. */
+.file-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  clip-path: inset(50%);
+}
+
+.button-like:has(.file-input:focus-visible) {
+  outline: 2px solid Highlight;
+  outline-offset: 2px;
 }
 
 .bar {
@@ -86,7 +122,7 @@ button,
 .workspace {
   flex: 1;
   display: grid;
-  grid-template-columns: 18rem 1fr;
+  grid-template-columns: 20rem 1fr;
   min-height: 0;
 }
 
@@ -126,6 +162,31 @@ button,
   font-weight: 600;
 }
 
+.choice-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.role {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 400;
+}
+
+/* On a button the muted colour is too faint (ButtonFace is mid-grey in the
+   dark theme): the button's own text colour, set apart by size and weight. */
+.choices button .role {
+  color: inherit;
+}
+
+.tag {
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  background: var(--chosen);
+  font-size: 0.8rem;
+}
+
 .swatch {
   flex: none;
   width: 0.8rem;
@@ -140,17 +201,153 @@ button,
   margin: 0.4rem 0;
 }
 
+/* A select as wide as its longest option (a long file name) stays in the panel. */
+.field select,
+.field input {
+  min-width: 0;
+}
+
+/* Long unbroken names (file names, protein names) wrap rather than widen the
+   panel or the page. */
+.status,
+.view-hint,
+.lane-picker p,
+.project-name,
+.panel p,
+.panel li,
+.check .choice-text {
+  overflow-wrap: anywhere;
+}
+
+.project-name {
+  min-width: 0;
+}
+
+.group {
+  min-width: 0;
+  margin: 0.5rem 0;
+  padding: 0.3rem 0.6rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.group legend {
+  padding: 0 0.3rem;
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.loading-controls {
+  min-width: 0;
+  margin: 0.4rem 0;
+  padding: 0;
+  border: 0;
+}
+
+.loading-controls legend {
+  margin-bottom: 0.2rem;
+  padding: 0;
+  color: inherit;
+}
+
+.note {
+  margin: 0.2rem 0 0;
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+  margin: 0.3rem 0;
+}
+
+.check input {
+  margin: 0.15rem 0 0;
+}
+
+.check .swatch {
+  margin-top: 0.25rem;
+}
+
+.note.warning {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.box-size {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0.4rem 0;
+}
+
+.box-size-label {
+  flex-basis: 100%;
+}
+
+.box-size input {
+  width: 4.5rem;
+}
+
+.subhead {
+  margin: 0.5rem 0 0.2rem;
+}
+
+.undetected-list {
+  margin: 0 0 0.4rem;
+  padding: 0;
+  list-style: none;
+}
+
+.undetected-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-bottom: 0.2rem;
+}
+
+.undetected-list button {
+  flex: none;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.15rem 0.6rem;
+  margin: 0 0 0.4rem;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .notices {
   margin: 0;
   padding-left: 1.1rem;
 }
 
-.notices .clipped {
-  color: #c2185b;
+.notices li {
+  margin-bottom: 0.25rem;
 }
 
+.notices .warning::marker {
+  color: var(--warn);
+}
+
+.notices .info,
 .notices .missing,
-.notices .warning {
+.notices .ok {
   color: var(--muted);
 }
 
@@ -167,6 +364,24 @@ button,
   height: 100%;
   cursor: crosshair;
   touch-action: none;
+}
+
+.view-hint {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.75rem;
+  max-width: calc(100% - 1.5rem);
+  margin: 0;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #ffffff;
+  font-size: 0.85rem;
+  pointer-events: none; /* the view under it takes the clicks */
+}
+
+.hint-target {
+  font-weight: 600;
 }
 
 .view-tools {
@@ -208,6 +423,10 @@ button,
   border-radius: 8px;
 }
 
+.projects-dialog[aria-busy="true"] button {
+  cursor: progress;
+}
+
 .new-project {
   display: flex;
   align-items: flex-end;
@@ -219,5 +438,9 @@ button,
 }
 
 .error {
-  color: #c2185b;
+  color: var(--error);
+}
+
+.group .error {
+  margin: 0.3rem 0 0;
 }

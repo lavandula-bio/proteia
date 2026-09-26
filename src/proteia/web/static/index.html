@@ -5,6 +5,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+<!-- No icon to fetch: /favicon.ico is not part of the page shell, so it would need the token. -->
+<link rel="icon" href="data:,">
 <title>Proteia</title>
 <link rel="stylesheet" href="/static/app.css">
 <script type="module" src="/static/app.js"></script>
@@ -27,24 +29,8 @@
     <section>
       <h2>Images</h2>
       <ul id="images" class="choices"></ul>
-      <label class="field">Import as
-        <select id="import-kind">
-          <option value="chemiluminescence">Chemiluminescence</option>
-          <option value="visible_marker">Marker (visible light)</option>
-          <option value="merged">Merged</option>
-        </select>
-      </label>
-      <label class="field">Bands in the new image are
-        <select id="import-polarity">
-          <option value="" selected disabled>choose…</option>
-          <option value="dark_on_light">dark on a light background</option>
-          <option value="light_on_dark">light on a dark background</option>
-        </select>
-      </label>
-      <label id="import-button" class="button-like disabled">Import image…
-        <input id="import-file" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" hidden disabled>
-      </label>
       <div id="image-controls" hidden>
+        <ul id="image-warnings" class="notices"></ul>
         <label class="field">Bands are
           <select id="polarity">
             <option value="dark_on_light">dark on a light background</option>
@@ -53,18 +39,95 @@
         </label>
         <button id="remove-image" type="button">Remove this image</button>
       </div>
+      <fieldset class="group">
+        <legend>Import an image</legend>
+        <label class="field">Import as
+          <select id="import-kind">
+            <option value="chemiluminescence">Chemiluminescence</option>
+            <option value="visible_marker">Marker (visible light)</option>
+            <option value="merged">Merged</option>
+          </select>
+        </label>
+        <label class="field">Membrane
+          <select id="import-membrane">
+            <option value="">New membrane</option>
+          </select>
+        </label>
+        <label class="field">Bands in the new image are
+          <select id="import-polarity">
+            <option value="" selected disabled>choose…</option>
+            <option value="dark_on_light">dark on a light background</option>
+            <option value="light_on_dark">light on a dark background</option>
+          </select>
+        </label>
+        <!-- The input stays focusable: Tab reaches it, Enter or Space opens the file chooser. -->
+        <label id="import-button" class="button-like disabled">Import image…
+          <input id="import-file" class="file-input" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" disabled>
+        </label>
+      </fieldset>
     </section>
 
     <section>
       <h2>Proteins on this image</h2>
       <ul id="proteins" class="choices"></ul>
-      <p class="hint">Click the image to place a box of the chosen protein;
-        Shift+click to grow it from a band.</p>
+      <button id="add-protein-open" type="button" aria-controls="add-protein">+ Add protein</button>
+      <p id="add-protein-hint" class="hint" hidden></p>
+      <form id="add-protein" class="group" hidden>
+        <label class="field">Name
+          <input id="add-protein-name" type="text" required autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">Role
+          <select id="add-protein-role">
+            <option value="target">Target</option>
+            <option value="loading control">Loading control</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button type="submit">Add</button>
+          <button id="add-protein-cancel" type="button">Cancel</button>
+        </div>
+        <p id="add-protein-error" class="error" role="alert"></p>
+      </form>
+      <div id="protein-editor" class="group" hidden>
+        <label class="field">Name
+          <input id="protein-name" type="text" required autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">Role
+          <select id="protein-role">
+            <option value="target">Target</option>
+            <option value="loading control">Loading control</option>
+          </select>
+        </label>
+        <fieldset id="loading-controls" class="loading-controls">
+          <legend>Loading control</legend>
+          <div id="loading-choices"></div>
+          <p id="loading-hint" class="note"></p>
+        </fieldset>
+        <form id="box-size" class="box-size">
+          <span class="box-size-label">Box size (pixels)</span>
+          <label>W <input id="box-width" type="number" min="1" step="1" required></label>
+          <span aria-hidden="true">×</span>
+          <label>H <input id="box-height" type="number" min="1" step="1" required></label>
+          <button type="submit">Apply</button>
+        </form>
+        <div id="undetected" hidden>
+          <p class="subhead">Not detected (n.d.)</p>
+          <ul id="undetected-list" class="undetected-list"></ul>
+        </div>
+        <button id="remove-protein" type="button">Remove protein</button>
+        <!-- Moved next to the part of the editor a refusal is about. -->
+        <p id="protein-error" class="error" role="alert" hidden></p>
+      </div>
     </section>
 
     <section id="box-panel" hidden>
       <h2>Selected box</h2>
       <p id="box-summary"></p>
+      <dl class="facts">
+        <dt>Over-exposed</dt><dd id="box-clipped"></dd>
+        <dt>Net</dt><dd id="box-net"></dd>
+        <dt>Placed by</dt><dd id="box-source"></dd>
+      </dl>
       <label class="field">Lane
         <select id="box-lane"></select>
       </label>
@@ -79,6 +142,7 @@
 
   <section class="stage">
     <canvas id="view" class="view"></canvas>
+    <p id="view-hint" class="view-hint" hidden></p>
     <div class="view-tools">
       <button id="zoom-in" type="button" title="Zoom in (+)">+</button>
       <button id="zoom-out" type="button" title="Zoom out (−)">−</button>
@@ -102,6 +166,7 @@
     </label>
     <button type="submit">Create</button>
   </form>
+  <p id="projects-state" class="hint" role="status" hidden></p>
   <p id="projects-error" class="error" role="alert"></p>
   <button id="projects-close" type="button">Close</button>
 </dialog>
