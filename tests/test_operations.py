@@ -27,7 +27,14 @@ import numpy as np
 import pytest
 
 import proteia
-from conftest import FakeClock, make_project, synthetic_blot, write_image_files, write_tiff
+from conftest import (
+    FakeClock,
+    make_project,
+    make_project_with_undetected,
+    synthetic_blot,
+    write_image_files,
+    write_tiff,
+)
 from proteia.core import boxes, record, results, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
@@ -40,7 +47,10 @@ from proteia.core.model import (
     Polarity,
     Project,
     ProposalSource,
+    Region,
     Role,
+    UndetectedBand,
+    UndetectedReason,
     UnknownIdError,
     apply_change,
     revalidate,
@@ -151,10 +161,13 @@ def assert_nets_current(session: ProjectSession) -> None:
             assert band.clipped is clipped, band.id
 
 
-def open_sample(tmp_path: Path, hook=save_to_folder) -> ProjectSession:
-    """The conftest sample project saved with stand-in image files, then opened."""
+def open_sample(
+    tmp_path: Path, hook=save_to_folder, project: Project | None = None
+) -> ProjectSession:
+    """The conftest sample project (or ``project``) saved with stand-in image
+    files, then opened."""
     folder = tmp_path / FOLDER
-    project = make_project()
+    project = make_project() if project is None else project
     write_image_files(folder, project)
     storage.save_project(project, folder)
     return ops.open_project(folder, autosave=hook, clock=FakeClock())
@@ -473,6 +486,18 @@ REFUSALS = [
         ErrorCode.LOADING_CONTROL_IN_USE,
         id="loading-control-in-use",
     ),
+    pytest.param(
+        None,
+        lambda s, ids: ops.remove_undetected(s, ids["target"], 3),
+        ErrorCode.LANE_OUT_OF_RANGE,
+        id="remove-undetected-lane-out-of-range",
+    ),
+    pytest.param(
+        None,
+        lambda s, ids: ops.remove_undetected(s, "prot-999", 0),
+        None,
+        id="remove-undetected-unknown-protein",
+    ),
 ]
 
 
@@ -511,6 +536,7 @@ def test_no_op_logs_nothing(tmp_path):
     ops.set_polarity(s, ids["image"], DARK)
     ops.edit_protein(s, ids["target"], name=" β-catenin ")  # the stored name, once cleaned
     ops.set_reference_condition(s, None)  # no reference is set
+    ops.remove_undetected(s, ids["target"], 2)  # no record there
     assert s.project is before
     assert len(s.project.log) == len(before.log)
     assert recorder.actions == []
@@ -1729,6 +1755,7 @@ LOGGED_STEPS = [
                 {"index": 2, "condition": "10 µM", "sample": "a2", "included": False},
             ],
             "reference_condition": None,
+            "dropped_undetected": [],
         },
     ),
     (
@@ -1745,6 +1772,7 @@ LOGGED_STEPS = [
                 {"index": 2, "condition": f"10 {MICRO}M", "sample": "a2", "included": True}
             ],
             "reference_condition": "vehicle",
+            "dropped_undetected": [],
         },
     ),
     (
@@ -1833,6 +1861,7 @@ LOGGED_STEPS = [
             "lane_proposed": False,
             "rect": _rect_of(s, "band-9"),
             "box_size": _size_of(s, "prot-4"),  # the first seed click sets it
+            "replaced_undetected": None,
         },
     ),
     (
@@ -1848,6 +1877,7 @@ LOGGED_STEPS = [
             "lane_proposed": False,
             "rect": _rect_of(s, "band-10"),
             "box_size": _size_of(s, "prot-4"),  # grown by the wide band
+            "replaced_undetected": None,
         },
     ),
     (
@@ -1863,6 +1893,7 @@ LOGGED_STEPS = [
             "lane_proposed": True,
             "rect": list(boxes.centered_rect(150, ROW, protein_of(s, "prot-4").box_size, W, H)),
             "box_size": _size_of(s, "prot-4"),
+            "replaced_undetected": None,
         },
     ),
     (
@@ -1881,7 +1912,7 @@ LOGGED_STEPS = [
     (
         lambda s: ops.set_polarity(s, "img-1", LIGHT),
         "set_polarity",
-        lambda s: {"image_id": "img-1", "polarity": "light_on_dark"},
+        lambda s: {"image_id": "img-1", "polarity": "light_on_dark", "dropped_undetected": []},
     ),
     (
         lambda s: ops.remove_box(s, "band-10"),
@@ -1891,7 +1922,13 @@ LOGGED_STEPS = [
     (
         lambda s: ops.set_box_lane(s, "band-11", 1),  # into the lane band-10 left
         "set_box_lane",
-        lambda s: {"band_id": "band-11", "protein_id": "prot-4", "from_lane": 2, "lane_index": 1},
+        lambda s: {
+            "band_id": "band-11",
+            "protein_id": "prot-4",
+            "from_lane": 2,
+            "lane_index": 1,
+            "replaced_undetected": None,
+        },
     ),
     (
         lambda s: ops.remove_image(s, "img-1"),
@@ -2192,3 +2229,297 @@ def test_compute_takes_the_raw_error_type_and_method(tmp_path):
     s = _parity_session(tmp_path, _blot(), DARK)
     raw = ops.compute(s, error_type="SEM", method="representative")
     assert raw == ops.compute(s, error_type=ErrorType.SEM, method=ReduceMethod.REPRESENTATIVE)
+
+
+# --- #51: not-detected records ---
+
+
+def _record(
+    lane: int,
+    *,
+    band_index: int = 0,
+    snr: float = 1.5,
+    region: tuple[int, int, int, int] = (60, 20, 80, 40),
+) -> UndetectedBand:
+    """A not-detected record from row-box detection (the blot is 160x60)."""
+    x0, y0, x1, y1 = region
+    return UndetectedBand(
+        lane_index=lane,
+        band_index=band_index,
+        reason=UndetectedReason.BELOW_DETECTION_LIMIT,
+        snr=snr,
+        threshold=6.0,
+        region=Region(x0=x0, y0=y0, x1=x1, y1=y1),
+        source=ProposalSource.ROW_BOX,
+    )
+
+
+def plant_records(
+    session: ProjectSession, protein_id: str, *records: UndetectedBand, bands: int = 1
+) -> None:
+    """Store records no operation writes yet (the row commit is #51's next step);
+    ``bands`` is the protein's expected band count."""
+
+    def change(draft: Project) -> None:
+        protein = draft.batch.find_protein(protein_id)
+        protein.expected_band_count = bands
+        protein.undetected.extend(records)
+
+    plant(session, change)
+
+
+def _record_json(protein_id: str, u: UndetectedBand) -> dict:
+    """A record as a log entry names it."""
+    return {
+        "protein_id": protein_id,
+        "lane_index": u.lane_index,
+        "band_index": u.band_index,
+        "reason": "below_detection_limit",
+        "snr": u.snr,
+        "threshold": u.threshold,
+        "region": list(u.region.rect()),
+        "source": u.source.value,
+    }
+
+
+def _keys(session: ProjectSession, protein_id: str) -> list[tuple[int, int]]:
+    return [(u.lane_index, u.band_index) for u in protein_of(session, protein_id).undetected]
+
+
+def test_place_box_replaces_the_record_in_its_lane(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    lane_1, lane_1_band_1, lane_2 = _record(1), _record(1, band_index=1), _record(2, snr=-0.5)
+    plant_records(s, protein, lane_1, lane_1_band_1, lane_2, bands=2)
+    length = len(s.project.log)
+
+    band = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    assert band_of(s, band).lane_index == 1
+    assert _keys(s, protein) == [(1, 1), (2, 0)]  # only band index 0 in lane 1
+    assert len(s.project.log) == length + 1  # one entry: the box and the dropped record
+    entry = s.project.log[-1]
+    assert entry.action == "place_box"
+    assert entry.params["replaced_undetected"] == _record_json(protein, lane_1)
+    assert entry.content_hash == content_hash(s.project)
+
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert s.project.log[-1].params["replaced_undetected"] is None  # no record there
+    assert _keys(s, protein) == [(1, 1), (2, 0)]
+    [column] = ops.compute(s).proteins
+    assert column.detected == [True, True, False]
+
+
+def test_set_box_lane_replaces_the_record_of_its_new_lane(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    a = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    lane_2 = _record(2)
+    plant_records(s, protein, lane_2)
+
+    ops.set_box_lane(s, a, 2)
+    assert _keys(s, protein) == []  # and lane 0, which the box left, gets no record
+    assert s.project.log[-1].params == {
+        "band_id": a,
+        "protein_id": protein,
+        "from_lane": 0,
+        "lane_index": 2,
+        "replaced_undetected": _record_json(protein, lane_2),
+    }
+    ops.set_box_lane(s, a, 1)
+    assert s.project.log[-1].params["replaced_undetected"] is None
+    [column] = ops.compute(s).proteins
+    assert column.detected == [None, True, None]
+
+
+def test_set_box_lane_replaces_only_the_record_of_the_moved_band(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    a = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    plant_records(s, protein, _record(2), bands=2)
+    # The box becomes the second band's (#58 stores them; a loaded file may hold one).
+    plant(s, lambda draft: setattr(draft.batch.find_band(a)[1], "band_index", 1))
+
+    ops.set_box_lane(s, a, 2)
+    assert _keys(s, protein) == [(2, 0)]  # the first band's record stays
+    assert s.project.log[-1].params["replaced_undetected"] is None
+
+    lane_1_band_1 = _record(1, band_index=1)
+    plant_records(s, protein, _record(1), lane_1_band_1, bands=2)
+    ops.set_box_lane(s, a, 1)
+    assert _keys(s, protein) == [(1, 0), (2, 0)]
+    assert s.project.log[-1].params["replaced_undetected"] == _record_json(protein, lane_1_band_1)
+
+
+def test_set_polarity_drops_the_records_on_that_image(tmp_path):
+    s = session_on(tmp_path)
+    first = import_blot(s, blot(), "chemi α.tif")
+    second = import_blot(s, blot(), "chemi β.tif")
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    beta = ops.add_protein(s, "β-catenin", Role.TARGET, first)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, first)  # records only, no box
+    tubulin = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, second)
+    ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
+    beta_records = [_record(2, snr=-0.5), _record(1)]
+    gapdh_record = _record(0, snr=3.0)
+    plant_records(s, beta, *beta_records)
+    plant_records(s, gapdh, gapdh_record)
+    plant_records(s, tubulin, _record(2))
+    kept = protein_of(s, tubulin).undetected
+
+    ops.set_polarity(s, first, LIGHT)
+    assert (_keys(s, beta), _keys(s, gapdh)) == ([], [])
+    assert protein_of(s, tubulin).undetected == kept  # another image's records stay
+    assert s.project.log[-1].params == {
+        "image_id": first,
+        "polarity": "light_on_dark",
+        # Protein order, then lane order.
+        "dropped_undetected": [
+            _record_json(beta, beta_records[1]),
+            _record_json(beta, beta_records[0]),
+            _record_json(gapdh, gapdh_record),
+        ],
+    }
+    ops.set_polarity(s, first, DARK)
+    assert s.project.log[-1].params["dropped_undetected"] == []
+    assert_nets_current(s)
+
+
+def test_set_polarity_drops_the_records_on_an_image_without_boxes(tmp_path):
+    # No protein holds a box on the image, so no net is recomputed; the records
+    # still go, since their SNR was measured with the other signal direction.
+    s, image, beta = boxed(tmp_path)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    beta_record, gapdh_record = _record(1), _record(2, snr=-0.5)
+    plant_records(s, beta, beta_record)
+    plant_records(s, gapdh, gapdh_record)
+    length = len(s.project.log)
+
+    ops.set_polarity(s, image, LIGHT)
+    assert (_keys(s, beta), _keys(s, gapdh)) == ([], [])
+    assert len(s.project.log) == length + 1
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "set_polarity",
+        {
+            "image_id": image,
+            "polarity": "light_on_dark",
+            "dropped_undetected": [
+                _record_json(beta, beta_record),
+                _record_json(gapdh, gapdh_record),
+            ],
+        },
+    )
+    assert entry.content_hash == content_hash(s.project)
+
+
+def test_set_lanes_drops_the_records_of_the_lanes_it_cuts(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    four = [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM"), LaneInput("100 µM")]
+    ops.set_lanes(s, four)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
+    last = ops.place_box(s, protein, 140, ROW, lane_index=3, grow=False)
+    lane_1, lane_2 = _record(1), _record(2, snr=-1.0)
+    plant_records(s, protein, lane_2, lane_1)
+
+    # Boxes still block, and a refusal leaves the records as they were.
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.set_lanes(s, four[:2])
+    assert (info.value.code, info.value.ids) == (ErrorCode.LANES_IN_USE, (last,))
+    assert s.project is before
+
+    ops.remove_box(s, last)
+    update = ops.set_lanes(s, four[:2])
+    assert update == LanesUpdate(
+        respelled=(), reference_cleared=False, dropped_undetected=((protein, 2, 0),)
+    )
+    assert _keys(s, protein) == [(1, 0)]  # a kept lane keeps its record
+    params = s.project.log[-1].params
+    assert (params["lane_count"], params["dropped_undetected"]) == (
+        2,
+        [_record_json(protein, lane_2)],
+    )
+
+    update = ops.set_lanes(s, four[:3])  # the table grows: nothing to drop
+    assert update.dropped_undetected == ()
+    assert s.project.log[-1].params["dropped_undetected"] == []
+    assert _keys(s, protein) == [(1, 0)]
+
+
+def test_remove_undetected(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    lane_1, lane_0_band_1 = _record(1), _record(0, band_index=1)
+    plant_records(s, protein, lane_1, lane_0_band_1, bands=2)
+
+    ops.remove_undetected(s, protein, 1)
+    assert _keys(s, protein) == [(0, 1)]
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "remove_undetected",
+        {
+            "protein_id": protein,
+            "lane_index": 1,
+            "band_index": 0,
+            "removed": _record_json(protein, lane_1),
+        },
+    )
+    [column] = ops.compute(s).proteins
+    assert column.detected == [True, None, None]  # the lane is now "not measured"
+
+    committed = s.project
+    ops.remove_undetected(s, protein, 1)  # nothing there any more: a no-op
+    ops.remove_undetected(s, protein, 0)  # band index 0 of lane 0 is a band, not a record
+    assert s.project is committed
+
+    ops.remove_undetected(s, protein, 0, band_index=1)
+    assert _keys(s, protein) == []
+    assert s.project.log[-1].params["removed"] == _record_json(protein, lane_0_band_1)
+
+    committed = s.project
+    for lane, band_index, code in [
+        (3, 0, ErrorCode.LANE_OUT_OF_RANGE),
+        (-1, 0, ErrorCode.LANE_OUT_OF_RANGE),
+        ("1", 0, ErrorCode.INVALID_INPUT),
+        (1, -1, ErrorCode.INVALID_INPUT),
+        (1, True, ErrorCode.INVALID_INPUT),
+    ]:
+        with pytest.raises(OperationError) as info:
+            ops.remove_undetected(s, protein, lane, band_index=band_index)
+        assert info.value.code is code, (lane, band_index)
+    with pytest.raises(UnknownIdError):
+        ops.remove_undetected(s, "prot-999", 0)
+    assert s.project is committed
+
+
+def test_remove_box_leaves_the_lane_not_measured(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    plant_records(s, protein, _record(1))
+    band = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)  # replaces it
+    ops.remove_box(s, band)
+    assert _keys(s, protein) == []  # no record is created, and the old one does not return
+    assert s.project.log[-1].params == {"band_id": band, "protein_id": protein, "lane_index": 1}
+    [column] = ops.compute(s).proteins
+    assert column.detected == [None, None, None]
+
+
+def test_move_and_resize_keep_the_records(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    band = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    plant_records(s, protein, _record(2))
+    kept = protein_of(s, protein).undetected
+    ops.move_box(s, band, (30, 22, 50, 38))
+    ops.set_box_size(s, protein, BoxSize(width=12, height=6))
+    ops.edit_protein(s, protein, name="β-catenin (E-5)", expected_mw=92)
+    assert protein_of(s, protein).undetected == kept
+
+
+def test_removals_take_the_records_along(tmp_path):
+    s = open_sample(tmp_path, project=make_project_with_undetected())
+    assert _keys(s, "prot-9") == [(2, 0), (3, 0)]
+    cascade = ops.remove_protein(s, "prot-9")  # GAPDH: records only in lanes 2 and 3
+    assert cascade.removed == ("prot-9", "band-17", "band-18")  # records have no ids
+    assert s.project.log[-1].params == {"protein_id": "prot-9", **_listed(cascade)}
+    cascade = ops.remove_image(s, "img-2")  # β-catenin, with its lane-2 record
+    assert cascade.removed == ("img-2", "prot-7", "band-10", "band-11", "band-12")
+    assert all(not p.undetected for p in s.project.batch.proteins)
+    saved = (s.folder / storage.PROJECT_FILE).read_bytes()
+    assert b'"undetected"' not in saved  # an empty list is never written
+    assert load_project(s.folder) == s.project

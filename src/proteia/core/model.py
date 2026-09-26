@@ -8,10 +8,13 @@ Hierarchy. A :class:`Project` holds one :class:`Batch` (one run): its lane table
 the reference condition, its membranes and its proteins. A :class:`Membrane` is one
 physical blot: its images (chemiluminescence exposures, reprobes, the visible-light
 marker, merged overlays) and one molecular-weight calibration. A :class:`Protein`
-is one protein quantified on one image, with one :class:`Band` (box) per lane and
-expected band; a reprobe is simply another image of the same membrane. Objects
-refer to each other by stable, project-unique ids (``mem-N``, ``img-N``,
-``prot-N``, ``band-N``) and to lanes by index, never by list position or name.
+is one protein quantified on one image: per lane and expected band, it has a
+:class:`Band` (a box), an :class:`UndetectedBand` (a detector measured the lane
+and the band stayed below its detection limit), or neither (not measured). A
+reprobe is simply another image of the same membrane. Objects refer to each
+other by stable, project-unique ids (``mem-N``, ``img-N``, ``prot-N``,
+``band-N``) and to lanes by index, never by list position or name; a
+not-detected record has no id of its own, only its protein, lane and band index.
 
 The stored numbers (each band's net, each image's background) are the raw data.
 Normalization and statistics combine several proteins downstream in
@@ -149,12 +152,22 @@ class Polarity(StrEnum):
 
 
 class ProposalSource(StrEnum):
-    """How a band's box was placed."""
+    """How a band's box was placed, or which detector wrote a not-detected record."""
 
     CLICK = "click"  # seed click grown by grow.grow_box
     ROW_BOX = "row_box"  # detection inside a dragged row box (#51)
     MW_GUIDED = "mw_guided"  # detection inside the row the calibration predicts (#58)
     MANUAL = "manual"  # placed or drawn by the user with no detection
+
+
+# The sources that run a detector over a lane slot, so they alone can find nothing there.
+DETECTING_SOURCES: Final = frozenset({ProposalSource.ROW_BOX, ProposalSource.MW_GUIDED})
+
+
+class UndetectedReason(StrEnum):
+    """Why a lane holds a not-detected record."""
+
+    BELOW_DETECTION_LIMIT = "below_detection_limit"  # a detector measured the slot: snr < threshold
 
 
 class CalibrationPointSource(StrEnum):
@@ -222,6 +235,24 @@ class Box(_Model):
 
     def rect(self, size: BoxSize) -> Rect:
         return self.x, self.y, self.x + size.width, self.y + size.height
+
+
+class Region(_Model):
+    """An axis-aligned rectangle in image pixels, half-open on the high edge."""
+
+    x0: int = Field(ge=0)
+    y0: int = Field(ge=0)
+    x1: int = Field(gt=0)
+    y1: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _check_not_empty(self) -> Region:
+        if self.x1 <= self.x0 or self.y1 <= self.y0:
+            raise ValueError("a region must have a positive width and height")
+        return self
+
+    def rect(self) -> Rect:
+        return self.x0, self.y0, self.x1, self.y1
 
 
 # --- Images and the molecular-weight calibration ---
@@ -344,12 +375,49 @@ class Band(_Model):
     manually_edited: bool = False  # moved or edited by the user after it was proposed
 
 
+class UndetectedBand(_Model):
+    """An expected band a detector looked for in one lane and did not find: the
+    lane was measured, and the band is below the detection limit.
+
+    It carries no value, so statistics leave the lane out as they do a lane with
+    no box; results and exports can still tell "not measured" from "below the
+    detection limit". ``threshold`` is the limit in force when the record was
+    written, so each record backs its own claim. The detector's window comes from
+    code constants, not from the protein's box size, so a size change never makes
+    ``snr`` stale.
+    """
+
+    lane_index: int = Field(ge=0)  # index into Batch.lanes, as for a band
+    band_index: int = Field(default=0, ge=0)  # which expected band
+    reason: UndetectedReason
+    snr: Finite  # the detector's statistic for this slot; any sign
+    threshold: Annotated[Finite, Field(gt=0)]  # the detection limit it was compared with
+    region: Region  # the slot the detector measured, in the protein's image
+    source: ProposalSource  # one of DETECTING_SOURCES
+
+    @model_validator(mode="after")
+    def _check_measurement(self) -> UndetectedBand:
+        if self.source not in DETECTING_SOURCES:
+            detectors = " or ".join(sorted(source.value for source in DETECTING_SOURCES))
+            raise ValueError(
+                f"a not-detected record comes from a detector ({detectors}),"
+                f" not {self.source.value!r}"
+            )
+        if not self.snr < self.threshold:
+            raise ValueError(
+                f"a not-detected record's snr {self.snr} is not below its threshold"
+                f" {self.threshold}"
+            )
+        return self
+
+
 class Protein(_Model):
     """One protein quantified on one image (the successor of ``Analysis``).
 
     Every band shares ``box_size``, the effective size that was quantified. A
     target normalizes against ``loading_control_ids``; an empty list means the
-    batch's single loading control.
+    batch's single loading control. Each (lane, band index) holds a band, a
+    not-detected record, or neither; a record only ever concerns an expected band.
     """
 
     id: ProteinId
@@ -362,6 +430,9 @@ class Protein(_Model):
     mw_tolerance: Annotated[Finite, Field(gt=0, lt=1)] = 0.10  # relative: 0.10 = ±10%
     box_size: BoxSize
     bands: list[Band] = Field(default_factory=list)
+    # Left out of the saved form when empty, so a project without records keeps its
+    # bytes and hash. Do not "normalize" this: see "Canonical form" in storage.
+    undetected: list[UndetectedBand] = Field(default_factory=list, exclude_if=lambda v: not v)
 
     @model_validator(mode="after")
     def _check_bands_and_loading_controls(self) -> Protein:
@@ -388,6 +459,30 @@ class Protein(_Model):
             raise ValueError(f"protein {self.id}: a loading control is listed twice")
         if self.id in ids:
             raise ValueError(f"protein {self.id}: a protein cannot be its own loading control")
+        return self
+
+    @model_validator(mode="after")
+    def _check_undetected(self) -> Protein:
+        # Record order carries no meaning either: sorted like the bands.
+        self.undetected.sort(key=lambda record: (record.lane_index, record.band_index))
+        for a, b in itertools.pairwise(self.undetected):
+            if (a.lane_index, a.band_index) == (b.lane_index, b.band_index):
+                raise ValueError(
+                    f"protein {self.id}: two not-detected records in lane {a.lane_index}"
+                    f" with band index {a.band_index}"
+                )
+        held = {(band.lane_index, band.band_index) for band in self.bands}
+        for record in self.undetected:
+            if (record.lane_index, record.band_index) in held:
+                raise ValueError(
+                    f"protein {self.id}: lane {record.lane_index} has both a band and a"
+                    f" not-detected record for band index {record.band_index}"
+                )
+            if record.band_index >= self.expected_band_count:
+                raise ValueError(
+                    f"protein {self.id}: a not-detected record for band index"
+                    f" {record.band_index}, but {self.expected_band_count} band(s) are expected"
+                )
         return self
 
 
@@ -503,6 +598,18 @@ class Batch(_Model):
                         f"protein {protein.id}: box of {band.id}"
                         f" extends beyond the bounds of image {image.id}"
                     )
+            for record in protein.undetected:
+                if record.lane_index >= len(self.lanes):
+                    raise ValueError(
+                        f"protein {protein.id}: a not-detected record references"
+                        f" unknown lane index {record.lane_index}"
+                    )
+                region = record.region
+                if region.x1 > image.width or region.y1 > image.height:
+                    raise ValueError(
+                        f"protein {protein.id}: the not-detected region in lane"
+                        f" {record.lane_index} extends beyond the bounds of image {image.id}"
+                    )
         return self
 
 
@@ -516,7 +623,8 @@ class Project(_Model):
     log: tuple[LogEntry, ...] = ()  # history, oldest first; excluded from the content hash
 
     def iter_ids(self) -> Iterator[str]:
-        """Every object id: membranes, images, proteins, bands."""
+        """Every object id: membranes, images, proteins, bands (not-detected records
+        have none)."""
         batch = self.batch
         yield from (membrane.id for membrane in batch.membranes)
         yield from (image.id for image in batch.iter_images())

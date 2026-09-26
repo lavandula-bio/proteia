@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from conftest import image_bytes, make_project, write_image_files
+from conftest import image_bytes, make_project, make_project_with_undetected, write_image_files
 from proteia.core import storage
 from proteia.core.model import (
     SCHEMA_VERSION,
@@ -25,6 +25,7 @@ from proteia.core.model import (
     LogEntry,
     Polarity,
     Project,
+    ProposalSource,
     apply_change,
     revalidate,
 )
@@ -37,8 +38,10 @@ from proteia.core.storage import (
     ProjectFormatError,
     SchemaVersionError,
     canonical_json,
+    content_document,
     content_hash,
     document_bytes,
+    document_hash,
     image_path,
     load_project,
     migrate,
@@ -226,6 +229,100 @@ def test_content_hash_changes_with_content(change):
     project = make_project()
     changed, _ = apply_change(project, change)
     assert content_hash(changed) != content_hash(project)
+
+
+# --- Not-detected records in the saved form ---
+
+
+def test_content_hash_with_records_is_pinned():
+    """The content hash of the sample project with not-detected records: the records
+    are content. Regenerate it on the same terms as the pinned hash above."""
+    assert content_hash(make_project_with_undetected()) == (
+        "805e1f12d680a4466887a9f53e52e6405dc960ebde5334ea94b0bda7719389b4"
+    )
+
+
+def test_records_round_trip_and_resave_byte_identically(tmp_path):
+    project = make_project_with_undetected()
+    first = _saved(tmp_path / "a", project)
+    data = first.read_bytes()
+    assert data.count(b'"undetected"') == 2  # β-catenin and GAPDH; α-tubulin has none
+    assert b'"below_detection_limit"' in data
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)
+    second = _saved(tmp_path / "b", loaded)
+    assert second.read_bytes() == data
+
+
+def test_an_empty_record_list_is_never_written():
+    project = make_project()
+    doc = _doc(project)
+    assert all("undetected" not in protein for protein in doc["batch"]["proteins"])
+    for protein in doc["batch"]["proteins"]:
+        protein["undetected"] = []  # a hand-edited file: loads, and is saved without it
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)
+    assert project_to_json(loaded) == project_to_json(project)
+    # Writing the empty list would have moved the hash of every existing project.
+    written = {key: value for key, value in doc.items() if key not in HASH_EXCLUDE}
+    assert document_hash(written) != content_hash(project)
+    assert content_document(loaded) == content_document(project)
+
+
+def _gapdh_records(p: Project) -> list:
+    return p.batch.find_protein("prot-9").undetected
+
+
+def _swap_record_lanes(p: Project) -> None:
+    lane_2, lane_3 = _gapdh_records(p)
+    lane_2.lane_index, lane_3.lane_index = 3, 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(_swap_record_lanes, id="lane_index"),
+        pytest.param(
+            lambda p: setattr(p.batch.find_protein("prot-7").undetected[0], "band_index", 1),
+            id="band_index",
+        ),
+        pytest.param(
+            lambda p: setattr(
+                _gapdh_records(p)[0], "snr", math.nextafter(_gapdh_records(p)[0].snr, 0)
+            ),
+            id="snr-one-ulp",
+        ),
+        pytest.param(lambda p: setattr(_gapdh_records(p)[0], "threshold", 7.0), id="threshold"),
+        pytest.param(lambda p: setattr(_gapdh_records(p)[0].region, "x0", 99), id="region"),
+        pytest.param(
+            lambda p: setattr(_gapdh_records(p)[0], "source", ProposalSource.MW_GUIDED),
+            id="source",
+        ),
+        pytest.param(lambda p: _gapdh_records(p).pop(), id="removed"),
+    ],
+)
+def test_content_hash_changes_with_any_record_field(change):
+    # Two bands expected for β-catenin, so its record may move to band index 1.
+    project, _ = apply_change(
+        make_project_with_undetected(),
+        lambda p: setattr(p.batch.find_protein("prot-7"), "expected_band_count", 2),
+    )
+    changed, _ = apply_change(project, change)
+    assert content_hash(changed) != content_hash(project)
+
+
+def test_record_order_does_not_change_the_hash():
+    doc = make_project_with_undetected().model_dump()
+    # A second band's record in β-catenin's lane 2: order within a lane counts too.
+    beta = doc["batch"]["proteins"][0]
+    beta["expected_band_count"] = 2
+    beta["undetected"].append({**beta["undetected"][0], "band_index": 1})
+    project = Project.model_validate(doc)
+    for protein in doc["batch"]["proteins"]:
+        protein.get("undetected", []).reverse()
+    assert content_hash(Project.model_validate(doc)) == content_hash(project)
 
 
 # --- The action log in project.json ---

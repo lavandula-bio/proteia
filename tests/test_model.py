@@ -13,9 +13,10 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from conftest import make_project
+from conftest import make_project, make_project_with_undetected
 from proteia.core import analyze, model
 from proteia.core.model import (
+    DETECTING_SOURCES,
     SCHEMA_VERSION,
     Band,
     Batch,
@@ -30,8 +31,12 @@ from proteia.core.model import (
     Membrane,
     Polarity,
     Project,
+    ProposalSource,
     Protein,
+    Region,
     Role,
+    UndetectedBand,
+    UndetectedReason,
     UnknownIdError,
     apply_change,
     format_timestamp,
@@ -645,3 +650,223 @@ def test_apply_change_shares_the_log(project):
     with pytest.raises(RuntimeError, match="must not edit the log"):
         apply_change(project, rewrite_history)
     assert project == snapshot
+
+
+# --- Not-detected records ---
+
+
+def _record(**fields) -> dict:
+    """A valid not-detected record as project.json holds it: β-catenin's lane 2,
+    which has no band, on img-2 (340x150); ``fields`` replace its values."""
+    return {
+        "lane_index": 2,
+        "reason": "below_detection_limit",
+        "snr": 2.5,
+        "threshold": 6.0,
+        "region": {"x0": 98, "y0": 36, "x1": 128, "y1": 64},
+        "source": "row_box",
+        **fields,
+    }
+
+
+def _with_records(*records: dict, **protein_fields) -> Project:
+    """The sample project with β-catenin's records (and fields) set, validated."""
+    doc = make_project().model_dump(mode="json")
+    doc["batch"]["proteins"][0].update(undetected=list(records), **protein_fields)
+    return Project.model_validate(doc)
+
+
+def test_a_not_detected_record_is_accepted():
+    project = _with_records(_record(snr=-3.5))  # the statistic may have any sign
+    [record] = project.batch.find_protein("prot-7").undetected
+    assert record == UndetectedBand(
+        lane_index=2,
+        band_index=0,
+        reason=UndetectedReason.BELOW_DETECTION_LIMIT,
+        snr=-3.5,
+        threshold=6.0,
+        region=Region(x0=98, y0=36, x1=128, y1=64),
+        source=ProposalSource.ROW_BOX,
+    )
+    assert record.region.rect() == (98, 36, 128, 64)
+    assert UndetectedReason.BELOW_DETECTION_LIMIT.value == "below_detection_limit"
+    assert DETECTING_SOURCES == {ProposalSource.ROW_BOX, ProposalSource.MW_GUIDED}
+    # Records have no ids: the id set and next_id are the sample project's.
+    assert list(project.iter_ids()) == list(make_project().iter_ids())
+    assert project.next_id == 19
+    assert revalidate(project) == project
+
+
+def test_records_are_canonically_ordered():
+    project = make_project_with_undetected()  # GAPDH's records given as lanes 3, 2
+    keys = [(u.lane_index, u.band_index) for u in project.batch.find_protein("prot-9").undetected]
+    assert keys == [(2, 0), (3, 0)]
+    doc = project.model_dump()
+    doc["batch"]["proteins"][2]["undetected"].reverse()
+    assert Project.model_validate(doc) == project
+    # Within a lane, by band index.
+    given = [_record(band_index=1), _record(band_index=0)]
+    two_bands = _with_records(*given, expected_band_count=2)
+    keys = [(u.lane_index, u.band_index) for u in two_bands.batch.find_protein("prot-7").undetected]
+    assert keys == [(2, 0), (2, 1)]
+    assert _with_records(*reversed(given), expected_band_count=2) == two_bands
+
+
+def test_a_duplicate_record_is_found_between_other_bands_records():
+    # Sorted by lane, then band index, the two band-0 records of lane 2 meet.
+    with pytest.raises(
+        ValidationError, match="two not-detected records in lane 2 with band index 0"
+    ):
+        _with_records(_record(), _record(band_index=1), _record(snr=1.0), expected_band_count=2)
+
+
+@pytest.mark.parametrize(
+    "region",
+    [
+        pytest.param({"x0": 310, "y0": 36, "x1": 340, "y1": 64}, id="right-edge"),
+        pytest.param({"x0": 98, "y0": 120, "x1": 128, "y1": 150}, id="bottom-edge"),
+    ],
+)
+def test_a_region_may_end_at_the_image_edge(region):
+    # Regions are half-open, so x1 == width and y1 == height (img-2 is 340x150) fit.
+    project = _with_records(_record(region=region))
+    [record] = project.batch.find_protein("prot-7").undetected
+    assert record.region.rect() == tuple(region.values())
+    assert Project.model_validate_json(project.model_dump_json()) == project
+
+
+def test_negative_zero_snr_stored_as_positive_zero():
+    [record] = _with_records(_record(snr=-0.0)).batch.find_protein("prot-7").undetected
+    assert math.copysign(1, record.snr) == 1
+
+
+@pytest.mark.parametrize(
+    ("records", "match"),
+    [
+        pytest.param(
+            [_record(lane_index=0)],
+            "lane 0 has both a band and a not-detected record for band index 0",
+            id="lane-with-a-band",
+        ),
+        pytest.param(
+            [_record(), _record(snr=1.0)],
+            "two not-detected records in lane 2 with band index 0",
+            id="duplicate-key",
+        ),
+        pytest.param([_record(lane_index=4)], "unknown lane index 4", id="unknown-lane"),
+        pytest.param([_record(lane_index=-1)], "greater than or equal to 0", id="negative-lane"),
+        pytest.param(
+            [_record(band_index=1)],
+            "band index 1, but 1 band\\(s\\) are expected",
+            id="band-index-not-expected",
+        ),
+        pytest.param([_record(band_index=-1)], "greater than or equal to 0", id="negative-band"),
+        pytest.param(
+            [_record(region={"x0": 320, "y0": 36, "x1": 341, "y1": 64})],
+            "extends beyond the bounds of image img-2",
+            id="region-beyond-width",
+        ),
+        pytest.param(
+            [_record(region={"x0": 98, "y0": 140, "x1": 128, "y1": 151})],
+            "extends beyond the bounds of image img-2",
+            id="region-beyond-height",
+        ),
+        pytest.param(
+            [_record(region={"x0": 98, "y0": 36, "x1": 98, "y1": 64})],
+            "positive width and height",
+            id="region-no-width",
+        ),
+        pytest.param(
+            [_record(region={"x0": 98, "y0": 64, "x1": 128, "y1": 36})],
+            "positive width and height",
+            id="region-upside-down",
+        ),
+        pytest.param(
+            [_record(region={"x0": -1, "y0": 36, "x1": 128, "y1": 64})],
+            "greater than or equal to 0",
+            id="region-negative",
+        ),
+        pytest.param([_record(source="click")], "comes from a detector", id="click"),
+        pytest.param([_record(source="manual")], "comes from a detector", id="manual"),
+        pytest.param([_record(snr=6.0)], "is not below its threshold", id="snr-at-threshold"),
+        pytest.param([_record(snr=9.5)], "is not below its threshold", id="snr-above-threshold"),
+        pytest.param([_record(threshold=0.0, snr=-1.0)], "greater than 0", id="threshold-0"),
+        pytest.param(
+            [_record(threshold=-2.0, snr=-3.0)], "greater than 0", id="threshold-negative"
+        ),
+        pytest.param([_record(snr=math.nan)], "finite number", id="nan-snr"),
+        pytest.param([_record(snr=-math.inf)], "finite number", id="inf-snr"),
+        pytest.param([_record(threshold=math.inf)], "finite number", id="inf-threshold"),
+        pytest.param([_record(reason="absent")], "below_detection_limit", id="unknown-reason"),
+        pytest.param([_record(net=0.0)], "Extra inputs are not permitted", id="unknown-key"),
+        pytest.param(
+            [_record(region={"x0": 98, "y0": 36, "x1": 128, "y1": 64, "w": 30})],
+            "Extra inputs are not permitted",
+            id="unknown-region-key",
+        ),
+    ],
+)
+def test_not_detected_record_rules(records, match):
+    with pytest.raises(ValidationError, match=match):
+        _with_records(*records)
+
+
+def test_a_band_one_record_may_sit_beside_a_band_zero_box():
+    # Lane 0 holds band-10 (band index 0); two bands are expected.
+    project = _with_records(_record(lane_index=0, band_index=1), expected_band_count=2)
+    [record] = project.batch.find_protein("prot-7").undetected
+    assert (record.lane_index, record.band_index) == (0, 1)
+    # A record for the second band also refuses a band in its place.
+    with pytest.raises(ValidationError, match="lane 0 has both a band"):
+        _edit(project, "band-11", lane_index=0, band_index=1)
+        revalidate(project)
+
+
+def test_placing_a_band_where_a_record_is_needs_the_record_dropped():
+    project = _with_records(_record())
+
+    def place_in_lane_2(draft: Project) -> None:
+        draft.batch.find_protein("prot-7").bands.append(
+            Band(
+                id=draft.new_id("band"), lane_index=2, box=Box(x=98, y=43), net=1.0, source="manual"
+            )
+        )
+
+    with pytest.raises(ValidationError, match="lane 2 has both a band"):
+        apply_change(project, place_in_lane_2)
+
+    def place_and_drop(draft: Project) -> None:
+        place_in_lane_2(draft)
+        draft.batch.find_protein("prot-7").undetected.clear()
+
+    placed, _ = apply_change(project, place_and_drop)
+    assert placed.batch.find_protein("prot-7").undetected == []
+
+
+def test_dumps_leave_out_an_empty_record_list():
+    assert (
+        Protein(
+            id="prot-1",
+            name="p53",
+            role=Role.TARGET,
+            image_id="img-2",
+            box_size=BoxSize(width=4, height=4),
+        ).undetected
+        == []
+    )
+    for mode in ("python", "json"):
+        proteins = make_project().model_dump(mode=mode)["batch"]["proteins"]
+        assert ["undetected" in protein for protein in proteins] == [False, False, False]
+        proteins = make_project_with_undetected().model_dump(mode=mode)["batch"]["proteins"]
+        assert ["undetected" in protein for protein in proteins] == [True, False, True]
+    assert proteins[0]["undetected"] == [
+        {
+            "lane_index": 2,
+            "band_index": 0,
+            "reason": "below_detection_limit",
+            "snr": 2.5,
+            "threshold": 6.0,
+            "region": {"x0": 98, "y0": 36, "x1": 128, "y1": 64},
+            "source": "row_box",
+        }
+    ]
