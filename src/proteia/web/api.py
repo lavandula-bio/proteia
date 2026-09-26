@@ -2,8 +2,11 @@
 """The HTTP routes: thin adapters over the project operations (ADR 0002).
 
 Every edit goes through :mod:`proteia.core.operations` and answers with the
-whole project state (:func:`~proteia.web.state.project_state`), so the browser
-redraws from what the server stored. One project is open at a time.
+whole project state (:func:`~proteia.web.state.project_state`) and its results
+(:func:`~proteia.web.results_view.results_payload`), both from one snapshot
+(:func:`~proteia.core.operations.compute_view`), so the browser redraws the
+image, the table and the charts from what the server stored. Creating, opening
+and reading the project answer the same way. One project is open at a time.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -13,10 +16,13 @@ the routes cannot read.
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 import threading
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final
 
@@ -27,11 +33,15 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
 from proteia.core import operations as ops
+from proteia.core.analyze import ReduceMethod
 from proteia.core.model import BoxSize, UnknownIdError
+from proteia.core.plotspec import ErrorType
+from proteia.core.results import Results
 from proteia.core.session import Clock, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
 from proteia.web import projects
-from proteia.web.state import preview_png, project_state
+from proteia.web.results_view import results_payload
+from proteia.web.state import preview_png, project_state, revision
 
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
@@ -50,11 +60,30 @@ class UploadTooLargeError(ValueError):
     """An upload longer than :data:`MAX_UPLOAD_BYTES`."""
 
 
+@dataclass(frozen=True)
+class ResultSettings:
+    """How the results are computed: the keyword arguments of
+    :func:`~proteia.core.operations.compute_view`. The defaults until the web UI
+    can choose them."""
+
+    plot_conditions: tuple[str, ...] | None = None
+    error_type: ErrorType = ErrorType.SD
+    method: ReduceMethod = ReduceMethod.MEAN
+
+
+_ResultsKey = tuple[int, int, ResultSettings]  # open id, revision, settings
+
+
 class Workspace:
     """The server's state: the projects root and the one open project.
 
     A request keeps the session it started with: a project switch while it runs
     does not redirect it (one user, one tab, so this only matters in a race).
+    Every create or open gives the new session the next open id, so answers
+    about different openings never compare equal, even at the same revision.
+    The results of the open project's latest revision computed so far are kept
+    (with the open id, the revision and the settings they belong to), since
+    reading them again is common and computing them is not cheap.
     """
 
     def __init__(
@@ -63,9 +92,16 @@ class Workspace:
         self.root = root
         self.reveal = reveal
         self.clock = clock
-        self._lock = threading.Lock()  # guards the open session and the previews
+        # Guards the open session, the open ids, the settings, the previews and the
+        # results; never held while computing.
+        self._lock = threading.Lock()
         self._switching = threading.Lock()  # one switch at a time; never held by readers
         self._session: ProjectSession | None = None
+        self._open_id = 0  # the open id of the latest create or open
+        # Each session's open id, for as long as a request still holds that session.
+        self._open_ids: weakref.WeakKeyDictionary[ProjectSession, int] = weakref.WeakKeyDictionary()
+        self._settings = ResultSettings()
+        self._results: tuple[_ResultsKey, Results] | None = None
         self._previews: OrderedDict[tuple[str, str], bytes] = OrderedDict()
 
     def current(self) -> ProjectSession:
@@ -108,7 +144,10 @@ class Workspace:
             session = make()
             with self._lock:
                 self._session = session
+                self._open_id += 1
+                self._open_ids[session] = self._open_id
                 self._previews.clear()
+                self._results = None
             return session
 
     def create(self, name: object) -> ProjectSession:
@@ -116,6 +155,35 @@ class Workspace:
 
     def open(self, name: object) -> ProjectSession:
         return self._switch(lambda: projects.open_named(self.root, name, clock=self.clock))
+
+    def view(self, session: ProjectSession) -> tuple[int, ops.ComputedView]:
+        """``session``'s open id, and its committed project with the results of
+        it (:func:`~proteia.core.operations.compute_view`). The kept results are
+        reused while the open id, the revision and the settings match; the
+        computation itself runs outside the lock, and its results are kept only
+        while ``session`` is still the open one and no later revision's results
+        are kept."""
+        with self._lock:
+            open_id, settings = self._open_ids[session], self._settings
+            kept = self._results
+        project = session.project
+        if kept is not None and kept[0] == (open_id, revision(project), settings):
+            return open_id, ops.ComputedView(project, kept[1])
+        view = ops.compute_view(session, **dataclasses.asdict(settings))
+        key = (open_id, revision(view.project), settings)
+        with self._lock:
+            if open_id == self._open_id and not self._keeps_later(key):
+                self._results = (key, view.results)
+        return open_id, view
+
+    def _keeps_later(self, key: _ResultsKey) -> bool:
+        """Whether the kept results are of a later revision than ``key``, with the
+        same open id and settings: results that finished late never replace them.
+        Called with the lock held."""
+        if self._results is None:
+            return False
+        open_id, kept_revision, settings = self._results[0]
+        return (open_id, settings) == (key[0], key[2]) and kept_revision > key[1]
 
     def preview(self, session: ProjectSession, image_id: str) -> bytes:
         """The image's preview PNG, kept for the last few images shown."""
@@ -197,8 +265,15 @@ def _workspace(request: Request) -> Workspace:
 WorkspaceDep = Annotated[Workspace, Depends(_workspace)]
 
 
-def _answer(session: ProjectSession, **extra: Any) -> dict[str, Any]:
-    return {**extra, "project": project_state(session.folder.name, session)}
+def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
+    """A route's answer: ``extra``, then the project state and its results, both
+    from one snapshot of ``session``."""
+    open_id, view = workspace.view(session)
+    return {
+        **extra,
+        "project": project_state(session.folder.name, session, view.project, open_id=open_id),
+        "results": results_payload(view.results, open_id=open_id, revision=revision(view.project)),
+    }
 
 
 router = APIRouter(prefix="/api")
@@ -218,17 +293,17 @@ def list_projects(workspace: WorkspaceDep) -> dict[str, Any]:
 
 @router.post("/projects", status_code=201)
 def create_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace.create(body.name))
+    return _answer(workspace, workspace.create(body.name))
 
 
 @router.post("/projects/open")
 def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace.open(body.name))
+    return _answer(workspace, workspace.open(body.name))
 
 
 @router.get("/project")
 def get_project(workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace.current())
+    return _answer(workspace, workspace.current())
 
 
 @router.post("/project/reveal", status_code=204)
@@ -279,21 +354,22 @@ async def import_image(
                 max_bytes=MAX_UPLOAD_BYTES,
             )
         )
-    return _answer(session, image_id=image_id)
+    # Computing the results takes a while: off the event loop, like the import.
+    return await run_in_threadpool(lambda: _answer(workspace, session, image_id=image_id))
 
 
 @router.delete("/images/{image_id}")
 def remove_image(image_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
     cascade = ops.remove_image(session, image_id)
-    return _answer(session, removed=list(cascade.removed))
+    return _answer(workspace, session, removed=list(cascade.removed))
 
 
 @router.put("/images/{image_id}/polarity")
 def set_polarity(image_id: str, body: PolarityBody, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
     ops.set_polarity(session, image_id, body.polarity)
-    return _answer(session)
+    return _answer(workspace, session)
 
 
 @router.get("/images/{image_id}/preview")
@@ -311,7 +387,10 @@ def set_lanes(body: LanesBody, workspace: WorkspaceDep) -> dict[str, Any]:
     else:
         update = ops.set_lanes(session, lanes)
     return _answer(
-        session, respelled=list(update.respelled), reference_cleared=update.reference_cleared
+        workspace,
+        session,
+        respelled=list(update.respelled),
+        reference_cleared=update.reference_cleared,
     )
 
 
@@ -330,7 +409,7 @@ def add_protein(body: ProteinBody, workspace: WorkspaceDep) -> dict[str, Any]:
         loading_control_ids=body.loading_control_ids,
         box_size=size,
     )
-    return _answer(session, protein_id=protein_id)
+    return _answer(workspace, session, protein_id=protein_id)
 
 
 @router.post("/boxes", status_code=201)
@@ -339,28 +418,28 @@ def place_box(body: PlaceBody, workspace: WorkspaceDep) -> dict[str, Any]:
     band_id = ops.place_box(
         session, body.protein_id, body.x, body.y, lane_index=body.lane_index, grow=body.grow
     )
-    return _answer(session, band_id=band_id)
+    return _answer(workspace, session, band_id=band_id)
 
 
 @router.put("/boxes/{band_id}")
 def move_box(band_id: str, body: MoveBody, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
     ops.move_box(session, band_id, body.rect)
-    return _answer(session)
+    return _answer(workspace, session)
 
 
 @router.delete("/boxes/{band_id}")
 def remove_box(band_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
     ops.remove_box(session, band_id)
-    return _answer(session)
+    return _answer(workspace, session)
 
 
 @router.put("/boxes/{band_id}/lane")
 def set_box_lane(band_id: str, body: LaneIndexBody, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
     ops.set_box_lane(session, band_id, body.lane_index)
-    return _answer(session)
+    return _answer(workspace, session)
 
 
 # --- Errors ---
