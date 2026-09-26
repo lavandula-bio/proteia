@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The HTTP routes over the project operations (#50): projects in the app-managed
 root, image upload and previews, lanes, proteins and boxes. Requests go to a real
-server on a loopback socket; every edit answers with the stored project state."""
+server on a loopback socket; every edit answers with the stored project state and
+its live results (#52), in strict JSON."""
 
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from conftest import (
     write_tiff,
 )
 from proteia.core import storage
+from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
     Project,
     ProposalSource,
@@ -35,13 +37,20 @@ from proteia.core.model import (
     UndetectedReason,
     apply_change,
 )
+from proteia.core.plotspec import ErrorType
+from proteia.core.results import compute_results
 from proteia.web import api, launch
-from proteia.web.state import project_state
+from proteia.web.results_view import results_payload
+from proteia.web.state import project_state, revision
 
 H, W = 60, 400
 ROW = 30
 LANE_X = [50, 120, 190, 260, 330]
 NAME = "β-actin 10 µM.tif"  # beta-actin 10 micro-molar
+
+
+def _not_json(constant: str) -> float:
+    raise ValueError(f"{constant} is not JSON")
 
 
 class Client:
@@ -72,10 +81,9 @@ class Client:
             kind = response.getheader("content-type", "")
         finally:
             conn.close()
-        return response.status, json.loads(payload) if kind.startswith("application/json") else (
-            kind,
-            payload,
-        )
+        if not kind.startswith("application/json"):
+            return response.status, (kind, payload)
+        return response.status, json.loads(payload, parse_constant=_not_json)  # strict JSON
 
     def ok(self, method: str, path: str, body: Any = None, **kw: Any) -> Any:
         status, payload = self.call(method, path, body, **kw)
@@ -271,7 +279,11 @@ def test_boxes_are_exchanged_in_image_pixels(client, tmp_path):
     target = [x0 + 7, y0 + 3, x1 + 7, y1 + 3]  # exactly the box size, anywhere on the image
     moved = client.ok("PUT", f"/api/boxes/{answer['band_id']}", {"rect": target})
     assert bands(moved)[answer["band_id"]]["rect"] == target
-    assert client.ok("GET", "/api/project") == {"project": moved["project"]}  # what is drawn
+    # What is drawn, and the results computed from the same snapshot.
+    assert client.ok("GET", "/api/project") == {
+        "project": moved["project"],
+        "results": moved["results"],
+    }
 
 
 def test_boxes_are_placed_relaned_and_removed_through_the_operations(client, tmp_path):
@@ -421,13 +433,17 @@ def test_records_are_drawn_and_their_lanes_are_not_missing(client, tmp_path):
 
 
 def test_the_state_lists_every_proteins_records(tmp_path):
-    project = make_project_with_undetected()
+    doc = make_project_with_undetected().model_dump(mode="json")
+    # Two loading controls, in neither id nor creation order.
+    doc["batch"]["proteins"][0]["loading_control_ids"] = ["prot-9", "prot-8"]
+    project = Project.model_validate(doc)
     folder = tmp_path / "Blot"
     write_image_files(folder, project)
     storage.save_project(project, folder)
     session = api.ops.open_project(folder, clock=FakeClock())
 
-    answer = project_state("Blot", session)
+    answer = project_state("Blot", session, session.project, open_id=4)
+    assert (answer["open_id"], answer["revision"]) == (4, 0)  # the fixture has no log
     proteins = {protein["id"]: protein for protein in answer["proteins"]}
     common = {"band_index": 0, "reason": "below_detection_limit", "threshold": 6.0}
     assert proteins["prot-7"]["undetected"] == [
@@ -453,6 +469,23 @@ def test_the_state_lists_every_proteins_records(tmp_path):
     # Every lane of each protein holds a box or a record: none is offered as missing.
     assert [protein["missing_lanes"] for protein in answer["proteins"]] == [[], [], []]
     assert json.loads(json.dumps(answer, allow_nan=False)) == answer
+    # The target's loading controls in series order, its expected MW, each box's source.
+    details = {
+        protein["id"]: (protein["loading_control_ids"], protein["expected_mw"])
+        for protein in answer["proteins"]
+    }
+    assert details == {
+        "prot-7": (["prot-9", "prot-8"], 92.0),
+        "prot-8": ([], None),
+        "prot-9": ([], None),
+    }
+    series = compute_results(session.project.batch).series
+    assert [s.loading_id for s in series] == proteins["prot-7"]["loading_control_ids"]
+    assert [(band["lane_index"], band["source"]) for band in proteins["prot-7"]["bands"]] == [
+        (0, "click"),
+        (1, "row_box"),
+        (3, "mw_guided"),
+    ]
 
 
 def test_edits_need_an_open_project(client):
@@ -514,3 +547,386 @@ def test_a_bad_box_size_is_refused_as_json(client, tmp_path, size):
     image_id, _ = ready(client, tmp_path)
     body = {"name": "GAPDH", "role": "loading control", "image_id": image_id, "box_size": size}
     assert client.refused("POST", "/api/proteins", body)[:2] == (422, "invalid_input")
+
+
+# --- Live results (#52) ---
+
+TARGET_ROW, LOADING_ROW, TWO_ROW_H = 30, 75, 100
+SIZE = [14, 10]  # every box of both proteins: the same pixels under each lane
+DOSES = ["vehicle", "vehicle", "10 µM", "10 µM", "10 µM"]  # vehicle / 10 micro-molar
+DEPTHS = (20000.0, 22000.0, 30000.0, 33000.0, 36000.0)
+
+
+def two_row_bytes(tmp_path: Path, target: tuple[float, ...], loading: tuple[float, ...]) -> bytes:
+    """A 16-bit blot with a target row and a loading-control row: one band per
+    lane in each, as dark as ``target`` and ``loading`` give per lane."""
+    rows = ((TARGET_ROW, target), (LOADING_ROW, loading))
+    spots = [
+        (x, row, 5.0, 3.0, depth)
+        for row, depths in rows
+        for x, depth in zip(LANE_X, depths, strict=True)
+    ]
+    blot = synthetic_blot((TWO_ROW_H, W), spots)
+    return write_tiff(tmp_path / "two rows.tif", blot).read_bytes()
+
+
+def live(
+    client: Client,
+    tmp_path: Path,
+    conditions: list[str],
+    *,
+    target: tuple[float, ...] = DEPTHS,
+    loading: tuple[float, ...] = (25000.0,) * 5,
+    boxed: tuple[int, ...] = (0, 1, 2, 3, 4),
+    reference: str | None = None,
+) -> tuple[str, str, dict]:
+    """A project over the two-row blot with the lanes ``conditions`` (there may
+    be more lanes than bands), α-tubulin boxed in every band's lane and
+    β-catenin in the lanes ``boxed``; (target id, loading id, the last answer)."""
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, two_row_bytes(tmp_path, target, loading))
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    lanes: dict[str, Any] = {"lanes": [{"condition": condition} for condition in conditions]}
+    if reference is not None:
+        lanes["reference_condition"] = reference
+    client.ok("PUT", "/api/lanes", lanes)
+    ids = []
+    for name, role in (("α-tubulin", "loading control"), ("β-catenin", "target")):
+        body = {"name": name, "role": role, "image_id": image_id, "box_size": SIZE}
+        ids.append(client.ok("POST", "/api/proteins", body)["protein_id"])
+    loading_id, target_id = ids
+    for protein, row, lanes_boxed in (
+        (loading_id, LOADING_ROW, range(len(LANE_X))),
+        (target_id, TARGET_ROW, boxed),
+    ):
+        for lane in lanes_boxed:
+            body = {"protein_id": protein, "x": LANE_X[lane], "y": row, "lane_index": lane}
+            answer = client.ok("POST", "/api/boxes", body)
+    return target_id, loading_id, answer
+
+
+def column(answer: dict, protein_id: str) -> dict:
+    """A protein's per-lane column of the answer's results."""
+    return next(p for p in answer["results"]["proteins"] if p["protein_id"] == protein_id)
+
+
+def only_series(answer: dict, set_index: int = 0) -> dict:
+    (series,) = answer["results"]["sets"][set_index]["series"]
+    return series
+
+
+def bar(series: dict, condition: str) -> dict:
+    return next(b for b in series["chart"]["bars"] if b["label"] == condition)
+
+
+def test_box_edits_answer_with_the_changed_net_and_chart(client, tmp_path):
+    target, _, before = live(client, tmp_path, DOSES, boxed=(0, 1, 2, 3))
+    assert column(before, target)["nets"][4] is None
+    assert bar(only_series(before), "10 µM")["n"] == 2
+
+    body = {"protein_id": target, "x": LANE_X[4], "y": TARGET_ROW, "lane_index": 4}
+    placed = client.ok("POST", "/api/boxes", body)
+    net = column(placed, target)["nets"][4]  # the net appears
+    assert net > 0 and column(placed, target)["band_ids"][4] == placed["band_id"]
+    series = only_series(placed)
+    assert series["normalized"][4] is not None
+    grown = bar(series, "10 µM")
+    assert (grown["n"], grown["lane_indices"]) == (3, [2, 3, 4])
+    assert series["chart"] != only_series(before)["chart"]
+
+    x0, y0, x1, y1 = bands(placed)[placed["band_id"]]["rect"]
+    rect = [x0 + 4, y0 + 3, x1 + 4, y1 + 3]  # off the band's centre
+    moved = client.ok("PUT", f"/api/boxes/{placed['band_id']}", {"rect": rect})
+    assert 0 < column(moved, target)["nets"][4] < net  # the net changes
+    shifted = bar(only_series(moved), "10 µM")
+    assert shifted["n"] == 3 and shifted["mean"] < grown["mean"]
+    assert shifted["points"][:2] == grown["points"][:2]
+    assert shifted["points"][2] < grown["points"][2]
+
+    removed = client.ok("DELETE", f"/api/boxes/{placed['band_id']}")
+    assert column(removed, target)["nets"][4] is None  # the net becomes null
+    assert only_series(removed)["normalized"][4] is None
+    # The boxes are those before the placement again, and so are the results.
+    assert removed["results"]["sets"] == before["results"]["sets"]
+    assert removed["results"]["revision"] == before["results"]["revision"] + 3
+
+
+def test_the_answer_equals_the_results_of_the_saved_project(client, tmp_path):
+    _, _, answer = live(client, tmp_path, DOSES, reference="vehicle")
+    results = answer["results"]
+    assert results["sets"][0]["tier"] == "fold_change"
+    saved = storage.load_project(client.root / "Blot")
+    open_id, revision = results["open_id"], results["revision"]
+    expected = results_payload(compute_results(saved.batch), open_id=open_id, revision=revision)
+    assert results == expected  # the one computation path (#42)
+    assert revision == saved.log[-1].seq == answer["project"]["revision"]
+
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+    assert reopened["results"] == {**expected, "open_id": open_id + 2}
+    assert reopened["project"]["revision"] == revision  # opening logs nothing
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
+def test_identical_values_answer_strict_json_without_a_test(client, tmp_path):
+    # Every band alike: every ratio is the same, so a t-test would divide by zero.
+    same = (30000.0,) * 5
+    _, _, answer = live(client, tmp_path, DOSES, target=same, loading=same)
+    series = only_series(answer)  # Client.call refused NaN and inf in the body
+    assert len(set(series["normalized"])) == 1
+    chart = series["chart"]
+    assert (chart["test_name"], chart["test_p"], chart["comparisons"]) == (None, None, [])
+    assert chart["test_note"].startswith("no test")
+
+
+def test_an_excluded_lane_with_a_value_gives_two_labelled_sets(client, tmp_path):
+    conditions = [*DOSES, "ladder"]  # the last lane has no box of any protein
+    _, _, answer = live(client, tmp_path, conditions)
+    (only,) = answer["results"]["sets"]
+    assert (only["id"], only["label"], only["excluded_lanes"]) == ("applied", None, [])
+
+    def excluding(*lanes: int) -> dict:
+        rows = [{"condition": c, "included": i not in lanes} for i, c in enumerate(conditions)]
+        return {"lanes": rows}
+
+    answer = client.ok("PUT", "/api/lanes", excluding(5))  # no value: nothing to show twice
+    (only,) = answer["results"]["sets"]
+    assert (only["label"], only["excluded_lanes"]) == (None, [5])
+    assert only_series(answer)["chart"]["subtitle"] is None
+
+    answer = client.ok("PUT", "/api/lanes", excluding(2, 5))
+    applied, every = answer["results"]["sets"]
+    assert [(s["id"], s["label"], s["excluded_lanes"]) for s in (applied, every)] == [
+        ("applied", "Excluding lane 3", [2, 5]),
+        ("all_lanes", "All lanes", []),
+    ]
+    for result_set in (applied, every):
+        (series,) = result_set["series"]
+        assert series["chart"]["subtitle"] == result_set["label"]
+    assert bar(applied["series"][0], "10 µM")["n"] == 2
+    assert bar(every["series"][0], "10 µM")["n"] == 3
+    lanes = answer["results"]["lanes"]  # once, as the lane table has them
+    assert [lane["included"] for lane in lanes] == [True, True, False, True, True, False]
+    # The per-lane values keep the excluded lane in both sets.
+    assert applied["series"][0]["normalized"][2] == every["series"][0]["normalized"][2] > 0
+
+    answer = client.ok("PUT", "/api/lanes", excluding())
+    assert [s["label"] for s in answer["results"]["sets"]] == [None]
+
+
+def test_an_unusable_reference_gives_no_chart_and_a_notice(client, tmp_path):
+    # No β-catenin box in the vehicle lanes: no baseline for a fold-change.
+    target, loading, answer = live(client, tmp_path, DOSES, boxed=(2, 3, 4), reference="vehicle")
+    (result_set,) = answer["results"]["sets"]
+    (series,) = result_set["series"]
+    assert (series["chart"], series["chart_url"], series["fold_change"]) == (None, None, None)
+    assert series["value_kind"] == "loading_normalized"
+    (notice,) = [n for n in result_set["notices"] if n["code"] == "reference_unusable"]
+    assert (notice["level"], notice["protein_ids"], notice["conditions"]) == (
+        "warning",
+        [target, loading],
+        ["vehicle"],
+    )
+
+
+def test_the_revision_counts_commits_and_the_open_id_counts_opens(client, tmp_path):
+    created = client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, imported = upload(client, blot_bytes(tmp_path))
+    image_id = imported["image_id"]
+    lanes = {"lanes": [{"condition": f"c{i}"} for i in range(len(LANE_X))]}
+    declared = client.ok("PUT", "/api/lanes", lanes)
+    same = client.ok("PUT", "/api/lanes", lanes)  # a no-op: no log entry
+    body = {"name": "α-tubulin", "role": "loading control", "image_id": image_id}
+    loading = client.ok("POST", "/api/proteins", body)
+    body = {
+        "name": "β-catenin",
+        "role": "target",
+        "image_id": image_id,
+        "expected_mw": 92.5,
+        "loading_control_ids": [loading["protein_id"]],
+    }
+    target = client.ok("POST", "/api/proteins", body)
+    place = {"protein_id": target["protein_id"], "y": ROW}
+    grown = client.ok(
+        "POST", "/api/boxes", {**place, "x": LANE_X[0], "lane_index": 0, "grow": True}
+    )
+    fixed = client.ok("POST", "/api/boxes", {**place, "x": LANE_X[1], "lane_index": 1})
+    answers = [created, imported, declared, same, loading, target, grown, fixed]
+    assert [a["project"]["revision"] for a in answers] == [1, 2, 3, 3, 4, 5, 6, 7]
+    assert all(a["results"]["revision"] == a["project"]["revision"] for a in answers)
+    assert {a["project"]["open_id"] for a in answers} == {1}
+    refused = client.refused("PUT", f"/api/boxes/{fixed['band_id']}/lane", {"lane_index": 0})
+    assert refused[1] == "lane_occupied"
+
+    state = client.ok("GET", "/api/project")["project"]
+    assert (state["open_id"], state["revision"]) == (1, 7)  # the refusal committed nothing
+    proteins = {protein["name"]: protein for protein in state["proteins"]}
+    assert proteins["β-catenin"]["loading_control_ids"] == [loading["protein_id"]]
+    assert proteins["β-catenin"]["expected_mw"] == 92.5
+    tubulin = proteins["α-tubulin"]
+    assert (tubulin["loading_control_ids"], tubulin["expected_mw"]) == ([], None)
+    assert [band["source"] for band in proteins["β-catenin"]["bands"]] == ["click", "manual"]
+
+    # Every create or open is a new open id, even of the project already open.
+    assert client.ok("POST", "/api/projects", {"name": "Other"})["project"]["open_id"] == 2
+    for open_id in (3, 4):
+        answer = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+        assert (answer["project"]["open_id"], answer["project"]["revision"]) == (open_id, 7)
+        assert (answer["results"]["open_id"], answer["results"]["revision"]) == (open_id, 7)
+
+
+def test_every_project_answer_carries_its_results(client, tmp_path):
+    answers = {"POST /api/projects": client.ok("POST", "/api/projects", {"name": "Blot"})}
+    answers["GET /api/project"] = client.ok("GET", "/api/project")
+    _, answers["POST /api/images"] = upload(client, blot_bytes(tmp_path))
+    image_id = answers["POST /api/images"]["image_id"]
+    _, second = upload(client, blot_bytes(tmp_path), name="second.tif")
+    answers["PUT /api/images/{image_id}/polarity"] = client.ok(
+        "PUT", f"/api/images/{image_id}/polarity", {"polarity": "light_on_dark"}
+    )
+    lanes = [{"condition": "vehicle"}, {"condition": "10 µM"}, {"condition": "10 µM"}]
+    answers["PUT /api/lanes"] = client.ok("PUT", "/api/lanes", {"lanes": lanes})
+    body = {"name": "β-catenin", "role": "target", "image_id": image_id, "box_size": SIZE}
+    answers["POST /api/proteins"] = client.ok("POST", "/api/proteins", body)
+    protein = answers["POST /api/proteins"]["protein_id"]
+    body = {"protein_id": protein, "x": LANE_X[0], "y": ROW, "lane_index": 0}
+    answers["POST /api/boxes"] = client.ok("POST", "/api/boxes", body)
+    band = answers["POST /api/boxes"]["band_id"]
+    x0, y0, x1, y1 = bands(answers["POST /api/boxes"])[band]["rect"]
+    answers["PUT /api/boxes/{band_id}"] = client.ok(
+        "PUT", f"/api/boxes/{band}", {"rect": [x0 + 2, y0, x1 + 2, y1]}
+    )
+    answers["PUT /api/boxes/{band_id}/lane"] = client.ok(
+        "PUT", f"/api/boxes/{band}/lane", {"lane_index": 1}
+    )
+    answers["DELETE /api/boxes/{band_id}"] = client.ok("DELETE", f"/api/boxes/{band}")
+    answers["DELETE /api/images/{image_id}"] = client.ok(
+        "DELETE", f"/api/images/{second['image_id']}"
+    )
+    answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+
+    revisions = []
+    for route, answer in answers.items():
+        project, results = answer["project"], answer["results"]
+        assert (results["open_id"], results["revision"]) == (
+            project["open_id"],
+            project["revision"],
+        ), route
+        assert {"lanes", "proteins", "sets", "settings"} <= set(results), route
+        revisions.append(project["revision"])
+    assert revisions == sorted(revisions)
+    # Every route that answers with the project is exercised above.
+    others = {"GET /api/projects", "POST /api/project/reveal", "GET /api/images/{image_id}/preview"}
+    routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
+    assert routes - others == set(answers)
+
+
+def _counting(monkeypatch, calls: list) -> None:
+    """Record each computation of the results: its session's folder and settings."""
+    compute_view = api.ops.compute_view
+
+    def counting(session, **settings):
+        calls.append((session.folder.name, settings))
+        return compute_view(session, **settings)
+
+    monkeypatch.setattr(api.ops, "compute_view", counting)
+
+
+def test_a_repeated_read_reuses_the_results_of_its_revision(client, monkeypatch):
+    calls: list = []
+    _counting(monkeypatch, calls)
+    created = client.ok("POST", "/api/projects", {"name": "Blot"})
+    assert client.ok("GET", "/api/project") == created
+    defaults = {"plot_conditions": None, "error_type": ErrorType.SD, "method": ReduceMethod.MEAN}
+    assert calls == [("Blot", defaults)]
+
+    lanes = {"lanes": [{"condition": "vehicle"}]}
+    client.ok("PUT", "/api/lanes", lanes)  # a new revision
+    client.ok("PUT", "/api/lanes", lanes)  # a no-op: the same revision
+    client.ok("GET", "/api/project")
+    assert len(calls) == 2
+    client.ok("POST", "/api/projects/open", {"name": "Blot"})  # the same project, opened again
+    assert len(calls) == 3
+
+
+def test_a_request_keeps_the_open_id_of_the_project_it_started_with(tmp_path, monkeypatch):
+    calls: list = []
+    _counting(monkeypatch, calls)
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    first = workspace.create("A µ")
+    second = workspace.create("B")  # a switch while a request on A still runs
+    open_id, view = workspace.view(first)
+    assert open_id == 1 and view.project is first.project
+    assert workspace.view(second)[0] == 2
+    assert workspace.view(first)[0] == 1  # A's results were not kept in place of B's
+    assert workspace.view(second)[1].project is second.project
+    assert [name for name, _ in calls] == ["A µ", "B", "A µ"]
+    assert workspace.view(workspace.open("A µ"))[0] == 3
+    # Both halves of a late answer on A carry A's open id, so a client drops it whole.
+    answer = api._answer(workspace, first)
+    assert answer["project"]["name"] == "A µ"
+    assert (answer["project"]["open_id"], answer["results"]["open_id"]) == (1, 1)
+
+
+def test_a_commit_while_the_results_are_computed_splits_no_answer(tmp_path, monkeypatch):
+    # compute_view takes no lock, so another request may commit while it runs: the
+    # answer describes the one project it computed from, and those results are not
+    # kept as the committed revision's.
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    compute_view = api.ops.compute_view
+    committed = threading.Event()
+
+    def commit_meanwhile(current, **settings):
+        view = compute_view(current, **settings)
+        if not committed.is_set():  # during the first computation only
+            lanes = [api.ops.LaneInput("vehicle"), api.ops.LaneInput("10 µM")]
+            other = threading.Thread(target=api.ops.set_lanes, args=(current, lanes))
+            other.start()
+            other.join(10)
+            committed.set()
+        return view
+
+    monkeypatch.setattr(api.ops, "compute_view", commit_meanwhile)
+    first = api._answer(workspace, session)
+    assert revision(session.project) == 2  # the commit landed
+    halves = (first["project"], first["results"])
+    assert [half["revision"] for half in halves] == [1, 1]
+    assert [half["lanes"] for half in halves] == [[], []]
+
+    second = api._answer(workspace, session)
+    halves = (second["project"], second["results"])
+    assert [half["revision"] for half in halves] == [2, 2]
+    conditions = [[lane["condition"] for lane in half["lanes"]] for half in halves]
+    assert conditions == [["vehicle", "10 µM"]] * 2
+
+
+def test_results_that_finish_late_do_not_replace_those_of_a_later_revision(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    compute_view = api.ops.compute_view
+    computed: list[int] = []  # the revision of each computation
+    paused, resume = threading.Event(), threading.Event()
+
+    def first_finishes_last(current, **settings):
+        view = compute_view(current, **settings)
+        computed.append(revision(view.project))
+        if len(computed) == 1:
+            paused.set()
+            resume.wait(10)
+        return view
+
+    monkeypatch.setattr(api.ops, "compute_view", first_finishes_last)
+    late = threading.Thread(target=workspace.view, args=(session,))  # a read of revision 1
+    late.start()
+    assert paused.wait(10)
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])  # another request: revision 2
+    assert workspace.view(session)[1].project is session.project
+    resume.set()
+    late.join(10)
+    assert not late.is_alive()
+
+    _, view = workspace.view(session)  # revision 2 again: its results were kept
+    assert computed == [1, 2]
+    assert [lane.condition for lane in view.results.lanes] == ["vehicle"]

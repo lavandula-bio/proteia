@@ -19,10 +19,11 @@ then autosaves. So an edit is all or nothing:
   is committed and the hook does not run.
 * Every committed change appends one log entry (see
   :class:`~proteia.core.model.LogEntry`); a refusal or a no-op appends none, and
-  so do :func:`compute`, :func:`export_lane_table` and :func:`save`, which change
-  no state. The params record the inputs as they took effect (cleaned text, the
-  stored spelling, the proposed lane, the snapped rect, the size used) and the
-  ids created or removed; objects are named by id, never by path or typed text.
+  so do :func:`compute_view`, :func:`compute`, :func:`export_lane_table` and
+  :func:`save`, which change no state. The params record the inputs as they
+  took effect (cleaned text, the stored spelling, the proposed lane, the
+  snapped rect, the size used) and the ids created or removed; objects are
+  named by id, never by path or typed text.
   Clients commit a drag or a cell edit once, when it ends, not on every pointer
   move or keystroke.
 
@@ -124,6 +125,7 @@ __all__ = [
     "LANE_TABLE_FILE",
     "LANE_TABLE_RECORD_FILE",
     "Cascade",
+    "ComputedView",
     "ErrorCode",
     "Keep",
     "LaneInput",
@@ -133,6 +135,7 @@ __all__ = [
     "RowPlacement",
     "add_protein",
     "compute",
+    "compute_view",
     "detect_row_boxes",
     "edit_protein",
     "export_lane_table",
@@ -1760,6 +1763,40 @@ def remove_undetected(
 # --- Results, export, save ---
 
 
+@dataclass(frozen=True)
+class ComputedView:
+    """One committed project and every result computed from it: what a client
+    shows together (the project's state, its table and its charts) comes from
+    this one snapshot."""
+
+    project: Project
+    results: Results
+
+
+def compute_view(
+    session: ProjectSession,
+    *,
+    plot_conditions: Collection[str] | None = None,
+    error_type: ErrorType | str = ErrorType.SD,
+    method: ReduceMethod | str = ReduceMethod.MEAN,
+) -> ComputedView:
+    """The committed project with every result of it
+    (:func:`~proteia.core.results.compute_results`).
+
+    Reads ``session.project`` once, so a change committed meanwhile is in neither
+    half of the view: no lock, no pixels, no autosave. ``error_type`` and
+    ``method`` may be their raw values (``"SEM"``, ``"mean"``); an unknown value
+    is refused (``INVALID_INPUT``).
+    """
+    error_type = _member(ErrorType, error_type, "error type")
+    method = _member(ReduceMethod, method, "method")
+    project = session.project
+    computed = results.compute_results(
+        project.batch, plot_conditions=plot_conditions, error_type=error_type, method=method
+    )
+    return ComputedView(project, computed)
+
+
 def compute(
     session: ProjectSession,
     *,
@@ -1767,18 +1804,10 @@ def compute(
     error_type: ErrorType | str = ErrorType.SD,
     method: ReduceMethod | str = ReduceMethod.MEAN,
 ) -> Results:
-    """Every result of the committed project (:func:`~proteia.core.results.compute_results`).
-
-    Reads the committed project once: no lock, no pixels, no autosave.
-    ``error_type`` and ``method`` may be their raw values (``"SEM"``, ``"mean"``);
-    an unknown value is refused (``INVALID_INPUT``).
-    """
-    error_type = _member(ErrorType, error_type, "error type")
-    method = _member(ReduceMethod, method, "method")
-    project = session.project
-    return results.compute_results(
-        project.batch, plot_conditions=plot_conditions, error_type=error_type, method=method
-    )
+    """Every result of the committed project: :func:`compute_view`'s results."""
+    return compute_view(
+        session, plot_conditions=plot_conditions, error_type=error_type, method=method
+    ).results
 
 
 @_locked

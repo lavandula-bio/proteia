@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the browser draws: the open project as JSON, and image previews.
 
+The state is built from one snapshot of the committed project, the one its
+results were computed from (:func:`~proteia.core.operations.compute_view`), and
+carries ``open_id`` and ``revision``: which opening of a project it belongs to
+(the workspace counts every create and open) and the ``seq`` of the project's
+last log entry (0 with an empty log). Every commit appends one entry, so within
+one opening the revision names one state, and a client can keep the newest
+answer by the pair and drop an older one that arrives late. The revision alone
+would not do: another project may be opened with a shorter log.
+
 Coordinates are image pixels: a box is ``[x0, y0, x1, y1]`` with the end
 exclusive, as :meth:`~proteia.core.model.Box.rect` gives it, so a box the browser
 draws at any zoom lands on the same pixels the server quantifies.
@@ -50,9 +59,17 @@ def _missing_lanes(
     return [{"lane_index": lane, "x": xs.get(lane), "y": y} for lane in lanes]
 
 
-def project_state(name: str, session: ProjectSession) -> dict[str, JsonValue]:
-    """The open project ``name`` as the web UI draws it."""
-    project: Project = session.project  # one snapshot for the whole answer
+def revision(project: Project) -> int:
+    """The ``seq`` of the project's last log entry; 0 with an empty log."""
+    return project.log[-1].seq if project.log else 0
+
+
+def project_state(
+    name: str, session: ProjectSession, project: Project, *, open_id: int
+) -> dict[str, JsonValue]:
+    """The open project ``name`` as the web UI draws it, from the snapshot
+    ``project`` of ``session``; ``open_id`` names this opening of it. Only the
+    save status is read from the session itself."""
     batch = project.batch
     images: list[JsonValue] = [
         {
@@ -82,6 +99,8 @@ def project_state(name: str, session: ProjectSession) -> dict[str, JsonValue]:
                 "name": protein.name,
                 "role": protein.role.value,
                 "image_id": protein.image_id,
+                "loading_control_ids": list(protein.loading_control_ids),  # the series order
+                "expected_mw": protein.expected_mw,
                 "box_size": {"width": size.width, "height": size.height},
                 "bands": [
                     {
@@ -90,6 +109,7 @@ def project_state(name: str, session: ProjectSession) -> dict[str, JsonValue]:
                         "band_index": band.band_index,
                         "rect": list(band.box.rect(size)),
                         "clipped": band.clipped,
+                        "source": band.source.value,
                         "manually_edited": band.manually_edited,
                     }
                     for band in protein.bands
@@ -111,6 +131,8 @@ def project_state(name: str, session: ProjectSession) -> dict[str, JsonValue]:
         )
     return {
         "name": name,
+        "open_id": open_id,
+        "revision": revision(project),
         "lanes": [
             {
                 "index": lane.index,
