@@ -272,9 +272,10 @@ def compute_results(
     value (a ladder, an empty lane) change nothing, so they add no second set.
     Notices the two sets share are kept only in the first. Two sets are labelled
     (see :class:`Results`); one set has no label. A chart with a plotted group
-    too small for a test (n < 2) is still drawn, with no test result, no brackets
-    and a note saying why, even when the other groups could be tested: a test
-    over only some of a chart's bars is never shown (see
+    too small for a test (n < 2) is still drawn. When at least two other groups
+    can be tested, the chart shows their test, with brackets only among them and
+    a note naming the groups left out; otherwise it has no test result, no
+    brackets, and a note saying why (see
     :func:`~proteia.core.plotspec.build_plotspec`).
 
     ``error_type`` and ``method`` may be their raw values (``"SEM"``, ``"mean"``):

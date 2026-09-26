@@ -13,6 +13,7 @@ from proteia.core.plotspec import (
     NO_P_VALUE,
     NO_VARIATION,
     NO_VARIATION_WITHIN,
+    TOO_FEW_CONDITIONS,
     ErrorType,
     ValueKind,
     build_plotspec,
@@ -215,33 +216,134 @@ def test_the_cores_note_explains_a_single_group():
     assert spec.test_note == test.note == "need >=2 groups with >=2 replicates for a test"
 
 
+def _fold_change(groups, test=None, **kwargs):
+    """The chart of ``groups``, with the core's test unless ``test`` is given."""
+    test = compare(groups) if test is None else test
+    return build_plotspec(
+        groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ("groups", "test", "tested", "note"),
+    [
+        # Welch's t over vehicle and 10 µM: p = 0.005, one bracket.
+        (
+            {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1], "50 µM": [3.0]},
+            "welch_t",
+            {"vehicle", "10 µM"},
+            "'50 µM' (n = 1) is not in the test",
+        ),
+        # ANOVA and Tukey over three of the four groups: three brackets.
+        (
+            {"ctl": [1.0, 1.1, 0.9], "A": [2.0, 2.1, 2.2], "B": [3.0, 3.2, 3.1], "C": [9.0]},
+            "anova_oneway",
+            {"ctl", "A", "B"},
+            "'C' (n = 1) is not in the test",
+        ),
+        # Two groups left out: Welch's t over β and γ, p = 0.03.
+        (
+            {"α": [1.0], "β": [2.0, 2.2], "γ": [3.0, 3.1], "δ": [4.0]},
+            "welch_t",
+            {"β", "γ"},
+            "'α', 'δ' (n = 1) are not in the test",
+        ),
+    ],
+)
+def test_a_group_of_one_beside_testable_groups_is_left_out_of_their_test(
+    groups, test, tested, note
+):
+    core = compare(groups)
+    spec = _fold_change(groups, core)
+    assert [bar.label for bar in spec.bars] == list(groups)  # every group is drawn
+    assert (spec.test_name, spec.test_p) == (test, core.p_value)  # the core's test of the rest
+    assert spec.test_note == note
+    brackets = [(c.group_a, c.group_b, c.p_value) for c in spec.comparisons]
+    assert brackets == [
+        (p.group_a, p.group_b, p.p_value) for p in core.pairwise if p.p_value < 0.05
+    ]
+    assert brackets and all({a, b} <= tested for a, b, _ in brackets)
+    assert_strict_json(spec)
+
+
+def test_brackets_pair_only_the_tested_groups():
+    # A test whose pairwise results name a group with n = 1 draws no bracket to it.
+    groups = {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1], "50 µM": [3.0]}
+    pairwise = [
+        analyze.PairwiseResult("vehicle", "10 µM", 0.01),
+        analyze.PairwiseResult("vehicle", "50 µM", 0.001),
+        analyze.PairwiseResult("10 µM", "50 µM", 0.001),
+    ]
+    spec = _fold_change(groups, analyze.TestResult("anova_oneway", 0.01, 9.0, pairwise=pairwise))
+    assert (spec.test_name, spec.test_p) == ("anova_oneway", 0.01)
+    assert [(c.group_a, c.group_b) for c in spec.comparisons] == [("vehicle", "10 µM")]
+    assert spec.test_note == "'50 µM' (n = 1) is not in the test"
+
+
+def test_groups_left_out_with_different_n_are_named_with_their_own():
+    groups = {"ctl": [1.0, 1.1], "A": [2.0, 2.1], "B": [3.0], "C": []}
+    spec = _fold_change(groups)
+    assert spec.test_name == "welch_t"
+    assert spec.test_note == "'B' (n = 1), 'C' (n = 0) are not in the test"
+
+
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
 @pytest.mark.parametrize(
     ("groups", "note"),
     [
-        # The core tests vehicle and 10 µM alone: Welch's t, p = 0.005, one bracket.
-        (
-            {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1], "50 µM": [3.0]},
-            "no test: '50 µM' has fewer than 2 replicates",
-        ),
-        # The two tested groups do not vary (p is NaN), but the chart's values do.
+        # The tested groups hold one value (p is NaN), but c's differs: "the values
+        # do not vary" would be wrong.
         (
             {"a": [1.0, 1.0], "b": [1.0, 1.0], "c": [5.0]},
-            "no test: 'c' has fewer than 2 replicates",
+            "no test: 'c' has fewer than 2 replicates,"
+            " and the values of the other conditions do not vary",
+        ),
+        # Only the tested groups' means differ (p = 0).
+        (
+            {"a": [1.0, 1.0], "b": [2.0, 2.0], "c": [5.0]},
+            "no test: 'c' has fewer than 2 replicates,"
+            " and the values within each of the other conditions do not vary",
+        ),
+        # Up to rounding: Welch's t gives p = 1e-23 alone.
+        (
+            {"a": [0.30000000000000004, 0.3], "b": [0.6, 0.6000000000000001], "c": [0.3]},
+            "no test: 'c' has fewer than 2 replicates,"
+            " and the values within each of the other conditions do not vary",
         ),
         (
-            {"α": [1.0], "β": [2.0, 2.2], "γ": [3.0, 3.1], "δ": [4.0]},
-            "no test: 'α', 'δ' have fewer than 2 replicates",
+            {"α": [1.0], "β": [2.0, 2.0], "γ": [2.0, 2.0], "δ": [4.0]},
+            "no test: 'α', 'δ' have fewer than 2 replicates,"
+            " and the values of the other conditions do not vary",
         ),
     ],
 )
-def test_a_group_of_one_beside_testable_groups_gives_no_test(groups, note):
+def test_a_group_of_one_beside_constant_tested_groups_gives_no_test(groups, note):
     test = compare(groups)
-    assert test.p_value is not None  # the core tests the other groups only
-    spec = build_plotspec(groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE)
-    assert [bar.label for bar in spec.bars] == list(groups)  # every group is drawn
+    assert test.test == "welch_t" and test.pairwise  # the core tests the others
+    spec = _fold_change(groups, test)
     assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
     assert spec.test_note == note
+    assert_strict_json(spec)
+
+
+@pytest.mark.parametrize("p", [None, math.nan, math.inf])
+def test_a_test_of_the_others_without_a_finite_p_gives_no_test(p):
+    groups = {"ctl": [1.0, 1.2], "A": [2.0, 2.3], "B": [3.0]}  # the tested values vary
+    pairwise = [analyze.PairwiseResult("ctl", "A", 0.001)]
+    spec = _fold_change(groups, analyze.TestResult("welch_t", p, p, pairwise=pairwise))
+    assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
+    assert spec.test_note == (
+        "no test: 'B' has fewer than 2 replicates,"
+        " and the test of the other conditions gives no p-value"
+    )
+
+
+def test_one_condition_never_shows_a_test():
+    # Not the core's test (it gives one condition a note and no p): the chart still
+    # shows none, since there is nothing to compare.
+    spec = _fold_change({"ctl": [1.0, 1.1]}, analyze.TestResult("welch_t", 0.01, 5.0))
+    assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
+    assert spec.test_note == TOO_FEW_CONDITIONS
 
 
 def test_subtitle_is_passed_through():
@@ -265,6 +367,25 @@ def test_render_draws_the_subtitle_as_the_second_title_line():
     assert title.split("\n") == ["test", "Excluding lanes 3, 7", without.split("\n")[1]]
 
 
+@pytest.mark.parametrize("subtitle", [None, "Excluding lane 8"])
+def test_render_draws_the_test_and_then_the_groups_it_leaves_out(subtitle):
+    groups = {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1], "50 µM": [3.0]}
+    spec = _fold_change(groups, title="test", subtitle=subtitle)
+    title = render_figure(spec).axes[0].get_title()
+    assert title.split("\n") == [
+        "test",
+        *([subtitle] if subtitle else []),
+        f"welch_t: p = {spec.test_p:.3g}",
+        "'50 µM' (n = 1) is not in the test",
+    ]
+
+
+def _test_lines(spec):
+    """The title lines a chart gives its test: the test that ran, then its note."""
+    ran = [f"{spec.test_name}: p = {spec.test_p:.3g}"] if spec.test_name else []
+    return ran + ([spec.test_note] if spec.test_note else [])
+
+
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
 @pytest.mark.parametrize(
     "groups",
@@ -272,28 +393,19 @@ def test_render_draws_the_subtitle_as_the_second_title_line():
         {"ctl": [1.0, 1.1], "A": [2.0, 2.1]},  # a test ran
         {"ctl": [1.0], "A": [2.0, 2.1]},  # a group of one
         {"ctl": [1.0, 1.0], "A": [2.0, 2.0]},  # no variation within the conditions
-        {"ctl": [1.0, 1.1], "A": [2.0, 2.1], "B": [3.0]},  # the core tests two of three
+        {"ctl": [1.0, 1.1], "A": [2.0, 2.1], "B": [3.0]},  # a test of two of three, and a note
+        {"ctl": [1.0, 1.0], "A": [2.0, 2.0], "B": [3.0]},  # two of three, but no variation
     ],
 )
 @pytest.mark.parametrize("subtitle", [None, "All lanes"])
 def test_every_chart_states_its_test_or_why_there_is_none(groups, subtitle):
-    spec = build_plotspec(
-        groups,
-        describe(groups),
-        compare(groups),
-        value_kind=ValueKind.FOLD_CHANGE,
-        title="test",
-        subtitle=subtitle,
-    )
-    if spec.test_name is None:
-        last = spec.test_note
-        assert last
-    else:
-        last = f"{spec.test_name}: p = {spec.test_p:.3g}"
+    spec = _fold_change(groups, title="test", subtitle=subtitle)
+    assert spec.test_name is not None or spec.test_note  # no test is never silent
     lines = render_figure(spec).axes[0].get_title().split("\n")
     head = ["test", *([subtitle] if subtitle else [])]
     assert lines[: len(head)] == head
-    assert " ".join(lines[len(head) :]) == last  # a long note may be broken over lines
+    # A long line may be broken over lines.
+    assert " ".join(lines[len(head) :]) == " ".join(_test_lines(spec))
 
 
 _NAPARI_TITLE = "p-ERK fold-change vs vehicle  (/GAPDH)"  # the form napari gives a chart
@@ -318,21 +430,23 @@ def _title_box_and_text(spec):
             {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1]},
             "Excluding lanes " + ", ".join(str(lane) for lane in range(1, 16)),
         ),
+        # A test of two groups, and a long note naming the two it leaves out.
+        (
+            {
+                "vehicle": [1.0, 1.1],
+                "10 µM": [2.0, 2.1],
+                "50 µM rapamycin + 10 nM bafilomycin A1": [3.0],
+                "100 µM rapamycin + 10 nM bafilomycin A1": [4.0],
+            },
+            "Excluding lanes 4, 8",
+        ),
     ],
 )
 def test_no_title_line_runs_past_the_figure_edge(groups, subtitle):
-    spec = build_plotspec(
-        groups,
-        describe(groups),
-        compare(groups),
-        value_kind=ValueKind.FOLD_CHANGE,
-        title=_NAPARI_TITLE,
-        subtitle=subtitle,
-    )
+    spec = _fold_change(groups, title=_NAPARI_TITLE, subtitle=subtitle)
     box, figure, text = _title_box_and_text(spec)
     assert 0 <= box.x0 and box.x1 <= figure.width  # a saved figure crops what lies outside
-    last = spec.test_note or f"{spec.test_name}: p = {spec.test_p:.3g}"
-    wanted = " ".join([_NAPARI_TITLE, *([subtitle] if subtitle else []), last])
+    wanted = " ".join([_NAPARI_TITLE, *([subtitle] if subtitle else []), *_test_lines(spec)])
     assert text.split() == wanted.split()  # every word is still drawn, in order
 
 

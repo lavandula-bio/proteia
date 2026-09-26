@@ -35,8 +35,9 @@ def render_figure(spec: PlotSpec) -> Figure:
     """Render the spec to a matplotlib :class:`Figure` (no global pyplot state).
 
     The title's lines: the spec's title, its subtitle (the result set) when it has
-    one, then the test and its p when a test ran, or else the spec's note on why
-    none did, so a chart never drops its test without a word. A line too wide
+    one, the test and its p when a test ran, and the spec's note when it has one:
+    why no test ran, or which groups the test that ran leaves out. So a chart
+    never drops its test, or a group from it, without a word. A line too wide
     for the figure is broken over lines (:func:`_fit_title`), so a saved figure
     never crops it.
     """
@@ -70,7 +71,7 @@ def render_figure(spec: PlotSpec) -> Figure:
         lines.append(spec.subtitle)
     if spec.test_name and spec.test_p is not None:
         lines.append(f"{spec.test_name}: p = {spec.test_p:.3g}")
-    elif spec.test_note:
+    if spec.test_note:
         lines.append(spec.test_note)
     ax.set_title("\n".join(lines))
     ax.spines[["top", "right"]].set_visible(False)

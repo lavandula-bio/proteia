@@ -778,10 +778,10 @@ def test_a_group_of_one_gives_a_chart_with_a_note_and_no_brackets():
     assert chart.test_note == "no test: '10 µM' has fewer than 2 replicates"
 
 
-def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_gives_no_test():
-    # The baseline blot with lane 8 excluded too: 50 µM keeps only b1. The core would
-    # test vehicle and 10 µM alone, a Welch's t with p < 0.05 where the ANOVA over all
-    # three conditions had none, and the chart would pass it for its own.
+def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_tests_the_other_two():
+    # The baseline blot with lane 8 excluded too: 50 µM keeps only b1. The chart
+    # shows the core's Welch's t of vehicle and 10 µM, p < 0.05 where the ANOVA over
+    # all three conditions had none, and says that 50 µM is not in it.
     baseline = _baseline_batch(REFERENCE)
     lanes = [
         lane.model_copy(update={"included": False}) if lane.index == 7 else lane
@@ -795,8 +795,12 @@ def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_gives_no_t
     chart = series.chart
     assert chart is not None
     assert [(bar.label, bar.n) for bar in chart.bars] == [(REFERENCE, 2), (LOW, 2), (HIGH, 1)]
-    assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
-    assert chart.test_note == f"no test: {HIGH!r} has fewer than 2 replicates"
+    assert (chart.test_name, chart.test_p) == ("welch_t", tested.p_value)
+    assert [(c.group_a, c.group_b, c.p_value) for c in chart.comparisons] == [
+        (REFERENCE, LOW, tested.p_value)  # the one bracket, between the tested conditions
+    ]
+    assert HIGH == "50 µM" and chart.test_note == "'50 µM' (n = 1) is not in the test"
+    assert chart.subtitle == res.label
     assert_strict_json(res)
     all_chart = res.all_lanes.series[0].chart
     assert all_chart is not None and [bar.n for bar in all_chart.bars] == [2, 3, 2]
