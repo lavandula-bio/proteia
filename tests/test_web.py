@@ -514,7 +514,8 @@ def test_the_page_shell_loads_nothing_from_the_network(running):
     _, _, body = send(running.port, "GET", "/")
     parser = _Links()
     parser.feed(body.decode("utf-8"))
-    assert parser.links == ["/static/app.css", "/static/app.js"]
+    # An empty icon: the browser asks for no /favicon.ico, which would need the token.
+    assert parser.links == ["data:,", "/static/app.css", "/static/app.js"]
     for path in server.STATIC_DIR.iterdir():
         text = path.read_text(encoding="utf-8")
         assert "://" not in text and "@import" not in text and "url(" not in text, path.name
@@ -533,4 +534,44 @@ def test_every_module_the_page_imports_is_served(running):
             assert target.startswith("/static/"), target
             if target not in seen:
                 pending.append(target)
-    assert seen == {"/static/app.js", "/static/view.js"}
+    assert seen == {
+        "/static/app.js",
+        "/static/dom.js",
+        "/static/proteins.js",
+        "/static/view.js",
+    }
+    assert {f"/static/{p.name}" for p in server.STATIC_DIR.glob("*.js")} == seen  # none unused
+
+
+def test_the_page_never_parses_text_as_markup():
+    # Names, conditions and messages go into the page as text (textContent,
+    # Option, append of strings), so none can become markup or script.
+    for path in server.STATIC_DIR.glob("*.js"):
+        text = path.read_text(encoding="utf-8")
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+            assert sink not in text, (path.name, sink)
+
+
+class _Tags(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_id: dict[str, dict[str, str | None]] = {}
+
+    def handle_starttag(self, tag, attrs):
+        fields = dict(attrs)
+        if fields.get("id"):
+            self.by_id[fields["id"]] = fields
+
+
+def test_the_import_file_input_can_take_the_keyboard_focus():
+    # Its label "Import image…" is what shows. The input itself is only out of
+    # sight (class file-input), never display:none (the hidden attribute) or out
+    # of the tab order, so Tab reaches it and Enter or Space opens the chooser.
+    parser = _Tags()
+    parser.feed((server.STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    fields = parser.by_id["import-file"]
+    assert (fields["type"], fields["class"]) == ("file", "file-input")
+    assert "hidden" not in fields and fields.get("tabindex") != "-1"
+    css = (server.STATIC_DIR / "app.css").read_text(encoding="utf-8")
+    rule = css[css.index(".file-input {") :].split("}", 1)[0]
+    assert "display" not in rule and "visibility" not in rule
