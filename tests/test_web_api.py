@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The HTTP routes over the project operations (#50): projects in the app-managed
-root, image upload and previews, lanes, proteins and boxes. Requests go to a real
-server on a loopback socket; every edit answers with the stored project state and
-its live results (#52), in strict JSON."""
+root, image upload and previews, lanes and the reference, proteins, boxes and
+not-detected records. Requests go to a real server on a loopback socket; every
+edit answers with the stored project state and its live results (#52), in strict
+JSON."""
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import io
 import json
@@ -22,6 +24,7 @@ from PIL import Image
 from conftest import (
     MEMBRANE_LEVEL,
     FakeClock,
+    make_project,
     make_project_with_undetected,
     synthetic_blot,
     write_image_files,
@@ -805,6 +808,18 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "PUT", f"/api/boxes/{band}/lane", {"lane_index": 1}
     )
     answers["DELETE /api/boxes/{band_id}"] = client.ok("DELETE", f"/api/boxes/{band}")
+    answers["PUT /api/reference"] = client.ok("PUT", "/api/reference", {"condition": "vehicle"})
+    answers["PATCH /api/proteins/{protein_id}"] = client.ok(
+        "PATCH", f"/api/proteins/{protein}", {"expected_mw": 92.5}
+    )
+    answers["PUT /api/proteins/{protein_id}/box-size"] = client.ok(
+        "PUT", f"/api/proteins/{protein}/box-size", {"width": 16, "height": 12}
+    )
+    plant_records(client, protein, _record(1), bands=1)
+    answers["DELETE /api/proteins/{protein_id}/undetected/{lane_index}"] = client.ok(
+        "DELETE", f"/api/proteins/{protein}/undetected/1"
+    )
+    answers["DELETE /api/proteins/{protein_id}"] = client.ok("DELETE", f"/api/proteins/{protein}")
     answers["DELETE /api/images/{image_id}"] = client.ok(
         "DELETE", f"/api/images/{second['image_id']}"
     )
@@ -934,3 +949,390 @@ def test_results_that_finish_late_do_not_replace_those_of_a_later_revision(tmp_p
     _, view = workspace.view(session)  # revision 2 again: its results were kept
     assert computed == [1, 2]
     assert [lane.condition for lane in view.results.lanes] == ["vehicle"]
+
+
+# --- The reference, protein edits, removals and box size (#52) ---
+
+CASCADE = [field.name for field in dataclasses.fields(api.ops.Cascade)]
+
+
+def unchanged_refusal(client: Client, method: str, path: str, body: Any = None) -> tuple[str, list]:
+    """A refusal's code and ids, checked to have changed nothing: the project, its
+    revision and its results answer as before."""
+    before = client.ok("GET", "/api/project")
+    status, code, ids = client.refused(method, path, body)
+    assert status in (404, 422), (status, code)
+    assert client.ok("GET", "/api/project") == before
+    return code, ids
+
+
+def logged(client: Client) -> list[str]:
+    """The actions in the saved log of the project "Blot"."""
+    return [entry.action for entry in storage.load_project(client.root / "Blot").log]
+
+
+def protein_of(answer: dict, protein_id: str) -> dict:
+    """A protein of the answer's project state."""
+    return next(p for p in answer["project"]["proteins"] if p["id"] == protein_id)
+
+
+def notice_codes(answer: dict) -> set[str]:
+    return {notice["code"] for s in answer["results"]["sets"] for notice in s["notices"]}
+
+
+def test_a_box_size_change_recentres_every_box_and_changes_the_nets(client, tmp_path):
+    target, loading, before = live(client, tmp_path, DOSES)
+    old = {band["id"]: band["rect"] for band in protein_of(before, target)["bands"]}
+    path = f"/api/proteins/{target}/box-size"
+    answer = client.ok("PUT", path, {"width": 20, "height": 16})
+    state = protein_of(answer, target)
+    assert state["box_size"] == {"width": 20, "height": 16}
+    assert {band["id"] for band in state["bands"]} == set(old)
+    for band in state["bands"]:
+        x0, y0, x1, y1 = band["rect"]
+        ox0, oy0, ox1, oy1 = old[band["id"]]
+        assert (x1 - x0, y1 - y0) == (20, 16)
+        assert ((x0 + x1) // 2, (y0 + y1) // 2) == ((ox0 + ox1) // 2, (oy0 + oy1) // 2)
+    # A larger box takes in more of each band's tails: every net grows, and the chart moves.
+    grown = zip(column(answer, target)["nets"], column(before, target)["nets"], strict=True)
+    assert all(new > old for new, old in grown)
+    assert column(answer, loading)["nets"] == column(before, loading)["nets"]
+    assert only_series(answer)["chart"] != only_series(before)["chart"]
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1
+    assert logged(client)[-1] == "set_box_size"
+
+    same = client.ok("PUT", path, {"width": 20, "height": 16})  # a no-op: no log entry
+    assert same == client.ok("GET", "/api/project")
+    assert same["project"]["revision"] == answer["project"]["revision"]
+    assert logged(client).count("set_box_size") == 1
+    body = {"width": 20, "height": 16}
+    assert unchanged_refusal(client, "PUT", "/api/proteins/prot-99/box-size", body) == (
+        "unknown_id",
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    ("size", "code"),
+    [
+        ({"width": 80, "height": 10}, "size_would_overlap"),  # wider than the lane pitch, 70
+        ({"width": W + 1, "height": 10}, "size_out_of_bounds"),
+        ({"width": 14, "height": TWO_ROW_H + 1}, "size_out_of_bounds"),
+    ],
+)
+def test_a_box_size_that_does_not_fit_changes_nothing(client, tmp_path, size, code):
+    target, _, _ = live(client, tmp_path, DOSES)
+    path = f"/api/proteins/{target}/box-size"
+    assert unchanged_refusal(client, "PUT", path, size) == (code, [])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"width": 0, "height": 10},
+        {"width": 20, "height": -1},
+        {"width": "20", "height": 10},  # a number as text
+        {"width": 20.0, "height": 10},
+        {"width": True, "height": 10},
+        {"width": 20},
+        {"width": 20, "height": 10, "depth": 1},  # an unknown field
+        [20, 10],  # the form POST /api/proteins takes, not this route's
+    ],
+)
+def test_a_malformed_box_size_is_refused(client, tmp_path, body):
+    _, protein = ready(client, tmp_path)
+    path = f"/api/proteins/{protein}/box-size"
+    assert unchanged_refusal(client, "PUT", path, body) == ("invalid_input", [])
+
+
+def test_a_seed_click_grows_a_box_over_the_band_and_answers_its_net(client, tmp_path):
+    _, protein = ready(client, tmp_path)
+    cx = LANE_X[2]
+    body = {"protein_id": protein, "x": cx + 2, "y": ROW - 1, "lane_index": 2, "grow": True}
+    answer = client.ok("POST", "/api/boxes", body)
+    band = bands(answer)[answer["band_id"]]
+    assert band["source"] == "click"
+    x0, y0, x1, y1 = band["rect"]
+    assert x0 <= cx - 5 and cx + 5 <= x1  # the band's 1/e half-widths are 5 and 3
+    assert y0 <= ROW - 3 and ROW + 3 <= y1
+    results = column(answer, protein)
+    assert results["band_ids"][2] == answer["band_id"]
+    assert results["nets"][2] > 0 and results["detected"][2] is True
+
+    between = (LANE_X[0] + LANE_X[1]) // 2
+    background = {**body, "x": between, "y": 5, "lane_index": 0}  # the flat membrane
+    assert unchanged_refusal(client, "POST", "/api/boxes", background) == ("no_band_found", [])
+
+
+def test_the_reference_switches_the_series_to_fold_change_and_back(client, tmp_path):
+    _, _, before = live(client, tmp_path, DOSES)
+    series = only_series(before)
+    assert before["results"]["sets"][0]["tier"] == "normalized"
+    assert (series["value_kind"], series["chart"]["y_label"]) == (
+        "loading_normalized",
+        "Normalized signal (target / loading)",
+    )
+
+    answer = client.ok("PUT", "/api/reference", {"condition": "vehicle"})
+    assert answer["project"]["reference_condition"] == "vehicle"
+    assert answer["results"]["reference_condition"] == "vehicle"
+    (result_set,) = answer["results"]["sets"]
+    series = only_series(answer)
+    assert (result_set["tier"], series["value_kind"], series["chart"]["value_kind"]) == (
+        "fold_change",
+        "fold_change",
+        "fold_change",
+    )
+    assert series["chart"]["y_label"] == "Fold change vs control"
+    assert bar(series, "vehicle")["mean"] == pytest.approx(1.0)
+    assert logged(client)[-1] == "set_reference_condition"
+
+    cleared = client.ok("PUT", "/api/reference", {"condition": None})
+    assert cleared["project"]["reference_condition"] is None
+    assert cleared["results"]["sets"] == before["results"]["sets"]
+    assert cleared["project"]["revision"] == before["project"]["revision"] + 2
+
+    # Greek mu names the lanes' micro sign: the lanes' own spelling is stored.
+    answer = client.ok("PUT", "/api/reference", {"condition": "10 μM"})
+    assert answer["project"]["reference_condition"] == "10 µM"
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ({"condition": "20 µM"}, "unknown_condition"),
+        ({"condition": "C0"}, "unknown_condition"),  # conditions keep their case
+        ({"condition": "  "}, "blank_text"),
+        ({"condition": ""}, "blank_text"),  # not a way to clear the reference
+        ({"condition": "c\u00070"}, "control_character"),
+        ({"condition": 0}, "invalid_input"),
+        ({}, "invalid_input"),  # clearing the reference takes an explicit null
+        ({"condition": "c0", "lane": 0}, "invalid_input"),
+    ],
+)
+def test_a_reference_that_names_no_lane_is_refused(client, tmp_path, body, code):
+    ready(client, tmp_path)
+    assert unchanged_refusal(client, "PUT", "/api/reference", body) == (code, [])
+
+
+def test_a_protein_edit_keeps_the_fields_it_leaves_out(client, tmp_path):
+    target, loading, _ = live(client, tmp_path, DOSES)
+    path = f"/api/proteins/{target}"
+
+    def fields(answer: dict) -> tuple:
+        state = protein_of(answer, target)
+        return state["name"], state["role"], state["expected_mw"], state["loading_control_ids"]
+
+    answer = client.ok("PATCH", path, {"expected_mw": 92.5, "loading_control_ids": [loading]})
+    assert fields(answer) == ("β-catenin", "target", 92.5, [loading])
+    answer = client.ok("PATCH", path, {"name": "  β-catenin  µ "})  # stored cleaned
+    assert fields(answer) == ("β-catenin µ", "target", 92.5, [loading])
+    answer = client.ok("PATCH", path, {"expected_mw": None})  # null is a value: no expected MW
+    assert fields(answer) == ("β-catenin µ", "target", None, [loading])
+    answer = client.ok("PATCH", path, {"loading_control_ids": []})  # the only one, implicitly
+    assert fields(answer) == ("β-catenin µ", "target", None, [])
+    revision_before = answer["project"]["revision"]
+    assert client.ok("PATCH", path, {})["project"]["revision"] == revision_before  # a no-op
+    assert logged(client)[-4:] == ["edit_protein"] * 4
+
+    answer = client.ok("PATCH", path, {"role": "loading control"})
+    assert fields(answer) == ("β-catenin µ", "loading control", None, [])
+    assert answer["results"]["sets"][0]["tier"] == "export_only"  # no target is left
+
+
+def test_a_protein_edit_is_refused_with_the_operations_codes(client, tmp_path):
+    target, loading, _ = live(client, tmp_path, DOSES)
+    edit_target, edit_loading = f"/api/proteins/{target}", f"/api/proteins/{loading}"
+    cases: list[tuple[str, Any, tuple[str, list]]] = [
+        # Greek capital alpha: the same name, ignoring case and look-alikes.
+        (edit_target, {"name": "Α-Tubulin"}, ("duplicate_name", [loading])),
+        (edit_target, {"name": "Lane"}, ("reserved_name", [])),
+        (edit_target, {"name": "α-tubulin clipped"}, ("reserved_name", [loading])),
+        (edit_target, {"name": " \t "}, ("blank_text", [])),
+        (edit_target, {"name": "β\u0007"}, ("control_character", [])),
+        # β-catenin normalizes to it as the batch's only loading control.
+        (edit_loading, {"role": "target"}, ("loading_control_in_use", [target])),
+        (edit_target, {"role": "enzyme"}, ("invalid_input", [])),
+        (edit_target, {"name": None}, ("invalid_input", [])),  # only expected_mw takes null
+        (edit_target, {"loading_control_ids": [target]}, ("invalid_input", [target])),
+        (edit_target, {"loading_control_ids": "prot-1"}, ("invalid_input", [])),
+        (edit_target, {"expected_mw": 0}, ("invalid_input", [])),
+        (edit_target, {"colour": "red"}, ("invalid_input", [])),  # an unknown field
+        (edit_target, {"loading_control_ids": ["prot-99"]}, ("unknown_id", [])),
+        ("/api/proteins/prot-99", {"name": "GAPDH"}, ("unknown_id", [])),
+    ]
+    for path, body, refusal in cases:
+        assert unchanged_refusal(client, "PATCH", path, body) == refusal, body
+
+
+@pytest.mark.parametrize("mw", [True, "42", "42.5", [42]])
+def test_an_expected_mw_that_is_not_a_number_is_refused(client, tmp_path, mw):
+    image_id, protein = ready(client, tmp_path)
+    body = {"name": "GAPDH", "role": "loading control", "image_id": image_id, "expected_mw": mw}
+    assert unchanged_refusal(client, "POST", "/api/proteins", body) == ("invalid_input", [])
+    path = f"/api/proteins/{protein}"
+    assert unchanged_refusal(client, "PATCH", path, {"expected_mw": mw}) == ("invalid_input", [])
+
+
+def test_an_expected_mw_may_be_a_whole_number(client, tmp_path):
+    image_id, protein = ready(client, tmp_path)
+    body = {"name": "GAPDH", "role": "loading control", "image_id": image_id, "expected_mw": 36}
+    added = client.ok("POST", "/api/proteins", body)
+    assert protein_of(added, added["protein_id"])["expected_mw"] == 36.0
+    edited = client.ok("PATCH", f"/api/proteins/{protein}", {"expected_mw": 92})
+    assert protein_of(edited, protein)["expected_mw"] == 92.0
+
+
+def test_removing_a_protein_answers_its_cascade_and_drops_its_series(client, tmp_path):
+    target, loading, before = live(client, tmp_path, DOSES)
+    assert len(before["results"]["sets"][0]["series"]) == 1
+    band_ids = [band["id"] for band in protein_of(before, loading)["bands"]]
+
+    answer = client.ok("DELETE", f"/api/proteins/{loading}")
+    assert set(answer) == {*CASCADE, "project", "results"}
+    assert {name: answer[name] for name in CASCADE} == {
+        "removed": [loading, *band_ids],
+        "detached_targets": [target],  # it used the batch's only loading control
+        "unpaired_images": [],
+        "unfitted_membranes": [],
+    }
+    assert [p["id"] for p in answer["project"]["proteins"]] == [target]
+    assert [p["protein_id"] for p in answer["results"]["proteins"]] == [target]
+    (result_set,) = answer["results"]["sets"]
+    assert (result_set["tier"], result_set["series"]) == ("export_only", [])
+    assert logged(client)[-1] == "remove_protein"
+    assert unchanged_refusal(client, "DELETE", f"/api/proteins/{loading}") == ("unknown_id", [])
+
+
+def test_removing_an_image_answers_the_whole_cascade(client, tmp_path):
+    target, loading, before = live(client, tmp_path, DOSES)
+    (image,) = before["project"]["images"]
+    _, other = upload(client, blot_bytes(tmp_path), name="γ-actin.tif")  # on its own membrane
+    body = {"name": "γ-actin", "role": "target", "image_id": other["image_id"]}
+    gamma = client.ok("POST", "/api/proteins", body)["protein_id"]
+    band_ids = [band["id"] for p in (loading, target) for band in protein_of(before, p)["bands"]]
+
+    answer = client.ok("DELETE", f"/api/images/{image['id']}")
+    assert set(answer) == {*CASCADE, "project", "results"}
+    assert {name: answer[name] for name in CASCADE} == {
+        "removed": [image["id"], loading, target, *band_ids, image["membrane_id"]],
+        "detached_targets": [gamma],  # it used α-tubulin, the only loading control
+        "unpaired_images": [],
+        "unfitted_membranes": [],
+    }
+    assert [i["id"] for i in answer["project"]["images"]] == [other["image_id"]]
+    assert [p["id"] for p in answer["project"]["proteins"]] == [gamma]
+    path = f"/api/images/{image['id']}"
+    assert unchanged_refusal(client, "DELETE", path) == ("unknown_id", [])
+
+
+def test_removing_a_marker_image_answers_the_pairing_and_the_fit_it_undid(client):
+    # The conftest sample: img-3 is img-2's marker image and holds two of mem-1's
+    # three calibration points, so mem-1 loses its fit.
+    project = make_project()
+    folder = client.root / "Sample µ"
+    write_image_files(folder, project)
+    storage.save_project(project, folder)
+    before = client.ok("POST", "/api/projects/open", {"name": "Sample µ"})
+
+    answer = client.ok("DELETE", "/api/images/img-3")
+    assert {name: answer[name] for name in CASCADE} == {
+        "removed": ["img-3"],
+        "detached_targets": [],
+        "unpaired_images": ["img-2"],
+        "unfitted_membranes": ["mem-1"],
+    }
+    assert [i["id"] for i in answer["project"]["images"]] == ["img-2", "img-4", "img-6"]
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1
+    batch = storage.load_project(folder).batch
+    assert batch.find_image("img-2").marker_image_id is None
+    (membrane,) = (m for m in batch.membranes if m.id == "mem-1")
+    assert membrane.calibration.fit_quality is None
+
+
+def test_removing_a_not_detected_record_leaves_its_lane_not_measured(client, tmp_path):
+    _, protein = ready(client, tmp_path)
+    for lane in (0, 1):
+        body = {"protein_id": protein, "x": LANE_X[lane], "y": ROW, "lane_index": lane}
+        client.ok("POST", "/api/boxes", {**body, "grow": lane == 0})
+    second_band = _record(3, band_index=1, source=ProposalSource.MW_GUIDED)
+    plant_records(client, protein, _record(2), second_band, bands=2)
+    before = client.ok("GET", "/api/project")
+    assert column(before, protein)["detected"] == [True, True, False, None, None]
+    assert "below_detection" in notice_codes(before)
+
+    path = f"/api/proteins/{protein}/undetected"
+    answer = client.ok("DELETE", f"{path}/2")
+    state = protein_of(answer, protein)
+    assert [(r["lane_index"], r["band_index"]) for r in state["undetected"]] == [(3, 1)]
+    assert 2 in {entry["lane_index"] for entry in state["missing_lanes"]}
+    assert column(answer, protein)["detected"] == [True, True, None, None, None]
+    assert "below_detection" not in notice_codes(answer)
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1
+
+    # Lane 3's record is for the second band: band index 0 finds none there, a no-op.
+    assert client.ok("DELETE", f"{path}/3") == answer
+    answer = client.ok("DELETE", f"{path}/3?band_index=1")
+    assert protein_of(answer, protein)["undetected"] == []
+    assert logged(client)[-2:] == ["remove_undetected"] * 2
+
+    for route, code in [
+        ("/api/proteins/prot-99/undetected/2", "unknown_id"),
+        (f"{path}/5", "lane_out_of_range"),
+        (f"{path}/-1", "lane_out_of_range"),
+        (f"{path}/two", "invalid_input"),
+        (f"{path}/2?band_index=-1", "invalid_input"),
+        (f"{path}/2?band_index=first", "invalid_input"),
+    ]:
+        assert unchanged_refusal(client, "DELETE", route) == (code, []), route
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "0_2",  # not lane 2: underscores are not digits
+        "2.0",
+        "+2",
+        "%202",  # " 2"
+        "2%20",
+        "02",
+        "-0",
+        "%D9%A2",  # the Arabic-Indic digit two
+        "2?band_index=0_0",
+        "2?band_index=0.0",
+        "2?band_index=%2B0",  # "+0"
+        "2?band_index=00",
+        "2?band_index=-0",
+    ],
+)
+def test_an_index_in_a_url_is_read_only_as_plain_digits(client, tmp_path, where):
+    _, protein = ready(client, tmp_path)
+    plant_records(client, protein, _record(2), bands=1)
+    path = f"/api/proteins/{protein}/undetected/{where}"
+    assert unchanged_refusal(client, "DELETE", path) == ("invalid_input", [])
+
+
+def test_an_unpaired_surrogate_in_typed_text_is_refused_as_json(client, tmp_path):
+    # JSON can escape half of a UTF-16 pair ("\ud800"), as a string cut inside a
+    # pair gives; no UTF-8 file can store it. json.dumps sends it as that escape.
+    image_id, protein = ready(client, tmp_path)
+    lanes = [{"condition": f"c{i}"} for i in range(len(LANE_X))]
+    add = {"name": "GAPDH\udfff", "role": "loading control", "image_id": image_id}
+    cases: list[tuple[str, str, Any, str]] = [
+        ("PATCH", f"/api/proteins/{protein}", {"name": "β-actin\ud800"}, "control_character"),
+        ("POST", "/api/proteins", add, "control_character"),
+        ("PUT", "/api/lanes", {"lanes": [{"condition": "c\ud800"}]}, "control_character"),
+        (
+            "PUT",
+            "/api/lanes",
+            {"lanes": [{**lanes[0], "sample": "α\udc00"}, *lanes[1:]]},
+            "control_character",
+        ),
+        ("POST", "/api/projects", {"name": "Blot µ\ud800"}, "invalid_project_name"),
+        ("POST", "/api/projects/open", {"name": "Blot\ud800"}, "invalid_project_name"),
+    ]
+    for method, path, body, code in cases:
+        assert unchanged_refusal(client, method, path, body) == (code, []), (path, body)
+    # A whole pair is one character, a mathematical bold beta here: stored as typed.
+    answer = client.ok("PATCH", f"/api/proteins/{protein}", {"name": "\U0001d6c3-actin"})
+    assert protein_of(answer, protein)["name"] == "\U0001d6c3-actin"

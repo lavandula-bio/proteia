@@ -6,7 +6,9 @@ whole project state (:func:`~proteia.web.state.project_state`) and its results
 (:func:`~proteia.web.results_view.results_payload`), both from one snapshot
 (:func:`~proteia.core.operations.compute_view`), so the browser redraws the
 image, the table and the charts from what the server stored. Creating, opening
-and reading the project answer the same way. One project is open at a time.
+and reading the project answer the same way. One project is open at a time. A
+removal of a protein or an image also answers what it took with it: every field
+of :class:`~proteia.core.operations.Cascade`, as lists of ids.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -30,7 +32,16 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    ValidationError,
+)
 
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
@@ -207,6 +218,24 @@ class Workspace:
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 
 
+def _url_index(value: object) -> object:
+    """An index in a URL as an int, only if it is written as ``str`` writes one:
+    lax int parsing would also take "+1", " 1", "1.0" and "01", and read "1_2"
+    as 12. Its range is the operation's to check."""
+    if not isinstance(value, str):
+        return value
+    try:
+        number = int(value)
+    except ValueError:
+        number = None
+    if number is None or str(number) != value:
+        raise ValueError(f"must be a whole number in plain digits, such as 0 or 3, not {value!r}")
+    return number
+
+
+UrlIndex = Annotated[int, BeforeValidator(_url_index)]
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -230,13 +259,37 @@ class LanesBody(_Body):
     reference_condition: str | None = None  # absent: keep the current reference
 
 
+class ReferenceBody(_Body):
+    condition: str | None  # required: null clears the reference
+
+
+# An expected MW in kDa: a JSON number (a whole one too), never true or "42".
+ExpectedMw = StrictFloat | None
+
+
 class ProteinBody(_Body):
     name: str
     role: str
     image_id: str
-    expected_mw: float | None = None
+    expected_mw: ExpectedMw = None
     loading_control_ids: list[str] = []
     box_size: tuple[PositiveInt, PositiveInt] | None = None  # width, height
+
+
+class ProteinEditBody(_Body):
+    """The fields a protein edit changes. A field left out keeps its value: only
+    the fields the request set are passed on, so these defaults are never used,
+    and null is a value only for ``expected_mw`` (no expected MW)."""
+
+    name: str = ""
+    role: str = ""
+    expected_mw: ExpectedMw = None
+    loading_control_ids: list[str] = []
+
+
+class BoxSizeBody(_Body):
+    width: PositiveInt
+    height: PositiveInt
 
 
 class PlaceBody(_Body):
@@ -274,6 +327,11 @@ def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict
         "project": project_state(session.folder.name, session, view.project, open_id=open_id),
         "results": results_payload(view.results, open_id=open_id, revision=revision(view.project)),
     }
+
+
+def _cascade(cascade: ops.Cascade) -> dict[str, list[str]]:
+    """Every field of what a removal took with it, as lists of ids."""
+    return {field.name: list(getattr(cascade, field.name)) for field in dataclasses.fields(cascade)}
 
 
 router = APIRouter(prefix="/api")
@@ -362,7 +420,7 @@ async def import_image(
 def remove_image(image_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
     cascade = ops.remove_image(session, image_id)
-    return _answer(workspace, session, removed=list(cascade.removed))
+    return _answer(workspace, session, **_cascade(cascade))
 
 
 @router.put("/images/{image_id}/polarity")
@@ -394,6 +452,13 @@ def set_lanes(body: LanesBody, workspace: WorkspaceDep) -> dict[str, Any]:
     )
 
 
+@router.put("/reference")
+def set_reference_condition(body: ReferenceBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    session = workspace.current()
+    ops.set_reference_condition(session, body.condition)
+    return _answer(workspace, session)
+
+
 @router.post("/proteins", status_code=201)
 def add_protein(body: ProteinBody, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
@@ -410,6 +475,39 @@ def add_protein(body: ProteinBody, workspace: WorkspaceDep) -> dict[str, Any]:
         box_size=size,
     )
     return _answer(workspace, session, protein_id=protein_id)
+
+
+@router.patch("/proteins/{protein_id}")
+def edit_protein(protein_id: str, body: ProteinEditBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    session = workspace.current()
+    # Only the fields the request set: the operation keeps the others (KEEP).
+    ops.edit_protein(session, protein_id, **body.model_dump(exclude_unset=True))
+    return _answer(workspace, session)
+
+
+@router.delete("/proteins/{protein_id}")
+def remove_protein(protein_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
+    session = workspace.current()
+    cascade = ops.remove_protein(session, protein_id)
+    return _answer(workspace, session, **_cascade(cascade))
+
+
+@router.put("/proteins/{protein_id}/box-size")
+def set_box_size(protein_id: str, body: BoxSizeBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    session = workspace.current()
+    ops.set_box_size(session, protein_id, BoxSize(width=body.width, height=body.height))
+    return _answer(workspace, session)
+
+
+@router.delete("/proteins/{protein_id}/undetected/{lane_index}")
+def remove_undetected(
+    protein_id: str, lane_index: UrlIndex, workspace: WorkspaceDep, band_index: UrlIndex = 0
+) -> dict[str, Any]:
+    """Remove the protein's not-detected record in the lane, for its first band
+    unless ``band_index`` names a later one; no record there is a no-op."""
+    session = workspace.current()
+    ops.remove_undetected(session, protein_id, lane_index, band_index=band_index)
+    return _answer(workspace, session)
 
 
 @router.post("/boxes", status_code=201)

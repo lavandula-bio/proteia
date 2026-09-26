@@ -144,5 +144,19 @@ def test_clean_text_refuses_separator_controls_that_split_would_hide(char):
     assert info.value.code == "control_character"
 
 
+@pytest.mark.parametrize("char", ["\ud800", "\udbff", "\udc00", "\udfff"])
+def test_clean_text_refuses_an_unpaired_surrogate(char):
+    # Half of a UTF-16 pair, as JSON's "\ud800" gives: no UTF-8 file can store it.
+    with pytest.raises(TextError) as info:
+        clean_text(f"β-actin{char} µ")
+    assert info.value.code == "control_character"
+    assert repr(char) in str(info.value)
+
+
+def test_clean_text_keeps_a_character_beyond_the_basic_plane():
+    beta = "\U0001d6c3"  # mathematical bold small beta: one character, not a pair
+    assert clean_text(f" {beta}-actin ") == f"{beta}-actin"
+
+
 def test_clean_text_still_collapses_tabs_and_line_breaks():
     assert clean_text(" a\tb\nc\r\n\x0bd\x0c ") == "a b c d"
