@@ -87,7 +87,7 @@ from proteia.core.names import (
     unify_spellings,
 )
 from proteia.core.plotspec import ErrorType
-from proteia.core.project import propose_lane, spine_axes
+from proteia.core.project import lane_anchors, propose_lane, spine_axes
 from proteia.core.quantify import estimate_background, is_clipped, net_signal
 from proteia.core.results import Results
 from proteia.core.session import (
@@ -122,6 +122,7 @@ __all__ = [
     "remove_image",
     "remove_protein",
     "save",
+    "set_box_lane",
     "set_box_size",
     "set_lanes",
     "set_polarity",
@@ -439,22 +440,6 @@ def _check_lane(
             ids=[taken[lane]],
         )
     return lane
-
-
-def _lane_anchors(batch: Batch, image: ImageRef) -> list[tuple[float, int]]:
-    """``(centre x, stored lane)`` of the first bands on an image, of any protein.
-
-    A box touching the left or right edge is left out: it may have been shifted
-    inside the image, so its centre need not be its lane's.
-    """
-    anchors = []
-    for protein in batch.proteins:
-        if protein.image_id == image.id:
-            for band in protein.bands:
-                x0, _, x1, _ = band.box.rect(protein.box_size)
-                if band.band_index == 0 and x0 > 0 and x1 < image.width:
-                    anchors.append(((x0 + x1) / 2, band.lane_index))
-    return anchors
 
 
 def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> list[str]:
@@ -1004,7 +989,7 @@ def place_box(
     else:
         # Before any pixel work: can a lane be proposed at all? A fixed box's lane
         # is where the user clicked; a seed click's waits for the grown band.
-        anchors = _lane_anchors(batch, image)
+        anchors = lane_anchors(batch, image)
         if propose_lane(x, anchors) is None:
             raise OperationError(
                 ErrorCode.LANE_REQUIRED,
@@ -1136,6 +1121,40 @@ def remove_box(session: ProjectSession, band_id: str) -> None:
         protein.bands = [band for band in protein.bands if band.id != band_id]
 
     _apply(session, "remove_box", change, lambda _: params)
+
+
+@_locked
+def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None:
+    """Store another lane as the box's lane; the box stays where it is.
+
+    The lane must be one of the declared lanes (``LANE_OUT_OF_RANGE``) where the
+    protein has no box for the same band yet (``LANE_OCCUPIED``). The box counts
+    as edited by the user. The same lane is a no-op.
+    """
+    batch = session.project.batch
+    protein, band = batch.find_band(band_id)
+    lane = _int(lane_index, "lane index")
+    if lane == band.lane_index:
+        return
+    taken = {
+        b.lane_index: b.id
+        for b in protein.bands
+        if b.band_index == band.band_index and b.id != band_id
+    }
+    _check_lane(protein, lane, len(batch.lanes), taken, proposed=False)
+    params = {
+        "band_id": band_id,
+        "protein_id": protein.id,
+        "from_lane": band.lane_index,
+        "lane_index": lane,
+    }
+
+    def change(draft: Project) -> None:
+        _, edited = draft.batch.find_band(band_id)
+        edited.lane_index = lane
+        edited.manually_edited = True
+
+    _apply(session, "set_box_lane", change, lambda _: params)
 
 
 @_locked
