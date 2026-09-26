@@ -9,9 +9,12 @@ then autosaves. So an edit is all or nothing:
 
 * Checks run on the committed project first and raise :class:`OperationError`
   with a stable :class:`ErrorCode`; an unknown id raises
-  :class:`~proteia.core.model.UnknownIdError`. A refusal changes nothing: the
-  project (the same object), ``next_id``, the pixel cache and the ``images/``
-  listing are as they were, and the autosave hook does not run.
+  :class:`~proteia.core.model.UnknownIdError`. A refusal's message numbers
+  lanes from 1, as the user does (:func:`~proteia.core.model.lane_number`);
+  log params and returned fields keep the stored 0-based lane index. A
+  refusal changes nothing: the project (the same object), ``next_id``, the
+  pixel cache and the ``images/`` listing are as they were, and the autosave
+  hook does not run.
 * Pixels are fetched before the change, so an image-file problem changes nothing.
   New ids come only from ``new_id`` inside the change, so a refusal uses up no
   number.
@@ -97,6 +100,8 @@ from proteia.core.model import (
     UndetectedReason,
     UnknownIdError,
     apply_change,
+    lane_number,
+    lanes_phrase,
     overlaps,
 )
 from proteia.core.names import (
@@ -546,15 +551,16 @@ def _check_lane(
     has no box yet. ``proposed`` words the refusal for a lane read from position."""
     if lane is None:  # position could not propose one after all
         raise OperationError(ErrorCode.LANE_REQUIRED, "choose the lane")
-    where = f" (the box lies at lane {lane}); choose the lane" if proposed else ""
+    number = lane_number(lane)
+    where = f" (the box lies at lane {number}); choose the lane" if proposed else ""
     if not 0 <= lane < n:
         raise OperationError(
-            ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane} is not one of the {n} lanes{where}"
+            ErrorCode.LANE_OUT_OF_RANGE, f"lane {number} is not one of the {n} lanes{where}"
         )
     if lane in taken:
         raise OperationError(
             ErrorCode.LANE_OCCUPIED,
-            f"{protein.name!r} already has a box in lane {lane}{where}",
+            f"{protein.name!r} already has a box in lane {number}{where}",
             ids=[taken[lane]],
         )
     return lane
@@ -835,12 +841,13 @@ def set_lanes(
     typed_samples: list[str | None] = []
     included: list[bool] = []
     for i, lane in enumerate(lanes):
+        row = f"lane {lane_number(i)}"
         if not isinstance(lane, LaneInput):
-            raise _invalid(f"lane {i} must be a LaneInput, not {lane!r}")
-        typed_conditions.append(_clean(lane.condition, f"lane {i} condition"))
-        typed_samples.append(_clean_optional(lane.sample, f"lane {i} sample"))
+            raise _invalid(f"{row} must be a LaneInput, not {lane!r}")
+        typed_conditions.append(_clean(lane.condition, f"{row} condition"))
+        typed_samples.append(_clean_optional(lane.sample, f"{row} sample"))
         if not isinstance(lane.included, bool):
-            raise _invalid(f"lane {i} included must be True or False, not {lane.included!r}")
+            raise _invalid(f"{row} included must be True or False, not {lane.included!r}")
         included.append(lane.included)
 
     batch = session.project.batch
@@ -853,12 +860,13 @@ def set_lanes(
         if conditions[i] != typed_conditions[i] or samples[i] != typed_samples[i]
     )
 
-    cut = [band.id for p in batch.proteins for band in p.bands if band.lane_index >= n]
+    cut = [band for p in batch.proteins for band in p.bands if band.lane_index >= n]
     if cut:
+        held = lanes_phrase({band.lane_index for band in cut})
         raise OperationError(
             ErrorCode.LANES_IN_USE,
-            f"{len(cut)} box(es) are in lanes the new table drops; remove them first",
-            ids=cut,
+            f"{len(cut)} box(es) are in {held}, which the new table drops; remove them first",
+            ids=[band.id for band in cut],
         )
 
     labels = [c for c in conditions if c is not None]
@@ -1503,7 +1511,7 @@ def _misnumbered_lanes(
     return OperationError(
         ErrorCode.ROW_LANES_UNCLEAR,
         f"the lanes already placed on this image are numbered inconsistently: in {where}"
-        f" {_in_words([str(lane) for lane in apart])}, the boxes of"
+        f" {_in_words([str(lane_number(lane)) for lane in apart])}, the boxes of"
         f" {_in_words([repr(p.name) for p in named])} lie more than {pitch / 2:.0f} px"
         f" (half the lane pitch) apart; {fix}",
         ids=[band_id for _, _, band_id in boxes_in],
@@ -1899,7 +1907,7 @@ def remove_undetected(
     n = len(batch.lanes)
     if not 0 <= lane < n:
         raise OperationError(
-            ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane} is not one of the {n} lanes"
+            ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane_number(lane)} is not one of the {n} lanes"
         )
     if band < 0:
         raise _invalid(f"band index must be 0 or more, not {band}")

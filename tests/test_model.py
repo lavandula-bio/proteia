@@ -40,6 +40,8 @@ from proteia.core.model import (
     UnknownIdError,
     apply_change,
     format_timestamp,
+    lane_number,
+    lanes_phrase,
     revalidate,
 )
 
@@ -155,13 +157,22 @@ def test_reprobe_is_another_image_of_the_same_membrane(project):
 
 
 def test_band_in_undeclared_lane_rejected(project):
-    _rejected(_edit(project, "band-10", lane_index=4), "unknown lane")
+    # Four lanes are declared; stored index 4 is the fifth lane.
+    _rejected(_edit(project, "band-10", lane_index=4), r"band-10 references unknown lane 5\b")
 
 
 @pytest.mark.parametrize("indices", [[0, 2], [1, 0], [0, 0]])
 def test_lane_indices_follow_list_order(indices):
     with pytest.raises(ValidationError, match="lane indices"):
         Batch(lanes=[Lane(index=i, label="vehicle") for i in indices])
+
+
+def test_messages_number_lanes_from_1():
+    # Stored index 0 is the lane the user calls lane 1.
+    assert [lane_number(i) for i in (0, 1, 11)] == [1, 2, 12]
+    assert lanes_phrase([7]) == "lane 8"
+    assert lanes_phrase({6, 2}) == "lanes 3, 7"  # ascending, whatever the order given
+    assert lanes_phrase((4, 0, 1)) == "lanes 1, 2, 5"
 
 
 def test_box_beyond_its_own_image_rejected():
@@ -195,7 +206,9 @@ def test_boxes_of_different_proteins_may_overlap(project):
 
 
 def test_lane_and_band_index_pair_unique():
-    _rejected(_edit(make_project(), "band-11", lane_index=0), "two bands")
+    _rejected(
+        _edit(make_project(), "band-11", lane_index=0), "two bands in lane 1 with band index 0"
+    )
     two_in_lane_0 = revalidate(_edit(make_project(), "band-11", lane_index=0, band_index=1))
     bands = two_in_lane_0.batch.find_protein("prot-7").bands
     assert [(b.id, b.lane_index, b.band_index) for b in bands[:2]] == [
@@ -713,9 +726,10 @@ def test_records_are_canonically_ordered():
 
 
 def test_a_duplicate_record_is_found_between_other_bands_records():
-    # Sorted by lane, then band index, the two band-0 records of lane 2 meet.
+    # Sorted by lane, then band index, the two band-0 records of lane index 2
+    # (lane 3, as messages number lanes) meet.
     with pytest.raises(
-        ValidationError, match="two not-detected records in lane 2 with band index 0"
+        ValidationError, match="two not-detected records in lane 3 with band index 0"
     ):
         _with_records(_record(), _record(band_index=1), _record(snr=1.0), expected_band_count=2)
 
@@ -745,15 +759,17 @@ def test_negative_zero_snr_stored_as_positive_zero():
     [
         pytest.param(
             [_record(lane_index=0)],
-            "lane 0 has both a band and a not-detected record for band index 0",
+            "lane 1 has both a band and a not-detected record for band index 0",
             id="lane-with-a-band",
         ),
         pytest.param(
             [_record(), _record(snr=1.0)],
-            "two not-detected records in lane 2 with band index 0",
+            "two not-detected records in lane 3 with band index 0",
             id="duplicate-key",
         ),
-        pytest.param([_record(lane_index=4)], "unknown lane index 4", id="unknown-lane"),
+        pytest.param(
+            [_record(lane_index=4)], "record references unknown lane 5", id="unknown-lane"
+        ),
         pytest.param([_record(lane_index=-1)], "greater than or equal to 0", id="negative-lane"),
         pytest.param(
             [_record(band_index=1)],
@@ -763,7 +779,7 @@ def test_negative_zero_snr_stored_as_positive_zero():
         pytest.param([_record(band_index=-1)], "greater than or equal to 0", id="negative-band"),
         pytest.param(
             [_record(region={"x0": 320, "y0": 36, "x1": 341, "y1": 64})],
-            "extends beyond the bounds of image img-2",
+            "region in lane 3 extends beyond the bounds of image img-2",
             id="region-beyond-width",
         ),
         pytest.param(
@@ -831,7 +847,7 @@ def test_a_band_one_record_may_sit_beside_a_band_zero_box():
     [record] = project.batch.find_protein("prot-7").undetected
     assert (record.lane_index, record.band_index) == (0, 1)
     # A record for the second band also refuses a band in its place.
-    with pytest.raises(ValidationError, match="lane 0 has both a band"):
+    with pytest.raises(ValidationError, match="lane 1 has both a band"):
         _edit(project, "band-11", lane_index=0, band_index=1)
         revalidate(project)
 
@@ -846,7 +862,7 @@ def test_placing_a_band_where_a_record_is_needs_the_record_dropped():
             )
         )
 
-    with pytest.raises(ValidationError, match="lane 2 has both a band"):
+    with pytest.raises(ValidationError, match="lane 3 has both a band"):
         apply_change(project, place_in_lane_2)
 
     def place_and_drop(draft: Project) -> None:

@@ -561,6 +561,93 @@ def test_refusals_name_the_objects_involved(tmp_path):
     assert info.value.ids == (ids["a"],)
 
 
+@pytest.mark.parametrize(
+    ("call", "code", "message"),
+    [
+        pytest.param(
+            lambda s, ids: ops.place_box(s, ids["target"], 70, ROW, lane_index=0, grow=False),
+            ErrorCode.LANE_OCCUPIED,
+            "'β-catenin' already has a box in lane 1",
+            id="place-occupied",
+        ),
+        pytest.param(
+            lambda s, ids: ops.place_box(s, ids["target"], 70, ROW, lane_index=3, grow=False),
+            ErrorCode.LANE_OUT_OF_RANGE,
+            "lane 4 is not one of the 3 lanes",
+            id="place-past-the-last-lane",
+        ),
+        pytest.param(
+            lambda s, ids: ops.place_box(s, ids["target"], 70, ROW, lane_index=-1, grow=False),
+            ErrorCode.LANE_OUT_OF_RANGE,
+            "lane 0 is not one of the 3 lanes",
+            id="place-before-the-first-lane",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_box_lane(s, ids["a"], 1),
+            ErrorCode.LANE_OCCUPIED,
+            "'β-catenin' already has a box in lane 2",
+            id="set-box-lane-occupied",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_box_lane(s, ids["a"], 3),
+            ErrorCode.LANE_OUT_OF_RANGE,
+            "lane 4 is not one of the 3 lanes",
+            id="set-box-lane-out-of-range",
+        ),
+        pytest.param(
+            lambda s, ids: ops.remove_undetected(s, ids["target"], 3),
+            ErrorCode.LANE_OUT_OF_RANGE,
+            "lane 4 is not one of the 3 lanes",
+            id="remove-undetected-out-of-range",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_lanes(s, [LaneInput("vehicle")]),
+            ErrorCode.LANES_IN_USE,
+            "1 box(es) are in lane 2, which the new table drops; remove them first",
+            id="lanes-in-use",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_lanes(s, []),
+            ErrorCode.LANES_IN_USE,
+            "2 box(es) are in lanes 1, 2, which the new table drops; remove them first",
+            id="lanes-in-use-all",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_lanes(s, [LaneInput("vehicle"), LaneInput(f" {ZWSP} ")]),
+            ErrorCode.BLANK_TEXT,
+            "lane 2 condition must not be blank",
+            id="set-lanes-blank-condition",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_lanes(s, [LaneInput("vehicle", "a\x07b")]),
+            ErrorCode.CONTROL_CHARACTER,
+            "lane 1 sample must not contain the control character '\\x07'",
+            id="set-lanes-control-character",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_lanes(s, [LaneInput("a"), LaneInput("b", included=1)]),
+            ErrorCode.INVALID_INPUT,
+            "lane 2 included must be True or False, not 1",
+            id="set-lanes-included",
+        ),
+        pytest.param(
+            lambda s, ids: ops.set_lanes(s, [LaneInput("a"), LaneInput("b"), "c"]),
+            ErrorCode.INVALID_INPUT,
+            "lane 3 must be a LaneInput, not 'c'",
+            id="set-lanes-not-a-lane-input",
+        ),
+    ],
+)
+def test_refusals_number_lanes_from_1(tmp_path, call, code, message):
+    # The UI numbers lanes from 1 and shows a refusal's message as it is; the
+    # ids keep the stored lanes' objects. β-catenin's boxes are in the first
+    # two of three lanes (stored lanes 0 and 1).
+    s, _, ids = _refusal_scene(tmp_path)
+    with pytest.raises(OperationError) as info:
+        call(s, ids)
+    assert (info.value.code, str(info.value)) == (code, message)
+
+
 def test_a_change_that_invalidates_the_project_uses_up_no_id(tmp_path):
     s = session_on(tmp_path)
     before = s.project
@@ -1477,10 +1564,17 @@ def test_a_proposal_never_moves_a_box_to_another_lane(tmp_path):
     with pytest.raises(OperationError) as info:
         ops.place_box(s, protein, lane_x(1), 8, grow=False)
     assert info.value.code is ErrorCode.LANE_OCCUPIED
+    # The message numbers lanes from 1, as the UI does, the proposed one too.
+    assert str(info.value) == (
+        "'β-catenin' already has a box in lane 2 (the box lies at lane 2); choose the lane"
+    )
     # A box beyond the declared lanes is refused too, though lane 3 is free.
     with pytest.raises(OperationError) as info:
         ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=False)
     assert info.value.code is ErrorCode.LANE_OUT_OF_RANGE
+    assert str(info.value) == (
+        "lane 6 is not one of the 4 lanes (the box lies at lane 6); choose the lane"
+    )
 
 
 def test_a_fixed_box_at_the_edge_is_proposed_from_the_click(tmp_path):
@@ -4109,7 +4203,8 @@ def test_one_lane_number_on_two_columns_refuses_a_row(tmp_path, monkeypatch):
     s, image, protein = row_session(tmp_path, case)
     other = other_protein_in_lanes(s, image, case)
     clicked = ops.place_box(s, protein, *at_lane(case, 2), lane_index=3, grow=False)
-    message = two_columns("lane 3", "'β-catenin' and 'GAPDH'", 35)
+    # Messages number lanes from 1: lane index 3 prints as lane 4.
+    message = two_columns("lane 4", "'β-catenin' and 'GAPDH'", 35)
     ids = numbering_refused(s, protein, case.row, message, monkeypatch)
     assert ids == (clicked, lane_bands(s, other)[3].id)
 
@@ -4129,7 +4224,8 @@ def test_a_lanes_boxes_within_half_a_pitch_of_each_other_are_one_column(
     gapdh = other_protein_in_lanes(s, image, case)
     actin = other_protein_in_lanes(s, image, case, (2, 3), dx=dx, name="actin")
     if refused:
-        message = two_columns("lanes 2 and 3", "'GAPDH' and 'actin'", 35)
+        # Messages number lanes from 1: lane indices 2 and 3 print as lanes 3 and 4.
+        message = two_columns("lanes 3 and 4", "'GAPDH' and 'actin'", 35)
         ids = numbering_refused(s, protein, case.row, message, monkeypatch)
         assert ids == (
             lane_bands(s, gapdh)[2].id,
@@ -4204,7 +4300,8 @@ def test_the_row_boxes_that_turn_the_next_drag_count_among_the_lanes_numbered(
     first = ops.detect_row_boxes(s, protein, case.row)
     assert not first.right_to_left
     actin = ops.add_protein(s, "actin", Role.TARGET, image)
-    message = two_columns("lane 5", "'β-catenin' and 'GAPDH'", 35)
+    # Messages number lanes from 1: lane index 5 prints as lane 6.
+    message = two_columns("lane 6", "'β-catenin' and 'GAPDH'", 35)
     for row_of in (protein, actin):
         ids = numbering_refused(s, row_of, case.row, message, monkeypatch)
         assert ids == (first.band_ids[5], lane_bands(s, gapdh)[5].id)

@@ -37,7 +37,7 @@ protein share its box size, so they have equal area; only their positions vary.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Final, Literal
@@ -225,6 +225,22 @@ class Lane(_Model):
     sample: str | None = None
     included: bool = True
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+def lane_number(index: int) -> int:
+    """The number a user knows a lane by: its stored index plus one.
+
+    Every text a user can read (a refusal, a validation message, a results
+    notice, a detector's note) numbers lanes from 1, as the web UI does;
+    stored indices, log params and API fields keep the 0-based index."""
+    return index + 1
+
+
+def lanes_phrase(indices: Iterable[int]) -> str:
+    """Stored lane indices in words, numbered by :func:`lane_number` and
+    ascending: ``lane 8``, ``lanes 3, 7``."""
+    numbers = sorted(lane_number(index) for index in indices)
+    return ("lane " if len(numbers) == 1 else "lanes ") + ", ".join(map(str, numbers))
 
 
 class Box(_Model):
@@ -442,7 +458,7 @@ class Protein(_Model):
         for a, b in itertools.pairwise(self.bands):
             if (a.lane_index, a.band_index) == (b.lane_index, b.band_index):
                 raise ValueError(
-                    f"protein {self.id}: two bands in lane {a.lane_index}"
+                    f"protein {self.id}: two bands in lane {lane_number(a.lane_index)}"
                     f" with band index {a.band_index}"
                 )
         # Boxes of one protein must not overlap; other proteins' boxes may.
@@ -468,15 +484,15 @@ class Protein(_Model):
         for a, b in itertools.pairwise(self.undetected):
             if (a.lane_index, a.band_index) == (b.lane_index, b.band_index):
                 raise ValueError(
-                    f"protein {self.id}: two not-detected records in lane {a.lane_index}"
-                    f" with band index {a.band_index}"
+                    f"protein {self.id}: two not-detected records in lane"
+                    f" {lane_number(a.lane_index)} with band index {a.band_index}"
                 )
         held = {(band.lane_index, band.band_index) for band in self.bands}
         for record in self.undetected:
             if (record.lane_index, record.band_index) in held:
                 raise ValueError(
-                    f"protein {self.id}: lane {record.lane_index} has both a band and a"
-                    f" not-detected record for band index {record.band_index}"
+                    f"protein {self.id}: lane {lane_number(record.lane_index)} has both a band"
+                    f" and a not-detected record for band index {record.band_index}"
                 )
             if record.band_index >= self.expected_band_count:
                 raise ValueError(
@@ -590,7 +606,7 @@ class Batch(_Model):
                 if band.lane_index >= len(self.lanes):
                     raise ValueError(
                         f"protein {protein.id}: band {band.id} references"
-                        f" unknown lane index {band.lane_index}"
+                        f" unknown lane {lane_number(band.lane_index)}"
                     )
                 _, _, x1, y1 = band.box.rect(size)
                 if x1 > image.width or y1 > image.height:
@@ -602,13 +618,14 @@ class Batch(_Model):
                 if record.lane_index >= len(self.lanes):
                     raise ValueError(
                         f"protein {protein.id}: a not-detected record references"
-                        f" unknown lane index {record.lane_index}"
+                        f" unknown lane {lane_number(record.lane_index)}"
                     )
                 region = record.region
                 if region.x1 > image.width or region.y1 > image.height:
                     raise ValueError(
                         f"protein {protein.id}: the not-detected region in lane"
-                        f" {record.lane_index} extends beyond the bounds of image {image.id}"
+                        f" {lane_number(record.lane_index)} extends beyond the bounds of"
+                        f" image {image.id}"
                     )
         return self
 
