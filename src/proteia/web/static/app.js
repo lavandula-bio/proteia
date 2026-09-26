@@ -933,12 +933,17 @@ function reportStep(direction, error) {
   if (error.code === `nothing_to_${direction}`) {
     showStatus(`Nothing to ${direction}.`);
   } else if (error.code === "image_file_changed") {
+    // The image is often not in the project shown (undoing a removal), so its
+    // name may be unknown here; and the file may be missing or changed.
     const names = error.ids
       .map((id) => state.project.images.find((image) => image.id === id))
       .filter(Boolean)
       .map((image) => isolate(image.original_name));
     const which = names.length ? `the file of ${inWords(names)} is` : "an image file it needs is";
-    showStatus(`Cannot ${direction}: ${which} missing from the project's images folder.`);
+    showStatus(
+      `Cannot ${direction}: ${which} missing from the project's images folder` +
+        " or was changed outside Proteia.",
+    );
   } else {
     report(error);
   }
@@ -1037,14 +1042,14 @@ function editsText(element) {
   return (
     (element instanceof HTMLInputElement && !NOT_TEXT.has(element.type)) ||
     element instanceof HTMLTextAreaElement ||
-    element instanceof HTMLSelectElement ||
     (element instanceof HTMLElement && element.isContentEditable)
   );
 }
 
 // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo (Cmd on macOS). Not while the
-// focus is where the browser undoes typing (a text field, a select, editable
-// text), nor while a dialog is open.
+// focus is where the browser undoes typing (a text field, editable text), nor
+// while a dialog is open. A select has no text undo: right after choosing in
+// one (polarity, a box's lane) is when Ctrl+Z is wanted.
 document.addEventListener("keydown", (event) => {
   if (!(event.ctrlKey || event.metaKey) || event.altKey || event.isComposing) {
     return;
