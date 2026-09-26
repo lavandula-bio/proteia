@@ -30,7 +30,9 @@ Pipeline, in crop coordinates (rects are offset back at the end):
 
 1. Validate and clip the row box (:class:`RowDetectError`).
 2. Stage 1: a plane ``a + b*x + c*y`` robustly fitted over the crop, or the
-   stored background where that fits the membrane better. The detection signal
+   stored background where the plane is off the membrane (its membrane side
+   spreads over :data:`MEMBRANE_SPREAD_K` pixel sigmas: the bands pulled it,
+   or a light strip) and the stored level's spreads less. The detection signal
    is the 3x5 box-smoothed crop on the band side of it; its noise is the
    smaller of two robust spreads.
 3. Rows of the row: a hump of the row-mean signal cut by the top or bottom box
@@ -45,8 +47,8 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    gaps; the second-best reading measures how certain that is.
 6. Per lane: growth with the click's rule (:func:`~proteia.core.grow.grow_region`
    at ``EXTENT_LEVEL`` of the lane's strongest pixel) between the lane's walls.
-7. Stage 2: the plane and the noise again from the band-free pixels of the
-   row, then steps 3 to 6 again.
+7. Stage 2: the plane (or the stored background, chosen as in stage 1) and the
+   noise again from the band-free pixels of the row, then steps 3 to 6 again.
 8. Each band's lane: its separate components counted (peaks split as pieces
    are along x). Empty lanes get a reason; flags; one shared size by
    :data:`SIZE_RULE`, capped by the lane spacing and the box; bounded isotonic
@@ -57,11 +59,12 @@ Flags (:attr:`RowDetection.flags`):
 * ``lanes_outside_row`` (refusing): an empty end lane's expected centre lies
   outside the row box, so the box does not cover every declared lane;
 * ``ambiguous_lanes`` (refusing): a different lane reading costs less than
-  :data:`AMBIGUITY_MARGIN` more than the chosen one;
-* ``background_mismatch``: a box's local background differs from the stored
-  one by more than :data:`BG_WARN_K` pixel sigmas;
-* ``size_outlier``: an extent above :data:`SIZE_GUARD` times the median was
-  left out of the shared size (``"max_guarded"``);
+  :data:`AMBIGUITY_MARGIN` more than the chosen one, or two neighbouring
+  lanes' extents are closer than the narrowest band (or out of order);
+* ``background_mismatch``: the membrane under a box differs from the stored
+  background by more than :data:`BG_WARN_K` pixel sigmas;
+* ``size_outlier``: an extent above :data:`SIZE_GUARD` times the median of the
+  other extents was left out of the shared size (``"max_guarded"``);
 * ``multiple_components``: a lane holds a second, separate component (see
   ``components``); its box is grown from the lane's strongest pixel, as a
   click there would be (quantifying doublets is #58's).
@@ -90,9 +93,10 @@ from scipy.ndimage import (
 from scipy.signal import find_peaks
 from scipy.special import ndtri
 from skimage.morphology import reconstruction
+from skimage.segmentation import watershed
 
 from proteia.core.boxes import place_in_row
-from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_region
+from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_region, mad_sigma
 from proteia.core.model import BoxSize, Rect
 
 # --- Domain settings (maintainer decisions on #51) ---
@@ -100,7 +104,7 @@ from proteia.core.model import BoxSize, Rect
 DETECT_K: Final = 6.0  # a band's peak reaches this many smoothed-noise sigmas
 EXTENT_LEVEL: Final = REL_THRESHOLD  # sized extent: this fraction of the band's own peak (click)
 SIZE_RULE: Final = "max_guarded"  # the shared size: the largest extent, outliers left out
-SIZE_GUARD: Final = 2.0  # an extent above this times the median does not set the size
+SIZE_GUARD: Final = 2.0  # an extent above this times the others' median does not set the size
 
 # --- Technical settings ---
 
@@ -142,6 +146,7 @@ BG_MIN_KEEP: Final = 0.10  # a plane fit keeps this fraction; stage 2 needs it o
 BG_MIN_PIXELS: Final = 200  # stage 2 needs at least this many band-free pixels
 BG_GUARD: Final = (0.5, 0.25)  # stage-2 exclusion around a band, x its own (h, w)...
 BG_GUARD_MIN: Final = 2  # ...and at least this many px
+MEMBRANE_SPREAD_K: Final = 1.5  # a spread over this x the white noise holds more than membrane
 MIN_FIT: Final = 16  # fewest values a robust fit or noise estimate is made from
 FIT_MAX_PIXELS: Final = 20000  # fits and noise estimates use a fixed-stride subsample
 NOISE_FLOOR_FRAC: Final = 1e-3  # sigma floor: this fraction of the crop's range
@@ -160,7 +165,6 @@ LaneReason = Literal["band", "no_band", "artefact", "edge_signal", "unassigned"]
 
 _TAIL_Z: Final = float(ndtri(0.5 + TAIL_Q / 200.0))  # Gaussian |z| at the TAIL_Q percentile
 _P_SIGMA: Final = 68.27  # the percentile of |deviation| at one Gaussian sigma
-_MAD_SIGMA: Final = 1.4826  # Gaussian sigma per median absolute deviation
 _CROSS: Final = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)  # 4-connectivity, as label()
 
 
@@ -198,9 +202,11 @@ class LaneDetection:
     * ``expected_x``: the lane's expected centre, also for an empty lane: between
       the present lanes by index, past them by the pitch, or an even split of
       the row when no lane holds a band.
-    * ``bg_offset``: the band-side difference between the local detection
-      background under the box and the stored background, in pixel sigmas;
-      None for an empty lane.
+    * ``bg_offset``: how far the stored background lies to the band side of the
+      membrane under the box (the detection surface there, moved by the
+      membrane's level in the signal as measured on the row's band-free pixels,
+      also when stage 2 is skipped; the stage-1 signal's own with fewer than
+      ``MIN_FIT`` of them), in pixel sigmas; None for an empty lane.
     * ``components``: the separate peaks of the lane's detection signal, in its
       x-range and between its walls; a peak is separate from a higher one if
       the saddle between them is ``DETECT_K`` sigma below it and at most
@@ -296,7 +302,7 @@ def _pixel_noise(crop: np.ndarray) -> float:
     d = np.diff(crop, axis=1).ravel()
     if d.size < 2:
         return 0.0
-    return float(_MAD_SIGMA * np.median(np.abs(d - np.median(d))) / math.sqrt(2.0))
+    return mad_sigma(d) / math.sqrt(2.0)
 
 
 def _noise_floor(crop: np.ndarray) -> float:
@@ -349,16 +355,49 @@ def _plane(coef: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return coef[0] + coef[1] * gx + coef[2] * gy
 
 
-def _membrane_spread(v: np.ndarray, surface: np.ndarray | float, sign: float) -> float:
-    """Robust spread of the membrane-side values about ``surface`` (inf if too few)."""
-    r = sign * (surface - v)
+def _side_spread(r: np.ndarray) -> float:
+    """Robust sigma of the membrane side of ``r``, a band-side signal about a
+    surface: from the median distance of its negative values to the surface;
+    inf if fewer than ``MIN_FIT``."""
     mem = -r[r < 0]
-    return float(_MAD_SIGMA * np.median(mem)) if mem.size >= MIN_FIT else math.inf
+    return mad_sigma(mem, 0.0) if mem.size >= MIN_FIT else math.inf
+
+
+def _surface(
+    crop: np.ndarray,
+    idx: np.ndarray,
+    coef: np.ndarray,
+    flat: np.ndarray,
+    sign: float,
+    sigma_px: float,
+) -> np.ndarray:
+    """The plane of ``coef``, or the stored background ``flat`` where the plane
+    is off the membrane, judged on the pixels ``idx``.
+
+    About the membrane's own level, the membrane side of the pixels spreads as
+    the pixel noise ``sigma_px`` (half a Gaussian: 1.0). About a surface the
+    bands pulled towards them it spreads more (1.5 at 0.7 pixel sigmas into
+    them), as it does over a light strip; about one beyond the membrane, less
+    (only the membrane's tail lies beyond it). So the plane stands unless its
+    membrane side spreads over ``MEMBRANE_SPREAD_K`` pixel sigmas, and then
+    the stored level is taken if it spreads less. The smaller spread alone
+    would prefer a stored level beyond the membrane to a plane on it (a ramp's
+    light end, say)."""
+    plane = _plane(coef, crop.shape)
+    v = crop.ravel()[idx]
+    spread = _side_spread(sign * (plane.ravel()[idx] - v))
+    if (
+        spread > MEMBRANE_SPREAD_K * sigma_px
+        and _side_spread(sign * (flat.ravel()[idx] - v)) < spread
+    ):
+        return flat
+    return plane
 
 
 @dataclass(frozen=True)
 class _Signal:
-    plane: np.ndarray  # the detection background (crop coordinates)
+    plane: np.ndarray  # the detection surface (crop coordinates)
+    offset: float  # the membrane's level in the band-side signal, subtracted below
     s_sm: np.ndarray  # smoothed signal, band side, >= 0
     s_ds: np.ndarray  # the same from the despeckled crop: shape decisions only
     sigma_sm: float
@@ -403,15 +442,23 @@ def _signal(
     sfloor = max(white, floor / math.sqrt(ky * kx))
     if free is None or free.sum() < MIN_FIT:
         # Stage 1 only has to find the clear bands to mask for stage 2: the
-        # smaller of the membrane-side spread about the plane (inflated by a
+        # smaller of the membrane-side spread about the surface (inflated by a
         # light strip) and the central spread about the median (inflated a
-        # little by many bands).
-        mem = -r[r < 0]
-        est = float(_MAD_SIGMA * np.median(mem)) if mem.size >= MIN_FIT else white
-        sigma_sm, offset = max(est, sfloor), 0.0
+        # little by many bands). With next to nothing on the membrane side, the
+        # surface lies beyond the membrane (a stored level lighter than it) or
+        # the box holds next to no membrane (it is filled by bands): the median
+        # is the membrane's level if the values spread about it as the white
+        # noise does, within MEMBRANE_SPREAD_K; otherwise it is a band's, and
+        # the noise is the white noise about the surface.
+        est = _side_spread(r)
+        if math.isfinite(est):
+            sigma_sm, tol = max(est, sfloor), 1.0
+        else:
+            sigma_sm, tol = sfloor, MEMBRANE_SPREAD_K
+        offset = 0.0
         idx = _subsample(np.arange(r.size))
         off2, s2 = _center_scale(r.ravel()[idx], sfloor, tail=False)
-        if s2 < sigma_sm:
+        if s2 < tol * sigma_sm:
             sigma_sm, offset = s2, off2
     else:
         idx = _subsample(np.flatnonzero(free.ravel()))
@@ -420,7 +467,12 @@ def _signal(
         sigma_px = max(sigma_px, _center_scale((plane - crop).ravel()[idx], floor)[1])
     r_ds = sign * (plane - uniform_filter(crop_ds, size=(ky, kx), mode="nearest"))
     return _Signal(
-        plane, np.maximum(r - offset, 0.0), np.maximum(r_ds - offset, 0.0), sigma_sm, sigma_px
+        plane,
+        float(offset),
+        np.maximum(r - offset, 0.0),
+        np.maximum(r_ds - offset, 0.0),
+        sigma_sm,
+        sigma_px,
     )
 
 
@@ -520,6 +572,12 @@ def _flat(s: np.ndarray, lo: int, hi: int, c0: int, c1: int) -> bool:
     return top > 0 and bool(v.min() >= REL_THRESHOLD * top) and min(v[0], v[-1]) >= FLAT_EDGE * top
 
 
+def _min_width(wc: int, n: int) -> float:
+    """The narrowest band, px: the smoothing kernel + 2 px, and a fraction of the
+    box pitch (dust is far narrower than a lane; a narrow band is not)."""
+    return min(max(MIN_WIDTH_PX, MIN_WIDTH_PITCH * wc / n), wc)
+
+
 def _candidates(sig: _Signal, n: int) -> _Candidates:
     """The kept components and the pieces of their column profile."""
     s_all = sig.s_sm
@@ -535,9 +593,7 @@ def _candidates(sig: _Signal, n: int) -> _Candidates:
     if hi < hc:
         rejected.append(("edge_signal", (slice(hi, hc), slice(0, wc))))
     thr = NOISE_K * sig.sigma_sm
-    # Width floor: the smoothing kernel + 2 px, and a fraction of the lane
-    # spacing (dust is far narrower than a lane; a narrow band is not).
-    min_w = min(max(MIN_WIDTH_PX, MIN_WIDTH_PITCH * wc / n), wc)
+    min_w = _min_width(wc, n)
     lab, count = label(s > thr)
     kept = np.zeros(s.shape, bool)
     if count:
@@ -742,14 +798,21 @@ def _dp(pieces: list[_Piece], n: int, box_w: float, pitch: float) -> _Assignment
 
 def _assign(pieces: list[_Piece], n: int, box_w: float) -> tuple[_Assignment | None, float]:
     """The best reading over a coarse-to-fine pitch search, and the cost of the
-    best reading with different lanes (at the same pitch or any other)."""
+    best reading with different lanes (at the same pitch or any other). Each
+    fraction of the box pitch is tried once: the fine pass skips the coarse
+    fraction it is centred on."""
     p0 = box_w / n
     lo, hi = PITCH_RANGE
     coarse, fine = PITCH_STEPS
     found: list[_Assignment] = []
+    tried: set[float] = set()
 
     def run(fracs: np.ndarray) -> None:
         for f in fracs:
+            key = round(float(f), 9)
+            if key in tried:
+                continue
+            tried.add(key)
             a = _dp(pieces, n, box_w, f * p0)
             if a is not None:
                 prior = ((f - 1.0) / PITCH_PRIOR_TOL) ** 2
@@ -828,7 +891,13 @@ def _peaks(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
     highest down, a candidate is dropped if its region above the saddle level
     ``min(height - h, VALLEY_FRAC * height)`` holds a higher pixel or a peak
     already found. Only the bounding box of the nonzero pixels is searched;
-    around it all is 0, which moves no saddle. ``h * 1e-9`` absorbs rounding."""
+    around it all is 0, which moves no saddle. ``h * 1e-9`` absorbs rounding.
+
+    The regions are read from the candidates' saddle graph (:func:`_saddles`)
+    with one union-find, not labelled once per candidate: a region above a
+    level holds a higher pixel exactly when it holds a higher candidate (the
+    highest pixel of a region above a level at least ``h`` below it is an
+    h-maximum), and joins two candidates exactly when the graph does."""
     rows, cols = np.flatnonzero(ks.any(axis=1)), np.flatnonzero(ks.any(axis=0))
     if rows.size == 0:
         return []
@@ -841,14 +910,81 @@ def _peaks(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
     lab, count = label(box - rec >= h - eps)
     tops = [(int(y), int(x)) for y, x in maximum_position(box, lab, np.arange(1, count + 1))]
     tops.sort(key=lambda p: (-float(box[p]), p))
-    found = tops[:1]
-    for top in tops[1:]:
-        height = float(box[top])
-        region, _ = label(box > min(height - h, VALLEY_FRAC * height) + eps)
-        joined = region == region[top]
-        if float(box[joined].max()) <= height + eps and not any(joined[p] for p in found):
+    heights = [float(box[p]) for p in tops]
+    # Non-increasing, as the heights: each candidate's level joins at least
+    # what the previous one's did.
+    levels = [min(v - h, VALLEY_FRAC * v) + eps for v in heights]
+    edges = _saddles(box, tops, levels[-1]) if len(tops) > 1 else []
+    parent = list(range(len(tops)))  # a root is its set's highest candidate
+    holds_found = [False] * len(tops)
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    found: list[tuple[int, int]] = []
+    e = 0
+    for i, top in enumerate(tops):
+        while e < len(edges) and edges[e][0] > levels[i]:
+            a, b = sorted((root(edges[e][1]), root(edges[e][2])))
+            if a != b:
+                parent[b] = a
+                holds_found[a] = holds_found[a] or holds_found[b]
+            e += 1
+        r = root(i)
+        if i == 0 or (heights[r] <= heights[i] + eps and not holds_found[r]):
             found.append(top)
+            holds_found[r] = True
     return [(y + y0, x + x0) for y, x in found]
+
+
+def _saddles(
+    box: np.ndarray, tops: list[tuple[int, int]], floor: float
+) -> list[tuple[float, int, int]]:
+    """The saddle graph of the pixels ``tops`` of ``box``: ``(level, i, j)``,
+    highest first, such that tops ``i`` and ``j`` lie in one 4-connected region
+    of ``box > t`` (for any ``t >= floor``) exactly when a path of edges above
+    ``t`` joins them.
+
+    A watershed from the tops floods the pixels above ``floor`` from the
+    highest down, so each pixel's basin is a top it can reach through its
+    highest path; ``reach`` is that path's lowest value (reconstruction by
+    dilation from the tops). Two basins touch at the level of the highest
+    ``min(reach)`` over their touching pixel pairs. Nothing at or below
+    ``floor`` joins anything, so the pixels above it, in their bounding box,
+    are enough."""
+    above = box > floor
+    rows, cols = np.flatnonzero(above.any(axis=1)), np.flatnonzero(above.any(axis=0))
+    dy, dx = int(rows[0]), int(cols[0])
+    sub = box[dy : int(rows[-1]) + 1, dx : int(cols[-1]) + 1]
+    above = above[dy : int(rows[-1]) + 1, dx : int(cols[-1]) + 1]
+    ty = np.array([y for y, _ in tops]) - dy
+    tx = np.array([x for _, x in tops]) - dx
+    k = len(tops)
+    markers = np.zeros(sub.shape, np.int32)
+    markers[ty, tx] = np.arange(1, k + 1)
+    seed = np.full(sub.shape, float(sub.min()))
+    seed[ty, tx] = sub[ty, tx]
+    reach = reconstruction(seed, sub, method="dilation", footprint=_CROSS)
+    basin = watershed(-sub, markers, connectivity=1, mask=above)
+    keys, levels = [], []
+    for a, b, ra, rb in (
+        (basin[:, :-1], basin[:, 1:], reach[:, :-1], reach[:, 1:]),
+        (basin[:-1, :], basin[1:, :], reach[:-1, :], reach[1:, :]),
+    ):
+        touch = (a != b) & (a > 0) & (b > 0)
+        lo, hi = np.minimum(a[touch], b[touch]), np.maximum(a[touch], b[touch])
+        keys.append(lo.astype(np.int64) * (k + 1) + hi)
+        levels.append(np.minimum(ra[touch], rb[touch]))
+    pairs, inverse = np.unique(np.concatenate(keys), return_inverse=True)
+    level = np.full(pairs.size, -np.inf)
+    np.maximum.at(level, inverse, np.concatenate(levels))
+    order = np.argsort(-level, kind="stable")
+    return [
+        (float(level[m]), int(pairs[m] // (k + 1)) - 1, int(pairs[m] % (k + 1)) - 1) for m in order
+    ]
 
 
 def _measure(lanes: list[_Lane], s: np.ndarray, kept: np.ndarray, sigma_sm: float) -> None:
@@ -981,17 +1117,36 @@ def _run_pass(sig: _Signal, n: int, x_offset: int) -> _Pass:
 def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
     """The band-free pixels of the row: its rows, minus each band's extent
     dilated by ``BG_GUARD`` of its own size (at least ``BG_GUARD_MIN`` px),
-    minus the rejected regions."""
+    minus every kept pixel outside those (a piece dropped or left unassigned, a
+    lane whose growth failed, a doublet's other band, a band's tail): each
+    connected part's bounding box dilated by ``BG_GUARD_MIN`` px; minus the
+    rejected regions.
+
+    An extent is a band at ``EXTENT_LEVEL`` of its peak, so its guard grows
+    with it to take in the tails below that level. A kept component already
+    reaches down to ``NOISE_K`` sigma, tails and all; a guard of its own size
+    on top leaves too few band-free pixels for stage 2 around doublets and
+    dust (on the adversarial rows of #51, stage 2 was skipped in 17 more of
+    510 and 12 doublets were poorly boxed)."""
+    blocked = np.zeros(shape, bool)
+
+    def block(rect: Rect, gy: int, gx: int) -> None:
+        bx0, by0, bx1, by1 = rect
+        blocked[max(0, by0 - gy) : by1 + gy, max(0, bx0 - gx) : bx1 + gx] = True
+
+    fy, fx = BG_GUARD
+    for ln in res.lanes:
+        if ln.rect is not None:
+            w, h = ln.rect[2] - ln.rect[0], ln.rect[3] - ln.rect[1]
+            gy = max(BG_GUARD_MIN, int(math.ceil(fy * h)))
+            block(ln.rect, gy, max(BG_GUARD_MIN, int(math.ceil(fx * w))))
+    rest, _ = label(res.cand.kept & ~blocked)
+    for sy, sx in find_objects(rest):
+        block((sx.start, sy.start, sx.stop, sy.stop), BG_GUARD_MIN, BG_GUARD_MIN)
     free = np.zeros(shape, bool)
     lo, hi = res.cand.rows
     free[lo:hi] = True
-    fy, fx = BG_GUARD
-    for ln in res.lanes:
-        if ln.present and ln.rect is not None:
-            bx0, by0, bx1, by1 = ln.rect
-            gy = max(BG_GUARD_MIN, int(math.ceil(fy * (by1 - by0))))
-            gx = max(BG_GUARD_MIN, int(math.ceil(fx * (bx1 - bx0))))
-            free[max(0, by0 - gy) : by1 + gy, max(0, bx0 - gx) : bx1 + gx] = False
+    free &= ~blocked
     for _, region in res.cand.rejected:
         free[region] = False
     return free
@@ -1037,17 +1192,42 @@ def _lanes_phrase(lanes: Sequence[int]) -> str:
 
 
 def _shared_size(
-    ws: Sequence[int], hs: Sequence[int], rule: str
+    ws: Sequence[int],
+    hs: Sequence[int],
+    rule: str,
+    *,
+    cut_w: Sequence[bool] | None = None,
+    cut_h: Sequence[bool] | None = None,
 ) -> tuple[int, int, tuple[int, ...]]:
     """``(w, h, outliers)``: the shared size of the extents ``ws`` x ``hs`` by
     ``rule``, and the positions of the extents the rule left out. ``max``: the
-    largest. ``max_guarded``: the largest of those within ``SIZE_GUARD`` times
-    the median, per dimension (never empty: the smallest is below the median)."""
+    largest. ``max_guarded``: per dimension, the largest of those at most
+    ``SIZE_GUARD`` times the median of the OTHER extents, the upper of the two
+    middle ones when the others are even in number. Of two extents that is the
+    other one (twice the median of both is their sum, which neither exceeds);
+    of an even count, the median of the others; of an odd count it is the whole
+    row's median for every extent above it, as a guard on the median of all.
+    Never empty: the smallest is at most the others' median; a lone extent is
+    kept.
+
+    ``cut_w`` / ``cut_h`` mark extents the row box cuts in that dimension: their
+    true size is at least the measured one, so as another extent's reference
+    they count as unbounded. A band the box cuts short then never shrinks the
+    size of a complete one beside it (with two extents it would otherwise be
+    the reference)."""
     w, h = np.asarray(ws, float), np.asarray(hs, float)
     if rule == "max":
         return int(w.max()), int(h.max()), ()
-    within_w = w <= SIZE_GUARD * np.median(w)
-    within_h = h <= SIZE_GUARD * np.median(h)
+
+    def within(v: np.ndarray, cut: Sequence[bool] | None) -> np.ndarray:
+        if v.size == 1:
+            return np.ones(1, bool)
+        ref = v if cut is None else np.where(np.asarray(cut, bool), np.inf, v)
+        mid = (v.size - 1) // 2  # of the v.size - 1 others: the median, or the upper middle
+        others = np.array([np.sort(np.delete(ref, k))[mid] for k in range(v.size)])
+        return v <= SIZE_GUARD * others
+
+    within_w, within_h = within(w, cut_w), within(h, cut_h)
     outliers = tuple(int(k) for k in np.flatnonzero(~(within_w & within_h)))
     return int(w[within_w].max()), int(h[within_h].max()), outliers
 
@@ -1065,10 +1245,10 @@ def detect_row(
     shared size, or None for an empty lane (see the module docstring).
 
     ``gray`` is the 2-D analysis array (``session.pixels``); it is read, never
-    written. ``background`` is the image's stored background: it only decides
-    whether a fitted plane or the stored level fits the membrane better, and
-    sets ``bg_offset``. ``size_rule`` is one of :data:`SIZE_RULES`, for tests and
-    evaluation; callers that commit boxes use the default :data:`SIZE_RULE`.
+    written. ``background`` is the image's stored background: it only stands in
+    for a fitted plane that is off the membrane, and sets ``bg_offset``.
+    ``size_rule`` is one of :data:`SIZE_RULES`, for tests and evaluation;
+    callers that commit boxes use the default :data:`SIZE_RULE`.
     Raises :class:`RowDetectError` for a row it cannot use.
     """
     if size_rule not in SIZE_RULES:
@@ -1084,40 +1264,45 @@ def detect_row(
     floor = _noise_floor(crop)
     sigma_px = max(_pixel_noise(crop), floor)
 
-    # Stage 1: a plane over the crop, or the stored background if it fits the
-    # membrane better.
+    # Stage 1: a plane over the crop, or the stored background where the plane
+    # is off the membrane.
     flat = np.full(crop.shape, float(background))
     plane = flat
     coef = _fit_plane(crop, np.ones(crop.shape, bool), floor)
     if coef is not None:
-        plane = _plane(coef, crop.shape)
-        sub = _subsample(np.arange(crop.size))
-        cv = crop.ravel()[sub]
-        if _membrane_spread(cv, float(background), sign) < _membrane_spread(
-            cv, plane.ravel()[sub], sign
-        ):
-            plane = flat
+        plane = _surface(crop, _subsample(np.arange(crop.size)), coef, flat, sign, sigma_px)
     crop_ds = _despeckle(crop, _despeckle_width(wc, n))
     res = _run_pass(_signal(crop, crop_ds, plane, sign, sigma_px, floor, None), n, x0)
 
-    # Stage 2: the plane and the noise from the band-free pixels of the row.
+    # Stage 2: the plane (or the stored background, the same choice) and the
+    # noise from the band-free pixels of the row.
     free = _stage2_free(res, crop.shape)
     stage2 = bool(free.sum() >= max(BG_MIN_PIXELS, BG_MIN_KEEP * crop.size))
     if stage2:
         coef2 = _fit_plane(crop, free, floor)
-        plane2 = plane if coef2 is None else _plane(coef2, crop.shape)
-        res = _run_pass(_signal(crop, crop_ds, plane2, sign, sigma_px, floor, free), n, x0)
+        if coef2 is not None:
+            idx = _subsample(np.flatnonzero(free.ravel()))
+            plane = _surface(crop, idx, coef2, flat, sign, sigma_px)
+        res = _run_pass(_signal(crop, crop_ds, plane, sign, sigma_px, floor, free), n, x0)
+    sig, assign, lanes = res.sig, res.assign, res.lanes
+    # The membrane's level in the signal, for bg_offset: stage 2 measured it on
+    # the band-free pixels. Too few of them to fit and detect again may still
+    # be enough to read it under the stage-1 surface.
+    membrane = sig.offset
     notes = list(res.notes)
     if not stage2:
         notes.append("stage 2 skipped: too few band-free pixels")
+        if free.sum() >= MIN_FIT:
+            membrane = _signal(crop, crop_ds, sig.plane, sign, sigma_px, floor, free).offset
     _count_components(res)
-    sig, assign, lanes = res.sig, res.assign, res.lanes
     pitch = assign.pitch if assign is not None else wc / n
     _empty_lanes(res, n, wc, pitch)
 
-    # Geometry the row box cannot resolve.
+    # Geometry the row box cannot resolve. A lane holds a band exactly when
+    # its growth gave an extent.
     flags: list[str] = []
-    present = [i for i, ln in enumerate(lanes) if ln.present and ln.rect is not None]
+    extents = {i: ln.rect for i, ln in enumerate(lanes) if ln.rect is not None}
+    present = list(extents)
     margin = None
     if assign is not None and present:
         if (present[0] > 0 and lanes[0].centre < 0.0) or (
@@ -1133,16 +1318,30 @@ def detect_row(
     out: dict[int, Rect] = {}
     outliers: tuple[int, ...] = ()
     if present:
-        extents: list[Rect] = [r for i in present if (r := lanes[i].rect) is not None]
+        rects = list(extents.values())
         w, h, outliers = _shared_size(
-            [r[2] - r[0] for r in extents], [r[3] - r[1] for r in extents], size_rule
+            [r[2] - r[0] for r in rects],
+            [r[3] - r[1] for r in rects],
+            size_rule,
+            cut_w=[r[0] <= 0 or r[2] >= wc for r in rects],
+            cut_h=[r[1] <= 0 or r[3] >= hc for r in rects],
         )
-        if len(extents) > 1:  # no wider than the closest pair of extent centres
-            w = min(w, int(math.floor(min(np.diff([0.5 * (r[0] + r[2]) for r in extents])))))
-        w = max(MIN_BOX, min(w, wc // len(extents)))  # len * w fits: MIN_BOX * n <= wc
+        if len(rects) > 1:  # no wider than the closest pair of extent centres
+            gaps = np.diff([0.5 * (r[0] + r[2]) for r in rects])
+            min_w = _min_width(wc, n)
+            crowded = np.flatnonzero(gaps < min_w)
+            if crowded.size:  # one centre, crossed, or closer than a band: not two lanes
+                flags.append("ambiguous_lanes")
+                pairs = sorted({present[k] for k in crowded} | {present[k + 1] for k in crowded})
+                notes.append(
+                    f"{_lanes_phrase(pairs)}: extents closer than the narrowest band "
+                    f"({min_w:.0f} px) or out of order"
+                )
+            w = min(w, int(math.floor(max(float(gaps.min()), min_w))))
+        w = max(MIN_BOX, min(w, wc // len(rects)))  # len * w fits: MIN_BOX * n <= wc
         h = max(MIN_BOX, min(h, hc))
-        xs = place_in_row([(r[0] + r[2]) // 2 - w // 2 for r in extents], w, 0, wc)
-        for i, r, x in zip(present, extents, xs, strict=True):
+        xs = place_in_row([(r[0] + r[2]) // 2 - w // 2 for r in rects], w, 0, wc)
+        for i, r, x in zip(present, rects, xs, strict=True):
             y = max(0, min((r[1] + r[3]) // 2 - h // 2, hc - h))
             out[i] = (x0 + x, y0 + y, x0 + x + w, y0 + y + h)
         size = BoxSize(width=w, height=h)
@@ -1151,12 +1350,15 @@ def detect_row(
     for i, ln in enumerate(lanes):
         rect = out.get(i)
         extent = bg_offset = None
-        if ln.rect is not None and rect is not None:
-            extent = (x0 + ln.rect[0], y0 + ln.rect[1], x0 + ln.rect[2], y0 + ln.rect[3])
-            local = float(
-                sig.plane[rect[1] - y0 : rect[3] - y0, rect[0] - x0 : rect[2] - x0].mean()
-            )
-            bg_offset = sign * (local - float(background)) / sig.sigma_px
+        if rect is not None:
+            ex0, ey0, ex1, ey1 = extents[i]
+            extent = (x0 + ex0, y0 + ey0, x0 + ex1, y0 + ey1)
+            # The membrane level under the box: the detection surface there,
+            # moved by the membrane's level in the signal (r = sign * (surface
+            # - crop) - membrane is 0 on the membrane).
+            under = sig.plane[rect[1] - y0 : rect[3] - y0, rect[0] - x0 : rect[2] - x0]
+            level = float(under.mean()) - sign * membrane
+            bg_offset = sign * (level - float(background)) / sig.sigma_px
         result.append(
             LaneDetection(
                 lane=i,
@@ -1175,7 +1377,7 @@ def detect_row(
         flags.append("size_outlier")
         notes.append(
             f"{_lanes_phrase([present[k] for k in outliers])}: extent above "
-            f"{SIZE_GUARD:g}x the median, left out of the shared size"
+            f"{SIZE_GUARD:g}x the median of the other extents, left out of the shared size"
         )
     multiple = [ld.lane for ld in result if ld.components > 1]
     if multiple:
@@ -1245,6 +1447,7 @@ def settings() -> dict[str, JsonValue]:
         "bg_min_pixels": BG_MIN_PIXELS,
         "bg_guard": list(BG_GUARD),
         "bg_guard_min": BG_GUARD_MIN,
+        "membrane_spread_k": MEMBRANE_SPREAD_K,
         "min_fit": MIN_FIT,
         "fit_max_pixels": FIT_MAX_PIXELS,
         "noise_floor_frac": NOISE_FLOOR_FRAC,

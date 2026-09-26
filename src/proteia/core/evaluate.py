@@ -27,8 +27,8 @@ import csv
 import io
 import math
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
@@ -56,14 +56,15 @@ class HitRate:
     NaN when there are no reference bands (nothing to find is not a perfect
     score). ``false_positive_lanes`` are the lanes, ascending, that got a box but
     have no reference band. ``iou`` maps each reference lane to the IoU of its
-    lane's box, 0.0 where the lane got no box.
+    lane's box, 0.0 where the lane got no box; it counts in equality, not in the
+    hash (a dict has none).
     """
 
     hits: int
     n_ref: int
     rate: float
     false_positive_lanes: tuple[int, ...]
-    iou: dict[int, float]
+    iou: dict[int, float] = field(hash=False)
 
 
 def _area(r: Rect) -> int:
@@ -116,17 +117,33 @@ def _read_text(path: Path) -> str:
         raise ReferenceFileError(f"{path.name}:{line}: the file is not UTF-8 text") from exc
 
 
+def _records(text: str, name: str) -> Iterator[tuple[int, list[str]]]:
+    """``(line, values)`` of each CSV record of ``text``; a line the csv reader
+    rejects (a value over its field size limit, say) raises
+    :class:`ReferenceFileError` naming it."""
+    reader = csv.reader(io.StringIO(text, newline=""))
+    while True:
+        try:
+            values = next(reader)
+        except StopIteration:
+            return
+        except csv.Error as exc:
+            raise ReferenceFileError(
+                f"{name}:{reader.line_num}: not a valid CSV line ({exc})"
+            ) from exc
+        yield reader.line_num, values
+
+
 def read_reference_csv(path: Path) -> dict[int, Rect]:
     """The reference boxes of a CSV file (see the module docstring), by lane."""
     path = Path(path)
     name = path.name
-    reader = csv.reader(io.StringIO(_read_text(path), newline=""))
-    header = next(reader, None)
+    records = _records(_read_text(path), name)
+    _, header = next(records, (1, None))
     if header is None or tuple(h.strip().lower() for h in header) != REFERENCE_COLUMNS:
         raise ReferenceFileError(f"{name}:1: the first line must be {','.join(REFERENCE_COLUMNS)}")
     boxes: dict[int, Rect] = {}
-    for values in reader:
-        line = reader.line_num
+    for line, values in records:
         cells = [c.strip() for c in values]
         if not any(cells):
             continue

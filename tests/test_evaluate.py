@@ -2,6 +2,7 @@
 """Tests for the evaluation helper: reference CSV files, IoU, the same-lane hit
 rate, and the hit rate of row-box detection on the synthetic rows (#51)."""
 
+import dataclasses
 import math
 from pathlib import Path
 
@@ -86,6 +87,21 @@ def test_bad_files_name_the_file_and_line(tmp_path, text, line, words):
     assert isinstance(err.value, ValueError)
 
 
+@pytest.mark.parametrize(
+    ("text", "line"),
+    [
+        (f"{HEADER}\n0,1,2,3,4\n1,{'9' * 200_000},2,3,4\n", 3),  # over the csv field limit
+        (f"lane,x,y,width,{'h' * 200_000}\n", 1),
+    ],
+    ids=["value", "header"],
+)
+def test_a_line_the_csv_reader_rejects_names_the_file_and_line(tmp_path, text, line):
+    path = write(tmp_path, "α big.csv", text)
+    with pytest.raises(ReferenceFileError, match="not a valid CSV line") as err:
+        read_reference_csv(path)
+    assert str(err.value).startswith(f"α big.csv:{line}: ")
+
+
 def test_non_utf8_file_names_its_line(tmp_path):
     path = tmp_path / "cp950.csv"
     path.write_bytes(f"{HEADER}\n0,1,2,3,4\n".encode() + "1,參,2,3,4\n".encode("cp950"))
@@ -161,6 +177,18 @@ def test_hit_rate_takes_slots_in_lane_order():
 def test_iou_exactly_at_the_minimum_is_a_hit():
     assert hit_rate({0: (0, 0, 10, 10)}, {0: (0, 0, 10, 20)}).hits == 1
     assert hit_rate({0: (0, 0, 10, 10)}, {0: (0, 0, 10, 20)}, iou_min=0.51).hits == 0
+
+
+def test_hit_rate_is_hashable_and_equality_compares_the_ious():
+    a = hit_rate({0: (0, 0, 10, 10), 1: (25, 0, 35, 10)}, REFERENCE)
+    b = hit_rate({0: (0, 0, 10, 10), 1: (25, 0, 35, 10)}, REFERENCE)
+    assert a == b and hash(a) == hash(b)
+    assert len({a, b}) == 1
+    # The same counts with other IoUs: not equal (and still hashable).
+    other = dataclasses.replace(a, iou={**a.iou, 1: 0.25})
+    assert (other.hits, other.n_ref, other.false_positive_lanes) == (a.hits, a.n_ref, ())
+    assert other != a
+    assert len({a, other}) == 2
 
 
 def test_rate_is_nan_without_reference_bands():

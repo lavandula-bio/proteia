@@ -2,8 +2,10 @@
 """Tests for region-growing a box from a seed (GUI-independent)."""
 
 import itertools
+import math
 
 import numpy as np
+import pytest
 
 from proteia.core.grow import grow_box, grow_region
 
@@ -110,6 +112,23 @@ def test_grow_region_is_4_connected_with_plain_ints():
     rect = grow_region(signal, (1, 1), 1.0)
     assert rect == (1, 1, 2, 2)
     assert all(type(v) is int for v in rect)
+
+
+def test_mad_sigma_is_the_one_robust_noise_estimator():
+    # 1.4826 times the median absolute deviation, from the median or from a
+    # given centre: grow_box's membrane noise and rowdetect's pixel noise and
+    # one-sided spreads all use it.
+    from proteia.core import rowdetect
+    from proteia.core.grow import mad_sigma
+
+    rng = np.random.default_rng(58)
+    values = rng.normal(0.0, 2.0, 5001)
+    assert mad_sigma(values) == float(1.4826 * np.median(np.abs(values - np.median(values))))
+    assert mad_sigma(np.abs(values), 0.0) == float(1.4826 * np.median(np.abs(values)))
+    assert mad_sigma(values) == pytest.approx(2.0, rel=0.05)
+    crop = np.round(rng.normal(1000.0, 50.0, (20, 60)))
+    diffs = np.diff(crop, axis=1).ravel()
+    assert rowdetect._pixel_noise(crop) == mad_sigma(diffs) / math.sqrt(2.0)
 
 
 def test_grow_box_is_grow_region_on_its_signal_and_threshold():

@@ -25,6 +25,8 @@ from proteia.core.model import Rect
 REL_THRESHOLD: Final = 0.3  # grow while the signal is above this fraction of the seed's
 NOISE_K: Final = 3.0  # ...and above this many times the membrane noise
 
+_MAD_SIGMA: Final = 1.4826  # Gaussian sigma per median absolute deviation
+
 
 def _signal(gray: np.ndarray, background: float, dark_on_light: bool) -> np.ndarray:
     """Per-pixel signal above background, with the direction handled."""
@@ -33,9 +35,13 @@ def _signal(gray: np.ndarray, background: float, dark_on_light: bool) -> np.ndar
     return np.maximum(gray - background, 0.0)
 
 
-def _membrane_noise(gray: np.ndarray) -> float:
-    """Robust estimate of membrane noise (1.4826 * MAD), in pixel units."""
-    return float(1.4826 * np.median(np.abs(gray - np.median(gray))))
+def mad_sigma(values: np.ndarray, center: float | None = None) -> float:
+    """Robust Gaussian sigma of ``values``: 1.4826 times their median absolute
+    deviation from ``center`` (their median by default), in their units. The
+    membrane noise of :func:`grow_box`; :mod:`proteia.core.rowdetect` measures
+    its pixel noise and one-sided spreads with it too."""
+    c = np.median(values) if center is None else center
+    return float(_MAD_SIGMA * np.median(np.abs(values - c)))
 
 
 def grow_region(signal: np.ndarray, seed: tuple[int, int], threshold: float) -> Rect | None:
@@ -83,7 +89,7 @@ def grow_box(
     """
     sx, sy = seed
     s = _signal(gray.astype(float), background, dark_on_light)
-    threshold = max(s[sy, sx] * rel_threshold, noise_k * _membrane_noise(gray))
+    threshold = max(s[sy, sx] * rel_threshold, noise_k * mad_sigma(gray))
     grown = grow_region(s, seed, threshold)
     if grown is None:
         return None

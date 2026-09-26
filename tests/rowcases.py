@@ -380,6 +380,17 @@ def blob_between(left: int, r: float, depth: float) -> Artefact:
     return f
 
 
+def band_between(left: int, w: float, h: float, depth: float) -> Artefact:
+    """An extra flat-topped band, ``w`` x ``h`` px at 20%, midway between lanes
+    ``left`` and ``left + 1``, at the band height of ``left``."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        cx = 0.5 * (lcx[left] + lcx[left + 1])
+        return _band(X[0], Y[:, 0], cx, lcy[left], w, h, depth, "super")
+
+    return f
+
+
 def vstreak(lane: int, half_w: float, depth: float) -> Artefact:
     """A dark vertical streak down ``lane`` over the whole image height."""
 
@@ -430,6 +441,9 @@ ADVERSARIAL: dict[str, dict] = {
         "my": 18,
         "missing": [2],
     },
+    # Touching bands, the first a quarter as deep as the rest: its end of the
+    # run is trimmed against its neighbour's peak once the envelope reaches it.
+    "touching_weak_end": {"pitch": 48.0, "w": 60.0, "depths": {0: 6000.0}},
 }
 
 

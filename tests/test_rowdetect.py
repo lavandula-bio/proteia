@@ -14,15 +14,25 @@ from functools import cache
 
 import numpy as np
 import pytest
-from scipy.ndimage import median_filter, uniform_filter
+from scipy.ndimage import (
+    find_objects,
+    gaussian_filter,
+    label,
+    maximum_position,
+    median_filter,
+    uniform_filter,
+)
+from skimage.morphology import reconstruction
 
 from proteia.core import rowdetect
-from proteia.core.evaluate import iou
+from proteia.core.evaluate import hit_rate, iou
 from proteia.core.grow import grow_box
 from proteia.core.model import BoxSize, overlaps
 from proteia.core.quantify import estimate_background
 from proteia.core.rowdetect import (
     AMBIGUITY_MARGIN,
+    BG_GUARD,
+    BG_GUARD_MIN,
     DETECT_K,
     FIT_MAX_PIXELS,
     REFUSING_FLAGS,
@@ -37,12 +47,15 @@ from proteia.core.rowdetect import (
 from rowcases import (
     FULL_SCALE,
     MEMBRANE,
+    NOISE_SIGMA,
     RowCase,
     adversarial,
     adversarial_row,
+    band_between,
     bench_cases,
     blob,
     fuzz_row,
+    synthetic_row,
 )
 
 BENCH = {case.name: case for case in bench_cases()}
@@ -288,8 +301,8 @@ def test_background_mismatch_warns_without_refusing():
 def test_bg_offset_counts_pixel_sigmas_to_the_band_side(k, warns):
     # The stored background k pixel sigmas lighter (to the membrane side of a
     # dark-on-light row) moves every offset by -k; beyond BG_WARN_K it warns.
-    # (Near the membrane the stored level may become the stage-1 surface, which
-    # moves the offsets by a few hundredths.)
+    # The plane on the membrane stays the detection surface whatever the
+    # stored level, so nothing else moves.
     case = BENCH["all_present"]
     base = _detected("all_present")
     found = detect_row(
@@ -298,27 +311,368 @@ def test_bg_offset_counts_pixel_sigmas_to_the_band_side(k, warns):
         6,
         background=estimate_background(case.image) + k * base.pixel_noise,
     )
+    assert found.slots == base.slots and found.noise == base.noise
     for moved, lane in zip(found.lanes, base.lanes, strict=True):
-        assert moved.bg_offset == pytest.approx(lane.bg_offset - k, abs=0.05)
+        assert moved.bg_offset == pytest.approx(lane.bg_offset - k, abs=1e-6)
     assert ("background_mismatch" in found.flags) is warns
 
 
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("dark_on_light", [True, False])
+@pytest.mark.parametrize("k", [5.0, -4.0])
+def test_background_mismatch_measures_the_membrane_under_the_boxes(
+    monkeypatch, flat, dark_on_light, k
+):
+    # The stored background k pixel sigmas off the membrane, to the band side
+    # (k > 0) or the membrane side, in either polarity. With ``flat`` every
+    # plane fit fails, so the stored level is the detection surface in both
+    # stages: the offset of the membrane from it (the signal's own centre)
+    # still measures the mismatch.
+    sigma = _detected("all_present").pixel_noise  # cached before any patch
+    if flat:
+        monkeypatch.setattr(rowdetect, "_fit_plane", lambda *args: None)
+    case = BENCH["all_present"]
+    sign = 1.0 if dark_on_light else -1.0
+    image = case.image if dark_on_light else FULL_SCALE - case.image
+    membrane = MEMBRANE if dark_on_light else FULL_SCALE - MEMBRANE
+    found = detect_row(
+        image, case.row, 6, background=membrane - sign * k * sigma, dark_on_light=dark_on_light
+    )
+    assert found.flags == ("background_mismatch",)
+    assert_hits_own_lanes(case, found)
+    for lane in found.lanes:
+        assert lane.bg_offset == pytest.approx(k, abs=0.5)
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("dark_on_light", [True, False])
+@pytest.mark.parametrize("k", [0.8, 1.5, 2.0])
+def test_a_stored_level_beyond_the_membrane_still_reads_the_membrane_as_zero(
+    monkeypatch, flat, dark_on_light, k
+):
+    # The stored background k pixel sigmas to the membrane side. With ``flat``
+    # every plane fit fails, so it is the stage-1 surface, yet next to no pixel
+    # lies beyond it: the median, about which the values spread as the white
+    # noise, is the membrane's level. Either way the membrane is not read as
+    # signal, stage 2 has its band-free pixels, and the offsets are -k.
+    sigma = _detected("all_present").pixel_noise  # cached before any patch
+    if flat:
+        monkeypatch.setattr(rowdetect, "_fit_plane", lambda *args: None)
+    case = BENCH["all_present"]
+    sign = 1.0 if dark_on_light else -1.0
+    image = case.image if dark_on_light else FULL_SCALE - case.image
+    membrane = MEMBRANE if dark_on_light else FULL_SCALE - MEMBRANE
+    found = detect_row(
+        image, case.row, 6, background=membrane + sign * k * sigma, dark_on_light=dark_on_light
+    )
+    assert found.flags == () and found.notes == ()  # stage 2 ran
+    assert_hits_own_lanes(case, found)
+    for lane in found.lanes:
+        assert lane.bg_offset == pytest.approx(-k, abs=0.15)
+
+
+def _spy_surfaces(monkeypatch) -> list[np.ndarray]:
+    """The detection surface of each stage, in order, as detection runs."""
+    surfaces: list[np.ndarray] = []
+    real = rowdetect._signal
+
+    def spy(crop, crop_ds, plane, *args):
+        surfaces.append(plane)
+        return real(crop, crop_ds, plane, *args)
+
+    monkeypatch.setattr(rowdetect, "_signal", spy)
+    return surfaces
+
+
+@pytest.mark.parametrize("dark_on_light", [True, False])
+@pytest.mark.parametrize("k", [-2.0, -1.0, 1.0, 2.0])
+def test_a_plane_on_the_membrane_stands_whatever_the_stored_level(monkeypatch, dark_on_light, k):
+    # The stored background k pixel sigmas off the membrane, beyond it (k > 0)
+    # or into the band side. Beyond it, only the membrane's tail lies past it,
+    # so the membrane side spreads less about it than about the plane; the
+    # plane's spreads as the pixel noise and stands, in both stages.
+    sigma = _detected("all_present").pixel_noise  # cached before the spy
+    surfaces = _spy_surfaces(monkeypatch)
+    case = BENCH["all_present"]
+    sign = 1.0 if dark_on_light else -1.0
+    image = case.image if dark_on_light else FULL_SCALE - case.image
+    membrane = MEMBRANE if dark_on_light else FULL_SCALE - MEMBRANE
+    background = membrane + sign * k * sigma
+    found = detect_row(image, case.row, 6, background=background, dark_on_light=dark_on_light)
+    assert_hits_own_lanes(case, found)
+    assert len(surfaces) == 2
+    assert not any(np.all(surface == background) for surface in surfaces)
+
+
+def _bright_strip(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+    """The judge's light strip: +3000 over the 6 rows from 15 to 9 px above the
+    highest band centre, across the image."""
+    top = float(np.min(lcy))
+    return -3000.0 * ((Y < top - 9) & (Y >= top - 15)) + 0.0 * X
+
+
+def test_stage_2_keeps_the_stored_level_where_the_plane_spreads_wide(monkeypatch):
+    # A light strip across the top rows widens the membrane side about the
+    # plane to over MEMBRANE_SPREAD_K pixel sigmas, and less about the stored
+    # level: both stages detect over the stored level, stage 2 judging on the
+    # band-free pixels as stage 1 on all.
+    case = adversarial_row("bright_strip", 1009, depths={3: 1500.0}, artefacts=[_bright_strip])
+    background = estimate_background(case.image)
+    surfaces = _spy_surfaces(monkeypatch)
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert "stage 2 skipped: too few band-free pixels" not in found.notes
+    assert len(surfaces) == 2
+    assert all(np.all(surface == background) for surface in surfaces)
+
+
+@pytest.mark.parametrize("dark_on_light", [True, False])
+def test_a_plane_pulled_into_faint_close_bands_gives_way_to_the_stored_level(
+    monkeypatch, dark_on_light
+):
+    # Faint bands (1500 to 3000 deep) 40 px apart in a tight box pull the
+    # fitted plane about a pixel sigma into them: its membrane side spreads
+    # over MEMBRANE_SPREAD_K pixel sigmas. Over it the noise would be read
+    # four times too high and every band missed (stage 2 is skipped); over
+    # the stored level every band is found.
+    case = adversarial_row(
+        "tight_faint",
+        1002,
+        pitch=40.0,
+        mx=2,
+        my=2,
+        depth_range=(1500.0, 3000.0),
+        light_on_dark=not dark_on_light,
+    )
+    surfaces = _spy_surfaces(monkeypatch)
+    found = detect(case)
+    assert found.flags == ()
+    assert "stage 2 skipped: too few band-free pixels" in found.notes
+    assert_hits_own_lanes(case, found)
+    assert np.all(surfaces[0] == estimate_background(case.image))
+
+
+@pytest.mark.parametrize("dark_on_light", [True, False])
+def test_a_box_filled_by_bands_is_read_over_the_stored_level(monkeypatch, dark_on_light):
+    # Twelve touching bands fill a tight box: the fitted plane is pulled into
+    # them, and next to no pixel lies beyond the stored level. Stage 1 detects
+    # over the stored level with the white noise (the median is a band's
+    # level, far wider spread), finds every band, and leaves too few band-free
+    # pixels for stage 2.
+    case = adversarial_row(
+        "touch12",
+        1036,
+        n=12,
+        pitch=40.0,
+        w=44.0,
+        h=12.0,
+        mx=4,
+        my=3,
+        light_on_dark=not dark_on_light,
+    )
+    surfaces = _spy_surfaces(monkeypatch)
+    found = detect(case)
+    assert found.flags == ()
+    assert found.notes == ("stage 2 skipped: too few band-free pixels",)
+    assert_hits_own_lanes(case, found)
+    assert len(surfaces) == 1 and np.all(surfaces[0] == estimate_background(case.image))
+    assert found.noise == pytest.approx(found.pixel_noise / math.sqrt(15))
+
+
+def _ramp_offsets(case: RowCase, found: RowDetection, gradient: float, background: float):
+    """Each box's true membrane offset from ``background``, band side positive,
+    in intensity units: the generator's noise-free ramp averaged under the box."""
+    cx = np.array(case.lane_cx)
+    xc, half = 0.5 * (cx[0] + cx[-1]), max(0.5 * (cx[-1] - cx[0]), 1.0)
+    sign = 1.0 if case.dark_on_light else -1.0
+    out = []
+    for lane in found.lanes:
+        xs = np.arange(lane.rect[0], lane.rect[2], dtype=float)
+        level = MEMBRANE + gradient * float(np.mean((xs - xc) / half))
+        level = level if case.dark_on_light else FULL_SCALE - level
+        out.append(sign * (level - background))
+    return out
+
+
+@pytest.mark.parametrize("dark_on_light", [True, False])
+@pytest.mark.parametrize(
+    ("seed", "q", "depths"),
+    [(57, 90.0, (18000.0, 30000.0)), (57, 99.5, (18000.0, 30000.0)), (80, 98.0, (5000.0, 9000.0))],
+)
+def test_a_ramp_is_detected_over_its_plane_whatever_the_stored_level(
+    monkeypatch, dark_on_light, seed, q, depths
+):
+    # The membrane ramps by 3000 across the row; the stored background is the
+    # q-th percentile of its outer rows, towards the light end, so most of the
+    # ramp lies to its band side and none of the stored level's membrane side
+    # widens. The plane follows the ramp in both stages: every band is found,
+    # stage 2 runs, and each box's bg_offset is the ramp's own offset there.
+    case = synthetic_row(
+        "ramp",
+        "",
+        seed,
+        gradient=(1500.0, 0.0),
+        depth_range=depths,
+        light_on_dark=not dark_on_light,
+    )
+    x0, y0, x1, y1 = case.row
+    crop = case.image[y0:y1, x0:x1]
+    outer = np.concatenate([crop[:3].ravel(), crop[-3:].ravel()])
+    background = float(np.percentile(outer, q if dark_on_light else 100.0 - q))
+    surfaces = _spy_surfaces(monkeypatch)
+    found = detect_row(case.image, case.row, 6, background=background, dark_on_light=dark_on_light)
+    assert_hits_own_lanes(case, found)
+    assert found.notes == ()  # stage 2 ran
+    assert len(surfaces) == 2 and all(np.ptp(surface) > 2000 for surface in surfaces)
+    true = _ramp_offsets(case, found, 1500.0, background)
+    for lane, offset in zip(found.lanes, true, strict=True):
+        assert lane.bg_offset * found.pixel_noise == pytest.approx(offset, abs=0.5 * NOISE_SIGMA)
+    assert found.flags == ("background_mismatch",)
+
+
+@pytest.mark.parametrize("dark_on_light", [True, False])
+@pytest.mark.parametrize(("k", "warns"), [(0.0, False), (6.0, True)])
+def test_bg_offset_is_measured_when_stage_2_is_skipped(monkeypatch, dark_on_light, k, warns):
+    # A tight box over close bands, the stored level k noise sigmas to the
+    # band side: the band-free pixels are too few for stage 2 but enough to
+    # read the membrane's level on. Stage 1 detects over the stored level (k =
+    # 0) or over a plane the bands pulled towards them (k = 6); either way the
+    # membrane lies about 0 in its signal, and the offsets show the stored
+    # level where it is (a little short: those pixels lie by the bands' tails).
+    case = adversarial_row(
+        "tight", 1001, pitch=40.0, w=44.0, mx=2, my=2, light_on_dark=not dark_on_light
+    )
+    sign = 1.0 if dark_on_light else -1.0
+    background = estimate_background(case.image) - sign * k * NOISE_SIGMA
+    surfaces = _spy_surfaces(monkeypatch)
+    found = detect_row(case.image, case.row, 6, background=background, dark_on_light=dark_on_light)
+    assert_hits_own_lanes(case, found)
+    assert "stage 2 skipped: too few band-free pixels" in found.notes
+    assert bool(np.all(surfaces[0] == background)) is (k == 0.0)
+    for lane in found.lanes:
+        assert lane.bg_offset == pytest.approx(k * NOISE_SIGMA / found.pixel_noise, abs=1.5)
+    assert ("background_mismatch" in found.flags) is warns
+
+
+def test_an_extent_the_row_box_cuts_is_no_reference_for_the_others():
+    # A band cut to 22 px by the box edge beside a complete 60 px band: the cut
+    # one's true width is at least 22, so it cannot make the complete one an outlier.
+    assert rowdetect._shared_size([22, 60], [10, 10], "max_guarded") == (22, 10, (1,))
+    assert rowdetect._shared_size(
+        [22, 60], [10, 10], "max_guarded", cut_w=[True, False], cut_h=[False, False]
+    ) == (60, 10, ())
+    # A complete extent above twice the complete others is still an outlier.
+    assert rowdetect._shared_size(
+        [22, 60, 23, 21], [10, 10, 10, 10], "max_guarded", cut_w=[False, False, True, False]
+    ) == (23, 10, (1,))
+    # Of three, the reference is the upper of the two others: one cut extent
+    # there leaves the wide one unjudged (the cut band may be as wide).
+    assert rowdetect._shared_size(
+        [22, 60, 23], [10, 10, 10], "max_guarded", cut_w=[False, False, True]
+    ) == (60, 10, ())
+
+
+@pytest.mark.parametrize("seed", [322, 356])
+def test_a_band_the_box_cuts_does_not_shrink_the_boxes_of_complete_bands(seed, monkeypatch):
+    # Fuzz rows whose row box cuts one outer band: with the cut extent as a
+    # reference, the complete band was flagged and its box shrunk to a miss.
+    case = fuzz_row(seed)
+    found = detect(case)
+    hits = hit_rate(list(found.slots), case.reference).hits
+    plain = rowdetect._shared_size
+    monkeypatch.setattr(rowdetect, "_shared_size", lambda ws, hs, rule, **_: plain(ws, hs, rule))
+    assert hits > hit_rate(list(detect(case).slots), case.reference).hits
+
+
 def test_size_outlier_does_not_set_the_shared_size():
-    # Lane 3's band is 30 px tall, the others about 12: above 2x the median.
+    # Lane 3's band is 30 px tall, the others about 12: above 2x their median.
     case = _adversarial("tall_band", 1000)
     found = detect(case)
     assert found.flags == ("size_outlier",)
     assert any("lane 4:" in note for note in found.notes)  # notes count lanes from 1
     heights = [lane.extent[3] - lane.extent[1] for lane in found.lanes]
-    median = float(np.median(heights))
-    assert heights[3] > SIZE_GUARD * median
-    assert found.size.height == max(h for h in heights if h <= SIZE_GUARD * median)
+    others = heights[:3] + heights[4:]
+    assert heights[3] > SIZE_GUARD * np.median(others)
+    assert found.size.height == max(others)
     for lane in (0, 1, 2, 4, 5):  # the tall band's own box is too short to hit it
         assert iou(found.slots[lane], case.reference[lane]) >= 0.5
     # The plain maximum lets the outlier set the size, and flags nothing.
     by_max = detect(case, size_rule="max")
     assert by_max.size.height == max(heights)
     assert "size_outlier" not in by_max.flags
+
+
+@pytest.mark.parametrize(
+    ("widths", "heights", "expected"),
+    [
+        ([22, 82], [12, 12], (22, 12, (1,))),  # the median of two is their mean: 82 < 2 x 52
+        ([20, 22, 40, 60], [12] * 4, (40, 12, (3,))),  # 60 > 2 x 22, though not 2 x 31
+        ([40, 41, 42, 43], [11, 12, 18, 26], (43, 18, (3,))),  # per dimension
+        ([12, 12, 30], [10] * 3, (12, 10, (2,))),  # an odd count, as before
+        # An odd count keeps the whole row's median: 49 <= 2 x 32 (not 2 x 23.5),
+        # 40 <= 2 x 25, 23 <= 2 x 12, and 25 <= 2 x 13 of five.
+        ([15, 32, 49], [12, 11, 10], (49, 12, ())),
+        ([10, 25, 40], [10] * 3, (40, 10, ())),
+        ([10, 12, 23], [8, 11, 20], (23, 20, ())),
+        ([40] * 5, [10, 10, 13, 14, 25], (40, 25, ())),
+        ([20, 22, 40, 44], [12] * 4, (44, 12, ())),  # at most twice the others' median
+        ([30], [10], (30, 10, ())),  # one extent: nothing to compare it with
+    ],
+)
+def test_size_guard_compares_each_extent_with_the_median_of_the_others(widths, heights, expected):
+    assert rowdetect._shared_size(widths, heights, "max_guarded") == expected
+    assert rowdetect._shared_size(widths, heights, "max") == (max(widths), max(heights), ())
+
+
+def test_size_guard_keeps_the_row_median_for_an_odd_count():
+    # Of an odd count, an extent is left out exactly when it exceeds twice the
+    # median of all (the rule before the others' median); of an even count,
+    # exactly when it exceeds twice the median of the others, an odd number.
+    rng = np.random.default_rng(51)
+    for _ in range(3000):
+        v = rng.integers(4, 60, int(rng.integers(2, 9)))
+        _, _, outliers = rowdetect._shared_size(v.tolist(), [10] * v.size, "max_guarded")
+        if v.size % 2:
+            expected = np.flatnonzero(v > SIZE_GUARD * np.median(v))
+        else:
+            others = [np.median(np.delete(v, k)) for k in range(v.size)]
+            expected = np.flatnonzero(v > SIZE_GUARD * np.array(others))
+        assert outliers == tuple(int(k) for k in expected), v
+
+
+def test_an_extent_within_twice_the_row_median_of_three_sets_the_size():
+    # Extents 15, 32 and 49 px wide: 49 is within twice the median (32), so it
+    # sets the size and nothing is flagged, as before the others' median.
+    case = adversarial_row("odd", 1000, n=3, pitch=80.0, widths={0: 16.0, 1: 34.0, 2: 52.0})
+    found = detect(case)
+    widths = sorted(lane.extent[2] - lane.extent[0] for lane in found.lanes)
+    assert widths[2] <= SIZE_GUARD * widths[1] and widths[2] > widths[0] + widths[1]
+    assert found.flags == ()
+    assert found.size.width == widths[2]
+
+
+@pytest.mark.parametrize(
+    ("recipe", "outlier", "dim"),
+    [
+        ({"n": 2, "pitch": 130.0, "widths": {0: 22.0, 1: 82.0}}, 1, 0),  # a band beside a smear
+        ({"n": 4, "heights": {2: 20.0, 3: 30.0}}, 3, 1),  # 18 px sets the size, 26 does not
+    ],
+)
+def test_an_outlier_among_two_or_four_extents_does_not_set_the_size(recipe, outlier, dim):
+    case = adversarial_row("guard", 1000, **recipe)
+    found = detect(case)
+    assert found.flags == ("size_outlier",)
+    assert found.notes == (
+        f"lane {outlier + 1}: extent above 2x the median of the other extents, "
+        "left out of the shared size",
+    )
+    sizes = [(e[2] - e[0], e[3] - e[1]) for e in (lane.extent for lane in found.lanes)]
+    others = [size[dim] for k, size in enumerate(sizes) if k != outlier]
+    assert sizes[outlier][dim] > SIZE_GUARD * np.median(others)
+    assert (found.size.width, found.size.height)[dim] == max(others)
+    for lane, slot in enumerate(found.slots):
+        if lane != outlier:
+            assert iou(slot, case.reference[lane]) >= 0.5
 
 
 def test_doublet_boxes_the_strongest_component_and_flags_the_lane():
@@ -416,6 +770,190 @@ def test_noise_is_measured_on_the_band_free_pixels():
     assert found.pixel_noise == pytest.approx(453.93837046984686, rel=1e-4)
     # White noise: the detection noise is the pixel noise over the 3x5 kernel.
     assert found.noise == pytest.approx(found.pixel_noise / math.sqrt(15), rel=0.1)
+
+
+def _guard(x0: int, y0: int, x1: int, y1: int, fy: float, fx: float) -> tuple[slice, slice]:
+    """A rect dilated by (fy, fx) of its own size, at least BG_GUARD_MIN px."""
+    gy = max(BG_GUARD_MIN, math.ceil(fy * (y1 - y0)))
+    gx = max(BG_GUARD_MIN, math.ceil(fx * (x1 - x0)))
+    return slice(max(0, y0 - gy), y1 + gy), slice(max(0, x0 - gx), x1 + gx)
+
+
+@pytest.mark.parametrize(
+    ("case", "note", "leaked"),
+    [
+        # A weak extra band between lanes 3 and 4, dropped for want of a lane:
+        # a component of its own, whose 266 pixels stage 2 used to fit.
+        (
+            adversarial_row(
+                "weak_band", 1000, pitch=100.0, artefacts=[band_between(2, 20.0, 12.0, 3000.0)]
+            ),
+            "dropped a weak piece at x=332..352",
+            266,
+        ),
+        # Dust there, dropped too, joins those lanes' bands into one component
+        # (259 pixels used to be fitted).
+        (_adversarial("blob_gap", 1003), "dropped a weak piece at x=256..277", 259),
+    ],
+    ids=["weak_band", "dust"],
+)
+def test_stage_2_background_leaves_out_every_kept_component(monkeypatch, case, note, leaked):
+    # Every kept pixel stays out of the stage-2 plane and noise: inside a
+    # band's extent guarded by BG_GUARD of its size, or in a part outside those
+    # guarded by BG_GUARD_MIN px (a kept component already reaches down to the
+    # noise, tails and all).
+    seen = []
+    real = rowdetect._stage2_free
+
+    def spy(res, shape):
+        free = real(res, shape)
+        seen.append((res, free))
+        return free
+
+    monkeypatch.setattr(rowdetect, "_stage2_free", spy)
+    found = detect(case)
+    ((res, free),) = seen
+    assert res.notes == [note]  # stage 1 dropped the piece
+    assert "stage 2 skipped: too few band-free pixels" not in found.notes
+    kept = res.cand.kept
+    assert not (free & kept).any()
+    bands = np.zeros(free.shape, bool)
+    for lane in res.lanes:
+        if lane.rect is not None:
+            bands[_guard(*lane.rect, *BG_GUARD)] = True
+    assert not (free & bands).any()
+    rest, _ = label(kept & ~bands)
+    assert np.bincount(rest.ravel())[1:].max() >= leaked // 2  # the dropped piece's part
+    for rows, cols in find_objects(rest):
+        assert not free[_guard(cols.start, rows.start, cols.stop, rows.stop, 0.0, 0.0)].any()
+
+
+@pytest.mark.parametrize("shift", [0, -6, 5])  # the same centre, out of order, closer than a band
+def test_extents_closer_than_a_band_refuse_the_row(monkeypatch, shift):
+    # Whatever the growth gives, two lanes' extents at one centre, crossed, or
+    # closer than the narrowest band do not show which lane each band is in:
+    # the row is refused, and the boxes are not shrunk to slivers between them.
+    real = rowdetect._measure
+
+    def crowd(lanes, *args):
+        real(lanes, *args)
+        a, b = lanes[2].rect, lanes[3].rect
+        x = (a[0] + a[2]) // 2 + shift - (b[2] - b[0]) // 2
+        lanes[3].rect = (x, b[1], x + b[2] - b[0], b[3])
+
+    monkeypatch.setattr(rowdetect, "_measure", crowd)
+    case = BENCH["all_present"]
+    found = detect(case)
+    assert found.flags == ("ambiguous_lanes",)
+    assert found.refused
+    assert any(note.startswith("lanes 3, 4: extents closer than") for note in found.notes)
+    assert found.size.width >= rowdetect.MIN_WIDTH_PX
+    check_invariants(case, found)
+
+
+def _peaks_reference(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
+    """The rule of :func:`rowdetect._peaks` as first written: one labelling of
+    the box per candidate peak."""
+    rows, cols = np.flatnonzero(ks.any(axis=1)), np.flatnonzero(ks.any(axis=0))
+    if rows.size == 0:
+        return []
+    y0, x0 = int(rows[0]), int(cols[0])
+    box = ks[y0 : int(rows[-1]) + 1, x0 : int(cols[-1]) + 1]
+    if float(box.max()) < h:
+        return []
+    eps = h * 1e-9
+    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
+    rec = reconstruction(box - h, box, method="dilation", footprint=cross)
+    lab, count = label(box - rec >= h - eps)
+    tops = [(int(y), int(x)) for y, x in maximum_position(box, lab, np.arange(1, count + 1))]
+    tops.sort(key=lambda p: (-float(box[p]), p))
+    found = tops[:1]
+    for top in tops[1:]:
+        height = float(box[top])
+        region, _ = label(box > min(height - h, rowdetect.VALLEY_FRAC * height) + eps)
+        joined = region == region[top]
+        if float(box[joined].max()) <= height + eps and not any(joined[p] for p in found):
+            found.append(top)
+    return [(y + y0, x + x0) for y, x in found]
+
+
+def _peak_field(seed: int) -> tuple[np.ndarray, float]:
+    """A random field >= 0 with many peaks: smooth, box-smoothed, quantised
+    (plateaus and exact ties), bumps on a plateau, or integer noise."""
+    rng = np.random.default_rng(seed)
+    shape = (int(rng.integers(3, 40)), int(rng.integers(3, 90)))
+    noise = rng.normal(0.0, 1.0, shape)
+    kind = seed % 5
+    if kind == 0:
+        field = gaussian_filter(noise, float(rng.uniform(0.5, 4.0)))
+    elif kind == 1:
+        field = uniform_filter(noise, size=SMOOTH)
+    elif kind == 2:
+        field = np.round(gaussian_filter(noise, float(rng.uniform(0.7, 3.0))) * 4.0)
+    elif kind == 3:
+        yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+        field = 0.05 * noise
+        for _ in range(int(rng.integers(1, 12))):
+            cy, cx, r = rng.uniform(0, shape[0]), rng.uniform(0, shape[1]), rng.uniform(1.0, 6.0)
+            field = field + rng.uniform(0.5, 5.0) * np.exp(
+                -0.5 * (((yy - cy) / r) ** 2 + ((xx - cx) / r) ** 2)
+            )
+    else:
+        field = rng.integers(0, 6, shape).astype(float)
+    ks = np.pad(np.maximum(field - np.quantile(field, rng.uniform(0.0, 0.8)), 0.0), (2, 1))
+    return ks, max(float(ks.max()) * float(rng.uniform(0.02, 0.6)), 1e-6)
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_peaks_are_the_per_peak_labelling_rule(seed):
+    ks, h = _peak_field(seed)
+    assert rowdetect._peaks(ks, h) == _peaks_reference(ks, h)
+
+
+def test_peaks_cost_does_not_grow_with_the_number_of_peaks():
+    # A plateau carrying about 10 bumps or 50 times as many: labelling the box
+    # once per peak costs 15x more for the second; the saddle graph of the
+    # peaks under 2x.
+    yy, xx = np.mgrid[0:200, 0:600].astype(float)
+    rng = np.random.default_rng(85)
+
+    def bumps(spacing: float) -> np.ndarray:
+        field = np.full(yy.shape, 100.0)
+        for cy in np.arange(spacing / 2, 200, spacing):
+            for cx in np.arange(spacing / 2, 600, spacing):
+                depth = rng.uniform(30.0, 60.0)
+                field += depth * np.exp(-0.5 * (((yy - cy) / 2.5) ** 2 + ((xx - cx) / 2.5) ** 2))
+        return field
+
+    few, many = bumps(100.0), bumps(12.0)
+    assert len(rowdetect._peaks(few, 10.0)) <= 12 and len(rowdetect._peaks(many, 10.0)) > 500
+
+    def cost(field: np.ndarray) -> float:
+        best = math.inf
+        for _ in range(3):
+            start = time.perf_counter()
+            rowdetect._peaks(field, 10.0)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    assert cost(many) < 5 * cost(few)
+
+
+def test_pitch_search_evaluates_each_pitch_once(monkeypatch):
+    # The fine pass skips the coarse fraction it is centred on.
+    fractions: list[float] = []
+    real = rowdetect._dp
+
+    def spy(pieces, n, box_w, pitch):
+        fractions.append(pitch / (box_w / n))
+        return real(pieces, n, box_w, pitch)
+
+    monkeypatch.setattr(rowdetect, "_dp", spy)
+    pieces = [rowdetect._Piece(10.0 + 70.0 * i, 54.0 + 70.0 * i, 1.0, 44.0) for i in range(6)]
+    best, _ = rowdetect._assign(pieces, 6, 430.0)
+    assert best is not None and best.lanes == tuple((i, 1) for i in range(6))
+    assert len(fractions) > len(np.arange(0.55, 1.30 + 1e-9, 0.05))  # a fine pass ran
+    assert len({round(f, 9) for f in fractions}) == len(fractions)
 
 
 def test_snr_is_the_smoothed_band_peak_over_the_noise():
@@ -753,11 +1291,11 @@ def test_settings_name_every_tuning_value():
         ("row_walk_tol", 0.3, "nbr_above_miss/1000"),
         ("row_min_rows", 1000, "nbr_above_miss/1000"),
         ("row_min_keep", 1000, "nbr_above_miss/1000"),
-        ("min_fit", 2000, "touching"),
+        ("min_fit", 2000, "missing_last"),
         ("q_window", -1, "touching"),
         ("gap_search", 0, "missing_middle"),
         ("despeckle_min", 99, "all_present"),
-        ("envelope_min", 60, "touching"),
+        ("envelope_min", 60, "touching_weak_end/1000"),
         ("bg_guard_min", 20, "all_present"),
         ("cell_seed", 0.0, "touching"),
     ],
