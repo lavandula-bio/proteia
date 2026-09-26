@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 license = "Apache-2.0"
 authors = [{ name = "Roger Huang" }]
 dependencies = [
+    "fastapi>=0.141.1",
     "matplotlib>=3.9",
     "napari[pyside6]>=0.7",
     "numpy>=2.1",
@@ -15,7 +16,11 @@ dependencies = [
     "scikit-image>=0.25",
     "scipy>=1.14",
     "tifffile>=2024.8",
+    "uvicorn>=0.54.0",
 ]
+
+[project.scripts]
+proteia = "proteia.web.launch:main"
 
 [project.urls]
 Homepage = "https://github.com/lavandula-bio/proteia"
