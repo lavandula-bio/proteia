@@ -722,7 +722,12 @@ def test_remove_image_cascade(tmp_path):
         unpaired_images=(),
         unfitted_membranes=(),
     )
-    assert s.project.log[-1].params == {"image_id": "img-6", **_listed(cascade)}
+    assert s.project.log[-1].params == {
+        "image_id": "img-6",
+        **_listed(cascade),
+        "removed_undetected": [],
+        "dropped_undetected": [],
+    }
     batch = s.project.batch
     assert [p.id for p in batch.proteins] == ["prot-7", "prot-9"]
     assert batch.find_protein("prot-7").loading_control_ids == []
@@ -740,7 +745,12 @@ def test_remove_image_cascade(tmp_path):
         unpaired_images=("img-2",),
         unfitted_membranes=("mem-1",),
     )
-    assert s.project.log[-1].params == {"image_id": "img-3", **_listed(cascade)}
+    assert s.project.log[-1].params == {
+        "image_id": "img-3",
+        **_listed(cascade),
+        "removed_undetected": [],
+        "dropped_undetected": [],
+    }
     batch = s.project.batch
     assert batch.find_image("img-2").marker_image_id is None
     calibration = batch.membranes[0].calibration
@@ -1801,7 +1811,12 @@ LOGGED_STEPS = [
         # typed the same once cleaned, is not a change.
         lambda s: ops.edit_protein(s, "prot-6", name=" p53 ", role=Role.LOADING_CONTROL),
         "edit_protein",
-        lambda s: {"protein_id": "prot-6", "pinned_targets": ["prot-4"], "role": "loading control"},
+        lambda s: {
+            "protein_id": "prot-6",
+            "pinned_targets": ["prot-4"],
+            "role": "loading control",
+            "dropped_undetected": [],
+        },
     ),
     (
         lambda s: ops.add_protein(
@@ -1819,6 +1834,7 @@ LOGGED_STEPS = [
             "detached_targets": ["prot-4", "prot-7"],
             "unpaired_images": [],
             "unfitted_membranes": [],
+            "removed_undetected": [],
         },
     ),
     (
@@ -1846,6 +1862,7 @@ LOGGED_STEPS = [
             "role": "loading control",
             "expected_mw": 42.0,
             "loading_control_ids": [],
+            "dropped_undetected": [],
         },
     ),
     (
@@ -1939,6 +1956,8 @@ LOGGED_STEPS = [
             "detached_targets": [],
             "unpaired_images": [],
             "unfitted_membranes": [],
+            "removed_undetected": [],
+            "dropped_undetected": [],
         },
     ),
 ]
@@ -2240,8 +2259,10 @@ def _record(
     band_index: int = 0,
     snr: float = 1.5,
     region: tuple[int, int, int, int] = (60, 20, 80, 40),
+    source: ProposalSource = ProposalSource.ROW_BOX,
 ) -> UndetectedBand:
-    """A not-detected record from row-box detection (the blot is 160x60)."""
+    """A not-detected record, from row-box detection unless ``source`` says
+    otherwise (the blot is 160x60)."""
     x0, y0, x1, y1 = region
     return UndetectedBand(
         lane_index=lane,
@@ -2250,7 +2271,7 @@ def _record(
         snr=snr,
         threshold=6.0,
         region=Region(x0=x0, y0=y0, x1=x1, y1=y1),
-        source=ProposalSource.ROW_BOX,
+        source=source,
     )
 
 
@@ -2511,15 +2532,135 @@ def test_move_and_resize_keep_the_records(tmp_path):
     assert protein_of(s, protein).undetected == kept
 
 
+def _records_json(session: ProjectSession, protein_id: str) -> list[dict]:
+    return [_record_json(protein_id, u) for u in protein_of(session, protein_id).undetected]
+
+
 def test_removals_take_the_records_along(tmp_path):
     s = open_sample(tmp_path, project=make_project_with_undetected())
     assert _keys(s, "prot-9") == [(2, 0), (3, 0)]
+    gapdh = _records_json(s, "prot-9")
     cascade = ops.remove_protein(s, "prot-9")  # GAPDH: records only in lanes 2 and 3
     assert cascade.removed == ("prot-9", "band-17", "band-18")  # records have no ids
-    assert s.project.log[-1].params == {"protein_id": "prot-9", **_listed(cascade)}
+    # The log keeps them whole, since they have no ids to name them by.
+    assert s.project.log[-1].params == {
+        "protein_id": "prot-9",
+        **_listed(cascade),
+        "removed_undetected": gapdh,
+    }
+    beta = _records_json(s, "prot-7")
     cascade = ops.remove_image(s, "img-2")  # β-catenin, with its lane-2 record
     assert cascade.removed == ("img-2", "prot-7", "band-10", "band-11", "band-12")
+    assert s.project.log[-1].params == {
+        "image_id": "img-2",
+        **_listed(cascade),
+        "removed_undetected": beta,
+        "dropped_undetected": [],
+    }
     assert all(not p.undetected for p in s.project.batch.proteins)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
     assert b'"undetected"' not in saved  # an empty list is never written
     assert load_project(s.folder) == s.project
+
+
+# --- review of PR #86 ---
+
+
+def test_edit_protein_drops_mw_guided_records_when_the_expected_mw_changes(tmp_path):
+    s, image, beta = boxed(tmp_path)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    guided, row = _record(1, source=ProposalSource.MW_GUIDED), _record(2, snr=-0.5)
+    plant_records(s, beta, guided, row)
+    plant_records(s, gapdh, _record(0, source=ProposalSource.MW_GUIDED))
+
+    ops.edit_protein(s, beta, name="β-catenin (E-5)")  # the MW is kept, and so are the records
+    assert _keys(s, beta) == [(1, 0), (2, 0)]
+    assert s.project.log[-1].params == {
+        "protein_id": beta,
+        "pinned_targets": [],
+        "name": "β-catenin (E-5)",
+        "dropped_undetected": [],
+    }
+
+    length = len(s.project.log)
+    ops.edit_protein(s, beta, expected_mw=92)
+    assert _keys(s, beta) == [(2, 0)]  # a row-box record does not depend on the MW
+    assert _keys(s, gapdh) == [(0, 0)]  # nor does another protein's
+    assert len(s.project.log) == length + 1  # one entry: the edit and the dropped record
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "edit_protein",
+        {
+            "protein_id": beta,
+            "pinned_targets": [],
+            "expected_mw": 92.0,
+            "dropped_undetected": [_record_json(beta, guided)],
+        },
+    )
+    assert entry.content_hash == content_hash(s.project)
+
+    plant_records(s, beta, guided)
+    committed = s.project
+    ops.edit_protein(s, beta, expected_mw=92)  # the same MW: a no-op, the record stays
+    assert s.project is committed
+    ops.edit_protein(s, beta, expected_mw=None)  # cleared: the searched slot means nothing
+    assert _keys(s, beta) == [(2, 0)]
+    assert s.project.log[-1].params["dropped_undetected"] == [_record_json(beta, guided)]
+
+
+def test_a_calibration_change_drops_the_membranes_mw_guided_records(tmp_path):
+    s = open_sample(tmp_path / "marker", project=make_project_with_undetected())
+    # GAPDH (img-4, mem-1): a row-box record in lane 2, an MW-guided one in lane 3.
+    [_, gapdh_guided] = _records_json(s, "prot-9")
+    # α-tubulin is on mem-5, whose calibration does not change.
+    tubulin = _record(0, band_index=1, region=(0, 10, 20, 30), source=ProposalSource.MW_GUIDED)
+    plant_records(s, "prot-8", tubulin, bands=2)
+
+    cascade = ops.remove_image(s, "img-3")  # the marker, with two calibration points
+    assert cascade.unfitted_membranes == ("mem-1",)
+    assert _keys(s, "prot-9") == [(2, 0)]
+    assert _keys(s, "prot-7") == [(2, 0)]  # a row-box record stays
+    assert _keys(s, "prot-8") == [(0, 1)]  # another membrane's stays
+    entry = s.project.log[-1]
+    assert entry.params == {
+        "image_id": "img-3",
+        **_listed(cascade),
+        "removed_undetected": [],
+        "dropped_undetected": [gapdh_guided],
+    }
+    assert entry.content_hash == content_hash(s.project)
+
+    # An image without calibration points leaves the calibration, and the MW-guided
+    # records of the membrane's other proteins, as they were.
+    s = open_sample(tmp_path / "reprobe", project=make_project_with_undetected())
+
+    def guided(draft: Project) -> None:
+        draft.batch.find_protein("prot-7").undetected[0].source = ProposalSource.MW_GUIDED
+
+    plant(s, guided)
+    gapdh = _records_json(s, "prot-9")
+    cascade = ops.remove_image(s, "img-4")  # GAPDH's image
+    assert cascade.unfitted_membranes == ()
+    assert _keys(s, "prot-7") == [(2, 0)]
+    assert s.project.log[-1].params == {
+        "image_id": "img-4",
+        **_listed(cascade),
+        "removed_undetected": gapdh,
+        "dropped_undetected": [],
+    }
+
+
+def test_dropping_records_asks_the_predicate_once_per_record(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    plant_records(s, protein, _record(0), _record(1), _record(2))
+    draft = s.project.model_copy(deep=True)
+    asked: list[int] = []
+
+    def drop(u: UndetectedBand) -> bool:
+        asked.append(u.lane_index)
+        return u.lane_index == 1
+
+    dropped = ops._drop_undetected_where(draft.batch.find_protein(protein), drop)
+    assert asked == [0, 1, 2]
+    assert dropped == [_record_json(protein, _record(1))]
+    assert [u.lane_index for u in draft.batch.find_protein(protein).undetected] == [0, 2]

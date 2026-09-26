@@ -205,30 +205,23 @@ def _join(protein: model.Protein, n: int) -> list[model.Band | None]:
     return [by_lane.get(i) for i in range(n)]
 
 
-def _join_undetected(protein: model.Protein, n: int) -> list[model.UndetectedBand | None]:
-    """A protein's band-index-0 not-detected record per lane: the twin of :func:`_join`."""
-    by_lane = {record.lane_index: record for record in protein.undetected if record.band_index == 0}
-    return [by_lane.get(i) for i in range(n)]
-
-
-def _detected(
-    bands: list[model.Band | None], records: list[model.UndetectedBand | None]
-) -> list[bool | None]:
-    """Per lane, from the two joins: True for a band, False for a not-detected
-    record, None for neither (the model allows at most one of the two)."""
-    return [
-        True if band is not None else False if record is not None else None
-        for band, record in zip(bands, records, strict=True)
-    ]
-
-
 def lane_detected(batch: model.Batch) -> dict[str, list[bool | None]]:
     """Each protein's detection state per lane (band index 0), keyed like
     :func:`lane_nets`: True where a box was measured, False where a detector found
     the band below its detection limit (a not-detected record: no value), None
-    where the lane was not measured."""
+    where the lane was not measured.
+
+    The one join of boxes and records to the lane table, by stored lane index as
+    in :func:`_join`; :func:`compute_results` takes the detection state from
+    here. The model allows a lane a box or a record, never both.
+    """
     n = len(batch.lanes)
-    return {p.id: _detected(_join(p, n), _join_undetected(p, n)) for p in batch.proteins}
+    detected: dict[str, list[bool | None]] = {}
+    for protein in batch.proteins:
+        state = {u.lane_index: False for u in protein.undetected if u.band_index == 0}
+        state.update((b.lane_index, True) for b in protein.bands if b.band_index == 0)
+        detected[protein.id] = [state.get(i) for i in range(n)]
+    return detected
 
 
 def lane_nets(batch: model.Batch) -> dict[str, LaneNets]:
@@ -379,7 +372,7 @@ def _compute(
     ]
     joined = {protein.id: _join(protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
-    detected = {p.id: _detected(joined[p.id], _join_undetected(p, n)) for p in batch.proteins}
+    detected = lane_detected(batch)
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -393,10 +386,8 @@ def _compute(
         )
         for p in batch.proteins
     ]
-    # Bands and not-detected records beyond the first expected band.
-    extra = tuple(
-        p.id for p in batch.proteins if any(x.band_index > 0 for x in (*p.bands, *p.undetected))
-    )
+    # Boxes only: a record beyond the first band has no value to ignore.
+    extra = tuple(p.id for p in batch.proteins if any(b.band_index > 0 for b in p.bands))
     if extra:
         note(
             NoticeCode.EXTRA_BANDS_IGNORED,
@@ -580,15 +571,19 @@ def _compute(
                     if not reference_all_excluded and red.groups:
                         reason = str(exc)
                         in_reference = [i for i in reference_lanes if included[i]]
-                        if (
-                            exc.reason == "no_value"
-                            and in_reference
-                            and all(detected[target_id][i] is False for i in in_reference)
-                        ):
+                        # The target or its loading control (or both) was not
+                        # detected in any included reference lane.
+                        missing = [
+                            name
+                            for pid, name in ((target_id, s.target), (loading_id, s.loading))
+                            if in_reference and all(detected[pid][i] is False for i in in_reference)
+                        ]
+                        if exc.reason == "no_value" and missing:
+                            were = "was" if len(missing) == 1 else "were"
                             reason = (
-                                f"{s.target!r} was not detected in the reference condition"
-                                f" {ref!r} (below the detection limit): no fold-change can"
-                                " be formed"
+                                f"{' and '.join(map(repr, missing))} {were} not detected in the"
+                                f" reference condition {ref!r} (below the detection limit):"
+                                " no fold-change can be formed"
                             )
                         note(
                             NoticeCode.REFERENCE_UNUSABLE,

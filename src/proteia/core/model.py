@@ -242,8 +242,8 @@ class Region(_Model):
 
     x0: int = Field(ge=0)
     y0: int = Field(ge=0)
-    x1: int = Field(gt=0)
-    y1: int = Field(gt=0)
+    x1: int  # beyond x0 (checked below), so positive
+    y1: int  # beyond y0, likewise
 
     @model_validator(mode="after")
     def _check_not_empty(self) -> Region:

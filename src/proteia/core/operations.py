@@ -40,8 +40,14 @@ detector's measurement that cannot be redone from the model alone, so an edit
 that invalidates one drops it, in the same change, and logs it in full: a box
 placed or moved into its lane replaces it (``replaced_undetected``), and a
 polarity change or a lane table that cuts its lane drops it
-(``dropped_undetected``). Removing a box never creates a record: the lane
-becomes "not measured".
+(``dropped_undetected``). An MW-guided record searched a slot placed from the
+protein's expected MW and its membrane's calibration, so a change to the
+expected MW drops that protein's MW-guided records, and a change to the
+calibration (points removed with their image) drops those of every protein on
+the membrane (``dropped_undetected``). A removed protein or image takes its
+proteins' records along, and the log lists them whole (``removed_undetected``),
+since they have no ids. Removing a box never creates a record: the lane becomes
+"not measured".
 
 Functions return ids or small frozen dataclasses, never model objects. Typed text
 follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxes`.
@@ -267,12 +273,23 @@ def _drop_undetected_where(
 ) -> list[dict[str, JsonValue]]:
     """Remove a draft protein's records for which ``drop`` is true; return their
     log forms in the stored order (plain values, as a change should return)."""
-    dropped = [
-        _undetected_json(protein.id, record) for record in protein.undetected if drop(record)
-    ]
+    kept: list[UndetectedBand] = []
+    dropped: list[dict[str, JsonValue]] = []
+    for u in protein.undetected:
+        if drop(u):
+            dropped.append(_undetected_json(protein.id, u))
+        else:
+            kept.append(u)
     if dropped:
-        protein.undetected = [record for record in protein.undetected if not drop(record)]
+        protein.undetected = kept
     return dropped
+
+
+def _drop_mw_guided(protein: Protein) -> list[dict[str, JsonValue]]:
+    """Remove a draft protein's MW-guided records: the slot each one examined was
+    placed from the expected MW and the membrane's calibration, so a change to
+    either leaves the record about a slot nobody looked in."""
+    return _drop_undetected_where(protein, lambda record: record.source is ProposalSource.MW_GUIDED)
 
 
 def _drop_undetected(
@@ -615,21 +632,24 @@ def import_image(
 
 @_locked
 def remove_image(session: ProjectSession, image_id: str) -> Cascade:
-    """Remove an image with the proteins and bands on it.
+    """Remove an image with the proteins, bands and not-detected records on it.
 
     Targets using a removed loading control, by name or as the batch's only
     one, are detached and reported, marker pairings to the image are cleared, and calibration
-    points on it are dropped, which clears the membrane's fit and its bands'
-    apparent MWs. A membrane left with no image is removed. The file is deleted
-    after the next successful save.
+    points on it are dropped, which clears the membrane's fit, its bands'
+    apparent MWs and its proteins' MW-guided records. A membrane left with no
+    image is removed. The file is deleted after the next successful save. The
+    log lists the removed records (``removed_undetected``) and the MW-guided ones
+    dropped (``dropped_undetected``) in full.
     """
     session.project.batch.find_image(image_id)
 
-    def change(draft: Project) -> Cascade:
+    def change(draft: Project) -> tuple[Cascade, list[JsonValue], list[JsonValue]]:
         batch = draft.batch
         gone = [p for p in batch.proteins if p.image_id == image_id]
         gone_ids = {p.id for p in gone}
         removed = [image_id, *(p.id for p in gone), *(b.id for p in gone for b in p.bands)]
+        records: list[JsonValue] = [_undetected_json(p.id, u) for p in gone for u in p.undetected]
         # Targets using a removed loading control without naming it lose it too.
         implicit = {t for p in gone for t in _implicit_users(batch, p.id)} - gone_ids
         batch.proteins = [p for p in batch.proteins if p.id not in gone_ids]
@@ -652,6 +672,7 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
         membrane = batch.membrane_of(image_id)
         membrane.images = [image for image in membrane.images if image.id != image_id]
         unfitted = []
+        dropped: list[JsonValue] = []
         calibration = membrane.calibration
         points = [point for point in calibration.points if point.image_id != image_id]
         if len(points) != len(calibration.points):
@@ -662,25 +683,31 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
                 if protein.image_id in on_membrane:
                     for band in protein.bands:
                         band.apparent_mw = None
+                    dropped.extend(_drop_mw_guided(protein))
             if membrane.images:
                 unfitted.append(membrane.id)
         if not membrane.images:
             batch.membranes = [m for m in batch.membranes if m.id != membrane.id]
             removed.append(membrane.id)
-        return Cascade(
+        cascade = Cascade(
             removed=tuple(removed),
             detached_targets=tuple(detached),
             unpaired_images=tuple(unpaired),
             unfitted_membranes=tuple(unfitted),
         )
+        return cascade, records, dropped
 
-    return _apply(
-        session,
-        "remove_image",
-        change,
-        lambda cascade: {"image_id": image_id, **_cascade(cascade)},
-        evict=(image_id,),
-    )
+    def params(result: tuple[Cascade, list[JsonValue], list[JsonValue]]) -> _Params:
+        cascade, records, dropped = result
+        return {
+            "image_id": image_id,
+            **_cascade(cascade),
+            "removed_undetected": records,
+            "dropped_undetected": dropped,
+        }
+
+    cascade, _, _ = _apply(session, "remove_image", change, params, evict=(image_id,))
+    return cascade
 
 
 @_locked
@@ -936,7 +963,9 @@ def edit_protein(
     becomes the second one, the first is written into the targets that used it
     without naming it. A loading control that targets use, by name or as the
     batch's only one, cannot become a target (``LOADING_CONTROL_IN_USE``, with
-    those targets): choose other loading controls for them first.
+    those targets): choose other loading controls for them first. A changed
+    expected MW drops the protein's MW-guided not-detected records, whose slot
+    came from the old one (``dropped_undetected``, logged in full).
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
@@ -957,7 +986,7 @@ def edit_protein(
     else:
         controls = _loading_controls(batch, protein_id, new_role, loading_control_ids)
 
-    def change(draft: Project) -> list[str]:
+    def change(draft: Project) -> tuple[list[str], list[JsonValue]]:
         pinned = []
         if protein.role is Role.TARGET and new_role is Role.LOADING_CONTROL:
             pinned = _pin_single_loading_control(draft.batch)
@@ -966,11 +995,21 @@ def edit_protein(
         edited.role = new_role
         edited.expected_mw = mw
         edited.loading_control_ids = controls
-        return [target for target in pinned if target != protein_id]  # its own is cleared
+        dropped: list[JsonValue] = []
+        if mw != protein.expected_mw:
+            dropped.extend(_drop_mw_guided(edited))
+        pinned = [target for target in pinned if target != protein_id]  # its own is cleared
+        return pinned, dropped
 
-    def params(pinned: list[str]) -> _Params:
-        # Only the fields whose stored value changed, a cleared list included.
-        edits: dict[str, JsonValue] = {"protein_id": protein_id, "pinned_targets": pinned}
+    def params(result: tuple[list[str], list[JsonValue]]) -> _Params:
+        pinned, dropped = result
+        # What the edit did to others, always; of the protein's own fields, only
+        # those whose stored value changed, a cleared list included.
+        edits: dict[str, JsonValue] = {
+            "protein_id": protein_id,
+            "pinned_targets": pinned,
+            "dropped_undetected": dropped,
+        }
         if new_name != protein.name:
             edits["name"] = new_name
         if new_role is not protein.role:
@@ -986,13 +1025,16 @@ def edit_protein(
 
 @_locked
 def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
-    """Remove a protein and its bands; targets using it as their loading control,
-    by name or as the batch's only one, are detached and reported."""
+    """Remove a protein with its bands and not-detected records; targets using it
+    as their loading control, by name or as the batch's only one, are detached
+    and reported. The log lists the records in full (``removed_undetected``)."""
     session.project.batch.find_protein(protein_id)
 
-    def change(draft: Project) -> Cascade:
+    def change(draft: Project) -> tuple[Cascade, list[JsonValue]]:
         batch = draft.batch
-        removed = (protein_id, *(band.id for band in batch.find_protein(protein_id).bands))
+        gone = batch.find_protein(protein_id)
+        removed = (protein_id, *(band.id for band in gone.bands))
+        records: list[JsonValue] = [_undetected_json(protein_id, u) for u in gone.undetected]
         implicit = set(_implicit_users(batch, protein_id))
         batch.proteins = [p for p in batch.proteins if p.id != protein_id]
         detached = []
@@ -1002,19 +1044,20 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
                 detached.append(protein.id)
             elif protein.id in implicit:
                 detached.append(protein.id)
-        return Cascade(
+        cascade = Cascade(
             removed=removed,
             detached_targets=tuple(detached),
             unpaired_images=(),
             unfitted_membranes=(),
         )
+        return cascade, records
 
-    return _apply(
-        session,
-        "remove_protein",
-        change,
-        lambda cascade: {"protein_id": protein_id, **_cascade(cascade)},
-    )
+    def params(result: tuple[Cascade, list[JsonValue]]) -> _Params:
+        cascade, records = result
+        return {"protein_id": protein_id, **_cascade(cascade), "removed_undetected": records}
+
+    cascade, _ = _apply(session, "remove_protein", change, params)
+    return cascade
 
 
 # --- Boxes ---

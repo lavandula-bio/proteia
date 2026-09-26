@@ -18,9 +18,25 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from conftest import MEMBRANE_LEVEL, FakeClock, synthetic_blot, write_tiff
+from conftest import (
+    MEMBRANE_LEVEL,
+    FakeClock,
+    make_project_with_undetected,
+    synthetic_blot,
+    write_image_files,
+    write_tiff,
+)
 from proteia.core import storage
+from proteia.core.model import (
+    Project,
+    ProposalSource,
+    Region,
+    UndetectedBand,
+    UndetectedReason,
+    apply_change,
+)
 from proteia.web import api, launch
+from proteia.web.state import project_state
 
 H, W = 60, 400
 ROW = 30
@@ -29,10 +45,14 @@ NAME = "β-actin 10 µM.tif"  # beta-actin 10 micro-molar
 
 
 class Client:
-    """JSON requests with this launch's token, over http.client."""
+    """JSON requests with this launch's token, over http.client; ``workspace`` is
+    the server's, for state no route writes yet."""
 
-    def __init__(self, port: int, token: str, root: Path, revealed: list[Path]) -> None:
+    def __init__(
+        self, port: int, token: str, root: Path, revealed: list[Path], workspace: api.Workspace
+    ) -> None:
         self.port, self.token, self.root, self.revealed = port, token, root, revealed
+        self.workspace = workspace
 
     def call(
         self, method: str, path: str, body: Any = None, *, raw: bytes | None = None
@@ -80,7 +100,7 @@ def client(tmp_path):
     while not instance.server.started:
         assert thread.is_alive() and time.monotonic() < deadline
         time.sleep(0.01)
-    yield Client(instance.port, instance.token, root, revealed)
+    yield Client(instance.port, instance.token, root, revealed, workspace)
     instance.stop()
     thread.join(10)
 
@@ -335,6 +355,104 @@ def test_missing_lanes_have_no_position_before_two_lanes_are_boxed(client, tmp_p
     assert state["missing_lanes"] == [
         {"lane_index": lane, "x": None, "y": None} for lane in range(len(LANE_X))
     ]
+
+
+def _record(
+    lane: int, *, band_index: int = 0, source: ProposalSource = ProposalSource.ROW_BOX
+) -> UndetectedBand:
+    """A not-detected record over a lane of the blot."""
+    x = LANE_X[lane]
+    return UndetectedBand(
+        lane_index=lane,
+        band_index=band_index,
+        reason=UndetectedReason.BELOW_DETECTION_LIMIT,
+        snr=2.0,
+        threshold=6.0,
+        region=Region(x0=x - 10, y0=ROW - 8, x1=x + 10, y1=ROW + 8),
+        source=source,
+    )
+
+
+def plant_records(client: Client, protein_id: str, *records: UndetectedBand, bands: int) -> None:
+    """Store records in the open project: the row-box route that writes them is #51's."""
+    session = client.workspace.current()
+
+    def change(draft: Project) -> None:
+        protein = draft.batch.find_protein(protein_id)
+        protein.expected_band_count = bands
+        protein.undetected.extend(records)
+
+    with session.transaction():
+        project, _ = apply_change(session.project, change)
+        session._commit(project, action="plant", params={})
+
+
+def test_records_are_drawn_and_their_lanes_are_not_missing(client, tmp_path):
+    _, protein = ready(client, tmp_path)
+    for lane in (0, 1):
+        body = {"protein_id": protein, "x": LANE_X[lane], "y": ROW, "lane_index": lane}
+        client.ok("POST", "/api/boxes", {**body, "grow": lane == 0})
+    guided = _record(3, band_index=1, source=ProposalSource.MW_GUIDED)
+    plant_records(client, protein, _record(2), guided, bands=2)
+
+    (state,) = client.ok("GET", "/api/project")["project"]["proteins"]
+    x2, x3 = LANE_X[2], LANE_X[3]
+    common = {"reason": "below_detection_limit", "snr": 2.0, "threshold": 6.0}
+    assert state["undetected"] == [
+        {
+            "lane_index": 2,
+            "band_index": 0,
+            **common,
+            "region": [x2 - 10, ROW - 8, x2 + 10, ROW + 8],
+            "source": "row_box",
+        },
+        {
+            "lane_index": 3,
+            "band_index": 1,
+            **common,
+            "region": [x3 - 10, ROW - 8, x3 + 10, ROW + 8],
+            "source": "mw_guided",
+        },
+    ]
+    # Lane 2 was examined. Lane 3's record is for the second band: its first is missing.
+    missing = {entry["lane_index"]: entry for entry in state["missing_lanes"]}
+    assert set(missing) == {3, 4}
+    assert abs(missing[3]["x"] - LANE_X[3]) <= 2 and abs(missing[3]["y"] - ROW) <= 1
+
+
+def test_the_state_lists_every_proteins_records(tmp_path):
+    project = make_project_with_undetected()
+    folder = tmp_path / "Blot"
+    write_image_files(folder, project)
+    storage.save_project(project, folder)
+    session = api.ops.open_project(folder, clock=FakeClock())
+
+    answer = project_state("Blot", session)
+    proteins = {protein["id"]: protein for protein in answer["proteins"]}
+    common = {"band_index": 0, "reason": "below_detection_limit", "threshold": 6.0}
+    assert proteins["prot-7"]["undetected"] == [
+        {**common, "lane_index": 2, "snr": 2.5, "region": [98, 36, 128, 64], "source": "row_box"}
+    ]
+    assert proteins["prot-8"]["undetected"] == []
+    assert proteins["prot-9"]["undetected"] == [
+        {
+            **common,
+            "lane_index": 2,
+            "snr": -0.75,
+            "region": [98, 93, 128, 121],
+            "source": "row_box",
+        },
+        {
+            **common,
+            "lane_index": 3,
+            "snr": 4.125,
+            "region": [138, 93, 168, 121],
+            "source": "mw_guided",
+        },
+    ]
+    # Every lane of each protein holds a box or a record: none is offered as missing.
+    assert [protein["missing_lanes"] for protein in answer["proteins"]] == [[], [], []]
+    assert json.loads(json.dumps(answer, allow_nan=False)) == answer
 
 
 def test_edits_need_an_open_project(client):

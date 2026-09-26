@@ -811,6 +811,20 @@ def test_not_detected_record_rules(records, match):
         _with_records(*records)
 
 
+@pytest.mark.parametrize(
+    "corners",
+    [(0, 0, 0, 5), (0, 0, 5, 0), (3, 4, -2, 9), (0, 0, 0, 0)],
+    ids=["x1-zero", "y1-zero", "x1-negative", "a-point"],
+)
+def test_an_empty_region_is_refused_with_one_message(corners):
+    # x0 and y0 are at least 0 and the far corner must lie beyond them, so an
+    # x1 or y1 of 0 or less is an empty region, refused as every other one is.
+    x0, y0, x1, y1 = corners
+    with pytest.raises(ValidationError, match="positive width and height") as info:
+        Region(x0=x0, y0=y0, x1=x1, y1=y1)
+    assert info.value.error_count() == 1
+
+
 def test_a_band_one_record_may_sit_beside_a_band_zero_box():
     # Lane 0 holds band-10 (band index 0); two bands are expected.
     project = _with_records(_record(lane_index=0, band_index=1), expected_band_count=2)

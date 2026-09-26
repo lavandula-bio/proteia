@@ -1068,16 +1068,65 @@ def test_a_reference_the_target_was_not_detected_in_says_so():
         _undetected("prot-7", 1),
     )
     assert _one(compute_results(excluded), NoticeCode.REFERENCE_UNUSABLE).message == not_detected
-    # Only the target's records count: β-catenin is measured there, α-tubulin is not.
+
+
+def test_a_reference_the_loading_control_was_not_detected_in_names_it():
+    # β-catenin is measured in both reference lanes; α-tubulin, its loading control,
+    # is not. Lane 3 is included so the series keeps a value elsewhere.
     loading = _batch(
         _lane(3, included=True), _no_bands("prot-8", 0, 1), _undetected("prot-8", 0, 1)
     )
-    assert _one(compute_results(loading), NoticeCode.REFERENCE_UNUSABLE).message == usual
+    notice = _one(compute_results(loading), NoticeCode.REFERENCE_UNUSABLE)
+    assert notice.message == (
+        "'β-catenin' / 'α-tubulin': 'α-tubulin' was not detected in the reference"
+        " condition 'vehicle' (below the detection limit): no fold-change can be formed"
+    )
+    assert (notice.protein_ids, notice.conditions) == (("prot-7", "prot-8"), ("vehicle",))
+    both = _batch(
+        _lane(3, included=True),
+        _no_bands("prot-7", 0, 1),
+        _undetected("prot-7", 0, 1),
+        _no_bands("prot-8", 0, 1),
+        _undetected("prot-8", 0, 1),
+    )
+    assert _one(compute_results(both), NoticeCode.REFERENCE_UNUSABLE).message == (
+        "'β-catenin' / 'α-tubulin': 'β-catenin' and 'α-tubulin' were not detected in the"
+        " reference condition 'vehicle' (below the detection limit): no fold-change can be"
+        " formed"
+    )
+    # Each lost one reference lane: neither is missing from the whole condition.
+    mixed = _batch(
+        _lane(3, included=True),
+        _no_bands("prot-7", 0),
+        _undetected("prot-7", 0),
+        _no_bands("prot-8", 1),
+        _undetected("prot-8", 1),
+    )
+    assert _one(compute_results(mixed), NoticeCode.REFERENCE_UNUSABLE).message == (
+        "'β-catenin' / 'α-tubulin': control condition 'vehicle' has no value in any included lane"
+    )
 
 
-def test_extra_bands_notice_lists_records_beyond_the_first_band():
-    batch = _batch(_expected_bands("prot-9", 2), _undetected("prot-9", 0, 2, band_index=1))
-    res = compute_results(batch)
-    notice = _one(res, NoticeCode.EXTRA_BANDS_IGNORED)
-    assert (notice.protein_ids, notice.level) == (("prot-9",), Level.INFO)
+def test_extra_bands_notice_is_about_boxes_not_records():
+    # Records for a second expected band: nothing is quantified from them, and no
+    # box of theirs is being ignored (#58 decides what they mean).
+    records = _batch(_expected_bands("prot-9", 2), _undetected("prot-9", 0, 2, band_index=1))
+    res = compute_results(records)
+    assert NoticeCode.EXTRA_BANDS_IGNORED not in _codes(res)
     assert NoticeCode.BELOW_DETECTION not in _codes(res)  # band index 0 only
+
+
+def test_compute_takes_the_detection_state_from_lane_detected(monkeypatch):
+    # One join serves the results, as it will the chart counts and the export.
+    batch = _batch(_undetected("prot-7", 2), _undetected("prot-9", 3))
+    seen: list[model.Batch] = []
+
+    def spy(b: model.Batch) -> dict[str, list[bool | None]]:
+        seen.append(b)
+        return lane_detected(b)
+
+    monkeypatch.setattr(results, "lane_detected", spy)
+    res = compute_results(batch)
+    assert len(seen) == 2  # this set and the all-lanes set (lane 3 is excluded)
+    assert seen[0] is batch
+    assert [column.detected for column in res.proteins] == list(lane_detected(batch).values())
