@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Final
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -162,7 +162,10 @@ def create_app(
         return {"app": APP_ID, "version": proteia.__version__}
 
     @app.post("/api/quit", status_code=202)
-    def quit_app() -> dict[str, str]:
+    def quit_app(request: Request) -> dict[str, str]:
+        # Unsaved changes (a failed autosave) are saved first; if that fails the
+        # answer is 409 unsaved_changes and Proteia keeps running.
+        request.app.state.workspace.flush()
         on_quit()
         return {"status": "stopping"}
 

@@ -21,19 +21,20 @@ from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import ProjectSession
 
 
-def _missing_lanes(batch: Batch, protein: Protein) -> list[JsonValue]:
+def _missing_lanes(
+    batch: Batch, protein: Protein, anchors: list[tuple[float, int]]
+) -> list[JsonValue]:
     """The declared lanes where ``protein`` has no box, each with where its box
-    is expected: the lane's centre x from the boxes already on the image
-    (:func:`~proteia.core.project.lane_positions`) and the protein's row (the
-    median centre y of its boxes); None where that cannot be known yet."""
-    has = {band.lane_index for band in protein.bands if band.band_index == 0}
+    is expected: the lane's centre x from ``anchors``, the boxes already on its
+    image (:func:`~proteia.core.project.lane_positions`), and the protein's row
+    (the median centre y of its first bands); None where that cannot be known yet."""
+    first = [band for band in protein.bands if band.band_index == 0]
+    has = {band.lane_index for band in first}
     lanes = [lane.index for lane in batch.lanes if lane.index not in has]
     if not lanes:
         return []
-    image = batch.find_image(protein.image_id)
-    xs = lane_positions(lane_anchors(batch, image), lanes)
-    size = protein.box_size
-    centres = [band.box.y + size.height / 2 for band in protein.bands]
+    xs = lane_positions(anchors, lanes)
+    centres = [band.box.y + protein.box_size.height / 2 for band in first]
     y = statistics.median(centres) if centres else None
     return [{"lane_index": lane, "x": xs.get(lane), "y": y} for lane in lanes]
 
@@ -60,6 +61,7 @@ def project_state(name: str, session: ProjectSession) -> dict[str, JsonValue]:
         for membrane in batch.membranes
         for image in membrane.images
     ]
+    anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
         size = protein.box_size
@@ -81,7 +83,7 @@ def project_state(name: str, session: ProjectSession) -> dict[str, JsonValue]:
                     }
                     for band in protein.bands
                 ],
-                "missing_lanes": _missing_lanes(batch, protein),
+                "missing_lanes": _missing_lanes(batch, protein, anchors[protein.image_id]),
             }
         )
     return {

@@ -28,9 +28,11 @@ ROOT_NAME: Final = "Proteia"
 MAX_NAME: Final = 100  # characters; well inside every file system's limit
 # Characters Windows refuses in a file name.
 _FORBIDDEN: Final = frozenset('<>:"/\\|?*')
-# Device names Windows reserves, with or without an extension.
+# Device names Windows reserves, with or without an extension: COM and LPT with
+# 0-9 and the superscript digits 1-3 as well.
 _RESERVED: Final = frozenset(
-    {"CON", "PRN", "AUX", "NUL"} | {f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)}
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{p}{d}" for p in ("COM", "LPT") for d in "0123456789¹²³"}
 )
 
 
@@ -129,12 +131,17 @@ def list_projects(root: Path) -> list[ProjectEntry]:
 
 
 def _existing(root: Path, name: str) -> Path | None:
-    """The folder in ``root`` whose name matches ``name`` ignoring case and
-    look-alike spellings."""
+    """The folder in ``root`` named exactly ``name``, else the first whose name
+    matches it ignoring case and look-alike spellings (on a case-sensitive file
+    system two such folders can exist; the exact one wins)."""
     if not root.is_dir():
         return None
+    children = sorted(root.iterdir())
+    for child in children:
+        if child.name == name:
+            return child
     key = name_key(name)
-    for child in root.iterdir():
+    for child in children:
         if name_key(child.name) == key:
             return child
     return None

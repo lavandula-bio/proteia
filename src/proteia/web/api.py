@@ -34,6 +34,7 @@ from proteia.web import projects
 from proteia.web.state import preview_png, project_state
 
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
+_WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
 
 
@@ -50,7 +51,11 @@ class UploadTooLargeError(ValueError):
 
 
 class Workspace:
-    """The server's state: the projects root and the one open project."""
+    """The server's state: the projects root and the one open project.
+
+    A request keeps the session it started with: a project switch while it runs
+    does not redirect it (one user, one tab, so this only matters in a race).
+    """
 
     def __init__(
         self, root: Path, *, reveal: Callable[[Path], None], clock: Clock = utc_now
@@ -58,7 +63,8 @@ class Workspace:
         self.root = root
         self.reveal = reveal
         self.clock = clock
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards the open session and the previews
+        self._switching = threading.Lock()  # one switch at a time; never held by readers
         self._session: ProjectSession | None = None
         self._previews: OrderedDict[tuple[str, str], bytes] = OrderedDict()
 
@@ -73,21 +79,36 @@ class Workspace:
         with self._lock:
             return None if self._session is None else self._session.folder.name
 
+    def _peek(self) -> ProjectSession | None:
+        with self._lock:
+            return self._session
+
+    @staticmethod
+    def _save(session: ProjectSession) -> None:
+        try:
+            session.save()
+        except (OSError, ProjectError) as exc:
+            raise UnsavedChangesError(f"the open project could not be saved: {exc}") from exc
+
+    def flush(self) -> None:
+        """Save the open project if it has unsaved changes (an autosave failed);
+        :class:`UnsavedChangesError` if that fails again."""
+        session = self._peek()
+        if session is not None and session.dirty:
+            self._save(session)
+
     def _switch(self, make: Callable[[], ProjectSession]) -> ProjectSession:
         """Replace the open project with ``make()``; the old one is saved first,
-        and stays open if ``make`` fails or its unsaved changes cannot be saved."""
-        with self._lock:
-            old = self._session
+        and stays open if ``make`` fails or its unsaved changes cannot be saved.
+        Saving and opening run outside the lock readers take."""
+        with self._switching:
+            old = self._peek()
             if old is not None and old.dirty:
-                try:
-                    old.save()
-                except (OSError, ProjectError) as exc:
-                    raise UnsavedChangesError(
-                        f"the open project could not be saved ({exc}); it stays open"
-                    ) from exc
+                self._save(old)
             session = make()
-            self._session = session
-            self._previews.clear()
+            with self._lock:
+                self._session = session
+                self._previews.clear()
             return session
 
     def create(self, name: object) -> ProjectSession:
@@ -104,7 +125,7 @@ class Workspace:
             if key in self._previews:
                 self._previews.move_to_end(key)
                 return self._previews[key]
-        data = preview_png(session.pixels(image_id))
+        data = preview_png(session.pixels(image_id, keep=False))
         with self._lock:
             self._previews[key] = data
             while len(self._previews) > _PREVIEWS_KEPT:
@@ -224,18 +245,25 @@ async def import_image(
 ) -> dict[str, Any]:
     """The request body is the file's bytes; ``name`` is its original name
     (percent-encoded in the URL), kept only as metadata."""
-    session = workspace.current()
+    session = await run_in_threadpool(workspace.current)  # never block the event loop
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
         raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
-    # Spooled on disk, in the project folder (same volume), never held in memory.
+    # Spooled to a temporary file on the project's drive (not the system drive),
+    # never held in memory whole; import_image then copies it into images/.
     with tempfile.TemporaryFile(dir=session.folder) as spool:
         size = 0
+        pending = bytearray()
         async for chunk in request.stream():
             size += len(chunk)
             if size > MAX_UPLOAD_BYTES:
                 raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
-            await run_in_threadpool(spool.write, chunk)
+            pending += chunk
+            if len(pending) >= _WRITE_BYTES:
+                await run_in_threadpool(spool.write, bytes(pending))
+                pending.clear()
+        if pending:
+            await run_in_threadpool(spool.write, bytes(pending))
         spool.seek(0)
         image_id = await run_in_threadpool(
             lambda: ops.import_image(
@@ -353,6 +381,9 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         projects.ProjectExistsError: lambda e: _error(409, "project_exists", str(e)),
         projects.ProjectNotFoundError: lambda e: _error(404, "project_not_found", str(e)),
         ProjectError: lambda e: _error(422, "unreadable_project", str(e)),
+        OSError: lambda e: _error(
+            500, "file_error", str(e)
+        ),  # e.g. a folder that cannot be written
         RequestValidationError: lambda e: _error(
             422, "invalid_input", "; ".join(_describe(error) for error in e.errors())
         ),

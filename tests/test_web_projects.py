@@ -44,6 +44,11 @@ def test_a_project_name_is_stored_cleaned(name, stored):
         "..",
         "ends.",
         "CON",
+        "COM0",
+        "COM¹",
+        "lpt³.txt",
+        "CONIN$",
+        "conout$",
         "con",
         "Aux.txt",
         "COM1",
@@ -89,3 +94,22 @@ def test_names_are_unique_ignoring_case_and_look_alikes(tmp_path):
 def test_the_projects_root_is_in_the_documents_folder():
     root = projects.projects_root()
     assert root.name == "Proteia" and root.parent.is_dir()
+
+
+def _case_sensitive(folder) -> bool:
+    (folder / "probe").mkdir()
+    return not (folder / "PROBE").exists()
+
+
+def test_the_exact_name_wins_over_a_look_alike(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    if not _case_sensitive(tmp_path):
+        pytest.skip("two names differing only in case need a case-sensitive file system")
+    for name in ("blot", "Blot"):
+        folder = root / name
+        folder.mkdir()
+        (folder / storage.PROJECT_FILE).write_bytes(b"")
+    upper = projects._existing(root, "Blot")
+    lower = projects._existing(root, "blot")
+    assert (upper.name, lower.name) == ("Blot", "blot")

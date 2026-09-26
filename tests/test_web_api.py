@@ -341,3 +341,51 @@ def test_edits_need_an_open_project(client):
     body = {"protein_id": "prot-1", "x": 1, "y": 1}
     assert client.refused("POST", "/api/boxes", body)[:2] == (409, "no_project")
     assert client.refused("PUT", "/api/lanes", {"lanes": []})[:2] == (409, "no_project")
+
+
+# --- Review of #80 ---
+
+
+def test_a_folder_that_cannot_be_written_answers_json(client):
+    client.root.parent.mkdir(parents=True, exist_ok=True)
+    client.root.write_text("a file where the projects folder should be", encoding="utf-8")
+    status, code, _ = client.refused("POST", "/api/projects", {"name": "Blot"})
+    assert (status, code) == (500, "file_error")
+
+
+def test_readers_do_not_wait_for_a_project_switch(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    workspace.create("A")
+    with workspace._switching:  # a switch is saving or opening
+        assert workspace.current().folder.name == "A"
+        assert workspace.open_name == "A"
+
+
+def test_a_preview_does_not_keep_the_full_image_in_memory(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A")
+    with io.BytesIO(blot_bytes(tmp_path)) as stream:
+        image_id = api.ops.import_image(
+            session, stream, "a.tif", kind="chemiluminescence", polarity="dark_on_light"
+        )
+    session._pixels.clear()  # as if the image had not been worked on in this session
+    assert workspace.preview(session, image_id).startswith(b"\x89PNG")
+    assert image_id not in session._pixels
+
+
+def test_quit_saves_unsaved_changes_first_or_refuses(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    project_file = client.root / "Blot" / storage.PROJECT_FILE
+    project_file.unlink()
+    project_file.mkdir()  # the autosave cannot replace it
+    answer = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    assert answer["project"]["saved"] is False and answer["project"]["save_error"]
+
+    assert client.refused("POST", "/api/quit")[:2] == (409, "unsaved_changes")
+    assert client.ok("GET", "/api/status")["app"] == "proteia"  # still running
+
+    project_file.rmdir()
+    assert client.call("POST", "/api/quit")[0] == 202
+    saved = json.loads(project_file.read_text(encoding="utf-8"))
+    assert [lane["label"] for lane in saved["batch"]["lanes"]] == ["vehicle"]
