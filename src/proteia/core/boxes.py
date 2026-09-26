@@ -14,7 +14,9 @@ the image; :func:`center_snap` reads an edited rect by its centre (napari's
 ``_center_snap``); :func:`initial_box_size` is a new protein's default size
 (``_initial_size``); and :func:`grow_to_fit` fits the shared size to a
 seed-grown band (``_seed_grow``). Only one protein's own boxes must not overlap
-(:func:`overlaps_any`); boxes of different proteins may.
+(:func:`overlaps_any`); boxes of different proteins may. :func:`place_in_row`
+places one row of same-size boxes left to right without overlap (row-box
+detection, :mod:`proteia.core.rowdetect`).
 
 Coordinates use the model's :data:`~proteia.core.model.Rect` convention:
 ``(x0, y0, x1, y1)`` in image pixels, half-open on the high edge, with the box
@@ -23,6 +25,7 @@ anchored at its top-left ``(x0, y0)`` corner.
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Iterable, Sequence
 from typing import Literal
 
@@ -113,6 +116,40 @@ def initial_box_size(width: int, height: int) -> BoxSize:
     an eighth of the width and a twelfth of the height, at least 4 px, clamped to
     the image."""
     return BoxSize(width=min(width, max(4, width // 8)), height=min(height, max(4, height // 12)))
+
+
+def place_in_row(targets: Sequence[int], width: int, lo: int, hi: int) -> list[int]:
+    """Left edges for boxes of ``width`` along one row, in order, each as near its
+    target left edge as the row allows.
+
+    The result ``x0`` keeps ``x0[i + 1] >= x0[i] + width``, so the boxes never
+    overlap whatever their y, and ``lo <= x0[0]``, ``x0[-1] + width <= hi``. It
+    is bounded isotonic regression: the offsets ``targets[i] - i * width`` are
+    pooled where they decrease (pool adjacent violators, least squares), rounded
+    half up and clamped to ``[lo, hi - len(targets) * width]``, which keeps them
+    non-decreasing. Integer arithmetic only: shifting the targets and the bounds
+    by ``d`` shifts the result by exactly ``d``. Targets already in order and in
+    bounds come back unchanged.
+
+    Raises ValueError if the boxes cannot fit: ``len(targets) * width > hi - lo``.
+    """
+    top = hi - len(targets) * width
+    if top < lo:
+        raise ValueError(f"{len(targets)} boxes {width} px wide do not fit in [{lo}, {hi})")
+    blocks: list[list[int]] = []  # pooled offsets as [sum, count]
+    for i, target in enumerate(targets):
+        blocks.append([operator.index(target) - i * width, 1])
+        # Pool while the previous block's mean exceeds this one's.
+        while len(blocks) > 1 and blocks[-2][0] * blocks[-1][1] > blocks[-1][0] * blocks[-2][1]:
+            total, count = blocks.pop()
+            blocks[-1][0] += total
+            blocks[-1][1] += count
+    lefts: list[int] = []
+    for total, count in blocks:
+        offset = min(max((2 * total + count) // (2 * count), lo), top)  # round half up, clamp
+        start = len(lefts)
+        lefts.extend(offset + (start + k) * width for k in range(count))
+    return lefts
 
 
 def grow_to_fit(

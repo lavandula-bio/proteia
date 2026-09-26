@@ -38,6 +38,27 @@ def _membrane_noise(gray: np.ndarray) -> float:
     return float(1.4826 * np.median(np.abs(gray - np.median(gray))))
 
 
+def grow_region(signal: np.ndarray, seed: tuple[int, int], threshold: float) -> Rect | None:
+    """The growth rule itself: the bounding rect ``(x0, y0, x1, y1)``, half-open
+    on the high edge, of the 4-connected region of ``signal > threshold`` that
+    holds ``seed`` (an ``(x, y)`` pixel inside ``signal``); None if the seed's own
+    signal is not above ``threshold``.
+
+    :func:`grow_box` measures its signal and threshold and calls this; a caller
+    that measures its own (:mod:`proteia.core.rowdetect`, with a local
+    background and noise) passes them here and so grows a band exactly as a
+    click does.
+    """
+    from scipy.ndimage import label
+
+    sx, sy = seed
+    if not signal[sy, sx] > threshold:
+        return None
+    labels, _ = label(signal > threshold)
+    ys, xs = np.where(labels == labels[sy, sx])
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
 def grow_box(
     gray: np.ndarray,
     seed: tuple[int, int],
@@ -60,19 +81,13 @@ def grow_box(
     noise). ``max_width`` / ``max_height``, if given, cap the box around the seed
     as a safety valve against leaking into a neighbour.
     """
-    from scipy.ndimage import label
-
     sx, sy = seed
     s = _signal(gray.astype(float), background, dark_on_light)
     threshold = max(s[sy, sx] * rel_threshold, noise_k * _membrane_noise(gray))
-    if s[sy, sx] <= threshold:
+    grown = grow_region(s, seed, threshold)
+    if grown is None:
         return None
-
-    mask = s > threshold
-    labels, _ = label(mask)
-    ys, xs = np.where(labels == labels[sy, sx])
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, y0, x1, y1 = grown
 
     h_img, w_img = gray.shape
     if max_width is not None and (x1 - x0) > max_width:

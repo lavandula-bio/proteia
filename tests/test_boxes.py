@@ -15,9 +15,10 @@ from proteia.core.boxes import (
     initial_box_size,
     normalize_corners,
     overlaps_any,
+    place_in_row,
     resize_all,
 )
-from proteia.core.model import BoxSize
+from proteia.core.model import BoxSize, overlaps
 
 SIZE = BoxSize(width=10, height=4)
 
@@ -169,3 +170,60 @@ def test_grow_to_fit_refuses_a_box_on_an_existing_one():
         grow_to_fit(rects, SIZE, (12, 10, 18, 14), width=W, height=H)
     assert info.value.code == "overlap"
     assert isinstance(info.value, ValueError)
+
+
+# --- One row of same-size boxes (row-box detection) ---
+
+
+def test_place_in_row_keeps_ordered_targets():
+    assert place_in_row([0, 20, 45], 10, 0, 100) == [0, 20, 45]
+    assert place_in_row([], 10, 0, 5) == []
+
+
+def test_place_in_row_pushes_boxes_apart_about_their_mean():
+    assert place_in_row([20, 24], 10, 0, 100) == [17, 27]  # each moves 3 px
+    assert place_in_row([50, 50, 50], 10, 0, 200) == [40, 50, 60]
+    # Only the colliding pair moves; the first box stays on its target.
+    assert place_in_row([0, 40, 44], 10, 0, 100) == [0, 37, 47]
+
+
+def test_place_in_row_rounds_a_pooled_half_up():
+    assert place_in_row([21, 30], 10, 0, 100) == [21, 31]  # offsets 21, 20 pool to 20.5
+    assert place_in_row([-3, 4], 10, -100, 100) == [-4, 6]  # -4.5 rounds up to -4
+
+
+def test_place_in_row_stays_inside_the_bounds():
+    assert place_in_row([-5, 3], 10, 0, 100) == [0, 10]
+    assert place_in_row([95], 10, 0, 100) == [90]
+    assert place_in_row([0, 0, 0], 10, 0, 30) == [0, 10, 20]  # exactly fits
+
+
+def test_place_in_row_refuses_boxes_that_do_not_fit():
+    with pytest.raises(ValueError, match="do not fit"):
+        place_in_row([0, 0, 0], 10, 0, 29)
+
+
+def test_place_in_row_takes_ints_only():
+    assert place_in_row([np.int64(3)], 4, 0, 10) == [3]
+    with pytest.raises(TypeError):
+        place_in_row([1.5], 10, 0, 100)
+
+
+def test_place_in_row_properties():
+    rng = np.random.default_rng(51)
+    for _ in range(300):
+        m, w = int(rng.integers(1, 9)), int(rng.integers(1, 21))
+        lo = int(rng.integers(-50, 51))
+        hi = lo + m * w + int(rng.integers(0, 60))
+        targets = [int(t) for t in rng.integers(lo - 30, hi + 30, m)]
+        lefts = place_in_row(targets, w, lo, hi)
+        assert all(type(x) is int for x in lefts)
+        assert lo <= lefts[0] and lefts[-1] + w <= hi
+        assert all(b - a >= w for a, b in itertools.pairwise(lefts))
+        rects = [(x, int(rng.integers(0, 5)), x + w, 10) for x in lefts]  # any y
+        assert not any(overlaps(a, b) for a, b in itertools.combinations(rects, 2))
+        # Exact translation: shifting targets and bounds shifts the result.
+        d = int(rng.integers(-40, 41))
+        assert place_in_row([t + d for t in targets], w, lo + d, hi + d) == [x + d for x in lefts]
+        # Targets that already fit come back unchanged.
+        assert place_in_row(lefts, w, lo, hi) == lefts
