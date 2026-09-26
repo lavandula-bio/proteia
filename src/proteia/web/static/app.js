@@ -233,11 +233,13 @@ async function openProject(path, name) {
     return;
   }
   setOpening(name);
-  // Before asking: no queued panel edit may reach the project opened next.
-  proteinPanel.reset();
-  $("lane-picker").hidden = true;
   $("projects-error").textContent = "";
   try {
+    // The panel's edits end in the project they were made in, their refusals
+    // shown (the dialog is modal: no edit is made meanwhile). Then, before
+    // asking, none may reach the project opened next: ids repeat across projects.
+    await proteinPanel.settled();
+    proteinPanel.invalidateEdits();
     const answer = await call("POST", path, { name });
     if (!isCurrent(answer.project)) {
       $("projects-error").textContent = "Another project was opened meanwhile.";
@@ -250,6 +252,8 @@ async function openProject(path, name) {
     for (const id of [...state.bitmaps.keys()]) {
       forgetBitmap(id);
     }
+    proteinPanel.forgetTyped();
+    $("lane-picker").hidden = true; // its retry places a box in the project it asked about
     applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
     $("projects-dialog").close();
     showStatus("");

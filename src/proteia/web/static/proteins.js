@@ -55,14 +55,30 @@ export class ProteinPanel {
     this.filled = new Map(); // input id -> the value the panel last put in it
     this.editorFor = null; // the protein the editor was last drawn for
     this.queue = Promise.resolve(); // edits run one at a time, in order
-    this.opening = 0; // counts reset(): a queued edit never reaches another project
+    this.adding = Promise.resolve(); // the adds on their way (they are not queued)
+    this.opening = 0; // counts invalidateEdits(): a queued edit never reaches another project
     this.bind();
   }
 
-  // Forget what was typed or queued: another project was opened, and its ids
-  // repeat those of the one before (prot-3 in each).
-  reset() {
+  // Resolves once every edit made in the panel has its answer, and what the
+  // answer shows (the editor, a refusal, the add form closing) is shown. The app
+  // waits for it before asking to open another project, so those edits end in
+  // the project they were made in.
+  settled() {
+    return Promise.all([this.queue, this.adding]);
+  }
+
+  // No edit made before this, nor the answer to one, is applied from now on:
+  // called just before another project is asked for, since its ids repeat those
+  // of the one open (prot-3 in each). After settled() nothing is left to drop;
+  // this keeps it so.
+  invalidateEdits() {
     this.opening += 1;
+  }
+
+  // Forget what was typed in the editor and the add form: another project is
+  // shown now. Not before: a failed open leaves the open project's panel as it was.
+  forgetTyped() {
     this.filled.clear();
     this.editorFor = null;
     this.closeAdd(false);
@@ -83,7 +99,7 @@ export class ProteinPanel {
     $("add-protein-cancel").addEventListener("click", () => this.closeAdd(true));
     $("add-protein").addEventListener("submit", (event) => {
       event.preventDefault();
-      this.add();
+      this.adding = Promise.all([this.adding, this.add()]).catch(() => null);
     });
     $("add-protein").addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
