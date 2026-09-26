@@ -52,16 +52,17 @@ def clean_text(text: str) -> str:
     trimmed and collapsed to single ASCII spaces. Raises :class:`TextError`
     (``control_character``) for a control character other than tab, newline,
     vertical tab, form feed or carriage return, such as BEL or the separators
-    U+001C-U+001F and U+0085 that ``str.split`` would treat as spaces; or
-    (``blank_text``) if nothing is left.
+    U+001C-U+001F and U+0085 that ``str.split`` would treat as spaces, or for an
+    unpaired surrogate (``Cs``, as JSON's ``"\\ud800"`` gives), which no UTF-8
+    file can store; or (``blank_text``) if nothing is left.
     """
     text = unicodedata.normalize("NFC", _drop_format(text))
-    bad = next(
-        (c for c in text if unicodedata.category(c) == "Cc" and c not in _WHITESPACE_CONTROLS),
-        None,
-    )
-    if bad is not None:
-        raise TextError("control_character", f"must not contain the control character {bad!r}")
+    for c in text:
+        category = unicodedata.category(c)
+        if category == "Cc" and c not in _WHITESPACE_CONTROLS:
+            raise TextError("control_character", f"must not contain the control character {c!r}")
+        if category == "Cs":
+            raise TextError("control_character", f"must not contain the unpaired surrogate {c!r}")
     cleaned = " ".join(text.split())
     if not cleaned:
         raise TextError("blank_text", "must not be blank")
