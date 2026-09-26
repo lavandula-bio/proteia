@@ -245,6 +245,23 @@ def test_a_launch_never_starts_a_second_server(tmp_path, with_info):
     assert opener.urls == []
 
 
+def test_a_launch_starts_when_the_waited_for_instance_stops(tmp_path):
+    held = launch.InstanceLock.acquire(tmp_path)  # an instance that is quitting
+    timer = threading.Timer(0.5, held.release)
+    timer.start()
+    opener = Opener()
+    try:
+        instance = launch.start(folder=tmp_path, opener=opener, wait=10)
+    finally:
+        timer.join()
+    assert instance is not None
+    try:
+        assert opener.urls == [(tmp_path / REDIRECT_FILE).as_uri()]
+        assert launch.InstanceLock.acquire(tmp_path) is None  # the new instance holds it
+    finally:
+        instance.close()
+
+
 def test_the_probe_ignores_proxy_settings(running, monkeypatch):
     for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.setenv(name, "http://127.0.0.1:9")

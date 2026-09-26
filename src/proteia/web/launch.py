@@ -21,7 +21,9 @@ writes it to files only the current user can read, in the same folder:
   to a server. The page keeps it for its tab and sends it in a request header.
 
 Both files are removed when the server stops (Quit on the page, Ctrl+C, or a
-termination signal), before the lock is released. The only connection a launch
+termination signal), before the lock is released. (A launch that opens the
+running instance just as it stops can write the redirect page again; its token
+opens nothing, and the next launch replaces it.) The only connection a launch
 makes is the check of the running instance, to its loopback port, without any
 proxy. On POSIX the folder is 0700 and the files 0600; on Windows the per-user
 local application-data folder is readable only by its owner.
@@ -294,14 +296,18 @@ class Instance:
         self._lock.release()
 
 
-def _open_running(folder: Path, opener: Opener, wait: float) -> None:
-    """Another process holds the lock: wait until its instance answers, then open it."""
+def _open_running(folder: Path, opener: Opener, wait: float) -> InstanceLock | None:
+    """Another process holds the lock: wait until its instance answers and open it
+    (None), or return the lock if that instance stops meanwhile (it was quitting)."""
     deadline = time.monotonic() + wait
     while True:
         info = read_instance(folder)
         if info is not None and probe(info):
             open_in_browser(folder, info.port, info.token, opener)
-            return
+            return None
+        lock = InstanceLock.acquire(folder)
+        if lock is not None:
+            return lock
         if time.monotonic() >= deadline:
             raise NotRespondingError("Proteia is already running but does not respond")
         time.sleep(0.2)
@@ -314,15 +320,17 @@ def start(
 
     A new instance holds the lock, is bound and listening, and has written its
     files before the browser opens; call :meth:`Instance.serve` to serve it. When
-    another instance holds the lock but does not answer within ``wait`` seconds,
-    ``NotRespondingError``: a second server is never started.
+    another instance holds the lock, this waits up to ``wait`` seconds for it to
+    answer, or to stop and free the lock; then ``NotRespondingError``. A second
+    server is never started.
     """
     folder = state_dir() if folder is None else folder
     _private_dir(folder)
     lock = InstanceLock.acquire(folder)
     if lock is None:
-        _open_running(folder, opener, wait)
-        return None
+        lock = _open_running(folder, opener, wait)
+        if lock is None:
+            return None
     instance: Instance | None = None
     try:
         sock = bind_loopback()
