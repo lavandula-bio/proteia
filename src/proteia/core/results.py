@@ -7,7 +7,9 @@ One call gives:
 
 * the lane rows and the raw per-lane table: each protein's stored nets joined to
   the lane table by the stored lane index, so a lane with no box is ``None`` and
-  shifts nothing;
+  shifts nothing. A lane with a not-detected record has no value either, so the
+  statistics leave it out as they do a lane with no box; its ``detected`` flag
+  (:func:`lane_detected`) and a ``below_detection`` notice tell the two apart;
 * one :class:`SeriesResult` per (target, resolved loading control) pairing, with
   its per-lane ratios, fold-changes, reduced groups and chart;
 * typed :class:`Notice` objects, built from the model directly, never by parsing
@@ -81,6 +83,7 @@ class NoticeCode(StrEnum):
     REFERENCE_NOT_PLOTTED = "reference_not_plotted"  # the baseline still comes from it
     EXTRA_BANDS_IGNORED = "extra_bands_ignored"  # band_index > 0 is not quantified yet
     CLIPPED = "clipped"  # bands with pixels at the detector limit: over-exposed, still included
+    BELOW_DETECTION = "below_detection"  # not-detected records in included lanes: no value
 
 
 class Level(StrEnum):
@@ -127,6 +130,9 @@ class ProteinColumn(BaseModel, frozen=True):
     nets: list[float | None]  # joined on the stored lane_index; None = no box
     band_ids: list[str | None]
     clipped: list[bool | None]  # per lane: over-exposed; None = no box, or not checked
+    # Per lane: True = a box; False = not detected (below the detection limit, no
+    # value); None = not measured.
+    detected: list[bool | None]
 
 
 class SeriesResult(BaseModel, frozen=True):
@@ -143,6 +149,9 @@ class SeriesResult(BaseModel, frozen=True):
     groups: dict[str, list[float]]  # the one reduction, every condition, in value_kind units
     averaged: list[tuple[str, str]]  # (condition, sample) keys whose repeats were collapsed
     chart: PlotSpec | None  # groups restricted to the plotted conditions
+    # Per condition, in lane order: the included lanes where the target was not
+    # detected (the loading control's are in its below_detection notice).
+    undetected: dict[str, list[int]]
 
 
 class Results(BaseModel, frozen=True):
@@ -194,6 +203,25 @@ def _join(protein: model.Protein, n: int) -> list[model.Band | None]:
     """
     by_lane = {band.lane_index: band for band in protein.bands if band.band_index == 0}
     return [by_lane.get(i) for i in range(n)]
+
+
+def lane_detected(batch: model.Batch) -> dict[str, list[bool | None]]:
+    """Each protein's detection state per lane (band index 0), keyed like
+    :func:`lane_nets`: True where a box was measured, False where a detector found
+    the band below its detection limit (a not-detected record: no value), None
+    where the lane was not measured.
+
+    The one join of boxes and records to the lane table, by stored lane index as
+    in :func:`_join`; :func:`compute_results` takes the detection state from
+    here. The model allows a lane a box or a record, never both.
+    """
+    n = len(batch.lanes)
+    detected: dict[str, list[bool | None]] = {}
+    for protein in batch.proteins:
+        state = {u.lane_index: False for u in protein.undetected if u.band_index == 0}
+        state.update((b.lane_index, True) for b in protein.bands if b.band_index == 0)
+        detected[protein.id] = [state.get(i) for i in range(n)]
+    return detected
 
 
 def lane_nets(batch: model.Batch) -> dict[str, LaneNets]:
@@ -344,6 +372,7 @@ def _compute(
     ]
     joined = {protein.id: _join(protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
+    detected = lane_detected(batch)
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -353,9 +382,11 @@ def _compute(
             nets=nets[p.id],
             band_ids=_field(joined[p.id], "id"),
             clipped=_field(joined[p.id], "clipped"),
+            detected=detected[p.id],
         )
         for p in batch.proteins
     ]
+    # Boxes only: a record beyond the first band has no value to ignore.
     extra = tuple(p.id for p in batch.proteins if any(b.band_index > 0 for b in p.bands))
     if extra:
         note(
@@ -408,6 +439,24 @@ def _compute(
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
+    for column in columns:  # not-detected records in lanes this set includes
+        below = tuple(i for i, flag in enumerate(column.detected) if flag is False and included[i])
+        if not below:
+            continue
+        if column.role is Role.LOADING_CONTROL:
+            effect = "targets normalized to it have no value there"
+        elif len(below) == 1:
+            effect = "that lane has no value and is left out of the statistics"
+        else:
+            effect = "those lanes have no value and are left out of the statistics"
+        note(
+            NoticeCode.BELOW_DETECTION,
+            f"{column.name!r} was not detected in {_lanes(below)}"
+            f" (below the detection limit): {effect}",
+            protein_ids=(column.protein_id,),
+            lane_indices=below,
+            conditions=tuple(dict.fromkeys(conditions[i] for i in below)),
+        )
     labels = list(dict.fromkeys(conditions))  # distinct, in lane order
     similar: dict[str, list[str]] = {}
     for label in labels:
@@ -503,6 +552,10 @@ def _compute(
             for key in red.averaged:
                 if key not in averaged:
                     averaged.append(key)
+            undetected: dict[str, list[int]] = {}
+            for i, flag in enumerate(detected[target_id]):
+                if flag is False and included[i]:
+                    undetected.setdefault(conditions[i], []).append(i)
             kind = ValueKind.LOADING_NORMALIZED
             groups = red.groups
             baseline: float | None = None
@@ -516,9 +569,25 @@ def _compute(
                     # Already explained when every reference lane is excluded, or when
                     # the series has no value at all (NO_VALUES below).
                     if not reference_all_excluded and red.groups:
+                        reason = str(exc)
+                        in_reference = [i for i in reference_lanes if included[i]]
+                        # The target or its loading control (or both) was not
+                        # detected in any included reference lane.
+                        missing = [
+                            name
+                            for pid, name in ((target_id, s.target), (loading_id, s.loading))
+                            if in_reference and all(detected[pid][i] is False for i in in_reference)
+                        ]
+                        if exc.reason == "no_value" and missing:
+                            were = "was" if len(missing) == 1 else "were"
+                            reason = (
+                                f"{' and '.join(map(repr, missing))} {were} not detected in the"
+                                f" reference condition {ref!r} (below the detection limit):"
+                                " no fold-change can be formed"
+                            )
                         note(
                             NoticeCode.REFERENCE_UNUSABLE,
-                            f"{s.target!r} / {s.loading!r}: {exc}",
+                            f"{s.target!r} / {s.loading!r}: {reason}",
                             protein_ids=pair_ids,
                             conditions=(ref,),
                         )
@@ -568,6 +637,7 @@ def _compute(
                     groups=groups,
                     averaged=red.averaged,
                     chart=chart,
+                    undetected=undetected,
                 )
             )
 

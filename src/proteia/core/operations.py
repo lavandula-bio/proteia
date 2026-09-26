@@ -35,6 +35,20 @@ always equals ``net_signal`` of the stored pixels, box, size, background and
 polarity, and every clipping flag these operations store is ``is_clipped`` of
 the same.
 
+A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
+detector's measurement that cannot be redone from the model alone, so an edit
+that invalidates one drops it, in the same change, and logs it in full: a box
+placed or moved into its lane replaces it (``replaced_undetected``), and a
+polarity change or a lane table that cuts its lane drops it
+(``dropped_undetected``). An MW-guided record searched a slot placed from the
+protein's expected MW and its membrane's calibration, so a change to the
+expected MW drops that protein's MW-guided records, and a change to the
+calibration (points removed with their image) drops those of every protein on
+the membrane (``dropped_undetected``). A removed protein or image takes its
+proteins' records along, and the log lists them whole (``removed_undetected``),
+since they have no ids. Removing a box never creates a record: the lane becomes
+"not measured".
+
 Functions return ids or small frozen dataclasses, never model objects. Typed text
 follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxes`.
 """
@@ -74,6 +88,7 @@ from proteia.core.model import (
     Protein,
     Rect,
     Role,
+    UndetectedBand,
     UnknownIdError,
     apply_change,
     overlaps,
@@ -121,6 +136,7 @@ __all__ = [
     "remove_box",
     "remove_image",
     "remove_protein",
+    "remove_undetected",
     "save",
     "set_box_lane",
     "set_box_size",
@@ -171,6 +187,8 @@ class LanesUpdate:
 
     respelled: tuple[int, ...]  # lanes whose condition or sample took an existing spelling
     reference_cleared: bool  # the reference no longer named a lane and was cleared
+    # (protein id, lane index, band index) of each not-detected record in a dropped lane
+    dropped_undetected: tuple[tuple[str, int, int], ...] = ()
 
 
 # --- Common machinery ---
@@ -234,6 +252,54 @@ def _cascade(cascade: Cascade) -> dict[str, JsonValue]:
         "unpaired_images": list(cascade.unpaired_images),
         "unfitted_membranes": list(cascade.unfitted_membranes),
     }
+
+
+def _undetected_json(protein_id: str, record: UndetectedBand) -> dict[str, JsonValue]:
+    """A not-detected record as a log entry names it: whole, since it has no id."""
+    return {
+        "protein_id": protein_id,
+        "lane_index": record.lane_index,
+        "band_index": record.band_index,
+        "reason": record.reason.value,
+        "snr": record.snr,
+        "threshold": record.threshold,
+        "region": list(record.region.rect()),
+        "source": record.source.value,
+    }
+
+
+def _drop_undetected_where(
+    protein: Protein, drop: Callable[[UndetectedBand], bool]
+) -> list[dict[str, JsonValue]]:
+    """Remove a draft protein's records for which ``drop`` is true; return their
+    log forms in the stored order (plain values, as a change should return)."""
+    kept: list[UndetectedBand] = []
+    dropped: list[dict[str, JsonValue]] = []
+    for u in protein.undetected:
+        if drop(u):
+            dropped.append(_undetected_json(protein.id, u))
+        else:
+            kept.append(u)
+    if dropped:
+        protein.undetected = kept
+    return dropped
+
+
+def _drop_mw_guided(protein: Protein) -> list[dict[str, JsonValue]]:
+    """Remove a draft protein's MW-guided records: the slot each one examined was
+    placed from the expected MW and the membrane's calibration, so a change to
+    either leaves the record about a slot nobody looked in."""
+    return _drop_undetected_where(protein, lambda record: record.source is ProposalSource.MW_GUIDED)
+
+
+def _drop_undetected(
+    protein: Protein, lane_index: int, band_index: int
+) -> dict[str, JsonValue] | None:
+    """Remove a draft protein's record at (lane, band index): its log form, or None."""
+    dropped = _drop_undetected_where(
+        protein, lambda record: (record.lane_index, record.band_index) == (lane_index, band_index)
+    )
+    return dropped[0] if dropped else None
 
 
 def _quantify(band: Band, protein: Protein, image: ImageRef, array: np.ndarray) -> None:
@@ -566,21 +632,24 @@ def import_image(
 
 @_locked
 def remove_image(session: ProjectSession, image_id: str) -> Cascade:
-    """Remove an image with the proteins and bands on it.
+    """Remove an image with the proteins, bands and not-detected records on it.
 
     Targets using a removed loading control, by name or as the batch's only
     one, are detached and reported, marker pairings to the image are cleared, and calibration
-    points on it are dropped, which clears the membrane's fit and its bands'
-    apparent MWs. A membrane left with no image is removed. The file is deleted
-    after the next successful save.
+    points on it are dropped, which clears the membrane's fit, its bands'
+    apparent MWs and its proteins' MW-guided records. A membrane left with no
+    image is removed. The file is deleted after the next successful save. The
+    log lists the removed records (``removed_undetected``) and the MW-guided ones
+    dropped (``dropped_undetected``) in full.
     """
     session.project.batch.find_image(image_id)
 
-    def change(draft: Project) -> Cascade:
+    def change(draft: Project) -> tuple[Cascade, list[JsonValue], list[JsonValue]]:
         batch = draft.batch
         gone = [p for p in batch.proteins if p.image_id == image_id]
         gone_ids = {p.id for p in gone}
         removed = [image_id, *(p.id for p in gone), *(b.id for p in gone for b in p.bands)]
+        records: list[JsonValue] = [_undetected_json(p.id, u) for p in gone for u in p.undetected]
         # Targets using a removed loading control without naming it lose it too.
         implicit = {t for p in gone for t in _implicit_users(batch, p.id)} - gone_ids
         batch.proteins = [p for p in batch.proteins if p.id not in gone_ids]
@@ -603,6 +672,7 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
         membrane = batch.membrane_of(image_id)
         membrane.images = [image for image in membrane.images if image.id != image_id]
         unfitted = []
+        dropped: list[JsonValue] = []
         calibration = membrane.calibration
         points = [point for point in calibration.points if point.image_id != image_id]
         if len(points) != len(calibration.points):
@@ -613,31 +683,43 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
                 if protein.image_id in on_membrane:
                     for band in protein.bands:
                         band.apparent_mw = None
+                    dropped.extend(_drop_mw_guided(protein))
             if membrane.images:
                 unfitted.append(membrane.id)
         if not membrane.images:
             batch.membranes = [m for m in batch.membranes if m.id != membrane.id]
             removed.append(membrane.id)
-        return Cascade(
+        cascade = Cascade(
             removed=tuple(removed),
             detached_targets=tuple(detached),
             unpaired_images=tuple(unpaired),
             unfitted_membranes=tuple(unfitted),
         )
+        return cascade, records, dropped
 
-    return _apply(
-        session,
-        "remove_image",
-        change,
-        lambda cascade: {"image_id": image_id, **_cascade(cascade)},
-        evict=(image_id,),
-    )
+    def params(result: tuple[Cascade, list[JsonValue], list[JsonValue]]) -> _Params:
+        cascade, records, dropped = result
+        return {
+            "image_id": image_id,
+            **_cascade(cascade),
+            "removed_undetected": records,
+            "dropped_undetected": dropped,
+        }
+
+    cascade, _, _ = _apply(session, "remove_image", change, params, evict=(image_id,))
+    return cascade
 
 
 @_locked
 def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> None:
     """Set an image's polarity and recompute the nets of every band on it (the
-    background, a median, does not depend on it)."""
+    background, a median, does not depend on it).
+
+    The not-detected records of every protein on the image are dropped and
+    logged: their SNR was measured with the other signal direction, against the
+    row's fitted background, so it cannot be recomputed here. A later detection
+    run writes them again.
+    """
     polarity = _member(Polarity, polarity, "polarity")
     batch = session.project.batch
     if batch.find_image(image_id).polarity is polarity:
@@ -645,16 +727,26 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     has_bands = any(p.bands for p in batch.proteins if p.image_id == image_id)
     array = session.pixels(image_id) if has_bands else None
 
-    def change(draft: Project) -> None:
+    def change(draft: Project) -> list[dict[str, JsonValue]]:
         draft.batch.find_image(image_id).polarity = polarity
         if array is not None:
             _requantify_image(draft, image_id, array)
+        return [
+            dropped
+            for protein in draft.batch.proteins
+            if protein.image_id == image_id
+            for dropped in _drop_undetected_where(protein, lambda _: True)
+        ]
 
     _apply(
         session,
         "set_polarity",
         change,
-        lambda _: {"image_id": image_id, "polarity": polarity.value},
+        lambda dropped: {
+            "image_id": image_id,
+            "polarity": polarity.value,
+            "dropped_undetected": dropped,
+        },
     )
 
 
@@ -674,8 +766,11 @@ def set_lanes(
     (equal NFKC key, e.g. the micro sign and Greek mu) are unified: where the new
     table mixes them, the spelling already in the table wins; a look-alike typed
     for every lane of a condition renames it. Case differences are kept.
-    Lanes holding a box cannot be dropped (``LANES_IN_USE``); band lane indices
-    are never remapped. Each kept lane keeps its metadata.
+    Lanes holding a box cannot be dropped (``LANES_IN_USE``): boxes are the user's
+    measurements. Not-detected records in dropped lanes are dropped instead, and
+    reported: one detection run makes them again, and a lane cut from the table
+    means nothing any more. Lane indices are never remapped. Each kept lane keeps
+    its metadata and its records.
 
     ``reference_condition``: ``KEEP`` re-resolves the current reference against
     the new conditions and clears it if none matches (reported in the result); a
@@ -725,7 +820,7 @@ def set_lanes(
     else:
         reference = _condition(reference_condition, labels)
 
-    def change(draft: Project) -> None:
+    def change(draft: Project) -> list[dict[str, JsonValue]]:
         old = draft.batch.lanes
         draft.batch.lanes = [
             Lane(
@@ -738,6 +833,11 @@ def set_lanes(
             for i in range(n)
         ]
         draft.batch.reference_condition = reference
+        return [
+            dropped
+            for protein in draft.batch.proteins
+            for dropped in _drop_undetected_where(protein, lambda record: record.lane_index >= n)
+        ]
 
     # Only the rows that are new or differ from the committed table, as stored.
     stored = [(lane.label, lane.sample, lane.included) for lane in batch.lanes]
@@ -747,9 +847,18 @@ def set_lanes(
         for i, (condition, sample, include) in enumerate(rows)
         if i >= len(stored) or rows[i] != stored[i]
     ]
-    params = {"lane_count": n, "changed": changed, "reference_condition": reference}
-    _apply(session, "set_lanes", change, lambda _: params)
-    return LanesUpdate(respelled=respelled, reference_cleared=cleared)
+
+    def params(dropped: list[dict[str, JsonValue]]) -> _Params:
+        return {
+            "lane_count": n,
+            "changed": changed,
+            "reference_condition": reference,
+            "dropped_undetected": dropped,
+        }
+
+    dropped = _apply(session, "set_lanes", change, params)
+    keys = tuple((d["protein_id"], d["lane_index"], d["band_index"]) for d in dropped)
+    return LanesUpdate(respelled=respelled, reference_cleared=cleared, dropped_undetected=keys)
 
 
 @_locked
@@ -854,7 +963,9 @@ def edit_protein(
     becomes the second one, the first is written into the targets that used it
     without naming it. A loading control that targets use, by name or as the
     batch's only one, cannot become a target (``LOADING_CONTROL_IN_USE``, with
-    those targets): choose other loading controls for them first.
+    those targets): choose other loading controls for them first. A changed
+    expected MW drops the protein's MW-guided not-detected records, whose slot
+    came from the old one (``dropped_undetected``, logged in full).
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
@@ -875,7 +986,7 @@ def edit_protein(
     else:
         controls = _loading_controls(batch, protein_id, new_role, loading_control_ids)
 
-    def change(draft: Project) -> list[str]:
+    def change(draft: Project) -> tuple[list[str], list[JsonValue]]:
         pinned = []
         if protein.role is Role.TARGET and new_role is Role.LOADING_CONTROL:
             pinned = _pin_single_loading_control(draft.batch)
@@ -884,11 +995,21 @@ def edit_protein(
         edited.role = new_role
         edited.expected_mw = mw
         edited.loading_control_ids = controls
-        return [target for target in pinned if target != protein_id]  # its own is cleared
+        dropped: list[JsonValue] = []
+        if mw != protein.expected_mw:
+            dropped.extend(_drop_mw_guided(edited))
+        pinned = [target for target in pinned if target != protein_id]  # its own is cleared
+        return pinned, dropped
 
-    def params(pinned: list[str]) -> _Params:
-        # Only the fields whose stored value changed, a cleared list included.
-        edits: dict[str, JsonValue] = {"protein_id": protein_id, "pinned_targets": pinned}
+    def params(result: tuple[list[str], list[JsonValue]]) -> _Params:
+        pinned, dropped = result
+        # What the edit did to others, always; of the protein's own fields, only
+        # those whose stored value changed, a cleared list included.
+        edits: dict[str, JsonValue] = {
+            "protein_id": protein_id,
+            "pinned_targets": pinned,
+            "dropped_undetected": dropped,
+        }
         if new_name != protein.name:
             edits["name"] = new_name
         if new_role is not protein.role:
@@ -904,13 +1025,16 @@ def edit_protein(
 
 @_locked
 def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
-    """Remove a protein and its bands; targets using it as their loading control,
-    by name or as the batch's only one, are detached and reported."""
+    """Remove a protein with its bands and not-detected records; targets using it
+    as their loading control, by name or as the batch's only one, are detached
+    and reported. The log lists the records in full (``removed_undetected``)."""
     session.project.batch.find_protein(protein_id)
 
-    def change(draft: Project) -> Cascade:
+    def change(draft: Project) -> tuple[Cascade, list[JsonValue]]:
         batch = draft.batch
-        removed = (protein_id, *(band.id for band in batch.find_protein(protein_id).bands))
+        gone = batch.find_protein(protein_id)
+        removed = (protein_id, *(band.id for band in gone.bands))
+        records: list[JsonValue] = [_undetected_json(protein_id, u) for u in gone.undetected]
         implicit = set(_implicit_users(batch, protein_id))
         batch.proteins = [p for p in batch.proteins if p.id != protein_id]
         detached = []
@@ -920,19 +1044,20 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
                 detached.append(protein.id)
             elif protein.id in implicit:
                 detached.append(protein.id)
-        return Cascade(
+        cascade = Cascade(
             removed=removed,
             detached_targets=tuple(detached),
             unpaired_images=(),
             unfitted_membranes=(),
         )
+        return cascade, records
 
-    return _apply(
-        session,
-        "remove_protein",
-        change,
-        lambda cascade: {"protein_id": protein_id, **_cascade(cascade)},
-    )
+    def params(result: tuple[Cascade, list[JsonValue]]) -> _Params:
+        cascade, records = result
+        return {"protein_id": protein_id, **_cascade(cascade), "removed_undetected": records}
+
+    cascade, _ = _apply(session, "remove_protein", change, params)
+    return cascade
 
 
 # --- Boxes ---
@@ -965,6 +1090,9 @@ def place_box(
     only grow it, and the other boxes are re-centred and re-quantified).
     ``grow=False`` drops a box of the current size centred on the point, shifted
     inside the image. A protein's own boxes never overlap.
+
+    A not-detected record in the lane is replaced by the box, with no
+    confirmation: the log entry names it (``replaced_undetected``, else null).
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
@@ -1038,7 +1166,7 @@ def place_box(
     if lane_index is None:  # unreachable: every branch above checks or proposes it
         raise RuntimeError("place_box left the lane unresolved")
 
-    def change(draft: Project) -> str:
+    def change(draft: Project) -> tuple[str, dict[str, JsonValue] | None]:
         edited = draft.batch.find_protein(protein_id)
         edited_image = draft.batch.find_image(edited.image_id)
         size_changed = edited.box_size != size
@@ -1058,9 +1186,10 @@ def place_box(
         )
         _quantify(band, edited, edited_image, array)
         edited.bands.append(band)
-        return band.id
+        return band.id, _drop_undetected(edited, lane_index, 0)
 
-    def params(band_id: str) -> _Params:
+    def params(result: tuple[str, dict[str, JsonValue] | None]) -> _Params:
+        band_id, replaced = result
         return {
             "band_id": band_id,
             "protein_id": protein_id,
@@ -1071,9 +1200,11 @@ def place_box(
             "lane_proposed": proposed,
             "rect": list(rect),
             "box_size": _size(size),  # after the change: a seed click may grow it
+            "replaced_undetected": replaced,
         }
 
-    return _apply(session, "place_box", change, params)
+    band_id, _ = _apply(session, "place_box", change, params)
+    return band_id
 
 
 @_locked
@@ -1129,7 +1260,9 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
 
     The lane must be one of the declared lanes (``LANE_OUT_OF_RANGE``) where the
     protein has no box for the same band yet (``LANE_OCCUPIED``). The box counts
-    as edited by the user. The same lane is a no-op.
+    as edited by the user. The same lane is a no-op. A not-detected record for
+    the same band in the new lane is replaced (``replaced_undetected``); the lane
+    the box leaves gets no record.
     """
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
@@ -1149,12 +1282,18 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
         "lane_index": lane,
     }
 
-    def change(draft: Project) -> None:
-        _, edited = draft.batch.find_band(band_id)
+    def change(draft: Project) -> dict[str, JsonValue] | None:
+        edited_protein, edited = draft.batch.find_band(band_id)
         edited.lane_index = lane
         edited.manually_edited = True
+        return _drop_undetected(edited_protein, lane, edited.band_index)
 
-    _apply(session, "set_box_lane", change, lambda _: params)
+    _apply(
+        session,
+        "set_box_lane",
+        change,
+        lambda replaced: {**params, "replaced_undetected": replaced},
+    )
 
 
 @_locked
@@ -1191,6 +1330,49 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
         "set_box_size",
         change,
         lambda _: {"protein_id": protein_id, "box_size": _size(size)},
+    )
+
+
+# --- Not-detected records ---
+
+
+@_locked
+def remove_undetected(
+    session: ProjectSession, protein_id: str, lane_index: int, *, band_index: int = 0
+) -> None:
+    """Remove a protein's not-detected record in a lane: the lane becomes "not
+    measured", as if the detector had never looked there.
+
+    The lane must be one of the declared lanes (``LANE_OUT_OF_RANGE``). No record
+    at that lane and band index is a no-op. The log entry holds the whole record.
+    """
+    batch = session.project.batch
+    protein = batch.find_protein(protein_id)
+    lane = _int(lane_index, "lane index")
+    band = _int(band_index, "band index")
+    n = len(batch.lanes)
+    if not 0 <= lane < n:
+        raise OperationError(
+            ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane} is not one of the {n} lanes"
+        )
+    if band < 0:
+        raise _invalid(f"band index must be 0 or more, not {band}")
+    if all((u.lane_index, u.band_index) != (lane, band) for u in protein.undetected):
+        return
+
+    def change(draft: Project) -> dict[str, JsonValue] | None:
+        return _drop_undetected(draft.batch.find_protein(protein_id), lane, band)
+
+    _apply(
+        session,
+        "remove_undetected",
+        change,
+        lambda removed: {
+            "protein_id": protein_id,
+            "lane_index": lane,
+            "band_index": band,
+            "removed": removed,
+        },
     )
 
 

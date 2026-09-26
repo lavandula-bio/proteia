@@ -9,7 +9,9 @@ Layout: two membranes. ``mem-1`` holds a chemiluminescence image paired with its
 visible-light marker and a reprobe of the same blot; ``mem-5`` holds one JPEG on
 light-on-dark. The target β-catenin (``img-2``) normalizes against α-tubulin on
 the other membrane; GAPDH is measured on the reprobe. Lane 2 has no β-catenin
-band, and band lists are given out of order.
+band, and band lists are given out of order. It has no not-detected record, so
+its saved form has no ``undetected`` key; :func:`make_project_with_undetected`
+adds some.
 
 Image helpers for tests that read real pixels: :func:`write_tiff` and
 :func:`synthetic_blot`. :class:`FakeClock` gives a session predictable log times.
@@ -90,6 +92,39 @@ def _band(band_id: str, lane: int, x: int, y: int, net: float, source: str, **fi
 
 def make_project() -> Project:
     """A valid project with ids 1-18 in use and ``next_id`` 19."""
+    return Project.model_validate(_sample_doc())
+
+
+def _undetected(lane: int, snr: float, region: tuple[int, int, int, int], **fields) -> dict:
+    x0, y0, x1, y1 = region
+    return {
+        "lane_index": lane,
+        "reason": "below_detection_limit",
+        "snr": snr,
+        "threshold": 6.0,
+        "region": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+        "source": "row_box",
+        **fields,
+    }
+
+
+def make_project_with_undetected() -> Project:
+    """:func:`make_project` with not-detected records: β-catenin in lane 2, where
+    it has no band, and GAPDH in lanes 2 and 3, given out of order (the model
+    sorts them). GAPDH's lane-3 record comes from molecular-weight-guided
+    detection, and its lane-2 record has a negative SNR."""
+    doc = _sample_doc()
+    beta, _, gapdh = doc["batch"]["proteins"]
+    beta["undetected"] = [_undetected(2, 2.5, (98, 36, 128, 64))]
+    gapdh["undetected"] = [
+        _undetected(3, 4.125, (138, 93, 168, 121), source="mw_guided"),
+        _undetected(2, -0.75, (98, 93, 128, 121)),
+    ]
+    return Project.model_validate(doc)
+
+
+def _sample_doc() -> dict:
+    """The sample project as ``project.json`` would hold it (see :func:`make_project`)."""
     lanes = [
         {"index": 0, "label": "vehicle", "sample": "v1"},
         {"index": 1, "label": "vehicle", "sample": "v2"},
@@ -214,18 +249,16 @@ def make_project() -> Project:
             ],
         },
     ]
-    return Project.model_validate(
-        {
-            "schema_version": 1,
-            "next_id": 19,
-            "batch": {
-                "lanes": lanes,
-                "reference_condition": "vehicle",
-                "membranes": [mem_1, mem_5],
-                "proteins": proteins,
-            },
-        }
-    )
+    return {
+        "schema_version": 1,
+        "next_id": 19,
+        "batch": {
+            "lanes": lanes,
+            "reference_condition": "vehicle",
+            "membranes": [mem_1, mem_5],
+            "proteins": proteins,
+        },
+    }
 
 
 @pytest.fixture

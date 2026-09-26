@@ -13,7 +13,13 @@ import pytest
 from pydantic import ValidationError
 
 import proteia
-from conftest import FakeClock, make_project, synthetic_blot, write_tiff
+from conftest import (
+    FakeClock,
+    make_project,
+    make_project_with_undetected,
+    synthetic_blot,
+    write_tiff,
+)
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import LANE_TABLE_DECIMALS
@@ -188,3 +194,36 @@ def test_a_missing_distribution_is_null(monkeypatch):
     software = software_versions()
     assert software["tifffile"] is None
     assert software["numpy"] == real("numpy")
+
+
+def test_the_content_includes_not_detected_records():
+    project = _with_log(make_project_with_undetected(), "new_project")
+    record = build_record(project, exported_at=EXPORTED_AT, files={})
+    proteins = record["content"]["batch"]["proteins"]
+    assert ["undetected" in protein for protein in proteins] == [True, False, True]
+    assert proteins[2]["undetected"] == [
+        u.model_dump(mode="json") for u in project.batch.find_protein("prot-9").undetected
+    ]
+    # The record verifies itself, and its hash covers the records.
+    digest = hashlib.sha256(canonical_json(record["content"])).hexdigest()
+    assert digest == record["content_hash"] == content_hash(project)
+    assert digest != content_hash(make_project())
+    assert record["history_issues"] == []
+
+
+def test_a_log_written_before_records_existed_has_no_history_issues():
+    # The content hash a build without not-detected records stored for the
+    # sample project (test_storage pins the same value).
+    before = "28dfdbcbca235bb7359164954bf76a6d743a2c4448e51049172f42cc00b3df6a"
+    entry = LogEntry(
+        seq=1,
+        time="2026-09-20T08:00:00.000Z",
+        action="new_project",
+        version="0.1.0.dev0",
+        content_hash=before,
+    )
+    project = make_project().model_copy(update={"log": (entry,)})
+    assert history_issues(project) == []
+    record = build_record(project, exported_at=EXPORTED_AT, files={})
+    assert record["history_issues"] == []
+    assert all("undetected" not in p for p in record["content"]["batch"]["proteins"])

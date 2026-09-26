@@ -28,11 +28,14 @@ from proteia.core.model import (
     Project,
     ProposalSource,
     Protein,
+    Region,
     Role,
+    UndetectedBand,
+    UndetectedReason,
     apply_change,
 )
 from proteia.core.plotspec import NO_VARIATION, ErrorType, ValueKind
-from proteia.core.results import Level, NoticeCode, compute_results, lane_nets
+from proteia.core.results import Level, NoticeCode, compute_results, lane_detected, lane_nets
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -863,3 +866,267 @@ def test_raw_error_type_and_method_behave_like_their_enums(error_type, method):
 def test_an_unknown_error_type_or_method_is_a_value_error(argument, value, message):
     with pytest.raises(ValueError, match=message):
         compute_results(make_project().batch, **{argument: value})
+
+
+# --- #51: lanes where detection found no band ---
+
+
+def _undetected(protein_id: str, *lanes: int, band_index: int = 0) -> Callable[[Project], None]:
+    """Not-detected records for a protein in ``lanes``."""
+
+    def edit(draft: Project) -> None:
+        protein = draft.batch.find_protein(protein_id)
+        for lane in lanes:
+            protein.undetected.append(
+                UndetectedBand(
+                    lane_index=lane,
+                    band_index=band_index,
+                    reason=UndetectedReason.BELOW_DETECTION_LIMIT,
+                    snr=1.25,
+                    threshold=6.0,
+                    region=Region(x0=10 * lane, y0=30, x1=10 * lane + 10, y1=60),
+                    source=ProposalSource.ROW_BOX,
+                )
+            )
+
+    return edit
+
+
+def _no_bands(protein_id: str, *lanes: int) -> Callable[[Project], None]:
+    def edit(draft: Project) -> None:
+        protein = draft.batch.find_protein(protein_id)
+        protein.bands = [b for b in protein.bands if b.lane_index not in lanes]
+
+    return edit
+
+
+def _expected_bands(protein_id: str, count: int) -> Callable[[Project], None]:
+    def edit(draft: Project) -> None:
+        draft.batch.find_protein(protein_id).expected_band_count = count
+
+    return edit
+
+
+def test_detected_tells_a_band_from_a_record_from_nothing():
+    batch = _batch(_undetected("prot-7", 2), _undetected("prot-9", 3))
+    detected = lane_detected(batch)
+    assert detected == {
+        "prot-7": [True, True, False, True],
+        "prot-8": [True, True, True, True],
+        "prot-9": [True, True, None, False],
+    }
+    res = compute_results(batch)
+    assert [column.detected for column in res.proteins] == list(detected.values())
+    assert lane_detected(make_project().batch)["prot-7"] == [True, True, None, True]
+    # Only band index 0 counts, like the nets.
+    band_one = _batch(_expected_bands("prot-9", 2), _undetected("prot-9", 2, band_index=1))
+    assert lane_detected(band_one)["prot-9"] == [True, True, None, None]
+
+    def no_lanes(draft: Project) -> None:
+        draft.batch.lanes, draft.batch.reference_condition = [], None
+        for protein in draft.batch.proteins:
+            protein.bands = []
+
+    assert lane_detected(_batch(no_lanes)) == {"prot-7": [], "prot-8": [], "prot-9": []}
+    assert [column.detected for column in compute_results(_batch(no_lanes)).proteins] == [[]] * 3
+
+
+def test_below_detection_is_a_warning_per_protein_in_the_included_lanes():
+    # β-catenin: records in lane 1 (vehicle), lane 2 (10 µM) and excluded lane 3.
+    # α-tubulin: a record in lane 2. GAPDH: none.
+    batch = _batch(
+        _no_bands("prot-7", 1, 3),
+        _undetected("prot-7", 1, 2, 3),
+        _no_bands("prot-8", 2),
+        _undetected("prot-8", 2),
+    )
+    res = compute_results(batch)
+    target, loading = [n for n in res.notices if n.code is NoticeCode.BELOW_DETECTION]
+    assert target.level is loading.level is Level.WARNING
+    assert (target.protein_ids, target.lane_indices, target.conditions) == (
+        ("prot-7",),
+        (1, 2),  # 0-based; lane 3 is excluded from this set
+        ("vehicle", "10 µM"),
+    )
+    assert target.message == (
+        "'β-catenin' was not detected in lanes 2, 3 (below the detection limit):"
+        " those lanes have no value and are left out of the statistics"
+    )
+    assert (loading.protein_ids, loading.lane_indices, loading.conditions) == (
+        ("prot-8",),
+        (2,),
+        ("10 µM",),
+    )
+    assert loading.message == (
+        "'α-tubulin' was not detected in lane 3 (below the detection limit):"
+        " targets normalized to it have no value there"
+    )
+    # The all-lanes set includes lane 3, so its target notice is its own.
+    everything = res.all_lanes
+    [own] = [n for n in everything.notices if n.code is NoticeCode.BELOW_DETECTION]
+    assert (own.protein_ids, own.lane_indices) == (("prot-7",), (1, 2, 3))
+    assert own.message.startswith("'β-catenin' was not detected in lanes 2, 3, 4 ")
+    assert own.conditions == ("vehicle", "10 µM")
+
+
+def test_one_lane_below_detection_reads_in_the_singular():
+    res = compute_results(_batch(_undetected("prot-7", 2)))
+    notice = _one(res, NoticeCode.BELOW_DETECTION)
+    assert notice.message == (
+        "'β-catenin' was not detected in lane 3 (below the detection limit):"
+        " that lane has no value and is left out of the statistics"
+    )
+    assert notice.lane_indices == (2,)
+
+
+def test_a_record_in_an_excluded_lane_gives_no_notice_in_that_set():
+    batch = _batch(_no_bands("prot-7", 3), _undetected("prot-7", 3))
+    res = compute_results(batch)
+    assert NoticeCode.BELOW_DETECTION not in _codes(res)
+    assert _one(res.all_lanes, NoticeCode.BELOW_DETECTION).lane_indices == (3,)
+
+
+def test_records_carry_no_value():
+    plain = compute_results(_batch())
+    batch = _batch(_undetected("prot-7", 2), _undetected("prot-9", 2, 3))
+    res = compute_results(batch)
+    assert lane_nets(batch) == lane_nets(_batch())
+    for with_records, without in ((res, plain), (res.all_lanes, plain.all_lanes)):
+        assert [c.nets for c in with_records.proteins] == [c.nets for c in without.proteins]
+        assert (with_records.label, with_records.excluded_lanes, with_records.tier) == (
+            without.label,
+            without.excluded_lanes,
+            without.tier,
+        )
+        for a, b in zip(with_records.series, without.series, strict=True):
+            assert a.model_copy(update={"undetected": {}}) == b
+        assert [n for n in with_records.notices if n.code is not NoticeCode.BELOW_DETECTION] == (
+            without.notices
+        )
+
+
+def test_records_alone_never_create_the_all_lanes_set():
+    # Lane 3 is excluded and holds no band once they are removed: only records.
+    no_values = [_no_bands(p, 3) for p in ("prot-7", "prot-8")]
+    res = compute_results(_batch(*no_values, _undetected("prot-7", 3), _undetected("prot-9", 3)))
+    assert (res.all_lanes, res.label, res.excluded_lanes) == (None, None, [3])
+    assert NoticeCode.BELOW_DETECTION not in _codes(res)  # lane 3 is not in this set
+
+
+def test_series_lists_the_targets_not_detected_lanes():
+    # β-catenin: records in lanes 2 and 3 (excluded); α-tubulin: a record in lane 1.
+    batch = _batch(
+        _no_bands("prot-7", 3),
+        _undetected("prot-7", 2, 3),
+        _no_bands("prot-8", 1),
+        _undetected("prot-8", 1),
+    )
+    res = compute_results(batch)
+    [series] = res.series
+    assert series.undetected == {"10 µM": [2]}  # included lanes; loading records left out
+    [every] = res.all_lanes.series
+    assert every.undetected == {"10 µM": [2, 3]}
+    [plain] = compute_results(_batch()).series
+    assert plain.undetected == {}
+    assert_strict_json(res)
+
+
+def test_a_technical_repeat_with_one_lane_not_detected_keeps_its_measured_lane():
+    # Lanes 0 and 1 become technical repeats of one vehicle sample; lane 1 is n.d.
+    batch = _batch(_lane(1, sample="v1"), _no_bands("prot-7", 1), _undetected("prot-7", 1))
+    res = compute_results(batch)
+    [series] = res.series
+    assert series.groups["vehicle"] == [1.0]  # lane 0 alone, as the fold-change baseline
+    assert series.normalized[1] is None
+    assert series.averaged == []  # one measured lane: nothing averaged
+    assert series.undetected == {"vehicle": [1]}
+    assert _one(res, NoticeCode.BELOW_DETECTION).lane_indices == (1,)
+
+
+def test_a_reference_the_target_was_not_detected_in_says_so():
+    not_detected = (
+        "'β-catenin' / 'α-tubulin': 'β-catenin' was not detected in the reference"
+        " condition 'vehicle' (below the detection limit): no fold-change can be formed"
+    )
+    usual = (
+        "'β-catenin' / 'α-tubulin': control condition 'vehicle' has no value in any included lane"
+    )
+    both = _batch(_lane(3, included=True), _no_bands("prot-7", 0, 1), _undetected("prot-7", 0, 1))
+    res = compute_results(both)
+    notice = _one(res, NoticeCode.REFERENCE_UNUSABLE)
+    assert notice.message == not_detected
+    assert (notice.protein_ids, notice.conditions) == (("prot-7", "prot-8"), ("vehicle",))
+    assert res.series[0].chart is None
+    # One reference lane not detected and one not measured: the usual wording.
+    one = _batch(_lane(3, included=True), _no_bands("prot-7", 0, 1), _undetected("prot-7", 0))
+    assert _one(compute_results(one), NoticeCode.REFERENCE_UNUSABLE).message == usual
+    # Only included lanes count: excluded lane 0 keeps its band, included lane 1 is n.d.
+    excluded = _batch(
+        _lane(3, included=True),
+        _lane(0, included=False),
+        _no_bands("prot-7", 1),
+        _undetected("prot-7", 1),
+    )
+    assert _one(compute_results(excluded), NoticeCode.REFERENCE_UNUSABLE).message == not_detected
+
+
+def test_a_reference_the_loading_control_was_not_detected_in_names_it():
+    # β-catenin is measured in both reference lanes; α-tubulin, its loading control,
+    # is not. Lane 3 is included so the series keeps a value elsewhere.
+    loading = _batch(
+        _lane(3, included=True), _no_bands("prot-8", 0, 1), _undetected("prot-8", 0, 1)
+    )
+    notice = _one(compute_results(loading), NoticeCode.REFERENCE_UNUSABLE)
+    assert notice.message == (
+        "'β-catenin' / 'α-tubulin': 'α-tubulin' was not detected in the reference"
+        " condition 'vehicle' (below the detection limit): no fold-change can be formed"
+    )
+    assert (notice.protein_ids, notice.conditions) == (("prot-7", "prot-8"), ("vehicle",))
+    both = _batch(
+        _lane(3, included=True),
+        _no_bands("prot-7", 0, 1),
+        _undetected("prot-7", 0, 1),
+        _no_bands("prot-8", 0, 1),
+        _undetected("prot-8", 0, 1),
+    )
+    assert _one(compute_results(both), NoticeCode.REFERENCE_UNUSABLE).message == (
+        "'β-catenin' / 'α-tubulin': 'β-catenin' and 'α-tubulin' were not detected in the"
+        " reference condition 'vehicle' (below the detection limit): no fold-change can be"
+        " formed"
+    )
+    # Each lost one reference lane: neither is missing from the whole condition.
+    mixed = _batch(
+        _lane(3, included=True),
+        _no_bands("prot-7", 0),
+        _undetected("prot-7", 0),
+        _no_bands("prot-8", 1),
+        _undetected("prot-8", 1),
+    )
+    assert _one(compute_results(mixed), NoticeCode.REFERENCE_UNUSABLE).message == (
+        "'β-catenin' / 'α-tubulin': control condition 'vehicle' has no value in any included lane"
+    )
+
+
+def test_extra_bands_notice_is_about_boxes_not_records():
+    # Records for a second expected band: nothing is quantified from them, and no
+    # box of theirs is being ignored (#58 decides what they mean).
+    records = _batch(_expected_bands("prot-9", 2), _undetected("prot-9", 0, 2, band_index=1))
+    res = compute_results(records)
+    assert NoticeCode.EXTRA_BANDS_IGNORED not in _codes(res)
+    assert NoticeCode.BELOW_DETECTION not in _codes(res)  # band index 0 only
+
+
+def test_compute_takes_the_detection_state_from_lane_detected(monkeypatch):
+    # One join serves the results, as it will the chart counts and the export.
+    batch = _batch(_undetected("prot-7", 2), _undetected("prot-9", 3))
+    seen: list[model.Batch] = []
+
+    def spy(b: model.Batch) -> dict[str, list[bool | None]]:
+        seen.append(b)
+        return lane_detected(b)
+
+    monkeypatch.setattr(results, "lane_detected", spy)
+    res = compute_results(batch)
+    assert len(seen) == 2  # this set and the all-lanes set (lane 3 is excluded)
+    assert seen[0] is batch
+    assert [column.detected for column in res.proteins] == list(lane_detected(batch).values())

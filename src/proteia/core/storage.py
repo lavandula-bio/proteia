@@ -31,14 +31,22 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   differently (``1e-7`` where Python writes ``1e-07``), so ``model_dump_json`` is
   never used: a library upgrade must not move the hash.
 * Sorted keys make the bytes independent of field order and of the insertion
-  order of ``Lane.metadata``. The model sorts bands and calibration points; the
-  order of membranes, images and proteins is content and changes the hash.
+  order of ``Lane.metadata``. The model sorts bands, not-detected records and
+  calibration points; the order of membranes, images and proteins is content
+  and changes the hash.
+* An optional field added before v0.1 is left out of every dump (``project.json``,
+  :func:`content_document` and so the export record's ``content``) while its value
+  is empty or its default, so adding it changes no project's bytes or hash. The
+  first case is ``Protein.undetected``: Proteia never writes ``"undetected": []``,
+  and a hand-edited file that holds it loads, hashes as if the key were absent and
+  is saved without it. Writing the empty value instead would move every existing
+  project's hash, so every export would report ``content_changed_outside_log``.
 * The hash covers ``schema_version``, every id, the lane table, the image records
   (and so the pixels, through each ``sha256``), the calibrations, and the
-  proteins and bands with their stored nets and flags. It excludes ``next_id``
-  and the log (the history: equal content made at other times must hash
-  equal), and the file's formatting. The project never stores its own hash;
-  each log entry stores the hash of the content it left.
+  proteins with their bands (stored nets and flags) and their not-detected
+  records. It excludes ``next_id`` and the log (the history: equal content made
+  at other times must hash equal), and the file's formatting. The project never
+  stores its own hash; each log entry stores the hash of the content it left.
 * Loading a file Proteia wrote and saving it again gives the same bytes, because
   the strict load keeps every type exactly.
 
