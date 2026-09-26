@@ -17,6 +17,11 @@
   <span id="project-name" class="project-name"></span>
   <button id="switch-project" type="button" hidden>Projects…</button>
   <button id="reveal" type="button" hidden>Show folder</button>
+  <!-- Labelled with the change each would take back or make again. -->
+  <button id="undo" class="history" type="button" hidden disabled
+    aria-keyshortcuts="Control+Z Meta+Z">Undo</button>
+  <button id="redo" class="history" type="button" hidden disabled
+    aria-keyshortcuts="Control+Shift+Z Control+Y Meta+Shift+Z">Redo</button>
   <span id="save-state" class="save-state" role="status"></span>
   <span class="spacer"></span>
   <button id="quit" type="button" hidden>Quit Proteia</button>
@@ -114,7 +119,12 @@
           <p class="subhead">Not detected (n.d.)</p>
           <ul id="undetected-list" class="undetected-list"></ul>
         </div>
-        <button id="remove-protein" type="button">Remove protein</button>
+        <div id="protein-actions" class="actions protein-actions">
+          <!-- No confirmation: Undo brings the boxes and marks back. -->
+          <button id="clear-boxes" type="button"
+            title="Remove every box and n.d. mark of this protein (Undo brings them back)">Clear boxes</button>
+          <button id="remove-protein" type="button">Remove protein</button>
+        </div>
         <!-- Moved next to the part of the editor a refusal is about. -->
         <p id="protein-error" class="error" role="alert" hidden></p>
       </div>

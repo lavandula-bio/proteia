@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-// Small DOM helpers shared by the panels. Text always goes in as text, never as
-// markup.
+// Small DOM and wording helpers shared by the panels. Text always goes in as
+// text, never as markup.
 
 export const $ = (id) => document.getElementById(id);
+
+// "1 box", "3 boxes".
+export function counted(count, one, many) {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+// "a", "a and b", "a, b and c".
+export function inWords(items) {
+  return items.length > 2
+    ? `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`
+    : items.join(" and ");
+}
 
 // A file name inside a sentence, set apart for bidirectional text (between
 // U+2068 and U+2069): a direction mark in the name cannot reorder the words

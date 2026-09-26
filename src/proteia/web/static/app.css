@@ -92,6 +92,37 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
+/* The header keeps one line whatever Undo and Redo name, so the workspace
+   under it never moves as their labels change: in a narrow window the project
+   name is cut short first ("…"; its tooltip has it whole), then those labels;
+   the other controls keep their size. */
+.bar > * {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.bar > .project-name,
+.bar > .history {
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar > .project-name {
+  flex-shrink: 1000; /* gives way before the labels do */
+  min-width: 4rem;
+}
+
+.bar > .history {
+  min-width: 5.5rem;
+}
+
+/* A save error is read whole: it may take a second line. */
+.bar > .save-state {
+  flex-shrink: 1;
+  white-space: normal;
+}
+
 .brand {
   font-size: 1.1rem;
 }
@@ -109,14 +140,25 @@ button:disabled {
   flex: 1;
 }
 
+/* Empty, it keeps its place while a project is shown (app.js placeStatus), as
+   tall as a line with an Undo in it: a message coming or going moves nothing. */
 .status {
+  min-height: 2.4rem;
   margin: 0;
   padding: 0.4rem 1rem;
   background: color-mix(in srgb, #e0a800 25%, Canvas);
 }
 
+.status:empty {
+  background: none;
+}
+
 .status[hidden] {
   display: none;
+}
+
+.status-action button {
+  padding: 0.05rem 0.6rem;
 }
 
 .workspace {
@@ -239,6 +281,11 @@ button:disabled {
 .actions {
   display: flex;
   gap: 0.4rem;
+}
+
+.protein-actions {
+  flex-wrap: wrap;
+  margin-top: 0.4rem;
 }
 
 .loading-controls {
