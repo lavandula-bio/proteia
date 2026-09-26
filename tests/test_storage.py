@@ -22,9 +22,11 @@ from proteia.core.model import (
     Box,
     ImageKind,
     ImageRef,
+    LogEntry,
     Polarity,
     Project,
     apply_change,
+    revalidate,
 )
 from proteia.core.project import join_to_spine
 from proteia.core.storage import (
@@ -36,6 +38,7 @@ from proteia.core.storage import (
     SchemaVersionError,
     canonical_json,
     content_hash,
+    document_bytes,
     image_path,
     load_project,
     migrate,
@@ -68,6 +71,21 @@ def _doc(project: Project) -> dict:
 
 def _encode(doc: dict) -> bytes:
     return json.dumps(doc, ensure_ascii=False).encode()
+
+
+def _logged(project: Project, *entries: dict) -> Project:
+    """``project`` with a log of ``entries`` (seq 1, 2, ... in order)."""
+    log = []
+    for seq, fields in enumerate(entries, start=1):
+        entry = {
+            "time": "2026-09-26T08:00:00.000Z",
+            "action": "set_lanes",
+            "version": "0.1.0",
+            "content_hash": content_hash(project),
+            **fields,
+        }
+        log.append(LogEntry(seq=seq, **entry))
+    return Project.model_validate({**project.model_dump(), "log": log})
 
 
 def test_round_trip_through_project_folder(tmp_path):
@@ -122,7 +140,8 @@ def test_project_json_encoding(tmp_path):
 def test_empty_project_bytes_exact():
     assert project_to_json(Project()) == (
         b'{\n "batch": {\n  "lanes": [],\n  "membranes": [],\n  "proteins": [],\n'
-        b'  "reference_condition": null\n },\n "next_id": 1,\n "schema_version": 1\n}\n'
+        b'  "reference_condition": null\n },\n "log": [],\n "next_id": 1,\n'
+        b' "schema_version": 1\n}\n'
     )
 
 
@@ -133,7 +152,8 @@ def test_content_hash_is_pinned():
     canonical form, and say why in the pull request. After the v0.1 tag such a
     change also bumps SCHEMA_VERSION and registers a migration. The constant lives
     in code, not in a committed file, because the Windows CI checkout converts text
-    files to CRLF.
+    files to CRLF. It did not move when the action log was added: the log is not
+    content, and the hash leaves it out.
     """
     assert content_hash(make_project()) == (
         "28dfdbcbca235bb7359164954bf76a6d743a2c4448e51049172f42cc00b3df6a"
@@ -206,6 +226,71 @@ def test_content_hash_changes_with_content(change):
     project = make_project()
     changed, _ = apply_change(project, change)
     assert content_hash(changed) != content_hash(project)
+
+
+# --- The action log in project.json ---
+
+
+def test_content_hash_ignores_the_log():
+    plain = make_project()
+    logged = _logged(
+        plain,
+        {"action": "new_project", "content_hash": content_hash(Project())},
+        {"time": "2031-01-01T00:00:00.999Z", "version": "0.2.0.dev1", "params": {"n": 4}},
+    )
+    assert content_hash(logged) == content_hash(plain)
+    assert project_to_json(logged) != project_to_json(plain)
+    assert HASH_EXCLUDE == {"next_id", "log"}
+
+
+def test_log_round_trips_byte_identically(tmp_path):
+    params = {
+        "rel_threshold": 0.3,
+        "noise_k": 3.0,
+        "tiny": 1e-07,
+        "lane_index": 2,
+        "sample": None,
+        "rect": [18, 43, 42, 57],
+        "changed": [{"condition": "10 µM", "sample": "α1", "included": False}],
+        "name": "β-catenin",
+    }
+    project = _logged(make_project(), {"action": "new_project"}, {"params": params})
+    first = _saved(tmp_path / "a", project)
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project
+    stored = loaded.log[1].params
+    assert stored == params
+    assert [type(stored[key]) for key in ("noise_k", "lane_index")] == [float, int]  # 3.0 stays
+    second = _saved(tmp_path / "b", loaded)
+    assert second.read_bytes() == first.read_bytes()
+
+
+def test_project_json_without_a_log_loads():
+    project = _logged(make_project(), {"action": "new_project"})
+    doc = _doc(project)
+    del doc["log"]  # a file saved before the log existed
+    loaded = project_from_json(_encode(doc))
+    assert loaded.log == ()
+    assert content_hash(loaded) == content_hash(project)
+
+
+def test_load_rejects_a_log_out_of_sequence():
+    doc = _doc(_logged(make_project(), {"action": "new_project"}, {}, {}))
+    del doc["log"][1]  # an entry deleted by hand
+    with pytest.raises(ProjectFormatError, match="log entry 3 is out of sequence: expected 2"):
+        project_from_json(_encode(doc))
+
+
+def test_document_bytes_rules():
+    data = document_bytes({"b": "µ α β", "a": [1, 0.3, None]})
+    assert data == '{\n "a": [\n  1,\n  0.3,\n  null\n ],\n "b": "µ α β"\n}\n'.encode()
+    assert not data.startswith(b"\xef\xbb\xbf")
+    assert b"\r" not in data
+    assert b"\\u" not in data
+    with pytest.raises(ValueError):
+        document_bytes({"a": math.nan})
+    project = _logged(make_project(), {"action": "new_project"})
+    assert project_to_json(project) == document_bytes(revalidate(project).model_dump(mode="json"))
 
 
 def _spine(project: Project) -> list:

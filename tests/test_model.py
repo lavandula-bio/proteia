@@ -7,6 +7,7 @@ caller could, and check that re-validation accepts or rejects the result.
 
 import hashlib
 import math
+from datetime import UTC, datetime, timedelta, timezone
 from typing import get_args
 
 import pytest
@@ -25,6 +26,7 @@ from proteia.core.model import (
     ImageKind,
     ImageRef,
     Lane,
+    LogEntry,
     Membrane,
     Polarity,
     Project,
@@ -32,6 +34,7 @@ from proteia.core.model import (
     Role,
     UnknownIdError,
     apply_change,
+    format_timestamp,
     revalidate,
 )
 
@@ -528,3 +531,117 @@ def test_lookup_of_unknown_id_raises(project):
 def test_role_is_shared_with_analyze():
     assert analyze.Role is model.Role
     assert [role.value for role in model.Role] == ["target", "loading control"]
+
+
+# --- The action log ---
+
+
+def _entry(**fields) -> LogEntry:
+    """A valid log entry, with ``fields`` replaced."""
+    valid = {
+        "seq": 1,
+        "time": "2026-09-26T08:15:30.123Z",
+        "action": "place_box",
+        "version": "0.1.0",
+        "params": {},
+        "content_hash": "0" * 64,
+    }
+    return LogEntry(**{**valid, **fields})
+
+
+@pytest.mark.parametrize(
+    ("fields", "valid"),
+    [
+        pytest.param(
+            {
+                "params": {
+                    "name": "β-catenin α µ",
+                    "tiny": 1e-07,
+                    "none": None,
+                    "rect": [1, [2, 3.5]],
+                    "size": {"width": 4, "inner": {"ok": True}},
+                }
+            },
+            True,
+            id="json-params",
+        ),
+        pytest.param({"time": "2026-09-26T08:15:30Z"}, False, id="time-no-milliseconds"),
+        pytest.param({"time": "2026-09-26T08:15:30.123456Z"}, False, id="time-microseconds"),
+        pytest.param({"time": "2026-09-26T08:15:30.123+00:00"}, False, id="time-offset"),
+        pytest.param({"time": "２０２６-09-26T08:15:30.123Z"}, False, id="time-fullwidth"),
+        pytest.param({"time": "2026-02-30T08:15:30.123Z"}, False, id="time-february-30"),
+        pytest.param({"action": "Place_box"}, False, id="action-uppercase"),
+        pytest.param({"action": ""}, False, id="action-empty"),
+        pytest.param({"action": "place-box"}, False, id="action-dash"),
+        pytest.param({"version": ""}, False, id="version-empty"),
+        pytest.param({"version": "0.1 0"}, False, id="version-space"),
+        pytest.param({"content_hash": "A" * 64}, False, id="hash-uppercase"),
+        pytest.param({"content_hash": "0" * 63}, False, id="hash-63-characters"),
+        pytest.param({"params": {"x": math.nan}}, False, id="params-nan"),
+        pytest.param({"params": {"x": [math.inf]}}, False, id="params-inf"),
+        pytest.param({"params": {"x": (1, 2)}}, False, id="params-tuple"),
+        pytest.param({"params": {"x": {1, 2}}}, False, id="params-set"),
+        pytest.param({"params": {"x": b"x"}}, False, id="params-bytes"),
+        pytest.param({"note": "x"}, False, id="unknown-key"),
+        pytest.param({"seq": 0}, False, id="seq-0"),
+    ],
+)
+def test_log_entry_validation(fields, valid):
+    if valid:
+        assert _entry(**fields).params == fields["params"]
+    else:
+        with pytest.raises(ValidationError):
+            _entry(**fields)
+
+
+def test_log_entries_are_immutable():
+    entry = _entry()
+    with pytest.raises(ValidationError) as info:
+        entry.seq = 2
+    assert info.value.errors()[0]["type"] == "frozen_instance"
+    project = Project(log=(entry,))
+    with pytest.raises(AttributeError):
+        project.log.append(entry)
+
+
+def test_log_seq_counts_from_one():
+    for seqs in [(1, 3), (2,)]:  # an entry deleted by hand; a log not starting at 1
+        with pytest.raises(ValidationError, match="out of sequence"):
+            Project(log=tuple(_entry(seq=seq) for seq in seqs))
+    for seqs in [(), (1, 2)]:
+        project = Project(log=tuple(_entry(seq=seq) for seq in seqs))
+        assert [entry.seq for entry in project.log] == list(seqs)
+
+
+def test_format_timestamp():
+    taipei = timezone(timedelta(hours=8))
+    moment = datetime(2026, 9, 26, 16, 15, 30, 123999, tzinfo=taipei)
+    assert format_timestamp(moment) == "2026-09-26T08:15:30.123Z"  # UTC, truncated
+    assert format_timestamp(datetime(2026, 9, 26, 8, tzinfo=UTC)) == "2026-09-26T08:00:00.000Z"
+    assert _entry(time=format_timestamp(moment)).time == "2026-09-26T08:15:30.123Z"
+    with pytest.raises(ValueError, match="aware"):
+        format_timestamp(datetime(2026, 9, 26))
+
+
+def test_apply_change_shares_the_log(project):
+    project = project.model_copy(update={"log": (_entry(),)})
+    snapshot = project.model_copy(deep=True)
+
+    def edit(draft: Project) -> str:
+        draft.batch.lanes.append(Lane(index=4, label="50 µM"))
+        draft.batch.find_protein("prot-9").name = "Gapdh"
+        return draft.new_id("band")
+
+    new, band_id = apply_change(project, edit)
+    assert band_id == "band-19"
+    assert new.log is project.log
+    assert (new.next_id, len(new.batch.lanes), new.batch.proteins[2].name) == (20, 5, "Gapdh")
+    assert project == snapshot  # the batch edits and the new id never reach the original
+    assert project.next_id == 19
+
+    def rewrite_history(draft: Project) -> None:
+        draft.log = ()
+
+    with pytest.raises(RuntimeError, match="must not edit the log"):
+        apply_change(project, rewrite_history)
+    assert project == snapshot

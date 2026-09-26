@@ -12,6 +12,10 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   memory (``dirty`` stays True, ``save_error`` holds the exception) and the
   previous ``project.json`` on disk (the write is atomic); the next change, or an
   explicit :meth:`ProjectSession.save`, tries again.
+* Every committed change appends one :class:`~proteia.core.model.LogEntry` at
+  that single commit point, in the same project object, so one save writes the
+  change and its entry together; refusals and no-ops append nothing. Times come
+  from the session's injectable clock (UTC; the offline system clock by default).
 * Pixels are read lazily and cached as read-only arrays, after checking the
   stored file's SHA-256 and the array's shape against the image record.
 * Files in ``images/`` that no project references (an image removed, an import
@@ -33,14 +37,17 @@ import os
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
 import numpy as np
+from pydantic import JsonValue
 
+import proteia
 from proteia.core import storage
 from proteia.core.imaging import load_image
-from proteia.core.model import IMAGE_SUFFIXES, Project
+from proteia.core.model import IMAGE_SUFFIXES, LogEntry, Project, format_timestamp
 
 _log = logging.getLogger(__name__)
 
@@ -98,10 +105,32 @@ class OperationError(ValueError):
 
 
 AutosaveHook = Callable[["ProjectSession"], None]
+# Returns an aware datetime; tests inject a fake one.
+Clock = Callable[[], datetime]
+
+
+def utc_now() -> datetime:
+    """The default clock: the system clock, in UTC."""
+    return datetime.now(UTC)
 
 
 def _referenced_files(project: Project) -> frozenset[str]:
     return frozenset(image.file for image in project.batch.iter_images())
+
+
+def _entry(
+    project: Project, *, seq: int, action: str, params: Mapping[str, JsonValue], clock: Clock
+) -> LogEntry:
+    """The log entry of a change that leaves ``project``. Raises ``ValidationError``
+    for params that are not plain JSON, ``ValueError`` for a naive clock."""
+    return LogEntry(
+        seq=seq,
+        time=format_timestamp(clock()),
+        action=action,
+        version=proteia.__version__,  # read at call time: what is running now
+        params=dict(params),
+        content_hash=storage.content_hash(project),
+    )
 
 
 class ProjectSession:
@@ -111,6 +140,7 @@ class ProjectSession:
     re-enters it). ``dirty`` is True while the in-memory project differs from
     ``project.json``; ``save_error`` is the last failed save (None after a
     successful one); ``last_action`` names the last committed operation.
+    ``clock`` gives the time of each log entry and export.
     """
 
     def __init__(
@@ -120,10 +150,12 @@ class ProjectSession:
         *,
         autosave: AutosaveHook | None,
         saved_files: Iterable[str],
+        clock: Clock = utc_now,
     ) -> None:
         self._project = project
         self._folder = Path(folder)
         self.autosave = autosave
+        self.clock = clock
         self.lock = threading.RLock()
         self.dirty = False
         self.save_error: Exception | None = None
@@ -141,6 +173,10 @@ class ProjectSession:
         """The committed project: replaced on each change, never mutated. Callers
         must not mutate it either."""
         return self._project
+
+    def timestamp(self) -> str:
+        """Now, from the session clock, in the log's form (UTC, milliseconds, Z)."""
+        return format_timestamp(self.clock())
 
     def pixels(self, image_id: str) -> np.ndarray:
         """The image's read-only analysis array, read and checked on first use.
@@ -209,17 +245,28 @@ class ProjectSession:
         project: Project,
         *,
         action: str,
+        params: Mapping[str, JsonValue],
         add_pixels: Mapping[str, np.ndarray] | None = None,
         evict: Iterable[str] = (),
     ) -> None:
-        """Make ``project`` the committed project, then run the autosave hook.
+        """Append the change's log entry to ``project``, make it the committed
+        project, then run the autosave hook.
 
-        A failed save (``OSError`` or ``ProjectError``) is recorded in
-        ``save_error`` and logged; the edit stays committed. Any other exception
-        from the hook is a bug and propagates, after the commit.
+        ``project`` must be prepared from the committed project (it shares its
+        log), else ``RuntimeError``. The entry is built first: params that are not
+        plain JSON (``ValidationError``) or a naive clock (``ValueError``) raise
+        before anything changes. A failed save (``OSError`` or ``ProjectError``)
+        is recorded in ``save_error`` and logged; the edit stays committed. Any
+        other exception from the hook is a bug and propagates, after the commit.
         """
         with self.lock:
-            self._project = project
+            log = self._project.log
+            if project.log is not log:
+                raise RuntimeError("stale project: prepare the change from the committed project")
+            seq = log[-1].seq + 1 if log else 1
+            entry = _entry(project, seq=seq, action=action, params=params, clock=self.clock)
+            # One object holds the change and its entry, so one save writes both.
+            self._project = project.model_copy(update={"log": (*log, entry)})
             for image_id, array in (add_pixels or {}).items():
                 array.flags.writeable = False
                 self._pixels[image_id] = array
@@ -269,33 +316,42 @@ def save_to_folder(session: ProjectSession) -> None:
 
 
 def new_project(
-    folder: str | os.PathLike[str], *, autosave: AutosaveHook | None = save_to_folder
+    folder: str | os.PathLike[str],
+    *,
+    autosave: AutosaveHook | None = save_to_folder,
+    clock: Clock = utc_now,
 ) -> ProjectSession:
     """Create an empty project in ``folder`` and open it.
 
     ``folder`` must not exist or must be an empty directory (orphan cleanup deletes
     files in ``images/``); otherwise ``FOLDER_NOT_EMPTY``. ``project.json``,
     ``images/`` and ``exports/`` are written at once; an ``OSError`` propagates.
+    The log starts with one ``new_project`` entry.
     """
     path = Path(folder)
     if path.exists() and (not path.is_dir() or any(path.iterdir())):
         raise OperationError(
             ErrorCode.FOLDER_NOT_EMPTY, f"{path} exists and is not an empty folder"
         )
-    project = Project()
+    created = _entry(Project(), seq=1, action="new_project", params={}, clock=clock)
+    project = Project(log=(created,))
     storage.save_project(project, path)
-    return ProjectSession(project, path, autosave=autosave, saved_files=())
+    return ProjectSession(project, path, autosave=autosave, saved_files=(), clock=clock)
 
 
 def open_project(
-    folder: str | os.PathLike[str], *, autosave: AutosaveHook | None = save_to_folder
+    folder: str | os.PathLike[str],
+    *,
+    autosave: AutosaveHook | None = save_to_folder,
+    clock: Clock = utc_now,
 ) -> ProjectSession:
     """Open the project in ``folder``, with every image file required.
 
     ``FileNotFoundError`` and the :class:`~proteia.core.storage.ProjectError` family
-    propagate. Opening deletes nothing, rewrites nothing and reads no pixels.
+    propagate. Opening deletes nothing, rewrites nothing, reads no pixels and
+    logs nothing.
     """
     project = storage.load_project(folder)
     return ProjectSession(
-        project, folder, autosave=autosave, saved_files=_referenced_files(project)
+        project, folder, autosave=autosave, saved_files=_referenced_files(project), clock=clock
     )

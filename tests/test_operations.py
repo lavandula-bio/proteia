@@ -11,20 +11,24 @@ path, from an imported file to the chart, to the golden numbers of
 
 import codecs
 import csv
+import dataclasses
 import hashlib
+import inspect
 import io
 import json
 import os
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from conftest import make_project, synthetic_blot, write_image_files, write_tiff
-from proteia.core import boxes, results, storage
+import proteia
+from conftest import FakeClock, make_project, synthetic_blot, write_image_files, write_tiff
+from proteia.core import boxes, record, results, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
@@ -39,6 +43,7 @@ from proteia.core.model import (
     Role,
     UnknownIdError,
     apply_change,
+    revalidate,
 )
 from proteia.core.operations import (
     Cascade,
@@ -50,9 +55,10 @@ from proteia.core.operations import (
 )
 from proteia.core.plotspec import ErrorType
 from proteia.core.quantify import estimate_background, is_clipped, net_signal
+from proteia.core.record import history_issues
 from proteia.core.results import NoticeCode
 from proteia.core.session import save_to_folder
-from proteia.core.storage import load_project
+from proteia.core.storage import canonical_json, content_hash, load_project
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -102,9 +108,10 @@ class Recorder:
         self.actions.append(session.last_action)
 
 
-def session_on(tmp_path: Path, hook=None) -> ProjectSession:
-    """A new project in a non-ASCII folder; ``hook`` None means no autosave."""
-    return ops.new_project(tmp_path / FOLDER, autosave=hook)
+def session_on(tmp_path: Path, hook=None, clock=None) -> ProjectSession:
+    """A new project in a non-ASCII folder; ``hook`` None means no autosave.
+    The clock is a fresh :class:`FakeClock` unless one is given."""
+    return ops.new_project(tmp_path / FOLDER, autosave=hook, clock=clock or FakeClock())
 
 
 def import_blot(
@@ -150,7 +157,7 @@ def open_sample(tmp_path: Path, hook=save_to_folder) -> ProjectSession:
     project = make_project()
     write_image_files(folder, project)
     storage.save_project(project, folder)
-    return ops.open_project(folder, autosave=hook)
+    return ops.open_project(folder, autosave=hook, clock=FakeClock())
 
 
 def boxed(tmp_path: Path, hook=None) -> tuple[ProjectSession, str, str]:
@@ -174,10 +181,15 @@ def protein_of(session: ProjectSession, protein_id: str):
     return session.project.batch.find_protein(protein_id)
 
 
+def _listed(cascade: Cascade) -> dict[str, list[str]]:
+    """A cascade as its log entry records it: every field a list of ids."""
+    return {name: list(ids) for name, ids in dataclasses.asdict(cascade).items()}
+
+
 def plant(session: ProjectSession, change) -> None:
     """Commit a change no operation makes yet (e.g. an apparent MW from #58)."""
     project, _ = apply_change(session.project, change)
-    session._commit(project, action="plant")
+    session._commit(project, action="plant", params={})
 
 
 class ReplaceLock:
@@ -207,9 +219,16 @@ def replace_lock(monkeypatch) -> ReplaceLock:
 
 def test_new_project_needs_an_empty_folder(tmp_path):
     folder = tmp_path / FOLDER
-    session = ops.new_project(folder)
+    session = ops.new_project(folder, clock=FakeClock())
     assert sorted(p.name for p in folder.iterdir()) == ["exports", "images", "project.json"]
-    assert session.project == Project() == load_project(folder)
+    # Empty content, and a log that starts with the creation.
+    [created] = session.project.log
+    assert (created.seq, created.action, created.params) == (1, "new_project", {})
+    assert created.time == "2026-09-26T08:00:00.000Z"
+    assert created.version == proteia.__version__
+    assert created.content_hash == content_hash(Project()) == content_hash(session.project)
+    assert session.project.model_copy(update={"log": ()}) == Project()
+    assert load_project(folder) == session.project
     assert (session.dirty, session.save_error, session.last_action) == (False, None, None)
     assert session.folder == folder
 
@@ -225,7 +244,7 @@ def test_new_project_needs_an_empty_folder(tmp_path):
         assert info.value.code is ErrorCode.FOLDER_NOT_EMPTY
     empty = tmp_path / "空的 µ"
     empty.mkdir()
-    assert ops.new_project(empty).project == Project()
+    assert content_hash(ops.new_project(empty).project) == content_hash(Project())
 
 
 def test_open_project_reads_no_pixels_and_changes_nothing(tmp_path):
@@ -284,6 +303,12 @@ def test_autosave_hook_runs_once_after_each_change(tmp_path):
         "remove_protein",
         "remove_image",
     ]
+    # One entry per commit: the no-ops, the refusal, compute and export add none.
+    log = s.project.log
+    assert [entry.action for entry in log] == ["new_project", *recorder.actions]
+    assert [entry.seq for entry in log] == list(range(1, len(log) + 1))
+    seconds = [*range(10), 11, 12, 13]  # second 10 is the export's timestamp
+    assert [entry.time for entry in log] == [f"2026-09-26T08:00:{i:02d}.000Z" for i in seconds]
 
 
 def test_default_autosave_writes_every_change(tmp_path):
@@ -458,7 +483,7 @@ def test_refused_operation_changes_nothing(tmp_path, setup, call, code):
         setup(s, ids)
     recorder.actions.clear()
     before = s.project
-    next_id = before.next_id
+    next_id, log_length = before.next_id, len(before.log)
     files = listing(s)
     cache = dict(s._pixels)
 
@@ -468,10 +493,27 @@ def test_refused_operation_changes_nothing(tmp_path, setup, call, code):
         assert info.value.code is code
     assert s.project is before
     assert s.project.next_id == next_id
+    assert len(s.project.log) == log_length  # a failed attempt is not history
     assert recorder.actions == []
     assert listing(s) == files
     assert s._pixels.keys() == cache.keys()
     assert all(s._pixels[key] is array for key, array in cache.items())
+
+
+def test_no_op_logs_nothing(tmp_path):
+    s, recorder, ids = _refusal_scene(tmp_path)
+    before = s.project
+    lanes = before.batch.lanes
+    target = before.batch.find_protein(ids["target"])
+    ops.set_lanes(s, [LaneInput(lane.label, lane.sample, lane.included) for lane in lanes])
+    ops.move_box(s, ids["a"], before.batch.find_band(ids["a"])[1].box.rect(target.box_size))
+    ops.set_box_size(s, ids["target"], target.box_size)
+    ops.set_polarity(s, ids["image"], DARK)
+    ops.edit_protein(s, ids["target"], name=" β-catenin ")  # the stored name, once cleaned
+    ops.set_reference_condition(s, None)  # no reference is set
+    assert s.project is before
+    assert len(s.project.log) == len(before.log)
+    assert recorder.actions == []
 
 
 def test_refusals_name_the_objects_involved(tmp_path):
@@ -522,6 +564,10 @@ def test_parallel_operations_get_distinct_ids(tmp_path):
     assert {p.id for p in s.project.batch.proteins} == set(ids)
     assert s.project.next_id == start + 8
     assert load_project(s.folder) == s.project
+    log = s.project.log
+    assert [entry.seq for entry in log] == list(range(1, len(log) + 1))
+    added = [entry.params["protein_id"] for entry in log if entry.action == "add_protein"]
+    assert added == [p.id for p in s.project.batch.proteins]  # in commit order
 
 
 def test_core_imports_no_gui_toolkit():
@@ -650,6 +696,7 @@ def test_remove_image_cascade(tmp_path):
         unpaired_images=(),
         unfitted_membranes=(),
     )
+    assert s.project.log[-1].params == {"image_id": "img-6", **_listed(cascade)}
     batch = s.project.batch
     assert [p.id for p in batch.proteins] == ["prot-7", "prot-9"]
     assert batch.find_protein("prot-7").loading_control_ids == []
@@ -667,6 +714,7 @@ def test_remove_image_cascade(tmp_path):
         unpaired_images=("img-2",),
         unfitted_membranes=("mem-1",),
     )
+    assert s.project.log[-1].params == {"image_id": "img-3", **_listed(cascade)}
     batch = s.project.batch
     assert batch.find_image("img-2").marker_image_id is None
     calibration = batch.membranes[0].calibration
@@ -736,7 +784,7 @@ def test_pixels_of_another_shape_are_refused(tmp_path):
         image.width, image.height = image.height, image.width
 
     project, _ = apply_change(s.project, swap_sides)
-    s._commit(project, action="plant", evict=[image_id])
+    s._commit(project, action="plant", params={}, evict=[image_id])
     with pytest.raises(OperationError) as info:
         s.pixels(image_id)
     assert info.value.code is ErrorCode.IMAGE_FILE_CHANGED
@@ -1196,7 +1244,7 @@ def test_table_and_chart_use_the_same_loading_control(tmp_path):
     assert load_project(s.folder) == s.project  # saved as well
 
 
-def test_export_lane_table(tmp_path):
+def test_export_lane_table(tmp_path, monkeypatch):
     recorder = Recorder()
     s = open_sample(tmp_path, recorder)
     path = ops.export_lane_table(s)
@@ -1234,12 +1282,20 @@ def test_export_lane_table(tmp_path):
     assert len(rows) == 5
     assert recorder.actions == []  # not a state change
 
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    record_path = s.folder / "exports" / ops.LANE_TABLE_RECORD_FILE
+    earlier = record_path.read_bytes()
     path.unlink()
     path.mkdir()  # something in the way
     before = s.project
     with pytest.raises(OSError):
         ops.export_lane_table(s)
     assert s.project is before
+    assert record_path.read_bytes() == earlier  # the table goes first: the record is kept
+    assert sorted(p.name for p in path.parent.iterdir()) == [
+        "lane-table.csv",
+        "lane-table.record.json",
+    ]  # no temp file left
 
     empty = session_on(tmp_path / "empty")
     with pytest.raises(OperationError) as info:
@@ -1577,3 +1633,476 @@ def test_a_protein_name_that_would_clash_with_a_clipped_column_is_refused(tmp_pa
     with pytest.raises(OperationError) as info:
         ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
     assert info.value.code is ErrorCode.RESERVED_NAME
+
+
+# --- #46: the action log and the export record ---
+
+
+def _file_sha256(s: ProjectSession, file: str) -> str:
+    return hashlib.sha256((s.folder / storage.IMAGES_DIR / file).read_bytes()).hexdigest()
+
+
+def _rect_of(s: ProjectSession, band_id: str) -> list[int]:
+    protein, band = s.project.batch.find_band(band_id)
+    return list(band.box.rect(protein.box_size))
+
+
+def _size_of(s: ProjectSession, protein_id: str) -> dict[str, int]:
+    size = s.project.batch.find_protein(protein_id).box_size
+    return {"width": size.width, "height": size.height}
+
+
+def _protein(protein_id: str, name: str, role: str, image_id: str, **fields) -> dict:
+    """add_protein's params with its defaults (no expected MW, no loading
+    controls, the initial box size of the blot, nothing pinned)."""
+    return {
+        "protein_id": protein_id,
+        "name": name,
+        "role": role,
+        "image_id": image_id,
+        "expected_mw": None,
+        "loading_control_ids": [],
+        "box_size": {"width": 20, "height": 5},  # boxes.initial_box_size(W, H)
+        "pinned_targets": [],
+        **fields,
+    }
+
+
+# Every logged operation, as (call, action, the params it must log). ``expected``
+# reads the session after the call, for values the pixels decide (grown rects).
+# Ids follow the one counter: img-1, mem-2, img-3, then proteins and bands.
+LOGGED_STEPS = [
+    (
+        lambda s: import_blot(s, blot(), "β-actin 10 µM.tif"),
+        "import_image",
+        lambda s: {
+            "image_id": "img-1",
+            "membrane_id": "mem-2",
+            "new_membrane": True,
+            "original_name": "β-actin 10 µM.tif",
+            "kind": "chemiluminescence",
+            "polarity": "dark_on_light",
+            "sha256": _file_sha256(s, "img-1.tif"),
+        },
+    ),
+    (
+        lambda s: import_blot(s, blot(), "reprobe β.tif", LIGHT, membrane_id="mem-2"),
+        "import_image",
+        lambda s: {
+            "image_id": "img-3",
+            "membrane_id": "mem-2",
+            "new_membrane": False,
+            "original_name": "reprobe β.tif",
+            "kind": "chemiluminescence",
+            "polarity": "light_on_dark",
+            "sha256": _file_sha256(s, "img-3.tif"),
+        },
+    ),
+    (
+        lambda s: ops.set_lanes(
+            s,
+            [
+                LaneInput(" vehicle ", " v1\t"),
+                LaneInput("10 µM", "a1"),
+                LaneInput("10 µM", "a2", included=False),
+            ],
+        ),
+        "set_lanes",
+        lambda s: {
+            "lane_count": 3,
+            "changed": [  # every row is new; the text as stored
+                {"index": 0, "condition": "vehicle", "sample": "v1", "included": True},
+                {"index": 1, "condition": "10 µM", "sample": "a1", "included": True},
+                {"index": 2, "condition": "10 µM", "sample": "a2", "included": False},
+            ],
+            "reference_condition": None,
+        },
+    ),
+    (
+        lambda s: ops.set_lanes(
+            s,
+            [LaneInput("vehicle", "v1"), LaneInput("10 µM", "a1"), LaneInput(f"10 {MU}M", "a2")],
+            reference_condition="vehicle",
+        ),
+        "set_lanes",
+        lambda s: {
+            "lane_count": 3,
+            # Only the changed row, in the stored spelling (micro sign, not mu).
+            "changed": [
+                {"index": 2, "condition": f"10 {MICRO}M", "sample": "a2", "included": True}
+            ],
+            "reference_condition": "vehicle",
+        },
+    ),
+    (
+        lambda s: ops.set_reference_condition(s, f"10 {MU}M"),
+        "set_reference_condition",
+        lambda s: {"reference_condition": f"10 {MICRO}M"},
+    ),
+    (
+        lambda s: ops.add_protein(s, " β-catenin ", Role.TARGET, "img-1", expected_mw=92),
+        "add_protein",
+        lambda s: _protein("prot-4", "β-catenin", "target", "img-1", expected_mw=92.0),
+    ),
+    (
+        lambda s: ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, "img-3"),
+        "add_protein",
+        lambda s: _protein("prot-5", "GAPDH", "loading control", "img-3"),
+    ),
+    (
+        lambda s: ops.add_protein(s, "p53", Role.TARGET, "img-1"),
+        "add_protein",
+        lambda s: _protein("prot-6", "p53", "target", "img-1"),
+    ),
+    (
+        # A target becomes the second loading control: β-catenin, which used GAPDH
+        # implicitly, is pinned to it. p53 itself is not listed, and its name,
+        # typed the same once cleaned, is not a change.
+        lambda s: ops.edit_protein(s, "prot-6", name=" p53 ", role=Role.LOADING_CONTROL),
+        "edit_protein",
+        lambda s: {"protein_id": "prot-6", "pinned_targets": ["prot-4"], "role": "loading control"},
+    ),
+    (
+        lambda s: ops.add_protein(
+            s, "β-actin", Role.TARGET, "img-1", loading_control_ids=["prot-5"]
+        ),
+        "add_protein",
+        lambda s: _protein("prot-7", "β-actin", "target", "img-1", loading_control_ids=["prot-5"]),
+    ),
+    (
+        lambda s: ops.remove_protein(s, "prot-5"),
+        "remove_protein",
+        lambda s: {
+            "protein_id": "prot-5",
+            "removed": ["prot-5"],
+            "detached_targets": ["prot-4", "prot-7"],
+            "unpaired_images": [],
+            "unfitted_membranes": [],
+        },
+    ),
+    (
+        # A second loading control is added: the targets using p53 implicitly are pinned.
+        lambda s: ops.add_protein(
+            s, "α-tubulin", Role.LOADING_CONTROL, "img-3", box_size=BoxSize(width=10, height=6)
+        ),
+        "add_protein",
+        lambda s: _protein(
+            "prot-8",
+            "α-tubulin",
+            "loading control",
+            "img-3",
+            box_size={"width": 10, "height": 6},
+            pinned_targets=["prot-4", "prot-7"],
+        ),
+    ),
+    (
+        # A target turned into a loading control loses its list: an implicit change.
+        lambda s: ops.edit_protein(s, "prot-7", role=Role.LOADING_CONTROL, expected_mw=42),
+        "edit_protein",
+        lambda s: {
+            "protein_id": "prot-7",
+            "pinned_targets": [],
+            "role": "loading control",
+            "expected_mw": 42.0,
+            "loading_control_ids": [],
+        },
+    ),
+    (
+        lambda s: ops.place_box(s, "prot-4", NARROW_X, ROW, lane_index=0, grow=True),
+        "place_box",
+        lambda s: {
+            "band_id": "band-9",
+            "protein_id": "prot-4",
+            "x": NARROW_X,
+            "y": ROW,
+            "grow": True,
+            "lane_index": 0,
+            "lane_proposed": False,
+            "rect": _rect_of(s, "band-9"),
+            "box_size": _size_of(s, "prot-4"),  # the first seed click sets it
+        },
+    ),
+    (
+        lambda s: ops.place_box(s, "prot-4", WIDE_X, ROW, lane_index=1, grow=True),
+        "place_box",
+        lambda s: {
+            "band_id": "band-10",
+            "protein_id": "prot-4",
+            "x": WIDE_X,
+            "y": ROW,
+            "grow": True,
+            "lane_index": 1,
+            "lane_proposed": False,
+            "rect": _rect_of(s, "band-10"),
+            "box_size": _size_of(s, "prot-4"),  # grown by the wide band
+        },
+    ),
+    (
+        lambda s: ops.place_box(s, "prot-4", 150, ROW, grow=False),
+        "place_box",
+        lambda s: {
+            "band_id": "band-11",
+            "protein_id": "prot-4",
+            "x": 150,
+            "y": ROW,
+            "grow": False,
+            "lane_index": 2,  # proposed from the two boxes before
+            "lane_proposed": True,
+            "rect": list(boxes.centered_rect(150, ROW, protein_of(s, "prot-4").box_size, W, H)),
+            "box_size": _size_of(s, "prot-4"),
+        },
+    ),
+    (
+        lambda s: ops.move_box(s, "band-9", (30, 44, 10, 20)),
+        "move_box",
+        lambda s: {  # after the centre snap, not as dragged
+            "band_id": "band-9",
+            "rect": list(boxes.centered_rect(20, 32, protein_of(s, "prot-4").box_size, W, H)),
+        },
+    ),
+    (
+        lambda s: ops.set_box_size(s, "prot-4", BoxSize(width=12, height=6)),
+        "set_box_size",
+        lambda s: {"protein_id": "prot-4", "box_size": {"width": 12, "height": 6}},
+    ),
+    (
+        lambda s: ops.set_polarity(s, "img-1", LIGHT),
+        "set_polarity",
+        lambda s: {"image_id": "img-1", "polarity": "light_on_dark"},
+    ),
+    (
+        lambda s: ops.remove_box(s, "band-10"),
+        "remove_box",
+        lambda s: {"band_id": "band-10", "protein_id": "prot-4", "lane_index": 1},
+    ),
+    (
+        lambda s: ops.remove_image(s, "img-1"),
+        "remove_image",
+        lambda s: {
+            "image_id": "img-1",
+            "removed": ["img-1", "prot-4", "prot-6", "prot-7", "band-9", "band-11"],
+            "detached_targets": [],
+            "unpaired_images": [],
+            "unfitted_membranes": [],
+        },
+    ),
+]
+
+
+def _run_logged_steps(tmp_path: Path, check) -> ProjectSession:
+    """Run :data:`LOGGED_STEPS` with autosave; ``check(s, action, expected)`` after each."""
+    s = session_on(tmp_path, save_to_folder)
+    for call, action, expected in LOGGED_STEPS:
+        length = len(s.project.log)
+        call(s)
+        assert len(s.project.log) == length + 1, action
+        check(s, action, expected)
+    return s
+
+
+def test_each_operation_logs_its_params(tmp_path):
+    def check(s: ProjectSession, action: str, expected) -> None:
+        entry = s.project.log[-1]
+        assert (entry.action, entry.params) == (action, expected(s))
+
+    s = _run_logged_steps(tmp_path, check)
+    first = s.project.log[0]
+    assert (first.action, first.params) == ("new_project", {})
+    assert {entry.action for entry in s.project.log} == {
+        "new_project",
+        "import_image",
+        "remove_image",
+        "set_polarity",
+        "set_lanes",
+        "set_reference_condition",
+        "add_protein",
+        "edit_protein",
+        "remove_protein",
+        "place_box",
+        "move_box",
+        "remove_box",
+        "set_box_size",
+    }
+    text = (s.folder / storage.PROJECT_FILE).read_text(encoding="utf-8")
+    for leak in (str(tmp_path), json.dumps(str(tmp_path))[1:-1], FOLDER):
+        assert leak not in text  # no path is ever recorded
+
+
+def test_each_entry_hashes_the_content_it_left(tmp_path):
+    def check(s: ProjectSession, action: str, expected) -> None:
+        assert s.project.log[-1].content_hash == content_hash(s.project), action
+        assert history_issues(s.project) == [], action
+
+    s = _run_logged_steps(tmp_path, check)
+    assert load_project(s.folder).log == s.project.log
+
+
+def test_the_entry_is_saved_with_its_change(tmp_path, replace_lock):
+    s, image, protein = boxed(tmp_path, save_to_folder)
+    assert load_project(s.folder).log == s.project.log
+    band = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert load_project(s.folder).log == s.project.log
+    ops.set_polarity(s, image, LIGHT)
+    assert load_project(s.folder).log == s.project.log
+
+    path = s.folder / storage.PROJECT_FILE
+    before = path.read_bytes()
+    replace_lock.locked = True
+    ops.move_box(s, band, (50, 20, 70, 40))
+    assert s.project.log[-1].action == "move_box" and s.dirty  # both in memory
+    assert path.read_bytes() == before
+    on_disk = load_project(s.folder)  # the older pair, still consistent
+    assert on_disk.log == s.project.log[:-1]
+    assert on_disk.log[-1].content_hash == content_hash(on_disk)
+
+    replace_lock.locked = False
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))  # saves both changes
+    saved = load_project(s.folder)
+    assert saved == s.project
+    assert [entry.action for entry in saved.log[-2:]] == ["move_box", "set_box_size"]
+
+    data = path.read_bytes()
+    ops.save(ops.open_project(s.folder))
+    assert path.read_bytes() == data  # reopened and saved: byte-identical
+
+
+def test_equal_content_hashes_equal_whatever_the_log(tmp_path):
+    source = write_tiff(tmp_path / "sources" / "β-actin 10 µM.tif", blot())
+    taipei = timezone(timedelta(hours=8))
+
+    def build(name: str, clock: FakeClock, *, detour: bool) -> ProjectSession:
+        s = ops.new_project(tmp_path / name, autosave=save_to_folder, clock=clock)
+        with source.open("rb") as f:
+            image = ops.import_image(s, f, source.name, kind=CHEMI, polarity=DARK)
+        ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+        if detour:  # there and back: the log grows, the content does not change
+            ops.set_reference_condition(s, "10 µM")
+            ops.set_reference_condition(s, None)
+        protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        return s
+
+    a = build("a α", FakeClock(), detour=False)
+    b = build("b β", FakeClock(start=datetime(2030, 1, 1, 9, 0, tzinfo=taipei)), detour=True)
+    assert content_hash(a.project) == content_hash(b.project)
+    assert a.project.log != b.project.log
+    assert len(b.project.log) == len(a.project.log) + 2
+    assert b.project.log[0].time == "2030-01-01T01:00:00.000Z"  # stored in UTC
+    project_json = storage.PROJECT_FILE
+    assert (a.folder / project_json).read_bytes() != (b.folder / project_json).read_bytes()
+
+    hashed, length = content_hash(a.project), len(a.project.log)
+    ops.set_lanes(a, [LaneInput("vehicle", included=False), LaneInput("10 µM")])
+    assert content_hash(a.project) != hashed
+    ops.set_lanes(a, [LaneInput("vehicle"), LaneInput("10 µM")])
+    assert content_hash(a.project) == hashed
+    assert len(a.project.log) == length + 2
+
+
+def test_content_hash_changes_when_a_box_moves_or_a_lane_is_excluded(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    band = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    hashes = [content_hash(s.project)]
+    ops.move_box(s, band, (50, 20, 70, 40))
+    hashes.append(content_hash(s.project))
+    lanes = [LaneInput("vehicle", included=False), LaneInput("10 µM"), LaneInput("50 µM")]
+    ops.set_lanes(s, lanes)
+    hashes.append(content_hash(s.project))
+    assert len(set(hashes)) == 3
+
+
+def test_a_naive_clock_commits_nothing(tmp_path):
+    recorder = Recorder()
+    s = session_on(tmp_path, recorder)
+    before = s.project
+    s.clock = lambda: datetime(2026, 9, 26)  # no time zone
+    with pytest.raises(ValueError, match="aware") as info:
+        ops.set_lanes(s, [LaneInput("vehicle")])
+    assert not isinstance(info.value, OperationError)  # a bug, not a refusal
+    assert s.project is before
+    assert recorder.actions == []
+
+
+def test_a_stale_draft_is_refused(tmp_path):
+    recorder = Recorder()
+    s = session_on(tmp_path, recorder)
+    stale = s.project
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    before = s.project
+    old_draft, _ = apply_change(stale, lambda draft: draft.new_id("band"))
+    # Prepared from an older project, and a copy whose log is not the committed one.
+    for draft in (old_draft, revalidate(before)):
+        with pytest.raises(RuntimeError, match="stale project"):
+            s._commit(draft, action="plant", params={})
+        assert s.project is before
+    assert recorder.actions == ["set_lanes"]
+
+
+def test_export_writes_the_record(tmp_path):
+    recorder = Recorder()
+    s = open_sample(tmp_path, recorder)
+    project_json = (s.folder / storage.PROJECT_FILE).read_bytes()
+    log = s.project.log
+    table = ops.export_lane_table(s).read_bytes()
+    data = (s.folder / "exports" / "lane-table.record.json").read_bytes()
+
+    assert not data.startswith(codecs.BOM_UTF8)
+    assert b"\r" not in data and data.endswith(b"}\n")
+    for text in ("µ", "α", "β"):
+        assert text.encode() in data  # raw UTF-8
+    assert b"\\u" not in data
+    doc = json.loads(data.decode("utf-8"))
+    assert record.record_bytes(doc) == data  # the canonical file form
+
+    assert doc["files"] == {
+        "lane-table.csv": {"sha256": hashlib.sha256(table).hexdigest(), "bytes": len(table)}
+    }
+    assert doc["content_hash"] == content_hash(s.project)
+    assert hashlib.sha256(canonical_json(doc["content"])).hexdigest() == doc["content_hash"]
+    assert doc["log"] == [entry.model_dump(mode="json") for entry in s.project.log]
+    assert doc["exported_at"] == "2026-09-26T08:00:00.000Z"
+    assert doc["history_issues"] == ["no_history"]  # the sample was saved without a log
+    assert doc["results"] is None  # the lane table uses no compute settings
+    assert doc["settings"] == record.settings()
+    text = data.decode("utf-8")
+    for leak in (str(tmp_path), json.dumps(str(tmp_path))[1:-1], FOLDER):
+        assert leak not in text
+
+    assert recorder.actions == [] and s.project.log is log  # not a state change
+    assert (s.folder / storage.PROJECT_FILE).read_bytes() == project_json
+
+
+@pytest.mark.parametrize("problem", ["changed", "missing"])
+def test_export_refuses_changed_or_missing_images(tmp_path, problem):
+    s = open_sample(tmp_path)
+    ops.export_lane_table(s)
+    exports = s.folder / "exports"
+    earlier = {path.name: path.read_bytes() for path in exports.iterdir()}
+    assert set(earlier) == {"lane-table.csv", "lane-table.record.json"}
+    image = s.folder / "images" / "img-2.tif"
+    if problem == "changed":
+        image.write_bytes(b"other pixels")
+    else:
+        image.unlink()
+    with pytest.raises(OperationError) as info:
+        ops.export_lane_table(s)
+    assert info.value.code is ErrorCode.IMAGE_FILE_CHANGED
+    assert info.value.ids == ("img-2",)
+    assert {path.name: path.read_bytes() for path in exports.iterdir()} == earlier
+
+
+def test_record_grow_settings_are_what_place_box_uses(tmp_path, monkeypatch):
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return grow_box(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "grow_box", spy)
+    s, _, protein = boxed(tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    [(args, kwargs)] = calls
+    bound = inspect.signature(grow_box).bind(*args, **kwargs)
+    bound.apply_defaults()
+    recorded = record.settings()["grow_box"]
+    assert {name: bound.arguments[name] for name in recorded} == recorded

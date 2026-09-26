@@ -20,6 +20,12 @@ Normalization and statistics combine several proteins downstream in
 Models are mutable. Edits go through :func:`apply_change`, which works on a copy
 and re-validates the whole tree, so a failed edit leaves the project untouched.
 
+History. ``Project.log`` records every committed change, oldest first: one
+immutable :class:`LogEntry` each, with its time, action, parameters, the Proteia
+version that made it and the content hash it left. The log is not content: it
+says how the data got there, not what it is, so the content hash leaves it out.
+A change never edits the log; the session appends the entry when it commits.
+
 Geometry convention: boxes are axis-aligned and anchored at their top-left
 corner in image pixel coordinates (numpy ``image[y, x]``). All boxes of one
 protein share its box size, so they have equal area; only their positions vary.
@@ -29,6 +35,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Final, Literal
 
@@ -37,6 +44,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StringConstraints,
     model_validator,
 )
@@ -72,6 +80,11 @@ def _plain_file_name(v: str) -> str:
     return v
 
 
+def _real_time(v: str) -> str:
+    datetime.fromisoformat(v)  # the pattern allows 2026-02-30; this rejects it
+    return v
+
+
 Finite = Annotated[float, AfterValidator(_positive_zero)]  # finiteness comes from the config
 NonNegative = Annotated[Finite, Field(ge=0)]
 Kda = Annotated[Finite, Field(gt=0)]  # molecular weight in kDa
@@ -88,6 +101,21 @@ WarningCode = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$"
 # Text is stored exactly as given: no Unicode normalization or trimming here.
 ProteinName = Annotated[str, AfterValidator(_non_blank)]
 OriginalName = Annotated[str, StringConstraints(max_length=255), AfterValidator(_plain_file_name)]
+# UTC with milliseconds and a Z, as format_timestamp writes it: one spelling per
+# instant, so times sort as text. [0-9], not \d: pydantic's Rust regex lets \d
+# match fullwidth and Arabic-Indic digits.
+_TIME = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
+Timestamp = Annotated[str, StringConstraints(pattern=_TIME), AfterValidator(_real_time)]
+ActionName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+SoftwareVersion = Annotated[str, StringConstraints(pattern=r"^[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}$")]
+
+
+def format_timestamp(moment: datetime) -> str:
+    """UTC with milliseconds and a Z, e.g. ``"2026-09-26T08:15:30.123Z"``
+    (truncated, not rounded). Raises ``ValueError`` for a naive datetime."""
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("the clock must return an aware datetime")
+    return moment.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class UnknownIdError(LookupError):
@@ -361,6 +389,23 @@ class Protein(_Model):
         return self
 
 
+# --- History ---
+
+
+class LogEntry(_Model):
+    """One committed change: when, what, with which inputs, by which version, and
+    the content hash it left. Immutable; entries are shared between snapshots."""
+
+    model_config = ConfigDict(frozen=True)  # merged with extra="forbid", allow_inf_nan=False
+
+    seq: int = Field(ge=1)  # 1, 2, 3, ... in list order: the entry's id
+    time: Timestamp  # commit time from the session clock; informative, seq is the order
+    action: ActionName  # the operation's function name, e.g. "place_box"
+    version: SoftwareVersion  # proteia.__version__ that committed it
+    params: dict[str, JsonValue] = Field(default_factory=dict)
+    content_hash: Sha256  # storage.content_hash of the project this change left
+
+
 # --- Batch and project ---
 
 
@@ -466,6 +511,7 @@ class Project(_Model):
     # Bookkeeping, excluded from the content hash: the number of the next new id.
     next_id: int = Field(default=1, ge=1, le=10**9)
     batch: Batch = Field(default_factory=Batch)
+    log: tuple[LogEntry, ...] = ()  # history, oldest first; excluded from the content hash
 
     def iter_ids(self) -> Iterator[str]:
         """Every object id: membranes, images, proteins, bands."""
@@ -498,19 +544,43 @@ class Project(_Model):
             seen[number] = obj_id
         return self
 
+    @model_validator(mode="after")
+    def _check_log(self) -> Project:
+        # An entry deleted by hand in the middle breaks the count. Time order is
+        # not checked: a wall clock can step back.
+        for expected, entry in enumerate(self.log, start=1):
+            if entry.seq != expected:
+                raise ValueError(f"log entry {entry.seq} is out of sequence: expected {expected}")
+        return self
 
-def revalidate(project: Project) -> Project:
-    """A freshly validated copy: reruns every nested validator on the current values."""
-    return Project.model_validate(project.model_dump())
+
+def revalidate(project: Project, *, log: bool = True) -> Project:
+    """A freshly validated copy: reruns every nested validator on the current values.
+
+    With ``log=False`` only the content is re-validated, and the copy shares the
+    project's log (a tuple of frozen, already validated entries).
+    """
+    if log:
+        return Project.model_validate(project.model_dump())
+    fresh = Project.model_validate(project.model_dump(exclude={"log"}))
+    return fresh.model_copy(update={"log": project.log})
 
 
 def apply_change[T](project: Project, change: Callable[[Project], T]) -> tuple[Project, T]:
-    """Run ``change`` on a deep copy, then re-validate the whole tree.
+    """Run ``change`` on a copy, then re-validate the content.
 
+    The copy is deep for the batch and shallow for the rest, so ``next_id`` and
+    the batch are the draft's own and the log is shared: a change never copies
+    or re-validates the history, and must not replace it (``RuntimeError``).
     A ``ValidationError`` leaves ``project`` untouched (``next_id`` included).
     ``change`` should return ids or plain values, not model objects: the returned
     project is a fresh copy.
     """
-    draft = project.model_copy(deep=True)
+    log = project.log
+    draft = project.model_copy(update={"batch": project.batch.model_copy(deep=True)})
     result = change(draft)
-    return revalidate(draft), result
+    if draft.log is not log:
+        raise RuntimeError(
+            "a change must not edit the log: the session appends its entry on commit"
+        )
+    return revalidate(draft, log=False), result
