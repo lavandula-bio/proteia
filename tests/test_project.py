@@ -8,7 +8,9 @@ from proteia.core.project import (
     align_to_lanes,
     build_spine,
     join_to_spine,
+    lane_pitch,
     lane_positions,
+    lanes_run_right_to_left,
     propose_lane,
     spine_axes,
     spine_from_labels,
@@ -174,10 +176,81 @@ def test_lane_positions_interpolate_and_extrapolate():
     assert got[-1] == pytest.approx(50.0 - 105.0)
 
 
+@pytest.mark.parametrize(
+    ("anchors", "kept", "past"),
+    [
+        (
+            [(50.0, 0), (530.0, 4), (800.0, 7)],
+            range(8),
+            {-2: -150.0, -1: -50.0, 8: 900.0, 9: 1000.0},
+        ),
+        ([(330.0, 0), (270.0, 1)], range(2), {-2: 530.0, -1: 430.0, 2: 170.0, 9: -530.0}),
+    ],
+    ids=["smile", "mirrored"],
+)
+def test_lane_positions_step_past_the_kept_lanes_by_a_given_pitch(anchors, kept, past):
+    # Between the kept lanes nothing changes; past them each lane steps 100 px
+    # from the nearest kept lane, in the lanes' own direction.
+    got = lane_positions(anchors, range(-2, 10), pitch=100.0)
+    assert {lane: got[lane] for lane in past} == pytest.approx(past)
+    between = lane_positions(anchors, kept)
+    assert {lane: got[lane] for lane in kept} == between
+
+
 def test_lane_positions_ignore_a_dragged_box():
     anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]
     anchors.append((150.0, 7))  # lane 7 dragged over lane 2
     assert lane_positions(anchors, [7])[7] == pytest.approx(450.0)
+
+
+# --- lanes_run_right_to_left: which way the anchored lanes are numbered ---
+
+# Lanes 0-2 and 5 numbered left to right, 60 px apart; lanes 5 and 6 right to
+# left.
+MIXED = [(100.0, 0), (160.0, 1), (220.0, 2), (400.0, 5), (340.0, 6)]
+
+
+@pytest.mark.parametrize(
+    ("anchors", "answer"),
+    [
+        ([], None),
+        ([(100.0, 1), (104.0, 1)], None),  # one lane: no direction
+        ([(100.0, 1), (100.0, 2)], None),  # two lanes at one x
+        ([(50.0, 0), (530.0, 4), (800.0, 7)], False),
+        ([(330.0, 0), (270.0, 1)], True),
+        (MIXED, False),  # the longer run
+        ([(30.0 + 60 * lane, lane) for lane in range(7)] + [(150.0, 7)], False),  # one dragged
+    ],
+    ids=["none", "one-lane", "one-x", "smile", "mirrored", "mixed", "dragged"],
+)
+def test_lanes_run_right_to_left(anchors, answer):
+    assert lanes_run_right_to_left(anchors) is answer
+    # The direction lane_positions reads them in.
+    steps = lane_positions(anchors, [0, 1])
+    assert (steps[1] < steps[0] if steps else None) is answer
+
+
+# --- lane_pitch: the lane spacing several groups of anchors show ---
+
+
+@pytest.mark.parametrize(
+    ("groups", "pitch"),
+    [
+        ([], None),
+        ([[(100.0, 1)], [(300.0, 4)]], None),  # one lane each: no step
+        ([[(100.0, 0), (160.0, 1), (230.0, 2)]], 65.0),  # steps 60, 70
+        ([[(330.0, 0), (270.0, 1)]], 60.0),  # numbered right to left
+        ([[(50.0, 0), (530.0, 4), (800.0, 7)]], 105.0),  # per lane: 120, 90
+        # Each group's own steps: two groups numbering the lanes opposite ways
+        # still show the spacing.
+        ([[(100.0, 0), (160.0, 1)], [(400.0, 0), (340.0, 1), (280.0, 2)]], 60.0),
+        # Each group's kept anchors: a dragged box is left out.
+        ([[(30.0 + 60 * lane, lane) for lane in range(7)] + [(150.0, 7)]], 60.0),
+    ],
+    ids=["none", "one-lane-each", "median", "mirrored", "per-lane", "both-ways", "dragged"],
+)
+def test_lane_pitch(groups, pitch):
+    assert lane_pitch(groups) == pitch
 
 
 @pytest.mark.parametrize(

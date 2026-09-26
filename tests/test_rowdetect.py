@@ -34,6 +34,7 @@ from proteia.core.rowdetect import (
     BG_GUARD,
     BG_GUARD_MIN,
     DETECT_K,
+    EMPTY_WINDOW,
     FIT_MAX_PIXELS,
     REFUSING_FLAGS,
     SIZE_GUARD,
@@ -163,6 +164,17 @@ def test_missing_lane_is_an_empty_slot_and_shifts_nothing(name, missing):
         # Its expected centre is where the lane is, a tenth of the pitch at most
         # away (also past the present lanes, extrapolated with the pitch).
         assert abs(lane.expected_x - case.lane_cx[i]) < 0.1 * 70
+        # The slot its snr was read in: EMPTY_WINDOW pitch either side of that
+        # centre, over the row's rows (no neighbouring row here: all of them).
+        x0, y0, x1, y1 = case.row
+        half = EMPTY_WINDOW * found.pitch
+        assert lane.window == (
+            max(x0, math.floor(lane.expected_x - half)),
+            y0,
+            min(x1, math.ceil(lane.expected_x + half)),
+            y1,
+        )
+    assert all(lane.window is None for lane in found.lanes if lane.rect is not None)
 
 
 def test_touching_bands_get_one_box_per_lane():
@@ -233,6 +245,9 @@ def test_empty_lane_reasons(key, seed, lane, reason):
     assert_hits_own_lanes(case, found)
     empty = found.lanes[lane]
     assert (empty.rect, empty.reason, empty.components) == (None, reason, 0)
+    assert empty.window is not None  # measured, whatever the reason
+    if reason == "edge_signal":  # the neighbouring row's rows are left out of the slot
+        assert empty.window[1] > case.row[1]
     if reason == "unassigned":
         assert empty.snr >= DETECT_K  # signal in the lane's rows, in no piece
     elif reason == "edge_signal":
@@ -270,6 +285,8 @@ def test_lanes_outside_row_refuses():
     found = detect(case)
     assert "lanes_outside_row" in found.flags
     assert found.slots[0] is None and found.lanes[0].expected_x < case.row[0]
+    # Its slot is clipped to the row box: only the part inside was measured.
+    assert found.lanes[0].window[0] == case.row[0]
     assert found.refused
     assert found.flags[: len(REFUSING_FLAGS)] == REFUSING_FLAGS  # refusing flags first
 
@@ -1036,6 +1053,14 @@ def check_invariants(case: RowCase, found: RowDetection) -> None:
             assert all(type(v) is int for v in lane.extent)
             ex0, ey0, ex1, ey1 = lane.extent
             assert rx0 <= ex0 < ex1 <= rx1 and ry0 <= ey0 < ey1 <= ry1
+        if lane.rect is not None:
+            assert lane.window is None  # only an empty lane's slot is reported
+        elif lane.window is None:
+            assert lane.snr == 0.0  # not measured
+        else:  # a non-empty slot inside the clipped row
+            assert all(type(v) is int for v in lane.window)
+            wx0, wy0, wx1, wy1 = lane.window
+            assert rx0 <= wx0 < wx1 <= rx1 and ry0 <= wy0 < wy1 <= ry1
         assert math.isfinite(lane.snr) and math.isfinite(lane.expected_x)
 
 
@@ -1084,7 +1109,11 @@ def test_translation_is_exact(name):
     for after, before in zip(moved.lanes, found.lanes, strict=True):
         assert after.expected_x - dx == pytest.approx(before.expected_x)
         assert dataclasses.replace(after, expected_x=0.0) == dataclasses.replace(
-            before, rect=move(before.rect), extent=move(before.extent), expected_x=0.0
+            before,
+            rect=move(before.rect),
+            extent=move(before.extent),
+            window=move(before.window),
+            expected_x=0.0,
         )
     assert dataclasses.replace(moved, lanes=(), notes=()) == dataclasses.replace(
         found, lanes=(), notes=()
@@ -1124,11 +1153,43 @@ def test_polarity_symmetry(name):
     assert inverse.slots == found.slots
     assert inverse.flags == found.flags
     assert [lane.reason for lane in inverse.lanes] == [lane.reason for lane in found.lanes]
+    assert [lane.window for lane in inverse.lanes] == [lane.window for lane in found.lanes]
     assert components(inverse) == components(found)
     for a, b in zip(inverse.lanes, found.lanes, strict=True):
         assert (a.bg_offset is None) == (b.bg_offset is None)
         if b.bg_offset is not None:
             assert a.bg_offset == pytest.approx(b.bg_offset, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("name", "renumbered"),
+    [
+        ("missing_first", {}),
+        ("tall_band/1000", {"lane 4:": "lane 3:"}),  # size_outlier
+        ("doublet_deep/1000", {"lane 3:": "lane 4:"}),  # multiple_components
+    ],
+)
+def test_lanes_numbered_right_to_left_are_the_same_reading_reversed(name, renumbered):
+    # Only the numbering changes: lane 0 is the one at the box's right end, in
+    # the lanes and in the notes.
+    found = _detected(name)
+    back = detect(_case(name), right_to_left=True)
+    n = len(found.lanes)
+    assert back.lanes == tuple(
+        dataclasses.replace(lane, lane=n - 1 - lane.lane) for lane in reversed(found.lanes)
+    )
+    assert dataclasses.replace(back, lanes=(), notes=()) == dataclasses.replace(
+        found, lanes=(), notes=()
+    )
+    for old in renumbered:
+        assert any(note.startswith(old) for note in found.notes)
+    assert back.notes == tuple(
+        next(
+            (new + note[len(old) :] for old, new in renumbered.items() if note.startswith(old)),
+            note,
+        )
+        for note in found.notes
+    )
 
 
 def test_integer_input_and_a_row_beyond_the_image():
@@ -1197,7 +1258,7 @@ IMAGE = np.full((40, 60), 1000.0)
 @pytest.mark.parametrize(
     ("gray", "row", "n_lanes", "code"),
     [
-        (np.zeros((40, 60, 3)), (0, 0, 60, 40), 2, "invalid_row"),  # not 2-D
+        (np.zeros((40, 60, 3)), (0, 0, 60, 40), 2, "invalid_image"),  # not 2-D
         (IMAGE, (0, 0, 60, 40), 0, "invalid_row"),
         (IMAGE, (0, 0, 60, 40), -1, "invalid_row"),
         (IMAGE, (0, 0, 60, 40), True, "invalid_row"),  # a bool is not a lane count
@@ -1223,24 +1284,24 @@ def test_row_errors_have_stable_codes(gray, row, n_lanes, code):
     assert isinstance(err.value, ValueError)
 
 
-def test_non_finite_pixels_are_an_invalid_row():
+def test_non_finite_pixels_are_an_invalid_image():
     image = IMAGE.copy()
     image[20, 30] = np.nan
     with pytest.raises(RowDetectError) as err:
         detect_row(image, (0, 0, 60, 40), 2, background=1000.0)
-    assert err.value.code == "invalid_row"
+    assert err.value.code == "invalid_image"
     # A NaN outside the row does not matter.
     assert detect_row(image, (40, 0, 60, 40), 2, background=1000.0).slots == (None, None)
 
 
 @pytest.mark.parametrize("background", [math.nan, math.inf, -math.inf, None, "1000", True])
-def test_a_background_that_is_not_a_finite_number_is_an_invalid_row(background):
+def test_a_background_that_is_not_a_finite_number_is_an_invalid_image(background):
     image = IMAGE.copy()
     image[1, 1] = 0.0
     for row in ((0, 0, 60, 40), (0, 0, 4, 3)):
         with pytest.raises(RowDetectError) as err:
             detect_row(image, row, 2, background=background)
-        assert err.value.code == "invalid_row"
+        assert err.value.code == "invalid_image"
     # Any finite real number is a background, a numpy one included.
     for background in (1000, np.float32(1000.0), np.int64(1000)):
         assert len(detect_row(image, (0, 0, 4, 3), 2, background=background).lanes) == 2

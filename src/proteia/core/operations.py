@@ -48,7 +48,9 @@ calibration (points removed with their image) drops those of every protein on
 the membrane (``dropped_undetected``). A removed protein or image takes its
 proteins' records along, and the log lists them whole (``removed_undetected``),
 since they have no ids. Removing a box never creates a record: the lane becomes
-"not measured".
+"not measured". Records are written by a row commit (:func:`detect_row_boxes`),
+whose outcome in each lane replaces the record there
+(``undetected_written``, ``dropped_undetected``).
 
 Functions return ids or small frozen dataclasses, never model objects. Typed text
 follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxes`.
@@ -68,12 +70,13 @@ from typing import BinaryIO, Concatenate, Final
 import numpy as np
 from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, record, results, storage
+from proteia.core import boxes, record, results, rowdetect, storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import LANE_COLUMNS, lane_table_bytes
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import clipping_depth, load_image
 from proteia.core.model import (
+    DETECTING_SOURCES,
     IMAGE_SUFFIXES,
     Band,
     Batch,
@@ -88,8 +91,10 @@ from proteia.core.model import (
     ProposalSource,
     Protein,
     Rect,
+    Region,
     Role,
     UndetectedBand,
+    UndetectedReason,
     UnknownIdError,
     apply_change,
     overlaps,
@@ -103,7 +108,14 @@ from proteia.core.names import (
     unify_spellings,
 )
 from proteia.core.plotspec import ErrorType
-from proteia.core.project import lane_anchors, propose_lane, spine_axes
+from proteia.core.project import (
+    lane_anchors,
+    lane_pitch,
+    lane_positions,
+    lanes_run_right_to_left,
+    propose_lane,
+    spine_axes,
+)
 from proteia.core.quantify import estimate_background, is_clipped, net_signal
 from proteia.core.results import Results
 from proteia.core.session import (
@@ -126,9 +138,11 @@ __all__ = [
     "LanesUpdate",
     "OperationError",
     "ProjectSession",
+    "RowPlacement",
     "add_protein",
     "compute",
     "compute_view",
+    "detect_row_boxes",
     "edit_protein",
     "export_lane_table",
     "import_image",
@@ -192,6 +206,41 @@ class LanesUpdate:
     reference_cleared: bool  # the reference no longer named a lane and was cleared
     # (protein id, lane index, band index) of each not-detected record in a dropped lane
     dropped_undetected: tuple[tuple[str, int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class RowPlacement:
+    """What :func:`detect_row_boxes` did, lane by lane (lane indices 0-based).
+
+    ``empty`` lists every lane the detector left empty, as ``(lane, reason,
+    snr, expected_x)`` (:class:`~proteia.core.rowdetect.LaneDetection`), whatever
+    the lane kept; of those, ``undetected_lanes`` got a not-detected record and
+    ``unmeasured_lanes`` were left with neither a box nor a record, for the user
+    to place by hand (a box placed there stays through the next drag over the
+    row as long as that drag finds no band there either).
+
+    ``band_ids`` names, per declared lane, the lane's band-index-0 box after
+    the commit, whichever way it got there: placed new, replaced in place
+    (``replaced_band_ids``) or kept (``kept_lanes``); None in a lane left
+    without one.
+
+    ``kept_lanes`` are the lanes whose box was kept as it was: one edited by
+    hand, or one the user placed (source ``click`` or ``manual``) in a lane
+    where no band was found.
+    """
+
+    band_ids: tuple[str | None, ...]  # per declared lane: its first-band box after, or None
+    box_size: BoxSize  # the protein's shared size after the change
+    kept_lanes: tuple[int, ...]
+    replaced_band_ids: tuple[str, ...]  # boxes nobody edited that took the band found, in place
+    # boxes a detector placed (row_box, mw_guided) that nobody edited, where no band was found
+    removed_band_ids: tuple[str, ...]
+    undetected_lanes: tuple[int, ...]
+    unmeasured_lanes: tuple[int, ...]
+    empty: tuple[tuple[int, str, float, float], ...]
+    flags: tuple[str, ...]  # the detector's warnings (rowdetect.WARNING_FLAGS)
+    notes: tuple[str, ...]  # the detector's diagnostics, lanes counted from 1
+    right_to_left: bool  # lanes read from the box's right end, as those on the image run
 
 
 # --- Common machinery ---
@@ -1333,6 +1382,500 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
         "set_box_size",
         change,
         lambda _: {"protein_id": protein_id, "box_size": _size(size)},
+    )
+
+
+# RowDetectError codes as refusals.
+_ROW_ERRORS: Final = {
+    "invalid_row": ErrorCode.INVALID_INPUT,
+    "invalid_image": ErrorCode.UNREADABLE_IMAGE,  # with the image's id
+    "row_outside_image": ErrorCode.OUT_OF_IMAGE,
+    "row_too_small": ErrorCode.ROW_TOO_SMALL,
+}
+# The sources of boxes the user placed: kept by a row that finds no band there.
+_PLACED_BY_USER: Final = frozenset({ProposalSource.CLICK, ProposalSource.MANUAL})
+
+
+def _off_lanes(centres: Mapping[int, float], expected: Mapping[int, float]) -> list[int]:
+    """The lanes, in order, whose band lies nearer a neighbouring lane than its
+    own.
+
+    ``centres`` maps a lane to its band's centre x; ``expected`` maps each of
+    those lanes and both its neighbours to the lane's expected x
+    (:func:`~proteia.core.project.lane_positions`: rising with the lane, or
+    falling on lanes numbered right to left). A band is off its lane when it
+    lies more than half the local pitch from the lane's expected x, the local
+    pitch being the distance to the neighbouring lane on the band's side, so
+    uneven spacing is judged on each side by its own step.
+    """
+    off = []
+    for lane, x in sorted(centres.items()):
+        at, after = expected[lane], expected[lane + 1]
+        neighbour = after if (after - at) * (x - at) > 0 else expected[lane - 1]
+        if abs(x - at) > abs(neighbour - at) / 2:
+            off.append(lane)
+    return off
+
+
+def _in_words(items: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _misnumbered_lanes(
+    batch: Batch, image: ImageRef, without: Collection[str]
+) -> OperationError | None:
+    """The refusal of a row (:func:`detect_row_boxes`) on an image whose lanes
+    already placed are numbered inconsistently, or None.
+
+    The lanes placed are the first-band boxes on the image, of every protein
+    and from any source (:func:`~proteia.core.project.lane_anchors`), less
+    those whose ids are in ``without`` and the boxes grown from a click
+    (source ``click``, edited by hand or not) of a protein whose boxes are
+    wider than the lane pitch (:func:`~proteia.core.project.lane_pitch` of
+    each protein's): such a box is centred on what grew from the click, which
+    may span several lanes' bands (touching bands), so its centre need not lie
+    on its lane's column. A box dropped where the user clicked, moved there by
+    hand or centred on a band a detector found shows its lane whatever its
+    width.
+
+    The lanes placed are numbered inconsistently when two proteins' boxes,
+    each in two or more kept lanes, number the lanes opposite ways
+    (:func:`~proteia.core.project.lanes_run_right_to_left` of each protein's;
+    ``ids``: those proteins, the ones numbering them left to right first), or
+    else when one lane's boxes have centres more than half the lane pitch
+    apart, one lane number on two columns (``ids``: those lanes' boxes, in
+    lane order). Boxes each within a quarter pitch of their lane's column never
+    lie that far apart; two boxes dropped on opposite edges of a band wider
+    than half the pitch can.
+    """
+    proteins = [p for p in batch.proteins if p.image_id == image.id]
+
+    def anchors_of(skipped: Collection[str]) -> dict[str, list[tuple[float, int]]]:
+        return {
+            p.id: lane_anchors(batch, image, without=skipped, only={b.id for b in p.bands})
+            for p in proteins
+        }
+
+    anchors = anchors_of(without)
+    pitch = lane_pitch(anchors.values())
+    if pitch is None:  # no protein has two kept lanes
+        return None
+    grown = {
+        b.id
+        for p in proteins
+        if p.box_size.width > pitch
+        for b in p.bands
+        if b.source is ProposalSource.CLICK
+    }
+    if grown:
+        anchors = anchors_of({*without, *grown})
+    ways = {p.id: lanes_run_right_to_left(anchors[p.id]) for p in proteins}
+    ltr = [p for p in proteins if ways[p.id] is False]
+    rtl = [p for p in proteins if ways[p.id] is True]
+    fix = "fix the lane numbers of the boxes already on this image first"
+    if ltr and rtl:
+        return OperationError(
+            ErrorCode.ROW_LANES_UNCLEAR,
+            "the lanes already placed on this image are numbered both ways: the boxes of"
+            f" {_in_words([repr(p.name) for p in ltr])} left to right, those of"
+            f" {_in_words([repr(p.name) for p in rtl])} right to left; {fix}",
+            ids=[p.id for p in ltr + rtl],
+        )
+    columns: dict[int, list[float]] = {}
+    for p in proteins:
+        for cx, lane in anchors[p.id]:
+            columns.setdefault(lane, []).append(cx)
+    apart = sorted(lane for lane, xs in columns.items() if max(xs) - min(xs) > pitch / 2)
+    if not apart:
+        return None
+    # Each protein has one first-band box per lane: those anchored in the lanes.
+    held = {p.id: {lane for _, lane in anchors[p.id]} for p in proteins}
+    boxes_in = [
+        (lane, p, b.id)
+        for lane in apart
+        for p in proteins
+        for b in p.bands
+        if b.band_index == 0 and b.lane_index == lane and lane in held[p.id]
+    ]
+    named = [p for p in proteins if any(q is p for _, q, _ in boxes_in)]
+    where = "lane" if len(apart) == 1 else "lanes"
+    return OperationError(
+        ErrorCode.ROW_LANES_UNCLEAR,
+        f"the lanes already placed on this image are numbered inconsistently: in {where}"
+        f" {_in_words([str(lane) for lane in apart])}, the boxes of"
+        f" {_in_words([repr(p.name) for p in named])} lie more than {pitch / 2:.0f} px"
+        f" (half the lane pitch) apart; {fix}",
+        ids=[band_id for _, _, band_id in boxes_in],
+    )
+
+
+def _row(row: object) -> Rect:
+    """A row box as given: four ints ``(x0, y0, x1, y1)`` with ``x0 < x1`` and
+    ``y0 < y1``, else ``INVALID_INPUT``. Text and bytes are sequences, but not
+    of coordinates."""
+    if (
+        isinstance(row, str | bytes | bytearray | memoryview)
+        or not isinstance(row, Sequence)
+        or len(row) != 4
+    ):
+        raise _invalid(f"row must be (x0, y0, x1, y1), not {row!r}")
+    x0, y0, x1, y1 = (_int(v, "row coordinate") for v in row)
+    if x1 <= x0 or y1 <= y0:
+        raise _invalid(f"row {(x0, y0, x1, y1)} is empty or inverted")
+    return x0, y0, x1, y1
+
+
+@_locked
+def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> RowPlacement:
+    """Detect one band per declared lane in the row box the user dragged over a
+    protein's row (:func:`~proteia.core.rowdetect.detect_row`) and commit the
+    outcome for the protein's band index 0.
+
+    ``row`` is ``(x0, y0, x1, y1)`` in image pixels, end-exclusive (a client
+    normalizes drag corners with :func:`~proteia.core.boxes.normalize_corners`);
+    it is clipped to the image. It must span every declared lane, include=no
+    lanes and empty end lanes too: the lanes are read from the bands, and
+    detection runs in every lane. In each lane:
+
+    * a box edited by hand (moved, or given another lane) is kept as it is,
+      whatever was found there, and so is a box the user placed (source
+      ``click`` or ``manual``) in a lane where no band is found; both are
+      reported (``kept_lanes``), and the lane gets no record;
+    * otherwise this detection's outcome replaces what the lane held (a box
+      nobody edited, a not-detected record, or nothing). A band found there is
+      placed, with source ``row_box``; over a box nobody edited, whoever placed
+      it, it is placed in place: the band keeps its id and takes the detected
+      box, source and net (a box the band found leaves where it was keeps what
+      its position gave it, an apparent MW), so a second drag corrects the
+      first without undo, and the same drag again changes nothing. A box a
+      detector placed (``row_box``, ``mw_guided``) in a lane where no band is
+      found goes (``removed_band_ids``). A lane where nothing reaches the
+      detection limit (``no_band``) gets a not-detected record of the slot the
+      detector measured. Any other empty lane (a stain or streak, only a
+      neighbouring row's signal, a piece left unassigned) is left with neither
+      a box nor a record (``unmeasured_lanes``).
+
+    So a box the user clicked into a lane the detector cannot read or finds
+    nothing in stays through the next drag over its row, while one clicked
+    over a band the detector finds takes that band until it is edited by hand.
+
+    Boxes and records of another band index are left alone.
+
+    The shared size is the detector's. If a box of the protein survives (one
+    kept, or of another band index), the size only grows, as a seed
+    click grows it, even when every band found is in a kept lane and nothing is
+    placed: the survivors are re-centred and re-quantified and the new boxes
+    centred on the detected ones. That size making survivors overlap, or
+    new boxes overlap each other, is refused (``SIZE_WOULD_OVERLAP``), and so is
+    a new box over a survivor (``OVERLAP``, with the survivor). If none
+    survives, this detection sets the size afresh. A box may then extend beyond
+    the row box, never beyond the image. Nets use ``image.background``; the
+    detector's local background only finds the bands.
+
+    The lanes already placed on the image are its first-band boxes, of any
+    protein and from any source (:func:`~proteia.core.project.lane_anchors`),
+    less this protein's boxes a detector placed that nobody edited, which give
+    way to the row whatever it finds.
+
+    The row reads its lanes left to right, or right to left (lane 0 at the
+    box's right end, ``right_to_left``) when those lanes run that way
+    (:func:`~proteia.core.project.lanes_run_right_to_left`). With fewer than
+    two such lanes, the way this protein's boxes a detector placed run, as the
+    last row read them (so once the row has replaced the boxes the user placed
+    that turned it, the same drag again still reads the lanes their way); with
+    fewer than two of those either, left to right.
+
+    Before anything is detected, the lanes already placed, and this protein's
+    boxes a detector placed when they turn the row, must be numbered
+    consistently, or the row is refused (``ROW_LANES_UNCLEAR``,
+    :func:`_misnumbered_lanes`): the user fixes the lane numbers of the boxes
+    already on the image first, since the row cannot tell which of them are
+    right. So the last row's boxes, turning the row against another protein's
+    box, refuse it until they are removed or that row is undone: the row
+    cannot tell whether its last reading or the other box is right. They are
+    not numbered consistently when two proteins' boxes, each in two or more
+    lanes, number the lanes opposite ways (``ids``: those proteins), or when
+    one lane's boxes lie more than half the lane pitch apart, one lane number
+    on two columns (``ids``: those boxes). A box dragged that far from its
+    lane on purpose refuses the row too. A box grown from a click is left out
+    of this check when the protein's boxes are wider than the lane pitch: it
+    is centred on what grew, which may span several lanes' bands (touching
+    bands), so its centre need not show its lane's column.
+
+    The lanes already placed then check the reading, since a row box that
+    leaves out a banded end lane can be read a lane off with no refusing flag;
+    the lanes that turn the row check it, so the check reads the lanes the way
+    the row was read (the last row's boxes, which turn it only when those
+    lanes show no direction, check nothing: the row replaces them). This
+    protein's boxes the user placed are among them, even where the row
+    replaces them: they show where the user put each lane. Given two
+    anchored lanes, each lane's expected x is interpolated between them and,
+    past them, stepped by the row's own pitch
+    (:func:`~proteia.core.project.lane_positions`: the step of two close
+    lanes, repeated over many, drifts). A band found whose extent's centre
+    lies more than half the local pitch from its lane's expected x
+    (:func:`_off_lanes`) refuses the row (``ROW_LANES_UNCLEAR``). So a row read
+    a lane or more off is refused wherever its bands lie; one squeezed into
+    more lanes than the box covers (its pitch too small), only where its bands
+    lie between the anchored lanes, since past them the row's pitch follows
+    its own reading.
+
+    Also refused, changing nothing: ``row`` not four ints, or empty or
+    inverted (``INVALID_INPUT``); no lanes (``NO_LANES``); lanes on the image
+    numbered inconsistently, as above; a row outside the image
+    (``OUT_OF_IMAGE``) or too small for its lanes (``ROW_TOO_SMALL``);
+    non-finite pixels in the row (``UNREADABLE_IMAGE``, with the image: the
+    image is at fault, not the row); bands that do not show which lane each
+    is in (``ROW_LANES_UNCLEAR``); no band in any lane (``NO_BAND_FOUND``:
+    with no band located, the lane slots would rest only on an even split of
+    the box, so no record is written either). The checks run in that order,
+    the lanes on the image checking the reading next, then the size
+    (:func:`~proteia.core.boxes.grow_to_fit_all`).
+
+    The log entry holds the row as given; each lane's first-band box after the
+    change, as ``band_ids`` names it (placed, replaced in place or kept: its
+    band id and rect), with the lane's outcome (the detector's reason, ``snr``
+    to 2 decimals and ``expected_x`` to 1); the kept lanes, the band ids
+    replaced in place or removed, the records written and dropped (in full),
+    the size after, the fitted pitch and noise, the detector's warnings and
+    notes, whether the lanes were read right to left, and its settings
+    (:func:`~proteia.core.rowdetect.settings`: dev builds share a version
+    string, so the entry names the constants that placed the boxes).
+    """
+    batch = session.project.batch
+    protein = batch.find_protein(protein_id)
+    given = _row(row)
+    n = len(batch.lanes)
+    if n == 0:
+        raise OperationError(ErrorCode.NO_LANES, "declare the lanes before detecting a row")
+    image = batch.find_image(protein.image_id)
+    width, height = image.width, image.height
+    # The lanes on the image, less this protein's boxes that give way to the
+    # row whatever it finds, turn the row and check it. Showing no direction,
+    # the row reads the lanes the way those boxes run, the last row's way:
+    # then they turn it, so they count among the lanes that must be numbered
+    # consistently.
+    detectors = {
+        b.id
+        for b in protein.bands
+        if b.band_index == 0 and not b.manually_edited and b.source in DETECTING_SOURCES
+    }
+    anchors = lane_anchors(batch, image, without=detectors)
+    runs = lanes_run_right_to_left(anchors)
+    last = None
+    if runs is None:
+        last = lanes_run_right_to_left(lane_anchors(batch, image, only=detectors))
+    misnumbered = _misnumbered_lanes(batch, image, detectors if last is None else ())
+    if misnumbered is not None:
+        raise misnumbered
+    array = session.pixels(image.id)
+    right_to_left = runs is True or last is True
+    try:
+        # The settings the export record reports (record.settings): the defaults.
+        found = rowdetect.detect_row(
+            array,
+            given,
+            n,
+            background=image.background,
+            dark_on_light=image.polarity.dark_on_light,
+            right_to_left=right_to_left,
+        )
+    except rowdetect.RowDetectError as exc:
+        ids = (image.id,) if exc.code == "invalid_image" else ()
+        raise OperationError(_ROW_ERRORS[exc.code], str(exc), ids=ids) from exc
+    if found.refused:
+        raise OperationError(
+            ErrorCode.ROW_LANES_UNCLEAR,
+            "the row box does not show which lane each band is in; draw it over every"
+            " declared lane, empty end lanes included, or place the boxes by clicking",
+        )
+    if found.size is None:
+        raise OperationError(ErrorCode.NO_BAND_FOUND, "no band found in the row box")
+
+    # Band index 0, per lane: a box edited by hand stays, and so does one the
+    # user placed where no band was found; any other gives way.
+    banded = {lane.lane for lane in found.lanes if lane.rect is not None}
+    kept = {
+        b.lane_index: b.id
+        for b in protein.bands
+        if b.band_index == 0
+        and (b.manually_edited or (b.source in _PLACED_BY_USER and b.lane_index not in banded))
+    }
+    yielding = {
+        b.lane_index: b.id for b in protein.bands if b.band_index == 0 and b.lane_index not in kept
+    }
+    # The same lanes check the reading (none when they show no direction);
+    # past them, the row's own pitch.
+    expected = lane_positions(anchors, range(-1, n + 1), pitch=found.pitch)
+    centres = {
+        lane.lane: (lane.extent[0] + lane.extent[2]) / 2
+        for lane in found.lanes
+        if lane.extent is not None
+    }
+    if expected and _off_lanes(centres, expected):
+        raise OperationError(
+            ErrorCode.ROW_LANES_UNCLEAR,
+            "the bands in the row box do not line up with the lanes already placed on this"
+            " image; draw the box over every declared lane, empty end lanes included",
+        )
+    # The boxes that survive the commit: those kept, and those of another band
+    # index.
+    keeping = set(kept.values())
+    surviving = [b for b in protein.bands if b.band_index > 0 or b.id in keeping]
+    survivors = [b.id for b in surviving]
+    old = [b.box.rect(protein.box_size) for b in surviving]
+    placed = [lane for lane in found.lanes if lane.rect is not None and lane.lane not in kept]
+    try:
+        # The detector's size; while a box survives it only grows the size, even
+        # if every band found is in a kept lane and nothing is placed.
+        size, resized, new_rects = boxes.grow_to_fit_all(
+            old,
+            protein.box_size,
+            [lane.rect for lane in placed],
+            need=found.size,
+            width=width,
+            height=height,
+        )
+    except boxes.BoxRuleError as exc:
+        grown = f"{exc.size.width}x{exc.size.height}"
+        if exc.code == "overlap":
+            raise OperationError(
+                ErrorCode.OVERLAP,
+                "a box of the row would overlap a box the row keeps",
+                ids=[survivors[i] for i in exc.hits],
+            ) from exc
+        if exc.hits:  # the survivors overlap each other at the grown size
+            message = (
+                f"box size {grown} would make the boxes of {protein.name!r}"
+                " that the row keeps overlap"
+            )
+        else:  # the new boxes do
+            message = (
+                f"the row's boxes would overlap each other at the box size {grown}"
+                f" that the kept boxes of {protein.name!r} need"
+            )
+        raise OperationError(ErrorCode.SIZE_WOULD_OVERLAP, message) from exc
+    rects = {lane.lane: rect for lane, rect in zip(placed, new_rects, strict=True)}
+    records = [
+        lane
+        for lane in found.lanes
+        if lane.reason == "no_band" and lane.window is not None and lane.lane not in kept
+    ]
+    replaced = [yielding[lane] for lane in rects if lane in yielding]
+    removed = [yielding[lane] for lane in sorted(yielding) if lane not in rects]
+    warnings = [flag for flag in found.flags if flag in rowdetect.WARNING_FLAGS]
+
+    def change(
+        draft: Project,
+    ) -> tuple[list[str | None], list[Rect | None], list[JsonValue], list[JsonValue]]:
+        edited = draft.batch.find_protein(protein_id)
+        edited_image = draft.batch.find_image(edited.image_id)
+        old_size = edited.box_size
+        size_changed = old_size != size
+        edited.box_size = size
+        by_id = {band.id: band for band in edited.bands}
+        for band_id, before, after in zip(survivors, old, resized, strict=True):
+            band = by_id[band_id]
+            if after != before:
+                _set_box(band, after)
+            if size_changed or after != before:
+                _quantify(band, edited, edited_image, array)
+        edited.bands = [by_id[band_id] for band_id in survivors]
+        for lane, rect in rects.items():  # in lane order: new ids too
+            if lane in yielding:  # the band found takes the box nobody edited
+                band = by_id[yielding[lane]]
+                if rect != band.box.rect(old_size):  # else it keeps what its position gave it
+                    _set_box(band, rect)
+                band.source = ProposalSource.ROW_BOX
+            else:
+                band = Band(
+                    id=draft.new_id("band"),
+                    lane_index=lane,
+                    band_index=0,
+                    box=Box(x=rect[0], y=rect[1]),
+                    net=0.0,  # set by _quantify
+                    source=ProposalSource.ROW_BOX,
+                )
+            _quantify(band, edited, edited_image, array)
+            edited.bands.append(band)
+        # Every band-index-0 record gives way to this run's outcome in its lane (a
+        # kept box's lane holds none).
+        dropped: list[JsonValue] = list(
+            _drop_undetected_where(edited, lambda record: record.band_index == 0)
+        )
+        written: list[JsonValue] = []
+        for lane in records:
+            x0, y0, x1, y1 = lane.window
+            record = UndetectedBand(
+                lane_index=lane.lane,
+                band_index=0,
+                reason=UndetectedReason.BELOW_DETECTION_LIMIT,
+                snr=lane.snr,
+                threshold=rowdetect.DETECT_K,
+                region=Region(x0=x0, y0=y0, x1=x1, y1=y1),
+                source=ProposalSource.ROW_BOX,
+            )
+            edited.undetected.append(record)
+            written.append(_undetected_json(protein_id, record))
+        # Each lane's first-band box after the change: placed, replaced or kept.
+        after = {b.lane_index: b for b in edited.bands if b.band_index == 0}
+        band_ids = [after[lane].id if lane in after else None for lane in range(n)]
+        lane_rects = [after[lane].box.rect(size) if lane in after else None for lane in range(n)]
+        return band_ids, lane_rects, written, dropped
+
+    def params(
+        result: tuple[list[str | None], list[Rect | None], list[JsonValue], list[JsonValue]],
+    ) -> _Params:
+        band_ids, lane_rects, written, dropped = result
+        return {
+            "protein_id": protein_id,
+            "row": list(given),
+            "lanes": [
+                {
+                    "band_id": band_ids[lane.lane],
+                    "rect": None if lane_rects[lane.lane] is None else list(lane_rects[lane.lane]),
+                    "reason": lane.reason,
+                    "snr": round(lane.snr, 2),
+                    "expected_x": round(lane.expected_x, 1),
+                }
+                for lane in found.lanes
+            ],
+            "kept_lanes": sorted(kept),
+            "replaced_band_ids": list(replaced),
+            "removed_band_ids": list(removed),
+            "undetected_written": written,
+            "dropped_undetected": dropped,
+            "box_size": _size(size),
+            "pitch": found.pitch,
+            "noise": found.noise,
+            "flags": list(warnings),
+            "notes": list(found.notes),
+            "right_to_left": right_to_left,
+            "settings": rowdetect.settings(),
+        }
+
+    band_ids, _, _, _ = _apply(session, "detect_row_boxes", change, params)
+    empty = tuple(
+        (lane.lane, lane.reason, lane.snr, lane.expected_x)
+        for lane in found.lanes
+        if lane.rect is None
+    )
+    recorded = tuple(lane.lane for lane in records)
+    return RowPlacement(
+        band_ids=tuple(band_ids),
+        box_size=size,
+        kept_lanes=tuple(sorted(kept)),
+        replaced_band_ids=tuple(replaced),
+        removed_band_ids=tuple(removed),
+        undetected_lanes=recorded,
+        unmeasured_lanes=tuple(
+            lane for lane, *_ in empty if lane not in recorded and lane not in kept
+        ),
+        empty=empty,
+        flags=tuple(warnings),
+        notes=found.notes,
+        right_to_left=right_to_left,
     )
 
 

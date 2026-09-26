@@ -12,6 +12,7 @@ from proteia.core.boxes import (
     center_snap,
     centered_rect,
     grow_to_fit,
+    grow_to_fit_all,
     initial_box_size,
     normalize_corners,
     overlaps_any,
@@ -170,6 +171,89 @@ def test_grow_to_fit_refuses_a_box_on_an_existing_one():
         grow_to_fit(rects, SIZE, (12, 10, 18, 14), width=W, height=H)
     assert info.value.code == "overlap"
     assert isinstance(info.value, ValueError)
+
+
+# --- grow_to_fit_all: several grown bands at once (row-box detection) ---
+
+
+@pytest.mark.parametrize(
+    ("rects", "grown"),
+    [
+        ([], (40, 20, 51, 27)),
+        ([], (50, 30, 51, 31)),
+        ([(10, 10, 20, 14), (30, 40, 40, 44)], (60, 9, 64, 17)),
+        ([(10, 10, 20, 14), (30, 40, 40, 44)], (70, 30, 72, 31)),
+    ],
+)
+def test_grow_to_fit_all_of_one_band_is_grow_to_fit(rects, grown):
+    size, resized, rect = grow_to_fit(rects, SIZE, grown, width=W, height=H)
+    assert grow_to_fit_all(rects, SIZE, [grown], width=W, height=H) == (size, resized, [rect])
+
+
+def test_grow_to_fit_all_first_boxes_take_the_largest_grown_size():
+    # 11x5 and 7x9 grown: the first boxes set the size to the larger of each,
+    # and each box is centred on its own band, in input order.
+    grown = [(10, 20, 21, 25), (40, 18, 47, 27)]
+    size, resized, placed = grow_to_fit_all([], SIZE, grown, width=W, height=H)
+    assert size == BoxSize(width=11, height=9)
+    assert resized == []
+    assert placed == [(10, 18, 21, 27), (38, 18, 49, 27)]
+
+
+def test_grow_to_fit_all_takes_a_size_fitted_elsewhere():
+    # A size the bands share (a row's detector fits one) stands in for their
+    # own extents; it grows the existing boxes even with no band to place.
+    rects = [(10, 10, 20, 14), (30, 40, 40, 44)]  # centres (15, 12) and (35, 42)
+    need = BoxSize(width=8, height=8)
+    size, resized, placed = grow_to_fit_all(rects, SIZE, [], need=need, width=W, height=H)
+    assert size == BoxSize(width=10, height=8)
+    assert resized == [(10, 8, 20, 16), (30, 38, 40, 46)]
+    assert placed == []
+    need = BoxSize(width=12, height=6)
+    size, _, placed = grow_to_fit_all([], SIZE, [(60, 10, 64, 12)], need=need, width=W, height=H)
+    assert (size, placed) == (need, [(56, 8, 68, 14)])
+
+
+def test_grow_to_fit_all_needs_a_band_or_a_size():
+    with pytest.raises(ValueError, match="grown band or a size") as info:
+        grow_to_fit_all([(10, 10, 20, 14)], SIZE, [], width=W, height=H)
+    assert not isinstance(info.value, BoxRuleError)
+
+
+def test_grow_to_fit_all_refuses_existing_boxes_the_size_makes_overlap():
+    rects = [(0, 0, 10, 4), (15, 0, 25, 4), (60, 30, 70, 34)]  # the first two 5 px apart
+    with pytest.raises(BoxRuleError) as info:
+        grow_to_fit_all(rects, SIZE, [(80, 10, 100, 14)], width=W, height=H)  # 20 px wide
+    error = info.value
+    assert (error.code, error.size, error.hits) == (
+        "size_would_overlap",
+        BoxSize(width=20, height=4),
+        (0, 1),
+    )
+
+
+def test_grow_to_fit_all_refuses_new_boxes_the_size_makes_overlap():
+    # The existing box sets no overlap; the two new ones overlap each other at
+    # the grown size: no existing box is named.
+    grown = [(10, 10, 30, 14), (25, 10, 45, 14)]
+    with pytest.raises(BoxRuleError) as info:
+        grow_to_fit_all([(60, 30, 70, 34)], SIZE, grown, width=W, height=H)
+    error = info.value
+    assert (error.code, error.size, error.hits) == (
+        "size_would_overlap",
+        BoxSize(width=20, height=4),
+        (),
+    )
+
+
+def test_grow_to_fit_all_refuses_new_boxes_on_existing_ones():
+    rects = [(10, 10, 20, 14), (40, 10, 50, 14), (70, 10, 80, 14)]
+    grown = [(12, 20, 18, 24), (72, 10, 78, 14), (41, 10, 49, 14)]  # over the last two
+    with pytest.raises(BoxRuleError) as info:
+        grow_to_fit_all(rects, SIZE, grown, width=W, height=H)
+    error = info.value
+    assert (error.code, error.size, error.hits) == ("overlap", SIZE, (1, 2))  # input order
+    assert str(error) == "a new box would overlap another box of this protein"
 
 
 # --- One row of same-size boxes (row-box detection) ---
