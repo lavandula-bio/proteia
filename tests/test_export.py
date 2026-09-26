@@ -5,7 +5,7 @@ import csv
 
 import pytest
 
-from proteia.core.export import write_lane_table
+from proteia.core.export import LANE_TABLE_DECIMALS, lane_table_bytes, write_lane_table
 
 BOM = b"\xef\xbb\xbf"
 
@@ -85,3 +85,35 @@ def test_lane_table_marks_clipped_bands(tmp_path):
             [("p", [1.0]), ("p clipped", [2.0])],
             clipped={"p": [True]},
         )
+
+
+def test_lane_table_bytes_match_the_written_file(tmp_path):
+    table = (
+        ["vehicle", "10 µM"],
+        ["α1", None],
+        [True, False],
+        [("β-actin", [1.23456, None])],
+    )
+    data = lane_table_bytes(*table, clipped={"β-actin": [False, None]})
+    path = tmp_path / "table β.csv"
+    write_lane_table(path, *table, clipped={"β-actin": [False, None]})
+    assert path.read_bytes() == data
+    assert LANE_TABLE_DECIMALS == 3
+    rows = (
+        "lane,condition,sample,include,β-actin,β-actin clipped\r\n"
+        "0,vehicle,α1,yes,1.235,no\r\n"  # rounded to LANE_TABLE_DECIMALS
+        "1,10 µM,,no,,\r\n"
+    )
+    assert data == BOM + rows.encode()
+
+    collision = tmp_path / "collision.csv"
+    with pytest.raises(ValueError, match="share a name"):
+        write_lane_table(
+            collision,
+            ["a"],
+            ["s1"],
+            [True],
+            [("p", [1.0]), ("p clipped", [2.0])],
+            clipped={"p": [True]},
+        )
+    assert not collision.exists()  # checked before the file is opened

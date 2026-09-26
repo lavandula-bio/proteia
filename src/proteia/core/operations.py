@@ -17,6 +17,14 @@ then autosaves. So an edit is all or nothing:
   number.
 * An edit that leaves the project equal to the committed one is a no-op: nothing
   is committed and the hook does not run.
+* Every committed change appends one log entry (see
+  :class:`~proteia.core.model.LogEntry`); a refusal or a no-op appends none, and
+  so do :func:`compute`, :func:`export_lane_table` and :func:`save`, which change
+  no state. The params record the inputs as they took effect (cleaned text, the
+  stored spelling, the proposed lane, the snapped rect, the size used) and the
+  ids created or removed; objects are named by id, never by path or typed text.
+  Clients commit a drag or a cell edit once, when it ends, not on every pointer
+  move or keystroke.
 
 Stored values that depend on pixels or geometry are recomputed by the operation
 that invalidates them: :func:`_quantify` is the one place a band's net is
@@ -36,19 +44,19 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Concatenate, Final
 
 import numpy as np
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, results, storage
+from proteia.core import boxes, record, results, storage
 from proteia.core.analyze import ReduceMethod
-from proteia.core.export import LANE_COLUMNS, write_lane_table
-from proteia.core.grow import grow_box
+from proteia.core.export import LANE_COLUMNS, lane_table_bytes
+from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import clipping_depth, load_image
 from proteia.core.model import (
     IMAGE_SUFFIXES,
@@ -93,6 +101,7 @@ from proteia.core.session import (
 __all__ = [
     "KEEP",
     "LANE_TABLE_FILE",
+    "LANE_TABLE_RECORD_FILE",
     "Cascade",
     "ErrorCode",
     "Keep",
@@ -119,8 +128,9 @@ __all__ = [
     "set_reference_condition",
 ]
 
-# The lane table export: a fixed name chosen here, never from client text.
+# The lane table export and its record: fixed names chosen here, never from client text.
 LANE_TABLE_FILE: Final = "lane-table.csv"
+LANE_TABLE_RECORD_FILE: Final = "lane-table.record.json"
 # A protein name must not read as one of the lane table's own columns.
 _RESERVED_KEYS: Final = frozenset(name_key(column) for column in LANE_COLUMNS)
 
@@ -193,15 +203,36 @@ def _prepare[T](session: ProjectSession, change: Callable[[Project], T]) -> tupl
         raise _invalid(message) from exc
 
 
+_Params = Mapping[str, JsonValue]  # a log entry's params
+
+
 def _apply[T](
-    session: ProjectSession, action: str, change: Callable[[Project], T], **commit_kw
+    session: ProjectSession,
+    action: str,
+    change: Callable[[Project], T],
+    params: Callable[[T], _Params],
+    **commit_kw,
 ) -> T:
-    """:func:`_prepare`, then commit unless the project did not change."""
+    """:func:`_prepare`, then commit with the log entry ``params(result)`` unless
+    the project did not change."""
     new, result = _prepare(session, change)
-    if new == session.project:  # a no-op: nothing committed, no hook
+    if new == session.project:  # a no-op: nothing committed, no entry, no hook
         return result
-    session._commit(new, action=action, **commit_kw)
+    session._commit(new, action=action, params=params(result), **commit_kw)
     return result
+
+
+def _size(size: BoxSize) -> dict[str, JsonValue]:
+    return {"width": size.width, "height": size.height}
+
+
+def _cascade(cascade: Cascade) -> dict[str, JsonValue]:
+    return {
+        "removed": list(cascade.removed),
+        "detached_targets": list(cascade.detached_targets),
+        "unpaired_images": list(cascade.unpaired_images),
+        "unfitted_membranes": list(cascade.unfitted_membranes),
+    }
 
 
 def _quantify(band: Band, protein: Protein, image: ImageRef, array: np.ndarray) -> None:
@@ -373,16 +404,20 @@ def _users(batch: Batch, protein_id: str) -> list[str]:
     return named + _implicit_users(batch, protein_id)
 
 
-def _pin_single_loading_control(batch: Batch) -> None:
+def _pin_single_loading_control(batch: Batch) -> list[str]:
     """Before a second loading control appears, write the single one into the
     targets that use it implicitly, so their normalization does not change (with
-    two loading controls and none chosen, a target is not normalized at all)."""
+    two loading controls and none chosen, a target is not normalized at all).
+    Returns the ids of the targets it pinned."""
     only = _loading_control_ids(batch)
     if len(only) != 1:
-        return
+        return []
+    pinned = []
     for protein in batch.proteins:
         if protein.role is Role.TARGET and not protein.loading_control_ids:
             protein.loading_control_ids = list(only)
+            pinned.append(protein.id)
+    return pinned
 
 
 def _check_lane(
@@ -496,7 +531,7 @@ def import_image(
             ) from exc
         background = estimate_background(loaded.array)
 
-        def change(draft: Project) -> None:
+        def change(draft: Project) -> str:
             if draft.new_id("img") != image_id:  # the lock makes this impossible
                 raise RuntimeError(f"image id {image_id} changed while the file was stored")
             if membrane_id is None:
@@ -519,13 +554,28 @@ def import_image(
                     import_warnings=loaded.warnings,
                 )
             )
+            return membrane.id
 
-        new, _ = _prepare(session, change)
+        new, membrane_used = _prepare(session, change)
+        params = {
+            "image_id": image_id,
+            "membrane_id": membrane_used,
+            "new_membrane": membrane_id is None,
+            "original_name": original_name,
+            "kind": kind.value,
+            "polarity": polarity.value,
+            "sha256": stored.sha256,  # keeps a removed image's provenance
+        }
+        session._commit(
+            new, action="import_image", params=params, add_pixels={image_id: loaded.array}
+        )
     except BaseException:
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        # _commit can raise before committing (a bad clock or params) or after
+        # (a hook bug): keep the file only if the committed project uses it.
+        if all(image.id != image_id for image in session.project.batch.iter_images()):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
         raise
-    session._commit(new, action="import_image", add_pixels={image_id: loaded.array})
     return image_id
 
 
@@ -590,7 +640,13 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
             unfitted_membranes=tuple(unfitted),
         )
 
-    return _apply(session, "remove_image", change, evict=(image_id,))
+    return _apply(
+        session,
+        "remove_image",
+        change,
+        lambda cascade: {"image_id": image_id, **_cascade(cascade)},
+        evict=(image_id,),
+    )
 
 
 @_locked
@@ -609,7 +665,12 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
         if array is not None:
             _requantify_image(draft, image_id, array)
 
-    _apply(session, "set_polarity", change)
+    _apply(
+        session,
+        "set_polarity",
+        change,
+        lambda _: {"image_id": image_id, "polarity": polarity.value},
+    )
 
 
 # --- Lanes and the reference ---
@@ -693,7 +754,16 @@ def set_lanes(
         ]
         draft.batch.reference_condition = reference
 
-    _apply(session, "set_lanes", change)
+    # Only the rows that are new or differ from the committed table, as stored.
+    stored = [(lane.label, lane.sample, lane.included) for lane in batch.lanes]
+    rows = list(zip(conditions, samples, included, strict=True))
+    changed: list[JsonValue] = [
+        {"index": i, "condition": condition, "sample": sample, "included": include}
+        for i, (condition, sample, include) in enumerate(rows)
+        if i >= len(stored) or rows[i] != stored[i]
+    ]
+    params = {"lane_count": n, "changed": changed, "reference_condition": reference}
+    _apply(session, "set_lanes", change, lambda _: params)
     return LanesUpdate(respelled=respelled, reference_cleared=cleared)
 
 
@@ -707,7 +777,7 @@ def set_reference_condition(session: ProjectSession, condition: str | None) -> N
     def change(draft: Project) -> None:
         draft.batch.reference_condition = reference
 
-    _apply(session, "set_reference_condition", change)
+    _apply(session, "set_reference_condition", change, lambda _: {"reference_condition": reference})
 
 
 # --- Proteins ---
@@ -750,9 +820,8 @@ def add_protein(
     else:
         size = _fitting_size(box_size, image)
 
-    def change(draft: Project) -> str:
-        if role is Role.LOADING_CONTROL:
-            _pin_single_loading_control(draft.batch)
+    def change(draft: Project) -> tuple[str, list[str]]:
+        pinned = _pin_single_loading_control(draft.batch) if role is Role.LOADING_CONTROL else []
         protein_id = draft.new_id("prot")
         draft.batch.proteins.append(
             Protein(
@@ -765,9 +834,23 @@ def add_protein(
                 box_size=size,
             )
         )
-        return protein_id
+        return protein_id, pinned
 
-    return _apply(session, "add_protein", change)
+    def params(result: tuple[str, list[str]]) -> _Params:
+        protein_id, pinned = result
+        return {
+            "protein_id": protein_id,
+            "name": name,
+            "role": role.value,
+            "image_id": image_id,
+            "expected_mw": mw,
+            "loading_control_ids": list(controls),
+            "box_size": _size(size),
+            "pinned_targets": pinned,
+        }
+
+    protein_id, _ = _apply(session, "add_protein", change, params)
+    return protein_id
 
 
 @_locked
@@ -807,16 +890,31 @@ def edit_protein(
     else:
         controls = _loading_controls(batch, protein_id, new_role, loading_control_ids)
 
-    def change(draft: Project) -> None:
+    def change(draft: Project) -> list[str]:
+        pinned = []
         if protein.role is Role.TARGET and new_role is Role.LOADING_CONTROL:
-            _pin_single_loading_control(draft.batch)
+            pinned = _pin_single_loading_control(draft.batch)
         edited = draft.batch.find_protein(protein_id)
         edited.name = new_name
         edited.role = new_role
         edited.expected_mw = mw
         edited.loading_control_ids = controls
+        return [target for target in pinned if target != protein_id]  # its own is cleared
 
-    _apply(session, "edit_protein", change)
+    def params(pinned: list[str]) -> _Params:
+        # Only the fields whose stored value changed, a cleared list included.
+        edits: dict[str, JsonValue] = {"protein_id": protein_id, "pinned_targets": pinned}
+        if new_name != protein.name:
+            edits["name"] = new_name
+        if new_role is not protein.role:
+            edits["role"] = new_role.value
+        if mw != protein.expected_mw:
+            edits["expected_mw"] = mw
+        if controls != protein.loading_control_ids:
+            edits["loading_control_ids"] = list(controls)
+        return edits
+
+    _apply(session, "edit_protein", change, params)
 
 
 @_locked
@@ -844,7 +942,12 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
             unfitted_membranes=(),
         )
 
-    return _apply(session, "remove_protein", change)
+    return _apply(
+        session,
+        "remove_protein",
+        change,
+        lambda cascade: {"protein_id": protein_id, **_cascade(cascade)},
+    )
 
 
 # --- Boxes ---
@@ -882,6 +985,7 @@ def place_box(
     protein = batch.find_protein(protein_id)
     x, y = _int(x, "x"), _int(y, "y")
     lane_index = None if lane_index is None else _int(lane_index, "lane index")
+    proposed = lane_index is None
     if not isinstance(grow, bool):
         raise _invalid(f"grow must be True or False, not {grow!r}")
     n = len(batch.lanes)
@@ -913,8 +1017,14 @@ def place_box(
     array = session.pixels(image.id)
     rects = [band.box.rect(protein.box_size) for band in protein.bands]
     if grow:
+        # The settings the export record reports (record.settings), passed explicitly.
         grown = grow_box(
-            array, (x, y), image.background, dark_on_light=image.polarity.dark_on_light
+            array,
+            (x, y),
+            image.background,
+            rel_threshold=REL_THRESHOLD,
+            noise_k=NOISE_K,
+            dark_on_light=image.polarity.dark_on_light,
         )
         if grown is None:
             raise OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})")
@@ -965,7 +1075,20 @@ def place_box(
         edited.bands.append(band)
         return band.id
 
-    return _apply(session, "place_box", change)
+    def params(band_id: str) -> _Params:
+        return {
+            "band_id": band_id,
+            "protein_id": protein_id,
+            "x": x,
+            "y": y,
+            "grow": grow,
+            "lane_index": lane_index,  # the stored lane, chosen or proposed
+            "lane_proposed": proposed,
+            "rect": list(rect),
+            "box_size": _size(size),  # after the change: a seed click may grow it
+        }
+
+    return _apply(session, "place_box", change, params)
 
 
 @_locked
@@ -999,19 +1122,20 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         moved.manually_edited = True
         _quantify(moved, edited, draft.batch.find_image(edited.image_id), array)
 
-    _apply(session, "move_box", change)
+    _apply(session, "move_box", change, lambda _: {"band_id": band_id, "rect": list(new)})
 
 
 @_locked
 def remove_box(session: ProjectSession, band_id: str) -> None:
     """Remove one box. The protein's size and its other boxes are unchanged."""
-    session.project.batch.find_band(band_id)
+    protein, band = session.project.batch.find_band(band_id)
+    params = {"band_id": band_id, "protein_id": protein.id, "lane_index": band.lane_index}
 
     def change(draft: Project) -> None:
         protein, _ = draft.batch.find_band(band_id)
         protein.bands = [band for band in protein.bands if band.id != band_id]
 
-    _apply(session, "remove_box", change)
+    _apply(session, "remove_box", change, lambda _: params)
 
 
 @_locked
@@ -1043,7 +1167,12 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
                 _set_box(band, new)
             _quantify(band, edited, edited_image, array)
 
-    _apply(session, "set_box_size", change)
+    _apply(
+        session,
+        "set_box_size",
+        change,
+        lambda _: {"protein_id": protein_id, "box_size": _size(size)},
+    )
 
 
 # --- Results, export, save ---
@@ -1068,29 +1197,59 @@ def compute(
 
 @_locked
 def export_lane_table(session: ProjectSession) -> Path:
-    """Write the raw per-lane table to ``exports/lane-table.csv`` and return its path.
+    """Write the raw per-lane table to ``exports/lane-table.csv`` with its
+    reproducibility record, ``exports/lane-table.record.json``
+    (:func:`~proteia.core.record.build_record`); return the table's path.
 
     The same stored-index nets the results table shows, each followed by its
-    clipping flags, in UTF-8 with a BOM.
-    ``OSError`` propagates (with Excel holding the file, nothing is truncated).
-    Not a state change: no autosave.
+    clipping flags, in UTF-8 with a BOM. An image file that is missing or changed
+    since import is refused (``IMAGE_FILE_CHANGED``, with those images): a record
+    never vouches for pixels that are no longer on disk. Both files are built
+    before either is written, and each is replaced atomically, the table first;
+    ``OSError`` propagates (with Excel holding the table, both old files stay; a
+    first export whose record fails removes its table).
+    Not a state change: no log entry, no autosave.
     """
-    batch = session.project.batch
+    project = session.project  # one snapshot for both files
+    batch = project.batch
     if not batch.lanes:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before exporting them")
-    exports = session.folder / storage.EXPORTS_DIR
-    exports.mkdir(parents=True, exist_ok=True)
-    path = exports / LANE_TABLE_FILE
+    bad = storage.verify_images(project, session.folder)
+    if bad:
+        raise OperationError(
+            ErrorCode.IMAGE_FILE_CHANGED,
+            f"image files changed or missing since import: {', '.join(bad)};"
+            " restore them before exporting",
+            ids=bad,
+        )
     conditions, samples, included = spine_axes(batch.lanes)
     nets, clipped = results.lane_nets(batch), results.lane_clipped(batch)
-    write_lane_table(
-        path,
+    table = lane_table_bytes(
         conditions,
         samples,
         included,
         [(p.name, nets[p.id]) for p in batch.proteins],
         clipped={p.name: clipped[p.id] for p in batch.proteins},
     )
+    doc = record.build_record(
+        project, exported_at=session.timestamp(), files={LANE_TABLE_FILE: table}
+    )
+    data = record.record_bytes(doc)
+
+    exports = session.folder / storage.EXPORTS_DIR
+    exports.mkdir(parents=True, exist_ok=True)
+    path, record_path = exports / LANE_TABLE_FILE, exports / LANE_TABLE_RECORD_FILE
+    had_record = record_path.is_file()
+    storage.write_atomic(path, table)
+    try:
+        storage.write_atomic(record_path, data)
+    except OSError:
+        # An old record names other table bytes (detectable); with none, remove
+        # the table rather than leave numbers that no record describes.
+        if not had_record:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+        raise
     return path
 
 

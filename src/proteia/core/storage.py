@@ -4,9 +4,11 @@
 GUI-independent: the standard library plus the model (and pydantic, through its
 types). A project folder, which may have any name, holds::
 
-    project.json        the model (see "Canonical form" below)
-    images/img-2.tif    byte-identical copies of the imported files, named by image id
-    exports/            created by save_project, for exported results
+    project.json                    the model (see "Canonical form" below)
+    images/img-2.tif                byte-identical copies of the imported files, named by id
+    exports/                        created by save_project, for exported results:
+    exports/lane-table.csv          the per-lane table
+    exports/lane-table.record.json  its reproducibility record (proteia.core.record)
 
 Stored names come only from validated ids plus a whitelisted suffix; an image's
 ``original_name`` never becomes a path. A crash can leave orphan files (a temp
@@ -19,9 +21,10 @@ an id that a failed or unsaved import gave back, so importing removes
 Canonical form. ``project.json`` is ``json.dumps`` of the re-validated model's
 JSON-mode dump with sorted keys, ``indent=1``, ``ensure_ascii=False`` and
 ``allow_nan=False``, plus a trailing newline, encoded as UTF-8 with no BOM and
-written in binary, so every platform gets LF and raw UTF-8 for µ, α and β. The
-content hash is the lowercase hex SHA-256 of :func:`canonical_json` (the same
-dump written compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
+written in binary, so every platform gets LF and raw UTF-8 for µ, α and β
+(:func:`document_bytes`, which the export records share). The content hash is
+the lowercase hex SHA-256 of :func:`canonical_json` (the same dump written
+compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
 
 * Floats are written by the standard library's ``float.__repr__``, the shortest
   form that round-trips exactly. pydantic-core's serializer writes some floats
@@ -33,7 +36,9 @@ dump written compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
 * The hash covers ``schema_version``, every id, the lane table, the image records
   (and so the pixels, through each ``sha256``), the calibrations, and the
   proteins and bands with their stored nets and flags. It excludes ``next_id``
-  and the file's formatting, and it is not stored in the project.
+  and the log (the history: equal content made at other times must hash
+  equal), and the file's formatting. The project never stores its own hash;
+  each log entry stores the hash of the content it left.
 * Loading a file Proteia wrote and saving it again gives the same bytes, because
   the strict load keeps every type exactly.
 
@@ -71,8 +76,8 @@ from proteia.core.model import (
 PROJECT_FILE: Final = "project.json"
 IMAGES_DIR: Final = "images"
 EXPORTS_DIR: Final = "exports"
-# Top-level keys left out of the content hash: bookkeeping, not content.
-HASH_EXCLUDE: Final = frozenset({"next_id"})
+# Top-level keys left out of the content hash: bookkeeping and history, not content.
+HASH_EXCLUDE: Final = frozenset({"next_id", "log"})
 # A reader holding project.json (antivirus, indexer, OneDrive) makes the replace
 # fail on Windows: retry with a doubling delay (about 0.75 s in all).
 REPLACE_ATTEMPTS = 5
@@ -132,18 +137,35 @@ def canonical_json(obj: object) -> bytes:
     ).encode("utf-8")
 
 
-def project_to_json(project: Project) -> bytes:
-    """The exact ``project.json`` bytes. Raises ``ValidationError`` if an in-place
-    edit made the project invalid."""
-    doc = revalidate(project).model_dump(mode="json")
+def document_bytes(doc: object) -> bytes:
+    """A JSON document in the file form (see "Canonical form"): ``project.json``
+    and the export records share it."""
     text = json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=1, allow_nan=False)
     return (text + "\n").encode("utf-8")
 
 
-def content_hash(project: Project) -> str:
-    """Lowercase hex SHA-256 of the project's content (see the module docstring)."""
-    doc = revalidate(project).model_dump(mode="json", exclude=set(HASH_EXCLUDE))
+def project_to_json(project: Project) -> bytes:
+    """The exact ``project.json`` bytes. Raises ``ValidationError`` if an in-place
+    edit made the project invalid; the log is validated too, so a file that
+    cannot load is never written."""
+    return document_bytes(revalidate(project).model_dump(mode="json"))
+
+
+def content_document(project: Project) -> dict[str, Any]:
+    """The re-validated content that :func:`content_hash` hashes: the JSON-mode
+    dump without the keys in :data:`HASH_EXCLUDE`."""
+    return revalidate(project, log=False).model_dump(mode="json", exclude=set(HASH_EXCLUDE))
+
+
+def document_hash(doc: Any) -> str:
+    """Lowercase hex SHA-256 of ``canonical_json(doc)``: the one hash recipe."""
     return hashlib.sha256(canonical_json(doc)).hexdigest()
+
+
+def content_hash(project: Project) -> str:
+    """Lowercase hex SHA-256 of the project's content (see the module docstring).
+    Its cost does not grow with the log."""
+    return document_hash(content_document(project))
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -218,7 +240,12 @@ def migrate(
     target: int = SCHEMA_VERSION,
     migrations: Mapping[int, Migration] = MIGRATIONS,
 ) -> dict[str, Any]:
-    """Run the migration steps from ``doc``'s schema up to ``target`` on a copy."""
+    """Run the migration steps from ``doc``'s schema up to ``target`` on a copy.
+
+    A step that changes the hashed content must also append a ``migrate`` log
+    entry (from and to schema, the new content hash); otherwise every export
+    record of a migrated project reports ``content_changed_outside_log``.
+    """
     out, version = copy.deepcopy(doc), doc["schema_version"]
     while version < target:
         step = migrations.get(version)
@@ -297,8 +324,12 @@ def _temp_file(directory: Path, name: str, suffix: str) -> tuple[int, Path]:
     return fd, Path(tmp)
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Replace ``path`` with ``data`` so a reader sees either the old or the new bytes."""
+def write_atomic(path: Path, data: bytes) -> None:
+    """Replace ``path`` with ``data`` so a reader sees either the old or the new bytes.
+
+    The folder must exist. A ``PermissionError`` that outlasts the retries (a
+    reader holding the file on Windows) propagates and leaves the old file intact.
+    """
     mode = _file_mode(path)
     fd, tmp = _temp_file(path.parent, path.name, ".tmp")
     try:
@@ -333,7 +364,7 @@ def save_project(project: Project, folder: str | os.PathLike[str]) -> Path:
     for directory in (folder, folder / IMAGES_DIR, folder / EXPORTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
     path = folder / PROJECT_FILE
-    _atomic_write(path, data)
+    write_atomic(path, data)
     return path
 
 

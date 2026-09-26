@@ -12,11 +12,12 @@ the other membrane; GAPDH is measured on the reprobe. Lane 2 has no β-catenin
 band, and band lists are given out of order.
 
 Image helpers for tests that read real pixels: :func:`write_tiff` and
-:func:`synthetic_blot`.
+:func:`synthetic_blot`. :class:`FakeClock` gives a session predictable log times.
 """
 
 import hashlib
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,22 @@ from proteia.core.model import Project
 from proteia.core.storage import image_path
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
+
+
+class FakeClock:
+    """Aware UTC time from 2026-09-26T08:00:00Z, one second later on each call."""
+
+    def __init__(
+        self,
+        start: datetime = datetime(2026, 9, 26, 8, 0, tzinfo=UTC),
+        step: timedelta = timedelta(seconds=1),
+    ) -> None:
+        self.now = start
+        self.step = step
+
+    def __call__(self) -> datetime:
+        now, self.now = self.now, self.now + self.step
+        return now
 
 
 def image_bytes(image_id: str) -> bytes:

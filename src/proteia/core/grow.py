@@ -15,9 +15,15 @@ Pure and GUI-independent so the growth rule can be unit-tested.
 
 from __future__ import annotations
 
+from typing import Final
+
 import numpy as np
 
 from proteia.core.model import Rect
+
+# The growth settings place_box uses, reported in every export record.
+REL_THRESHOLD: Final = 0.3  # grow while the signal is above this fraction of the seed's
+NOISE_K: Final = 3.0  # ...and above this many times the membrane noise
 
 
 def _signal(gray: np.ndarray, background: float, dark_on_light: bool) -> np.ndarray:
@@ -37,8 +43,8 @@ def grow_box(
     seed: tuple[int, int],
     background: float,
     *,
-    rel_threshold: float = 0.3,
-    noise_k: float = 3.0,
+    rel_threshold: float = REL_THRESHOLD,
+    noise_k: float = NOISE_K,
     max_width: int | None = None,
     max_height: int | None = None,
     dark_on_light: bool = True,
