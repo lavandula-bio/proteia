@@ -8,7 +8,7 @@ from proteia import core, gui  # noqa: F401  (import-only check)
 
 
 def test_version():
-    assert proteia.__version__ == "0.1.0"
+    assert proteia.__version__ == "0.1.0.dev0"
 
 
 def test_version_matches_the_installed_metadata():
