@@ -159,6 +159,28 @@ def lane_positions(
     return positions
 
 
+def lanes_run_right_to_left(anchors: Sequence[tuple[float, int]]) -> bool | None:
+    """Whether the kept anchors number the lanes right to left (a mirrored
+    image), as :func:`propose_lane` and :func:`lane_positions` read them; None
+    with fewer than two kept lanes, which show no direction."""
+    points, sign = _kept(anchors)
+    return None if len(points) < 2 else sign < 0
+
+
+def lane_pitch(groups: Iterable[Sequence[tuple[float, int]]]) -> float | None:
+    """The lane pitch (px per lane) that several groups of anchors show, e.g.
+    each protein's boxes on an image: the median x step per lane between
+    neighbouring kept anchors (:func:`propose_lane`) of each group, taken over
+    every group. Each group is read on its own, so groups numbering the lanes
+    opposite ways, or one a lane off, still show the spacing. None when no
+    group has two kept lanes."""
+    steps = []
+    for anchors in groups:
+        points, _ = _kept(anchors)
+        steps.extend((bx - ax) / (bl - al) for (al, ax), (bl, bx) in itertools.pairwise(points))
+    return statistics.median(steps) if steps else None
+
+
 def _kept(anchors: Sequence[tuple[float, int]]) -> tuple[list[tuple[int, float]], int]:
     """The kept anchors as ``(lane, signed centre x)`` points, rising in both, and
     the sign (1, or -1 for lanes numbered right to left) of the signed x."""
@@ -179,21 +201,32 @@ def _pitch(pairs: Sequence[tuple[tuple[int, float], tuple[int, float]]]) -> floa
 
 
 def lane_anchors(
-    batch: Batch, image: ImageRef, *, without: Collection[str] = ()
+    batch: Batch,
+    image: ImageRef,
+    *,
+    without: Collection[str] = (),
+    only: Collection[str] | None = None,
 ) -> list[tuple[float, int]]:
     """``(centre x, stored lane)`` of the first bands on an image, of any protein:
     the anchors :func:`propose_lane` and :func:`lane_positions` take.
 
     A box touching the left or right edge is left out: it may have been shifted
     inside the image, so its centre need not be its lane's. So are the bands
-    whose ids are in ``without`` (boxes a change is about to replace).
+    whose ids are in ``without`` (boxes a change is about to replace) and, when
+    ``only`` is given, those whose ids are not in it.
     """
     anchors = []
     for protein in batch.proteins:
         if protein.image_id == image.id:
             for band in protein.bands:
                 x0, _, x1, _ = band.box.rect(protein.box_size)
-                if band.band_index == 0 and x0 > 0 and x1 < image.width and band.id not in without:
+                if (
+                    band.band_index == 0
+                    and x0 > 0
+                    and x1 < image.width
+                    and band.id not in without
+                    and (only is None or band.id in only)
+                ):
                     anchors.append(((x0 + x1) / 2, band.lane_index))
     return anchors
 

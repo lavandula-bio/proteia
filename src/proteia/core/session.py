@@ -81,7 +81,9 @@ class ErrorCode(StrEnum):
     OUT_OF_IMAGE = "out_of_image"
     NO_BAND_FOUND = "no_band_found"
     ROW_TOO_SMALL = "row_too_small"  # a row box too narrow for its lanes or too low to smooth
-    ROW_LANES_UNCLEAR = "row_lanes_unclear"  # the bands in a row box do not show their lanes
+    # The bands in a row box, or the lanes already placed on its image, do not
+    # show which lane is which.
+    ROW_LANES_UNCLEAR = "row_lanes_unclear"
     OVERLAP = "overlap"
     SIZE_WOULD_OVERLAP = "size_would_overlap"
     SIZE_OUT_OF_BOUNDS = "size_out_of_bounds"

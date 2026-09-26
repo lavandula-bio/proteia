@@ -162,7 +162,7 @@ SIZE_RULES: Final = ("max", "max_guarded")
 REFUSING_FLAGS: Final = ("lanes_outside_row", "ambiguous_lanes")
 WARNING_FLAGS: Final = ("background_mismatch", "size_outlier", "multiple_components")
 
-RowDetectErrorCode = Literal["invalid_row", "row_outside_image", "row_too_small"]
+RowDetectErrorCode = Literal["invalid_row", "invalid_image", "row_outside_image", "row_too_small"]
 LaneReason = Literal["band", "no_band", "artefact", "edge_signal", "unassigned"]
 
 _TAIL_Z: Final = float(ndtri(0.5 + TAIL_Q / 200.0))  # Gaussian |z| at the TAIL_Q percentile
@@ -173,9 +173,11 @@ _CROSS: Final = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)  # 4-connectiv
 class RowDetectError(ValueError):
     """A row box :func:`detect_row` cannot use. ``code`` is stable for callers:
 
-    * ``invalid_row``: not a 2-D array of finite values, ``n_lanes`` not a
-      positive int, the row not four ints with ``x0 < x1`` and ``y0 < y1``, or
-      ``background`` not a finite real number;
+    * ``invalid_row``: ``n_lanes`` not a positive int, or the row not four
+      ints with ``x0 < x1`` and ``y0 < y1``;
+    * ``invalid_image``: the image is at fault: the array not 2-D, the row
+      holding non-finite pixel values, or ``background`` (the image's) not a
+      finite real number;
     * ``row_outside_image``: nothing of the row is left after clipping it to
       the image;
     * ``row_too_small``: the clipped row is narrower than :data:`MIN_BOX` px per
@@ -1073,7 +1075,7 @@ def _is_int(v: object) -> bool:
 def _check_row(gray: np.ndarray, row: Sequence[int], n_lanes: int, background: float) -> Rect:
     """The row clipped to the image, or :class:`RowDetectError`."""
     if gray.ndim != 2:
-        raise RowDetectError("invalid_row", "the analysis array must be 2-D")
+        raise RowDetectError("invalid_image", "the analysis array must be 2-D")
     if not _is_int(n_lanes) or n_lanes < 1:
         raise RowDetectError("invalid_row", f"n_lanes must be a positive int, not {n_lanes!r}")
     if (
@@ -1082,7 +1084,7 @@ def _check_row(gray: np.ndarray, row: Sequence[int], n_lanes: int, background: f
         or not math.isfinite(background)
     ):
         raise RowDetectError(
-            "invalid_row", f"background must be a finite number, not {background!r}"
+            "invalid_image", f"background must be a finite number, not {background!r}"
         )
     try:
         values = tuple(row)
@@ -1278,7 +1280,7 @@ def detect_row(
     n = int(n_lanes)
     crop = np.asarray(gray[y0:y1, x0:x1], dtype=np.float64)
     if not np.isfinite(crop).all():
-        raise RowDetectError("invalid_row", "the row holds non-finite pixel values")
+        raise RowDetectError("invalid_image", "the row holds non-finite pixel values")
     hc, wc = crop.shape
     sign = 1.0 if dark_on_light else -1.0
     floor = _noise_floor(crop)

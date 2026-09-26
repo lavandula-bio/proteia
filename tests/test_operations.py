@@ -67,7 +67,7 @@ from proteia.core.operations import (
     ProjectSession,
 )
 from proteia.core.plotspec import ErrorType
-from proteia.core.project import lane_positions
+from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.quantify import estimate_background, is_clipped, net_signal
 from proteia.core.record import history_issues
 from proteia.core.results import Level, NoticeCode
@@ -2812,17 +2812,20 @@ def other_protein_in_lanes(
     *,
     dx: float = 0.0,
     mirrored: bool = False,
+    name: str = "GAPDH",
+    offset: int = 0,
 ) -> str:
     """A second protein on the image with a small box in each of ``lanes``
     (every lane by default), at the lane's true centre moved ``dx`` px, in a row
     of its own above the case's: lanes already placed on the image. Mirrored,
-    the lanes are numbered right to left."""
+    the lanes are numbered right to left; ``offset`` is added to each lane
+    number (a protein numbered a lane off)."""
     other = ops.add_protein(
-        s, "GAPDH", Role.LOADING_CONTROL, image_id, box_size=BoxSize(width=20, height=8)
+        s, name, Role.LOADING_CONTROL, image_id, box_size=BoxSize(width=20, height=8)
     )
     n = case.n_lanes
     for lane in range(n) if lanes is None else lanes:
-        index = n - 1 - lane if mirrored else lane
+        index = (n - 1 - lane if mirrored else lane) + offset
         ops.place_box(s, other, round(case.lane_cx[lane] + dx), 20, lane_index=index, grow=False)
     return other
 
@@ -2977,7 +2980,8 @@ def test_a_box_the_user_placed_where_no_band_is_found_is_kept(tmp_path, key, lan
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     kept = band_of(s, box)
-    assert lane_bands(s, protein)[lane] is kept and placement.band_ids[lane] is None
+    # The lane's box after the commit is the kept one.
+    assert lane_bands(s, protein)[lane] is kept and placement.band_ids[lane] == box
     assert (kept.source, kept.manually_edited) == (source, False)
     assert placement.kept_lanes == (lane,)
     assert (placement.replaced_band_ids, placement.removed_band_ids) == ((), ())
@@ -2996,6 +3000,10 @@ def test_a_box_the_user_placed_where_no_band_is_found_is_kept(tmp_path, key, lan
     params = s.project.log[-1].params
     assert (params["kept_lanes"], params["removed_band_ids"]) == ([lane], [])
     assert params["undetected_written"] == []
+    assert (params["lanes"][lane]["band_id"], params["lanes"][lane]["rect"]) == (
+        box,
+        _rect_of(s, box),
+    )
     assert ops.compute(s).proteins[0].detected[lane] is True
     assert_nets_current(s)
 
@@ -3045,7 +3053,7 @@ def test_a_box_the_user_placed_in_a_lane_left_unmeasured_stays_on_the_next_drag(
     assert second.kept_lanes == (4,) and second.unmeasured_lanes == ()
     ids = tuple(band_id for band_id in first.band_ids if band_id is not None)
     assert second.replaced_band_ids == ids
-    assert second.band_ids == first.band_ids
+    assert second.band_ids == (*first.band_ids[:4], box, *first.band_ids[5:])
 
 
 def test_a_record_from_any_detector_gives_way(tmp_path):
@@ -3164,7 +3172,7 @@ def test_a_hand_edited_box_is_kept_and_reported(tmp_path):
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert placement.kept_lanes == (1, 2)
-    assert (placement.band_ids[1], placement.band_ids[2]) == (None, None)
+    assert (placement.band_ids[1], placement.band_ids[2]) == (on_band, on_empty)
     bands = lane_bands(s, protein)
     assert (bands[1].id, bands[2].id) == (on_band, on_empty)
     assert (bands[1].source, bands[2].source) == (ProposalSource.CLICK, ProposalSource.MANUAL)
@@ -3222,12 +3230,13 @@ def test_a_row_whose_bands_all_have_edited_boxes_grows_them_and_records(tmp_path
             s, ops.place_box(s, protein, *at_lane(case, lane), lane_index=lane, grow=False)
         )
     before = rects_by_lane(s, protein)
+    ids = {lane: band.id for lane, band in lane_bands(s, protein).items()}
     found = detected(s, protein, case.row)
     size = BoxSize(width=max(40, found.size.width), height=max(10, found.size.height))
     assert size != small  # the detector's size is larger
 
     placement = ops.detect_row_boxes(s, protein, case.row)
-    assert placement.band_ids == (None,) * 6
+    assert placement.band_ids == tuple(ids.get(lane) for lane in range(6))  # the kept boxes
     assert placement.kept_lanes == (0, 1, 3, 4, 5)
     assert placement.box_size == protein_of(s, protein).box_size == size
     assert rects_by_lane(s, protein) == {
@@ -3292,6 +3301,22 @@ def test_a_second_drag_corrects_the_first(tmp_path):
     assert s.project is committed  # the same drag again: a no-op, no entry
 
 
+def test_a_box_the_same_drag_replaces_where_it_is_keeps_its_mw(tmp_path):
+    # Replaced in place by a box of the same rect, a band keeps what its
+    # position gave it (an apparent MW, #58): the same drag again is a no-op.
+    case = ROWS["all_present"]
+    s, _, protein = row_session(tmp_path, case)
+    first = ops.detect_row_boxes(s, protein, case.row)
+    band_id = first.band_ids[2]
+    plant(s, lambda draft: setattr(draft.batch.find_band(band_id)[1], "apparent_mw", 92.0))
+    committed, length = s.project, len(s.project.log)
+
+    again = ops.detect_row_boxes(s, protein, case.row)
+    assert again.replaced_band_ids == first.band_ids
+    assert s.project is committed and len(s.project.log) == length
+    assert band_of(s, band_id).apparent_mw == 92.0
+
+
 def test_warnings_are_reported_and_logged(tmp_path):
     case = adversarial("tall_band", 1000)  # lane 3 far taller than the others
     s, _, protein = row_session(tmp_path, case)
@@ -3317,7 +3342,8 @@ def test_the_row_commit_logs_every_lane(tmp_path):
     next_id = s.project.next_id
 
     placement = ops.detect_row_boxes(s, protein, case.row)
-    ids = [replaced, f"band-{next_id}", None, f"band-{next_id + 1}", None, f"band-{next_id + 2}"]
+    # Each lane's box after the commit: replaced in place, new, or kept (lane 4).
+    ids = [replaced, f"band-{next_id}", None, f"band-{next_id + 1}", kept, f"band-{next_id + 2}"]
     assert placement.band_ids == tuple(ids)
     [written] = protein_of(s, protein).undetected
     lanes = [
@@ -3447,6 +3473,25 @@ def _placed_lanes(s: ProjectSession, ids: dict[str, str]) -> None:
     other_protein_in_lanes(s, ids["image"], SCENE)
 
 
+def _numbered_both_ways(s: ProjectSession, ids: dict[str, str]) -> None:
+    """Another protein's boxes number the lanes right to left, the target's
+    boxes in lanes 1 and 2 left to right."""
+    other_protein_in_lanes(s, ids["image"], SCENE, mirrored=True)
+    ops.place_box(s, ids["protein"], *at_lane(SCENE, 2), lane_index=2, grow=True)
+
+
+def _lane_in_two_columns(s: ProjectSession, ids: dict[str, str]) -> None:
+    """Another protein numbered a lane off: its box in lane 1 lies over true
+    lane 0, the target's over true lane 1."""
+    other_protein_in_lanes(s, ids["image"], SCENE, range(5), offset=1)
+
+
+# The setups whose rows are refused for the lanes on the image: the bands
+# found would not line up with those lanes either, so the code alone does not
+# show which check refused them.
+NUMBERING_SETUPS = (_numbered_both_ways, _lane_in_two_columns)
+NUMBERED = "the lanes already placed on this image are numbered"
+
 ROW_REFUSALS = [
     pytest.param(None, "prot-999", SCENE.row, None, id="unknown-protein"),
     pytest.param(None, None, (1, 2, 3), ErrorCode.INVALID_INPUT, id="three-values"),
@@ -3455,6 +3500,12 @@ ROW_REFUSALS = [
         None, None, (*SCENE.row[:3], SCENE.row[3] + 0.5), ErrorCode.INVALID_INPUT, id="float"
     ),
     pytest.param(None, None, (*SCENE.row[:3], True), ErrorCode.INVALID_INPUT, id="bool"),
+    # Bytes are a sequence of ints: (62, 68, 255, 93) would be a row.
+    pytest.param(None, None, bytes((62, 68, 255, 93)), ErrorCode.INVALID_INPUT, id="bytes"),
+    pytest.param(None, None, bytearray((62, 68, 255, 93)), ErrorCode.INVALID_INPUT, id="bytearray"),
+    pytest.param(
+        None, None, memoryview(bytes((62, 68, 255, 93))), ErrorCode.INVALID_INPUT, id="memoryview"
+    ),
     pytest.param(
         None,
         None,
@@ -3462,7 +3513,45 @@ ROW_REFUSALS = [
         ErrorCode.INVALID_INPUT,
         id="inverted",
     ),
+    # The row is checked before the lanes.
+    pytest.param(
+        _no_lanes,
+        None,
+        (SCENE.row[0], SCENE.row[3], SCENE.row[2], SCENE.row[1]),
+        ErrorCode.INVALID_INPUT,
+        id="inverted-without-lanes",
+    ),
+    pytest.param(
+        _no_lanes,
+        None,
+        (SCENE.row[0], SCENE.row[1], SCENE.row[0], SCENE.row[3]),
+        ErrorCode.INVALID_INPUT,
+        id="empty-without-lanes",
+    ),
     pytest.param(_no_lanes, None, SCENE.row, ErrorCode.NO_LANES, id="no-lanes"),
+    # The lanes on the image are checked before anything is detected: even a
+    # row outside the image is refused for them.
+    pytest.param(
+        _numbered_both_ways,
+        None,
+        SCENE.row,
+        ErrorCode.ROW_LANES_UNCLEAR,
+        id="numbered-both-ways",
+    ),
+    pytest.param(
+        _lane_in_two_columns,
+        None,
+        SCENE.row,
+        ErrorCode.ROW_LANES_UNCLEAR,
+        id="lane-in-two-columns",
+    ),
+    pytest.param(
+        _lane_in_two_columns,
+        None,
+        (SCENE_W + 10, 0, SCENE_W + 50, 20),
+        ErrorCode.ROW_LANES_UNCLEAR,
+        id="lane-in-two-columns-outside",
+    ),
     pytest.param(
         None, None, (SCENE_W + 10, 0, SCENE_W + 50, 20), ErrorCode.OUT_OF_IMAGE, id="outside"
     ),
@@ -3514,6 +3603,7 @@ def test_a_refused_row_changes_nothing(tmp_path, setup, protein_id, row, code):
         ops.detect_row_boxes(s, protein_id or ids["protein"], row)
     if code is not None:
         assert info.value.code is code
+    assert str(info.value).startswith(NUMBERED) is (setup in NUMBERING_SETUPS)
     assert s.project is before
     assert s.project.next_id == next_id
     assert len(s.project.log) == log_length
@@ -3522,6 +3612,30 @@ def test_a_refused_row_changes_nothing(tmp_path, setup, protein_id, row, code):
     assert s._pixels == {}  # pixels read for the detection are not kept
     if code is ErrorCode.OVERLAP:
         assert info.value.ids == (ids["band"],)
+
+
+def _not_2d(pixels: np.ndarray) -> np.ndarray:
+    return np.stack([pixels] * 3, axis=-1)
+
+
+def _nan_in_row(pixels: np.ndarray) -> np.ndarray:
+    pixels = pixels.astype(np.float64)
+    pixels[SCENE.row[1] + 5, SCENE.row[0] + 5] = np.nan
+    return pixels
+
+
+@pytest.mark.parametrize("damage", [_nan_in_row, _not_2d], ids=["nan-in-row", "not-2d"])
+def test_pixels_the_detector_cannot_read_are_an_unreadable_image(tmp_path, damage):
+    # The image is at fault, not the row: the refusal names the image.
+    s, image, protein = row_session(tmp_path, SCENE)
+    pixels = damage(np.array(s.pixels(image)))
+    pixels.flags.writeable = False
+    s._pixels[image] = pixels
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein, SCENE.row)
+    assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image,))
+    assert s.project is before
 
 
 @pytest.mark.parametrize(
@@ -3654,9 +3768,11 @@ def test_one_lane_on_the_image_does_not_show_the_lanes(tmp_path):
     assert placement.band_ids[5] is None and placement.undetected_lanes == (5,)
 
 
-def test_the_boxes_a_row_replaces_are_not_lanes_it_is_checked_against(tmp_path):
+def test_the_boxes_a_detector_placed_are_not_lanes_a_row_is_checked_against(tmp_path):
     # The first drag, a lane off, is committed: nothing is placed to check it
     # against. The right drag replaces its boxes in place; they do not refuse it.
+    # (Boxes the user placed that a row replaces do check it: see
+    # test_a_row_read_a_lane_off_the_lanes_that_turn_it_is_refused.)
     case = ROWS["all_present"]
     s, _, protein = row_session(tmp_path, case)
     first = ops.detect_row_boxes(s, protein, shifted(case, 70))
@@ -3809,6 +3925,321 @@ def test_boxes_the_user_placed_right_to_left_turn_the_row_around(tmp_path):
     assert placement.replaced_band_ids == (clicked[1], clicked[0])  # lanes 3, 4
     assert placement.band_ids[n - 2] == clicked[0] and placement.band_ids[n - 3] == clicked[1]
     assert at_true_lanes(s, protein, case) == {n - 1 - true: true for true in range(n)}
+
+    # The boxes that turned the row are the row's now, and nothing else is
+    # placed: the same drag again reads the lanes the way the row's boxes run,
+    # so it changes nothing.
+    committed, length = s.project, len(s.project.log)
+    again = ops.detect_row_boxes(s, protein, case.row)
+    assert again.right_to_left and again.band_ids == placement.band_ids
+    assert s.project is committed and len(s.project.log) == length
+
+
+def test_lanes_placed_after_a_row_turn_the_next_drag(tmp_path):
+    # The row's own boxes give way to the lanes placed on the image: read left
+    # to right with nothing placed, the same drag is read right to left once
+    # another protein's boxes number the lanes that way.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, image, protein = row_session(tmp_path, case)
+    first = ops.detect_row_boxes(s, protein, case.row)
+    assert not first.right_to_left
+    other_protein_in_lanes(s, image, case, mirrored=True)
+
+    second = ops.detect_row_boxes(s, protein, case.row)
+    assert second.right_to_left
+    assert set(second.replaced_band_ids) == set(first.band_ids)
+    assert at_true_lanes(s, protein, case) == {n - 1 - true: true for true in range(n)}
+
+
+def test_lane_anchors_of_some_bands_only(tmp_path):
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, (2, 3))
+    own = {band_id for band_id in ops.detect_row_boxes(s, protein, case.row).band_ids if band_id}
+    batch = s.project.batch
+    ref = batch.find_image(image)
+
+    mine, others = lane_anchors(batch, ref, only=own), lane_anchors(batch, ref, without=own)
+    assert sorted(lane for _, lane in mine) == list(range(6))
+    assert sorted(lane for _, lane in others) == [2, 3]
+    assert sorted(mine + others) == sorted(lane_anchors(batch, ref))
+    assert lane_anchors(batch, ref, without=own, only=own) == []
+
+
+def clicked_lanes(tmp_path: Path, mirrored: bool) -> tuple[ProjectSession, str, str, list[str]]:
+    """The protein's boxes clicked in true lanes 0, 1 and 4, numbered right to
+    left when ``mirrored``."""
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, image, protein = row_session(tmp_path, case)
+    lanes = {true: n - 1 - true if mirrored else true for true in (0, 1, 4)}
+    clicked = [
+        ops.place_box(s, protein, *at_lane(case, true), lane_index=lane, grow=True)
+        for true, lane in lanes.items()
+    ]
+    return s, image, protein, clicked
+
+
+@pytest.mark.parametrize("mirrored", [False, True], ids=["clicked-ltr", "clicked-rtl"])
+def test_the_lanes_that_turn_a_row_check_it(tmp_path, mirrored):
+    # The clicked boxes turn the row and check it, and it replaces them.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, _, protein, clicked = clicked_lanes(tmp_path, mirrored)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.right_to_left is mirrored
+    assert sorted(placement.replaced_band_ids) == sorted(clicked)
+    assert at_true_lanes(s, protein, case) == {
+        n - 1 - true if mirrored else true: true for true in range(n)
+    }
+
+
+@pytest.mark.parametrize("dx", [70, -70], ids=["right", "left"])
+@pytest.mark.parametrize("mirrored", [False, True], ids=["clicked-ltr", "clicked-rtl"])
+def test_a_row_read_a_lane_off_the_lanes_that_turn_it_is_refused(tmp_path, mirrored, dx):
+    # The clicked boxes the row would replace are among the lanes that check
+    # it: they show where the user put each lane.
+    case = ROWS["all_present"]
+    s, _, protein, _ = clicked_lanes(tmp_path, mirrored)
+    refused_as(s, protein, shifted(case, dx), OFF_LANES)
+
+
+# --- #51: a row on an image whose lanes are numbered inconsistently ---
+
+
+def both_ways(ltr: str, rtl: str) -> str:
+    """The refusal of a row on an image whose lanes are numbered both ways."""
+    return (
+        f"the lanes already placed on this image are numbered both ways: the boxes of {ltr}"
+        f" left to right, those of {rtl} right to left; fix the lane numbers of the boxes"
+        " already on this image first"
+    )
+
+
+def two_columns(lanes: str, names: str, half: int) -> str:
+    """The refusal of a row on an image where one lane number labels two
+    columns."""
+    return (
+        f"the lanes already placed on this image are numbered inconsistently: in {lanes},"
+        f" the boxes of {names} lie more than {half} px (half the lane pitch) apart; fix"
+        " the lane numbers of the boxes already on this image first"
+    )
+
+
+def numbering_refused(
+    s: ProjectSession, protein_id: str, row, message: str, monkeypatch
+) -> tuple[str, ...]:
+    """The row is refused for the lanes on its image before anything is
+    detected, changing nothing; the refusal's ids."""
+
+    def no_detection(*args, **kwargs):
+        raise AssertionError("the row was detected")
+
+    monkeypatch.setattr(rowdetect, "detect_row", no_detection)
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein_id, row)
+    assert info.value.code is ErrorCode.ROW_LANES_UNCLEAR
+    assert str(info.value) == message
+    assert s.project is before
+    return info.value.ids
+
+
+@pytest.mark.parametrize("mirrored", [False, True], ids=["gapdh-ltr", "gapdh-rtl"])
+def test_two_proteins_numbering_the_lanes_opposite_ways_refuse_a_row(
+    tmp_path, monkeypatch, mirrored
+):
+    # Whatever the row box, and before it is read: the user fixes the lane
+    # numbers first. The refusal names the proteins, left to right first.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    gapdh = other_protein_in_lanes(s, image, case, (1, 2, 3), mirrored=mirrored)
+    actin = other_protein_in_lanes(s, image, case, (3, 4), mirrored=not mirrored, name="actin")
+    ltr, rtl = ("'actin'", "'GAPDH'") if mirrored else ("'GAPDH'", "'actin'")
+    for row in (case.row, shifted(case, 70), UNCLEAR_ROW):
+        ids = numbering_refused(s, protein, row, both_ways(ltr, rtl), monkeypatch)
+        assert ids == ((actin, gapdh) if mirrored else (gapdh, actin))
+
+
+@pytest.mark.parametrize("mirrored", [False, True], ids=["clicked-ltr", "clicked-rtl"])
+def test_the_proteins_own_boxes_count_among_the_lanes_numbered(tmp_path, monkeypatch, mirrored):
+    # The protein's boxes clicked in four lanes number them one way, another
+    # protein's boxes in two lanes the other. (Read the clicked way and
+    # committed, the clicked boxes would be the row's, and the same drag again
+    # would read the lanes the other protein's way.)
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, image, protein = row_session(tmp_path, case)
+    other = other_protein_in_lanes(s, image, case, (2, 3), mirrored=not mirrored)
+    for true in (0, 1, 4, 5):
+        lane = n - 1 - true if mirrored else true
+        ops.place_box(s, protein, *at_lane(case, true), lane_index=lane, grow=True)
+    names = ("'GAPDH'", "'β-catenin'") if mirrored else ("'β-catenin'", "'GAPDH'")
+    ids = numbering_refused(s, protein, case.row, both_ways(*names), monkeypatch)
+    assert ids == ((other, protein) if mirrored else (protein, other))
+
+
+@pytest.mark.parametrize("mirrored", [False, True], ids=["clicked-ltr", "clicked-rtl"])
+def test_a_box_dragged_far_enough_to_turn_its_proteins_lanes_refuses_a_row(
+    tmp_path, monkeypatch, mirrored
+):
+    # Another protein's boxes in true lanes 2 and 3, numbered the clicked way,
+    # its box in lane 3 then moved by hand to between lanes 0 and 1 as
+    # numbered: on their own, its two boxes run the other way.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+
+    def lane(true: int) -> int:
+        return n - 1 - true if mirrored else true
+
+    s, image, protein, _ = clicked_lanes(tmp_path, mirrored)
+    other = other_protein_in_lanes(s, image, case, (2, 3), mirrored=mirrored)
+    between = round((case.lane_cx[lane(0)] + case.lane_cx[lane(1)]) / 2)
+    edit_by_hand(s, lane_bands(s, other)[3].id, to=(between, 20))
+    names = ("'GAPDH'", "'β-catenin'") if mirrored else ("'β-catenin'", "'GAPDH'")
+    numbering_refused(s, protein, case.row, both_ways(*names), monkeypatch)
+
+
+def test_one_lane_number_on_two_columns_refuses_a_row(tmp_path, monkeypatch):
+    # The protein's box clicked over true lane 2 but numbered 3: lane 3 lies
+    # in two columns a pitch (70 px) apart. The refusal names its boxes.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other = other_protein_in_lanes(s, image, case)
+    clicked = ops.place_box(s, protein, *at_lane(case, 2), lane_index=3, grow=False)
+    message = two_columns("lane 3", "'β-catenin' and 'GAPDH'", 35)
+    ids = numbering_refused(s, protein, case.row, message, monkeypatch)
+    assert ids == (clicked, lane_bands(s, other)[3].id)
+
+
+@pytest.mark.parametrize(
+    ("dx", "refused"),
+    [(-28, False), (28, False), (-42, True), (42, True)],
+    ids=["0.4-pitch-left", "0.4-pitch-right", "0.6-pitch-left", "0.6-pitch-right"],
+)
+def test_a_lanes_boxes_within_half_a_pitch_of_each_other_are_one_column(
+    tmp_path, monkeypatch, dx, refused
+):
+    # A third protein's boxes in lanes 2 and 3, dx px from the other
+    # protein's: 0.4 pitch apart they still show one column per lane.
+    case = ROWS["all_present"]  # pitch 70
+    s, image, protein = row_session(tmp_path, case)
+    gapdh = other_protein_in_lanes(s, image, case)
+    actin = other_protein_in_lanes(s, image, case, (2, 3), dx=dx, name="actin")
+    if refused:
+        message = two_columns("lanes 2 and 3", "'GAPDH' and 'actin'", 35)
+        ids = numbering_refused(s, protein, case.row, message, monkeypatch)
+        assert ids == (
+            lane_bands(s, gapdh)[2].id,
+            lane_bands(s, actin)[2].id,
+            lane_bands(s, gapdh)[3].id,
+            lane_bands(s, actin)[3].id,
+        )
+    else:
+        placement = ops.detect_row_boxes(s, protein, case.row)
+        assert None not in placement.band_ids
+
+
+@pytest.mark.parametrize("true", [0, 5], ids=["lane-0", "lane-5"])
+def test_clicks_grown_wider_than_the_lane_pitch_are_not_among_the_lanes_numbered(tmp_path, true):
+    # A click on a band of a row whose bands touch grows over the whole row:
+    # the box, wider than the lane pitch (48 px), is centred on the row, not on
+    # its lane. It does not show its lane's column; the row replaces it.
+    case = ROWS["touching"]
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case)
+    clicked = ops.place_box(s, protein, *at_lane(case, true), lane_index=true, grow=True)
+    x0, _, x1, _ = rects_by_lane(s, protein)[true]
+    assert x1 - x0 > 5 * 48 and abs((x0 + x1) / 2 - case.lane_cx[true]) > 48
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.replaced_band_ids == (clicked,)
+    assert at_true_lanes(s, protein, case) == {lane: lane for lane in range(case.n_lanes)}
+
+
+def test_a_mirrored_image_numbered_one_way_is_read_right_to_left(tmp_path):
+    # Two proteins' boxes and the protein's own clicked ones all number the
+    # lanes right to left.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, image, protein, clicked = clicked_lanes(tmp_path, mirrored=True)
+    other_protein_in_lanes(s, image, case, mirrored=True)
+    other_protein_in_lanes(s, image, case, (0, 2, 5), mirrored=True, name="actin")
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.right_to_left
+    assert sorted(placement.replaced_band_ids) == sorted(clicked)
+    assert at_true_lanes(s, protein, case) == {n - 1 - true: true for true in range(n)}
+
+
+def test_a_second_drag_corrects_a_row_the_lanes_placed_since_disagree_with(tmp_path):
+    # The first drag, a lane off with nothing placed to check it, is
+    # committed; another protein's boxes then placed in the true lanes put each
+    # lane in two columns with the row's. The row's boxes give way to the next
+    # drag whatever it finds, so they are not among the lanes numbered, and the
+    # right drag replaces them.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    first = ops.detect_row_boxes(s, protein, shifted(case, 70))
+    other_protein_in_lanes(s, image, case)
+
+    second = ops.detect_row_boxes(s, protein, case.row)
+    assert set(second.replaced_band_ids) == {b for b in first.band_ids if b}
+    assert all(read == true for read, true in at_true_lanes(s, protein, case).items())
+
+
+def test_the_row_boxes_that_turn_the_next_drag_count_among_the_lanes_numbered(
+    tmp_path, monkeypatch
+):
+    # Another protein's one box numbers the lanes right to left: lane 5 over
+    # true lane 0. One box shows no direction, so the first drag reads the
+    # lanes left to right and puts lane 5 over true lane 5. Its boxes then turn
+    # the next drag, so they count among the lanes numbered: lane 5 lies in two
+    # columns, and the same drag again is refused, as a third protein's is.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    gapdh = other_protein_in_lanes(s, image, case, (0,), mirrored=True)
+    first = ops.detect_row_boxes(s, protein, case.row)
+    assert not first.right_to_left
+    actin = ops.add_protein(s, "actin", Role.TARGET, image)
+    message = two_columns("lane 5", "'β-catenin' and 'GAPDH'", 35)
+    for row_of in (protein, actin):
+        ids = numbering_refused(s, row_of, case.row, message, monkeypatch)
+        assert ids == (first.band_ids[5], lane_bands(s, gapdh)[5].id)
+
+
+def test_the_row_boxes_that_turn_the_next_drag_agreeing_with_the_lanes_placed(tmp_path):
+    # Another protein's one box in lane 2 lies on the first drag's lane 2: the
+    # row's boxes that turn the next drag agree with it, and the same drag
+    # again changes nothing.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, (2,))
+    first = ops.detect_row_boxes(s, protein, case.row)
+    committed, length = s.project, len(s.project.log)
+
+    again = ops.detect_row_boxes(s, protein, case.row)
+    assert not again.right_to_left and again.band_ids == first.band_ids
+    assert s.project is committed and len(s.project.log) == length
+
+
+def test_fixed_boxes_wider_than_the_lane_pitch_count_among_the_lanes_numbered(
+    tmp_path, monkeypatch
+):
+    # On touching bands (pitch 48) a new protein's box, an eighth of the image
+    # width (55 px), is already wider than the pitch, but a box dropped where
+    # the user clicked still sits on its lane. The protein's two fixed boxes
+    # number the lanes right to left, another protein's boxes left to right.
+    case = ROWS["touching"]
+    s, image, protein = row_session(tmp_path, case)
+    gapdh = other_protein_in_lanes(s, image, case, (2, 3, 5))
+    for true, lane in ((5, 0), (1, 4)):
+        ops.place_box(s, protein, *at_lane(case, true), lane_index=lane, grow=False)
+    assert protein_of(s, protein).box_size.width > 48
+    message = both_ways("'GAPDH'", "'β-catenin'")
+    assert numbering_refused(s, protein, case.row, message, monkeypatch) == (gapdh, protein)
 
 
 # Expected lane centres: pitch 70 left of lane 0, then 60, 80, 70, 70.

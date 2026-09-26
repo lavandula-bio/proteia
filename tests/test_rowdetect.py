@@ -1258,7 +1258,7 @@ IMAGE = np.full((40, 60), 1000.0)
 @pytest.mark.parametrize(
     ("gray", "row", "n_lanes", "code"),
     [
-        (np.zeros((40, 60, 3)), (0, 0, 60, 40), 2, "invalid_row"),  # not 2-D
+        (np.zeros((40, 60, 3)), (0, 0, 60, 40), 2, "invalid_image"),  # not 2-D
         (IMAGE, (0, 0, 60, 40), 0, "invalid_row"),
         (IMAGE, (0, 0, 60, 40), -1, "invalid_row"),
         (IMAGE, (0, 0, 60, 40), True, "invalid_row"),  # a bool is not a lane count
@@ -1284,24 +1284,24 @@ def test_row_errors_have_stable_codes(gray, row, n_lanes, code):
     assert isinstance(err.value, ValueError)
 
 
-def test_non_finite_pixels_are_an_invalid_row():
+def test_non_finite_pixels_are_an_invalid_image():
     image = IMAGE.copy()
     image[20, 30] = np.nan
     with pytest.raises(RowDetectError) as err:
         detect_row(image, (0, 0, 60, 40), 2, background=1000.0)
-    assert err.value.code == "invalid_row"
+    assert err.value.code == "invalid_image"
     # A NaN outside the row does not matter.
     assert detect_row(image, (40, 0, 60, 40), 2, background=1000.0).slots == (None, None)
 
 
 @pytest.mark.parametrize("background", [math.nan, math.inf, -math.inf, None, "1000", True])
-def test_a_background_that_is_not_a_finite_number_is_an_invalid_row(background):
+def test_a_background_that_is_not_a_finite_number_is_an_invalid_image(background):
     image = IMAGE.copy()
     image[1, 1] = 0.0
     for row in ((0, 0, 60, 40), (0, 0, 4, 3)):
         with pytest.raises(RowDetectError) as err:
             detect_row(image, row, 2, background=background)
-        assert err.value.code == "invalid_row"
+        assert err.value.code == "invalid_image"
     # Any finite real number is a background, a numpy one included.
     for background in (1000, np.float32(1000.0), np.int64(1000)):
         assert len(detect_row(image, (0, 0, 4, 3), 2, background=background).lanes) == 2
