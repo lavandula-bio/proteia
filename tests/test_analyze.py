@@ -237,6 +237,18 @@ def test_reduce_representative_keeps_first_repeat():
     assert r.groups["a"] == [100.0, 80.0]  # first lane of s1, not the mean
 
 
+@pytest.mark.parametrize("method", ["mean", "representative"])
+def test_a_raw_method_behaves_like_its_enum(method):
+    # s1 has two repeats (100, 120), so the mean and the representative differ.
+    args = [100, 120, 80], ["a", "a", "a"], ["s1", "s1", "s2"]
+    raw = reduce_samples(*args, method=method)
+    assert raw == reduce_samples(*args, method=ReduceMethod(method))
+    assert raw.groups["a"] == ([110.0, 80.0] if method == "mean" else [100, 80])
+    assert repeats_message(1, method) == repeats_message(1, ReduceMethod(method))
+    fold = fold_change_lane(*args[:2], "a", args[2], method=method)
+    assert fold == fold_change_lane(*args[:2], "a", args[2], method=ReduceMethod(method))
+
+
 def test_reduce_unnamed_lane_never_merges_with_a_digit_sample_name():
     # Lane 2 has no sample name; it must stay its own sample, not join the one named "2".
     r = reduce_samples([1.0, 2.0, 6.0], ["c", "c", "c"], ["1", "2", None])

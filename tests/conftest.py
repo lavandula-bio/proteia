@@ -13,9 +13,11 @@ band, and band lists are given out of order.
 
 Image helpers for tests that read real pixels: :func:`write_tiff` and
 :func:`synthetic_blot`. :class:`FakeClock` gives a session predictable log times.
+:func:`assert_strict_json` checks that a model's JSON is strict and loses nothing.
 """
 
 import hashlib
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from pydantic import BaseModel
 
 from proteia.core.model import Project
 from proteia.core.storage import image_path
@@ -44,6 +47,18 @@ class FakeClock:
     def __call__(self) -> datetime:
         now, self.now = self.now, self.now + self.step
         return now
+
+
+def _not_json(constant: str) -> float:
+    raise ValueError(f"{constant} is not JSON")
+
+
+def assert_strict_json(obj: BaseModel) -> None:
+    """Strict JSON with nothing lost. Pydantic writes NaN and inf as null, which
+    strict JSON accepts, so only the round trip shows that none got into ``obj``."""
+    dump = obj.model_dump_json()
+    json.loads(dump, parse_constant=_not_json)
+    assert type(obj).model_validate_json(dump) == obj
 
 
 def image_bytes(image_id: str) -> bytes:

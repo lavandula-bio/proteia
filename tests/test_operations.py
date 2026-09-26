@@ -1576,6 +1576,7 @@ def test_placed_boxes_carry_the_clipping_flag(tmp_path):
     assert column.clipped == [False, True]
     notice = next(n for n in res.notices if n.code is NoticeCode.CLIPPED)
     assert (notice.protein_ids, notice.lane_indices) == ((protein,), (1,))
+    assert "over-exposed in lane 2:" in notice.message  # the user counts lanes from 1
 
     ops.set_polarity(s, image, LIGHT)  # 65535 is never reached: nothing is clipped
     assert (band_of(s, fine).clipped, band_of(s, over).clipped) == (False, False)
@@ -1629,8 +1630,10 @@ def test_the_clipped_notice_lists_only_included_lanes(tmp_path):
     res = ops.compute(s)
     [notice] = [n for n in res.notices if n.code is NoticeCode.CLIPPED]
     assert notice.lane_indices == (0,)  # lane 1 is excluded: the user already acted
+    assert "over-exposed in lane 1:" in notice.message  # lane numbers count from 1
     [all_lanes] = [n for n in res.all_lanes.notices if n.code is NoticeCode.CLIPPED]
     assert all_lanes.lane_indices == (0, 1)  # every lane is included in the all-lanes set
+    assert "over-exposed in lanes 1, 2:" in all_lanes.message
 
 
 def test_a_protein_name_that_would_clash_with_a_clipped_column_is_refused(tmp_path):
@@ -2168,3 +2171,24 @@ def test_record_grow_settings_are_what_place_box_uses(tmp_path, monkeypatch):
     bound.apply_defaults()
     recorded = record.settings()["grow_box"]
     assert {name: bound.arguments[name] for name in recorded} == recorded
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("error_type", "sd", "error type must be one of 'SD', 'SEM', not 'sd'"),
+        ("method", "median", "method must be one of 'mean', 'representative', not 'median'"),
+    ],
+)
+def test_compute_refuses_an_unknown_error_type_or_method(tmp_path, argument, value, message):
+    s = session_on(tmp_path)
+    with pytest.raises(OperationError) as info:
+        ops.compute(s, **{argument: value})
+    assert info.value.code is ErrorCode.INVALID_INPUT
+    assert str(info.value) == message
+
+
+def test_compute_takes_the_raw_error_type_and_method(tmp_path):
+    s = _parity_session(tmp_path, _blot(), DARK)
+    raw = ops.compute(s, error_type="SEM", method="representative")
+    assert raw == ops.compute(s, error_type=ErrorType.SEM, method=ReduceMethod.REPRESENTATIVE)
