@@ -2250,6 +2250,41 @@ def test_compute_takes_the_raw_error_type_and_method(tmp_path):
     assert raw == ops.compute(s, error_type=ErrorType.SEM, method=ReduceMethod.REPRESENTATIVE)
 
 
+def test_compute_view_pairs_the_committed_project_with_its_results(tmp_path):
+    s = _parity_session(tmp_path, _blot(), DARK)
+    s._pixels.clear()
+    log = s.project.log
+    settings = {"plot_conditions": ["vehicle"], "error_type": "SEM", "method": "representative"}
+    view = ops.compute_view(s, **settings)
+    assert view.project is s.project
+    assert view.results == results.compute_results(s.project.batch, **settings)
+    assert view.results == ops.compute(s, **settings)  # compute is the view's results
+    assert s.project.log is log and s._pixels == {}  # no log entry, no pixels read
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        view.project = None  # type: ignore[misc]
+    with pytest.raises(OperationError) as info:
+        ops.compute_view(s, error_type="sd")
+    assert info.value.code is ErrorCode.INVALID_INPUT
+
+
+def test_compute_view_reads_the_committed_project_once(tmp_path, monkeypatch):
+    # A commit that lands while the results are computed (another request, since
+    # compute_view takes no lock) is in neither half of the view.
+    s = _parity_session(tmp_path, _blot(), DARK)
+    before = s.project
+    compute_results = results.compute_results
+
+    def commit_meanwhile(batch, **settings):
+        ops.set_reference_condition(s, None)
+        return compute_results(batch, **settings)
+
+    monkeypatch.setattr(results, "compute_results", commit_meanwhile)
+    view = ops.compute_view(s)
+    assert view.project is before and s.project is not before
+    assert view.project.batch.reference_condition == view.results.reference_condition
+    assert view.results.reference_condition is not None
+
+
 # --- #51: not-detected records ---
 
 
