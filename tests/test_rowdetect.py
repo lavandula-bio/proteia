@@ -584,6 +584,24 @@ def test_a_band_the_box_cuts_does_not_shrink_the_boxes_of_complete_bands(seed, m
     assert hits > hit_rate(list(detect(case).slots), case.reference).hits
 
 
+def test_the_margin_counts_the_runner_up_at_every_pitch_of_the_best_reading(monkeypatch):
+    # Every pitch reads the same lanes; only the second pitch has a close
+    # runner-up. Its cost, not the first pitch's distant one, is the margin's.
+    seen = []
+
+    def one_reading(pieces, n, box_w, pitch):
+        seen.append(pitch)
+        k = len(seen)
+        second = 2.0 if k == 2 else 10.0 + k
+        return rowdetect._Assignment(1.0 + 0.01 * k, second, pitch, ((0, 1), (1, 1)))
+
+    monkeypatch.setattr(rowdetect, "_dp", one_reading)
+    monkeypatch.setattr(rowdetect, "PITCH_PRIOR_TOL", 1e12)  # no pitch prior
+    best, alt = rowdetect._assign([], 2, 100.0)
+    assert best.cost == pytest.approx(1.01)
+    assert alt == pytest.approx(2.0)
+
+
 def test_size_outlier_does_not_set_the_shared_size():
     # Lane 3's band is 30 px tall, the others about 12: above 2x their median.
     case = _adversarial("tall_band", 1000)

@@ -824,7 +824,13 @@ def _assign(pieces: list[_Piece], n: int, box_w: float) -> tuple[_Assignment | N
     f0 = min(found, key=lambda a: a.cost).pitch / p0
     run(np.arange(max(lo, f0 - PITCH_REFINE), min(hi, f0 + PITCH_REFINE) + 1e-9, fine))
     best = min(found, key=lambda a: a.cost)
-    alt = min([best.second] + [a.cost for a in found if a.lanes != best.lanes], default=math.inf)
+    # A different reading: the runner-up at any pitch that reads the best's lanes,
+    # or the best at a pitch that reads other lanes.
+    alt = min(
+        [a.second for a in found if a.lanes == best.lanes]
+        + [a.cost for a in found if a.lanes != best.lanes],
+        default=math.inf,
+    )
     return best, alt
 
 
