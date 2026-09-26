@@ -54,11 +54,19 @@ async function showStatus() {
 quitButton.addEventListener("click", async () => {
   quitButton.disabled = true;
   try {
-    await api("/api/quit", { method: "POST" });
+    const response = await api("/api/quit", { method: "POST" });
+    if (response.status === 401) {
+      statusLine.textContent = NEEDS_LAUNCH;
+      quitButton.hidden = true;
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`status ${response.status}`);
+    }
     statusLine.textContent = "Proteia has stopped. You can close this tab.";
     quitButton.hidden = true;
   } catch (error) {
-    statusLine.textContent = "Proteia did not respond to Quit.";
+    statusLine.textContent = "Proteia did not stop. Try Quit again.";
     quitButton.disabled = false;
   }
 });

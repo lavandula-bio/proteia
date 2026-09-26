@@ -91,9 +91,11 @@ async def _reject(send: Send, status: int, detail: str, *extra: tuple[bytes, byt
     await send({"type": "http.response.body", "body": body})
 
 
-class _Guard:
-    """ASGI middleware in front of every route: the Host and token checks, and the
-    security headers on every response (see the module docstring)."""
+class Guard:
+    """The ASGI app that wraps the FastAPI app (``app``), outside all of its
+    middleware: the Host and token checks, and the security headers on every
+    response, a 500 from FastAPI's error handler included (see the module
+    docstring)."""
 
     def __init__(self, app: ASGIApp, *, token: str, port: int) -> None:
         self.app = app
@@ -128,7 +130,7 @@ class _Guard:
         await self.app(scope, receive, send_secured)
 
 
-def create_app(*, token: str, port: int, on_quit: Callable[[], None]) -> FastAPI:
+def create_app(*, token: str, port: int, on_quit: Callable[[], None]) -> Guard:
     """The app for one launch served at ``127.0.0.1:port``, admitting ``token``.
 
     ``on_quit`` runs when the page asks the app to quit (``POST /api/quit``); it
@@ -139,7 +141,6 @@ def create_app(*, token: str, port: int, on_quit: Callable[[], None]) -> FastAPI
     if not 0 < port < 65536:
         raise ValueError(f"port {port} is out of range")
     app = FastAPI(title="Proteia", docs_url=None, redoc_url=None, openapi_url=None)
-    app.add_middleware(_Guard, token=token, port=port)
 
     @app.get("/", include_in_schema=False)
     def page_shell() -> FileResponse:
@@ -156,4 +157,4 @@ def create_app(*, token: str, port: int, on_quit: Callable[[], None]) -> FastAPI
         on_quit()
         return {"status": "stopping"}
 
-    return app
+    return Guard(app, token=token, port=port)

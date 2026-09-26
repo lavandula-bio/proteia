@@ -324,13 +324,15 @@ def _temp_file(directory: Path, name: str, suffix: str) -> tuple[int, Path]:
     return fd, Path(tmp)
 
 
-def write_atomic(path: Path, data: bytes) -> None:
+def write_atomic(path: Path, data: bytes, *, private: bool = False) -> None:
     """Replace ``path`` with ``data`` so a reader sees either the old or the new bytes.
 
     The folder must exist. A ``PermissionError`` that outlasts the retries (a
     reader holding the file on Windows) propagates and leaves the old file intact.
+    ``private`` makes the file owner-only (0600 on POSIX) whatever the old one's
+    mode; on Windows the folder's permissions apply either way.
     """
-    mode = _file_mode(path)
+    mode = None if private else _file_mode(path)
     fd, tmp = _temp_file(path.parent, path.name, ".tmp")
     try:
         # Closed before the replace: Windows cannot replace with an open file.

@@ -5,22 +5,26 @@ A launch binds a listening socket to ``127.0.0.1`` on a port the operating syste
 assigns (port 0, read back, so no other process can take it in between; on
 Windows with exclusive use of the address), and makes a new random token.
 
-The token never appears on a command line or in the console. The launcher writes
-it to files only the current user can read, in the per-user state folder
-(:func:`state_dir`):
+One instance runs per user. The running instance holds an exclusive operating
+system lock on ``instance.lock`` in the per-user state folder (:func:`state_dir`);
+the system releases it when the process ends, so a crash leaves no lock behind. A
+launch that cannot take the lock waits for the running instance to answer and
+opens it instead of starting another server.
 
-* ``instance.json``, the lock file: the running instance's port and token, so a
-  second launch opens that instance instead of starting another. A lock whose
-  instance does not answer (it crashed) is replaced;
-* ``open-proteia.html``, a redirect page that sends the browser to
+The token never appears on a command line or in the console. The running instance
+writes it to files only the current user can read, in the same folder:
+
+* ``instance.json``: its port and token, for a second launch to find it;
+* ``open-proteia.html``: a redirect page that sends the browser to
   ``http://127.0.0.1:<port>/#token=<token>``. The launcher opens this file, not
   the URL, and the token rides in the URL fragment, which the browser never sends
   to a server. The page keeps it for its tab and sends it in a request header.
 
-Both files are removed when the server stops. The only connection a launch makes
-is the check of an existing lock, to its loopback port, without any proxy. On
-POSIX the folder is 0700 and the files 0600; on Windows the per-user local
-application-data folder is readable only by its owner.
+Both files are removed when the server stops (Quit on the page, Ctrl+C, or a
+termination signal), before the lock is released. The only connection a launch
+makes is the check of the running instance, to its loopback port, without any
+proxy. On POSIX the folder is 0700 and the files 0600; on Windows the per-user
+local application-data folder is readable only by its owner.
 """
 
 from __future__ import annotations
@@ -31,29 +35,61 @@ import http.client
 import json
 import os
 import secrets
+import signal
 import socket
 import sys
-import tempfile
+import threading
+import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 import uvicorn
 
+from proteia.core.storage import write_atomic
 from proteia.web.server import APP_ID, HOST, TOKEN_PATTERN, create_app
 
-LOCK_FILE: Final = "instance.json"
+if os.name == "nt":
+    import msvcrt
+
+    def _lock(fd: int) -> None:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # the first byte; raises OSError if held
+
+    def _unlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # per open file, not per process
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+LOCK_FILE: Final = "instance.lock"
+INSTANCE_FILE: Final = "instance.json"
 REDIRECT_FILE: Final = "open-proteia.html"
 TOKEN_BYTES: Final = 32  # 43 URL-safe characters
-PROBE_TIMEOUT: Final = 2.0  # seconds
+PROBE_TIMEOUT: Final = 2.0  # seconds per check of the running instance
+STARTUP_WAIT: Final = 15.0  # seconds a second launch waits for it to answer
+_STOP_SIGNALS: Final = tuple(
+    getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGBREAK") if hasattr(signal, name)
+)
 
 Opener = Callable[[str], object]  # webbrowser.open's shape: takes a URL
 
 
+class NotRespondingError(RuntimeError):
+    """Another instance holds the lock but did not answer within the wait."""
+
+
 def state_dir() -> Path:
-    """The per-user folder that holds the lock and redirect files."""
+    """The per-user folder that holds the lock, instance and redirect files."""
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA")
         return (Path(base) if base else Path.home() / "AppData" / "Local") / "Proteia"
@@ -70,34 +106,45 @@ def _private_dir(folder: Path) -> None:
         os.chmod(folder, 0o700)
 
 
-def _write_private(path: Path, data: bytes) -> None:
-    """Replace ``path`` atomically with an owner-only (0600 on POSIX) file."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
+class InstanceLock:
+    """The exclusive lock on ``instance.lock`` that the running instance holds."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    @classmethod
+    def acquire(cls, folder: Path) -> InstanceLock | None:
+        """The lock, or None while another instance (in any process) holds it."""
+        fd = os.open(folder / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            _lock(fd)
+        except OSError:
+            os.close(fd)
+            return None
+        return cls(fd)
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
         with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+            _unlock(self._fd)
+        os.close(self._fd)
+        self._fd = None
 
 
 @dataclass(frozen=True)
 class InstanceInfo:
-    """What the lock file records about a running instance."""
+    """What ``instance.json`` records about the running instance."""
 
     pid: int
     port: int
     token: str
 
 
-def read_lock(folder: Path) -> InstanceInfo | None:
-    """The lock file's instance, or None when there is none or it is unreadable."""
+def read_instance(folder: Path) -> InstanceInfo | None:
+    """The instance file's contents, or None when it is missing or unreadable."""
     try:
-        doc = json.loads((folder / LOCK_FILE).read_text(encoding="utf-8"))
+        doc = json.loads((folder / INSTANCE_FILE).read_text(encoding="utf-8"))
         pid, port, token = doc["pid"], doc["port"], doc["token"]
     except (OSError, ValueError, TypeError, KeyError):
         return None
@@ -115,9 +162,7 @@ def read_lock(folder: Path) -> InstanceInfo | None:
 def probe(info: InstanceInfo, *, timeout: float = PROBE_TIMEOUT) -> bool:
     """Whether a Proteia instance answers on ``info.port`` and admits its token.
 
-    A direct loopback connection (``http.client`` uses no proxy settings). A
-    crashed instance's token may reach whatever now holds the port; it no longer
-    opens anything.
+    A direct loopback connection: ``http.client`` uses no proxy settings.
     """
     conn = http.client.HTTPConnection(HOST, info.port, timeout=timeout)
     try:
@@ -152,7 +197,7 @@ def _redirect_page(url: str) -> bytes:
 def open_in_browser(folder: Path, port: int, token: str, opener: Opener) -> Path:
     """Write the redirect page for ``port`` and ``token`` and open it; return its path."""
     path = folder / REDIRECT_FILE
-    _write_private(path, _redirect_page(app_url(port, token)))
+    write_atomic(path, _redirect_page(app_url(port, token)), private=True)
     opener(path.as_uri())
     return path
 
@@ -189,14 +234,40 @@ def _server(app: object) -> uvicorn.Server:
     return uvicorn.Server(config)
 
 
-class Instance:
-    """A started server. :meth:`serve` blocks until it stops; :meth:`stop` (or the
-    page's Quit, or Ctrl+C when served from the main thread) stops it."""
+@contextlib.contextmanager
+def _stop_on_signals(stop: Callable[[], None]) -> Iterator[None]:
+    """While serving from the main thread, a stop signal only calls ``stop``.
 
-    def __init__(self, folder: Path, sock: socket.socket, token: str) -> None:
+    uvicorn catches SIGINT and SIGTERM (and SIGBREAK on Windows), shuts down, then
+    raises the signal again with the handler it found. With the default handlers
+    that raise would end the process (SIGTERM) or raise ``KeyboardInterrupt``
+    (SIGINT) before the cleanup; with this one it is a no-op.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handle(signum: int, frame: object) -> None:
+        stop()
+
+    previous = {sig: signal.signal(sig, handle) for sig in _STOP_SIGNALS}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+
+class Instance:
+    """A started server that holds the instance lock. :meth:`serve` blocks until it
+    stops; :meth:`stop` (or Quit on the page, or a stop signal when served from the
+    main thread) stops it."""
+
+    def __init__(self, folder: Path, sock: socket.socket, token: str, lock: InstanceLock):
         self.folder = folder
         self.sock = sock
         self.token = token
+        self._lock = lock
         self.port: int = sock.getsockname()[1]
         self.redirect_path = folder / REDIRECT_FILE
         self.server = _server(create_app(token=token, port=self.port, on_quit=self.stop))
@@ -204,7 +275,8 @@ class Instance:
     def serve(self) -> None:
         """Serve until stopped, then :meth:`close`."""
         try:
-            self.server.run(sockets=[self.sock])
+            with _stop_on_signals(self.stop):
+                self.server.run(sockets=[self.sock])
         finally:
             self.close()
 
@@ -212,55 +284,92 @@ class Instance:
         self.server.should_exit = True
 
     def close(self) -> None:
-        """Release the socket and remove the files that name this instance."""
+        """Release the socket, remove the files that name this instance, then
+        release the lock (so no new instance writes its files before that)."""
         self.sock.close()
-        running = read_lock(self.folder)
-        if running is not None and running.token == self.token:
+        for path in (self.folder / INSTANCE_FILE, self.redirect_path):
             with contextlib.suppress(OSError):
-                (self.folder / LOCK_FILE).unlink()
-        with contextlib.suppress(OSError):
-            if self.token in self.redirect_path.read_text(encoding="utf-8"):
-                self.redirect_path.unlink()
+                if self.token in path.read_text(encoding="utf-8"):
+                    path.unlink()
+        self._lock.release()
 
 
-def start(*, folder: Path | None = None, opener: Opener = webbrowser.open) -> Instance | None:
+def _open_running(folder: Path, opener: Opener, wait: float) -> None:
+    """Another process holds the lock: wait until its instance answers, then open it."""
+    deadline = time.monotonic() + wait
+    while True:
+        info = read_instance(folder)
+        if info is not None and probe(info):
+            open_in_browser(folder, info.port, info.token, opener)
+            return
+        if time.monotonic() >= deadline:
+            raise NotRespondingError("Proteia is already running but does not respond")
+        time.sleep(0.2)
+
+
+def start(
+    *, folder: Path | None = None, opener: Opener = webbrowser.open, wait: float = STARTUP_WAIT
+) -> Instance | None:
     """Open the running instance in the browser (None), or start one and open it.
 
-    The new instance is bound and listening, and its lock file written, before the
-    browser opens; call :meth:`Instance.serve` to serve it.
+    A new instance holds the lock, is bound and listening, and has written its
+    files before the browser opens; call :meth:`Instance.serve` to serve it. When
+    another instance holds the lock but does not answer within ``wait`` seconds,
+    ``NotRespondingError``: a second server is never started.
     """
     folder = state_dir() if folder is None else folder
     _private_dir(folder)
-    running = read_lock(folder)
-    if running is not None and probe(running):
-        open_in_browser(folder, running.port, running.token, opener)
+    lock = InstanceLock.acquire(folder)
+    if lock is None:
+        _open_running(folder, opener, wait)
         return None
-    sock = bind_loopback()
     instance: Instance | None = None
     try:
-        instance = Instance(folder, sock, secrets.token_urlsafe(TOKEN_BYTES))
-        lock = {"pid": os.getpid(), "port": instance.port, "token": instance.token}
-        _write_private(folder / LOCK_FILE, json.dumps(lock).encode("utf-8"))
+        sock = bind_loopback()
+        try:
+            instance = Instance(folder, sock, secrets.token_urlsafe(TOKEN_BYTES), lock)
+        except BaseException:
+            sock.close()
+            raise
+        info = {"pid": os.getpid(), "port": instance.port, "token": instance.token}
+        write_atomic(folder / INSTANCE_FILE, json.dumps(info).encode("utf-8"), private=True)
         open_in_browser(folder, instance.port, instance.token, opener)
     except BaseException:
         if instance is None:
-            sock.close()
+            lock.release()
         else:
             instance.close()
         raise
     return instance
 
 
+def _tolerant_console() -> None:
+    """Escape what the console encoding cannot show (a path with µ in a code-page
+    console) rather than fail."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main() -> int:
     """The ``proteia`` console command."""
-    instance = start()
+    _tolerant_console()
+    try:
+        instance = start()
+    except NotRespondingError:
+        print(
+            "Proteia is already running but does not respond. Try again in a moment,"
+            " or end the other Proteia process."
+        )
+        return 1
     if instance is None:
         print("Proteia is already running; it has been opened in your browser.")
         return 0
     print(f"Proteia is running at http://{HOST}:{instance.port}/ and opens in your browser.")
     print(f"If no browser window opens, open this file in a browser: {instance.redirect_path}")
     print("To quit, use Quit on the page, or press Ctrl+C here.")
-    instance.serve()
+    with contextlib.suppress(KeyboardInterrupt):  # a Ctrl+C before serving begins
+        instance.serve()
     return 0
 
 
