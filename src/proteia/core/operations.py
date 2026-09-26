@@ -557,20 +557,25 @@ def import_image(
             return membrane.id
 
         new, membrane_used = _prepare(session, change)
+        params = {
+            "image_id": image_id,
+            "membrane_id": membrane_used,
+            "new_membrane": membrane_id is None,
+            "original_name": original_name,
+            "kind": kind.value,
+            "polarity": polarity.value,
+            "sha256": stored.sha256,  # keeps a removed image's provenance
+        }
+        session._commit(
+            new, action="import_image", params=params, add_pixels={image_id: loaded.array}
+        )
     except BaseException:
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        # _commit can raise before committing (a bad clock or params) or after
+        # (a hook bug): keep the file only if the committed project uses it.
+        if all(image.id != image_id for image in session.project.batch.iter_images()):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
         raise
-    params = {
-        "image_id": image_id,
-        "membrane_id": membrane_used,
-        "new_membrane": membrane_id is None,
-        "original_name": original_name,
-        "kind": kind.value,
-        "polarity": polarity.value,
-        "sha256": stored.sha256,  # keeps a removed image's provenance
-    }
-    session._commit(new, action="import_image", params=params, add_pixels={image_id: loaded.array})
     return image_id
 
 
@@ -1201,7 +1206,8 @@ def export_lane_table(session: ProjectSession) -> Path:
     since import is refused (``IMAGE_FILE_CHANGED``, with those images): a record
     never vouches for pixels that are no longer on disk. Both files are built
     before either is written, and each is replaced atomically, the table first;
-    ``OSError`` propagates (with Excel holding the table, both old files stay).
+    ``OSError`` propagates (with Excel holding the table, both old files stay; a
+    first export whose record fails removes its table).
     Not a state change: no log entry, no autosave.
     """
     project = session.project  # one snapshot for both files
@@ -1232,10 +1238,18 @@ def export_lane_table(session: ProjectSession) -> Path:
 
     exports = session.folder / storage.EXPORTS_DIR
     exports.mkdir(parents=True, exist_ok=True)
-    path = exports / LANE_TABLE_FILE
+    path, record_path = exports / LANE_TABLE_FILE, exports / LANE_TABLE_RECORD_FILE
+    had_record = record_path.is_file()
     storage.write_atomic(path, table)
-    # A failure here leaves the old record naming other table bytes: detectable.
-    storage.write_atomic(exports / LANE_TABLE_RECORD_FILE, data)
+    try:
+        storage.write_atomic(record_path, data)
+    except OSError:
+        # An old record names other table bytes (detectable); with none, remove
+        # the table rather than leave numbers that no record describes.
+        if not had_record:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+        raise
     return path
 
 

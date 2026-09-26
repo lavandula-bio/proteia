@@ -1303,6 +1303,16 @@ def test_export_lane_table(tmp_path, monkeypatch):
     assert info.value.code is ErrorCode.NO_LANES
 
 
+def test_a_first_export_whose_record_fails_leaves_no_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    s = open_sample(tmp_path, Recorder())
+    exports = s.folder / "exports"
+    (exports / ops.LANE_TABLE_RECORD_FILE).mkdir(parents=True)  # the record cannot be written
+    with pytest.raises(OSError):
+        ops.export_lane_table(s)
+    assert [p.name for p in exports.iterdir()] == [ops.LANE_TABLE_RECORD_FILE]
+
+
 # --- review of #70 ---
 
 
@@ -2019,6 +2029,18 @@ def test_a_naive_clock_commits_nothing(tmp_path):
     with pytest.raises(ValueError, match="aware") as info:
         ops.set_lanes(s, [LaneInput("vehicle")])
     assert not isinstance(info.value, OperationError)  # a bug, not a refusal
+    assert s.project is before
+    assert recorder.actions == []
+
+
+def test_an_import_that_fails_to_commit_leaves_no_file(tmp_path):
+    recorder = Recorder()
+    s = session_on(tmp_path, recorder)
+    before = s.project
+    s.clock = lambda: datetime(2026, 9, 26)  # no time zone: _commit raises
+    with pytest.raises(ValueError, match="aware"):
+        import_blot(s, blot())
+    assert listing(s) == []
     assert s.project is before
     assert recorder.actions == []
 

@@ -97,7 +97,9 @@ ProteinId = Annotated[str, StringConstraints(pattern=rf"^prot-{_N}$")]
 BandId = Annotated[str, StringConstraints(pattern=rf"^band-{_N}$")]
 IdPrefix = Literal["mem", "img", "prot", "band"]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-WarningCode = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+# A stable snake_case code: warning codes and action names.
+_CODE = r"^[a-z][a-z0-9_]{0,63}$"
+WarningCode = Annotated[str, StringConstraints(pattern=_CODE)]
 # Text is stored exactly as given: no Unicode normalization or trimming here.
 ProteinName = Annotated[str, AfterValidator(_non_blank)]
 OriginalName = Annotated[str, StringConstraints(max_length=255), AfterValidator(_plain_file_name)]
@@ -106,7 +108,7 @@ OriginalName = Annotated[str, StringConstraints(max_length=255), AfterValidator(
 # match fullwidth and Arabic-Indic digits.
 _TIME = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
 Timestamp = Annotated[str, StringConstraints(pattern=_TIME), AfterValidator(_real_time)]
-ActionName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+ActionName = Annotated[str, StringConstraints(pattern=_CODE)]
 SoftwareVersion = Annotated[str, StringConstraints(pattern=r"^[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}$")]
 
 

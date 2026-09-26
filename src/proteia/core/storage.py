@@ -157,10 +157,15 @@ def content_document(project: Project) -> dict[str, Any]:
     return revalidate(project, log=False).model_dump(mode="json", exclude=set(HASH_EXCLUDE))
 
 
+def document_hash(doc: Any) -> str:
+    """Lowercase hex SHA-256 of ``canonical_json(doc)``: the one hash recipe."""
+    return hashlib.sha256(canonical_json(doc)).hexdigest()
+
+
 def content_hash(project: Project) -> str:
     """Lowercase hex SHA-256 of the project's content (see the module docstring).
     Its cost does not grow with the log."""
-    return hashlib.sha256(canonical_json(content_document(project))).hexdigest()
+    return document_hash(content_document(project))
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -235,7 +240,12 @@ def migrate(
     target: int = SCHEMA_VERSION,
     migrations: Mapping[int, Migration] = MIGRATIONS,
 ) -> dict[str, Any]:
-    """Run the migration steps from ``doc``'s schema up to ``target`` on a copy."""
+    """Run the migration steps from ``doc``'s schema up to ``target`` on a copy.
+
+    A step that changes the hashed content must also append a ``migrate`` log
+    entry (from and to schema, the new content hash); otherwise every export
+    record of a migrated project reports ``content_changed_outside_log``.
+    """
     out, version = copy.deepcopy(doc), doc["schema_version"]
     while version < target:
         step = migrations.get(version)

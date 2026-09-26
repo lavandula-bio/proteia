@@ -122,7 +122,7 @@ def build_record(
     gives it). ``files`` maps each exported file's fixed name to its bytes.
     """
     content = storage.content_document(project)
-    digest = hashlib.sha256(storage.canonical_json(content)).hexdigest()
+    digest = storage.document_hash(content)  # equals storage.content_hash(project)
     return {
         "record_format": RECORD_FORMAT,
         "exported_at": _TIMESTAMP.validate_python(exported_at, strict=True),
