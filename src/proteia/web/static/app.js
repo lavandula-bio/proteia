@@ -146,6 +146,10 @@ async function showProjects() {
 async function openProject(path, name) {
   try {
     const answer = await call("POST", path, { name });
+    // Image ids repeat across projects (img-1 in each): drop everything shown.
+    view.setImage(null, 0, 0);
+    view.setOverlay([], [], null);
+    state.shownImageId = null;
     for (const id of [...state.bitmaps.keys()]) {
       forgetBitmap(id);
     }
