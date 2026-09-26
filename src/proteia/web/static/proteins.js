@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // The "Proteins on this image" panel: the list with each protein's colour and
 // role, the form that adds a protein, and the editor of the chosen one (name,
-// role, loading controls, box size, not-detected marks, removal). It stores
-// nothing itself: each change goes to the server through the app, and the panel
-// is drawn again from the state the server answers.
-import { $, focusLost, isolate, rebuild, span, swatch } from "/static/dom.js";
+// role, loading controls, box size, not-detected marks, clearing its boxes,
+// removal). It stores nothing itself: each change goes to the server through
+// the app, and the panel is drawn again from the state the server answers.
+import { $, counted, focusLost, inWords, isolate, rebuild, span, swatch } from "/static/dom.js";
 
 const PROTEIN_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#17becf", "#bcbd22"];
 const LOADING_CONTROL = "loading control";
@@ -37,16 +37,16 @@ function names(proteins) {
   return proteins.map((p) => p.name).join(", ");
 }
 
-function counted(count, one, many) {
-  return `${count} ${count === 1 ? one : many}`;
-}
-
 export class ProteinPanel {
   // handlers: send(method, path, json) gives a Promise of the server's answer
   // once the app has applied it (null if the answer is about a project opened
   // before the one shown), and rejects with the server's refusal (code,
   // message, ids); choose(proteinId) makes a protein the click target;
-  // status(text) shows a line to the user; laneName(index) names a lane.
+  // status(text, action) shows a line to the user, with an optional action
+  // button ({label, name, seq, run}) after it, and gives that button (or
+  // null); undo(seq) takes back the change logged as `seq` if it is still the
+  // last; pending() gives a Promise that settles once the edits the app made
+  // outside the queue have their answers; laneName(index) names a lane.
   constructor(handlers) {
     this.handlers = handlers;
     this.project = null;
@@ -54,16 +54,20 @@ export class ProteinPanel {
     this.protein = null;
     this.filled = new Map(); // input id -> the value the panel last put in it
     this.editorFor = null; // the protein the editor was last drawn for
-    this.queue = Promise.resolve(); // edits run one at a time, in order
+    // Edits, undo and redo run one at a time, in order; the app's box and image
+    // edits and the adds wait for it as it stands when they are made.
+    this.queue = Promise.resolve();
     this.adding = Promise.resolve(); // the adds on their way (they are not queued)
     this.opening = 0; // counts invalidateEdits(): a queued edit never reaches another project
+    this.clearing = new Set(); // the proteins whose Clear boxes has no answer yet
     this.bind();
   }
 
-  // Resolves once every edit made in the panel has its answer, and what the
-  // answer shows (the editor, a refusal, the add form closing) is shown. The app
-  // waits for it before asking to open another project, so those edits end in
-  // the project they were made in.
+  // Resolves once every edit made in the panel, and every undo and redo (they
+  // run in its queue), has its answer, and what the answer shows (the editor, a
+  // refusal, the add form closing, a status line) is shown. The app waits for it
+  // before asking to open another project, so those edits end in the project
+  // they were made in.
   settled() {
     return Promise.all([this.queue, this.adding]);
   }
@@ -122,6 +126,7 @@ export class ProteinPanel {
         near: $("box-size"),
       });
     });
+    $("clear-boxes").addEventListener("click", () => this.clear());
     $("remove-protein").addEventListener("click", () => this.remove());
   }
 
@@ -208,7 +213,13 @@ export class ProteinPanel {
       role: $("add-protein-role").value,
       image_id: this.image.id,
     };
+    // After the edits, undos and redos asked for before it, so none takes it back.
+    const before = this.queue;
     try {
+      await before;
+      if (opening !== this.opening) {
+        return;
+      }
       const answer = await this.handlers.send("POST", "/api/proteins", body);
       if (!answer || opening !== this.opening) {
         return; // another project is shown now: its ids are not this answer's
@@ -261,13 +272,26 @@ export class ProteinPanel {
     this.fill("box-width", protein.box_size.width, force("box-width"));
     this.fill("box-height", protein.box_size.height, force("box-height"));
     this.renderUndetected(protein);
+    this.renderClear();
   }
 
-  // Show a refusal right after the part of the editor it is about (`near`), in
-  // view, so it is read next to the control it put back; "" hides it.
+  // Clear boxes: disabled when the chosen protein has nothing to clear, and
+  // while its clear has no answer (a second press would clear nothing).
+  renderClear() {
+    const protein = this.protein;
+    $("clear-boxes").disabled =
+      !protein ||
+      this.clearing.has(protein.id) ||
+      (!protein.bands.length && !protein.undetected.length);
+  }
+
+  // Show a refusal right after the part of the editor it is about (`near`, by
+  // default its buttons), in view, so it is read next to the control it put
+  // back; "" hides it.
   showError(text, near = null) {
     const line = $("protein-error");
-    if (near && line.previousElementSibling !== near) {
+    near = near || $("protein-actions");
+    if (line.previousElementSibling !== near) {
       near.after(line);
     }
     line.textContent = text;
@@ -377,47 +401,65 @@ export class ProteinPanel {
 
   // --- Edits ---
 
-  // Run an edit of a protein (the chosen one by default) after the edits before
-  // it: `request` gives the path and body from the protein as the last answer
-  // stored it. `fields` are the inputs the edit sends, which then show the
-  // server's values; a refusal is shown `near` the part of the editor it is
-  // about. Gives the answer, or null.
-  editChosen(
-    method,
-    request,
-    { proteinId = this.protein && this.protein.id, fields = [], near = null } = {},
-  ) {
+  // Run `task(current)` once the edits queued before it have their answers and
+  // `after` (a Promise of edits sent before it outside the queue) has settled,
+  // so edits reach the server in the order they were made. It is not run once
+  // another project is asked for (invalidateEdits), and `current()` turns false
+  // then: nothing about its answer is shown. The app's undo and redo run here
+  // too, so they take back what was sent before them, and an open waits for
+  // them. Gives the task's result, or null.
+  queueEdit(task, { after = null } = {}) {
     const opening = this.opening;
+    const current = () => opening === this.opening;
     const run = this.queue.then(async () => {
-      const protein = this.project.proteins.find((p) => p.id === proteinId);
-      if (!protein || opening !== this.opening) {
-        return null;
-      }
-      const [path, body] = request(protein);
-      try {
-        const answer = await this.handlers.send(method, path, body);
-        if (!answer || opening !== this.opening) {
-          return null; // another project is shown now
-        }
-        this.showError("");
-        this.renderEditor(fields);
-        return answer;
-      } catch (error) {
-        if (opening !== this.opening) {
-          return null;
-        }
-        this.renderEditor(fields);
-        const message = this.explain(error, protein);
-        if (this.protein && this.protein.id === protein.id) {
-          this.showError(message, near || $("remove-protein"));
-        } else {
-          this.handlers.status(message); // the editor shows another protein by now
-        }
-        return null;
-      }
+      await after;
+      return current() ? task(current) : null;
     });
     this.queue = run.catch(() => null);
     return run;
+  }
+
+  // Run an edit of a protein (the chosen one by default) after the edits before
+  // it (queueEdit): `request` gives the path and body from the protein as the
+  // last answer stored it. `fields` are the inputs the edit sends, which then
+  // show the server's values; a refusal is shown `near` the part of the editor
+  // it is about. Gives the answer, or null.
+  editChosen(
+    method,
+    request,
+    { proteinId = this.protein && this.protein.id, fields = [], near = null, after = null } = {},
+  ) {
+    return this.queueEdit(
+      async (current) => {
+        const protein = this.project.proteins.find((p) => p.id === proteinId);
+        if (!protein) {
+          return null;
+        }
+        const [path, body] = request(protein);
+        try {
+          const answer = await this.handlers.send(method, path, body);
+          if (!answer || !current()) {
+            return null; // another project is shown now
+          }
+          this.showError("");
+          this.renderEditor(fields);
+          return answer;
+        } catch (error) {
+          if (!current()) {
+            return null;
+          }
+          this.renderEditor(fields);
+          const message = this.explain(error, protein);
+          if (this.protein && this.protein.id === protein.id) {
+            this.showError(message, near);
+          } else {
+            this.handlers.status(message); // the editor shows another protein by now
+          }
+          return null;
+        }
+      },
+      { after },
+    );
   }
 
   // A refusal in the user's terms: the proteins it names by their names.
@@ -487,6 +529,66 @@ export class ProteinPanel {
       this.handlers.status(
         `Removed the n.d. mark in lane ${record.lane_index + 1}: that lane is not measured now.`,
       );
+    }
+  }
+
+  // Remove every box and n.d. mark of the chosen protein, without asking: the
+  // status line says what went, with an Undo that brings it back. It waits for
+  // the boxes the app is placing or moving, so it clears those too. Pressed
+  // twice (a double click), it clears once: the button is disabled at once,
+  // and the status line keeps its place, so the second press lands on it.
+  async clear() {
+    const protein = this.protein;
+    if (!protein || this.clearing.has(protein.id)) {
+      return;
+    }
+    this.clearing.add(protein.id);
+    this.renderClear();
+    const path = `/api/proteins/${protein.id}/boxes`;
+    let answer = null;
+    try {
+      answer = await this.editChosen("DELETE", () => [path, undefined], {
+        proteinId: protein.id,
+        after: this.handlers.pending(),
+      });
+    } finally {
+      this.clearing.delete(protein.id);
+      this.renderClear();
+    }
+    if (!answer) {
+      if (focusLost() && !$("clear-boxes").disabled) {
+        $("clear-boxes").focus(); // refused: the keyboard stays on it
+      }
+      return;
+    }
+    const parts = [];
+    if (answer.removed.length) {
+      parts.push(counted(answer.removed.length, "box", "boxes"));
+    }
+    if (answer.dropped_undetected.length) {
+      parts.push(
+        counted(answer.dropped_undetected.length, "not-detected mark", "not-detected marks"),
+      );
+    }
+    if (!parts.length) {
+      this.handlers.status(`${protein.name} has no boxes or n.d. marks to clear.`);
+      return;
+    }
+    // This Undo takes back the clear only: it goes once the history moves on.
+    const step = answer.project.history.undo;
+    const undo =
+      step && step.action === "clear_boxes"
+        ? {
+            label: "Undo",
+            name: `Undo clearing the boxes of ${protein.name}`,
+            seq: step.seq,
+            run: () => this.handlers.undo(step.seq),
+          }
+        : null;
+    const button = this.handlers.status(`Cleared ${inWords(parts)}`, undo);
+    // Clear boxes is disabled now: the keyboard goes on to that Undo.
+    if (button && (focusLost() || document.activeElement === $("clear-boxes"))) {
+      button.focus();
     }
   }
 

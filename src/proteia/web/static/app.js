@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // The page: keeps this launch's access token, talks to the local server, and
-// shows the open project's images, proteins, boxes and checks. Every edit goes
-// to the server, which answers with the stored project and its results; the
-// page only draws what it is given.
-import { $, isolate, rebuild, span } from "/static/dom.js";
+// shows the open project's images, proteins, boxes and checks. Every edit, and
+// every undo and redo, goes to the server, which answers with the stored
+// project and its results; the page only draws what it is given.
+import { $, counted, focusLost, inWords, isolate, rebuild, span } from "/static/dom.js";
 import { colorOf, ProteinPanel } from "/static/proteins.js";
 import { ImageView, MISSING_COLOR } from "/static/view.js";
 
@@ -87,10 +87,65 @@ function forgetBitmap(imageId) {
   }
 }
 
-function showStatus(text) {
+// A press on `button` leaves the keyboard focus where it is. Undo and Redo name
+// the change they take back or make again: were the focus to leave the protein
+// name field, what is typed there would be committed first (its change event)
+// and the step would act on that rename instead. The typing stays, uncommitted.
+function keepsFocus(button) {
+  button.addEventListener("mousedown", (event) => event.preventDefault());
+}
+
+let statusUndo = null; // the change the status line's Undo takes back: {seq}, or null
+
+// Show `text` in the status line ("" empties it), with an optional action after
+// it: {label, name (its accessible name), seq, run}. The action takes back the
+// change logged as `seq`, and goes once the history has moved past it. Gives
+// the action's button, or null.
+function showStatus(text, action = null) {
   const line = $("status");
   line.textContent = text;
-  line.hidden = !text;
+  statusUndo = null;
+  let button = null;
+  if (text && action) {
+    button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.setAttribute("aria-label", action.name);
+    keepsFocus(button);
+    // Taken once: a second press before the answer (a double click) would find
+    // the change no longer the last, and say so over what the first one did.
+    button.addEventListener("click", () => {
+      action.run();
+      button.disabled = true;
+    });
+    const part = document.createElement("span");
+    part.className = "status-action";
+    part.append(" — ", button);
+    line.append(part);
+    statusUndo = { seq: action.seq };
+  }
+  placeStatus();
+  return button;
+}
+
+// While a project is shown the status line keeps its place under the header,
+// empty or not: a message coming or going (after every undo, and the next edit)
+// never moves the panel or the image under the pointer, so a second click, or
+// a click on a band, lands where it was aimed. Otherwise it shows only a message.
+function placeStatus() {
+  const line = $("status");
+  line.hidden = !line.textContent && $("workspace").hidden;
+}
+
+// Drop the status line's Undo once undo would take back another change.
+function renderStatusUndo(history) {
+  if (statusUndo && !(history.undo && history.undo.seq === statusUndo.seq)) {
+    statusUndo = null;
+    const part = $("status").querySelector(".status-action");
+    if (part) {
+      part.remove();
+    }
+  }
 }
 
 function report(error) {
@@ -155,12 +210,36 @@ async function send(method, path, json) {
   return answer;
 }
 
+// The edits made outside the panel's queue (boxes, images) that have no answer
+// yet, counted from the moment they are made. An undo waits for them, so it
+// takes back the last change made, not the one before it; so does "Clear
+// boxes", so it clears a box being placed; and so does opening another
+// project, so they end in the project they were made in.
+const inFlight = new Set();
+
+// Make an edit outside the panel's queue: `sendIt()` sends it once the queue as
+// it stands has run, so an undo, redo or clear asked for before it reaches the
+// server first and never takes back or clears this edit (a band clicked while
+// undos queue up). Gives its answer.
+function ordered(sendIt) {
+  const promise = proteinPanel.queue.then(sendIt);
+  inFlight.add(promise);
+  const done = () => inFlight.delete(promise);
+  promise.then(done, done);
+  return promise;
+}
+
+// Settles once every edit in flight now has its answer (or refusal).
+function pending() {
+  return Promise.allSettled([...inFlight]);
+}
+
 // Send an edit and show a refusal in the status line (unless another project
 // is shown by then).
 async function edit(method, path, json) {
   const opened = shownOpening();
   try {
-    return await send(method, path, json);
+    return await ordered(() => send(method, path, json));
   } catch (error) {
     if (opened === shownOpening()) {
       report(error);
@@ -187,6 +266,8 @@ const proteinPanel = new ProteinPanel({
     render();
   },
   status: showStatus,
+  undo: (seq) => takeStep("undo", { seq }),
+  pending,
   laneName: (index) => laneName(state.project, index),
 });
 
@@ -235,10 +316,14 @@ async function openProject(path, name) {
   setOpening(name);
   $("projects-error").textContent = "";
   try {
-    // The panel's edits end in the project they were made in, their refusals
-    // shown (the dialog is modal: no edit is made meanwhile). Then, before
-    // asking, none may reach the project opened next: ids repeat across projects.
-    await proteinPanel.settled();
+    // Every edit made before, in the panel's queue (its edits, the undos,
+    // redos and clears) or outside it (boxes and images, which wait for that
+    // queue before they are sent), ends in the project it was made in, its
+    // refusal shown (the dialog is modal and the shortcuts are off while it is
+    // open: none is made meanwhile). Then, before asking, none may reach the
+    // project opened next: an undo sent after the open would take back a
+    // change of that project.
+    await Promise.all([proteinPanel.settled(), pending()]);
     proteinPanel.invalidateEdits();
     const answer = await call("POST", path, { name });
     if (!isCurrent(answer.project)) {
@@ -317,10 +402,15 @@ function render() {
   $("workspace").hidden = !project;
   $("switch-project").hidden = false;
   $("reveal").hidden = !project;
+  $("undo").hidden = !project;
+  $("redo").hidden = !project;
+  placeStatus();
   if (!project) {
     return;
   }
   $("project-name").textContent = project.name;
+  $("project-name").title = project.name; // whole, when the header cuts it short
+  renderHistory(project.history);
   $("save-state").textContent = project.save_error
     ? `Not saved: ${project.save_error}`
     : project.saved
@@ -631,7 +721,7 @@ async function placeBox(x, y, options, laneIndex, proteinId) {
   const body = { protein_id: proteinId, x, y, lane_index: laneIndex, grow };
   const opened = shownOpening();
   try {
-    const answer = await call("POST", "/api/boxes", body);
+    const answer = await ordered(() => call("POST", "/api/boxes", body));
     applyAnswer(answer, { choose: { proteinId } }); // it stays the click target
     if (sameOpening(answer)) {
       showStatus(""); // not selected, so the next click places the next box
@@ -729,11 +819,12 @@ $("import-file").addEventListener("change", async (event) => {
   const opened = shownOpening();
   showStatus(`Importing ${isolate(file.name)}…`);
   try {
-    const response = await request("POST", `/api/images?${query}`, {
-      body: file,
-      contentType: "application/octet-stream",
-    });
-    const answer = await response.json();
+    const answer = await ordered(() =>
+      request("POST", `/api/images?${query}`, {
+        body: file,
+        contentType: "application/octet-stream",
+      }).then((response) => response.json()),
+    );
     applyAnswer(answer, { choose: { imageId: answer.image_id, boxId: null } });
     const image = answer.project.images.find((i) => i.id === answer.image_id);
     const name = isolate(image ? image.original_name : file.name);
@@ -758,6 +849,231 @@ $("import-file").addEventListener("change", async (event) => {
 $("import-polarity").addEventListener("change", (event) => {
   $("import-file").disabled = !event.target.value;
   $("import-button").classList.toggle("disabled", !event.target.value);
+});
+
+// --- Undo and redo ---
+
+// Each change the server logs, in the words of the control that makes it.
+const ACTION_WORDS = {
+  new_project: "create project",
+  import_image: "import image",
+  remove_image: "remove image",
+  set_polarity: "change band polarity",
+  set_lanes: "set lanes",
+  set_reference_condition: "set reference condition",
+  add_protein: "add protein",
+  edit_protein: "edit protein",
+  remove_protein: "remove protein",
+  place_box: "place box",
+  move_box: "move box",
+  remove_box: "delete box",
+  set_box_lane: "change box lane",
+  set_box_size: "change box size",
+  clear_boxes: "clear boxes",
+  detect_row_boxes: "detect row boxes",
+  remove_undetected: "remove n.d. mark",
+  undo: "undo",
+  redo: "redo",
+};
+
+// A logged change in words; one this page does not know, by its id.
+function actionWords(action) {
+  return Object.hasOwn(ACTION_WORDS, action) ? ACTION_WORDS[action] : action;
+}
+
+const STEPS = {
+  undo: { verb: "Undo", done: "Undid", keys: "Ctrl+Z" },
+  redo: { verb: "Redo", done: "Redid", keys: "Ctrl+Shift+Z or Ctrl+Y" },
+};
+
+// The Undo and Redo buttons, each named after the change it would take back or
+// make again, and disabled when there is none. The tooltip holds the whole
+// label, which a narrow window cuts short.
+function renderHistory(history) {
+  for (const [direction, { verb, keys }] of Object.entries(STEPS)) {
+    const step = history[direction];
+    const button = $(direction);
+    button.disabled = !step;
+    button.textContent = step ? `${verb}: ${actionWords(step.action)}` : verb;
+    button.title = step ? `${button.textContent} (${keys})` : `Nothing to ${direction}`;
+  }
+  renderStatusUndo(history);
+}
+
+// What `ids` and not-detected `records` name in `project`, counted: images,
+// proteins and boxes (a membrane goes with its images), and n.d. marks.
+function counts(project, ids, records) {
+  const named = new Set(ids);
+  const count = (items) => items.filter((item) => named.has(item.id)).length;
+  const parts = [
+    [count(project.images), "image", "images"],
+    [count(project.proteins), "protein", "proteins"],
+    [count(project.proteins.flatMap((p) => p.bands)), "box", "boxes"],
+    [records.length, "not-detected mark", "not-detected marks"],
+  ];
+  return inWords(parts.filter(([n]) => n > 0).map(([n, one, many]) => counted(n, one, many)));
+}
+
+// What an undo or redo did: the change, then what went (found in the state the
+// page showed `before`) and what came back.
+function stepText(direction, answer, before) {
+  const sentences = [`${STEPS[direction].done}: ${actionWords(answer.action)}.`];
+  const went = counts(before, answer.removed, answer.undetected_removed);
+  const back = counts(answer.project, answer.restored, answer.undetected_restored);
+  if (went) {
+    sentences.push(`Removed ${went}.`);
+  }
+  if (back) {
+    sentences.push(`Brought back ${back}.`);
+  }
+  return sentences.join(" ");
+}
+
+function reportStep(direction, error) {
+  if (error.code === `nothing_to_${direction}`) {
+    showStatus(`Nothing to ${direction}.`);
+  } else if (error.code === "image_file_changed") {
+    // The image is often not in the project shown (undoing a removal), so its
+    // name may be unknown here; and the file may be missing or changed.
+    const names = error.ids
+      .map((id) => state.project.images.find((image) => image.id === id))
+      .filter(Boolean)
+      .map((image) => isolate(image.original_name));
+    const which = names.length ? `the file of ${inWords(names)} is` : "an image file it needs is";
+    showStatus(
+      `Cannot ${direction}: ${which} missing from the project's images folder` +
+        " or was changed outside Proteia.",
+    );
+  } else {
+    report(error);
+  }
+}
+
+// Undo or redo once every edit made before it has its answer (the panel's
+// queue and adds, the box and image edits in flight), so it takes back or
+// makes again the change the history names by then. `seq`: only if that change
+// is still the one logged as `seq` (the status line's Undo of a clear). It runs
+// in the panel's queue and its answer goes through send(), so it never reaches
+// or shows a project opened after it was asked for (see openProject); the
+// edits made after it wait for it (ordered, and the queue).
+function takeStep(direction, { seq = null } = {}) {
+  if (!state.project || $("workspace").hidden) {
+    return;
+  }
+  const had = document.activeElement;
+  const offered = state.project.history[direction]; // what the page showed when asked
+  const after = Promise.allSettled([pending(), proteinPanel.adding]);
+  proteinPanel.queueEdit(
+    async (current) => {
+      const step = state.project.history[direction];
+      if (seq !== null && !(step && step.seq === seq)) {
+        showStatus(
+          "Not undone: other changes were made since. Undo at the top takes back the last one.",
+        );
+        keepFocus(had, direction, true);
+        return null;
+      }
+      if (!step) {
+        // Gone meanwhile: taken by the steps asked for before it, or, for a
+        // redo, dropped by an edit made before it (an edit ends what redo can
+        // make again). Said, unless the page offered none when it was asked.
+        if (offered) {
+          showStatus(`Nothing to ${direction}.`);
+        }
+        return null;
+      }
+      const before = state.project;
+      const opened = shownOpening();
+      try {
+        const answer = await send("POST", `/api/${direction}`);
+        if (!answer || !current()) {
+          return null;
+        }
+        showStatus(stepText(direction, answer, before));
+        keepFocus(had, direction, seq !== null);
+        return answer;
+      } catch (error) {
+        if (current() && opened === shownOpening()) {
+          reportStep(direction, error);
+          keepFocus(had, direction, seq !== null);
+        }
+        return null;
+      }
+    },
+    { after },
+  );
+}
+
+// The control a step was taken from (`had`, focused then) may be gone (the
+// status line's Undo) or disabled (the last Undo): if the focus was still on
+// it, the keyboard goes on to the next useful one.
+function keepFocus(had, direction, fromStatus) {
+  const gone = had && (!had.isConnected || had.disabled);
+  if (!gone || !(focusLost() || document.activeElement === had)) {
+    return;
+  }
+  const other = direction === "undo" ? "redo" : "undo";
+  const targets = [...(fromStatus ? [$("clear-boxes")] : []), $(direction), $(other)];
+  const target = targets.find((t) => !t.disabled && t.getClientRects().length);
+  if (target) {
+    target.focus();
+  }
+}
+
+for (const direction of Object.keys(STEPS)) {
+  keepsFocus($(direction));
+  $(direction).addEventListener("click", () => takeStep(direction));
+}
+
+// Inputs where Ctrl+Z is not the browser's text undo.
+const NOT_TEXT = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "image",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+]);
+
+function editsText(element) {
+  return (
+    (element instanceof HTMLInputElement && !NOT_TEXT.has(element.type)) ||
+    element instanceof HTMLTextAreaElement ||
+    (element instanceof HTMLElement && element.isContentEditable)
+  );
+}
+
+// Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo (Cmd on macOS). Not while the
+// focus is where the browser undoes typing (a text field, editable text), nor
+// while a dialog is open. A select has no text undo: right after choosing in
+// one (polarity, a box's lane) is when Ctrl+Z is wanted.
+document.addEventListener("keydown", (event) => {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.isComposing) {
+    return;
+  }
+  // The letter typed; by the key's place on a layout without Latin letters.
+  const letter = /^[a-z]$/i.test(event.key)
+    ? event.key.toLowerCase()
+    : { KeyZ: "z", KeyY: "y" }[event.code];
+  let direction = null;
+  if (letter === "z") {
+    direction = event.shiftKey ? "redo" : "undo";
+  } else if (letter === "y" && !event.shiftKey) {
+    direction = "redo";
+  }
+  if (
+    !direction ||
+    editsText(event.target) ||
+    document.querySelector("dialog[open]") ||
+    $("workspace").hidden
+  ) {
+    return;
+  }
+  event.preventDefault();
+  takeStep(direction);
 });
 
 $("zoom-in").addEventListener("click", () => view.zoomCentre(1.25));
@@ -803,6 +1119,8 @@ $("quit").addEventListener("click", async () => {
     showStatus("Proteia has stopped. You can close this tab.");
     $("workspace").hidden = true;
     $("quit").hidden = true;
+    $("undo").hidden = true;
+    $("redo").hidden = true;
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       $("quit").hidden = true; // this tab cannot reach the running Proteia
