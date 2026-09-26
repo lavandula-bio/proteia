@@ -99,7 +99,7 @@ from skimage.segmentation import watershed
 
 from proteia.core.boxes import place_in_row
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_region, mad_sigma
-from proteia.core.model import BoxSize, Rect
+from proteia.core.model import BoxSize, Rect, lanes_phrase
 
 # --- Domain settings (maintainer decisions on #51) ---
 
@@ -1203,12 +1203,6 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
             ln.reason = "no_band"  # the snr tells how close it came
 
 
-def _lanes_phrase(lanes: Sequence[int]) -> str:
-    """``lane 3`` or ``lanes 1, 4``: lane indices counted from 1, as the user does."""
-    word = "lane" if len(lanes) == 1 else "lanes"
-    return f"{word} {', '.join(str(i + 1) for i in lanes)}"
-
-
 def _shared_size(
     ws: Sequence[int],
     hs: Sequence[int],
@@ -1360,7 +1354,7 @@ def detect_row(
                 flags.append("ambiguous_lanes")
                 pairs = sorted({present[k] for k in crowded} | {present[k + 1] for k in crowded})
                 notes.append(
-                    f"{_lanes_phrase(numbered(pairs))}: extents closer than the narrowest band "
+                    f"{lanes_phrase(numbered(pairs))}: extents closer than the narrowest band "
                     f"({min_w:.0f} px) or out of order"
                 )
             w = min(w, int(math.floor(max(float(gaps.min()), min_w))))
@@ -1408,14 +1402,14 @@ def detect_row(
     if outliers:
         flags.append("size_outlier")
         notes.append(
-            f"{_lanes_phrase(numbered([present[k] for k in outliers]))}: extent above "
+            f"{lanes_phrase(numbered([present[k] for k in outliers]))}: extent above "
             f"{SIZE_GUARD:g}x the median of the other extents, left out of the shared size"
         )
     multiple = [ld.lane for ld in result if ld.components > 1]
     if multiple:
         flags.append("multiple_components")
         notes.append(
-            f"{_lanes_phrase(multiple)}: a second separate component reaches the "
+            f"{lanes_phrase(multiple)}: a second separate component reaches the "
             "detection level; the box covers the one with the lane's strongest pixel"
         )
     return RowDetection(

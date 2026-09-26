@@ -309,6 +309,10 @@ def test_boxes_are_placed_relaned_and_removed_through_the_operations(client, tmp
         422,
         "lane_out_of_range",
     )
+    # The page shows a refusal's message as it is, so it numbers lanes from 1
+    # as the page does; the request's lane_index 3 is the stored index.
+    _, payload = client.call("PUT", f"/api/boxes/{b}/lane", {"lane_index": 3})
+    assert payload["message"] == "'β-actin' already has a box in lane 4"
     rect = bands(answer)[a]["rect"]
     assert client.refused("PUT", f"/api/boxes/{b}", {"rect": rect})[:2] == (422, "overlap")
 

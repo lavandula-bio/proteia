@@ -58,7 +58,7 @@ from proteia.core.analyze import (
     reference_baseline,
     repeats_message,
 )
-from proteia.core.model import Role
+from proteia.core.model import Role, lanes_phrase
 from proteia.core.names import name_key, resolve_label
 from proteia.core.plotspec import ErrorType, PlotSpec, ValueKind, build_plotspec
 from proteia.core.project import spine_axes
@@ -245,13 +245,6 @@ def _listed(values: Collection[object]) -> str:
     return ", ".join(repr(v) for v in values)
 
 
-def _lanes(indices: Collection[int]) -> str:
-    """0-based lane indices as the user counts lanes: ``lane 8``, ``lanes 3, 7``
-    (1-based, ascending)."""
-    numbers = sorted(i + 1 for i in indices)
-    return ("lane " if len(numbers) == 1 else "lanes ") + ", ".join(map(str, numbers))
-
-
 def _chart(
     groups: dict[str, list[float]],
     point_lanes: dict[str, list[list[int]]],
@@ -324,7 +317,7 @@ def compute_results(
     ]
     if not removed:
         return one_set(batch, set_label=None)
-    results = one_set(batch, set_label=f"Excluding {_lanes(removed)}")
+    results = one_set(batch, set_label=f"Excluding {lanes_phrase(removed)}")
     every_lane = batch.model_copy(
         update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
     )
@@ -434,7 +427,7 @@ def _compute(
             kept = "the lane stays" if len(over) == 1 else "the lanes stay"
             note(
                 NoticeCode.CLIPPED,
-                f"{column.name!r} is over-exposed in {_lanes(over)}: pixels at the detector"
+                f"{column.name!r} is over-exposed in {lanes_phrase(over)}: pixels at the detector"
                 f" limit make its net an under-estimate; {kept} included",
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
@@ -451,7 +444,7 @@ def _compute(
             effect = "those lanes have no value and are left out of the statistics"
         note(
             NoticeCode.BELOW_DETECTION,
-            f"{column.name!r} was not detected in {_lanes(below)}"
+            f"{column.name!r} was not detected in {lanes_phrase(below)}"
             f" (below the detection limit): {effect}",
             protein_ids=(column.protein_id,),
             lane_indices=below,
@@ -542,7 +535,7 @@ def _compute(
             if not_positive:
                 note(
                     NoticeCode.LOADING_NOT_POSITIVE,
-                    f"{s.loading!r} has a net of 0 in {_lanes(not_positive)}:"
+                    f"{s.loading!r} has a net of 0 in {lanes_phrase(not_positive)}:"
                     f" {s.target!r} / {s.loading!r} has no value there",
                     protein_ids=pair_ids,
                     lane_indices=not_positive,

@@ -485,6 +485,17 @@ def test_load_wraps_invalid_content():
     assert isinstance(info.value.__cause__, ValidationError)
 
 
+def test_load_errors_number_lanes_from_1():
+    # Opening shows the message to the user, who counts lanes from 1: the
+    # file's lane_index 0 is lane 1.
+    doc = _doc(make_project())
+    bands = doc["batch"]["proteins"][0]["bands"]
+    bands[1]["lane_index"] = bands[0]["lane_index"] = 0
+    with pytest.raises(ProjectFormatError) as info:
+        project_from_json(_encode(doc))
+    assert "protein prot-7: two bands in lane 1 with band index 0" in str(info.value)
+
+
 @pytest.mark.parametrize(
     "edit",
     [
