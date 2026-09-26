@@ -389,3 +389,10 @@ def test_quit_saves_unsaved_changes_first_or_refuses(client, tmp_path, monkeypat
     assert client.call("POST", "/api/quit")[0] == 202
     saved = json.loads(project_file.read_text(encoding="utf-8"))
     assert [lane["label"] for lane in saved["batch"]["lanes"]] == ["vehicle"]
+
+
+@pytest.mark.parametrize("size", [[0, 10], [10, -5], [10], ["10", 10]])
+def test_a_bad_box_size_is_refused_as_json(client, tmp_path, size):
+    image_id, _ = ready(client, tmp_path)
+    body = {"name": "GAPDH", "role": "loading control", "image_id": image_id, "box_size": size}
+    assert client.refused("POST", "/api/proteins", body)[:2] == (422, "invalid_input")

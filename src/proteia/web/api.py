@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
 
 from proteia.core import operations as ops
 from proteia.core.model import BoxSize, UnknownIdError
@@ -136,6 +136,9 @@ class Workspace:
 # --- Request bodies ---
 
 
+PositiveInt = Annotated[StrictInt, Field(gt=0)]
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -165,7 +168,7 @@ class ProteinBody(_Body):
     image_id: str
     expected_mw: float | None = None
     loading_control_ids: list[str] = []
-    box_size: tuple[StrictInt, StrictInt] | None = None  # width, height
+    box_size: tuple[PositiveInt, PositiveInt] | None = None  # width, height
 
 
 class PlaceBody(_Body):
@@ -385,6 +388,10 @@ def install(app: FastAPI, workspace: Workspace) -> None:
             500, "file_error", str(e)
         ),  # e.g. a folder that cannot be written
         RequestValidationError: lambda e: _error(
+            422, "invalid_input", "; ".join(_describe(error) for error in e.errors())
+        ),
+        # A model a route builds itself; operations turn theirs into OperationError.
+        ValidationError: lambda e: _error(
             422, "invalid_input", "; ".join(_describe(error) for error in e.errors())
         ),
     }
