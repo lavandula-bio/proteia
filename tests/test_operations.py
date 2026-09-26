@@ -2171,3 +2171,24 @@ def test_record_grow_settings_are_what_place_box_uses(tmp_path, monkeypatch):
     bound.apply_defaults()
     recorded = record.settings()["grow_box"]
     assert {name: bound.arguments[name] for name in recorded} == recorded
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("error_type", "sd", "error type must be one of 'SD', 'SEM', not 'sd'"),
+        ("method", "median", "method must be one of 'mean', 'representative', not 'median'"),
+    ],
+)
+def test_compute_refuses_an_unknown_error_type_or_method(tmp_path, argument, value, message):
+    s = session_on(tmp_path)
+    with pytest.raises(OperationError) as info:
+        ops.compute(s, **{argument: value})
+    assert info.value.code is ErrorCode.INVALID_INPUT
+    assert str(info.value) == message
+
+
+def test_compute_takes_the_raw_error_type_and_method(tmp_path):
+    s = _parity_session(tmp_path, _blot(), DARK)
+    raw = ops.compute(s, error_type="SEM", method="representative")
+    assert raw == ops.compute(s, error_type=ErrorType.SEM, method=ReduceMethod.REPRESENTATIVE)

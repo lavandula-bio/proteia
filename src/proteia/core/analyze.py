@@ -224,9 +224,10 @@ class SampleReduction:
     lanes: dict[str, list[list[int]]] = field(default_factory=dict)
 
 
-def repeats_message(count: int, method: ReduceMethod) -> str:
-    """How :func:`reduce_samples` reports ``count`` samples with technical repeats."""
-    what = "averaged" if method is ReduceMethod.MEAN else "kept one lane of"
+def repeats_message(count: int, method: ReduceMethod | str) -> str:
+    """How :func:`reduce_samples` reports ``count`` samples with technical repeats.
+    ``method`` may be its raw value (``"mean"``)."""
+    what = "averaged" if ReduceMethod(method) is ReduceMethod.MEAN else "kept one lane of"
     return f"{what} {count} sample(s) with technical repeats (repeats do not count as n)"
 
 
@@ -236,7 +237,7 @@ def reduce_samples(
     samples: list[str | None] | None = None,
     *,
     included: list[bool] | None = None,
-    method: ReduceMethod = ReduceMethod.MEAN,
+    method: ReduceMethod | str = ReduceMethod.MEAN,
 ) -> SampleReduction:
     """Collapse technical repeats to one value per biological sample, then group.
 
@@ -245,8 +246,10 @@ def reduce_samples(
     representative) *before* grouping, so n counts biological samples, not lanes —
     this is what prevents pseudoreplication. When ``samples`` is ``None`` every
     lane is treated as its own sample (the biological-replicate default).
-    ``included=False`` drops presentation-only lanes.
+    ``included=False`` drops presentation-only lanes. ``method`` may be its raw
+    value (``"mean"``); an unknown value raises ``ValueError``.
     """
+    method = ReduceMethod(method)  # before the identity checks below
     n = len(conditions)
     if len(values) != n:
         raise ValueError("values and conditions length mismatch")
@@ -335,7 +338,7 @@ def fold_change_lane(
     samples: list[str | None] | None = None,
     *,
     included: list[bool] | None = None,
-    method: ReduceMethod = ReduceMethod.MEAN,
+    method: ReduceMethod | str = ReduceMethod.MEAN,
 ) -> LaneNets:
     """Express each lane as a fold-change vs the control condition's baseline.
 

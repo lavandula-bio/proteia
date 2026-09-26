@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the plot spec builder and the matplotlib renderer."""
 
-import json
 import math
 
 import pytest
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
+from conftest import assert_strict_json
 from proteia.core import analyze
 from proteia.core.analyze import compare, describe
 from proteia.core.plotspec import (
@@ -13,23 +14,10 @@ from proteia.core.plotspec import (
     NO_VARIATION,
     NO_VARIATION_WITHIN,
     ErrorType,
-    PlotSpec,
     ValueKind,
     build_plotspec,
 )
 from proteia.viz import render_figure, save_figure
-
-
-def _not_json(constant: str) -> float:
-    raise ValueError(f"{constant} is not JSON")
-
-
-def _assert_strict_json(spec: PlotSpec) -> None:
-    """Strict JSON with nothing lost. Pydantic writes NaN and inf as null, which
-    strict JSON accepts, so only the round trip shows that none got into the spec."""
-    dump = spec.model_dump_json()
-    json.loads(dump, parse_constant=_not_json)
-    assert PlotSpec.model_validate_json(dump) == spec
 
 
 def _spec(error_type=ErrorType.SD):
@@ -57,6 +45,13 @@ def test_error_type_selects_sd_vs_sem():
     sd_bar = next(b for b in _spec(ErrorType.SD).bars if b.label == "ctl")
     sem_bar = next(b for b in _spec(ErrorType.SEM).bars if b.label == "ctl")
     assert sem_bar.error < sd_bar.error  # SEM = SD / sqrt(n)
+
+
+@pytest.mark.parametrize("error_type", ["SD", "SEM"])
+def test_a_raw_error_type_behaves_like_its_enum(error_type):
+    raw = _spec(error_type)
+    assert raw == _spec(ErrorType(error_type))
+    assert raw.error_type is ErrorType(error_type)
 
 
 def test_only_significant_comparisons_become_brackets():
@@ -120,7 +115,7 @@ def test_a_non_finite_p_means_no_test(groups):
     spec = build_plotspec(groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE)
     assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
     assert spec.test_note == NO_VARIATION
-    _assert_strict_json(spec)
+    assert_strict_json(spec)
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
@@ -141,7 +136,43 @@ def test_values_constant_within_each_condition_give_no_test(groups, note):
     spec = build_plotspec(groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE)
     assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
     assert spec.test_note == note
-    _assert_strict_json(spec)
+    assert_strict_json(spec)
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
+@pytest.mark.parametrize(
+    ("groups", "note"),
+    [
+        # 0.1 + 0.2 is 0.30000000000000004: Welch's t gives p = 1e-23, three stars.
+        ({"ctl": [0.30000000000000004, 0.3], "A": [0.6, 0.6000000000000001]}, NO_VARIATION_WITHIN),
+        # ANOVA p = 0, and Tukey brackets A against both others with three stars.
+        (
+            {
+                "ctl": [0.30000000000000004, 0.3, 0.3],
+                "A": [0.7, 0.7000000000000001, 0.7],
+                "B": [0.3, 0.3, 0.30000000000000004],
+            },
+            NO_VARIATION_WITHIN,
+        ),
+        ({"ctl": [0.30000000000000004, 0.3], "A": [0.3, 0.3]}, NO_VARIATION),  # p = 1
+        ({"ctl": [0.0, 0.0], "A": [0.0, 0.0]}, NO_VARIATION),  # all 0: no spread at all
+    ],
+)
+def test_values_constant_up_to_rounding_give_no_test(groups, note):
+    test = compare(groups)
+    assert math.isfinite(test.p_value) or math.isnan(test.p_value)  # the core runs a test
+    spec = build_plotspec(groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE)
+    assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
+    assert spec.test_note == note
+
+
+@pytest.mark.parametrize("scale", [1e-12, 1.0, 1e12])
+def test_values_that_vary_are_tested_at_any_magnitude(scale):
+    # The rounding tolerance is relative: tiny or huge values that vary are tested.
+    groups = {"ctl": [1.0 * scale, 1.1 * scale], "A": [2.0 * scale, 2.2 * scale]}
+    spec = build_plotspec(groups, describe(groups), compare(groups), value_kind=ValueKind.RAW)
+    assert (spec.test_name, spec.test_note) == ("welch_t", None)
+    assert spec.test_p is not None and 0 < spec.test_p < 0.05
 
 
 def test_a_non_finite_p_keeps_the_tests_own_note():
@@ -161,12 +192,26 @@ def test_a_non_finite_p_draws_no_bracket_even_for_a_significant_pair(p):
     assert spec.test_note == NO_P_VALUE
 
 
-def test_a_group_of_one_gives_the_cores_reason_and_no_brackets():
-    groups = {"ctl": [1.0], "10 µM": [2.0, 2.1]}  # "ctl" cannot enter a test
+@pytest.mark.parametrize(
+    ("groups", "note"),
+    [
+        ({"ctl": [1.0], "10 µM": [2.0, 2.1]}, "no test: 'ctl' has fewer than 2 replicates"),
+        ({"ctl": [1.0], "10 µM": [2.0]}, "no test: 'ctl', '10 µM' have fewer than 2 replicates"),
+    ],
+)
+def test_a_group_of_one_is_named_even_when_the_core_gives_its_own_note(groups, note):
     test = compare(groups)
-    assert test.p_value is None
+    assert test.p_value is None and test.note  # the core's note names no group
     spec = build_plotspec(groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE)
     assert (spec.test_name, spec.test_p, spec.comparisons) == (None, None, [])
+    assert spec.test_note == note
+
+
+def test_the_cores_note_explains_a_single_group():
+    groups = {"ctl": [1.0, 1.1]}  # every group has two samples, but there is one group
+    test = compare(groups)
+    spec = build_plotspec(groups, describe(groups), test, value_kind=ValueKind.FOLD_CHANGE)
+    assert (spec.test_name, spec.test_p) == (None, None)
     assert spec.test_note == test.note == "need >=2 groups with >=2 replicates for a test"
 
 
@@ -218,6 +263,91 @@ def test_render_draws_the_subtitle_as_the_second_title_line():
     labelled = plain.model_copy(update={"subtitle": "Excluding lanes 3, 7"})
     title = render_figure(labelled).axes[0].get_title()
     assert title.split("\n") == ["test", "Excluding lanes 3, 7", without.split("\n")[1]]
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
+@pytest.mark.parametrize(
+    "groups",
+    [
+        {"ctl": [1.0, 1.1], "A": [2.0, 2.1]},  # a test ran
+        {"ctl": [1.0], "A": [2.0, 2.1]},  # a group of one
+        {"ctl": [1.0, 1.0], "A": [2.0, 2.0]},  # no variation within the conditions
+        {"ctl": [1.0, 1.1], "A": [2.0, 2.1], "B": [3.0]},  # the core tests two of three
+    ],
+)
+@pytest.mark.parametrize("subtitle", [None, "All lanes"])
+def test_every_chart_states_its_test_or_why_there_is_none(groups, subtitle):
+    spec = build_plotspec(
+        groups,
+        describe(groups),
+        compare(groups),
+        value_kind=ValueKind.FOLD_CHANGE,
+        title="test",
+        subtitle=subtitle,
+    )
+    if spec.test_name is None:
+        last = spec.test_note
+        assert last
+    else:
+        last = f"{spec.test_name}: p = {spec.test_p:.3g}"
+    lines = render_figure(spec).axes[0].get_title().split("\n")
+    head = ["test", *([subtitle] if subtitle else [])]
+    assert lines[: len(head)] == head
+    assert " ".join(lines[len(head) :]) == last  # a long note may be broken over lines
+
+
+_NAPARI_TITLE = "p-ERK fold-change vs vehicle  (/GAPDH)"  # the form napari gives a chart
+
+
+def _title_box_and_text(spec):
+    fig = render_figure(spec)
+    title = fig.axes[0].title
+    return title.get_window_extent(FigureCanvasAgg(fig).get_renderer()), fig.bbox, title.get_text()
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
+@pytest.mark.parametrize(
+    ("groups", "subtitle"),
+    [
+        ({"vehicle": [1.0, 1.0], "10 µM": [2.0, 2.0]}, None),  # no variation within
+        ({"ctl": [1.0, 1.1]}, None),  # one condition: the core's own note
+        ({"vehicle": [1.0], "10 µM": [2.0, 2.1]}, None),  # one short group, named
+        ({"vehicle": [1.0], "10 µM": [2.0]}, None),  # two short groups, named
+        ({"vehicle": [1.0], "10 µM": [2.0], "50 µM": [3.0]}, None),  # three
+        (
+            {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1]},
+            "Excluding lanes " + ", ".join(str(lane) for lane in range(1, 16)),
+        ),
+    ],
+)
+def test_no_title_line_runs_past_the_figure_edge(groups, subtitle):
+    spec = build_plotspec(
+        groups,
+        describe(groups),
+        compare(groups),
+        value_kind=ValueKind.FOLD_CHANGE,
+        title=_NAPARI_TITLE,
+        subtitle=subtitle,
+    )
+    box, figure, text = _title_box_and_text(spec)
+    assert 0 <= box.x0 and box.x1 <= figure.width  # a saved figure crops what lies outside
+    last = spec.test_note or f"{spec.test_name}: p = {spec.test_p:.3g}"
+    wanted = " ".join([_NAPARI_TITLE, *([subtitle] if subtitle else []), last])
+    assert text.split() == wanted.split()  # every word is still drawn, in order
+
+
+def test_a_title_that_fits_keeps_its_lines():
+    groups = {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1]}
+    spec = build_plotspec(
+        groups,
+        describe(groups),
+        compare(groups),
+        value_kind=ValueKind.FOLD_CHANGE,
+        title=_NAPARI_TITLE,
+    )
+    box, figure, text = _title_box_and_text(spec)
+    assert text.split("\n") == [_NAPARI_TITLE, f"{spec.test_name}: p = {spec.test_p:.3g}"]
+    assert 0 <= box.x0 and box.x1 <= figure.width
 
 
 def test_render_handles_empty_group_without_crashing():

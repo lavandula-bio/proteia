@@ -155,8 +155,10 @@ class Results(BaseModel, frozen=True):
 
     ``label`` names the set when there are two: ``Excluding lane 8`` or
     ``Excluding lanes 3, 7`` (1-based, ascending) for this one, ``All lanes`` for
-    ``all_lanes``. It is ``None`` when there is only one set. Every chart of a set
-    has the set's label as its subtitle.
+    ``all_lanes``. It is ``None`` when there is only one set. It names only the
+    excluded lanes that hold values: an excluded lane without any (a ladder)
+    changes nothing, so it is in ``excluded_lanes`` but not in the label. Every
+    chart of a set has the set's label as its subtitle.
     """
 
     lanes: list[LaneRow]
@@ -285,13 +287,15 @@ def compute_results(
         error_type=ErrorType(error_type),
         method=ReduceMethod(method),
     )
-    excluded = [lane.index for lane in batch.lanes if not lane.included]
-    removed_values = any(
-        nets[i] is not None for nets in lane_nets(batch).values() for i in excluded
-    )
-    if not removed_values:
+    per_protein = lane_nets(batch).values()
+    removed = [  # the excluded lanes that hold a value: what the exclusion changes
+        lane.index
+        for lane in batch.lanes
+        if not lane.included and any(nets[lane.index] is not None for nets in per_protein)
+    ]
+    if not removed:
         return one_set(batch, set_label=None)
-    results = one_set(batch, set_label=f"Excluding {_lanes(excluded)}")
+    results = one_set(batch, set_label=f"Excluding {_lanes(removed)}")
     every_lane = batch.model_copy(
         update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
     )

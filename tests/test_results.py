@@ -14,7 +14,7 @@ from collections.abc import Callable
 
 import pytest
 
-from conftest import make_project
+from conftest import assert_strict_json, make_project
 from proteia.core import model, results
 from proteia.core.analyze import ReduceMethod, Tier, compare
 from proteia.core.model import (
@@ -658,12 +658,14 @@ def test_too_few_samples_give_a_chart_without_statistics():
     assert chart is not None
     assert [bar.n for bar in chart.bars] == [1, 1]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
-    assert chart.test_note == compare(series.groups).note  # the reason no test ran
+    # The reason no test ran names the groups, where the core's note names none.
+    assert compare(series.groups).note == "need >=2 groups with >=2 replicates for a test"
+    assert chart.test_note == "no test: 'vehicle', '10 µM' have fewer than 2 replicates"
     # The all-lanes set has vehicle n = 2, still too few groups with two samples to test.
     all_chart = res.all_lanes.series[0].chart
     assert all_chart is not None
     assert (all_chart.test_name, all_chart.test_p, all_chart.comparisons) == (None, None, [])
-    assert all_chart.test_note is not None
+    assert all_chart.test_note == "no test: '10 µM' has fewer than 2 replicates"
 
 
 def test_excluded_lanes_without_values_add_no_second_set():
@@ -676,6 +678,18 @@ def test_excluded_lanes_without_values_add_no_second_set():
     assert res.excluded_lanes == [3]
     assert res.all_lanes is None
     assert res.label is None  # one set needs no name
+
+
+def test_the_label_names_only_the_excluded_lanes_that_hold_values():
+    # Lane 0 is emptied (a ladder) and excluded; lane 3, excluded, holds values.
+    def ladder_in_lane_0(draft: Project) -> None:
+        for protein in draft.batch.proteins:
+            protein.bands = [b for b in protein.bands if b.lane_index != 0]
+        draft.batch.lanes[0].included = False
+
+    res = compute_results(_batch(ladder_in_lane_0))
+    assert res.excluded_lanes == [0, 3]  # both are left out of this set
+    assert (res.label, res.all_lanes.label) == ("Excluding lane 4", "All lanes")
 
 
 def test_notices_shared_by_both_sets_appear_once():
@@ -742,18 +756,6 @@ def _no_variation(draft: Project) -> None:
     draft.batch.lanes[3].included = True
 
 
-def _not_json(constant: str) -> float:
-    raise ValueError(f"{constant} is not JSON")
-
-
-def _assert_strict_json(res: results.Results) -> None:
-    """Strict JSON with nothing lost. Pydantic writes NaN and inf as null, which
-    strict JSON accepts, so only the round trip shows that none got into the results."""
-    dump = res.model_dump_json()
-    json.loads(dump, parse_constant=_not_json)
-    assert results.Results.model_validate_json(dump) == res
-
-
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
 def test_values_that_do_not_vary_give_a_chart_with_a_note_and_no_test():
     res = compute_results(_batch(_no_variation))
@@ -764,7 +766,7 @@ def test_values_that_do_not_vary_give_a_chart_with_a_note_and_no_test():
     assert chart is not None and [bar.n for bar in chart.bars] == [2, 2]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
     assert chart.test_note == NO_VARIATION == "no test: the values do not vary"
-    _assert_strict_json(res)
+    assert_strict_json(res)
 
 
 def test_a_group_of_one_gives_a_chart_with_a_note_and_no_brackets():
@@ -773,7 +775,7 @@ def test_a_group_of_one_gives_a_chart_with_a_note_and_no_brackets():
     chart = res.series[0].chart
     assert chart is not None and [bar.n for bar in chart.bars] == [2, 1]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
-    assert chart.test_note == "need >=2 groups with >=2 replicates for a test"
+    assert chart.test_note == "no test: '10 µM' has fewer than 2 replicates"
 
 
 def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_gives_no_test():
@@ -795,7 +797,7 @@ def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_gives_no_t
     assert [(bar.label, bar.n) for bar in chart.bars] == [(REFERENCE, 2), (LOW, 2), (HIGH, 1)]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
     assert chart.test_note == f"no test: {HIGH!r} has fewer than 2 replicates"
-    _assert_strict_json(res)
+    assert_strict_json(res)
     all_chart = res.all_lanes.series[0].chart
     assert all_chart is not None and [bar.n for bar in all_chart.bars] == [2, 3, 2]
     assert (all_chart.test_name, all_chart.test_note) == ("anova_oneway", None)
@@ -845,3 +847,15 @@ def test_raw_error_type_and_method_behave_like_their_enums(error_type, method):
             if (other_error, other_method) != enums:
                 other = compute_results(batch, error_type=other_error, method=other_method)
                 assert other.series != raw.series
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("error_type", "sd", "'sd' is not a valid ErrorType"),
+        ("method", "median", "'median' is not a valid ReduceMethod"),
+    ],
+)
+def test_an_unknown_error_type_or_method_is_a_value_error(argument, value, message):
+    with pytest.raises(ValueError, match=message):
+        compute_results(make_project().batch, **{argument: value})

@@ -1201,13 +1201,17 @@ def compute(
     session: ProjectSession,
     *,
     plot_conditions: Collection[str] | None = None,
-    error_type: ErrorType = ErrorType.SD,
-    method: ReduceMethod = ReduceMethod.MEAN,
+    error_type: ErrorType | str = ErrorType.SD,
+    method: ReduceMethod | str = ReduceMethod.MEAN,
 ) -> Results:
     """Every result of the committed project (:func:`~proteia.core.results.compute_results`).
 
     Reads the committed project once: no lock, no pixels, no autosave.
+    ``error_type`` and ``method`` may be their raw values (``"SEM"``, ``"mean"``);
+    an unknown value is refused (``INVALID_INPUT``).
     """
+    error_type = _member(ErrorType, error_type, "error type")
+    method = _member(ReduceMethod, method, "method")
     project = session.project
     return results.compute_results(
         project.batch, plot_conditions=plot_conditions, error_type=error_type, method=method

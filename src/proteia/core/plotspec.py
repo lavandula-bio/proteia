@@ -96,6 +96,17 @@ NO_VARIATION = "no test: the values do not vary"
 NO_VARIATION_WITHIN = "no test: the values within each condition do not vary"
 NO_P_VALUE = "no test: the test gives no p-value"
 
+# Values whose spread is at most this fraction of their magnitude do not vary: a
+# difference in the last bits (0.1 + 0.2 against 0.3) is rounding, not data.
+_ROUNDING = 1e-9
+
+
+def _constant(values: list[float]) -> bool:
+    """Whether ``values`` (at least one) do not vary, up to rounding: their spread
+    is within :data:`_ROUNDING` of their largest magnitude, so values that are all
+    0 must be exactly 0."""
+    return bool(values) and max(values) - min(values) <= _ROUNDING * max(map(abs, values))
+
 
 def _no_test_reason(bars: list[Bar], test: TestResult) -> str | None:
     """Why the chart shows no test, or ``None`` when ``test`` stands for the chart.
@@ -106,17 +117,18 @@ def _no_test_reason(bars: list[Bar], test: TestResult) -> str | None:
     bars, with no multiple-comparison correction). When no condition's values
     vary the statistic divides by zero: scipy's p is NaN when every value is the
     same, and 0 or rounding noise when only the means differ, so constancy is
-    read from the points themselves, never from the SD or the p. The core's own
-    note, when it has one, comes first.
+    read from the points themselves (:func:`_constant`), never from the SD or
+    the p. Groups with n < 2 are always named; otherwise the core's own note,
+    when it has one, comes before ours.
     """
     few = [bar.label for bar in bars if bar.n < 2]
     p = test.p_value
     if few:
         listed = ", ".join(repr(label) for label in few)
         verb = "has" if len(few) == 1 else "have"
-        reason = f"no test: {listed} {verb} fewer than 2 replicates"
-    elif bars and all(len(set(bar.points)) == 1 for bar in bars):
-        same = len({value for bar in bars for value in bar.points}) == 1
+        return f"no test: {listed} {verb} fewer than 2 replicates"
+    if bars and all(_constant(bar.points) for bar in bars):
+        same = _constant([value for bar in bars for value in bar.points])
         reason = NO_VARIATION if same else NO_VARIATION_WITHIN
     elif p is None or not math.isfinite(p):
         reason = NO_P_VALUE
@@ -131,7 +143,7 @@ def build_plotspec(
     test: TestResult,
     *,
     value_kind: ValueKind,
-    error_type: ErrorType = ErrorType.SD,
+    error_type: ErrorType | str = ErrorType.SD,
     title: str = "",
     lane_indices: dict[str, list[int]] | None = None,
     first_label: str | None = None,
@@ -140,17 +152,20 @@ def build_plotspec(
     """Assemble a :class:`PlotSpec` from grouped values and computed statistics.
 
     ``error_type`` selects which precomputed error to surface — never hardcoded.
+    Its raw value (``"SD"``) works too; an unknown value raises ``ValueError``.
     ``lane_indices`` optionally carries provenance (condition -> source lanes).
     ``first_label`` (e.g. the control condition) is moved leftmost, the rest keep
     their order. Only significant pairwise comparisons (p < 0.05) become brackets.
 
     The chart shows no test (no test name, no p, no brackets) when a drawn group
-    has n < 2, when no condition's values vary, or when the p is missing or not
-    finite; ``test_note`` then carries the test's own note, or says which of
-    these it was (:data:`NO_VARIATION`, :data:`NO_VARIATION_WITHIN`,
-    :data:`NO_P_VALUE`, or the groups with too few replicates). So a spec never
-    holds a NaN p, and never a test that covers only some of its bars.
+    has n < 2, when no condition's values vary (up to rounding), or when the p is
+    missing or not finite; ``test_note`` then names the groups with too few
+    replicates, or else carries the test's own note, or says which of the other
+    reasons it was (:data:`NO_VARIATION`, :data:`NO_VARIATION_WITHIN`,
+    :data:`NO_P_VALUE`). So a spec never holds a NaN p, and never a test that
+    covers only some of its bars.
     """
+    error_type = ErrorType(error_type)  # before the identity check below
     bars: list[Bar] = []
     for gs in stats:
         err = gs.sd if error_type is ErrorType.SD else gs.sem
