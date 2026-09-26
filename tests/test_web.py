@@ -528,7 +528,8 @@ def test_every_module_the_page_imports_is_served(running):
         seen.add(path)
         status, headers, body = send(running.port, "GET", path)
         assert status == 200 and headers["content-type"].startswith("text/javascript"), path
-        for target in re.findall(r'^import .* from "([^"]+)";$', body.decode("utf-8"), re.M):
+        text = body.decode("utf-8")
+        for target in re.findall(r'^import\b[^;]*?\bfrom\s+"([^"]+)";', text, re.M | re.S):
             assert target.startswith("/static/"), target
             if target not in seen:
                 pending.append(target)

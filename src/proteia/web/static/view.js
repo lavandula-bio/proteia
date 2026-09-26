@@ -3,7 +3,6 @@
 // overlays. Everything it reports is in image pixels (x right, y down, a box's
 // end exclusive), so a box drawn at any zoom lands on the same pixels the server
 // quantifies. It edits nothing itself: it asks the app through its handlers.
-"use strict";
 
 const MIN_SCALE_FACTOR = 0.5; // of the fitted scale
 const MAX_SCALE = 40; // screen pixels per image pixel
@@ -266,7 +265,9 @@ export class ImageView {
       } else if (g.kind === "press" && !g.boxId) {
         const x = Math.floor(g.start.x);
         const y = Math.floor(g.start.y);
-        if (x >= 0 && y >= 0 && x < this.width && y < this.height) {
+        if (this.selectedId !== null) {
+          this.handlers.select(null); // a click away from a selected box only deselects
+        } else if (x >= 0 && y >= 0 && x < this.width && y < this.height) {
           this.handlers.place(x, y, {
             grow: event.shiftKey,
             clientX: event.clientX,

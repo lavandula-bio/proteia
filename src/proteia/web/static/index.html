@@ -34,8 +34,15 @@
           <option value="merged">Merged</option>
         </select>
       </label>
-      <label class="button-like">Import image…
-        <input id="import-file" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" hidden>
+      <label class="field">Bands in the new image are
+        <select id="import-polarity">
+          <option value="" selected disabled>choose…</option>
+          <option value="dark_on_light">dark on a light background</option>
+          <option value="light_on_dark">light on a dark background</option>
+        </select>
+      </label>
+      <label id="import-button" class="button-like disabled">Import image…
+        <input id="import-file" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" hidden disabled>
       </label>
       <div id="image-controls" hidden>
         <label class="field">Bands are
