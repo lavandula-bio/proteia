@@ -12,6 +12,7 @@ import importlib.metadata
 import io
 import json
 import os
+import re
 import signal
 import socket
 import stat
@@ -517,3 +518,18 @@ def test_the_page_shell_loads_nothing_from_the_network(running):
     for path in server.STATIC_DIR.iterdir():
         text = path.read_text(encoding="utf-8")
         assert "://" not in text and "@import" not in text and "url(" not in text, path.name
+
+
+def test_every_module_the_page_imports_is_served(running):
+    # The page is plain ES modules with no build step: each import must resolve.
+    pending, seen = ["/static/app.js"], set()
+    while pending:
+        path = pending.pop()
+        seen.add(path)
+        status, headers, body = send(running.port, "GET", path)
+        assert status == 200 and headers["content-type"].startswith("text/javascript"), path
+        for target in re.findall(r'^import .* from "([^"]+)";$', body.decode("utf-8"), re.M):
+            assert target.startswith("/static/"), target
+            if target not in seen:
+                pending.append(target)
+    assert seen == {"/static/app.js", "/static/view.js"}

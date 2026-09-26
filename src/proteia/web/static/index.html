@@ -7,13 +7,96 @@
 <meta name="referrer" content="no-referrer">
 <title>Proteia</title>
 <link rel="stylesheet" href="/static/app.css">
-<script src="/static/app.js" defer></script>
+<script type="module" src="/static/app.js"></script>
 </head>
 <body>
-<main>
-<h1>Proteia</h1>
-<p id="status" role="status">Connecting to Proteia…</p>
-<button id="quit" type="button" hidden>Quit Proteia</button>
+<header class="bar">
+  <strong class="brand">Proteia</strong>
+  <span id="project-name" class="project-name"></span>
+  <button id="switch-project" type="button" hidden>Projects…</button>
+  <button id="reveal" type="button" hidden>Show folder</button>
+  <span id="save-state" class="save-state" role="status"></span>
+  <span class="spacer"></span>
+  <button id="quit" type="button" hidden>Quit Proteia</button>
+</header>
+
+<p id="status" class="status" role="status">Connecting to Proteia…</p>
+
+<main id="workspace" class="workspace" hidden>
+  <aside class="panel">
+    <section>
+      <h2>Images</h2>
+      <ul id="images" class="choices"></ul>
+      <label class="field">Import as
+        <select id="import-kind">
+          <option value="chemiluminescence">Chemiluminescence</option>
+          <option value="visible_marker">Marker (visible light)</option>
+          <option value="merged">Merged</option>
+        </select>
+      </label>
+      <label class="button-like">Import image…
+        <input id="import-file" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" hidden>
+      </label>
+      <div id="image-controls" hidden>
+        <label class="field">Bands are
+          <select id="polarity">
+            <option value="dark_on_light">dark on a light background</option>
+            <option value="light_on_dark">light on a dark background</option>
+          </select>
+        </label>
+        <button id="remove-image" type="button">Remove this image</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Proteins on this image</h2>
+      <ul id="proteins" class="choices"></ul>
+      <p class="hint">Click the image to place a box of the chosen protein;
+        Shift+click to grow it from a band.</p>
+    </section>
+
+    <section id="box-panel" hidden>
+      <h2>Selected box</h2>
+      <p id="box-summary"></p>
+      <label class="field">Lane
+        <select id="box-lane"></select>
+      </label>
+      <button id="delete-box" type="button">Delete box</button>
+    </section>
+
+    <section>
+      <h2>Checks</h2>
+      <ul id="notices" class="notices"></ul>
+    </section>
+  </aside>
+
+  <section class="stage">
+    <canvas id="view" class="view"></canvas>
+    <div class="view-tools">
+      <button id="zoom-in" type="button" title="Zoom in (+)">+</button>
+      <button id="zoom-out" type="button" title="Zoom out (−)">−</button>
+      <button id="zoom-fit" type="button" title="Fit to window (F)">Fit</button>
+    </div>
+    <div id="lane-picker" class="lane-picker" hidden>
+      <p>Which lane is this box in?</p>
+      <div id="lane-picker-buttons"></div>
+      <button id="lane-picker-cancel" type="button">Cancel</button>
+    </div>
+  </section>
 </main>
+
+<dialog id="projects-dialog" class="projects-dialog">
+  <h2>Projects</h2>
+  <p id="projects-root" class="hint"></p>
+  <ul id="project-list" class="choices"></ul>
+  <form id="new-project" class="new-project">
+    <label class="field">New project
+      <input id="new-project-name" type="text" maxlength="100" required>
+    </label>
+    <button type="submit">Create</button>
+  </form>
+  <p id="projects-error" class="error" role="alert"></p>
+  <button id="projects-close" type="button">Close</button>
+</dialog>
 </body>
 </html>
