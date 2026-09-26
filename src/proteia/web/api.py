@@ -8,7 +8,11 @@ whole project state (:func:`~proteia.web.state.project_state`) and its results
 image, the table and the charts from what the server stored. Creating, opening
 and reading the project answer the same way. One project is open at a time. A
 removal of a protein or an image also answers what it took with it: every field
-of :class:`~proteia.core.operations.Cascade`, as lists of ids.
+of :class:`~proteia.core.operations.Cascade`, as lists of ids. Undo and redo
+answer the change they took back or made again (``action``, ``seq``) and the
+ids and not-detected record keys that went or came back
+(:class:`~proteia.core.operations.Restored`); clearing a protein's boxes answers
+the band ids removed and the (lane index, band index) of each record dropped.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -19,6 +23,7 @@ the routes cannot read.
 from __future__ import annotations
 
 import dataclasses
+import os
 import tempfile
 import threading
 import weakref
@@ -85,6 +90,15 @@ class ResultSettings:
 _ResultsKey = tuple[int, int, ResultSettings]  # open id, revision, settings
 
 
+def _same_folder(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` are one folder (however the paths are spelled);
+    True when that cannot be told."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return True
+
+
 class Workspace:
     """The server's state: the projects root and the one open project.
 
@@ -146,8 +160,15 @@ class Workspace:
 
     def _switch(self, make: Callable[[], ProjectSession]) -> ProjectSession:
         """Replace the open project with ``make()``; the old one is saved first,
-        and stays open if ``make`` fails or its unsaved changes cannot be saved.
-        Saving and opening run outside the lock readers take."""
+        and stays open, with its undo history, if ``make`` fails or its unsaved
+        changes cannot be saved. Once replaced, the old one is closed
+        (:meth:`~proteia.core.session.ProjectSession.close`): its history is
+        gone, and so are the image files only that history kept, unless the
+        same project was opened again. Then the close deletes nothing, since
+        the new session may already be storing files the old one does not know
+        (the close waits for any request still running on the old one), and
+        the new session's first save or import deletes those files. Saving,
+        opening and closing run outside the lock readers take."""
         with self._switching:
             old = self._peek()
             if old is not None and old.dirty:
@@ -159,7 +180,18 @@ class Workspace:
                 self._open_ids[session] = self._open_id
                 self._previews.clear()
                 self._results = None
+            if old is not None:
+                old.close(remove_files=not _same_folder(old.folder, session.folder))
             return session
+
+    def close(self) -> None:
+        """Close the open project: its undo history is gone, and so are the image
+        files only that history kept. Called when the server stops, after
+        :meth:`flush`."""
+        with self._switching:
+            session = self._peek()
+            if session is not None:
+                session.close()
 
     def create(self, name: object) -> ProjectSession:
         return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
@@ -538,6 +570,45 @@ def set_box_lane(band_id: str, body: LaneIndexBody, workspace: WorkspaceDep) -> 
     session = workspace.current()
     ops.set_box_lane(session, band_id, body.lane_index)
     return _answer(workspace, session)
+
+
+@router.delete("/proteins/{protein_id}/boxes")
+def clear_boxes(protein_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Remove every box and not-detected record of the protein; it keeps its box
+    size. A protein with neither is a no-op."""
+    session = workspace.current()
+    cleared = ops.clear_boxes(session, protein_id)
+    return _answer(
+        workspace,
+        session,
+        removed=list(cleared.band_ids),
+        dropped_undetected=[list(key) for key in cleared.undetected],
+    )
+
+
+def _restored(restored: ops.Restored) -> dict[str, Any]:
+    """What an undo or redo took back or made again
+    (:class:`~proteia.core.operations.Restored`)."""
+    return {
+        "action": restored.action,
+        "seq": restored.seq,
+        "removed": list(restored.removed),
+        "restored": list(restored.restored),
+        "undetected_removed": [list(key) for key in restored.undetected_removed],
+        "undetected_restored": [list(key) for key in restored.undetected_restored],
+    }
+
+
+@router.post("/undo")
+def undo(workspace: WorkspaceDep) -> dict[str, Any]:
+    session = workspace.current()
+    return _answer(workspace, session, **_restored(ops.undo(session)))
+
+
+@router.post("/redo")
+def redo(workspace: WorkspaceDep) -> dict[str, Any]:
+    session = workspace.current()
+    return _answer(workspace, session, **_restored(ops.redo(session)))
 
 
 # --- Errors ---

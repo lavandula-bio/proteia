@@ -35,7 +35,7 @@ from pydantic import JsonValue
 from proteia.core.imaging import preview
 from proteia.core.model import Batch, Project, Protein
 from proteia.core.project import lane_anchors, lane_positions
-from proteia.core.session import ProjectSession
+from proteia.core.session import HistoryStep, ProjectSession
 
 
 def _missing_lanes(
@@ -64,12 +64,21 @@ def revision(project: Project) -> int:
     return project.log[-1].seq if project.log else 0
 
 
+def _step(step: HistoryStep | None) -> JsonValue:
+    return None if step is None else {"seq": step.seq, "action": step.action}
+
+
 def project_state(
     name: str, session: ProjectSession, project: Project, *, open_id: int
 ) -> dict[str, JsonValue]:
     """The open project ``name`` as the web UI draws it, from the snapshot
     ``project`` of ``session``; ``open_id`` names this opening of it. Only the
-    save status is read from the session itself."""
+    save status and the undo history are read from the session itself, without
+    waiting for a running operation (so in a race they may be of a later commit
+    than the snapshot): ``history`` names the change undo would take back and
+    the one redo would make again, each as its log entry's ``seq`` and
+    ``action`` (null when there is none)."""
+    undo, redo = session.history_steps
     batch = project.batch
     images: list[JsonValue] = [
         {
@@ -133,6 +142,7 @@ def project_state(
         "name": name,
         "open_id": open_id,
         "revision": revision(project),
+        "history": {"undo": _step(undo), "redo": _step(redo)},
         "lanes": [
             {
                 "index": lane.index,

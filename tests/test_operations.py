@@ -796,13 +796,17 @@ def test_saved_references_survive_a_failed_autosave(tmp_path, replace_lock):
     ops.remove_image(s, a)
     b = import_blot(s, blot(), "B β.tif")  # cleans orphans first
     assert s.save_error is not None and s.dirty
-    assert a_file.exists()  # the project.json on disk still references it
+    assert a_file.exists()
+    # Closed while saving still fails, as when the server stops after a failed
+    # flush: no undo state keeps the file now, but the project.json on disk does.
+    s.close()
+    assert a_file.exists()
     crashed = load_project(s.folder)  # as if the app died now
     assert [image.id for image in crashed.batch.iter_images()] == [a]
 
     replace_lock.locked = False
     ops.save(s)
-    assert not a_file.exists()
+    assert not a_file.exists()  # saved without it, and no undo state keeps it
     assert listing(s) == [f"{b}.tif"]
 
 
@@ -825,10 +829,13 @@ def test_remove_image_cascade(tmp_path):
     assert [p.id for p in batch.proteins] == ["prot-7", "prot-9"]
     assert batch.find_protein("prot-7").loading_control_ids == []
     assert [m.id for m in batch.membranes] == ["mem-1"]
-    assert not (s.folder / "images" / "img-6.jpg").exists()  # gone after the autosave
+    removed = s.folder / "images" / "img-6.jpg"
+    assert removed.exists()  # autosaved without it, but the removal can still be undone
     assert load_project(s.folder) == s.project
     # prot-7 falls back to GAPDH, now the batch's single loading control.
     assert [(x.target_id, x.loading_id) for x in ops.compute(s).series] == [("prot-7", "prot-9")]
+    s.close()
+    assert not removed.exists()  # deleted once the removal can no longer be undone
 
     s = open_sample(tmp_path / "marker")
     cascade = ops.remove_image(s, "img-3")
@@ -850,6 +857,8 @@ def test_remove_image_cascade(tmp_path):
     assert [point.image_id for point in calibration.points] == ["img-2"]
     assert calibration.fit_quality is None
     assert batch.find_band("band-12")[1].apparent_mw is None
+    assert (s.folder / "images" / "img-3.png").exists()
+    s.close()
     assert not (s.folder / "images" / "img-3.png").exists()
 
 
@@ -1817,6 +1826,16 @@ def _protein(protein_id: str, name: str, role: str, image_id: str, **fields) -> 
     }
 
 
+def _plant_step_records(s: ProjectSession) -> None:
+    """:data:`LOGGED_STEPS`' not-detected records, in one planted change."""
+
+    def change(draft: Project) -> None:
+        draft.batch.find_protein("prot-4").undetected.append(_record(2))
+        draft.batch.find_protein("prot-8").undetected.append(_record(1))
+
+    plant(s, change)
+
+
 # Every logged operation, as (call, action, the params it must log). ``expected``
 # reads the session after the call, for values the pixels decide (grown rects).
 # Ids follow the one counter: img-1, mem-2, img-3, then proteins and bands.
@@ -2048,6 +2067,49 @@ LOGGED_STEPS = [
         },
     ),
     (
+        # Records no operation writes on this blot (a row commit would), planted
+        # through apply_change: in β-catenin's empty lane 2 and α-tubulin's lane 1.
+        _plant_step_records,
+        "plant",
+        lambda s: {},
+    ),
+    (
+        lambda s: ops.remove_undetected(s, "prot-4", 2),
+        "remove_undetected",
+        lambda s: {
+            "protein_id": "prot-4",
+            "lane_index": 2,
+            "band_index": 0,
+            "removed": _record_json("prot-4", _record(2)),
+        },
+    ),
+    (
+        lambda s: ops.place_box(s, "prot-8", NARROW_X, ROW, lane_index=0, grow=False),
+        "place_box",
+        lambda s: {
+            "band_id": "band-12",
+            "protein_id": "prot-8",
+            "x": NARROW_X,
+            "y": ROW,
+            "grow": False,
+            "lane_index": 0,
+            "lane_proposed": False,
+            "rect": list(boxes.centered_rect(NARROW_X, ROW, BoxSize(width=10, height=6), W, H)),
+            "box_size": {"width": 10, "height": 6},
+            "replaced_undetected": None,
+        },
+    ),
+    (
+        lambda s: ops.clear_boxes(s, "prot-8"),
+        "clear_boxes",
+        lambda s: {
+            "protein_id": "prot-8",
+            "removed": ["band-12"],
+            "lane_indices": [0],
+            "dropped_undetected": [_record_json("prot-8", _record(1))],
+        },
+    ),
+    (
         lambda s: ops.remove_image(s, "img-1"),
         "remove_image",
         lambda s: {
@@ -2131,6 +2193,9 @@ def test_each_operation_logs_its_params(tmp_path):
         "remove_box",
         "set_box_lane",
         "set_box_size",
+        "remove_undetected",
+        "clear_boxes",
+        "plant",  # the test's own records, as no operation writes them on this blot
     }
     text = (s.folder / storage.PROJECT_FILE).read_text(encoding="utf-8")
     for leak in (str(tmp_path), json.dumps(str(tmp_path))[1:-1], FOLDER):

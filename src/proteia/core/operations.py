@@ -29,6 +29,10 @@ then autosaves. So an edit is all or nothing:
   named by id, never by path or typed text.
   Clients commit a drag or a cell edit once, when it ends, not on every pointer
   move or keystroke.
+* Every committed change, of any operation, can be undone: the session keeps
+  each committed state and :func:`undo` and :func:`redo` restore one whole, as
+  a logged change of their own, so no operation needs an inverse, and an undone
+  change stays in the log.
 
 Stored values that depend on pixels or geometry are recomputed by the operation
 that invalidates them: :func:`_quantify` is the one place a band's net is
@@ -50,7 +54,8 @@ expected MW drops that protein's MW-guided records, and a change to the
 calibration (points removed with their image) drops those of every protein on
 the membrane (``dropped_undetected``). A removed protein or image takes its
 proteins' records along, and the log lists them whole (``removed_undetected``),
-since they have no ids. Removing a box never creates a record: the lane becomes
+since they have no ids; clearing a protein's boxes (:func:`clear_boxes`)
+drops its records too. Removing a box never creates a record: the lane becomes
 "not measured". Records are written by a row commit (:func:`detect_row_boxes`),
 whose outcome in each lane replaces the record there
 (``undetected_written``, ``dropped_undetected``).
@@ -68,7 +73,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Concatenate, Final
+from typing import Any, BinaryIO, Concatenate, Final
 
 import numpy as np
 from pydantic import JsonValue, ValidationError
@@ -136,6 +141,7 @@ __all__ = [
     "LANE_TABLE_FILE",
     "LANE_TABLE_RECORD_FILE",
     "Cascade",
+    "ClearedBoxes",
     "ComputedView",
     "ErrorCode",
     "Keep",
@@ -143,8 +149,10 @@ __all__ = [
     "LanesUpdate",
     "OperationError",
     "ProjectSession",
+    "Restored",
     "RowPlacement",
     "add_protein",
+    "clear_boxes",
     "compute",
     "compute_view",
     "detect_row_boxes",
@@ -155,6 +163,7 @@ __all__ = [
     "new_project",
     "open_project",
     "place_box",
+    "redo",
     "remove_box",
     "remove_image",
     "remove_protein",
@@ -165,6 +174,7 @@ __all__ = [
     "set_lanes",
     "set_polarity",
     "set_reference_condition",
+    "undo",
 ]
 
 # The lane table export and its record: fixed names chosen here, never from client text.
@@ -246,6 +256,36 @@ class RowPlacement:
     flags: tuple[str, ...]  # the detector's warnings (rowdetect.WARNING_FLAGS)
     notes: tuple[str, ...]  # the detector's diagnostics, lanes counted from 1
     right_to_left: bool  # lanes read from the box's right end, as those on the image run
+
+
+@dataclass(frozen=True)
+class Restored:
+    """What :func:`undo` took back or :func:`redo` made again.
+
+    ``seq`` and ``action`` name the original change's log entry. The ids that
+    went and came back are in the order :meth:`~proteia.core.model.Project.iter_ids`
+    gives: by kind (membranes, images, proteins, bands), each kind as stored
+    (images membrane by membrane, bands protein by protein and by lane), so not
+    sorted by id. Not-detected records, which have no ids, are listed by
+    (protein id, lane index, band index), as stored. An object or record in
+    both states whose fields changed (a moved box, a replaced record) is in no
+    list.
+    """
+
+    seq: int
+    action: str
+    removed: tuple[str, ...]
+    restored: tuple[str, ...]
+    undetected_removed: tuple[tuple[str, int, int], ...]
+    undetected_restored: tuple[tuple[str, int, int], ...]
+
+
+@dataclass(frozen=True)
+class ClearedBoxes:
+    """What :func:`clear_boxes` removed."""
+
+    band_ids: tuple[str, ...]
+    undetected: tuple[tuple[int, int], ...]  # (lane index, band index) of each dropped record
 
 
 # --- Common machinery ---
@@ -696,9 +736,11 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
     one, are detached and reported, marker pairings to the image are cleared, and calibration
     points on it are dropped, which clears the membrane's fit, its bands'
     apparent MWs and its proteins' MW-guided records. A membrane left with no
-    image is removed. The file is deleted after the next successful save. The
-    log lists the removed records (``removed_undetected``) and the MW-guided ones
-    dropped (``dropped_undetected``) in full.
+    image is removed. The file is deleted once the removal can no longer be
+    undone, at the next save or import after that (see
+    :mod:`proteia.core.session`). The log lists the removed records
+    (``removed_undetected``) and the MW-guided ones dropped
+    (``dropped_undetected``) in full.
     """
     session.project.batch.find_image(image_id)
 
@@ -1393,6 +1435,43 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
     )
 
 
+@_locked
+def clear_boxes(session: ProjectSession, protein_id: str) -> ClearedBoxes:
+    """Remove every box and every not-detected record of a protein, of every band
+    index, in one change; undo is the way back.
+
+    The protein's box size is kept (the width and height fields show it). A seed
+    click or a row box on the protein, which then has no boxes, sets the size
+    afresh from the band or bands found; a fixed box uses the kept size. A
+    protein with neither boxes nor records is a no-op. The log entry lists the
+    band ids with their lanes, and the records in full (``dropped_undetected``).
+    """
+    protein = session.project.batch.find_protein(protein_id)
+    removed = [band.id for band in protein.bands]
+    lanes = [band.lane_index for band in protein.bands]
+
+    def change(draft: Project) -> list[dict[str, JsonValue]]:
+        edited = draft.batch.find_protein(protein_id)
+        edited.bands = []
+        return _drop_undetected_where(edited, lambda _: True)
+
+    dropped = _apply(
+        session,
+        "clear_boxes",
+        change,
+        lambda dropped: {
+            "protein_id": protein_id,
+            "removed": list(removed),
+            "lane_indices": list(lanes),
+            "dropped_undetected": list(dropped),
+        },
+    )
+    return ClearedBoxes(
+        band_ids=tuple(removed),
+        undetected=tuple((record["lane_index"], record["band_index"]) for record in dropped),
+    )
+
+
 # RowDetectError codes as refusals.
 _ROW_ERRORS: Final = {
     "invalid_row": ErrorCode.INVALID_INPUT,
@@ -1928,6 +2007,64 @@ def remove_undetected(
             "removed": removed,
         },
     )
+
+
+# --- Undo and redo ---
+
+
+def _restored(params: Mapping[str, Any], verb: str) -> Restored:
+    """The :class:`Restored` that an undo's (``verb`` "undone") or a redo's log
+    params describe."""
+
+    def keys(name: str) -> tuple[tuple[str, int, int], ...]:
+        return tuple((protein_id, lane, band) for protein_id, lane, band in params[name])
+
+    return Restored(
+        seq=params[f"{verb}_seq"],
+        action=params[f"{verb}_action"],
+        removed=tuple(params["removed"]),
+        restored=tuple(params["restored"]),
+        undetected_removed=keys("undetected_removed"),
+        undetected_restored=keys("undetected_restored"),
+    )
+
+
+@_locked
+def undo(session: ProjectSession) -> Restored:
+    """Take back the last change still in effect: restore, whole, the state
+    before it, as a logged change of its own (action ``undo``).
+
+    Repeated undo walks back one change at a time, up to
+    :data:`~proteia.core.session.UNDO_LIMIT` changes or to the state the session
+    began with; an undo is never itself undone (:func:`redo` reverses it). The
+    restored content is exactly what was committed, stored nets, flags and
+    not-detected records included, and is never recomputed from pixels; ids,
+    and ``next_id``, never go back, so no id is used twice. Image files are only
+    checked to exist; their bytes are checked when their pixels are next read,
+    or at export. Refused, changing nothing: nothing to undo
+    (``NOTHING_TO_UNDO``), or an image file the state needs is missing
+    (``IMAGE_FILE_CHANGED``, with the images).
+
+    The log entry names the change taken back (``undone_seq``,
+    ``undone_action``) and the entry whose content it returns to
+    (``returns_to_seq``, whose ``content_hash`` it repeats; null for content no
+    entry recorded, such as a ``project.json`` edited by hand before the
+    session), then lists what :class:`Restored` lists (``removed``,
+    ``restored``, ``undetected_removed``, ``undetected_restored``; record keys
+    as ``[protein id, lane index, band index]``).
+    """
+    return _restored(session._move("undo"), "undone")
+
+
+@_locked
+def redo(session: ProjectSession) -> Restored:
+    """Make an undone change again: restore the state it left, as a logged
+    change (action ``redo``), whose params mirror an undo's (``redone_seq``,
+    ``redone_action``, and ``returns_to_seq``, which is ``redone_seq``). Any
+    other change clears what can be redone. Refused, changing nothing: nothing
+    to redo (``NOTHING_TO_REDO``), or a missing image file
+    (``IMAGE_FILE_CHANGED``)."""
+    return _restored(session._move("redo"), "redone")
 
 
 # --- Results, export, save ---

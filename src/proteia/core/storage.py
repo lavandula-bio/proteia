@@ -76,6 +76,7 @@ from proteia.core.model import (
     SCHEMA_VERSION,
     ImageId,
     ImageRef,
+    LogEntry,
     OriginalName,
     Project,
     revalidate,
@@ -165,15 +166,46 @@ def content_document(project: Project) -> dict[str, Any]:
     return revalidate(project, log=False).model_dump(mode="json", exclude=set(HASH_EXCLUDE))
 
 
+def content_bytes(project: Project) -> bytes:
+    """``canonical_json(content_document(project))``: the bytes :func:`content_hash`
+    hashes, and the form in which a session's undo history keeps each state
+    (:func:`project_from_content` reads it back)."""
+    return canonical_json(content_document(project))
+
+
 def document_hash(doc: Any) -> str:
     """Lowercase hex SHA-256 of ``canonical_json(doc)``: the one hash recipe."""
     return hashlib.sha256(canonical_json(doc)).hexdigest()
 
 
 def content_hash(project: Project) -> str:
-    """Lowercase hex SHA-256 of the project's content (see the module docstring).
-    Its cost does not grow with the log."""
-    return document_hash(content_document(project))
+    """Lowercase hex SHA-256 of the project's content (see the module docstring):
+    of :func:`content_bytes`. Its cost does not grow with the log."""
+    return hashlib.sha256(content_bytes(project)).hexdigest()
+
+
+def project_from_content(data: bytes, *, next_id: int, log: tuple[LogEntry, ...]) -> Project:
+    """The project whose content is ``data`` (:func:`content_bytes`), with
+    ``next_id`` and ``log``: what an undo restores.
+
+    The content is validated strictly, as :func:`project_from_json` validates a
+    file (``ValueError`` for bytes that are not JSON or repeat a key, a pydantic
+    ``ValidationError`` for content that is not a valid project, an id at or
+    above ``next_id`` included). ``log`` is attached as it is, neither copied nor
+    validated again, so a session sees the project as prepared from its committed
+    one. No migration runs: the history lives only as long as its session.
+    """
+    doc = json.loads(
+        data.decode("utf-8"),
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_constant,
+    )
+    if not isinstance(doc, dict):
+        raise ValueError("the content must be a JSON object")
+    project = Project.model_validate_json(
+        json.dumps({**doc, "next_id": next_id}, ensure_ascii=False), strict=True
+    )
+    return project.model_copy(update={"log": log})
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -454,9 +486,12 @@ def store_image(
 def orphan_files(project: Project, folder: str | os.PathLike[str]) -> list[Path]:
     """Files in ``images/`` that ``project`` does not reference, sorted by name.
 
-    These are left by a crash or by an import that was never saved: stale
+    Some are left by a crash or by an import that was never saved: stale
     ``.part``/``.tmp`` files, and images whose id the project may hand out again.
-    The import operation removes them before storing a new image.
+    Others are the files of images removed or undone in the open session, which
+    it keeps while its undo history can bring them back, or files the saved
+    ``project.json`` still references. The session deletes only the rest, before
+    an import and after a save (:class:`~proteia.core.session.ProjectSession`).
     """
     images = Path(folder) / IMAGES_DIR
     if not images.is_dir():

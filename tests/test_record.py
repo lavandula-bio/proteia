@@ -94,6 +94,48 @@ def test_history_issues(tmp_path):
     assert history_issues(load_project(s.folder)) == ["content_changed_outside_log"]
 
 
+def _restore_entry(seq: int, action: str, returns_to: object, digest: str) -> LogEntry:
+    verb = "undone" if action == "undo" else "redone"
+    return LogEntry(
+        seq=seq,
+        time=f"2026-09-26T08:00:0{seq}.000Z",
+        action=action,
+        version=proteia.__version__,
+        params={f"{verb}_seq": 2, f"{verb}_action": "set_lanes", "returns_to_seq": returns_to},
+        content_hash=digest,
+    )
+
+
+def test_an_undo_or_redo_must_return_to_content_an_earlier_entry_left():
+    project = make_project()
+    digest = content_hash(project)
+    other = "0" * 64
+    base = _with_log(project, "new_project").log  # seq 1 left this content
+    second = base[0].model_copy(update={"seq": 2, "action": "set_lanes", "content_hash": other})
+
+    def issues(*entries: LogEntry) -> list[str]:
+        return history_issues(project.model_copy(update={"log": (*base, second, *entries)}))
+
+    assert issues(_restore_entry(3, "undo", 1, digest)) == []
+    assert issues(_restore_entry(3, "undo", 1, digest), _restore_entry(4, "redo", 2, other)) == [
+        "content_changed_outside_log"  # the redo is consistent; the content is not its own
+    ]
+    # A later session opened at the undo (seq 3), made a change (4) and undid it:
+    # it returns to the undo, whose entry left content too.
+    later = (
+        _restore_entry(3, "undo", 1, digest),
+        second.model_copy(update={"seq": 4}),
+        _restore_entry(5, "undo", 3, digest),
+    )
+    assert issues(*later) == []
+    for returns_to in (None, 99, 3, 2, True, "1"):  # unknown, itself, another hash, not a seq
+        assert issues(_restore_entry(3, "undo", returns_to, digest)) == ["undo_mismatch"], (
+            returns_to
+        )
+    missing = base[0].model_copy(update={"seq": 3, "action": "redo", "params": {}})
+    assert issues(missing) == ["undo_mismatch"]
+
+
 def test_build_record_shape():
     project = _with_log(make_project(), "new_project", "set_lanes")
     data = "lane,condition\r\n0,10 µM\r\n".encode("utf-8-sig")

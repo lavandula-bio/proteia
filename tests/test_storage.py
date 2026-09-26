@@ -174,6 +174,45 @@ def test_content_hash_is_sha256_of_canonical_json():
     assert b"\n" not in compact
 
 
+def test_content_bytes_are_what_the_hash_covers():
+    for project in (make_project(), make_project_with_undetected(), Project()):
+        data = storage.content_bytes(project)
+        assert data == canonical_json(content_document(project))
+        assert hashlib.sha256(data).hexdigest() == content_hash(project)
+
+
+def test_project_from_content_restores_the_content_with_the_given_next_id_and_log():
+    project = _logged(make_project_with_undetected(), {"action": "new_project"})
+    data = storage.content_bytes(project)
+    restored = storage.project_from_content(data, next_id=25, log=project.log)
+    assert restored.log is project.log  # shared, not copied or validated again
+    assert restored.next_id == 25
+    assert restored.model_copy(update={"next_id": project.next_id}) == project
+    assert storage.content_bytes(restored) == data
+    assert project_to_json(storage.project_from_content(data, next_id=19, log=project.log)) == (
+        project_to_json(project)
+    )
+
+    # Validated strictly, as project_from_json validates a file.
+    for edit in (
+        lambda d: d["batch"]["lanes"][0].update(included=0),
+        lambda d: d["batch"].update(notes="x"),
+    ):
+        doc = json.loads(data)
+        edit(doc)
+        with pytest.raises(ValidationError):
+            storage.project_from_content(canonical_json(doc), next_id=19, log=())
+    with pytest.raises(ValidationError):  # an id at or above next_id
+        storage.project_from_content(data, next_id=18, log=())
+    # A repeated key is refused as such, not left to model validation (the last
+    # value would otherwise win, and this one is valid).
+    repeated = data.replace(b"{", b'{"schema_version":1,', 1)
+    assert repeated.count(b'"schema_version"') == 2
+    with pytest.raises(ValueError, match="duplicate key 'schema_version'") as info:
+        storage.project_from_content(repeated, next_id=19, log=())
+    assert not isinstance(info.value, ValidationError)
+
+
 def test_canonical_json_rules():
     assert canonical_json({"b": "β", "a": 1e-07}) == '{"a":1e-07,"b":"β"}'.encode()
     with pytest.raises(ValueError):
