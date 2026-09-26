@@ -25,6 +25,8 @@ from proteia.core.model import Rect
 REL_THRESHOLD: Final = 0.3  # grow while the signal is above this fraction of the seed's
 NOISE_K: Final = 3.0  # ...and above this many times the membrane noise
 
+_MAD_SIGMA: Final = 1.4826  # Gaussian sigma per median absolute deviation
+
 
 def _signal(gray: np.ndarray, background: float, dark_on_light: bool) -> np.ndarray:
     """Per-pixel signal above background, with the direction handled."""
@@ -33,9 +35,34 @@ def _signal(gray: np.ndarray, background: float, dark_on_light: bool) -> np.ndar
     return np.maximum(gray - background, 0.0)
 
 
-def _membrane_noise(gray: np.ndarray) -> float:
-    """Robust estimate of membrane noise (1.4826 * MAD), in pixel units."""
-    return float(1.4826 * np.median(np.abs(gray - np.median(gray))))
+def mad_sigma(values: np.ndarray, center: float | None = None) -> float:
+    """Robust Gaussian sigma of ``values``: 1.4826 times their median absolute
+    deviation from ``center`` (their median by default), in their units. The
+    membrane noise of :func:`grow_box`; :mod:`proteia.core.rowdetect` measures
+    its pixel noise and one-sided spreads with it too."""
+    c = np.median(values) if center is None else center
+    return float(_MAD_SIGMA * np.median(np.abs(values - c)))
+
+
+def grow_region(signal: np.ndarray, seed: tuple[int, int], threshold: float) -> Rect | None:
+    """The growth rule itself: the bounding rect ``(x0, y0, x1, y1)``, half-open
+    on the high edge, of the 4-connected region of ``signal > threshold`` that
+    holds ``seed`` (an ``(x, y)`` pixel inside ``signal``); None if the seed's own
+    signal is not above ``threshold``.
+
+    :func:`grow_box` measures its signal and threshold and calls this; a caller
+    that measures its own (:mod:`proteia.core.rowdetect`, with a local
+    background and noise) passes them here and so grows a band exactly as a
+    click does.
+    """
+    from scipy.ndimage import label
+
+    sx, sy = seed
+    if not signal[sy, sx] > threshold:
+        return None
+    labels, _ = label(signal > threshold)
+    ys, xs = np.where(labels == labels[sy, sx])
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
 
 
 def grow_box(
@@ -60,19 +87,13 @@ def grow_box(
     noise). ``max_width`` / ``max_height``, if given, cap the box around the seed
     as a safety valve against leaking into a neighbour.
     """
-    from scipy.ndimage import label
-
     sx, sy = seed
     s = _signal(gray.astype(float), background, dark_on_light)
-    threshold = max(s[sy, sx] * rel_threshold, noise_k * _membrane_noise(gray))
-    if s[sy, sx] <= threshold:
+    threshold = max(s[sy, sx] * rel_threshold, noise_k * mad_sigma(gray))
+    grown = grow_region(s, seed, threshold)
+    if grown is None:
         return None
-
-    mask = s > threshold
-    labels, _ = label(mask)
-    ys, xs = np.where(labels == labels[sy, sx])
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, y0, x1, y1 = grown
 
     h_img, w_img = gray.shape
     if max_width is not None and (x1 - x0) > max_width:
