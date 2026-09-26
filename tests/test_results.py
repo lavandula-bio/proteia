@@ -9,13 +9,14 @@ compute step to the golden numbers of ``test_regression_baseline``.
 """
 
 import json
+import math
 from collections.abc import Callable
 
 import pytest
 
 from conftest import make_project
 from proteia.core import model, results
-from proteia.core.analyze import ReduceMethod, Tier
+from proteia.core.analyze import ReduceMethod, Tier, compare
 from proteia.core.model import (
     Band,
     Box,
@@ -30,13 +31,14 @@ from proteia.core.model import (
     Role,
     apply_change,
 )
-from proteia.core.plotspec import ErrorType, ValueKind
+from proteia.core.plotspec import NO_VARIATION, ErrorType, ValueKind
 from proteia.core.results import Level, NoticeCode, compute_results, lane_nets
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
     GOLDEN,
     HEIGHT,
+    HIGH,
     INCLUDED,
     LANE_X,
     LOADING,
@@ -298,6 +300,9 @@ def test_zero_loading_net_is_reported_where_the_target_has_a_value():
     res = compute_results(_batch(_net("band-14", 0.0), _net("band-15", 0.0)))
     notice = _one(res, NoticeCode.LOADING_NOT_POSITIVE)
     assert notice.lane_indices == (1,)
+    assert notice.message == (
+        "'α-tubulin' has a net of 0 in lane 2: 'β-catenin' / 'α-tubulin' has no value there"
+    )  # the user's lane numbers count from 1
     assert notice.protein_ids == ("prot-7", "prot-8")
     assert res.series[0].normalized[1] is None
 
@@ -653,10 +658,12 @@ def test_too_few_samples_give_a_chart_without_statistics():
     assert chart is not None
     assert [bar.n for bar in chart.bars] == [1, 1]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
+    assert chart.test_note == compare(series.groups).note  # the reason no test ran
     # The all-lanes set has vehicle n = 2, still too few groups with two samples to test.
     all_chart = res.all_lanes.series[0].chart
     assert all_chart is not None
     assert (all_chart.test_name, all_chart.test_p, all_chart.comparisons) == (None, None, [])
+    assert all_chart.test_note is not None
 
 
 def test_excluded_lanes_without_values_add_no_second_set():
@@ -668,6 +675,7 @@ def test_excluded_lanes_without_values_add_no_second_set():
     res = compute_results(_batch(empty_lane_3))
     assert res.excluded_lanes == [3]
     assert res.all_lanes is None
+    assert res.label is None  # one set needs no name
 
 
 def test_notices_shared_by_both_sets_appear_once():
@@ -688,3 +696,152 @@ def test_the_all_lanes_set_has_no_set_of_its_own():
     # Nesting the whole result (which has its own all-lanes set) one level deeper.
     with pytest.raises(ValueError, match="no all-lanes set of its own"):
         results.Results.model_validate({**dump, "all_lanes": dump})
+
+
+# --- #52: labelled sets, charts without a test, lane numbers, raw arguments ---
+
+
+@pytest.mark.parametrize(
+    ("excluded", "label"),
+    [((3,), "Excluding lane 4"), ((3, 0), "Excluding lanes 1, 4")],  # 1-based, ascending
+)
+def test_the_two_sets_and_their_charts_are_labelled(excluded, label):
+    batch = _batch(_loading_ids("prot-8", "prot-9"), *(_lane(i, included=False) for i in excluded))
+    res = compute_results(batch)
+    assert res.excluded_lanes == sorted(excluded)  # the indices stay 0-based
+    assert (res.label, res.all_lanes.label) == (label, "All lanes")
+    for one_set in (res, res.all_lanes):
+        charts = [s.chart for s in one_set.series]
+        assert len(charts) == 2 and None not in charts
+        assert [chart.subtitle for chart in charts] == [one_set.label] * 2
+
+
+def test_one_set_has_no_label_and_its_charts_no_subtitle():
+    res = compute_results(_batch(_loading_ids("prot-8", "prot-9"), _lane(3, included=True)))
+    assert (res.label, res.all_lanes) == (None, None)
+    assert [s.chart.subtitle for s in res.series] == [None, None]
+
+
+def _no_variation(draft: Project) -> None:
+    """Every lane included and boxed, every β-catenin net 1000 and every α-tubulin
+    net 2000: both conditions' fold-changes are exactly [1.0, 1.0]."""
+    beta = draft.batch.find_protein("prot-7")
+    beta.bands.append(
+        Band(
+            id=draft.new_id("band"),
+            lane_index=2,
+            box=Box(x=98, y=43),
+            net=1000.0,
+            source=ProposalSource.MANUAL,
+        )
+    )
+    for band in beta.bands:
+        band.net = 1000.0
+    for band in draft.batch.find_protein("prot-8").bands:
+        band.net = 2000.0
+    draft.batch.lanes[3].included = True
+
+
+def _not_json(constant: str) -> float:
+    raise ValueError(f"{constant} is not JSON")
+
+
+def _assert_strict_json(res: results.Results) -> None:
+    """Strict JSON with nothing lost. Pydantic writes NaN and inf as null, which
+    strict JSON accepts, so only the round trip shows that none got into the results."""
+    dump = res.model_dump_json()
+    json.loads(dump, parse_constant=_not_json)
+    assert results.Results.model_validate_json(dump) == res
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
+def test_values_that_do_not_vary_give_a_chart_with_a_note_and_no_test():
+    res = compute_results(_batch(_no_variation))
+    [series] = res.series
+    assert series.groups == {"vehicle": [1.0, 1.0], "10 µM": [1.0, 1.0]}
+    assert math.isnan(compare(series.groups).p_value)  # what the core gives
+    chart = series.chart
+    assert chart is not None and [bar.n for bar in chart.bars] == [2, 2]
+    assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
+    assert chart.test_note == NO_VARIATION == "no test: the values do not vary"
+    _assert_strict_json(res)
+
+
+def test_a_group_of_one_gives_a_chart_with_a_note_and_no_brackets():
+    # Lane 3 included: vehicle has two samples, 10 µM one, so no test can run.
+    res = compute_results(_batch(_lane(3, included=True)))
+    chart = res.series[0].chart
+    assert chart is not None and [bar.n for bar in chart.bars] == [2, 1]
+    assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
+    assert chart.test_note == "need >=2 groups with >=2 replicates for a test"
+
+
+def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_gives_no_test():
+    # The baseline blot with lane 8 excluded too: 50 µM keeps only b1. The core would
+    # test vehicle and 10 µM alone, a Welch's t with p < 0.05 where the ANOVA over all
+    # three conditions had none, and the chart would pass it for its own.
+    baseline = _baseline_batch(REFERENCE)
+    lanes = [
+        lane.model_copy(update={"included": False}) if lane.index == 7 else lane
+        for lane in baseline.lanes
+    ]
+    res = compute_results(baseline.model_copy(update={"lanes": lanes}))
+    assert res.label == "Excluding lanes 6, 8"
+    [series] = res.series
+    tested = compare(series.groups)
+    assert (tested.test, tested.p_value < 0.05) == ("welch_t", True)  # what the core gives
+    chart = series.chart
+    assert chart is not None
+    assert [(bar.label, bar.n) for bar in chart.bars] == [(REFERENCE, 2), (LOW, 2), (HIGH, 1)]
+    assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
+    assert chart.test_note == f"no test: {HIGH!r} has fewer than 2 replicates"
+    _assert_strict_json(res)
+    all_chart = res.all_lanes.series[0].chart
+    assert all_chart is not None and [bar.n for bar in all_chart.bars] == [2, 3, 2]
+    assert (all_chart.test_name, all_chart.test_note) == ("anova_oneway", None)
+
+
+def _clipped(*band_ids: str) -> Callable[[Project], None]:
+    def edit(draft: Project) -> None:
+        for band_id in band_ids:
+            draft.batch.find_band(band_id)[1].clipped = True
+
+    return edit
+
+
+def test_notices_count_lanes_from_one():
+    res = compute_results(_batch(_clipped("band-11"), _net("band-13", 0.0), _net("band-14", 0.0)))
+    clipped = _one(res, NoticeCode.CLIPPED)
+    assert clipped.lane_indices == (1,)
+    assert clipped.message == (
+        "'β-catenin' is over-exposed in lane 2: pixels at the detector limit make its net"
+        " an under-estimate; the lane stays included"
+    )
+    loading = _one(res, NoticeCode.LOADING_NOT_POSITIVE)
+    assert loading.lane_indices == (0, 1)
+    assert loading.message == (
+        "'α-tubulin' has a net of 0 in lanes 1, 2: 'β-catenin' / 'α-tubulin' has no value there"
+    )
+
+    res = compute_results(_batch(_clipped("band-11", "band-10")))
+    clipped = _one(res, NoticeCode.CLIPPED)
+    assert clipped.lane_indices == (0, 1)
+    assert "over-exposed in lanes 1, 2:" in clipped.message
+    assert clipped.message.endswith("the lanes stay included")
+
+
+@pytest.mark.parametrize("method", ["mean", "representative"])
+@pytest.mark.parametrize("error_type", ["SD", "SEM"])
+def test_raw_error_type_and_method_behave_like_their_enums(error_type, method):
+    # The baseline blot has technical repeats and groups of two or more samples, so
+    # every other pair of arguments gives other charts: a mix-up cannot pass.
+    batch = _baseline_batch(REFERENCE)
+    raw = compute_results(batch, error_type=error_type, method=method)
+    enums = ErrorType(error_type), ReduceMethod(method)
+    assert raw == compute_results(batch, error_type=enums[0], method=enums[1])
+    assert (raw.error_type, raw.method) == enums
+    for other_error in ErrorType:
+        for other_method in ReduceMethod:
+            if (other_error, other_method) != enums:
+                other = compute_results(batch, error_type=other_error, method=other_method)
+                assert other.series != raw.series

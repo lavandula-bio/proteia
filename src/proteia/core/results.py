@@ -26,13 +26,18 @@ last ulp only for averaged technical repeats.
 When excluded lanes (include=no) hold values, a second result set is computed
 with every lane included (:attr:`Results.all_lanes`), so removing data points is
 never hidden; lanes excluded without any value (a ladder, an empty lane) add no
-second set.
+second set. Each of the two sets is labelled, and every chart carries its set's
+label as its subtitle, so a chart cannot be mistaken for the other set's.
+
+Notice messages count lanes from 1, as the user does; every index field
+(:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
 """
 
 from __future__ import annotations
 
 from collections.abc import Collection
 from enum import StrEnum
+from functools import partial
 
 from pydantic import BaseModel, model_validator
 
@@ -147,6 +152,11 @@ class Results(BaseModel, frozen=True):
     means every lane is in. When it is not empty, ``all_lanes`` holds the same
     results with every lane included, so what an exclusion changes is always
     visible, and each set can be shown or exported on its own.
+
+    ``label`` names the set when there are two: ``Excluding lane 8`` or
+    ``Excluding lanes 3, 7`` (1-based, ascending) for this one, ``All lanes`` for
+    ``all_lanes``. It is ``None`` when there is only one set. Every chart of a set
+    has the set's label as its subtitle.
     """
 
     lanes: list[LaneRow]
@@ -159,6 +169,7 @@ class Results(BaseModel, frozen=True):
     error_type: ErrorType
     method: ReduceMethod
     excluded_lanes: list[int] = []
+    label: str | None = None
     all_lanes: Results | None = None
 
     @model_validator(mode="after")
@@ -204,6 +215,13 @@ def _listed(values: Collection[object]) -> str:
     return ", ".join(repr(v) for v in values)
 
 
+def _lanes(indices: Collection[int]) -> str:
+    """0-based lane indices as the user counts lanes: ``lane 8``, ``lanes 3, 7``
+    (1-based, ascending)."""
+    numbers = sorted(i + 1 for i in indices)
+    return ("lane " if len(numbers) == 1 else "lanes ") + ", ".join(map(str, numbers))
+
+
 def _chart(
     groups: dict[str, list[float]],
     point_lanes: dict[str, list[list[int]]],
@@ -213,6 +231,7 @@ def _chart(
     error_type: ErrorType,
     title: str,
     reference: str | None,
+    subtitle: str | None,
 ) -> PlotSpec | None:
     """The chart of one series: its groups restricted to the plotted conditions."""
     shown = {c: g for c, g in groups.items() if chosen is None or c in chosen}
@@ -231,6 +250,7 @@ def _chart(
         title=title,
         lane_indices=lane_indices,
         first_label=reference,
+        subtitle=subtitle,
     )
 
 
@@ -238,8 +258,8 @@ def compute_results(
     batch: model.Batch,
     *,
     plot_conditions: Collection[str] | None = None,
-    error_type: ErrorType = ErrorType.SD,
-    method: ReduceMethod = ReduceMethod.MEAN,
+    error_type: ErrorType | str = ErrorType.SD,
+    method: ReduceMethod | str = ReduceMethod.MEAN,
 ) -> Results:
     """Everything the results view shows, from the stored batch alone.
 
@@ -248,22 +268,34 @@ def compute_results(
     exclusions and its ``all_lanes`` is the same computation with every lane
     included: removing data points is never hidden. Excluded lanes without any
     value (a ladder, an empty lane) change nothing, so they add no second set.
-    Notices the two sets share are kept only in the first. A set whose groups
-    are too small for a test still has its charts, with no test result and no
-    brackets.
+    Notices the two sets share are kept only in the first. Two sets are labelled
+    (see :class:`Results`); one set has no label. A chart with a plotted group
+    too small for a test (n < 2) is still drawn, with no test result, no brackets
+    and a note saying why, even when the other groups could be tested: a test
+    over only some of a chart's bars is never shown (see
+    :func:`~proteia.core.plotspec.build_plotspec`).
+
+    ``error_type`` and ``method`` may be their raw values (``"SEM"``, ``"mean"``):
+    they become their enums here, before anything compares them by identity. An
+    unknown value raises ``ValueError``.
     """
-    results = _compute(batch, plot_conditions=plot_conditions, error_type=error_type, method=method)
+    one_set = partial(
+        _compute,
+        plot_conditions=plot_conditions,
+        error_type=ErrorType(error_type),
+        method=ReduceMethod(method),
+    )
+    excluded = [lane.index for lane in batch.lanes if not lane.included]
     removed_values = any(
-        column.nets[i] is not None for column in results.proteins for i in results.excluded_lanes
+        nets[i] is not None for nets in lane_nets(batch).values() for i in excluded
     )
     if not removed_values:
-        return results
+        return one_set(batch, set_label=None)
+    results = one_set(batch, set_label=f"Excluding {_lanes(excluded)}")
     every_lane = batch.model_copy(
         update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
     )
-    all_lanes = _compute(
-        every_lane, plot_conditions=plot_conditions, error_type=error_type, method=method
-    )
+    all_lanes = one_set(every_lane, set_label="All lanes")
     own = [notice for notice in all_lanes.notices if notice not in results.notices]
     return results.model_copy(update={"all_lanes": all_lanes.model_copy(update={"notices": own})})
 
@@ -274,13 +306,15 @@ def _compute(
     plot_conditions: Collection[str] | None,
     error_type: ErrorType,
     method: ReduceMethod,
+    set_label: str | None,
 ) -> Results:
     """One result set, over the lane table's included lanes.
 
     ``plot_conditions`` chooses the charted conditions (None or empty: all); each
     is resolved against the lane labels (:func:`~proteia.core.names.resolve_label`),
     and one that matches no lane is reported and ignored. ``method`` reduces
-    technical repeats; ``error_type`` picks the charts' error bars.
+    technical repeats; ``error_type`` picks the charts' error bars. ``set_label``
+    names the set (:attr:`Results.label`) and is every chart's subtitle.
 
     Series come from :func:`~proteia.core.analyze.normalize_batch`. Each is reduced
     once over the lane table's included lanes. With a reference condition and a
@@ -361,10 +395,11 @@ def _compute(
     for column in columns:  # over-exposed bands in lanes this set includes
         over = tuple(i for i, flag in enumerate(column.clipped) if flag and included[i])
         if over:
+            kept = "the lane stays" if len(over) == 1 else "the lanes stay"
             note(
                 NoticeCode.CLIPPED,
-                f"{column.name!r} is over-exposed in lane(s) {_listed(over)}: pixels at the"
-                " detector limit make its net an under-estimate; the lanes stay included",
+                f"{column.name!r} is over-exposed in {_lanes(over)}: pixels at the detector"
+                f" limit make its net an under-estimate; {kept} included",
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
@@ -453,7 +488,7 @@ def _compute(
             if not_positive:
                 note(
                     NoticeCode.LOADING_NOT_POSITIVE,
-                    f"{s.loading!r} has a net of 0 in lane(s) {_listed(not_positive)}:"
+                    f"{s.loading!r} has a net of 0 in {_lanes(not_positive)}:"
                     f" {s.target!r} / {s.loading!r} has no value there",
                     protein_ids=pair_ids,
                     lane_indices=not_positive,
@@ -507,6 +542,7 @@ def _compute(
                     error_type=error_type,
                     title=title,
                     reference=ref,
+                    subtitle=set_label,
                 )
                 if chart is None:
                     note(
@@ -549,4 +585,5 @@ def _compute(
         error_type=error_type,
         method=method,
         excluded_lanes=[i for i in range(n) if not included[i]],
+        label=set_label,
     )

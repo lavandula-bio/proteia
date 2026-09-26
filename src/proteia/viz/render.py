@@ -28,7 +28,11 @@ def _point_xs(center: float, n: int, spread: float = 0.18) -> list[float]:
 
 
 def render_figure(spec: PlotSpec) -> Figure:
-    """Render the spec to a matplotlib :class:`Figure` (no global pyplot state)."""
+    """Render the spec to a matplotlib :class:`Figure` (no global pyplot state).
+
+    The title's lines: the spec's title, its subtitle (the result set) when it has
+    one, then the test and its p when a test ran.
+    """
     fig = Figure(figsize=(max(4.0, 1.3 * len(spec.bars) + 1.5), 4.5))
     ax = fig.subplots()
 
@@ -55,6 +59,8 @@ def render_figure(spec: PlotSpec) -> Figure:
     ax.set_xticklabels([f"{b.label}\n(n={b.n})" for b in spec.bars])
     ax.set_ylabel(spec.y_label)
     title = spec.title or "Quantification"
+    if spec.subtitle:
+        title += f"\n{spec.subtitle}"
     if spec.test_name and spec.test_p is not None:
         title += f"\n{spec.test_name}: p = {spec.test_p:.3g}"
     ax.set_title(title)
