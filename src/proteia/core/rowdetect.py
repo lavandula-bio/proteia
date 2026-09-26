@@ -13,7 +13,9 @@ Contract:
   every declared lane, the empty end lanes included: lanes are read from the
   bands, and a lane the box leaves out cannot be placed.
 * One slot per declared lane, in lane order: a rect, or None for no band. An
-  empty slot never shifts another lane's index.
+  empty slot never shifts another lane's index. Lanes are numbered from the
+  box's left end, or from its right end for an image whose lanes run that way
+  (``right_to_left``).
 * Every rect has the one shared size, no two overlap (:func:`~proteia.core.model.overlaps`),
   and all lie inside the clipped row box. Coordinates are plain ints placed with
   integer arithmetic only, so shifting the image and the row by ``(dx, dy)``
@@ -77,7 +79,7 @@ from __future__ import annotations
 import math
 import numbers
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, Literal
 
 import numpy as np
@@ -213,6 +215,11 @@ class LaneDetection:
       ``VALLEY_FRAC`` of it, as two pieces along x. 1 for a lone band (noise on
       its top or a dent in it never is), 2 or more for several (a doublet,
       however weak its second band; a band split by a bubble), 0 when empty.
+    * ``window``: the slot an empty lane's ``snr`` was read in: within
+      ``EMPTY_WINDOW`` pitch of its expected centre along x, clipped to the row
+      box, over the row's rows (a neighbouring row left out). None for a lane
+      that holds a band, and for an empty lane whose slot lies outside the row
+      box (not measured: its ``snr`` is 0).
     """
 
     lane: int
@@ -223,6 +230,7 @@ class LaneDetection:
     expected_x: float
     bg_offset: float | None
     components: int
+    window: Rect | None
 
 
 @dataclass(frozen=True)
@@ -850,6 +858,7 @@ class _Lane:
     snr: float = 0.0
     span: tuple[int, int] | None = None  # the x-range between the walls: components counted
     components: int = 0
+    window: Rect | None = None  # an empty lane's measured slot (crop coordinates)
 
 
 def _lanes_from(assign: _Assignment, pieces: list[_Piece], n: int) -> list[_Lane]:
@@ -1175,7 +1184,8 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
         a = int(max(0, math.floor(ln.centre - EMPTY_WINDOW * pitch)))
         b = int(min(wc, math.ceil(ln.centre + EMPTY_WINDOW * pitch)))
         if b <= a:
-            continue
+            continue  # the slot lies outside the row box: not measured
+        ln.window = (a, lo, b, hi)
         ln.snr = float(s_row[:, a:b].max()) / sig.sigma_sm
         full = float(sig.s_sm[:, a:b].max()) / sig.sigma_sm
         if any(
@@ -1246,6 +1256,7 @@ def detect_row(
     background: float,
     dark_on_light: bool = True,
     size_rule: str = SIZE_RULE,
+    right_to_left: bool = False,
 ) -> RowDetection:
     """One slot per declared lane in ``row`` ``(x0, y0, x1, y1)``: a box of one
     shared size, or None for an empty lane (see the module docstring).
@@ -1255,6 +1266,9 @@ def detect_row(
     for a fitted plane that is off the membrane, and sets ``bg_offset``.
     ``size_rule`` is one of :data:`SIZE_RULES`, for tests and evaluation;
     callers that commit boxes use the default :data:`SIZE_RULE`.
+    ``right_to_left`` numbers the lanes from the box's right end, for an image
+    whose lanes run that way: only the numbering changes, in ``lanes`` and in
+    the notes.
     Raises :class:`RowDetectError` for a row it cannot use.
     """
     if size_rule not in SIZE_RULES:
@@ -1304,6 +1318,10 @@ def detect_row(
     pitch = assign.pitch if assign is not None else wc / n
     _empty_lanes(res, n, wc, pitch)
 
+    def numbered(indices: Sequence[int]) -> list[int]:
+        """Lane indices as the caller numbers them, in order."""
+        return sorted(n - 1 - i if right_to_left else i for i in indices)
+
     # Geometry the row box cannot resolve. A lane holds a band exactly when
     # its growth gave an extent.
     flags: list[str] = []
@@ -1340,7 +1358,7 @@ def detect_row(
                 flags.append("ambiguous_lanes")
                 pairs = sorted({present[k] for k in crowded} | {present[k + 1] for k in crowded})
                 notes.append(
-                    f"{_lanes_phrase(pairs)}: extents closer than the narrowest band "
+                    f"{_lanes_phrase(numbered(pairs))}: extents closer than the narrowest band "
                     f"({min_w:.0f} px) or out of order"
                 )
             w = min(w, int(math.floor(max(float(gaps.min()), min_w))))
@@ -1355,7 +1373,10 @@ def detect_row(
     result: list[LaneDetection] = []
     for i, ln in enumerate(lanes):
         rect = out.get(i)
-        extent = bg_offset = None
+        extent = bg_offset = window = None
+        if rect is None and ln.window is not None:
+            wx0, wy0, wx1, wy1 = ln.window
+            window = (x0 + wx0, y0 + wy0, x0 + wx1, y0 + wy1)
         if rect is not None:
             ex0, ey0, ex1, ey1 = extents[i]
             extent = (x0 + ex0, y0 + ey0, x0 + ex1, y0 + ey1)
@@ -1375,14 +1396,17 @@ def detect_row(
                 expected_x=x0 + float(ln.centre),
                 bg_offset=bg_offset,
                 components=ln.components if rect is not None else 0,
+                window=window,
             )
         )
+    if right_to_left:
+        result = [replace(ld, lane=n - 1 - ld.lane) for ld in reversed(result)]
     if any(ld.bg_offset is not None and abs(ld.bg_offset) > BG_WARN_K for ld in result):
         flags.append("background_mismatch")
     if outliers:
         flags.append("size_outlier")
         notes.append(
-            f"{_lanes_phrase([present[k] for k in outliers])}: extent above "
+            f"{_lanes_phrase(numbered([present[k] for k in outliers]))}: extent above "
             f"{SIZE_GUARD:g}x the median of the other extents, left out of the shared size"
         )
     multiple = [ld.lane for ld in result if ld.components > 1]

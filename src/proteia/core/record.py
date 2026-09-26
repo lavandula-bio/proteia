@@ -35,7 +35,7 @@ from typing import Any, Final
 from pydantic import JsonValue, TypeAdapter
 
 import proteia
-from proteia.core import export, grow, quantify, storage
+from proteia.core import export, grow, quantify, rowdetect, storage
 from proteia.core.model import Project, Timestamp
 from proteia.core.results import Results
 
@@ -72,6 +72,8 @@ def settings() -> dict[str, JsonValue]:
         },
         "clipped_pixels_threshold": quantify.CLIPPED_PIXELS_THRESHOLD,
         "lane_table_decimals": export.LANE_TABLE_DECIMALS,
+        # What detect_row_boxes runs (rowdetect.detect_row with its defaults).
+        "detect_row": rowdetect.settings(),
     }
 
 

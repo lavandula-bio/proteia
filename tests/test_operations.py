@@ -6,7 +6,8 @@ in project folders with non-ASCII names, on real TIFF files written by
 ``conftest.write_tiff``. The box tests use a 16-bit ``synthetic_blot`` with a
 narrow and a wide band in one row; the parity tests at the end pin the whole
 path, from an imported file to the chart, to the golden numbers of
-``test_regression_baseline``.
+``test_regression_baseline``. The row-box tests at the end commit rows of
+:mod:`rowcases`.
 """
 
 import codecs
@@ -20,6 +21,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,12 +37,13 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
-from proteia.core import boxes, record, results, storage
+from proteia.core import boxes, record, results, rowdetect, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
 from proteia.core.imaging import clipping_depth
 from proteia.core.model import (
+    Band,
     Box,
     BoxSize,
     ImageKind,
@@ -64,11 +67,14 @@ from proteia.core.operations import (
     ProjectSession,
 )
 from proteia.core.plotspec import ErrorType
+from proteia.core.project import lane_positions
 from proteia.core.quantify import estimate_background, is_clipped, net_signal
 from proteia.core.record import history_issues
-from proteia.core.results import NoticeCode
+from proteia.core.results import Level, NoticeCode
+from proteia.core.rowdetect import DETECT_K, RowDetection
 from proteia.core.session import save_to_folder
 from proteia.core.storage import canonical_json, content_hash, load_project
+from rowcases import RowCase, adversarial, adversarial_row, bench_cases, synthetic_row
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -2664,3 +2670,1138 @@ def test_dropping_records_asks_the_predicate_once_per_record(tmp_path):
     assert asked == [0, 1, 2]
     assert dropped == [_record_json(protein, _record(1))]
     assert [u.lane_index for u in draft.batch.find_protein(protein).undetected] == [0, 2]
+
+
+# --- #51: committing a dragged row ---
+
+ROWS = {case.name: case for case in bench_cases()}
+# Lane 0 is empty. The same image under a box that stops 40 px short of it
+# leaves that lane's expected centre outside the box; 70 px short (the
+# adversarial case box_omits_empty_first), the bands fit the lanes two ways.
+SCENE = adversarial_row("scene", 1000, missing=[0])
+UNCLEAR_ROW = (SCENE.row[0] + 40, *SCENE.row[1:])
+AMBIGUOUS_ROW = (SCENE.row[0] + 70, *SCENE.row[1:])
+SCENE_W = SCENE.image.shape[1]
+
+
+def _lane_inputs(n: int, excluded: tuple[int, ...] = ()) -> list[LaneInput]:
+    """Two conditions in alternate lanes, one sample per pair of lanes."""
+    return [
+        LaneInput(
+            "vehicle" if i % 2 == 0 else "10 µM", f"rep {i // 2 + 1}", included=i not in excluded
+        )
+        for i in range(n)
+    ]
+
+
+def row_session(
+    tmp_path: Path, case: RowCase, *, excluded: tuple[int, ...] = (), hook=None
+) -> tuple[ProjectSession, str, str]:
+    """The case's image imported as a 16-bit TIFF, its lanes declared, and one
+    target without boxes."""
+    s = session_on(tmp_path, hook)
+    polarity = DARK if case.dark_on_light else LIGHT
+    image = import_blot(s, case.image.astype(np.uint16), "row α.tif", polarity)
+    ops.set_lanes(s, _lane_inputs(case.n_lanes, excluded))
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    return s, image, protein
+
+
+def detected(s: ProjectSession, protein_id: str, row) -> RowDetection:
+    """What detection finds in ``row`` on the stored pixels, called as the
+    operation calls it."""
+    batch = s.project.batch
+    image = batch.find_image(batch.find_protein(protein_id).image_id)
+    return rowdetect.detect_row(
+        s.pixels(image.id),
+        row,
+        len(batch.lanes),
+        background=image.background,
+        dark_on_light=image.polarity.dark_on_light,
+    )
+
+
+def lane_bands(s: ProjectSession, protein_id: str) -> dict[int, Band]:
+    """The protein's band-index-0 boxes by lane."""
+    return {b.lane_index: b for b in protein_of(s, protein_id).bands if b.band_index == 0}
+
+
+def rects_by_lane(s: ProjectSession, protein_id: str) -> dict[int, tuple[int, int, int, int]]:
+    size = protein_of(s, protein_id).box_size
+    return {lane: band.box.rect(size) for lane, band in lane_bands(s, protein_id).items()}
+
+
+def at_lane(case: RowCase, lane: int) -> tuple[int, int]:
+    """A point on the lane's band (its true centre)."""
+    return round(case.lane_cx[lane]), round(case.lane_cy[lane])
+
+
+def edit_by_hand(s: ProjectSession, band_id: str, *, to: tuple[int, int] | None = None) -> None:
+    """Move a box 1 px to the right, or centre it on ``to``: the user edited it."""
+    protein, band = s.project.batch.find_band(band_id)
+    x0, y0, x1, y1 = band.box.rect(protein.box_size)
+    rect = (x0 + 1, y0, x1 + 1, y1) if to is None else (*to, *to)
+    ops.move_box(s, band_id, rect)
+    assert band_of(s, band_id).manually_edited
+
+
+def centred(s: ProjectSession, image_id: str, rect, size: BoxSize) -> tuple[int, int, int, int]:
+    """A box of ``size`` on ``rect``'s integer centre, shifted inside the image."""
+    image = s.project.batch.find_image(image_id)
+    return boxes.center_snap(rect, size, image.width, image.height)
+
+
+def row_case(key: str) -> RowCase:
+    """A bench row by name, or an adversarial recipe at seed 1000."""
+    return ROWS[key] if key in ROWS else adversarial(key, 1000)
+
+
+def placed_box(
+    s: ProjectSession, protein_id: str, case: RowCase, lane: int, source: ProposalSource
+) -> str:
+    """A box of the protein's size on the lane's centre that nobody edited,
+    placed as ``source`` says: by the user (``manual``, or a grown ``click``) or
+    by a detector (``row_box``, ``mw_guided``)."""
+    band_id = ops.place_box(s, protein_id, *at_lane(case, lane), lane_index=lane, grow=False)
+    if source is not ProposalSource.MANUAL:
+        plant(s, lambda draft: setattr(draft.batch.find_band(band_id)[1], "source", source))
+    assert not band_of(s, band_id).manually_edited
+    return band_id
+
+
+def other_protein_in_lanes(
+    s: ProjectSession,
+    image_id: str,
+    case: RowCase,
+    lanes: Sequence[int] | None = None,
+    *,
+    dx: float = 0.0,
+    mirrored: bool = False,
+) -> str:
+    """A second protein on the image with a small box in each of ``lanes``
+    (every lane by default), at the lane's true centre moved ``dx`` px, in a row
+    of its own above the case's: lanes already placed on the image. Mirrored,
+    the lanes are numbered right to left."""
+    other = ops.add_protein(
+        s, "GAPDH", Role.LOADING_CONTROL, image_id, box_size=BoxSize(width=20, height=8)
+    )
+    n = case.n_lanes
+    for lane in range(n) if lanes is None else lanes:
+        index = n - 1 - lane if mirrored else lane
+        ops.place_box(s, other, round(case.lane_cx[lane] + dx), 20, lane_index=index, grow=False)
+    return other
+
+
+def shifted(case: RowCase, dx: int) -> tuple[int, int, int, int]:
+    """The case's row box moved ``dx`` px along x, clipped to the image."""
+    x0, y0, x1, y1 = case.row
+    return max(0, x0 + dx), y0, min(case.image.shape[1], x1 + dx), y1
+
+
+@pytest.mark.parametrize("name", ["all_present", "light_on_dark"])
+def test_a_row_places_one_box_per_lane(tmp_path, name):
+    case = ROWS[name]
+    s, _, protein = row_session(tmp_path, case, hook=save_to_folder)
+    found = detected(s, protein, case.row)
+    length = len(s.project.log)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    bands = lane_bands(s, protein)
+    assert rects_by_lane(s, protein) == dict(enumerate(found.slots))
+    assert protein_of(s, protein).box_size == found.size
+    for band in bands.values():
+        assert (band.source, band.manually_edited, band.apparent_mw) == (
+            ProposalSource.ROW_BOX,
+            False,
+            None,
+        )
+    assert placement == ops.RowPlacement(
+        band_ids=tuple(bands[lane].id for lane in range(6)),
+        box_size=found.size,
+        kept_lanes=(),
+        replaced_band_ids=(),
+        removed_band_ids=(),
+        undetected_lanes=(),
+        unmeasured_lanes=(),
+        empty=(),
+        flags=(),
+        notes=(),
+        right_to_left=False,
+    )
+    numbers = [int(band_id.removeprefix("band-")) for band_id in placement.band_ids]
+    assert numbers == list(range(numbers[0], numbers[0] + 6))  # new ids in lane order
+    assert_nets_current(s)
+    assert len(s.project.log) == length + 1  # one change, one entry
+    entry = s.project.log[-1]
+    assert entry.action == "detect_row_boxes"
+    assert entry.content_hash == content_hash(s.project)
+    assert load_project(s.folder) == s.project  # autosaved with its entry
+    [column] = ops.compute(s).proteins
+    assert column.detected == [True] * 6
+
+
+def test_lanes_without_a_band_get_a_not_detected_record(tmp_path):
+    case = ROWS["missing_two"]  # lanes 0 and 3 are empty
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, case.row)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert sorted(lane_bands(s, protein)) == [1, 2, 4, 5]
+    records = protein_of(s, protein).undetected
+    assert [(u.lane_index, u.band_index) for u in records] == [(0, 0), (3, 0)]
+    for u in records:
+        lane = found.lanes[u.lane_index]
+        assert lane.reason == "no_band"
+        assert u.reason is UndetectedReason.BELOW_DETECTION_LIMIT
+        assert (u.snr, u.threshold) == (lane.snr, DETECT_K)
+        assert u.snr < u.threshold
+        assert u.region.rect() == lane.window  # the slot the detector measured
+        assert u.source is ProposalSource.ROW_BOX
+    assert (placement.band_ids[0], placement.band_ids[3]) == (None, None)
+    assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((0, 3), ())
+    assert placement.empty == tuple(
+        (i, "no_band", found.lanes[i].snr, found.lanes[i].expected_x) for i in (0, 3)
+    )
+    params = s.project.log[-1].params
+    assert params["undetected_written"] == [_record_json(protein, u) for u in records]
+    assert params["dropped_undetected"] == []
+
+    res = ops.compute(s)
+    [column] = res.proteins
+    assert column.detected == [False, True, True, False, True, True]
+    assert (column.nets[0], column.nets[3]) == (None, None)
+    [notice] = [n for n in res.notices if n.code is NoticeCode.BELOW_DETECTION]
+    assert notice.level is Level.WARNING
+    assert (notice.protein_ids, notice.lane_indices, notice.conditions) == (
+        (protein,),
+        (0, 3),
+        ("vehicle", "10 µM"),
+    )
+    assert notice.message == (
+        "'β-catenin' was not detected in lanes 1, 4 (below the detection limit):"
+        " those lanes have no value and are left out of the statistics"
+    )
+
+
+# Adversarial rows whose one empty lane the detector cannot read.
+UNREADABLE_LANES = [
+    ("blotch_empty", 4, "artefact"),  # a stain over the empty lane
+    ("vstreak_empty", 4, "unassigned"),  # a streak kept, but in no piece
+    ("nbr_above_miss", 2, "edge_signal"),  # only the neighbouring row reaches the limit
+]
+
+
+@pytest.mark.parametrize(("key", "lane", "reason"), UNREADABLE_LANES)
+def test_other_empty_lanes_are_left_not_measured(tmp_path, key, lane, reason):
+    # Only "nothing reached the detection limit" is a not-detected claim. Any
+    # other empty lane gets no record, and an older record there goes: this
+    # run's outcome replaces it.
+    case = adversarial(key, 1000)
+    s, _, protein = row_session(tmp_path, case)
+    old = _record(lane)
+    plant_records(s, protein, old)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert protein_of(s, protein).undetected == []
+    assert sorted(lane_bands(s, protein)) == [i for i in range(6) if i != lane]
+    assert placement.band_ids[lane] is None
+    assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), (lane,))
+    [(empty_lane, empty_reason, _, _)] = placement.empty
+    assert (empty_lane, empty_reason) == (lane, reason)
+    params = s.project.log[-1].params
+    assert params["lanes"][lane]["reason"] == reason
+    assert (params["undetected_written"], params["dropped_undetected"]) == (
+        [],
+        [_record_json(protein, old)],
+    )
+    assert ops.compute(s).proteins[0].detected[lane] is None
+
+
+# Rows whose one empty lane holds nothing that reaches the detection limit, or
+# something the detector cannot read.
+EMPTY_LANES = [
+    pytest.param("missing_middle", 2, "no_band", id="no_band"),
+    *(pytest.param(*lane, id=lane[2]) for lane in UNREADABLE_LANES),
+]
+
+
+@pytest.mark.parametrize("source", [ProposalSource.CLICK, ProposalSource.MANUAL])
+@pytest.mark.parametrize(("key", "lane", "reason"), EMPTY_LANES)
+def test_a_box_the_user_placed_where_no_band_is_found_is_kept(tmp_path, key, lane, reason, source):
+    # The user placed the box where the detector finds nothing (a band too
+    # faint for it, a lane it cannot read): it is kept as a box edited by hand
+    # is, and its lane gets no record.
+    case = row_case(key)
+    s, image, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=20, height=30))
+    box = placed_box(s, protein, case, lane, source)
+    before = tuple(_rect_of(s, box))
+    found = detected(s, protein, case.row)
+    assert found.lanes[lane].reason == reason
+    assert found.size.width > 20 and found.size.height < 30
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    kept = band_of(s, box)
+    assert lane_bands(s, protein)[lane] is kept and placement.band_ids[lane] is None
+    assert (kept.source, kept.manually_edited) == (source, False)
+    assert placement.kept_lanes == (lane,)
+    assert (placement.replaced_band_ids, placement.removed_band_ids) == ((), ())
+    assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), ())
+    assert protein_of(s, protein).undetected == []
+    [(empty_lane, empty_reason, _, _)] = placement.empty
+    assert (empty_lane, empty_reason) == (lane, reason)
+    # The box survives, so the size only grows; it stays on its own centre.
+    size = BoxSize(width=found.size.width, height=30)
+    assert placement.box_size == protein_of(s, protein).box_size == size
+    assert tuple(_rect_of(s, box)) == centred(s, image, before, size)
+    rects = rects_by_lane(s, protein)
+    for other, rect in enumerate(found.slots):
+        if rect is not None:
+            assert rects[other] == centred(s, image, rect, size)
+    params = s.project.log[-1].params
+    assert (params["kept_lanes"], params["removed_band_ids"]) == ([lane], [])
+    assert params["undetected_written"] == []
+    assert ops.compute(s).proteins[0].detected[lane] is True
+    assert_nets_current(s)
+
+    committed = s.project
+    again = ops.detect_row_boxes(s, protein, case.row)
+    assert (again.kept_lanes, again.band_ids) == ((lane,), placement.band_ids)
+    assert s.project is committed  # the same drag again: a no-op
+
+
+@pytest.mark.parametrize("source", [ProposalSource.ROW_BOX, ProposalSource.MW_GUIDED])
+@pytest.mark.parametrize(("key", "lane", "reason"), EMPTY_LANES)
+def test_a_detectors_box_where_no_band_is_found_goes(tmp_path, key, lane, reason, source):
+    # A box an earlier detection placed gives way to this one's outcome: where
+    # it finds no band, the box goes, and the lane gets a record or is left
+    # not measured.
+    case = row_case(key)
+    s, _, protein = row_session(tmp_path, case)
+    box = placed_box(s, protein, case, lane, source)
+    found = detected(s, protein, case.row)
+    assert found.lanes[lane].reason == reason
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert lane not in lane_bands(s, protein) and placement.band_ids[lane] is None
+    assert (placement.kept_lanes, placement.removed_band_ids) == ((), (box,))
+    recorded = (lane,) if reason == "no_band" else ()
+    assert placement.undetected_lanes == recorded
+    assert placement.unmeasured_lanes == (() if recorded else (lane,))
+    assert _keys(s, protein) == [(i, 0) for i in recorded]
+    # Nothing survives, so the size is this detection's.
+    assert placement.box_size == protein_of(s, protein).box_size == found.size
+    assert s.project.log[-1].params["removed_band_ids"] == [box]
+    assert ops.compute(s).proteins[0].detected[lane] is (False if recorded else None)
+
+
+def test_a_box_the_user_placed_in_a_lane_left_unmeasured_stays_on_the_next_drag(tmp_path):
+    # The first drag leaves the stained lane not measured; the user places a
+    # box there by hand; dragging over the row again keeps it and replaces the
+    # rest in place.
+    case = adversarial("blotch_empty", 1000)  # lane 4: a stain over the empty lane
+    s, _, protein = row_session(tmp_path, case)
+    first = ops.detect_row_boxes(s, protein, case.row)
+    assert first.unmeasured_lanes == (4,)
+    box = placed_box(s, protein, case, 4, ProposalSource.MANUAL)
+
+    second = ops.detect_row_boxes(s, protein, case.row)
+    assert lane_bands(s, protein)[4].id == box
+    assert second.kept_lanes == (4,) and second.unmeasured_lanes == ()
+    ids = tuple(band_id for band_id in first.band_ids if band_id is not None)
+    assert second.replaced_band_ids == ids
+    assert second.band_ids == first.band_ids
+
+
+def test_a_record_from_any_detector_gives_way(tmp_path):
+    # An MW-guided record (#58) gives way to this run's outcome as a row-box
+    # record does, even in a lane this run could not measure.
+    case = adversarial("blotch_empty", 1000)  # lane 4: a stain over the empty lane
+    s, _, protein = row_session(tmp_path, case)
+    old = _record(4, region=(350, 68, 393, 93), source=ProposalSource.MW_GUIDED)
+    plant_records(s, protein, old)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.unmeasured_lanes == (4,)
+    assert protein_of(s, protein).undetected == []
+    assert s.project.log[-1].params["dropped_undetected"] == [_record_json(protein, old)]
+
+
+def test_include_no_lanes_are_detected_too(tmp_path):
+    case = ROWS["all_present"]
+    s, _, protein = row_session(tmp_path, case, excluded=(1, 4))
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert None not in placement.band_ids
+    assert sorted(lane_bands(s, protein)) == list(range(6))
+    res = ops.compute(s)
+    # The excluded lanes hold values, so the all-lanes set shows what excluding
+    # them changes.
+    assert (res.label, res.excluded_lanes) == ("Excluding lanes 2, 5", [1, 4])
+    assert res.all_lanes is not None and res.all_lanes.label == "All lanes"
+    assert None not in res.proteins[0].nets
+
+
+def test_an_empty_include_no_lane_is_recorded_too(tmp_path):
+    case = ROWS["missing_two"]  # lanes 0 and 3 are empty
+    s, _, protein = row_session(tmp_path, case, excluded=(0,))
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.undetected_lanes == (0, 3)
+    assert _keys(s, protein) == [(0, 0), (3, 0)]
+    res = ops.compute(s)
+    assert res.proteins[0].detected[0] is False
+    # The notice names only the lanes this set includes.
+    [notice] = [n for n in res.notices if n.code is NoticeCode.BELOW_DETECTION]
+    assert notice.lane_indices == (3,)
+
+
+def test_a_row_leaves_the_other_proteins_on_its_image_alone(tmp_path):
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    for lane in (1, 2):  # over the target's bands: boxes of two proteins may overlap
+        ops.place_box(s, other, *at_lane(case, lane), lane_index=lane, grow=True)
+    plant_records(s, other, _record(0))
+    before = protein_of(s, other)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert None not in placement.band_ids
+    assert protein_of(s, other) == before
+    assert_nets_current(s)
+
+
+def test_a_row_replaces_boxes_nobody_edited(tmp_path):
+    case = ROWS["missing_middle"]  # lane 2 is empty
+    s, _, protein = row_session(tmp_path, case)
+    clicked = ops.place_box(s, protein, *at_lane(case, 0), lane_index=0, grow=True)
+    plant(s, lambda draft: setattr(draft.batch.find_band(clicked)[1], "apparent_mw", 92.0))
+    fixed = placed_box(s, protein, case, 1, ProposalSource.MANUAL)
+    guided = placed_box(s, protein, case, 4, ProposalSource.MW_GUIDED)
+    dropped = placed_box(s, protein, case, 2, ProposalSource.ROW_BOX)
+    old = _record(3)
+    plant_records(s, protein, old)
+    found = detected(s, protein, case.row)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    bands = lane_bands(s, protein)
+    # Lanes 0, 1 and 4: the band found takes the box nobody edited in place,
+    # whoever placed it; its id stays, and the MW read from the clicked box's
+    # old position (#58) goes with it.
+    for lane, band_id in ((0, clicked), (1, fixed), (4, guided)):
+        assert bands[lane].id == band_id == placement.band_ids[lane]
+        assert (bands[lane].source, bands[lane].manually_edited, bands[lane].apparent_mw) == (
+            ProposalSource.ROW_BOX,
+            False,
+            None,
+        )
+    # Lane 2: nothing reaches the detection limit; the box an earlier detection
+    # placed goes, a record comes.
+    assert 2 not in bands and placement.band_ids[2] is None
+    assert [u.lane_index for u in protein_of(s, protein).undetected] == [2]
+    # Lane 3: the record gives way to the band found there.
+    assert bands[3].id == placement.band_ids[3] not in (clicked, fixed, guided, dropped)
+    # Nothing survives, so the size and the boxes are this detection's.
+    assert protein_of(s, protein).box_size == found.size
+    assert rects_by_lane(s, protein) == {i: r for i, r in enumerate(found.slots) if r}
+    assert (placement.replaced_band_ids, placement.removed_band_ids) == (
+        (clicked, fixed, guided),
+        (dropped,),
+    )
+    assert placement.kept_lanes == ()
+    params = s.project.log[-1].params
+    assert (params["replaced_band_ids"], params["removed_band_ids"]) == (
+        [clicked, fixed, guided],
+        [dropped],
+    )
+    assert params["dropped_undetected"] == [_record_json(protein, old)]
+    assert_nets_current(s)
+
+
+def test_a_hand_edited_box_is_kept_and_reported(tmp_path):
+    case = ROWS["missing_middle"]  # lane 2 is empty
+    s, image, protein = row_session(tmp_path, case)
+    on_band = ops.place_box(s, protein, *at_lane(case, 1), lane_index=1, grow=True)
+    on_empty = ops.place_box(s, protein, *at_lane(case, 2), lane_index=2, grow=False)
+    edit_by_hand(s, on_band)
+    edit_by_hand(s, on_empty)
+    before = {band_id: tuple(_rect_of(s, band_id)) for band_id in (on_band, on_empty)}
+    old_size = protein_of(s, protein).box_size
+    found = detected(s, protein, case.row)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.kept_lanes == (1, 2)
+    assert (placement.band_ids[1], placement.band_ids[2]) == (None, None)
+    bands = lane_bands(s, protein)
+    assert (bands[1].id, bands[2].id) == (on_band, on_empty)
+    assert (bands[1].source, bands[2].source) == (ProposalSource.CLICK, ProposalSource.MANUAL)
+    assert bands[1].manually_edited and bands[2].manually_edited
+    # A kept box's lane gets no record, even where nothing was detected.
+    assert protein_of(s, protein).undetected == []
+    assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), ())
+    assert placement.empty[0][:2] == (2, "no_band")
+    # Boxes survive, so the size only grows; they stay on their own centres.
+    size = BoxSize(
+        width=max(old_size.width, found.size.width),
+        height=max(old_size.height, found.size.height),
+    )
+    assert protein_of(s, protein).box_size == placement.box_size == size
+    for band_id, rect in before.items():
+        assert tuple(_rect_of(s, band_id)) == centred(s, image, rect, size)
+    rects = rects_by_lane(s, protein)
+    for lane in (0, 3, 4, 5):
+        assert rects[lane] == centred(s, image, found.slots[lane], size)
+    assert_nets_current(s)
+
+
+def test_the_size_only_grows_while_a_box_survives(tmp_path):
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=30, height=20))
+    kept = ops.place_box(s, protein, *at_lane(case, 0), lane_index=0, grow=False)
+    edit_by_hand(s, kept)
+    found = detected(s, protein, case.row)
+    assert found.size.width > 30 and found.size.height < 20
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    size = BoxSize(width=found.size.width, height=20)  # the larger of each
+    assert placement.box_size == protein_of(s, protein).box_size == size
+    rects = rects_by_lane(s, protein)
+    logged = s.project.log[-1].params["lanes"]
+    for lane in range(1, 6):
+        assert rects[lane] == centred(s, image, found.slots[lane], size)
+        # The log names the committed box, not the detector's lower one.
+        assert logged[lane]["rect"] == list(rects[lane]) != list(found.slots[lane])
+    assert placement.kept_lanes == (0,)
+    assert_nets_current(s)
+
+
+def test_a_row_whose_bands_all_have_edited_boxes_grows_them_and_records(tmp_path):
+    # Every band found is in a lane whose box was edited by hand: nothing is
+    # placed, but those boxes survive, so the size only grows, as with any
+    # survivor, and the empty lane is still recorded.
+    case = ROWS["missing_middle"]  # lane 2 is empty
+    s, image, protein = row_session(tmp_path, case)
+    small = BoxSize(width=40, height=10)
+    ops.set_box_size(s, protein, small)
+    for lane in (0, 1, 3, 4, 5):
+        edit_by_hand(
+            s, ops.place_box(s, protein, *at_lane(case, lane), lane_index=lane, grow=False)
+        )
+    before = rects_by_lane(s, protein)
+    found = detected(s, protein, case.row)
+    size = BoxSize(width=max(40, found.size.width), height=max(10, found.size.height))
+    assert size != small  # the detector's size is larger
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.band_ids == (None,) * 6
+    assert placement.kept_lanes == (0, 1, 3, 4, 5)
+    assert placement.box_size == protein_of(s, protein).box_size == size
+    assert rects_by_lane(s, protein) == {
+        lane: centred(s, image, rect, size) for lane, rect in before.items()
+    }
+    assert (placement.undetected_lanes, _keys(s, protein)) == ((2,), [(2, 0)])
+    assert_nets_current(s)
+
+    committed = s.project
+    ops.detect_row_boxes(s, protein, case.row)
+    assert s.project is committed  # the same record again: a no-op
+
+
+def test_another_bands_box_and_record_are_left_alone(tmp_path):
+    # A second expected band (#58) is not what the row looked for: its box
+    # survives, so the size only grows, and its record stays. Edited by hand,
+    # it keeps nothing but itself: the lane still takes the band found.
+    case = ROWS["missing_middle"]  # lane 2 is empty
+    s, image, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=40, height=16))
+    other = ops.place_box(s, protein, round(case.lane_cx[0]), 20, lane_index=0, grow=False)
+    second = _record(2, band_index=1, region=(209, 10, 253, 30))
+    plant_records(s, protein, second, bands=2)
+    plant(s, lambda draft: setattr(draft.batch.find_band(other)[1], "band_index", 1))
+    edit_by_hand(s, other)
+    found = detected(s, protein, case.row)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert band_of(s, other).band_index == 1 and other not in placement.band_ids
+    assert placement.band_ids[0] is not None
+    assert _keys(s, protein) == [(2, 0), (2, 1)]
+    assert protein_of(s, protein).undetected[1] == second
+    size = BoxSize(width=max(40, found.size.width), height=16)
+    assert placement.box_size == size
+    assert placement.kept_lanes == ()  # only band-index-0 boxes are kept or replaced
+    assert_nets_current(s)
+
+
+def test_a_second_drag_corrects_the_first(tmp_path):
+    # The first drag went over the wrong row (taller bands above the right
+    # one). Dragging the right row replaces every box; with nothing edited by
+    # hand the size is set afresh, not grown.
+    tall = synthetic_row("tall", "", 51, h=24.0)
+    short = synthetic_row("short", "", 51)  # the same lanes, bands half as high
+    offset = tall.image.shape[0]
+    case = dataclasses.replace(short, image=np.vstack([tall.image, short.image]))
+    s, _, protein = row_session(tmp_path, case)
+    x0, y0, x1, y1 = short.row
+    right = (x0, y0 + offset, x1, y1 + offset)
+    first = ops.detect_row_boxes(s, protein, tall.row)
+    found = detected(s, protein, right)
+    assert found.size.height < first.box_size.height
+
+    second = ops.detect_row_boxes(s, protein, right)
+    assert second.band_ids == second.replaced_band_ids == first.band_ids  # replaced in place
+    assert protein_of(s, protein).box_size == second.box_size == found.size
+    assert rects_by_lane(s, protein) == dict(enumerate(found.slots))
+    assert_nets_current(s)
+
+    committed = s.project
+    assert ops.detect_row_boxes(s, protein, right) == second
+    assert s.project is committed  # the same drag again: a no-op, no entry
+
+
+def test_warnings_are_reported_and_logged(tmp_path):
+    case = adversarial("tall_band", 1000)  # lane 3 far taller than the others
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, case.row)
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.flags == found.flags == ("size_outlier",)
+    assert placement.notes == found.notes != ()
+    params = s.project.log[-1].params
+    assert (params["flags"], params["notes"]) == (["size_outlier"], list(found.notes))
+
+
+def test_the_row_commit_logs_every_lane(tmp_path):
+    case = ROWS["missing_middle"]  # lane 2 is empty
+    s, _, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=40, height=10))
+    replaced = ops.place_box(s, protein, *at_lane(case, 0), lane_index=0, grow=False)
+    removed = placed_box(s, protein, case, 2, ProposalSource.ROW_BOX)
+    kept = ops.place_box(s, protein, *at_lane(case, 4), lane_index=4, grow=False)
+    edit_by_hand(s, kept)
+    old = _record(3, snr=2.5)
+    plant_records(s, protein, old)
+    found = detected(s, protein, case.row)
+    next_id = s.project.next_id
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    ids = [replaced, f"band-{next_id}", None, f"band-{next_id + 1}", None, f"band-{next_id + 2}"]
+    assert placement.band_ids == tuple(ids)
+    [written] = protein_of(s, protein).undetected
+    lanes = [
+        {
+            "band_id": band_id,
+            "rect": None if band_id is None else _rect_of(s, band_id),
+            "reason": lane.reason,
+            "snr": round(lane.snr, 2),
+            "expected_x": round(lane.expected_x, 1),
+        }
+        for band_id, lane in zip(ids, found.lanes, strict=True)
+    ]
+    assert lanes[4]["reason"] == "band"  # found, but the edited box was kept
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "detect_row_boxes",
+        {
+            "protein_id": protein,
+            "row": list(case.row),
+            "lanes": lanes,
+            "kept_lanes": [4],
+            "replaced_band_ids": [replaced],
+            "removed_band_ids": [removed],
+            "undetected_written": [_record_json(protein, written)],
+            "dropped_undetected": [_record_json(protein, old)],
+            "box_size": _size_of(s, protein),
+            "pitch": found.pitch,
+            "noise": found.noise,
+            "flags": [],
+            "notes": [],
+            "right_to_left": False,
+            # Dev builds share a version string: the constants that placed the
+            # boxes go with each commit.
+            "settings": rowdetect.settings(),
+        },
+    )
+    assert entry.content_hash == content_hash(s.project)
+
+
+def test_record_settings_are_what_the_row_commit_uses(tmp_path, monkeypatch):
+    calls = []
+    real = rowdetect.detect_row
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rowdetect, "detect_row", spy)
+    case = ROWS["all_present"]
+    s, image_id, protein = row_session(tmp_path, case)
+    ops.detect_row_boxes(s, protein, case.row)
+    [(args, kwargs)] = calls
+    bound = inspect.signature(real).bind(*args, **kwargs)
+    bound.apply_defaults()
+    image = s.project.batch.find_image(image_id)
+    assert bound.arguments["size_rule"] == record.settings()["detect_row"]["size_rule"]
+    assert (bound.arguments["background"], bound.arguments["dark_on_light"]) == (
+        image.background,
+        True,
+    )
+    assert record.settings()["detect_row"] == rowdetect.settings()
+
+
+def _row_scene(tmp_path: Path, setup) -> tuple[ProjectSession, Recorder, dict[str, str]]:
+    """:data:`SCENE` with a target and a clicked box in lane 1, then ``setup``
+    (autosaved), reopened with an empty pixel cache and a recording hook."""
+    s, image, protein = row_session(tmp_path, SCENE, hook=save_to_folder)
+    band = ops.place_box(s, protein, *at_lane(SCENE, 1), lane_index=1, grow=True)
+    ids = {"image": image, "protein": protein, "band": band}
+    if setup is not None:
+        setup(s, ids)
+    recorder = Recorder()
+    return ops.open_project(s.folder, autosave=recorder, clock=FakeClock()), recorder, ids
+
+
+def _no_lanes(s: ProjectSession, ids: dict[str, str]) -> None:
+    ops.remove_box(s, ids["band"])
+    ops.set_lanes(s, [])
+
+
+def _edited_pair(s: ProjectSession, ids: dict[str, str]) -> None:
+    """Two surviving boxes 14 px apart, lane 1's edited by hand and one of a
+    second band (#58): the detected width cannot fit them. (Two lanes' boxes
+    that close would not line up with the row's bands.)"""
+    ops.set_box_size(s, ids["protein"], BoxSize(width=10, height=8))
+    x, y = at_lane(SCENE, 1)
+    near = ops.place_box(s, ids["protein"], x + 14, y, lane_index=2, grow=False)
+
+    def second_band(draft: Project) -> None:
+        protein, band = draft.batch.find_band(near)
+        protein.expected_band_count = 2
+        band.band_index = 1
+
+    plant(s, second_band)
+    edit_by_hand(s, ids["band"])
+
+
+def _wide_survivor(s: ProjectSession, ids: dict[str, str]) -> None:
+    """A hand-edited box wider than the lane pitch, above the row: the new
+    boxes, grown to its width, would overlap each other."""
+    ops.set_box_size(s, ids["protein"], BoxSize(width=80, height=8))
+    edit_by_hand(s, ids["band"], to=(round(SCENE.lane_cx[1]), 20))
+
+
+def _moved_onto_lane_2(s: ProjectSession, ids: dict[str, str]) -> None:
+    """Lane 1's box, edited by hand, sits on lane 2's band."""
+    ops.set_box_size(s, ids["protein"], BoxSize(width=40, height=10))
+    edit_by_hand(s, ids["band"], to=at_lane(SCENE, 2))
+
+
+def _touching_lane_2(s: ProjectSession, ids: dict[str, str]) -> None:
+    """Lane 1's box, edited by hand, ends where lane 2's detected box begins:
+    clear of it at its own size, over it once the size grows to the detector's."""
+    found = detected(s, ids["protein"], SCENE.row)
+    size = BoxSize(width=found.size.width - 4, height=found.size.height - 2)
+    ops.set_box_size(s, ids["protein"], size)
+    x0, y0, _, y1 = found.slots[2]
+    top = (y0 + y1) // 2 - size.height // 2
+    ops.move_box(s, ids["band"], (x0 - size.width, top, x0, top + size.height))
+    rect = _rect_of(s, ids["band"])
+    assert band_of(s, ids["band"]).manually_edited
+    assert rect[2] == x0 and not boxes.overlaps_any(tuple(rect), [found.slots[2]])
+
+
+def _placed_lanes(s: ProjectSession, ids: dict[str, str]) -> None:
+    """Another protein's boxes in the true lanes of :data:`SCENE`."""
+    other_protein_in_lanes(s, ids["image"], SCENE)
+
+
+ROW_REFUSALS = [
+    pytest.param(None, "prot-999", SCENE.row, None, id="unknown-protein"),
+    pytest.param(None, None, (1, 2, 3), ErrorCode.INVALID_INPUT, id="three-values"),
+    pytest.param(None, None, "0 0 9 9", ErrorCode.INVALID_INPUT, id="text"),
+    pytest.param(
+        None, None, (*SCENE.row[:3], SCENE.row[3] + 0.5), ErrorCode.INVALID_INPUT, id="float"
+    ),
+    pytest.param(None, None, (*SCENE.row[:3], True), ErrorCode.INVALID_INPUT, id="bool"),
+    pytest.param(
+        None,
+        None,
+        (SCENE.row[2], SCENE.row[1], SCENE.row[0], SCENE.row[3]),
+        ErrorCode.INVALID_INPUT,
+        id="inverted",
+    ),
+    pytest.param(_no_lanes, None, SCENE.row, ErrorCode.NO_LANES, id="no-lanes"),
+    pytest.param(
+        None, None, (SCENE_W + 10, 0, SCENE_W + 50, 20), ErrorCode.OUT_OF_IMAGE, id="outside"
+    ),
+    pytest.param(
+        None,
+        None,
+        (SCENE.row[0], SCENE.row[1], SCENE.row[0] + 11, SCENE.row[3]),
+        ErrorCode.ROW_TOO_SMALL,
+        id="too-narrow",
+    ),
+    pytest.param(
+        None,
+        None,
+        (SCENE.row[0], SCENE.row[1], SCENE.row[2], SCENE.row[1] + 2),
+        ErrorCode.ROW_TOO_SMALL,
+        id="too-low",
+    ),
+    pytest.param(None, None, UNCLEAR_ROW, ErrorCode.ROW_LANES_UNCLEAR, id="lanes-unclear"),
+    pytest.param(None, None, AMBIGUOUS_ROW, ErrorCode.ROW_LANES_UNCLEAR, id="lanes-ambiguous"),
+    pytest.param(
+        _placed_lanes,
+        None,
+        shifted(SCENE, 70),
+        ErrorCode.ROW_LANES_UNCLEAR,
+        id="off-the-placed-lanes",
+    ),
+    pytest.param(
+        None, None, (SCENE.row[0], 5, SCENE.row[2], 40), ErrorCode.NO_BAND_FOUND, id="no-band"
+    ),
+    pytest.param(
+        _edited_pair, None, SCENE.row, ErrorCode.SIZE_WOULD_OVERLAP, id="kept-boxes-overlap"
+    ),
+    pytest.param(
+        _wide_survivor, None, SCENE.row, ErrorCode.SIZE_WOULD_OVERLAP, id="new-boxes-overlap"
+    ),
+    pytest.param(_moved_onto_lane_2, None, SCENE.row, ErrorCode.OVERLAP, id="onto-a-kept-box"),
+    pytest.param(_touching_lane_2, None, SCENE.row, ErrorCode.OVERLAP, id="onto-a-kept-box-grown"),
+]
+
+
+@pytest.mark.parametrize(("setup", "protein_id", "row", "code"), ROW_REFUSALS)
+def test_a_refused_row_changes_nothing(tmp_path, setup, protein_id, row, code):
+    s, recorder, ids = _row_scene(tmp_path, setup)
+    before = s.project
+    next_id, log_length = before.next_id, len(before.log)
+    files = listing(s)
+
+    with pytest.raises(UnknownIdError if code is None else OperationError) as info:
+        ops.detect_row_boxes(s, protein_id or ids["protein"], row)
+    if code is not None:
+        assert info.value.code is code
+    assert s.project is before
+    assert s.project.next_id == next_id
+    assert len(s.project.log) == log_length
+    assert recorder.actions == []
+    assert listing(s) == files
+    assert s._pixels == {}  # pixels read for the detection are not kept
+    if code is ErrorCode.OVERLAP:
+        assert info.value.ids == (ids["band"],)
+
+
+@pytest.mark.parametrize(
+    ("setup", "words"),
+    [(_edited_pair, "that the row keeps overlap"), (_wide_survivor, "overlap each other")],
+)
+def test_a_size_grown_for_kept_boxes_is_refused_either_way(tmp_path, setup, words):
+    # The kept boxes cannot take the grown size, or the row's boxes cannot.
+    s, _, ids = _row_scene(tmp_path, setup)
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, ids["protein"], SCENE.row)
+    assert info.value.code is ErrorCode.SIZE_WOULD_OVERLAP
+    assert words in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("row", "flag"),
+    [
+        pytest.param(UNCLEAR_ROW, "lanes_outside_row", id="40px-short"),
+        pytest.param(AMBIGUOUS_ROW, "ambiguous_lanes", id="70px-short"),
+    ],
+)
+def test_a_row_that_leaves_out_an_empty_end_lane_is_refused(tmp_path, row, flag):
+    # Either refusing flag refuses the commit.
+    s, _, protein = row_session(tmp_path, SCENE)
+    assert not detected(s, protein, SCENE.row).refused  # the whole row is clear
+    assert detected(s, protein, row).flags == (flag,)
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein, row)
+    assert info.value.code is ErrorCode.ROW_LANES_UNCLEAR
+    assert str(info.value) == (
+        "the row box does not show which lane each band is in; draw it over every"
+        " declared lane, empty end lanes included, or place the boxes by clicking"
+    )
+
+
+# --- #51: a row checked against the lanes already placed on its image ---
+
+OFF_LANES = (
+    "the bands in the row box do not line up with the lanes already placed on this"
+    " image; draw the box over every declared lane, empty end lanes included"
+)
+
+
+def reading(case: RowCase, found: RowDetection) -> dict[int, int]:
+    """Each band found, as its lane read -> the lane whose true centre is
+    nearest its extent's."""
+    return {
+        lane.lane: min(
+            range(case.n_lanes),
+            key=lambda true: abs(case.lane_cx[true] - (lane.extent[0] + lane.extent[2]) / 2),
+        )
+        for lane in found.lanes
+        if lane.extent is not None
+    }
+
+
+def refused_as(s: ProjectSession, protein_id: str, row, message: str) -> None:
+    """The row is refused as not lining up with the image's lanes, changing nothing."""
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein_id, row)
+    assert info.value.code is ErrorCode.ROW_LANES_UNCLEAR
+    assert str(info.value) == message
+    assert s.project is before
+
+
+@pytest.mark.parametrize(
+    "name", ["all_present", "missing_first", "smile", "uneven_spacing", "touching", "twelve_lanes"]
+)
+def test_a_row_that_lines_up_with_the_lanes_on_its_image_is_committed(tmp_path, name):
+    case = ROWS[name]
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case)
+    found = detected(s, protein, case.row)
+    assert all(read == true for read, true in reading(case, found).items())
+
+    ops.detect_row_boxes(s, protein, case.row)
+    assert rects_by_lane(s, protein) == {i: r for i, r in enumerate(found.slots) if r}
+
+
+@pytest.mark.parametrize(
+    ("dx", "committed"),
+    [(-28, True), (28, True), (-42, False), (42, False)],
+    ids=["0.4-pitch-left", "0.4-pitch-right", "0.6-pitch-left", "0.6-pitch-right"],
+)
+def test_a_band_lines_up_within_half_a_pitch_of_its_lane(tmp_path, dx, committed):
+    # Lanes bend between rows (a smile, a fan): another protein's boxes
+    # 0.4 pitch off this row's bands still show the same lanes; 0.6 pitch off,
+    # every band lies nearer a neighbouring lane.
+    case = ROWS["all_present"]  # pitch 70
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, dx=dx)
+    if committed:
+        placement = ops.detect_row_boxes(s, protein, case.row)
+        assert None not in placement.band_ids
+    else:
+        refused_as(s, protein, case.row, OFF_LANES)
+
+
+@pytest.mark.parametrize(
+    "lanes",
+    [None, (3, 4), (0, 1), (4, 5)],
+    ids=["every-lane", "lanes-3-4", "first-two", "last-two"],
+)
+@pytest.mark.parametrize("dx", [70, -70], ids=["right", "left"])
+@pytest.mark.parametrize("name", ["all_present", "missing_middle"])
+def test_a_row_read_a_lane_off_the_lanes_on_its_image_is_refused(tmp_path, name, dx, lanes):
+    # Moved a pitch along the row, the box leaves out a banded end lane and
+    # the detector reads every band one lane off without a refusing flag. Two
+    # lanes another protein placed on the image show it.
+    case = ROWS[name]
+    row = shifted(case, dx)
+    s, image, protein = row_session(tmp_path, case)
+    found = detected(s, protein, row)
+    assert not found.refused
+    assert all(true == read + (1 if dx > 0 else -1) for read, true in reading(case, found).items())
+    other_protein_in_lanes(s, image, case, lanes)
+    refused_as(s, protein, row, OFF_LANES)
+
+
+def test_one_lane_on_the_image_does_not_show_the_lanes(tmp_path):
+    # Lane positions need the pitch, so two placed lanes: with one, the row is
+    # not checked (and this one is committed a lane off).
+    case = ROWS["all_present"]
+    row = shifted(case, 70)
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, [3])
+    placement = ops.detect_row_boxes(s, protein, row)
+    assert placement.band_ids[5] is None and placement.undetected_lanes == (5,)
+
+
+def test_the_boxes_a_row_replaces_are_not_lanes_it_is_checked_against(tmp_path):
+    # The first drag, a lane off, is committed: nothing is placed to check it
+    # against. The right drag replaces its boxes in place; they do not refuse it.
+    case = ROWS["all_present"]
+    s, _, protein = row_session(tmp_path, case)
+    first = ops.detect_row_boxes(s, protein, shifted(case, 70))
+    assert first.undetected_lanes == (5,)
+    found = detected(s, protein, case.row)
+
+    second = ops.detect_row_boxes(s, protein, case.row)
+    assert second.replaced_band_ids == first.band_ids[:5]
+    assert rects_by_lane(s, protein) == dict(enumerate(found.slots))
+
+
+def test_the_boxes_a_row_keeps_are_lanes_it_is_checked_against(tmp_path):
+    # This protein's own kept boxes show the lanes too: one edited by hand, and
+    # one placed by the user where the row, read a lane off, finds no band.
+    # (Committed, lane 3's box would also overlap the kept one of lane 4.)
+    case = ROWS["all_present"]
+    row = shifted(case, 70)
+    s, _, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=40, height=12))
+    edit_by_hand(s, placed_box(s, protein, case, 4, ProposalSource.MANUAL))
+    placed_box(s, protein, case, 5, ProposalSource.MANUAL)
+    assert detected(s, protein, row).lanes[5].reason == "no_band"
+    refused_as(s, protein, row, OFF_LANES)
+
+
+def at_true_lanes(s: ProjectSession, protein_id: str, case: RowCase) -> dict[int, int]:
+    """Each band-index-0 box of the protein, as its stored lane -> the lane
+    whose true centre is nearest the box's."""
+    return {
+        lane: min(range(case.n_lanes), key=lambda true: abs(case.lane_cx[true] - (x0 + x1) / 2))
+        for lane, (x0, _, x1, _) in rects_by_lane(s, protein_id).items()
+    }
+
+
+# Rows whose other protein's boxes in two neighbouring lanes, extended by
+# their own pitch, miss the far lanes by over half a pitch: uneven spacing
+# (56, 84, 63, 80.5, 59.5 px) and twenty lanes whose first two lie 34 px apart
+# against a mean pitch of about 36.
+SPARSE_ANCHORS = [
+    pytest.param("uneven_spacing", (0, 1), id="uneven-first-two"),
+    pytest.param("uneven_spacing", (1, 2), id="uneven-lanes-1-2"),
+    pytest.param("uneven_spacing", (4, 5), id="uneven-last-two"),
+    pytest.param("twenty_lanes/1001", (0, 1), id="twenty-1001-first-two"),
+    pytest.param("twenty_lanes/1001", (18, 19), id="twenty-1001-last-two"),
+    pytest.param("twenty_lanes/1002", (0, 1), id="twenty-1002-first-two"),
+    pytest.param("twenty_lanes/1002", (1, 2), id="twenty-1002-lanes-1-2"),
+]
+
+
+def named_case(name: str) -> RowCase:
+    """A bench row by name, or an adversarial one as ``recipe/seed``."""
+    if name in ROWS:
+        return ROWS[name]
+    recipe, seed = name.rsplit("/", 1)
+    return adversarial(recipe, int(seed))
+
+
+@pytest.mark.parametrize(("name", "lanes"), SPARSE_ANCHORS)
+def test_a_row_is_committed_beside_two_lanes_placed_on_its_image(tmp_path, name, lanes):
+    # Past the lanes placed, a lane's expected x steps by the row's own pitch,
+    # not by the spacing of the two placed lanes.
+    case = named_case(name)
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, lanes)
+    found = detected(s, protein, case.row)
+    assert all(read == true for read, true in reading(case, found).items())
+
+    ops.detect_row_boxes(s, protein, case.row)
+    assert rects_by_lane(s, protein) == {i: r for i, r in enumerate(found.slots) if r}
+
+
+@pytest.mark.parametrize(
+    ("name", "lanes"),
+    [
+        ("uneven_spacing", (0, 1)),
+        ("uneven_spacing", (4, 5)),
+        ("twenty_lanes/1001", (17, 18)),
+        ("bubble_band/1000", (0, 1)),
+        ("bubble_band/1001", (0, 1)),
+    ],
+)
+def test_the_same_drag_after_two_boxes_are_edited_by_hand_is_committed(tmp_path, name, lanes):
+    # The two edited boxes are the only lanes placed besides the boxes the
+    # second drag replaces. (A bubble splits lane 1's band, so its box lies
+    # about 15 px off the lane: the two edited boxes are 85 px apart against a
+    # pitch of 70.)
+    case = named_case(name)
+    s, _, protein = row_session(tmp_path, case)
+    first = ops.detect_row_boxes(s, protein, case.row)
+    for lane in lanes:
+        edit_by_hand(s, first.band_ids[lane])
+
+    second = ops.detect_row_boxes(s, protein, case.row)
+    assert second.kept_lanes == lanes
+    assert second.replaced_band_ids == tuple(
+        band_id for lane, band_id in enumerate(first.band_ids) if band_id and lane not in lanes
+    )
+    assert all(read == true for read, true in at_true_lanes(s, protein, case).items())
+
+
+@pytest.mark.parametrize("name", ["all_present", "missing_first"])
+def test_a_row_on_lanes_numbered_right_to_left_reads_them_right_to_left(tmp_path, name):
+    # The other protein's boxes number the lanes right to left, so the row
+    # does too: lane 0 at the box's right end, each band in the lane of the
+    # other protein's box above it, and the record of an empty lane in its own
+    # lane.
+    case = ROWS[name]
+    n = case.n_lanes
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, mirrored=True)
+    found = detected(s, protein, case.row)
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert rects_by_lane(s, protein) == {n - 1 - i: r for i, r in enumerate(found.slots) if r}
+    assert at_true_lanes(s, protein, case) == {
+        n - 1 - true: true for true in range(n) if true in case.reference
+    }
+    empty = [n - 1 - lane.lane for lane in found.lanes if lane.reason == "no_band"]
+    assert list(placement.undetected_lanes) == sorted(empty)
+    assert [u.lane_index for u in protein_of(s, protein).undetected] == sorted(empty)
+    assert placement.right_to_left
+    entry = s.project.log[-1]
+    assert entry.params["right_to_left"] is True
+    assert [lane["band_id"] for lane in entry.params["lanes"]] == list(placement.band_ids)
+
+
+def test_a_row_read_a_lane_off_lanes_numbered_right_to_left_is_refused(tmp_path):
+    case = ROWS["all_present"]
+    row = shifted(case, 70)
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, (3, 4), mirrored=True)
+    refused_as(s, protein, row, OFF_LANES)
+
+
+def test_boxes_the_user_placed_right_to_left_turn_the_row_around(tmp_path):
+    # The protein's own boxes, placed by the user in lanes numbered right to
+    # left, show the direction; the row finds bands under them and replaces
+    # them in place.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, _, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=40, height=12))
+    clicked = [
+        ops.place_box(s, protein, *at_lane(case, true), lane_index=n - 1 - true, grow=False)
+        for true in (1, 2)
+    ]
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.right_to_left
+    assert placement.replaced_band_ids == (clicked[1], clicked[0])  # lanes 3, 4
+    assert placement.band_ids[n - 2] == clicked[0] and placement.band_ids[n - 3] == clicked[1]
+    assert at_true_lanes(s, protein, case) == {n - 1 - true: true for true in range(n)}
+
+
+# Expected lane centres: pitch 70 left of lane 0, then 60, 80, 70, 70.
+EXPECTED = {-1: -70.0, 0: 0.0, 1: 60.0, 2: 140.0, 3: 210.0, 4: 280.0}
+
+
+@pytest.mark.parametrize(
+    ("centres", "off"),
+    [
+        ({0: 0.0, 1: 60.0, 2: 140.0, 3: 210.0}, []),
+        ({0: 29.0}, []),  # towards lane 1: within half of 60
+        ({0: 31.0}, [0]),
+        ({0: -34.0}, []),  # towards lane -1: within half of 70
+        ({0: -36.0}, [0]),
+        ({1: 99.0}, []),  # towards lane 2: within half of 80
+        ({1: 101.0}, [1]),
+        ({1: 31.0}, []),  # towards lane 0: within half of 60
+        ({1: 29.0}, [1]),
+        ({3: 210.0, 0: 31.0, 2: 99.0}, [0, 2]),
+    ],
+)
+def test_a_band_is_off_its_lane_past_half_the_local_pitch(centres, off):
+    assert ops._off_lanes(centres, EXPECTED) == off
+
+
+def test_a_band_is_off_its_lane_on_lanes_numbered_right_to_left():
+    anchors = [(330.0, 0), (270.0, 1), (190.0, 2)]
+    expected = lane_positions(anchors, range(-1, 5))
+    assert expected == {-1: 400.0, 0: 330.0, 1: 270.0, 2: 190.0, 3: 120.0, 4: 50.0}
+    assert ops._off_lanes({0: 301.0, 1: 231.0, 2: 225.0, 3: 154.0}, expected) == []
+    assert ops._off_lanes({0: 299.0, 1: 301.0, 2: 231.0, 3: 156.0}, expected) == [0, 1, 2, 3]

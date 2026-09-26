@@ -21,6 +21,7 @@ from conftest import (
     write_tiff,
 )
 from proteia.core import operations as ops
+from proteia.core import rowdetect
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import LANE_TABLE_DECIMALS
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
@@ -176,6 +177,7 @@ def test_settings_are_the_code_constants():
         },
         "clipped_pixels_threshold": CLIPPED_PIXELS_THRESHOLD,
         "lane_table_decimals": LANE_TABLE_DECIMALS,
+        "detect_row": rowdetect.settings(),  # every row-box detection constant
     }
     parameters = inspect.signature(grow_box).parameters
     assert parameters["rel_threshold"].default == REL_THRESHOLD == 0.3

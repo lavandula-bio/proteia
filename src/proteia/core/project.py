@@ -30,7 +30,7 @@ from __future__ import annotations
 import itertools
 import math
 import statistics
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 
 from proteia.core.model import Batch, ImageRef, Lane
 
@@ -124,7 +124,9 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     return math.floor(lane + (x - cx) / _pitch(pairs) + 0.5)
 
 
-def lane_positions(anchors: Sequence[tuple[float, int]], lanes: Iterable[int]) -> dict[int, float]:
+def lane_positions(
+    anchors: Sequence[tuple[float, int]], lanes: Iterable[int], *, pitch: float | None = None
+) -> dict[int, float]:
     """The expected centre x of each lane in ``lanes``: the inverse of
     :func:`propose_lane`, from the same kept anchors.
 
@@ -132,12 +134,18 @@ def lane_positions(anchors: Sequence[tuple[float, int]], lanes: Iterable[int]) -
     from the nearest kept lane by the median pitch. Empty with fewer than two kept
     lanes (no pitch). Rounding aside, ``propose_lane(lane_positions(a, [k])[k], a)
     == k``. For display, e.g. marking where a lane without a box lies.
+
+    ``pitch`` (px per lane, positive; the kept lanes still set the direction)
+    replaces the median pitch past the kept lanes: a pitch measured over more
+    lanes than they span, since the step of two close lanes, repeated over many,
+    drifts from where the far lanes lie.
     """
     points, sign = _kept(anchors)
     if len(points) < 2:
         return {}
     pairs = list(itertools.pairwise(points))
-    pitch = _pitch(pairs)
+    if pitch is None:
+        pitch = _pitch(pairs)
     positions = {}
     for lane in lanes:
         for (al, ax), (bl, bx) in pairs:
@@ -170,19 +178,22 @@ def _pitch(pairs: Sequence[tuple[tuple[int, float], tuple[int, float]]]) -> floa
     return statistics.median((bx - ax) / (bl - al) for (al, ax), (bl, bx) in pairs)
 
 
-def lane_anchors(batch: Batch, image: ImageRef) -> list[tuple[float, int]]:
+def lane_anchors(
+    batch: Batch, image: ImageRef, *, without: Collection[str] = ()
+) -> list[tuple[float, int]]:
     """``(centre x, stored lane)`` of the first bands on an image, of any protein:
     the anchors :func:`propose_lane` and :func:`lane_positions` take.
 
     A box touching the left or right edge is left out: it may have been shifted
-    inside the image, so its centre need not be its lane's.
+    inside the image, so its centre need not be its lane's. So are the bands
+    whose ids are in ``without`` (boxes a change is about to replace).
     """
     anchors = []
     for protein in batch.proteins:
         if protein.image_id == image.id:
             for band in protein.bands:
                 x0, _, x1, _ = band.box.rect(protein.box_size)
-                if band.band_index == 0 and x0 > 0 and x1 < image.width:
+                if band.band_index == 0 and x0 > 0 and x1 < image.width and band.id not in without:
                     anchors.append(((x0 + x1) / 2, band.lane_index))
     return anchors
 

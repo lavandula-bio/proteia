@@ -174,6 +174,27 @@ def test_lane_positions_interpolate_and_extrapolate():
     assert got[-1] == pytest.approx(50.0 - 105.0)
 
 
+@pytest.mark.parametrize(
+    ("anchors", "kept", "past"),
+    [
+        (
+            [(50.0, 0), (530.0, 4), (800.0, 7)],
+            range(8),
+            {-2: -150.0, -1: -50.0, 8: 900.0, 9: 1000.0},
+        ),
+        ([(330.0, 0), (270.0, 1)], range(2), {-2: 530.0, -1: 430.0, 2: 170.0, 9: -530.0}),
+    ],
+    ids=["smile", "mirrored"],
+)
+def test_lane_positions_step_past_the_kept_lanes_by_a_given_pitch(anchors, kept, past):
+    # Between the kept lanes nothing changes; past them each lane steps 100 px
+    # from the nearest kept lane, in the lanes' own direction.
+    got = lane_positions(anchors, range(-2, 10), pitch=100.0)
+    assert {lane: got[lane] for lane in past} == pytest.approx(past)
+    between = lane_positions(anchors, kept)
+    assert {lane: got[lane] for lane in kept} == between
+
+
 def test_lane_positions_ignore_a_dragged_box():
     anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]
     anchors.append((150.0, 7))  # lane 7 dragged over lane 2
