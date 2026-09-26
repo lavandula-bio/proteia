@@ -27,12 +27,13 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Final
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import proteia
+from proteia.web import api, projects
 
 HOST: Final = "127.0.0.1"
 APP_ID: Final = "proteia"  # what /api/status reports, so a launcher knows it found Proteia
@@ -130,11 +131,19 @@ class Guard:
         await self.app(scope, receive, send_secured)
 
 
-def create_app(*, token: str, port: int, on_quit: Callable[[], None]) -> Guard:
+def create_app(
+    *,
+    token: str,
+    port: int,
+    on_quit: Callable[[], None],
+    workspace: api.Workspace | None = None,
+) -> Guard:
     """The app for one launch served at ``127.0.0.1:port``, admitting ``token``.
 
     ``on_quit`` runs when the page asks the app to quit (``POST /api/quit``); it
-    must return at once, and the server stops after answering.
+    must return at once, and the server stops after answering. ``workspace``
+    holds the projects (default: the app-managed projects root,
+    :func:`~proteia.web.projects.projects_root`), served by :mod:`proteia.web.api`.
     """
     if not TOKEN_PATTERN.fullmatch(token):
         raise ValueError("the token must be 32 to 128 URL-safe characters")
@@ -153,8 +162,14 @@ def create_app(*, token: str, port: int, on_quit: Callable[[], None]) -> Guard:
         return {"app": APP_ID, "version": proteia.__version__}
 
     @app.post("/api/quit", status_code=202)
-    def quit_app() -> dict[str, str]:
+    def quit_app(request: Request) -> dict[str, str]:
+        # Unsaved changes (a failed autosave) are saved first; if that fails the
+        # answer is 409 unsaved_changes and Proteia keeps running.
+        request.app.state.workspace.flush()
         on_quit()
         return {"status": "stopping"}
 
+    if workspace is None:
+        workspace = api.Workspace(projects.projects_root(), reveal=projects.reveal)
+    api.install(app, workspace)
     return Guard(app, token=token, port=port)

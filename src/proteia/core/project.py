@@ -30,9 +30,9 @@ from __future__ import annotations
 import itertools
 import math
 import statistics
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
-from proteia.core.model import Lane
+from proteia.core.model import Batch, ImageRef, Lane
 
 # A protein's net per lane, aligned to the spine; ``None`` marks a gap. Mirrors
 # ``analyze.LaneNets`` without importing the stats layer (project stays upstream).
@@ -112,6 +112,48 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     declared lanes: the caller checks it. It is only a proposal: once stored, a
     band's lane never follows its x again (:func:`join_to_spine`).
     """
+    points, sign = _kept(anchors)
+    if len(points) < 2:
+        return None
+    x *= sign
+    pairs = list(itertools.pairwise(points))
+    for (al, ax), (bl, bx) in pairs:
+        if ax <= x <= bx:
+            return math.floor(al + (x - ax) * (bl - al) / (bx - ax) + 0.5)
+    lane, cx = min(points, key=lambda point: abs(point[1] - x))
+    return math.floor(lane + (x - cx) / _pitch(pairs) + 0.5)
+
+
+def lane_positions(anchors: Sequence[tuple[float, int]], lanes: Iterable[int]) -> dict[int, float]:
+    """The expected centre x of each lane in ``lanes``: the inverse of
+    :func:`propose_lane`, from the same kept anchors.
+
+    Between two neighbouring kept lanes the x is interpolated; elsewhere it steps
+    from the nearest kept lane by the median pitch. Empty with fewer than two kept
+    lanes (no pitch). Rounding aside, ``propose_lane(lane_positions(a, [k])[k], a)
+    == k``. For display, e.g. marking where a lane without a box lies.
+    """
+    points, sign = _kept(anchors)
+    if len(points) < 2:
+        return {}
+    pairs = list(itertools.pairwise(points))
+    pitch = _pitch(pairs)
+    positions = {}
+    for lane in lanes:
+        for (al, ax), (bl, bx) in pairs:
+            if al <= lane <= bl:
+                x = ax + (lane - al) * (bx - ax) / (bl - al)
+                break
+        else:
+            nearest, nx = min(points, key=lambda point: abs(point[0] - lane))
+            x = nx + (lane - nearest) * pitch
+        positions[lane] = sign * x
+    return positions
+
+
+def _kept(anchors: Sequence[tuple[float, int]]) -> tuple[list[tuple[int, float]], int]:
+    """The kept anchors as ``(lane, signed centre x)`` points, rising in both, and
+    the sign (1, or -1 for lanes numbered right to left) of the signed x."""
     by_lane: dict[int, list[float]] = {}
     for cx, lane in anchors:
         by_lane.setdefault(lane, []).append(cx)
@@ -119,18 +161,30 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     rising = _rising(medians)
     falling = _rising([(lane, -cx) for lane, cx in medians])  # lanes numbered right to left
     if len(falling) > len(rising):
-        points, x = falling, -x
-    else:
-        points = rising
-    if len(points) < 2:
-        return None
-    pairs = list(itertools.pairwise(points))
-    for (al, ax), (bl, bx) in pairs:
-        if ax <= x <= bx:
-            return math.floor(al + (x - ax) * (bl - al) / (bx - ax) + 0.5)
-    pitch = statistics.median((bx - ax) / (bl - al) for (al, ax), (bl, bx) in pairs)
-    lane, cx = min(points, key=lambda point: abs(point[1] - x))
-    return math.floor(lane + (x - cx) / pitch + 0.5)
+        return falling, -1
+    return rising, 1
+
+
+def _pitch(pairs: Sequence[tuple[tuple[int, float], tuple[int, float]]]) -> float:
+    """The median x step per lane between neighbouring kept points."""
+    return statistics.median((bx - ax) / (bl - al) for (al, ax), (bl, bx) in pairs)
+
+
+def lane_anchors(batch: Batch, image: ImageRef) -> list[tuple[float, int]]:
+    """``(centre x, stored lane)`` of the first bands on an image, of any protein:
+    the anchors :func:`propose_lane` and :func:`lane_positions` take.
+
+    A box touching the left or right edge is left out: it may have been shifted
+    inside the image, so its centre need not be its lane's.
+    """
+    anchors = []
+    for protein in batch.proteins:
+        if protein.image_id == image.id:
+            for band in protein.bands:
+                x0, _, x1, _ = band.box.rect(protein.box_size)
+                if band.band_index == 0 and x0 > 0 and x1 < image.width:
+                    anchors.append(((x0 + x1) / 2, band.lane_index))
+    return anchors
 
 
 def _rising(points: list[tuple[int, float]]) -> list[tuple[int, float]]:

@@ -8,6 +8,7 @@ from proteia.core.project import (
     align_to_lanes,
     build_spine,
     join_to_spine,
+    lane_positions,
     propose_lane,
     spine_axes,
     spine_from_labels,
@@ -153,6 +154,45 @@ def test_propose_lane_on_a_mirrored_image():
     # Lane 0 is on the right: the centres fall as the lane index rises.
     anchors = [(330.0, 0), (270.0, 1)]
     assert [propose_lane(330 - 60 * lane, anchors) for lane in range(6)] == list(range(6))
+
+
+# --- lane_positions: where a lane is expected, the inverse of propose_lane ---
+
+
+def test_lane_positions_needs_two_anchored_lanes():
+    assert lane_positions([], [0, 1]) == {}
+    assert lane_positions([(100.0, 1), (104.0, 1)], [0, 1, 2]) == {}
+
+
+def test_lane_positions_interpolate_and_extrapolate():
+    # The smiling gel above: lanes 0 and 4 at 50 and 530, lane 7 at 800.
+    anchors = [(50.0, 0), (530.0, 4), (800.0, 7)]
+    got = lane_positions(anchors, [2, 6, 9, -1])
+    assert got[2] == pytest.approx(290.0)
+    assert got[6] == pytest.approx(710.0)
+    assert got[9] == pytest.approx(800.0 + 2 * 105.0)  # median pitch of 120 and 90
+    assert got[-1] == pytest.approx(50.0 - 105.0)
+
+
+def test_lane_positions_ignore_a_dragged_box():
+    anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]
+    anchors.append((150.0, 7))  # lane 7 dragged over lane 2
+    assert lane_positions(anchors, [7])[7] == pytest.approx(450.0)
+
+
+@pytest.mark.parametrize(
+    "anchors",
+    [
+        [(50.0, 0), (530.0, 4), (800.0, 7)],
+        [(330.0, 0), (270.0, 1)],  # mirrored
+        [(140.0, 1), (160.0, 1), (500.0, 1), (350.0, 3)],
+    ],
+    ids=["smile", "mirrored", "outlier"],
+)
+def test_lane_positions_round_trip_through_propose_lane(anchors):
+    lanes = range(-2, 10)
+    positions = lane_positions(anchors, lanes)
+    assert [propose_lane(positions[lane], anchors) for lane in lanes] == list(lanes)
 
 
 # --- join_to_spine: scatter by explicit identity, gaps don't shift ---

@@ -51,6 +51,7 @@ from typing import Final
 import uvicorn
 
 from proteia.core.storage import write_atomic
+from proteia.web.api import UnsavedChangesError, Workspace
 from proteia.web.server import APP_ID, HOST, TOKEN_PATTERN, create_app
 
 if os.name == "nt":
@@ -265,21 +266,34 @@ class Instance:
     stops; :meth:`stop` (or Quit on the page, or a stop signal when served from the
     main thread) stops it."""
 
-    def __init__(self, folder: Path, sock: socket.socket, token: str, lock: InstanceLock):
+    def __init__(
+        self,
+        folder: Path,
+        sock: socket.socket,
+        token: str,
+        lock: InstanceLock,
+        workspace: Workspace | None = None,
+    ) -> None:
         self.folder = folder
         self.sock = sock
         self.token = token
         self._lock = lock
         self.port: int = sock.getsockname()[1]
         self.redirect_path = folder / REDIRECT_FILE
-        self.server = _server(create_app(token=token, port=self.port, on_quit=self.stop))
+        app = create_app(token=token, port=self.port, on_quit=self.stop, workspace=workspace)
+        self.workspace: Workspace = app.app.state.workspace
+        self.server = _server(app)
 
     def serve(self) -> None:
-        """Serve until stopped, then :meth:`close`."""
+        """Serve until stopped, save what an autosave could not, then :meth:`close`."""
         try:
             with _stop_on_signals(self.stop):
                 self.server.run(sockets=[self.sock])
         finally:
+            try:
+                self.workspace.flush()
+            except UnsavedChangesError as exc:
+                print(f"Proteia stopped, but {exc}", file=sys.stderr)
             self.close()
 
     def stop(self) -> None:
@@ -314,7 +328,11 @@ def _open_running(folder: Path, opener: Opener, wait: float) -> InstanceLock | N
 
 
 def start(
-    *, folder: Path | None = None, opener: Opener = webbrowser.open, wait: float = STARTUP_WAIT
+    *,
+    folder: Path | None = None,
+    opener: Opener = webbrowser.open,
+    wait: float = STARTUP_WAIT,
+    workspace: Workspace | None = None,
 ) -> Instance | None:
     """Open the running instance in the browser (None), or start one and open it.
 
@@ -335,7 +353,8 @@ def start(
     try:
         sock = bind_loopback()
         try:
-            instance = Instance(folder, sock, secrets.token_urlsafe(TOKEN_BYTES), lock)
+            token = secrets.token_urlsafe(TOKEN_BYTES)
+            instance = Instance(folder, sock, token, lock, workspace)
         except BaseException:
             sock.close()
             raise

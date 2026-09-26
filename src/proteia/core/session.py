@@ -178,8 +178,12 @@ class ProjectSession:
         """Now, from the session clock, in the log's form (UTC, milliseconds, Z)."""
         return format_timestamp(self.clock())
 
-    def pixels(self, image_id: str) -> np.ndarray:
+    def pixels(self, image_id: str, *, keep: bool = True) -> np.ndarray:
         """The image's read-only analysis array, read and checked on first use.
+
+        ``keep=False`` reads it without adding it to the cache (for a display
+        preview, which should not hold every viewed image in memory); an array
+        already cached is returned either way.
 
         Raises ``UnknownIdError``, or :class:`OperationError` with
         ``IMAGE_FILE_CHANGED`` (the file is missing, its bytes no longer match the
@@ -220,7 +224,8 @@ class ProjectSession:
                     ids=(image_id,),
                 )
             array.flags.writeable = False
-            self._pixels[image_id] = array
+            if keep:
+                self._pixels[image_id] = array
             return array
 
     def save(self) -> Path:

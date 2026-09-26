@@ -1886,6 +1886,11 @@ LOGGED_STEPS = [
         lambda s: {"band_id": "band-10", "protein_id": "prot-4", "lane_index": 1},
     ),
     (
+        lambda s: ops.set_box_lane(s, "band-11", 1),  # into the lane band-10 left
+        "set_box_lane",
+        lambda s: {"band_id": "band-11", "protein_id": "prot-4", "from_lane": 2, "lane_index": 1},
+    ),
+    (
         lambda s: ops.remove_image(s, "img-1"),
         "remove_image",
         lambda s: {
@@ -1910,6 +1915,40 @@ def _run_logged_steps(tmp_path: Path, check) -> ProjectSession:
     return s
 
 
+def test_set_box_lane_changes_the_stored_lane_not_the_box(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    a = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    b = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=False)
+    before = band_of(s, a)
+    ops.set_box_lane(s, a, 2)
+    after = band_of(s, a)
+    assert (after.lane_index, after.manually_edited) == (2, True)
+    assert (after.box, after.net, after.clipped) == (before.box, before.net, before.clipped)
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params["from_lane"], entry.params["lane_index"]) == (
+        "set_box_lane",
+        0,
+        2,
+    )
+    committed = s.project
+    ops.set_box_lane(s, a, 2)  # the same lane: a no-op
+    assert s.project is committed
+
+    with pytest.raises(OperationError) as info:
+        ops.set_box_lane(s, a, 1)
+    assert (info.value.code, info.value.ids) == (ErrorCode.LANE_OCCUPIED, (b,))
+    for lane in (3, -1):
+        with pytest.raises(OperationError) as info:
+            ops.set_box_lane(s, a, lane)
+        assert info.value.code is ErrorCode.LANE_OUT_OF_RANGE
+    with pytest.raises(OperationError) as info:
+        ops.set_box_lane(s, a, "1")
+    assert info.value.code is ErrorCode.INVALID_INPUT
+    with pytest.raises(UnknownIdError):
+        ops.set_box_lane(s, "band-999", 0)
+    assert s.project is committed
+
+
 def test_each_operation_logs_its_params(tmp_path):
     def check(s: ProjectSession, action: str, expected) -> None:
         entry = s.project.log[-1]
@@ -1931,6 +1970,7 @@ def test_each_operation_logs_its_params(tmp_path):
         "place_box",
         "move_box",
         "remove_box",
+        "set_box_lane",
         "set_box_size",
     }
     text = (s.folder / storage.PROJECT_FILE).read_text(encoding="utf-8")
