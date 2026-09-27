@@ -52,7 +52,11 @@ Without the header there is no check. Either way the route runs, and answers,
 within the opening it was given: Proteia reads the open project's
 ``project.json`` again only once no such request runs, and one made meanwhile
 waits for that, then is checked (:meth:`Workspace.using`); so no edit is made
-in, and no answer is about, an opening the request did not name. ``GET
+in, and no answer is about, an opening the request did not name. An upload
+(``POST /api/images``) is checked before any of its body is read, and again
+once the body is stored: only its import and answer run within the opening,
+so a file that takes minutes to arrive holds up no reopen, and an upload
+whose opening ended meanwhile is refused, with nothing imported. ``GET
 /api/workspace`` answers which project is open, and its open id, without
 reading it: for a page to find out. The routes that list, create or open
 projects, and the status and quit routes, need no opening.
@@ -651,16 +655,30 @@ def _open_session(request: Request) -> Iterator[ProjectSession]:
     (:meth:`Workspace.using`), so the route runs, and answers, within the
     opening checked. A dependency runs before the route checks its path, query
     and body (only a body that is not JSON is refused first), so such a request
-    is refused before anything is done, an upload before its bytes are read. A
-    sync generator, so its code on either side of the yield runs in the thread
-    pool and never blocks the event loop, waiting for a reopen included. Of
-    scope ``function`` (:data:`OpenSession`): its session is done with once the
-    route returns, before its answer is sent."""
+    is refused before anything is done. A sync generator, so its code on either
+    side of the yield runs in the thread pool and never blocks the event loop,
+    waiting for a reopen included. Of scope ``function`` (:data:`OpenSession`):
+    its session is done with once the route returns, before its answer is
+    sent."""
     with _workspace(request).using(_opening(request)) as session:
         yield session
 
 
 OpenSession = Annotated[ProjectSession, Depends(_open_session, scope="function")]
+
+
+def _checked_session(request: Request) -> ProjectSession:
+    """The open project's session, checked as :func:`_open_session` checks it,
+    and as early, but not taken in use: for a route that reads its request's
+    body before it uses the session (:func:`import_image`), and then takes it in
+    use itself (:meth:`Workspace.using`), checked again. So an upload naming an
+    opening no longer open is refused before any of its bytes are read, and one
+    under way holds up no reopen. A sync function, so it runs in the thread
+    pool and never blocks the event loop."""
+    return _workspace(request).current(_opening(request))
+
+
+CheckedSession = Annotated[ProjectSession, Depends(_checked_session)]
 
 
 def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
@@ -811,7 +829,7 @@ def reveal_project(
 @router.post("/images", status_code=201)
 async def import_image(
     request: Request,
-    session: OpenSession,
+    checked: CheckedSession,
     workspace: WorkspaceDep,
     name: Annotated[str, Query(min_length=1)],
     kind: str,
@@ -819,13 +837,24 @@ async def import_image(
     membrane_id: str | None = None,
 ) -> dict[str, Any]:
     """The request body is the file's bytes; ``name`` is its original name
-    (percent-encoded in the URL), kept only as metadata."""
+    (percent-encoded in the URL), kept only as metadata.
+
+    The opening the request names is checked before any of its bytes are read
+    (:func:`_checked_session`), but the session is taken in use only once the
+    body is stored, which for a large file may take minutes: a reopen meanwhile
+    does not wait for the upload (:meth:`Workspace.open`). Then it is checked
+    again, and the import is made and answered within that opening
+    (:meth:`Workspace.using`): an upload whose opening a reopen or a switch
+    ended meanwhile is refused ``project_changed``, with nothing imported and
+    its temporary file removed; one that names none is imported into the
+    project open then."""
+    opening = _opening(request)  # as _checked_session read it
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
         raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
     # Spooled to a temporary file on the project's drive (not the system drive),
     # never held in memory whole; import_image then copies it into images/.
-    with tempfile.TemporaryFile(dir=session.folder) as spool:
+    with tempfile.TemporaryFile(dir=checked.folder) as spool:
         size = 0
         pending = bytearray()
         async for chunk in request.stream():
@@ -839,19 +868,23 @@ async def import_image(
         if pending:
             await run_in_threadpool(spool.write, bytes(pending))
         spool.seek(0)
-        image_id = await run_in_threadpool(
-            lambda: ops.import_image(
-                session,
-                spool,
-                name,
-                kind=kind,
-                polarity=polarity,
-                membrane_id=membrane_id,
-                max_bytes=MAX_UPLOAD_BYTES,
-            )
-        )
-    # Computing the results takes a while: off the event loop, like the import.
-    return await run_in_threadpool(lambda: _answer(workspace, session, image_id=image_id))
+
+        def imported() -> dict[str, Any]:
+            with workspace.using(opening) as session:
+                image_id = ops.import_image(
+                    session,
+                    spool,
+                    name,
+                    kind=kind,
+                    polarity=polarity,
+                    membrane_id=membrane_id,
+                    max_bytes=MAX_UPLOAD_BYTES,
+                )
+                return _answer(workspace, session, image_id=image_id)
+
+        # Waiting for a reopen under way, importing and computing the results
+        # take a while: off the event loop.
+        return await run_in_threadpool(imported)
 
 
 @router.delete("/images/{image_id}")

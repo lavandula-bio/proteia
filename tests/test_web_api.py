@@ -3415,10 +3415,13 @@ def test_every_route_on_the_open_project_refuses_another_opening(client, tmp_pat
     # A page still showing Other must neither edit nor read Blot, whose ids are
     # Other's too (img-1, prot-1). Each route is sent with the ids Blot has and
     # no body: the refusal comes before the body is read, and changes nothing.
+    # So is each route that takes its session in use only later
+    # (USES_ITS_SESSION_LATER): it checks the opening as early.
     routes = api_routes()
     assert set(NEEDS_NO_OPENING) <= routes  # none of them has gone
     guarded = sorted(routes - set(NEEDS_NO_OPENING))
     assert {("GET", "/api/project"), ("PUT", "/api/boxes/{band_id}")} <= set(guarded)
+    assert set(USES_ITS_SESSION_LATER) <= set(guarded)
     answer, shown = opened_elsewhere(client, tmp_path)
     project = answer["project"]
     protein = next(p for p in project["proteins"] if p["bands"])
@@ -3798,27 +3801,241 @@ def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_
     assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
 
 
+# The routes on the open project that check the opening their request names as
+# early as every other (before its path, query and body are), but take the
+# session in use only later, themselves, and why. Each has a test of its own
+# that it holds the session while it uses it.
+USES_ITS_SESSION_LATER = {
+    ("POST", "/api/images"): "reads its body first, which may take minutes: no reopen waits for it",
+}
+
+
 def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
     # The routes as test_every_route_on_the_open_project_refuses_another_opening
     # finds them: each gets its session from _open_session, which keeps it in
     # use (Workspace.using) until the route returns, so no reopen reads the
-    # project again while one runs.
+    # project again while one runs. Those in USES_ITS_SESSION_LATER get it from
+    # _checked_session, which checks it and no more, and take it in use
+    # themselves (test_an_upload_holds_its_session_while_it_imports_and_answers).
     workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
     app = server.create_app(
         token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
     ).app
 
-    def holders(dependant: Any) -> Iterator[Any]:
+    def given(dependant: Any, call: Callable[..., Any]) -> Iterator[Any]:
         for sub in dependant.dependencies:
-            if sub.call is api._open_session:
+            if sub.call is call:
                 yield sub
-            yield from holders(sub)
+            yield from given(sub, call)
 
     guarded = api_routes() - set(NEEDS_NO_OPENING)
+    assert set(USES_ITS_SESSION_LATER) <= guarded
     found = {
-        (method, route.path): [sub.scope for sub in holders(route.dependant)]
+        (method, route.path): (
+            [sub.scope for sub in given(route.dependant, api._open_session)],
+            [sub.scope for sub in given(route.dependant, api._checked_session)],
+        )
         for route in _declared(app.routes)
         for method in route.methods
         if (method, route.path) in guarded
     }
-    assert found == dict.fromkeys(guarded, ["function"])
+    assert found == {
+        route: ([], [None]) if route in USES_ITS_SESSION_LATER else (["function"], [])
+        for route in guarded
+    }
+
+
+# --- An upload holds its session only once its body is stored (#134's review) ---
+
+UPLOAD = "/api/images?name=a.tif&kind=chemiluminescence&polarity=dark_on_light"
+
+
+def _spools(monkeypatch) -> threading.Event:
+    """Set once an upload's route makes the temporary file its body goes to:
+    the request is past its check, and its body is read next."""
+    made = threading.Event()
+    temporary_file = api.tempfile.TemporaryFile
+
+    def spool(*args: Any, **kwargs: Any) -> Any:
+        made.set()
+        return temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(api.tempfile, "TemporaryFile", spool)
+    return made
+
+
+def _upload_begun(
+    client: Client, size: int, headers: dict[str, str] | None = None
+) -> http.client.HTTPConnection:
+    """An upload of ``size`` bytes (:data:`UPLOAD`) with its request line and
+    headers sent, and none of its body: the caller sends the body, as slowly as
+    it likes, reads the answer (:func:`_answered`) and closes the connection."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    conn.putrequest("POST", UPLOAD)
+    sent = {
+        "Authorization": f"Bearer {client.token}",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(size),
+        **(headers or {}),
+    }
+    for name, value in sent.items():
+        conn.putheader(name, value)
+    conn.endheaders()
+    return conn
+
+
+def _answered(conn: http.client.HTTPConnection) -> tuple[int, Any]:
+    response = conn.getresponse()
+    return response.status, json.loads(response.read())
+
+
+def _lanes_set(client: Client, name: str) -> tuple[dict, Path, bytes]:
+    """The project ``name`` created, then its lanes set. Gives that answer's
+    project (opening 1, as a page shows it), the project folder, and its
+    project.json from before the lanes were set: an earlier copy, which, once
+    restored outside Proteia, a reopen reads again."""
+    client.ok("POST", "/api/projects", {"name": name})
+    folder = client.root / name
+    earlier = (folder / storage.PROJECT_FILE).read_bytes()
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    return shown, folder, earlier
+
+
+def test_a_reopen_does_not_wait_for_an_upload_whose_body_is_on_its_way(
+    client, tmp_path, monkeypatch
+):
+    # A large file over a slow link takes seconds or minutes to arrive. Were
+    # the session in use meanwhile, a reopen from another page would hold up
+    # every request on the project for REOPEN_WAIT_S, then give up and leave
+    # the changed file unread, with nothing to say so. The upload holds nothing
+    # until its body is stored: the reopen reads the file at once, and an
+    # upload naming no opening is then imported into the project read again.
+    shown, folder, earlier = _lanes_set(client, "Blot")
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    data = blot_bytes(tmp_path)
+    spooled = _spools(monkeypatch)
+    conn = _upload_begun(client, len(data))
+    try:
+        conn.send(data[:1000])
+        assert spooled.wait(20)
+        started = time.monotonic()
+        reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})["project"]
+        took = time.monotonic() - started
+        conn.send(data[1000:])
+        status, imported = _answered(conn)
+    finally:
+        conn.close()
+    assert (reopened["open_id"], reopened["lanes"]) == (shown["open_id"] + 1, [])
+    assert took < api.REOPEN_WAIT_S
+    assert status == 201, imported
+    project = imported["project"]
+    assert (project["open_id"], project["lanes"]) == (reopened["open_id"], [])
+    assert [image["id"] for image in project["images"]] == [imported["image_id"]]
+
+
+@pytest.mark.parametrize(("meanwhile", "now"), [("reopen", "Blot"), ("create", "Other")])
+def test_an_upload_whose_opening_ended_on_its_way_is_refused_and_leaves_nothing(
+    client, tmp_path, monkeypatch, meanwhile, now
+):
+    # The page named opening 1. While its file was on its way, another page
+    # opened the project again, which was read again (opening 2: perhaps with
+    # other images and lanes), or created another project. The import is not
+    # made in a project the page does not show: it is refused once the body is
+    # stored, and neither the image nor its file is left, nor the temporary
+    # file the body went to.
+    shown, folder, earlier = _lanes_set(client, "Blot")
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    before = files_of(folder)
+    data = blot_bytes(tmp_path)
+    spooled = _spools(monkeypatch)
+    conn = _upload_begun(client, len(data), {OPENING: str(shown["open_id"])})
+    try:
+        conn.send(data[:1000])
+        assert spooled.wait(20)
+        if meanwhile == "reopen":
+            client.ok("POST", "/api/projects/open", {"name": "Blot"})
+        else:
+            client.ok("POST", "/api/projects", {"name": "Other"})
+        conn.send(data[1000:])
+        status, answer = _answered(conn)
+    finally:
+        conn.close()
+    open_id = shown["open_id"] + 1
+    assert status == 409, answer
+    assert (answer["code"], answer["detail"]) == (
+        "project_changed",
+        {"open": now, "open_id": open_id},
+    )
+    assert files_of(folder) == before
+    project = client.ok("GET", "/api/project")["project"]
+    assert (project["name"], project["open_id"], project["images"]) == (now, open_id, [])
+
+
+def test_an_upload_naming_another_opening_is_refused_before_its_body_is_read(
+    client, tmp_path, monkeypatch
+):
+    # Refused on its headers alone: none of a file of perhaps hundreds of
+    # megabytes is read, or stored even for a while, for a page that shows a
+    # project no longer open. The body is never sent: were it waited for, no
+    # answer would come.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("POST", "/api/projects", {"name": "Other"})  # opening 2
+    before = files_of(client.root)
+    spooled = _spools(monkeypatch)
+    conn = _upload_begun(client, len(blot_bytes(tmp_path)), {OPENING: "1"})
+    try:
+        status, answer = _answered(conn)
+    finally:
+        conn.close()
+    assert (status, answer["code"], answer["detail"]) == (
+        409,
+        "project_changed",
+        {"open": "Other", "open_id": 2},
+    )
+    assert not spooled.is_set()
+    assert files_of(client.root) == before
+
+
+@pytest.mark.parametrize("held", ["import", "answer"])
+def test_an_upload_holds_its_session_while_it_imports_and_answers(
+    client, tmp_path, monkeypatch, held
+):
+    # Once its body is stored the upload takes the session in use, as every
+    # other route on the open project does from its start
+    # (USES_ITS_SESSION_LATER): its import is made, and answered, within the
+    # opening it named. project.json changes outside Proteia while it runs; a
+    # reopen meanwhile waits for it, then finds the import saved over the
+    # change (held in the import) or reads the change (held in the answer).
+    shown, folder, earlier = _lanes_set(client, "Blot")
+    session = client.workspace.current()
+    owner, name = {"import": (api.ops, "import_image"), "answer": (api, "_answer")}[held]
+    entered, release = _held_until_released(monkeypatch, owner, name)
+    asked = _reads_recorded(monkeypatch, session)
+    data = blot_bytes(tmp_path)
+    uploading, uploaded = _in_thread(
+        lambda: client.call("POST", UPLOAD, raw=data, headers={OPENING: str(shown["open_id"])})
+    )
+    assert entered.wait(20)
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    reopening, reopened = _in_thread(
+        lambda: client.call("POST", "/api/projects/open", {"name": "Blot"})
+    )
+    reopening.join(1.0)  # time to read the file, were it not waiting for the upload
+    read_meanwhile = asked.is_set()
+    release.set()
+    for thread in (uploading, reopening):
+        thread.join(30)
+        assert not thread.is_alive()
+
+    (status, answer), (reopen_status, reopen) = uploaded[0], reopened[0]
+    assert status == 201, answer
+    project = answer["project"]
+    assert (project["open_id"], project["lanes"]) == (shown["open_id"], shown["lanes"])
+    assert [image["id"] for image in project["images"]] == [answer["image_id"]]
+    assert not read_meanwhile
+    assert reopen_status == 200, reopen
+    after = reopen["project"]
+    if held == "import":  # saved over the change: nothing to read
+        assert (after["open_id"], after["revision"]) == (shown["open_id"], project["revision"])
+    else:
+        assert (after["open_id"], after["lanes"], after["images"]) == (shown["open_id"] + 1, [], [])
