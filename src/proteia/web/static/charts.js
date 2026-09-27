@@ -164,10 +164,30 @@ function setNotices(sets) {
   return notices;
 }
 
+// The notices about one series (its test, its values), not about each of its
+// proteins: their protein ids are its target and its loading control, in that
+// order (the core's SERIES_NOTICE_CODES).
+const ONE_SERIES = new Set([
+  "reference_unusable",
+  "loading_not_positive",
+  "no_values",
+  "no_plotted_values",
+  "conditions_not_tested",
+  "test_not_applicable",
+  "log_scale_unavailable",
+  "rank_test_cannot_reach_alpha",
+]);
+
+// Whether a notice is about a series: one about a series, only its own (not
+// that of another target over the same loading control); one about proteins,
+// if it names either of the series' (a loading control's over-exposure is
+// about every target normalized to it).
 function aboutSeries(notice, series) {
-  return (
-    notice.protein_ids.includes(series.target_id) || notice.protein_ids.includes(series.loading_id)
-  );
+  const ids = notice.protein_ids;
+  if (ONE_SERIES.has(notice.code)) {
+    return ids[0] === series.target_id && ids[1] === series.loading_id;
+  }
+  return ids.includes(series.target_id) || ids.includes(series.loading_id);
 }
 
 // Why a series has no chart: its own notice that says so, else the set's.

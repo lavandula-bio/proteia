@@ -1420,6 +1420,26 @@ def test_each_set_keeps_the_test_notices_of_its_own_charts():
         assert one.series[0].chart.coverage[-1].left_out == "fewer_than_2"
 
 
+def test_a_notice_about_one_series_names_its_target_then_its_loading_control():
+    # Cyclin D1, a second target over α-tubulin, loses its lane-8 box: its chart
+    # leaves 50 µM out of the test, β-catenin's does not. The page shows such a
+    # notice under the series these ids name, not under every chart of α-tubulin.
+    doc = _baseline_batch(REFERENCE).model_dump()
+    beta = doc["proteins"][0]
+    cyclin = {**beta, "id": "prot-5", "name": "Cyclin D1"}
+    cyclin["bands"] = [{**band, "id": f"band-{50 + i}"} for i, band in enumerate(beta["bands"][:7])]
+    res = compute_results(
+        model.Batch.model_validate({**doc, "proteins": [*doc["proteins"], cyclin]})
+    )
+    assert [(s.target_id, s.loading_id) for s in res.series] == [
+        ("prot-3", "prot-4"),
+        ("prot-5", "prot-4"),
+    ]
+    notice = _one(res, NoticeCode.CONDITIONS_NOT_TESTED)
+    assert notice.protein_ids == ("prot-5", "prot-4")
+    assert results.TEST_NOTICE_CODES <= results.SERIES_NOTICE_CODES
+
+
 def test_a_choice_that_cannot_apply_is_a_warning():
     res = compute_results(_baseline_batch(None), statistics={"comparisons": "vs_reference"})
     notice = _one(res, NoticeCode.TEST_NOT_APPLICABLE)
@@ -1497,6 +1517,55 @@ def test_a_replicate_the_loading_control_misses_has_no_value_but_counts():
     assert chart.bars[0].label == "vehicle" and chart.bars[0].not_detected_lanes == []
     assert (chart.coverage[0].n, chart.coverage[0].replicates) == (1, 2)
     assert chart.coverage[0].left_out == "fewer_than_2"
+
+
+def _with_a_ladder(batch: model.Batch, *, included: bool) -> model.Batch:
+    """``batch`` with one more lane, ``Ladder``: no box and no record of any protein."""
+    ladder = Lane(index=len(batch.lanes), label="Ladder", included=included)
+    return batch.model_copy(update={"lanes": [*batch.lanes, ladder]})
+
+
+@pytest.mark.parametrize("included", [False, True])
+def test_a_lane_holding_nothing_for_a_series_changes_none_of_its_charts(included):
+    # Excluded, the ladder is in the all-lanes set only (lane 5 is excluded and
+    # holds values); included, in both. It holds nothing for β-catenin /
+    # α-tubulin, so it is no replicate and no condition: no place on a chart, no
+    # condition left out of a test, no notice.
+    plain = compute_results(_baseline_batch(REFERENCE))
+    res = compute_results(_with_a_ladder(_baseline_batch(REFERENCE), included=included))
+    assert res.all_lanes is not None
+    for one, without in ((res, plain), (res.all_lanes, plain.all_lanes)):
+        assert [s.chart for s in one.series] == [s.chart for s in without.series]
+        assert one.notices == without.notices
+
+
+def test_an_empty_lane_the_user_excluded_is_not_charted_in_all_lanes():
+    # Lane 0 is relabelled "Ladder", emptied and excluded; lane 3, excluded,
+    # holds values, so the all-lanes set includes the ladder.
+    def ladder_in_lane_0(draft: Project) -> None:
+        for protein in draft.batch.proteins:
+            protein.bands = [b for b in protein.bands if b.lane_index != 0]
+        draft.batch.lanes[0].label = "Ladder"
+        draft.batch.lanes[0].included = False
+
+    res = compute_results(_batch(ladder_in_lane_0))
+    for one in (res, res.all_lanes):
+        chart = one.series[0].chart
+        assert [bar.label for bar in chart.bars] == ["vehicle", "10 µM"]
+        assert not any("Ladder" in line for line in chart.statement)
+        assert not any("Ladder" in n.conditions or "Ladder" in n.message for n in one.notices)
+    # A condition keeps its place while one of its lanes holds something for the
+    # series: 10 µM's lane 2 has an α-tubulin band, and no β-catenin one.
+    assert res.series[0].chart.coverage[1].left_out == "no_value"
+
+
+def test_a_lane_holding_nothing_for_a_series_is_no_replicate():
+    # Lane 1 (vehicle, v2) keeps only its GAPDH band: nothing of β-catenin /
+    # α-tubulin, so no replicate of vehicle on that chart.
+    batch = _batch(*(_no_bands(p, 1) for p in ("prot-7", "prot-8")))
+    chart = compute_results(batch).series[0].chart
+    assert chart.bars[0].label == "vehicle"
+    assert (chart.coverage[0].n, chart.coverage[0].replicates) == (1, 1)
 
 
 # --- #112: bands the over-exposure check could not run on ---

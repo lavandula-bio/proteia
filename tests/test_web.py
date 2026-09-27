@@ -27,7 +27,7 @@ from typing import get_args
 import pytest
 
 import proteia
-from proteia.core import rowdetect
+from proteia.core import results, rowdetect
 from proteia.web import launch, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
 
@@ -613,3 +613,18 @@ def test_the_page_words_every_row_warning_and_empty_lane_reason():
     script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     assert _object_keys(script, "ROW_WARNINGS") == set(rowdetect.WARNING_FLAGS)
     assert _object_keys(script, "NOT_MEASURED") == set(get_args(rowdetect.LaneReason)) - {"band"}
+
+
+def _set_members(script: str, name: str) -> set[str]:
+    """The strings of the set literal ``const <name> = new Set([...]);`` in a script."""
+    body = script[script.index(f"const {name} = new Set([") :].split("]);", 1)[0]
+    return set(re.findall(r'"(\w+)"', body))
+
+
+def test_the_page_shows_a_notice_about_one_series_under_that_series_only():
+    # A notice about one series (its test, its values) names the series' target
+    # and loading control. The page shows it, and counts it in the card header,
+    # under that series' chart only, not under another target's over the same
+    # loading control (#52); for that it keeps the core's list of such notices.
+    script = (server.STATIC_DIR / "charts.js").read_text(encoding="utf-8")
+    assert _set_members(script, "ONE_SERIES") == set(results.SERIES_NOTICE_CODES)

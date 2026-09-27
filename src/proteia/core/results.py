@@ -39,9 +39,12 @@ compute argument like the error type: ``auto`` chooses the test from the design
 states the test that ran, the conditions it covers and those it leaves out
 (:func:`~proteia.core.plotspec.build_plotspec`). A condition with a replicate
 the target was not detected in keeps its place on the chart, draws no bar and
-is not tested. The two result sets may resolve to different tests (an exclusion
-can make the replicates unequal); each chart states its own. There is no
-correction across charts: the charts of several targets are each their own
+is not tested; so does a condition with no value while one of its lanes holds a
+box or a not-detected record of the chart's target or loading control. A lane
+holding none (a ladder, an empty lane) is no replicate of the chart and gives
+its condition no place. The two result sets may resolve to different tests (an
+exclusion can make the replicates unequal); each chart states its own. There is
+no correction across charts: the charts of several targets are each their own
 family of comparisons.
 
 Notice messages count lanes from 1, as the user does; every index field
@@ -154,6 +157,20 @@ TEST_NOTICE_CODES = frozenset(
         NoticeCode.TEST_NOT_APPLICABLE,
         NoticeCode.LOG_SCALE_UNAVAILABLE,
         NoticeCode.RANK_TEST_CANNOT_REACH_ALPHA,
+    }
+)
+# Notices about one series, not about each of its proteins: their protein_ids
+# are the series' target and loading control, in that order, and they concern
+# its chart alone, not that of another series sharing one of the proteins (a
+# second target over the same loading control). The web page keeps the same
+# list, pinned by a test.
+SERIES_NOTICE_CODES = frozenset(
+    {
+        NoticeCode.REFERENCE_UNUSABLE,
+        NoticeCode.LOADING_NOT_POSITIVE,
+        NoticeCode.NO_VALUES,
+        NoticeCode.NO_PLOTTED_VALUES,
+        *TEST_NOTICE_CODES,
     }
 )
 # The background modes of a ring cut short (quantify.band_backgrounds).
@@ -429,10 +446,12 @@ def _chart(
     conditions) and its test; None when no plotted condition has a value.
 
     ``replicates`` is every included replicate's lanes by condition
-    (:func:`~proteia.core.analyze.replicate_lanes`), so a plotted condition with
-    no value keeps its place. A replicate with no value (``values``) whose target
-    was not detected in one of its lanes (``detected``) is not detected: its
-    condition draws no bar and is left out of the test."""
+    (:func:`~proteia.core.analyze.replicate_lanes`), over the lanes that hold
+    something for the series, so a plotted condition with no value keeps its
+    place while a lane that holds nothing (a ladder) has none. A replicate with
+    no value (``values``) whose target was not detected in one of its lanes
+    (``detected``) is not detected: its condition draws no bar and is left out
+    of the test."""
     plotted = [c for c in replicates if chosen is None or c in chosen]
     shown = {c: groups[c] for c in plotted if c in groups}
     if not shown:
@@ -785,7 +804,6 @@ def _compute(
         )
 
     # 7. One series per (target, resolved loading control), each reduced once.
-    replicates = replicate_lanes(conditions, samples, included)
     series: list[SeriesResult] = []
     averaged: list[tuple[str, str]] = []
     if tier is not Tier.EXPORT_ONLY:
@@ -871,10 +889,18 @@ def _compute(
                     title = f"{s.target} fold-change vs {ref}  (/{s.loading})"
                 else:
                     title = f"{s.target} / {s.loading}"
+                # A lane is a replicate's when it holds a box or a not-detected
+                # record of the target or its loading control. One holding
+                # neither (a ladder, an empty lane) gives no value, so it gives
+                # no condition a place either, and changes nothing in either set.
+                held = [
+                    included[i] and any(detected[pid][i] is not None for pid in pair_ids)
+                    for i in range(n)
+                ]
                 charted = _chart(
                     groups,
                     red.lanes,
-                    replicates,
+                    replicate_lanes(conditions, samples, held),
                     s.values,
                     detected[target_id],
                     chosen=chosen,
