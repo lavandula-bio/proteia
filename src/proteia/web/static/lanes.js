@@ -45,27 +45,40 @@ function sameTable(a, b) {
   );
 }
 
-// The reference condition's new name when the edit renames it: every lane of
-// it gets one new name, and no lane keeps the old one (in any look-alike
-// spelling). Otherwise null, and the edit leaves the reference out: the server
-// keeps it while a lane still has it, with the lanes that have it after the
-// edit (labels swapped between lanes keep it with its label), and clears it,
-// and says so, once none has.
-function followedReference(reference, before, after) {
-  if (reference === null) {
+// The reference condition's new name when the edit `after` renames it, or
+// null. `remembered`: the indices of the lanes that have had the reference
+// condition at any time since the reference was set to that name, in this
+// opening of the project (LaneTable.rememberReference()). The reference
+// follows the rename, sent as typed and tidied, only when no lane keeps the
+// old name (in any look-alike spelling), every remembered lane still exists
+// and now has one and the same non-blank name, and no lane outside the
+// remembered ones has that name after the edit. So renaming the lanes of
+// [vehicle, vehicle] to DMSO one by one follows at the last (both lanes were
+// vehicle), while lane 1 of [vehicle, A, A] retyped A, a mislabel fixed, does
+// not make A the reference; nor does a lane of it relabelled to another
+// condition before the last one is renamed. Otherwise null, and the edit
+// leaves the reference out: the server keeps it while a lane still has it,
+// with the lanes that have it after the edit (labels swapped between lanes
+// keep it with its label), and clears it, and says so, once none has.
+function followedReference(reference, remembered, after) {
+  if (reference === null || !remembered || !remembered.size) {
     return null;
   }
   const key = textKey(reference);
   if (after.some((lane) => textKey(lane.condition) === key)) {
     return null;
   }
-  const lanes = [...before.keys()].filter((i) => before[i].condition === reference);
-  if (!lanes.length || lanes.some((i) => i >= after.length)) {
+  const lanes = [...remembered];
+  if (lanes.some((i) => i >= after.length)) {
     return null;
   }
   const names = new Set(lanes.map((i) => tidy(after[i].condition)));
   const [name] = names;
-  return names.size === 1 && name ? name : null;
+  if (names.size !== 1 || !name) {
+    return null;
+  }
+  const others = [...after.keys()].filter((i) => !remembered.has(i));
+  return others.some((i) => textKey(after[i].condition) === textKey(name)) ? null : name;
 }
 
 // Put a value in a control. A text field that has the focus keeps its text
@@ -142,6 +155,9 @@ export class LaneTable {
     this.synced = new Map(); // control key -> the value it last matched the table with (fill)
     this.sent = new Map(); // control key -> {value}: its last commit, until answered
     this.refused = null; // the boxes a lanes_in_use message shown names (ids), or null
+    // {openId, name, lanes}: the lanes that have had the reference condition
+    // since the reference was set to `name` (rememberReference()), or null.
+    this.referenceLanes = null;
     this.bind();
     // A cell scrolled to (by the keyboard) is not left under the sticky header,
     // nor under the lane number and condition, which stay while it scrolls sideways.
@@ -159,11 +175,13 @@ export class LaneTable {
     });
   }
 
-  // Forget what was typed and what a refusal said: another project is shown now.
+  // Forget what was typed, what a refusal said and the reference's lanes:
+  // another project is shown now.
   forgetTyped() {
     this.stored.clear();
     this.synced.clear();
     this.sent.clear();
+    this.referenceLanes = null;
     for (const row of this.rows) {
       row.row.remove();
     }
@@ -190,11 +208,38 @@ export class LaneTable {
   render(project, results, answered = new Map()) {
     this.project = project;
     this.results = results;
+    this.rememberReference(project);
     this.renderTools(project, answered.has("reference"));
     const columns = this.columns(results);
     this.renderHead(columns);
     this.renderRows(project, results, columns, answered);
     this.renderRefusal(project);
+  }
+
+  // Add the lanes that have the reference condition in the state shown (each
+  // answer applied is drawn) to those remembered for it (followedReference());
+  // a reference of another name, or of another opening, starts them anew, and
+  // lanes cut from the table are dropped.
+  rememberReference(project) {
+    const name = project.reference_condition;
+    if (name === null) {
+      this.referenceLanes = null;
+      return;
+    }
+    const lanes = [...project.lanes.keys()].filter((i) => project.lanes[i].condition === name);
+    const memo = this.referenceLanes;
+    if (!memo || memo.name !== name || memo.openId !== project.open_id) {
+      this.referenceLanes = { openId: project.open_id, name, lanes: new Set(lanes) };
+      return;
+    }
+    for (const i of [...memo.lanes]) {
+      if (i >= project.lanes.length) {
+        memo.lanes.delete(i);
+      }
+    }
+    for (const i of lanes) {
+      memo.lanes.add(i);
+    }
   }
 
   // Put the server's value in a control unless the user has changed it since
@@ -736,7 +781,8 @@ export class LaneTable {
           })),
         };
         const reference = project.reference_condition;
-        const renamed = followedReference(reference, before, lanes);
+        const remembered = this.referenceLanes && this.referenceLanes.lanes;
+        const renamed = followedReference(reference, remembered, lanes);
         if (renamed !== null) {
           body.reference_condition = renamed;
         }
