@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +47,7 @@ from proteia.core import session as session_module
 from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
+    BoxSize,
     Project,
     ProposalSource,
     Region,
@@ -3589,3 +3590,235 @@ def test_a_project_read_again_refuses_its_earlier_opening(client, tmp_path):
     )
     saved = storage.load_project(session.folder)
     assert [lane.label for lane in saved.batch.lanes] == ["drug"]
+
+
+# --- A request runs within the opening it named (#134's review) ---
+
+
+def _held_until_released(
+    monkeypatch, owner: Any, name: str
+) -> tuple[threading.Event, threading.Event]:
+    """Hold each call of ``owner.name`` (what a route calls once its request is
+    past the check) until released: (entered, release)."""
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(owner, name)
+
+    def held(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, held)
+    return entered, release
+
+
+def _reads_recorded(monkeypatch, session: api.ProjectSession) -> threading.Event:
+    """Set once ``session`` is asked to read its project.json again."""
+    asked = threading.Event()
+    reload = session.reload
+
+    def reloading() -> bool:
+        asked.set()
+        return reload()
+
+    monkeypatch.setattr(session, "reload", reloading)
+    return asked
+
+
+def _in_thread(target: Callable[[], Any]) -> tuple[threading.Thread, list[Any]]:
+    """``target`` started in a thread: (the thread, the list its result goes to)."""
+    result: list[Any] = []
+    thread = threading.Thread(target=lambda: result.append(target()))
+    thread.start()
+    return thread, result
+
+
+def test_an_edit_past_the_check_is_made_in_its_opening_before_a_reopen_reads_the_file(
+    client, tmp_path, monkeypatch
+):
+    # A page shows opening 1 and moves a box; its request passes the check, and
+    # before the move runs another page opens the project again, whose
+    # project.json changed outside Proteia: in another copy the band's id went
+    # to another box (the same next id). Read again first, the move would be
+    # made to that box, in a project the page never showed, and its answer, of
+    # opening 2, would be the page's first sign of that opening. The reopen
+    # waits for the request instead: the move is made to the box the page shows
+    # and answered as of opening 1. Saved, it replaces the outside change, as an
+    # edit made just before the reopen does, so the reopen finds nothing to read.
+    target_id, _, _ = live(client, tmp_path, DOSES, boxed=(0, 1, 2))
+    session = client.workspace.current()
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    placed = client.ok(
+        "POST",
+        "/api/boxes",
+        {"protein_id": target_id, "x": LANE_X[3], "y": TARGET_ROW, "lane_index": 3},
+    )
+    band_id, shown = placed["band_id"], placed["project"]["open_id"]
+    remote = api.ops.open_project(other, clock=FakeClock())
+    elsewhere = api.ops.place_box(
+        remote, target_id, LANE_X[4], TARGET_ROW, lane_index=4, grow=False
+    )
+    assert elsewhere == band_id
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+    band = next(b for p in placed["project"]["proteins"] for b in p["bands"] if b["id"] == band_id)
+    x0, y0, x1, y1 = band["rect"]
+    rect = [x0 + 2, y0, x1 + 2, y1]
+
+    entered, release = _held_until_released(monkeypatch, api.ops, "move_box")
+    asked = _reads_recorded(monkeypatch, session)
+    moving, moved = _in_thread(
+        lambda: client.call(
+            "PUT", f"/api/boxes/{band_id}", {"rect": rect}, headers={OPENING: str(shown)}
+        )
+    )
+    assert entered.wait(20)
+    reopening, reopened = _in_thread(
+        lambda: client.call("POST", "/api/projects/open", {"name": "Blot"})
+    )
+    reopening.join(1.0)  # time to read the file, were it not waiting for the move
+    read_meanwhile = asked.is_set()
+    release.set()
+    for thread in (moving, reopening):
+        thread.join(30)
+        assert not thread.is_alive()
+
+    (status, answer), (reopen_status, reopen) = moved[0], reopened[0]
+    assert status == 200, answer
+    assert answer["project"]["open_id"] == shown
+    box = next(b for p in answer["project"]["proteins"] for b in p["bands"] if b["id"] == band_id)
+    assert (box["lane_index"], box["rect"]) == (3, rect)
+    assert not read_meanwhile
+    assert reopen_status == 200, reopen
+    assert (reopen["project"]["open_id"], reopen["project"]["revision"]) == (
+        shown,
+        answer["project"]["revision"],
+    )
+    _, saved = storage.load_project(session.folder).batch.find_band(band_id)
+    assert (saved.lane_index, list(saved.box.rect(BoxSize(width=SIZE[0], height=SIZE[1])))) == (
+        3,
+        rect,
+    )
+
+
+def test_a_read_past_the_check_answers_its_opening_before_a_reopen_reads_the_file(
+    client, tmp_path, monkeypatch
+):
+    # The same race with a read: were the file read again while it runs, the
+    # answer to a request naming opening 1 would be of opening 2, or of opening
+    # 1 with opening 2's project in it. The reopen waits for it, then reads the
+    # file: the read answers opening 1 as it was, the reopen opening 2.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    session = client.workspace.current()
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    api.ops.set_lanes(api.ops.open_project(other, clock=FakeClock()), [api.ops.LaneInput("drug")])
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+
+    entered, release = _held_until_released(monkeypatch, api, "_answer")
+    asked = _reads_recorded(monkeypatch, session)
+    reading, read = _in_thread(
+        lambda: client.call("GET", "/api/project", headers={OPENING: str(shown["open_id"])})
+    )
+    assert entered.wait(20)
+    reopening, reopened = _in_thread(
+        lambda: client.call("POST", "/api/projects/open", {"name": "Blot"})
+    )
+    reopening.join(1.0)  # time to read the file, were it not waiting for the read
+    read_meanwhile = asked.is_set()
+    release.set()
+    for thread in (reading, reopening):
+        thread.join(30)
+        assert not thread.is_alive()
+
+    (status, answer), (reopen_status, reopen) = read[0], reopened[0]
+    assert status == 200, answer
+    assert answer["project"] == shown
+    assert answer["results"]["open_id"] == shown["open_id"]
+    assert not read_meanwhile
+    assert reopen_status == 200, reopen
+    assert reopen["project"]["open_id"] == shown["open_id"] + 1
+    assert [lane["condition"] for lane in reopen["project"]["lanes"]] == ["drug"]
+
+
+def test_a_request_made_while_a_reopen_waits_is_checked_against_the_opening_it_leaves(tmp_path):
+    # A reopen waits for the requests in use on the session; one made
+    # meanwhile waits for the reopen, so it never runs between the two: then it
+    # is checked against the opening the reopen leaves (here a new one).
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    project_file = session.folder / storage.PROJECT_FILE
+    empty = project_file.read_bytes()
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+    project_file.write_bytes(empty)  # changed outside Proteia
+
+    def later() -> Any:
+        try:
+            with workspace.using(1):
+                return "served"
+        except api.ProjectChangedError as refused:
+            return refused.open_id
+
+    with workspace.using(1) as used:
+        assert used is session
+        reopening, reopened = _in_thread(lambda: workspace.open("A µ"))
+        deadline = time.monotonic() + 10
+        while workspace._reopening is not session:  # it waits for the request in use
+            assert reopening.is_alive() and time.monotonic() < deadline
+            time.sleep(0.005)
+        asking, asked = _in_thread(later)
+        asking.join(0.3)
+        assert asking.is_alive()  # it waits for the reopen
+        assert workspace.view(session)[0] == 1 and session.project.batch.lanes  # nothing read
+    for thread in (reopening, asking):
+        thread.join(10)
+        assert not thread.is_alive()
+    assert reopened == [session]
+    assert asked == [2]
+    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+
+
+def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    project_file = session.folder / storage.PROJECT_FILE
+    empty = project_file.read_bytes()
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+    project_file.write_bytes(empty)  # changed outside Proteia
+    project = session.project
+    monkeypatch.setattr(api, "REOPEN_WAIT_S", 0.2)
+
+    with workspace.using(1):
+        assert workspace.open("A µ") is session  # answered as it is
+        assert session.project is project and workspace.view(session)[0] == 1
+        with workspace.using(1) as again:  # nothing waits once the reopen has ended
+            assert again is session
+    assert workspace.open("A µ") is session  # nothing in use now: read again
+    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+
+
+def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
+    # The routes as test_every_route_on_the_open_project_refuses_another_opening
+    # finds them: each gets its session from _open_session, which keeps it in
+    # use (Workspace.using) until the route returns, so no reopen reads the
+    # project again while one runs.
+    workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
+    app = server.create_app(
+        token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
+    ).app
+
+    def holders(dependant: Any) -> Iterator[Any]:
+        for sub in dependant.dependencies:
+            if sub.call is api._open_session:
+                yield sub
+            yield from holders(sub)
+
+    guarded = api_routes() - set(NEEDS_NO_OPENING)
+    found = {
+        (method, route.path): [sub.scope for sub in holders(route.dependant)]
+        for route in _declared(app.routes)
+        for method in route.methods
+        if (method, route.path) in guarded
+    }
+    assert found == dict.fromkeys(guarded, ["function"])

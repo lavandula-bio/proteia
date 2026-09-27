@@ -744,3 +744,36 @@ def test_a_refused_undo_or_redo_is_not_called_a_change():
     posts = {route.path for route in api.router.routes if "POST" in route.methods}
     assert set(refused_as) <= posts
     assert "REFUSED_AS[path]" in _function(script, "function projectChanged(")[1]
+
+
+def test_an_answer_about_a_newer_opening_than_its_request_named_is_never_applied():
+    # The server answers each request within the opening it names (#134's
+    # review), and the page does not rely on it. Applied (applyAnswer), such an
+    # answer would show the project opened again as a newer revision of the
+    # one shown, keeping that one's previews, typed values and queued edits,
+    # with no word that it was opened again. It is taken as a project_changed
+    # refusal instead: the page follows (showOpened, and its message).
+    script = _code("app.js")
+    start, request = _function(script, "async function request(")
+    assert "const named = anyProject ? null : shownOpening();" in request
+    assert "headers.set(OPENING_HEADER, String(named));" in request
+    checked = request.index("if (named && now > named)")
+    assert -1 < request.find("answered.project.open_id") < checked
+    follows = request.index("projectChanged(error, method, path, { answered: true });", checked)
+    assert follows < request.index("throw error;", follows) < request.index("return answered;")
+    # Every answer about a project is read there: call() asks for it, and the
+    # only JSON read elsewhere is GET /api/workspace's, about no project.
+    assert "answer: true" in _function(script, "async function call(")[1]
+    outside = [
+        m.start()
+        for m in re.finditer(r"\.json\(\)", script)
+        if not start < m.start() < start + len(request)
+    ]
+    at, check = _function(script, "function checkOpening(")
+    assert len(outside) == 1 and at < outside[0] < at + len(check)
+    # The requests answered about another opening on purpose name none: a
+    # create or open, and the follow's read of the project open now.
+    assert "anyProject: true" in _function(script, "async function switchTo(")[1]
+    assert "anyProject: true" in _function(script, "function followOpening(")[1]
+    # Answered, the request was not refused: nothing is said to be not done.
+    assert "answered ||" in _function(script, "function projectChanged(")[1]

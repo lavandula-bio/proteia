@@ -70,20 +70,27 @@ class NotSent extends Error {
 // Every request names the token in a header; nothing relies on cookies. It
 // names the opening of the project shown too (OPENING_HEADER), as it is when
 // the request is sent, unless `anyProject`: a read of the project open now,
-// whichever it is. An edit that waits for others is sent only while the page
-// shows the project it was made in (ordered, and the panel's queue once
-// showOpened drops its edits), so that is the opening shown when it was made.
-// An aborted `signal` cancels it; `priority` orders it among those waiting for
-// a connection (the browser's fetch priority).
+// whichever it is, or a create or open, whose answer is of the opening it
+// makes. An edit that waits for others is sent only while the page shows the
+// project it was made in (ordered, and the panel's queue once showOpened drops
+// its edits), so that is the opening shown when it was made. With `answer`, it
+// gives the JSON answer (null for none) in place of the response; but not an
+// answer about an opening newer than the one the request named: that is taken
+// as a project_changed refusal (projectChanged, which shows the project open
+// now), never shown as a newer state of the project shown, as applyAnswer
+// would show it (keeping what showOpened drops: previews, typed values, queued
+// edits). The server answers each request within the opening it names; the
+// page does not rely on it. An aborted `signal` cancels it; `priority` orders
+// it among those waiting for a connection (the browser's fetch priority).
 async function request(
   method,
   path,
-  { json, body, contentType, signal, priority, anyProject = false } = {},
+  { json, body, contentType, signal, priority, anyProject = false, answer = false } = {},
 ) {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
-  const shown = shownOpening();
-  if (shown && !anyProject) {
-    headers.set(OPENING_HEADER, String(shown));
+  const named = anyProject ? null : shownOpening();
+  if (named) {
+    headers.set(OPENING_HEADER, String(named));
   }
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
@@ -116,16 +123,27 @@ async function request(
     }
     throw error;
   }
-  return response;
+  if (!answer) {
+    return response;
+  }
+  const answered = response.status === 204 ? null : await response.json();
+  const now = answered && answered.project ? answered.project.open_id : null;
+  if (named && now > named) {
+    const error = new ApiError(response.status, {
+      code: PROJECT_CHANGED,
+      message: `The answer is about opening ${now}, not ${named}, which this page named.`,
+      detail: { open: answered.project.name, open_id: now },
+    });
+    projectChanged(error, method, path, { answered: true });
+    throw error;
+  }
+  return answered;
 }
 
-// `options`: request()'s, such as `anyProject`.
+// Gives the answer (request()'s `answer`); `options`: request()'s, such as
+// `anyProject`.
 async function call(method, path, json, options = {}) {
-  return dock.track(
-    request(method, path, { ...options, json }).then((response) =>
-      response.status === 204 ? null : response.json(),
-    ),
-  );
+  return dock.track(request(method, path, { ...options, json, answer: true }));
 }
 
 // --- Page state ---
@@ -515,7 +533,8 @@ async function switchTo(path, name, json) {
     // change of that project.
     await Promise.all([proteinPanel.settled(), pending()]);
     proteinPanel.invalidateEdits();
-    const answer = await call("POST", path, json);
+    // It names no opening: its answer is of the one it makes.
+    const answer = await call("POST", path, json, { anyProject: true });
     if (!isCurrent(answer.project)) {
       return null;
     }
@@ -561,8 +580,10 @@ async function openProject(path, name, json) {
 // now. The edits queued meanwhile are dropped, and with them what they would
 // say: each would be refused. `method` and `path`: the request's, which says
 // what was not done (NOT_DONE): nothing for a read, or a reveal (a folder not
-// shown); otherwise by its path (REFUSED_AS), or a change.
-function projectChanged(error, method, path) {
+// shown); otherwise by its path (REFUSED_AS), or a change. Nothing either if
+// `answered`: the request was answered, about an opening newer than the one
+// it named (request()), so it was not refused.
+function projectChanged(error, method, path, { answered = false } = {}) {
   const now = error.detail && error.detail.open_id;
   const shown = shownOpening();
   if (opening !== null || !shown || !(now > shown)) {
@@ -570,7 +591,9 @@ function projectChanged(error, method, path) {
   }
   proteinPanel.invalidateEdits();
   const refused =
-    method === "GET" || path === "/api/project/reveal" ? null : REFUSED_AS[path] || "change";
+    answered || method === "GET" || path === "/api/project/reveal"
+      ? null
+      : REFUSED_AS[path] || "change";
   followOpening({ refused });
 }
 
@@ -1591,12 +1614,10 @@ $("import-file").addEventListener("change", async (event) => {
   showStatus(`Importing ${isolate(file.name)}…`);
   try {
     const answer = await ordered(() =>
-      dock.track(
-        request("POST", `/api/images?${query}`, {
-          body: file,
-          contentType: "application/octet-stream",
-        }).then((response) => response.json()),
-      ),
+      call("POST", `/api/images?${query}`, undefined, {
+        body: file,
+        contentType: "application/octet-stream",
+      }),
     );
     applyAnswer(answer, { choose: { imageId: answer.image_id, boxId: null } });
     const image = answer.project.images.find((i) => i.id === answer.image_id);
@@ -1788,27 +1809,19 @@ function exportResults() {
   const after = Promise.allSettled([pending(), proteinPanel.adding]);
   const asked = proteinPanel.queueEdit(
     async (current) => {
-      const opened = shownOpening();
       showStatus("Exporting…"); // again: the answer of an edit before it empties the line
+      // Its answer is about the opening shown (request()). Refused as
+      // project_changed, or answered about a newer opening, it starts the
+      // follow instead (projectChanged), which turns current() false.
       try {
-        const answer = await request("POST", "/api/export").then((response) => response.json());
+        const answer = await request("POST", "/api/export", { answer: true });
         applyAnswer(answer);
-        if (current() && sameOpening(answer)) {
+        if (current()) {
           showExported(answer);
-        } else if (current()) {
-          // The project was read again from its folder while it exported (an
-          // outside change): the files are of the version before, and written.
-          const files = counted(answer.files.length, "file", "files");
-          showStatus(
-            `Exported ${files} to ${answer.folder}, from the project as it was before` +
-              " it was read again from its folder.",
-          );
         }
       } catch (error) {
-        if (current() && opened === shownOpening()) {
+        if (current()) {
           await reportExport(error);
-        } else if (current()) {
-          showStatus("Not exported: the project was read again from its folder meanwhile. Export again.");
         }
       }
       return null;

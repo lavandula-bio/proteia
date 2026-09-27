@@ -48,10 +48,14 @@ the page shows, as its answers carry it. A request that names another opening
 is refused before anything is done, so a page still showing a project opened
 before (another tab opened one since, or Proteia read the open one's
 ``project.json`` again) neither edits nor reads the one open now (#134).
-Without the header there is no check. ``GET /api/workspace`` answers which
-project is open, and its open id, without reading it: for a page to find out.
-The routes that list, create or open projects, and the status and quit routes,
-need no opening.
+Without the header there is no check. Either way the route runs, and answers,
+within the opening it was given: Proteia reads the open project's
+``project.json`` again only once no such request runs, and one made meanwhile
+waits for that, then is checked (:meth:`Workspace.using`); so no edit is made
+in, and no answer is about, an opening the request did not name. ``GET
+/api/workspace`` answers which project is open, and its open id, without
+reading it: for a page to find out. The routes that list, create or open
+projects, and the status and quit routes, need no opening.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
@@ -65,13 +69,15 @@ request the routes cannot read, a ``Proteia-Opening`` not in plain digits too.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import tempfile
 import threading
+import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
@@ -181,11 +187,23 @@ class Workspace:
     at the same revision. Opening the project already open answers its session
     (:meth:`open`), so no two sessions write one folder (#93); that session
     takes the next open id too if it reads a ``project.json`` changed outside
-    Proteia again.
+    Proteia again. It never does so while a request uses it (:meth:`using`):
+    every request runs, and is answered, wholly within the opening it was
+    given, so what a page named is what its request reads or edits.
     The results of the open project's latest revision computed so far are kept
     (with the open id, the revision and the settings they belong to), since
     reading them again is common and computing them is not cheap. So are the
     charts of the answers about the latest opening (:class:`ChartStore`).
+
+    The locks, in the order they are taken: the switch lock (a create or an
+    open holds it throughout), a session's lock (an operation holds it while it
+    runs; a reopen takes it to read ``project.json`` again), this workspace's
+    lock (held briefly, never while computing or waiting for another lock),
+    then the chart store's. None is taken while one after it is held. Waiting
+    adds no cycle: a request waits for a reopen under way (:meth:`using`) before
+    it takes any of them, on this lock's condition, which releases it
+    meanwhile; a reopen waits for the requests using the session holding only
+    the switch lock, which no request takes, and at most :data:`REOPEN_WAIT_S`.
     """
 
     def __init__(
@@ -194,15 +212,22 @@ class Workspace:
         self.root = root
         self.reveal = reveal
         self.clock = clock
-        # Guards the open session, the open ids, the settings, the previews and the
-        # results; never held while computing. Taken before the chart store's own
-        # lock, never while holding it.
+        # Guards the open session, the open ids, the sessions in use, the reopen
+        # under way, the settings, the previews and the results; never held while
+        # computing. Taken before the chart store's own lock, never while holding it.
         self._lock = threading.Lock()
+        # Notified whenever a request stops using a session and when a reopen ends.
+        self._changed = threading.Condition(self._lock)
         self._switching = threading.Lock()  # one switch at a time; never held by readers
         self._session: ProjectSession | None = None
         self._open_id = 0  # the open id of the latest create or open
         # Each session's open id, for as long as a request still holds that session.
         self._open_ids: weakref.WeakKeyDictionary[ProjectSession, int] = weakref.WeakKeyDictionary()
+        # The requests using each session (using, answering): none is read again
+        # while it has one.
+        self._in_use: dict[ProjectSession, int] = {}
+        # The open session while a reopen may read it again: none starts using it then.
+        self._reopening: ProjectSession | None = None
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
         # (image id, SHA-256, original colours) -> preview PNG, least recently shown first.
@@ -214,11 +239,55 @@ class Workspace:
         id (:class:`ProjectChangedError` otherwise), checked and answered under
         one lock, so the session answered is the one checked."""
         with self._lock:
-            if self._session is None:
-                raise NoProjectError("create or open a project first")
-            if opening is not None and opening != self._open_id:
-                raise ProjectChangedError(opening, self._session.folder.name, self._open_id)
-            return self._session
+            return self._checked(opening)
+
+    def _checked(self, opening: int | None) -> ProjectSession:
+        """:meth:`current`'s answer. Called with the lock held."""
+        if self._session is None:
+            raise NoProjectError("create or open a project first")
+        if opening is not None and opening != self._open_id:
+            raise ProjectChangedError(opening, self._session.folder.name, self._open_id)
+        return self._session
+
+    @contextlib.contextmanager
+    def using(self, opening: int | None = None) -> Iterator[ProjectSession]:
+        """The open project's session, as :meth:`current` gives it, for a request
+        that reads or edits it, in use until the block ends. Meanwhile no reopen
+        reads its ``project.json`` again (:meth:`open`), so its open id and
+        project stay those of the opening checked: an operation the request runs
+        is made in the project its page shows, never in one read again after
+        the check, and its answer is of that opening. A request made while a
+        reopen runs waits for it, then is checked against the opening it leaves.
+        A switch while it runs does not redirect it, as the class says."""
+        with self._lock:
+            self._changed.wait_for(lambda: self._reopening is None)
+            session = self._checked(opening)
+            self._in_use[session] = self._in_use.get(session, 0) + 1
+        try:
+            yield session
+        finally:
+            self._done(session)
+
+    @contextlib.contextmanager
+    def answering(self, session: ProjectSession) -> Iterator[None]:
+        """``session`` in use (:meth:`using`) while a create or an open makes its
+        answer, so the answer is of one opening: a reopen of it from another
+        page, under way or made meanwhile, is waited for or waits."""
+        with self._lock:
+            self._changed.wait_for(lambda: self._reopening is not session)
+            self._in_use[session] = self._in_use.get(session, 0) + 1
+        try:
+            yield
+        finally:
+            self._done(session)
+
+    def _done(self, session: ProjectSession) -> None:
+        """A request stops using ``session``."""
+        with self._lock:
+            left = self._in_use.pop(session) - 1
+            if left:
+                self._in_use[session] = left
+            self._changed.notify_all()
 
     def opened(self) -> tuple[str | None, int | None]:
         """The open project's name and open id, read together; (None, None)
@@ -325,32 +394,45 @@ class Workspace:
         that waited for its edits' answers finds it no older than what it
         shows); and with its undo history and kept results. Its unsaved changes
         (a failed autosave) are neither saved first, as a switch saves them, nor
-        replaced by the older file: the next change or quitting saves them. An
-        operation running on the session (an edit, or a read such as a preview)
-        is waited for, up to :data:`REOPEN_WAIT_S`, before the file is checked:
-        after an edit, which saved over it, there is nothing to read; after a
-        read, a changed file is read. One that runs longer leaves the file
-        unread, and the session is answered as it is; opening it again reads
-        it. When it cannot be told whether the two folders are one (the open
-        one is gone), the open is a switch, whose close deletes nothing."""
+        replaced by the older file: the next change or quitting saves them. The
+        requests using the session (:meth:`using`: an edit, or a read such as a
+        preview), and then an operation running on it, are waited for, up to
+        :data:`REOPEN_WAIT_S` in all, before the file is checked: after an
+        edit, which saved over it, there is nothing to read; after a read, a
+        changed file is read. The requests made meanwhile wait for the reopen.
+        One that runs longer leaves the file unread, and the session is answered
+        as it is; opening it again reads it. When it cannot be told whether the
+        two folders are one (the open one is gone), the open is a switch, whose
+        close deletes nothing."""
         with self._switching:
             folder = projects.project_folder(self.root, name)
             session = self._peek()
             if session is None or not _same_folder(session.folder, folder, unknown=False):
                 return self._switch(lambda: ops.open_project(folder, clock=self.clock))
-            if session.lock.acquire(timeout=REOPEN_WAIT_S):
-                try:
-                    # The new open id under the session's lock: no commit falls
-                    # between the reload and it.
-                    if session.reload():
-                        with self._lock:
-                            self._open_id += 1
-                            self._open_ids[session] = self._open_id
-                            self._previews.clear()
-                            self._results = None
-                            self._charts.reset(self._open_id)
-                finally:
-                    session.lock.release()
+            deadline = time.monotonic() + REOPEN_WAIT_S
+            try:
+                with self._lock:
+                    self._reopening = session  # no request starts using it now
+                    idle = self._changed.wait_for(
+                        lambda: session not in self._in_use, timeout=REOPEN_WAIT_S
+                    )
+                if idle and session.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                    try:
+                        # The new open id under the session's lock: no commit falls
+                        # between the reload and it.
+                        if session.reload():
+                            with self._lock:
+                                self._open_id += 1
+                                self._open_ids[session] = self._open_id
+                                self._previews.clear()
+                                self._results = None
+                                self._charts.reset(self._open_id)
+                    finally:
+                        session.lock.release()
+            finally:
+                with self._lock:
+                    self._reopening = None
+                    self._changed.notify_all()
             return session
 
     def view(self, session: ProjectSession) -> tuple[int, ops.ComputedView]:
@@ -359,7 +441,9 @@ class Workspace:
         reused while the open id, the revision and the settings match; the
         computation itself runs outside the lock, and its results are kept only
         while ``session`` is still the open one and no later revision's results
-        are kept."""
+        are kept. The routes call it while ``session`` is in use (:meth:`using`,
+        :meth:`answering`), when no reopen reads it again: its open id and its
+        project, read apart, are of one opening."""
         with self._lock:
             open_id, settings = self._open_ids[session], self._settings
             kept = self._results
@@ -560,18 +644,23 @@ def _opening(request: Request) -> int | None:
         raise OperationError(ErrorCode.INVALID_INPUT, f"{OPENING_HEADER}: {exc}") from exc
 
 
-def _open_session(request: Request) -> ProjectSession:
+def _open_session(request: Request) -> Iterator[ProjectSession]:
     """The open project's session, for a route that reads or edits it: if the
     request names an opening (:func:`_opening`), only while that is the open
-    one; ``project_changed`` otherwise. A dependency runs before the route
-    checks its path, query and body (only a body that is not JSON is refused
-    first), so such a request is refused before anything is done, an upload
-    before its bytes are read. A sync dependency, so it runs in the thread pool
-    and never blocks the event loop."""
-    return _workspace(request).current(_opening(request))
+    one; ``project_changed`` otherwise. It stays in use until the route returns
+    (:meth:`Workspace.using`), so the route runs, and answers, within the
+    opening checked. A dependency runs before the route checks its path, query
+    and body (only a body that is not JSON is refused first), so such a request
+    is refused before anything is done, an upload before its bytes are read. A
+    sync generator, so its code on either side of the yield runs in the thread
+    pool and never blocks the event loop, waiting for a reopen included. Of
+    scope ``function`` (:data:`OpenSession`): its session is done with once the
+    route returns, before its answer is sent."""
+    with _workspace(request).using(_opening(request)) as session:
+        yield session
 
 
-OpenSession = Annotated[ProjectSession, Depends(_open_session)]
+OpenSession = Annotated[ProjectSession, Depends(_open_session, scope="function")]
 
 
 def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
@@ -655,7 +744,9 @@ def get_workspace(workspace: WorkspaceDep) -> dict[str, Any]:
 
 @router.post("/projects", status_code=201)
 def create_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace, workspace.create(body.name))
+    session = workspace.create(body.name)
+    with workspace.answering(session):
+        return _answer(workspace, session)
 
 
 @router.post("/projects/sample", status_code=201)
@@ -665,12 +756,15 @@ def create_sample_project(workspace: WorkspaceDep) -> dict[str, Any]:
     a create does, with ``sample`` (:func:`~proteia.web.sample_project.sample_payload`):
     the truth table's name in the project folder and each protein's row."""
     session = workspace.create_sample()
-    return _answer(workspace, session, sample=sample_project.sample_payload(session.project))
+    with workspace.answering(session):
+        return _answer(workspace, session, sample=sample_project.sample_payload(session.project))
 
 
 @router.post("/projects/open")
 def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace, workspace.open(body.name))
+    session = workspace.open(body.name)
+    with workspace.answering(session):
+        return _answer(workspace, session)
 
 
 @router.get("/project")
@@ -791,7 +885,7 @@ def image_preview(
     return Response(data, media_type="image/png")
 
 
-@router.get("/charts/{key}.svg", dependencies=[Depends(_open_session)])
+@router.get("/charts/{key}.svg", dependencies=[Depends(_open_session, scope="function")])
 def chart(key: str, workspace: WorkspaceDep) -> Response:
     """A chart of an answer, at its ``chart_url``; 404 ``unknown_id`` for a key
     not given in the open project's answers, or no longer kept."""
