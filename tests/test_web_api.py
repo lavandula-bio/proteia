@@ -48,6 +48,7 @@ from proteia.viz import render_svg
 from proteia.web import api, charts, launch, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
+from rowcases import RowCase, adversarial
 
 H, W = 60, 400
 ROW = 30
@@ -446,7 +447,8 @@ def _record(
 
 
 def plant_records(client: Client, protein_id: str, *records: UndetectedBand, bands: int) -> None:
-    """Store records in the open project: the row-box route that writes them is #51's."""
+    """Store records in the open project as given: a row box writes only its own
+    (band index 0, source ``row_box``)."""
     session = client.workspace.current()
 
     def change(draft: Project) -> None:
@@ -873,6 +875,11 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     )
     answers["POST /api/undo"] = client.ok("POST", "/api/undo")
     answers["POST /api/redo"] = client.ok("POST", "/api/redo")
+    # A row box over the three declared lanes, on the image that kept the blot's polarity.
+    body = {"name": "GAPDH", "role": "loading control", "image_id": second["image_id"]}
+    other = client.ok("POST", "/api/proteins", body)["protein_id"]
+    body = {"protein_id": other, "rect": [15, ROW - 12, LANE_X[2] + 35, ROW + 12]}
+    answers["POST /api/boxes/row"] = client.ok("POST", "/api/boxes/row", body)
     plant_records(client, protein, _record(1), bands=1)
     answers["DELETE /api/proteins/{protein_id}/boxes"] = client.ok(
         "DELETE", f"/api/proteins/{protein}/boxes"
@@ -2118,3 +2125,345 @@ def test_a_read_from_the_kept_results_registers_their_charts_again(client, tmp_p
     assert calls == []  # the kept results of this revision, not computed again
     assert only_series(read)["chart_url"] == url
     assert fetch(client, url)[0] == 200
+
+
+# --- A row of boxes from a dragged row box (#52) ---
+
+ROW_FIELDS = [field.name for field in dataclasses.fields(api.ops.RowPlacement)]
+TARGET_ROW_BOX = [15, TARGET_ROW - 12, W - 35, TARGET_ROW + 12]  # every lane of the target row
+
+
+def drag(client: Client, protein_id: str, rect: list[int] = TARGET_ROW_BOX) -> dict:
+    """The answer to a row box dragged over the protein's row: 201, as any placement."""
+    body = {"protein_id": protein_id, "rect": rect}
+    status, answer = client.call("POST", "/api/boxes/row", body)
+    assert status == 201, (status, answer)
+    return answer
+
+
+def test_a_row_box_boxes_every_lane_and_answers_the_nets_and_the_chart(client, tmp_path):
+    target, _, before = live(client, tmp_path, DOSES, boxed=())
+    assert column(before, target)["nets"] == [None] * len(LANE_X)
+
+    answer = drag(client, target)
+    assert set(answer) == {*ROW_FIELDS, "project", "results"}  # every field of RowPlacement
+    band_ids = answer["band_ids"]
+    assert None not in band_ids and len(set(band_ids)) == len(LANE_X)
+    state = protein_of(answer, target)
+    assert [band["id"] for band in state["bands"]] == band_ids  # new ids in lane order
+    size = answer["box_size"]
+    assert state["box_size"] == size
+    for lane, band in enumerate(state["bands"]):
+        assert (band["lane_index"], band["source"], band["manually_edited"]) == (
+            lane,
+            "row_box",
+            False,
+        )
+        x0, y0, x1, y1 = band["rect"]
+        assert (x1 - x0, y1 - y0) == (size["width"], size["height"])  # one shared size
+        assert x0 < LANE_X[lane] < x1 and y0 < TARGET_ROW < y1
+    assert {name: answer[name] for name in ROW_FIELDS if name not in ("band_ids", "box_size")} == {
+        "kept_lanes": [],
+        "replaced_band_ids": [],
+        "removed_band_ids": [],
+        "undetected_lanes": [],
+        "unmeasured_lanes": [],
+        "empty": [],
+        "flags": [],
+        "notes": [],
+        "right_to_left": False,
+    }
+
+    # The nets of the new boxes and the chart they make, in the same answer.
+    results = column(answer, target)
+    assert results["band_ids"] == band_ids and results["detected"] == [True] * len(LANE_X)
+    assert all(net > 0 for net in results["nets"])
+    series = only_series(answer)
+    assert None not in series["normalized"]
+    assert [bar(series, dose)["n"] for dose in ("vehicle", "10 µM")] == [2, 3]
+    status, headers, body = fetch(client, series["chart_url"])
+    assert (status, headers["content-type"]) == (200, "image/svg+xml")
+    assert ET.fromstring(body).tag == "{http://www.w3.org/2000/svg}svg"
+
+    # One change, one entry, autosaved; the answer is what a read gives.
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1
+    entry = storage.load_project(client.root / "Blot").log[-1]
+    assert (entry.action, entry.params["protein_id"], entry.params["row"]) == (
+        "detect_row_boxes",
+        target,
+        TARGET_ROW_BOX,
+    )
+    read = client.ok("GET", "/api/project")
+    assert read == {"project": answer["project"], "results": answer["results"]}
+
+    # The same drag again replaces each box in place with itself: nothing changes.
+    again = drag(client, target)
+    assert {"project": again["project"], "results": again["results"]} == read
+    assert again["band_ids"] == again["replaced_band_ids"] == band_ids
+    assert logged(client).count("detect_row_boxes") == 1
+
+
+def test_a_lane_without_a_band_gets_a_not_detected_record(client, tmp_path):
+    lanes = [0, 1, 3, 4]  # lane 2 holds no band
+    depths = (20000.0, 22000.0, 0.0, 33000.0, 36000.0)
+    target, _, _ = live(client, tmp_path, DOSES, target=depths, boxed=())
+    answer = drag(client, target)
+    band_ids = answer["band_ids"]
+    assert band_ids[2] is None and None not in [band_ids[lane] for lane in lanes]
+    state = protein_of(answer, target)
+    # The other lanes keep their indices.
+    assert {band["id"]: band["lane_index"] for band in state["bands"]} == {
+        band_ids[lane]: lane for lane in lanes
+    }
+    assert (answer["undetected_lanes"], answer["unmeasured_lanes"]) == ([2], [])
+    (empty,) = answer["empty"]
+    assert list(empty) == ["lane_index", "reason", "snr", "expected_x"]
+    assert (empty["lane_index"], empty["reason"]) == (2, "no_band")
+    assert 0 <= empty["snr"] < 6 and abs(empty["expected_x"] - LANE_X[2]) <= 1
+    (record,) = state["undetected"]
+    assert {name: record[name] for name in ("lane_index", "band_index", "reason", "source")} == {
+        "lane_index": 2,
+        "band_index": 0,
+        "reason": "below_detection_limit",
+        "source": "row_box",
+    }
+    assert (record["snr"], record["threshold"]) == (empty["snr"], 6.0)
+    assert 2 not in {entry["lane_index"] for entry in state["missing_lanes"]}  # examined
+
+    results = column(answer, target)
+    assert results["band_ids"] == band_ids
+    assert results["detected"] == [True, True, False, True, True]
+    assert results["nets"][2] is None and all(results["nets"][lane] > 0 for lane in lanes)
+    assert "below_detection" in notice_codes(answer)
+    assert bar(only_series(answer), "10 µM")["lane_indices"] == [3, 4]
+    assert logged(client)[-1] == "detect_row_boxes"
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
+def test_a_second_row_box_corrects_the_first_and_removes_a_box_its_lane_lost(client, tmp_path):
+    depths = (20000.0, 22000.0, 0.0, 33000.0, 36000.0)  # lane 2 of the target row: no band
+    target, _, _ = live(client, tmp_path, DOSES, target=depths, boxed=())
+    # Dragged over the loading control's row first, by mistake: a box in every lane.
+    first = drag(client, target, [15, LOADING_ROW - 12, W - 35, LOADING_ROW + 12])
+    ids = first["band_ids"]
+    assert None not in ids
+
+    answer = drag(client, target)  # then over its own row
+    # The detector's boxes give way: taken over in place, or removed where no
+    # band is found (lane 2, which gets a not-detected record instead).
+    assert answer["band_ids"] == [*ids[:2], None, *ids[3:]]
+    assert answer["replaced_band_ids"] == [*ids[:2], *ids[3:]]
+    assert answer["removed_band_ids"] == [ids[2]]
+    assert (answer["kept_lanes"], answer["undetected_lanes"], answer["unmeasured_lanes"]) == (
+        [],
+        [2],
+        [],
+    )
+    state = protein_of(answer, target)
+    assert ids[2] not in bands(answer)
+    assert all(band["rect"][1] < TARGET_ROW < band["rect"][3] for band in state["bands"])
+    assert [record["lane_index"] for record in state["undetected"]] == [2]
+    assert column(answer, target)["detected"] == [True, True, False, True, True]
+
+
+def adversarial_project(client: Client, tmp_path: Path, key: str) -> tuple[RowCase, str]:
+    """A project over an adversarial row (:func:`rowcases.adversarial`, seed
+    1000) imported as a 16-bit TIFF, its lanes declared and one target without
+    boxes; (the case, the target's id)."""
+    case = adversarial(key, 1000)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    data = write_tiff(tmp_path / "row α.tif", case.image.astype(np.uint16)).read_bytes()
+    polarity = "dark_on_light" if case.dark_on_light else "light_on_dark"
+    status, answer = upload(client, data, polarity=polarity)
+    assert status == 201, answer
+    lanes = [{"condition": "vehicle" if i % 2 == 0 else "10 µM"} for i in range(case.n_lanes)]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes})
+    body = {"name": "β-catenin", "role": "target", "image_id": answer["image_id"]}
+    return case, client.ok("POST", "/api/proteins", body)["protein_id"]
+
+
+def test_a_box_placed_in_a_lane_a_row_box_left_unmeasured_is_kept_by_the_next(client, tmp_path):
+    case, target = adversarial_project(client, tmp_path, "blotch_empty")  # lane 4: a stain
+    first = drag(client, target, list(case.row))
+    # A stain is no not-detected claim: the lane is left with neither box nor record.
+    assert (first["kept_lanes"], first["undetected_lanes"], first["unmeasured_lanes"]) == (
+        [],
+        [],
+        [4],
+    )
+    assert first["band_ids"][4] is None
+    assert [(empty["lane_index"], empty["reason"]) for empty in first["empty"]] == [(4, "artefact")]
+    assert protein_of(first, target)["undetected"] == []
+    assert column(first, target)["detected"][4] is None
+
+    # The user boxes the lane by hand; the same drag again keeps that box.
+    x, y = round(case.lane_cx[4]), round(case.lane_cy[4])
+    body = {"protein_id": target, "x": x, "y": y, "lane_index": 4}
+    box = client.ok("POST", "/api/boxes", body)["band_id"]
+    answer = drag(client, target, list(case.row))
+    assert (answer["kept_lanes"], answer["undetected_lanes"], answer["unmeasured_lanes"]) == (
+        [4],
+        [],
+        [],
+    )
+    assert answer["band_ids"] == [*first["band_ids"][:4], box, *first["band_ids"][5:]]
+    assert answer["replaced_band_ids"] == [band for band in first["band_ids"] if band is not None]
+    assert answer["removed_band_ids"] == []
+    assert column(answer, target)["detected"][4] is True
+
+
+def test_a_row_box_answers_the_detectors_warnings_and_notes(client, tmp_path):
+    case, target = adversarial_project(client, tmp_path, "tall_band")  # lane 3: far taller
+    answer = drag(client, target, list(case.row))
+    params = storage.load_project(client.root / "Blot").log[-1].params
+    assert answer["flags"] == params["flags"] == ["size_outlier"]
+    assert answer["notes"] == params["notes"] != []
+
+
+def test_a_row_box_reads_the_lanes_the_way_the_image_numbers_them(client, tmp_path):
+    target, loading, _ = live(client, tmp_path, DOSES, boxed=())
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
+    for lane in range(len(LANE_X)):  # the loading control's lanes numbered right to left
+        body = {"protein_id": loading, "x": LANE_X[-1 - lane], "y": LOADING_ROW, "lane_index": lane}
+        client.ok("POST", "/api/boxes", body)
+    answer = drag(client, target)
+    assert answer["right_to_left"] is True
+    assert storage.load_project(client.root / "Blot").log[-1].params["right_to_left"] is True
+    for band in protein_of(answer, target)["bands"]:
+        x0, _, x1, _ = band["rect"]
+        assert x0 < LANE_X[-1 - band["lane_index"]] < x1
+
+
+def test_a_row_box_may_reach_far_past_the_image_and_is_logged_as_given(client, tmp_path):
+    # A drag is clipped to the image. Its corners are held to 32 bits: the log
+    # keeps the row as given, and the project file must still read.
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    rect = [-(2**31), TARGET_ROW - 12, 2**31 - 1, TARGET_ROW + 12]
+    answer = drag(client, target, rect)
+    assert None not in answer["band_ids"]
+    assert storage.load_project(client.root / "Blot").log[-1].params["row"] == rect
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+    assert protein_of(reopened, target)["bands"] == protein_of(answer, target)["bands"]
+
+
+def _no_lanes(client: Client, target: str, loading: str) -> list[str]:
+    client.ok("DELETE", f"/api/proteins/{loading}")  # its boxes hold the lanes
+    client.ok("PUT", "/api/lanes", {"lanes": []})
+    return []
+
+
+def _edited_box(client: Client, target: str, size: list[int], lane: int, rect: list[int]) -> str:
+    """A box of the target placed in the lane at the size, then moved by hand to ``rect``."""
+    width, height = size
+    client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": width, "height": height})
+    body = {"protein_id": target, "x": LANE_X[lane], "y": TARGET_ROW, "lane_index": lane}
+    band_id = client.ok("POST", "/api/boxes", body)["band_id"]
+    moved = client.ok("PUT", f"/api/boxes/{band_id}", {"rect": rect})
+    assert bands(moved)[band_id]["manually_edited"]
+    return band_id
+
+
+def _lane_1_on_two_columns(client: Client, target: str, loading: str) -> list[str]:
+    """The target's box in lane 1, moved by hand onto lane 2's band: lane 1 on
+    two columns, the loading control's and the target's."""
+    band_id = _edited_box(client, target, SIZE, 1, [LANE_X[2] - 7, 25, LANE_X[2] + 7, 35])
+    return [column(client.ok("GET", "/api/project"), loading)["band_ids"][1], band_id]
+
+
+def _wide_kept_box(client: Client, target: str, loading: str) -> list[str]:
+    """A box wider than the lane pitch (70), kept above the row: the row's
+    boxes, grown to its width, would overlap each other."""
+    _edited_box(client, target, [80, 8], 1, [LANE_X[1] - 39, 6, LANE_X[1] + 41, 14])
+    return []
+
+
+def _kept_box_on_lane_2(client: Client, target: str, loading: str) -> list[str]:
+    """A box kept in lane 1, moved by hand toward lane 2 (less than half the
+    pitch from its column): the row's box in lane 2 would overlap it."""
+    return [_edited_box(client, target, [60, 10], 1, [LANE_X[1], 25, LANE_X[1] + 60, 35])]
+
+
+def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:
+    """A non-finite pixel in the row, as a damaged file would read."""
+    session = client.workspace.current()
+    image_id = session.project.batch.find_protein(target).image_id
+    pixels = np.array(session.pixels(image_id), dtype=np.float64)
+    pixels[TARGET_ROW, LANE_X[0] + 30] = np.nan
+    pixels.flags.writeable = False
+    session._pixels[image_id] = pixels
+    return [image_id]  # the image is at fault, not the row
+
+
+ROW_BOX_REFUSALS = [
+    pytest.param(None, [W - 35, 18, 15, 42], "invalid_input", id="inverted"),
+    pytest.param(None, [15, 18, 15, 42], "invalid_input", id="empty"),
+    pytest.param(_no_lanes, TARGET_ROW_BOX, "no_lanes", id="no-lanes"),
+    pytest.param(None, [W + 10, 0, W + 50, 20], "out_of_image", id="outside"),
+    pytest.param(None, [15, 18, 24, 42], "row_too_small", id="too-narrow"),  # < 2 px a lane
+    pytest.param(None, [15, 18, W - 35, 20], "row_too_small", id="too-low"),
+    pytest.param(_unreadable_pixels, TARGET_ROW_BOX, "unreadable_image", id="unreadable"),
+    pytest.param(None, [85, 18, W, 42], "row_lanes_unclear", id="first-lane-left-out"),
+    pytest.param(
+        _lane_1_on_two_columns, TARGET_ROW_BOX, "row_lanes_unclear", id="numbered-inconsistently"
+    ),
+    pytest.param(None, [15, 45, W - 35, 60], "no_band_found", id="no-band"),
+    pytest.param(_wide_kept_box, TARGET_ROW_BOX, "size_would_overlap", id="size-would-overlap"),
+    pytest.param(_kept_box_on_lane_2, TARGET_ROW_BOX, "overlap", id="onto-a-kept-box"),
+]
+
+
+@pytest.mark.parametrize(("setup", "rect", "code"), ROW_BOX_REFUSALS)
+def test_a_refused_row_box_changes_nothing(client, tmp_path, setup, rect, code):
+    target, loading, _ = live(client, tmp_path, DOSES, boxed=())
+    ids = [] if setup is None else setup(client, target, loading)
+    body = {"protein_id": target, "rect": rect}
+    assert unchanged_refusal(client, "POST", "/api/boxes/row", body) == (code, ids)
+    assert "detect_row_boxes" not in logged(client)
+
+
+def test_a_row_box_is_for_a_known_protein_so_never_on_a_marker_image(client, tmp_path):
+    target, _, answer = live(client, tmp_path, DOSES, boxed=())
+    membrane = answer["project"]["images"][0]["membrane_id"]
+    status, marker = upload(
+        client, blot_bytes(tmp_path), "marker α.tif", kind="visible_marker", membrane_id=membrane
+    )
+    assert status == 201, marker
+    marker_id = marker["image_id"]
+    # No protein is on a visible-light marker image, and a row box is only ever a protein's.
+    body = {"name": "GAPDH", "role": "loading control", "image_id": marker_id}
+    assert unchanged_refusal(client, "POST", "/api/proteins", body) == ("marker_image", [marker_id])
+    for protein in ("prot-99", marker_id):
+        body = {"protein_id": protein, "rect": TARGET_ROW_BOX}
+        assert unchanged_refusal(client, "POST", "/api/boxes/row", body) == ("unknown_id", [])
+    body = {"protein_id": target, "rect": TARGET_ROW_BOX, "image_id": marker_id}
+    assert unchanged_refusal(client, "POST", "/api/boxes/row", body) == ("invalid_input", [])
+    assert "detect_row_boxes" not in logged(client)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"rect": [15, 18, 365, True]}, id="bool"),
+        pytest.param({"rect": [15, 18, 365.0, 42]}, id="whole-float"),
+        pytest.param({"rect": [15, 18, 365.5, 42]}, id="float"),
+        pytest.param({"rect": [15, 18, 365]}, id="three-numbers"),
+        pytest.param({"rect": [15, 18, 365, 42, 0]}, id="five-numbers"),
+        pytest.param({"rect": ["15", 18, 365, 42]}, id="number-as-text"),
+        pytest.param({"rect": "15 18 365 42"}, id="text"),
+        pytest.param({"rect": {"x0": 15, "y0": 18, "x1": 365, "y1": 42}}, id="object"),
+        pytest.param({"rect": None}, id="null"),
+        pytest.param({}, id="no-rect"),
+        pytest.param({"rect": [15, 18, 365, 42], "protein_id": None}, id="no-protein"),
+        pytest.param({"rect": [15, 18, 365, 42], "lane_index": 0}, id="unknown-field"),
+        pytest.param({"rect": [-(2**31) - 1, 18, 365, 42]}, id="below-32-bits"),
+        pytest.param({"rect": [15, 18, 365, 2**31]}, id="above-32-bits"),
+        # JSON reads 4300 digits and a sign, but a project file holding the row
+        # as the log keeps it would no longer read.
+        pytest.param({"rect": [-(10**4299), 18, 365, 42]}, id="4300-digits"),
+    ],
+)
+def test_a_malformed_row_box_is_refused(client, tmp_path, body):
+    _, protein = ready(client, tmp_path)
+    body = {"protein_id": protein, **body}
+    assert unchanged_refusal(client, "POST", "/api/boxes/row", body) == ("invalid_input", [])
