@@ -97,6 +97,14 @@ def settings() -> dict[str, JsonValue]:
             "max_height": None,
         },
         "clipped_pixels_threshold": quantify.CLIPPED_PIXELS_THRESHOLD,
+        # Where that check cannot run: a lossy, colour or CMYK-converted image
+        # of known bit depth (#112, quantify.is_possibly_clipped).
+        "possibly_clipped": {
+            "min_pixels": quantify.POSSIBLY_CLIPPED_PIXELS,
+            "near_limit_levels": quantify.NEAR_LIMIT_LEVELS,
+            "levels": "on an 8-bit scale, scaled to the image's range",
+            "values": "gray: the mean of red, green and blue for colour",
+        },
         "lane_table_decimals": export.LANE_TABLE_DECIMALS,
         "lane_table_ratio_decimals": export.LANE_TABLE_RATIO_DECIMALS,
         # The number the lane table gives the lane of stored index 0 (0 before #53).

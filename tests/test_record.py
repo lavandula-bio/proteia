@@ -29,7 +29,11 @@ from proteia.core.export import CHART_PNG_DPI, LANE_TABLE_DECIMALS, LANE_TABLE_R
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.model import ImageKind, LogEntry, Polarity, Project, Role, apply_change
 from proteia.core.plotspec import ErrorType
-from proteia.core.quantify import CLIPPED_PIXELS_THRESHOLD
+from proteia.core.quantify import (
+    CLIPPED_PIXELS_THRESHOLD,
+    NEAR_LIMIT_LEVELS,
+    POSSIBLY_CLIPPED_PIXELS,
+)
 from proteia.core.record import (
     RECORD_FORMAT,
     build_record,
@@ -225,6 +229,12 @@ def test_settings_are_the_code_constants():
             "max_height": None,
         },
         "clipped_pixels_threshold": CLIPPED_PIXELS_THRESHOLD,
+        "possibly_clipped": {  # #112: where the exact check cannot run
+            "min_pixels": POSSIBLY_CLIPPED_PIXELS,
+            "near_limit_levels": NEAR_LIMIT_LEVELS,
+            "levels": "on an 8-bit scale, scaled to the image's range",
+            "values": "gray: the mean of red, green and blue for colour",
+        },
         "lane_table_decimals": LANE_TABLE_DECIMALS,
         "lane_table_ratio_decimals": LANE_TABLE_RATIO_DECIMALS,
         "lane_table_first_lane": 1,  # the lane column numbers lanes as the app does

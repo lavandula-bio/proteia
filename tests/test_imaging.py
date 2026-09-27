@@ -16,6 +16,8 @@ from PIL import Image, ImageCms
 from skimage import io
 
 from proteia.core.imaging import (
+    UNTRUSTED_WARNINGS,
+    WARNINGS,
     UnsupportedColourSpaceError,
     _Declared,
     _read_tiff_with_pillow,
@@ -25,12 +27,13 @@ from proteia.core.imaging import (
     file_colours,
     from_pixels,
     load_image,
+    possible_clipping_depth,
     preview,
     read_colours,
     read_pixels,
     to_analysis_array,
 )
-from proteia.core.model import ImageKind, ImageRef, Polarity, Project
+from proteia.core.model import ImageKind, ImageRef, ImageWarning, Polarity, Project
 from proteia.core.storage import load_project, save_project, store_image
 
 
@@ -263,6 +266,37 @@ def test_every_warning_that_turns_the_clipping_check_off_says_so(tmp_path):
         "The red, green and blue channels differ; they were averaged into one gray"
         " channel, so over-exposure cannot be checked."
     )
+
+
+def test_possible_over_exposure_is_assessed_only_where_the_exact_check_cannot_run():
+    # #112: on an image of known bit depth that clipping_depth distrusts, the
+    # heuristic measures against the limit of that depth; nowhere else.
+    def warning(code: str) -> ImageWarning:
+        return ImageWarning(code=code, message=WARNINGS[code])
+
+    for depth in (8, 16):
+        assert possible_clipping_depth(depth, []) is None  # the exact check runs
+        assert clipping_depth(depth, []) == depth
+        for code in UNTRUSTED_WARNINGS:
+            assert possible_clipping_depth(depth, [warning(code)]) == depth, code
+            assert clipping_depth(depth, [warning(code)]) is None, code
+        both = [warning("lossy_format"), warning("color_channels_differ")]
+        assert possible_clipping_depth(depth, both) == depth
+    # An unknown bit depth has no limit: neither check runs.
+    for warnings in ([], [warning("unknown_bit_depth")], [warning("lossy_format")]):
+        assert possible_clipping_depth(None, warnings) is None
+        assert clipping_depth(None, warnings) is None
+
+
+def test_a_converted_cmyk_file_is_assessed_against_its_rgb_limit(tmp_path):
+    # Gray saved as CMYK converts back exactly by the formula: black stays 0,
+    # so the heuristic's limit is the converted colours' own 0.
+    path = tmp_path / "gray in CMYK.tif"
+    Image.fromarray(_gray(np.uint8, 255)).convert("CMYK").save(path)
+    loaded = load_image(path)
+    assert (loaded.bit_depth, _codes(loaded)) == (8, ["cmyk_converted"])
+    assert possible_clipping_depth(loaded.bit_depth, loaded.warnings) == 8
+    assert loaded.array.min() == 0.0 and loaded.array.max() == 255.0
 
 
 def test_jpeg_compressed_tiff_records_a_lossy_format_warning(tmp_path):

@@ -49,7 +49,7 @@ from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
-from proteia.core.imaging import clipping_depth
+from proteia.core.imaging import clipping_depth, possible_clipping_depth
 from proteia.core.model import (
     Band,
     Box,
@@ -83,6 +83,7 @@ from proteia.core.quantify import (
     band_backgrounds,
     estimate_background,
     is_clipped,
+    is_possibly_clipped,
     net_signal,
     quantify_nets,
 )
@@ -181,7 +182,7 @@ def import_blot(
 
 def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None = None) -> None:
     """The operations' invariant: every stored net, background (level, mode,
-    spread) and clipping flag equals, exactly, its value recomputed from the
+    spread) and clipping flag (exact or possible) equals, exactly, its value recomputed from the
     session's pixels, image by image, with every box on the image (every
     protein's, each with its size) measured together under the project's
     background method. ``only`` limits the check to those images.
@@ -214,6 +215,7 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
             )
             clamp = RING_CLAMP
         depth = clipping_depth(image.bit_depth, image.import_warnings)
+        near_depth = possible_clipping_depth(image.bit_depth, image.import_warnings)
         for (protein, band), background in zip(placed, found, strict=True):
             size = protein.box_size
             net = net_signal(
@@ -223,6 +225,10 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
             assert stored == (net, background.level, background.mode, background.spread), band.id
             clipped = is_clipped(pixels, band.box, size, bit_depth=depth, dark_on_light=dark)
             assert band.clipped is clipped, band.id
+            possibly = is_possibly_clipped(
+                pixels, band.box, size, bit_depth=near_depth, dark_on_light=dark
+            )
+            assert band.possibly_clipped is possibly, band.id
         # The product's one entry point gives the same nets.
         method = "global_median" if legacy else "ring_median"
         nets = quantify_nets(
@@ -1785,7 +1791,14 @@ def two_proteins(tmp_path: Path, hook=None) -> tuple[ProjectSession, str, str, s
     return s, image, a, b
 
 
-MEASURED = ("net", "background_level", "background_mode", "background_spread", "clipped")
+MEASURED = (
+    "net",
+    "background_level",
+    "background_mode",
+    "background_spread",
+    "clipped",
+    "possibly_clipped",
+)
 
 
 def measured(band: Band) -> list:
@@ -2759,6 +2772,9 @@ def test_images_whose_limit_cannot_be_trusted_are_not_checked(tmp_path, name, pi
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     band = ops.place_box(s, protein, lane_x(0), LANE_ROW, lane_index=0, grow=False)
     assert band_of(s, band).clipped is None
+    # #112: the band is saturated, so it is flagged as possibly over-exposed.
+    assert band_of(s, band).possibly_clipped is True
+    assert_nets_current(s)
 
 
 def test_the_clipped_notice_lists_only_included_lanes(tmp_path):
@@ -2776,6 +2792,321 @@ def test_the_clipped_notice_lists_only_included_lanes(tmp_path):
     [all_lanes] = [n for n in res.all_lanes.notices if n.code is NoticeCode.CLIPPED]
     assert all_lanes.lane_indices == (0, 1)  # every lane is included in the all-lanes set
     assert "over-exposed in lanes 1, 2:" in all_lanes.message
+
+
+# --- #112: possibly over-exposed bands, where the exact check cannot run ---
+
+# Six dark bands, one per lane, on a 16-bit truth: two well clear of the limit,
+# two clipped at 0 over 17 and 47 pixels of their 20x10 boxes, one that touches
+# it with a single pixel (a negligible bias: the rule's accepted miss) and a
+# faint one. Saved as 8-bit, lossy or in colour, the heuristic flags lanes 2, 3.
+POSSIBLE_DEPTHS = (30000.0, 45000.0, 70000.0, 120000.0, 51000.0, 10000.0)
+POSSIBLE_FLAGS = [False, False, True, True, False, False]
+POSSIBLE_BOX = BoxSize(width=20, height=10)
+
+
+def possible_truth() -> np.ndarray:
+    """The six bands, 16-bit, dark on light, clipped at 0 as a detector would."""
+    bands = [(lane_x(i), LANE_ROW, 6.0, 3.0, depth) for i, depth in enumerate(POSSIBLE_DEPTHS)]
+    return synthetic_blot((LANE_H, LANE_W), bands)
+
+
+def possible_gray8() -> np.ndarray:
+    return np.round(possible_truth() / 257.0).astype(np.uint8)
+
+
+def import_encoded(
+    s: ProjectSession, name: str, image, polarity: Polarity = DARK, **options: int
+) -> str:
+    """Save a Pillow image next to the project (the format from the suffix, with
+    ``options``), then import it."""
+    source = s.folder.parent / "sources" / name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    image.save(source, **options)
+    with source.open("rb") as f:
+        return ops.import_image(s, f, name, kind=CHEMI, polarity=polarity)
+
+
+def six_boxes(s: ProjectSession, image: str, role: Role = Role.TARGET) -> tuple[str, list[str]]:
+    """A protein on ``image`` with a fixed-size box on each of the six bands."""
+    if not s.project.batch.lanes:
+        ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(6)])
+    name = "β-catenin" if role is Role.TARGET else "GAPDH"
+    protein = ops.add_protein(s, name, role, image, box_size=POSSIBLE_BOX)
+    placed = [
+        ops.place_box(s, protein, lane_x(i), LANE_ROW, lane_index=i, grow=False) for i in range(6)
+    ]
+    return protein, placed
+
+
+def flags(s: ProjectSession, band_ids: Sequence[str]) -> tuple[list, list]:
+    """The bands' exact and possible over-exposure flags."""
+    bands = [band_of(s, band_id) for band_id in band_ids]
+    return [b.clipped for b in bands], [b.possibly_clipped for b in bands]
+
+
+def import_jpeg(
+    s: ProjectSession, pixels: np.ndarray, quality: int, polarity: Polarity = DARK
+) -> str:
+    """Import 8-bit gray ``pixels`` saved as a JPEG of that quality."""
+    from PIL import Image
+
+    return import_encoded(s, "blot β.jpg", Image.fromarray(pixels), polarity, quality=quality)
+
+
+@pytest.mark.parametrize("quality", [95, 85, 75])
+@pytest.mark.parametrize("polarity", [DARK, LIGHT])
+def test_bands_on_a_jpeg_are_flagged_when_possibly_over_exposed(tmp_path, quality, polarity):
+    # A light-on-dark blot is the same bands inverted: its limit is 255.
+    gray = possible_gray8() if polarity is DARK else 255 - possible_gray8()
+    s = session_on(tmp_path)
+    image = import_jpeg(s, gray, quality, polarity)
+    protein, band_ids = six_boxes(s, image)
+    assert flags(s, band_ids) == ([None] * 6, POSSIBLE_FLAGS)
+    assert_nets_current(s)
+
+    res = ops.compute(s)
+    [column] = res.proteins
+    assert (column.clipped, column.possibly_clipped) == ([None] * 6, POSSIBLE_FLAGS)
+    [possibly] = [n for n in res.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    assert (possibly.protein_ids, possibly.lane_indices, possibly.level) == (
+        (protein,),
+        (2, 3),
+        Level.WARNING,
+    )
+    assert possibly.message.startswith(
+        "'β-catenin' is possibly over-exposed in lanes 3, 4: each of those boxes holds 5 or"
+        " more pixels within 2 grey levels of the detector limit, and its image has lossy"
+        " (JPEG-type) compression, so saturation cannot be confirmed;"
+    )
+    # Every band is still reported as not checked, flagged or not.
+    [unchecked] = [n for n in res.notices if n.code is NoticeCode.CLIPPING_NOT_CHECKED]
+    assert unchecked.lane_indices == tuple(range(6))
+
+    # The other polarity's limit is the far end of the range: nothing is near it.
+    ops.set_polarity(s, image, LIGHT if polarity is DARK else DARK)
+    assert flags(s, band_ids) == ([None] * 6, [False] * 6)
+    assert_nets_current(s)
+    assert not [n for n in ops.compute(s).notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+
+
+@pytest.mark.parametrize("pixels", ["tinted rgb", "rgb16", "cmyk"])
+def test_colour_and_converted_images_are_flagged_on_their_gray_mean(tmp_path, pixels):
+    from PIL import Image
+
+    gray = possible_gray8()
+    s = session_on(tmp_path)
+    if pixels == "tinted rgb":
+        # Blue 40 levels below gray, as a tinted export: in lane 1, 11 pixels of
+        # blue come within 2 levels of 0 while the gray mean stays above 12, so
+        # the band is not flagged (a single channel near the limit is not enough);
+        # the saturated cores are 0 in all three channels.
+        blue = np.clip(gray.astype(int) - 40, 0, 255).astype(np.uint8)
+        assert np.count_nonzero(blue[LANE_ROW - 5 : LANE_ROW + 5, 80:100] <= 2) == 11
+        image = import_blot(s, np.stack([gray, gray, blue], axis=-1), "tinted blot.tif")
+        expected = (8, ["color_channels_differ"])
+    elif pixels == "rgb16":
+        # 16-bit colour: 5 pixels within 514 counts of 0 (2 levels of 255).
+        truth = possible_truth()
+        rgb = np.stack([truth, truth, truth], axis=-1)
+        rgb[:4, :4] = (65535, 0, 0)  # a red marking, away from the bands
+        image = import_blot(s, rgb, "blot 16-bit colour.tif")
+        expected = (16, ["color_channels_differ"])
+    else:
+        image = import_encoded(s, "blot CMYK.tif", Image.fromarray(gray).convert("CMYK"))
+        expected = (8, ["cmyk_converted"])
+    stored = s.project.batch.find_image(image)
+    assert (stored.bit_depth, [w.code for w in stored.import_warnings]) == expected
+    _, band_ids = six_boxes(s, image)
+    assert flags(s, band_ids) == ([None] * 6, POSSIBLE_FLAGS)
+    assert_nets_current(s)
+    [possibly] = [n for n in ops.compute(s).notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    assert possibly.lane_indices == (2, 3)
+    if pixels == "rgb16":
+        assert "within 514 grey levels (2 on an 8-bit scale) of the detector limit" in (
+            possibly.message
+        )
+
+
+@pytest.mark.parametrize("pixels", ["tiff16", "png8"])
+def test_no_possible_flag_where_the_exact_check_runs(tmp_path, pixels):
+    # A lossless gray image of known depth is checked exactly (#44): the single
+    # pixel at 0 in lane 4 counts there, and nothing is assessed as possible.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    if pixels == "tiff16":
+        image = import_blot(s, possible_truth())
+    else:
+        image = import_encoded(s, "blot.png", Image.fromarray(possible_gray8()))
+    assert s.project.batch.find_image(image).import_warnings == []
+    _, band_ids = six_boxes(s, image)
+    assert flags(s, band_ids) == ([False, False, True, True, True, False], [None] * 6)
+    assert_nets_current(s)
+    res = ops.compute(s)
+    codes = {n.code for n in res.notices}
+    assert NoticeCode.POSSIBLY_CLIPPED not in codes
+    assert NoticeCode.CLIPPING_NOT_CHECKED not in codes
+    assert res.proteins[0].possibly_clipped == [None] * 6
+    # Nothing unset is written: the saved project holds no possibly_clipped key.
+    assert b"possibly_clipped" not in storage.project_to_json(s.project)
+
+
+def test_an_image_of_unknown_depth_is_not_assessed(tmp_path):
+    # A float image has no range limit: neither check runs, and only the
+    # clipping_not_checked notice speaks for its bands.
+    s = session_on(tmp_path)
+    image = import_blot(s, possible_truth().astype(np.float64))
+    _, band_ids = six_boxes(s, image)
+    assert flags(s, band_ids) == ([None] * 6, [None] * 6)
+    codes = [n.code for n in ops.compute(s).notices]
+    assert NoticeCode.POSSIBLY_CLIPPED not in codes
+    assert NoticeCode.CLIPPING_NOT_CHECKED in codes
+    assert s.project.batch.find_image(image).bit_depth is None
+
+
+def test_a_possibly_over_exposed_loading_control_names_the_values_it_biases(tmp_path):
+    s = session_on(tmp_path)
+    image = import_jpeg(s, possible_gray8(), 85)
+    loading, _ = six_boxes(s, image, Role.LOADING_CONTROL)
+    ops.set_lanes(
+        s,
+        [LaneInput(f"c{i}", included=i != 3) for i in range(6)],
+    )
+    res = ops.compute(s)
+    [possibly] = [n for n in res.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    assert (possibly.protein_ids, possibly.lane_indices) == ((loading,), (2,))
+    assert possibly.message == (
+        "'GAPDH' is possibly over-exposed in lane 3: its box holds 5 or more pixels within"
+        " 2 grey levels of the detector limit, and its image has lossy (JPEG-type)"
+        " compression, so saturation cannot be confirmed; if it is over-exposed there, its"
+        " net is an under-estimate, which biases every value normalized to it; check the"
+        " imager's original capture"
+    )
+    # The excluded lane 4 holds a value: the all-lanes set has its own notice.
+    [every] = [n for n in res.all_lanes.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    assert every.lane_indices == (2, 3)
+    assert every.message.startswith("'GAPDH' is possibly over-exposed in lanes 3, 4:")
+
+
+def test_a_band_edit_fills_the_flag_of_a_project_saved_before_it(tmp_path):
+    # A project quantified before #112 holds no possibly_clipped on its JPEG
+    # bands (None: not assessed); the next re-quantification of the image
+    # assesses every band on it.
+    s = session_on(tmp_path)
+    image = import_jpeg(s, possible_gray8(), 95)
+    protein, band_ids = six_boxes(s, image)
+
+    def forget(draft: Project) -> None:
+        for band in draft.batch.find_protein(protein).bands:
+            band.possibly_clipped = None
+
+    plant(s, forget)
+    assert flags(s, band_ids)[1] == [None] * 6
+    assert not [n for n in ops.compute(s).notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    ops.move_box(s, band_ids[5], [lane_x(5) - 10, LANE_ROW - 4, lane_x(5) + 10, LANE_ROW + 6])
+    assert flags(s, band_ids)[1] == POSSIBLE_FLAGS
+    assert_nets_current(s, only=[image])
+
+
+def test_a_single_colour_export_hides_its_saturation_from_the_grey_mean(tmp_path):
+    # A known limit: a light-on-dark export in one colour (a green lookup
+    # table) saturates its green channel alone, so the grey mean it is assessed
+    # on stays at a third of the range. Its bands are assessed with no sign of
+    # it (False), and every one is still reported as not checked.
+    s = session_on(tmp_path)
+    green = 255 - possible_gray8()
+    zeros = np.zeros_like(green)
+    image = import_blot(s, np.stack([zeros, green, zeros], axis=-1), "green blot.tif", LIGHT)
+    _, band_ids = six_boxes(s, image)
+    assert np.count_nonzero(green == 255) > 60
+    assert flags(s, band_ids) == ([None] * 6, [False] * 6)
+    res = ops.compute(s)
+    assert NoticeCode.POSSIBLY_CLIPPED not in {n.code for n in res.notices}
+    [unchecked] = [n for n in res.notices if n.code is NoticeCode.CLIPPING_NOT_CHECKED]
+    assert unchecked.lane_indices == tuple(range(6))
+
+
+REQUANTIFY_HINT = (
+    "; its boxes were measured before Proteia looked for pixels near the detector limit:"
+    " requantify to look for them"
+)
+
+
+def test_requantify_assesses_the_bands_of_a_project_saved_before_it(tmp_path):
+    # A project quantified before #112, on the local background already: its
+    # JPEG bands hold no possibly_clipped. The not-checked notice says to
+    # requantify, and requantify assesses the bands of that image alone, in one
+    # change, leaving an image already assessed as it was.
+    from PIL import Image
+
+    s = session_on(tmp_path, save_to_folder)
+    old = import_jpeg(s, possible_gray8(), 95)
+    target, target_ids = six_boxes(s, old)
+    assessed = import_encoded(s, "blot α.jpg", Image.fromarray(possible_gray8()), quality=95)
+    loading, loading_ids = six_boxes(s, assessed, Role.LOADING_CONTROL)
+
+    def forget(draft: Project) -> None:
+        for band in draft.batch.find_protein(target).bands:
+            band.possibly_clipped = None
+
+    plant(s, forget)
+    assert ops.unassessed_images(s.project.batch) == [old]
+    res = ops.compute(s)
+    hinted = {
+        n.protein_ids: n.message.endswith(REQUANTIFY_HINT)
+        for n in res.notices
+        if n.code is NoticeCode.CLIPPING_NOT_CHECKED
+    }
+    assert hinted == {(target,): True, (loading,): False}
+    possibly = [n.protein_ids for n in res.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    assert possibly == [(loading,)]
+    kept = [band_of(s, band_id) for band_id in loading_ids]
+
+    assert ops.requantify(s) == (old,)
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "requantify",
+        {"from": "ring_median_v1", "to": "ring_median_v1", "images": [old]},
+    )
+    assert entry.content_hash == content_hash(s.project)
+    assert flags(s, target_ids) == ([None] * 6, POSSIBLE_FLAGS)
+    assert [band_of(s, band_id) for band_id in loading_ids] == kept
+    assert_nets_current(s)
+    assert ops.unassessed_images(s.project.batch) == []
+    res = ops.compute(s)
+    assert not [n for n in res.notices if n.message.endswith(REQUANTIFY_HINT)]
+    possibly = [n for n in res.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
+    assert [(n.protein_ids, n.lane_indices) for n in possibly] == [
+        ((target,), (2, 3)),
+        ((loading,), (2, 3)),
+    ]
+    assert load_project(s.folder) == s.project
+    assert history_issues(s.project) == []
+
+    committed = s.project
+    assert ops.requantify(s) == ()  # nothing left to assess: a no-op, with no entry
+    assert s.project is committed
+    ops.undo(s)  # taken back whole: not assessed again
+    assert flags(s, target_ids)[1] == [None] * 6
+    assert ops.unassessed_images(s.project.batch) == [old]
+
+
+@pytest.mark.parametrize("pixels", ["png8", "float"])
+def test_images_the_possible_check_does_not_run_on_are_never_unassessed(tmp_path, pixels):
+    # The exact check runs on a lossless gray image; an unknown depth has no
+    # limit: neither is waiting for requantify, and its notice has no hint.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    if pixels == "png8":
+        image = import_encoded(s, "blot.png", Image.fromarray(possible_gray8()))
+    else:
+        image = import_blot(s, possible_truth().astype(np.float64))
+    six_boxes(s, image)
+    assert ops.unassessed_images(s.project.batch) == []
+    assert not [n for n in ops.compute(s).notices if n.message.endswith(REQUANTIFY_HINT)]
+    assert ops.requantify(s) == ()
 
 
 def test_a_protein_name_that_would_clash_with_a_clipped_column_is_refused(tmp_path):
@@ -4346,7 +4677,14 @@ def test_a_row_leaves_the_other_proteins_on_its_image_alone(tmp_path):
     assert None not in placement.band_ids
     # Its boxes, size and records stay; only what its pixels give is measured
     # again, since every ring on the image now leaves out the row's boxes.
-    measured = {"net", "background_level", "background_mode", "background_spread", "clipped"}
+    measured = {
+        "net",
+        "background_level",
+        "background_mode",
+        "background_spread",
+        "clipped",
+        "possibly_clipped",
+    }
     after = protein_of(s, other)
     assert after.model_dump(exclude={"bands"}) == before.model_dump(exclude={"bands"})
     assert [b.model_dump(exclude=measured) for b in after.bands] == [

@@ -647,6 +647,52 @@ def _function(script: str, head: str) -> tuple[int, str]:
     return start, script[start : script.index("\n}\n", start) + 2]
 
 
+def test_the_page_words_a_box_possibly_over_exposed():
+    # #112: where the exact check could not run, the box panel, the box's label
+    # on the image and the lane table say what the heuristic found. The notice
+    # needs none of the page's lists: it is about one protein, as the clipped
+    # notice is, so the Checks list and every chart card of the protein show it.
+    app, charts = _code("app.js"), _code("charts.js")
+    _, text = _function(app, "function overExposureText(")
+    assert "band.possibly_clipped === true" in text and '"Possibly: ' in text
+    assert "band.possibly_clipped === false" in text
+    _, label = _function(app, "function overExposureLabel(")
+    assert "band.possibly_clipped === true" in label and '" over-exposed?"' in label
+    assert "column.possibly_clipped[lane] === true" in _code("lanes.js")
+    for name in ("NO_CHART", "OWN_SET", "ONE_SERIES"):
+        assert results.NoticeCode.POSSIBLY_CLIPPED.value not in _set_members(charts, name)
+
+
+def test_the_box_panel_does_not_reassure_where_the_heuristic_saw_nothing():
+    # #112: a band the heuristic did not flag was still not checked. Its grey
+    # analysis image cannot show every saturation (one colour channel saturated
+    # alone moves the grey mean a third of the way), so the panel says where it
+    # looked, never that few pixels came near the limit.
+    _, text = _function(_code("app.js"), "function overExposureText(")
+    assert '"Not checked; no sign of it in the grey analysis image"' in text
+    assert "few pixels" not in text
+
+
+def test_the_page_offers_to_requantify_boxes_not_assessed_for_over_exposure():
+    # #112: boxes measured before Proteia looked for pixels near the detector
+    # limit (the state's unassessed_images) get the header's requantify offer,
+    # worded for what it does there; the legacy background keeps its own. The
+    # history names the change without the background, which it may not touch.
+    app = _code("app.js")
+    _, reason = _function(app, "function requantifyReason(")
+    assert "project.unassessed_images.length" in reason
+    assert "LEGACY_BACKGROUND" in reason
+    assert _object_keys(app, "REQUANTIFY_OFFERS") == {"background", "overExposure"}
+    offers = app[app.index("const REQUANTIFY_OFFERS = {") :].split("\n};", 1)[0]
+    assert "near the detector limit" in offers
+    _, render = _function(app, "function renderRequantify(")
+    assert "requantifyReason(project)" in render and "REQUANTIFY_OFFERS[" in render
+    _, shown = _function(app, "function showRequantified(")
+    assert "before.background_method === LEGACY_BACKGROUND" in shown
+    words = app[app.index("const ACTION_WORDS = {") :].split("\n};", 1)[0]
+    assert 'requantify: "requantify",' in words
+
+
 def test_every_request_of_the_page_goes_through_request():
     # request() names the opening of the project the page shows in every
     # request, so the server refuses one about a project no longer open: the

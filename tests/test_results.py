@@ -1647,11 +1647,13 @@ def test_a_band_not_checked_for_over_exposure_is_reported_with_the_reason(
     bit_depth, warnings, because
 ):
     # Every band checked but β-catenin's in lanes 0 and 3 (excluded), on an
-    # image the check cannot trust.
+    # image the check cannot trust; where its range is known, they were
+    # assessed for pixels near the limit instead (#112).
     res = compute_results(
         _batch(
             _checked(False, *EVERY_BAND),
             _checked(None, "band-10", "band-12"),
+            _possibly(None if bit_depth is None else False, "band-10", "band-12"),
             _image("img-2", bit_depth, *warnings),
         )
     )
@@ -1675,7 +1677,11 @@ def test_a_band_not_checked_for_over_exposure_is_reported_with_the_reason(
 
 def test_a_loading_control_not_checked_names_the_values_it_biases():
     res = compute_results(
-        _batch(_checked(False, *BETA_BANDS, "band-17", "band-18"), _image("img-6", 8, LOSSY))
+        _batch(
+            _checked(False, *BETA_BANDS, "band-17", "band-18"),
+            _possibly(False, "band-13", "band-14", "band-15", "band-16"),
+            _image("img-6", 8, LOSSY),
+        )
     )
     [notice] = _unchecked(res)
     assert (notice.protein_ids, notice.lane_indices) == (("prot-8",), (0, 1, 2))
@@ -1684,6 +1690,49 @@ def test_a_loading_control_not_checked_names_the_values_it_biases():
         f" (JPEG-type) compression, so saturated pixels cannot be counted; {UNDER}, which"
         " biases every value normalized to it"
     )
+
+
+REQUANTIFY = (
+    "its boxes were measured before Proteia looked for pixels near the detector limit:"
+    " requantify to look for them"
+)
+
+
+def test_bands_measured_before_the_possible_check_are_told_to_requantify():
+    # A project saved before #112: β-catenin's bands on an 8-bit JPEG hold
+    # neither flag. Its not-checked notice says how to have them assessed.
+    def before(*edits: Callable[[Project], None]) -> model.Batch:
+        return _batch(
+            _checked(False, *EVERY_BAND),
+            _checked(None, *BETA_BANDS),
+            _image("img-2", 8, LOSSY),
+            *edits,
+        )
+
+    [notice] = _unchecked(compute_results(before()))
+    assert notice.message == (
+        "'β-catenin' was not checked for over-exposure in lanes 1, 2: its image has lossy"
+        f" (JPEG-type) compression, so saturated pixels cannot be counted; {UNDER};"
+        f" {REQUANTIFY}"
+    )
+    # Not once they are assessed (flagged or not), nor on an image without a
+    # range to assess against or with a limit the exact check trusts.
+    for edits in (
+        [_possibly(False, *BETA_BANDS)],
+        [_possibly(True, "band-10"), _possibly(False, "band-11", "band-12")],
+        [_image("img-2", None, LOSSY)],
+        [_image("img-2", 16)],
+    ):
+        res = compute_results(before(*edits))
+        assert not any(REQUANTIFY in n.message for n in _unchecked(res)), edits
+        assert not any(REQUANTIFY in n.message for n in _unchecked(res.all_lanes)), edits
+    # Only the lanes a set includes count: a band not assessed in the excluded
+    # lane 3 is named in the all-lanes set alone.
+    res = compute_results(before(_possibly(False, "band-10", "band-11")))
+    [notice] = _unchecked(res)
+    assert REQUANTIFY not in notice.message
+    [every] = _unchecked(res.all_lanes)
+    assert every.message.endswith(f"; {REQUANTIFY}")
 
 
 def test_only_the_unchecked_bands_of_included_lanes_are_reported():
@@ -1754,3 +1803,142 @@ def test_the_sample_projects_jpeg_loading_control_is_reported():
     assert _codes(res) == [NoticeCode.CLIPPING_NOT_CHECKED]
     assert _codes(res.all_lanes) == [NoticeCode.CLIPPING_NOT_CHECKED]
     assert "lossy (JPEG-type) compression and an unknown bit depth" in res.notices[0].message
+
+
+# --- #112: possibly over-exposed, where the exact check cannot run ---
+
+
+def _possibly(flag: bool | None, *band_ids: str) -> Callable[[Project], None]:
+    """The heuristic's flag on bands whose exact check did not run."""
+
+    def edit(draft: Project) -> None:
+        for band_id in band_ids:
+            band = draft.batch.find_band(band_id)[1]
+            band.clipped = None
+            band.possibly_clipped = flag
+
+    return edit
+
+
+def _possible(res: results.Results) -> list[results.Notice]:
+    return _all(res, NoticeCode.POSSIBLY_CLIPPED)
+
+
+NEAR_2 = "5 or more pixels within 2 grey levels of the detector limit"
+
+
+def test_a_band_possibly_over_exposed_is_reported_with_its_lanes():
+    # β-catenin on an 8-bit JPEG: lane 0 flagged, lane 1 not, lane 3 (excluded)
+    # flagged; every other band checked.
+    res = compute_results(
+        _batch(
+            _checked(False, *EVERY_BAND),
+            _possibly(True, "band-10", "band-12"),
+            _possibly(False, "band-11"),
+            _image("img-2", 8, LOSSY),
+        )
+    )
+    assert _possible(res) == [
+        results.Notice(
+            code=NoticeCode.POSSIBLY_CLIPPED,
+            level=Level.WARNING,
+            message=(
+                f"'β-catenin' is possibly over-exposed in lane 1: its box holds {NEAR_2},"
+                " and its image has lossy (JPEG-type) compression, so saturation cannot be"
+                f" confirmed; {UNDER}; check the imager's original capture"
+            ),
+            protein_ids=("prot-7",),
+            lane_indices=(0,),
+        )
+    ]
+    # The column carries the flags, lane by lane (lane 2 has no box).
+    [beta] = [column for column in res.proteins if column.protein_id == "prot-7"]
+    assert beta.possibly_clipped == [True, False, None, True]
+    assert beta.clipped == [None, None, None, None]
+    # The not-checked notice still names every unchecked lane, flagged or not.
+    assert _one(res, NoticeCode.CLIPPING_NOT_CHECKED).lane_indices == (0, 1)
+    # With every lane included, the excluded lane is reported too.
+    [every] = _possible(res.all_lanes)
+    assert (every.protein_ids, every.lane_indices) == (("prot-7",), (0, 3))
+    assert every.message.startswith(
+        f"'β-catenin' is possibly over-exposed in lanes 1, 4: each of those boxes holds {NEAR_2},"
+    )
+
+
+def test_a_possibly_over_exposed_loading_control_names_the_values_it_biases():
+    res = compute_results(
+        _batch(
+            _checked(False, *EVERY_BAND),
+            _possibly(True, "band-13", "band-14"),
+            _possibly(False, "band-15", "band-16"),
+            _image("img-6", 8, COLOR),
+        )
+    )
+    [notice] = _possible(res)
+    assert (notice.protein_ids, notice.lane_indices) == (("prot-8",), (0, 1))
+    assert notice.message == (
+        f"'α-tubulin' is possibly over-exposed in lanes 1, 2: each of those boxes holds {NEAR_2},"
+        " and its image has color channels averaged into gray, so saturation cannot be"
+        f" confirmed; {UNDER}, which biases every value normalized to it; check the imager's"
+        " original capture"
+    )
+    # The target normalized to it gets no notice of its own: the chart card of
+    # the series shows its loading control's (a notice about either protein).
+    assert {n.protein_ids for n in _possible(res)} == {("prot-8",)}
+
+
+@pytest.mark.parametrize(
+    ("bit_depth", "warnings", "near", "because"),
+    [
+        (16, [LOSSY], "514 grey levels (2 on an 8-bit scale)", "lossy (JPEG-type) compression"),
+        (8, [CMYK], "2 grey levels", "CMYK converted to RGB"),
+        (
+            8,
+            [LOSSY, COLOR],
+            "2 grey levels",
+            "lossy (JPEG-type) compression and color channels averaged into gray",
+        ),
+    ],
+)
+def test_the_possible_notice_states_the_range_and_the_reason(bit_depth, warnings, near, because):
+    res = compute_results(
+        _batch(
+            _checked(False, *EVERY_BAND),
+            _possibly(True, "band-11"),
+            _image("img-2", bit_depth, *warnings),
+        )
+    )
+    [notice] = _possible(res)
+    assert notice.message == (
+        f"'β-catenin' is possibly over-exposed in lane 2: its box holds 5 or more pixels"
+        f" within {near} of the detector limit, and its image has {because}, so saturation"
+        f" cannot be confirmed; {UNDER}; check the imager's original capture"
+    )
+
+
+def test_a_possible_flag_without_a_reason_is_still_reported():
+    # The operations assess only images the exact check distrusts; a flag on
+    # another (a hand-edited file: a 16-bit TIFF) is reported with no reason
+    # made up.
+    res = compute_results(_batch(_checked(False, *EVERY_BAND), _possibly(True, "band-11")))
+    [notice] = _possible(res)
+    assert notice.message == (
+        "'β-catenin' is possibly over-exposed in lane 2: its box holds 5 or more pixels"
+        " within 514 grey levels (2 on an 8-bit scale) of the detector limit;"
+        f" {UNDER}; check the imager's original capture"
+    )
+
+
+def test_no_possible_notice_without_a_flagged_band():
+    for edits in (
+        [_checked(False, *EVERY_BAND)],  # every band checked exactly
+        [_checked(True, *EVERY_BAND)],  # over-exposed: the clipped notice says so
+        [_checked(False, *EVERY_BAND), _possibly(False, *BETA_BANDS), _image("img-2", 8, LOSSY)],
+        [_checked(False, *EVERY_BAND), _possibly(None, *BETA_BANDS), _image("img-2", 8, LOSSY)],
+    ):
+        res = compute_results(_batch(*edits))
+        assert _possible(res) == [] and _possible(res.all_lanes) == []
+    # The sample itself: its JPEG has no bit depth, so nothing is assessed.
+    res = compute_results(_batch())
+    assert all(column.possibly_clipped == [None] * 4 for column in res.proteins)
+    assert _possible(res) == []

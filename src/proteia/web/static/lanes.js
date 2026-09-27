@@ -655,15 +655,25 @@ export class LaneTable {
       if (net === null) {
         return this.valueCell("—", headers, { title: "No box", className: "value missing" });
       }
-      if (column.clipped[lane] !== true) {
-        return this.valueCell(netText(net), headers);
+      if (column.clipped[lane] === true) {
+        const why = "Over-exposed: pixels at the detector limit, so the net is an under-estimate";
+        return this.valueCell(
+          [mark("▲", "over", "over-exposed", why), " ", netText(net)],
+          headers,
+          { title: why, className: "value clipped" },
+        );
       }
-      const why = "Over-exposed: pixels at the detector limit, so the net is an under-estimate";
-      return this.valueCell(
-        [mark("▲", "over", "over-exposed", why), " ", netText(net)],
-        headers,
-        { title: why, className: "value clipped" },
-      );
+      if (column.possibly_clipped[lane] === true) {
+        const why =
+          "Possibly over-exposed: pixels near the detector limit, which this image cannot" +
+          " confirm; if so, the net is an under-estimate";
+        return this.valueCell(
+          [mark("△", "over", "possibly over-exposed", why), " ", netText(net)],
+          headers,
+          { title: why, className: "value clipped" },
+        );
+      }
+      return this.valueCell(netText(net), headers);
     });
     columns.series.forEach((series, k) => {
       if (series.all) {

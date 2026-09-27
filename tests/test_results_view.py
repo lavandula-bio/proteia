@@ -88,6 +88,7 @@ def _results(**fields) -> Results:
                 nets=[10.0, 20.0, None, 40.0, 50.0],
                 band_ids=["band-3", "band-4", None, "band-5", "band-6"],
                 clipped=[False, True, None, None, False],
+                possibly_clipped=[None, None, None, True, None],  # lane 3 not checked (#112)
                 detected=[True, True, False, True, True],
             )
         ],
@@ -142,6 +143,7 @@ def test_the_payload_is_a_translation_of_one_result_set():
             "nets": [10.0, 20.0, None, 40.0, 50.0],
             "band_ids": ["band-3", "band-4", None, "band-5", "band-6"],
             "clipped": [False, True, None, None, False],
+            "possibly_clipped": [None, None, None, True, None],
             "detected": [True, True, False, True, True],
         }
     ]

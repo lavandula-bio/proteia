@@ -610,7 +610,7 @@ button:disabled {
   font-size: 0.85rem;
 }
 
-/* In the header while the nets use the legacy background (app.js
+/* In the header while there is something to requantify (app.js
    renderRequantify): the control that requantifies and, on the same line, what
    it changes, so it takes none of the lane table's height and stays when the
    results are hidden. Only its note gives way, cut short ("…"; its tooltip has

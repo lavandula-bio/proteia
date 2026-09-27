@@ -451,6 +451,54 @@ def test_a_zero_padding_is_never_written():
     assert document_hash(written) != content_hash(project)
 
 
+# --- A band's possible over-exposure (#112) in the saved form ---
+
+
+def _possibly(flags: dict[str, bool]) -> Project:
+    """The sample project with α-tubulin's bands (on its JPEG) assessed."""
+
+    def change(p: Project) -> None:
+        for band_id, flag in flags.items():
+            p.batch.find_band(band_id)[1].possibly_clipped = flag
+
+    return apply_change(make_project(), change)[0]
+
+
+def test_possible_flags_round_trip_and_resave_byte_identical(tmp_path):
+    project = _possibly({"band-13": True, "band-14": False})
+    first = _saved(tmp_path / "a", project)
+    data = first.read_bytes()
+    assert data.count(b'"possibly_clipped"') == 2  # the two assessed bands only
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)
+    assert _saved(tmp_path / "b", loaded).read_bytes() == data
+
+
+def test_possible_flags_move_the_content_hash():
+    # Assessed or not, flagged or not: each is content.
+    plain = content_hash(make_project())
+    hashes = {content_hash(_possibly({"band-13": flag})) for flag in (True, False)}
+    assert len(hashes) == 2 and plain not in hashes
+
+
+def test_an_unset_possible_flag_is_never_written():
+    project = make_project()
+    doc = _doc(project)
+    bands = [band for protein in doc["batch"]["proteins"] for band in protein["bands"]]
+    assert all("possibly_clipped" not in band for band in bands)
+    for band in bands:
+        # A hand-edited file: loads, hashes as if the key were absent, and is saved without it.
+        band["possibly_clipped"] = None
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)
+    assert project_to_json(loaded) == project_to_json(project)
+    # Writing null would have moved the hash of every existing project.
+    written = {key: value for key, value in doc.items() if key not in HASH_EXCLUDE}
+    assert document_hash(written) != content_hash(project)
+
+
 # --- The action log in project.json ---
 
 
