@@ -45,7 +45,10 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   is saved without it. The second is ``Protein.box_padding``, left out while it is
   ``{"across": 0, "along": 0}``, likewise. The third is ``Band.possibly_clipped``
   (#112), left out while it is ``null``: only bands on a lossy, colour or CMYK
-  image of known bit depth have it. Writing the empty value instead would
+  image of known bit depth have it. The fourth is in the molecular-weight
+  calibration (#58): ``CalibrationPoint.x`` is left out while ``null``,
+  ``CalibrationPoint.side`` while ``"left"`` and ``MwCalibration.ladder_kda``
+  while empty. Writing the empty value instead would
   move every existing project's hash, so every export would report
   ``content_changed_outside_log``.
 * The hash covers ``schema_version``, the background method, every id, the lane

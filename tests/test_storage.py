@@ -31,8 +31,11 @@ from proteia.core.model import (
     Band,
     Box,
     BoxPadding,
+    CalibrationPoint,
+    FitMethod,
     ImageKind,
     ImageRef,
+    LadderSide,
     LogEntry,
     Polarity,
     Project,
@@ -497,6 +500,80 @@ def test_an_unset_possible_flag_is_never_written():
     # Writing null would have moved the hash of every existing project.
     written = {key: value for key, value in doc.items() if key not in HASH_EXCLUDE}
     assert document_hash(written) != content_hash(project)
+
+
+# --- The molecular-weight calibration's fields (#58) in the saved form ---
+
+
+def test_explicit_defaults_keep_the_bytes_and_hash():
+    project = make_project()
+    doc = _doc(project)
+    for membrane in doc["batch"]["membranes"]:
+        calibration = membrane["calibration"]
+        assert "ladder_kda" not in calibration
+        # A hand-edited file: loads, hashes as if the keys were absent, and is saved without them.
+        calibration["ladder_kda"] = []
+        for point in calibration["points"]:
+            assert "x" not in point and "side" not in point
+            point.update(side="left", x=None)
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)  # pinned: test_content_hash_is_pinned
+    assert project_to_json(loaded) == project_to_json(project)
+    # Writing the defaults would have moved the hash of every existing project.
+    written = {key: value for key, value in doc.items() if key not in HASH_EXCLUDE}
+    assert document_hash(written) != content_hash(project)
+
+
+def _calibrated() -> Project:
+    """The sample project with a right ladder on mem-1's marker (every point of
+    mem-1 at its x), the ladder's MW list and the piecewise method, and mem-5's
+    strip edges clicked at an x."""
+
+    def change(p: Project) -> None:
+        mem_1, mem_5 = p.batch.membranes
+        calibration = mem_1.calibration
+        for point in calibration.points:
+            point.x = 77.0
+        calibration.points += [
+            CalibrationPoint(
+                image_id="img-3",
+                y=y,
+                mw=mw,
+                source="visible_marker",
+                x=x,
+                side=LadderSide.RIGHT,
+            )
+            for y, mw, x in ((22.0, 250, 301.5), (63.25, 100, 302.0))
+        ]
+        calibration.ladder_kda = [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0, 10.0]
+        calibration.fit_method = FitMethod.LOG_LINEAR_PIECEWISE
+        for point, x in zip(mem_5.calibration.points, (12.5, 180.25), strict=True):
+            point.x = x
+
+    return apply_change(make_project(), change)[0]
+
+
+def test_new_calibration_fields_round_trip(tmp_path):
+    project = _calibrated()
+    first = _saved(tmp_path / "a", project)
+    data = first.read_bytes()
+    mem_1, mem_5 = json.loads(data)["batch"]["membranes"]
+    assert [(point.get("side"), point["x"]) for point in mem_1["calibration"]["points"]] == [
+        (None, 77.0),  # left: no side key
+        (None, 77.0),
+        (None, 77.0),
+        ("right", 301.5),
+        ("right", 302.0),
+    ]
+    assert [point["x"] for point in mem_5["calibration"]["points"]] == [12.5, 180.25]
+    assert mem_1["calibration"]["ladder_kda"][0] == 250.0
+    assert mem_1["calibration"]["fit_method"] == "log_linear_piecewise"
+    assert "ladder_kda" not in mem_5["calibration"]
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project) != content_hash(make_project())
+    assert _saved(tmp_path / "b", loaded).read_bytes() == data
 
 
 # --- The action log in project.json ---
