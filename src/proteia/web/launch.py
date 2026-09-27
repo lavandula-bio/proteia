@@ -27,6 +27,12 @@ opens nothing, and the next launch replaces it.) The only connection a launch
 makes is the check of the running instance, to its loopback port, without any
 proxy. On POSIX the folder is 0700 and the files 0600; on Windows the per-user
 local application-data folder is readable only by its owner.
+
+Every launch writes its session log (:mod:`proteia.web.logs`) to the ``logs``
+folder there: when it started and stopped, and whether it served or opened the
+running instance. The token is concealed from it as soon as the launch makes or
+reads one, so neither the log nor the console ever shows it, nor the redirect
+page's address.
 """
 
 from __future__ import annotations
@@ -35,7 +41,9 @@ import contextlib
 import html
 import http.client
 import json
+import logging
 import os
+import platform
 import secrets
 import signal
 import socket
@@ -50,7 +58,9 @@ from typing import Final
 
 import uvicorn
 
+import proteia
 from proteia.core.storage import write_atomic
+from proteia.web import logs, projects
 from proteia.web.api import UnsavedChangesError, Workspace
 from proteia.web.server import APP_ID, HOST, TOKEN_PATTERN, create_app
 
@@ -85,6 +95,8 @@ _STOP_SIGNALS: Final = tuple(
 )
 
 Opener = Callable[[str], object]  # webbrowser.open's shape: takes a URL
+
+_log = logging.getLogger(__name__)
 
 
 class NotRespondingError(RuntimeError):
@@ -229,6 +241,9 @@ def _server(app: object) -> uvicorn.Server:
         http="h11",
         ws="none",
         lifespan="off",
+        # uvicorn's records go to the handlers the session log set up (or, without
+        # one, Python's last resort on standard error), not to handlers of its own.
+        log_config=None,
         log_level="warning",
         access_log=False,  # the log would name every request
         server_header=False,
@@ -297,6 +312,7 @@ class Instance:
                     self.workspace.flush()
                 except UnsavedChangesError as exc:
                     print(f"Proteia stopped, but {exc}", file=sys.stderr)
+                    _log.warning("Proteia stopped, but %s", exc, extra=logs.FILE_ONLY)
                 self.workspace.close()
             finally:
                 self.close()
@@ -321,6 +337,8 @@ def _open_running(folder: Path, opener: Opener, wait: float) -> InstanceLock | N
     deadline = time.monotonic() + wait
     while True:
         info = read_instance(folder)
+        if info is not None:
+            logs.conceal(info.token)
         if info is not None and probe(info):
             open_in_browser(folder, info.port, info.token, opener)
             return None
@@ -359,6 +377,7 @@ def start(
         sock = bind_loopback()
         try:
             token = secrets.token_urlsafe(TOKEN_BYTES)
+            logs.conceal(token)
             instance = Instance(folder, sock, token, lock, workspace)
         except BaseException:
             sock.close()
@@ -386,17 +405,42 @@ def _tolerant_console() -> None:
 def main() -> int:
     """The ``proteia`` console command."""
     _tolerant_console()
+    folder = state_dir()
+    hidden = {folder: "<state>", projects.projects_root(): "<projects>"}
+    with logs.session(folder / logs.LOG_DIR, hidden=hidden):
+        _log.info(
+            "session started: Proteia %s, Python %s, %s",
+            proteia.__version__,
+            platform.python_version(),
+            platform.platform(),
+        )
+        try:
+            return _run()
+        except Exception:
+            # The file only: Python prints the stack trace to the console as it exits.
+            _log.exception("Proteia stopped on an unexpected error", extra=logs.FILE_ONLY)
+            raise
+        finally:
+            _log.info("session ended")
+
+
+def _run() -> int:
+    """:func:`main` once the session log is set up."""
     try:
         instance = start()
     except NotRespondingError:
-        print(
+        message = (
             "Proteia is already running but does not respond. Try again in a moment,"
             " or end the other Proteia process."
         )
+        _log.error(message, extra=logs.FILE_ONLY)
+        print(message)
         return 1
     if instance is None:
+        _log.info("Proteia is already running; it has been opened in the browser")
         print("Proteia is already running; it has been opened in your browser.")
         return 0
+    _log.info("serving at http://%s:%d/", HOST, instance.port)
     print(f"Proteia is running at http://{HOST}:{instance.port}/ and opens in your browser.")
     print(f"If no browser window opens, open this file in a browser: {instance.redirect_path}")
     print("To quit, use Quit on the page, or press Ctrl+C here.")

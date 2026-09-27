@@ -83,12 +83,21 @@ an export folder to reveal that does not exist 404 ``folder_not_found``;
 request that names an opening no longer open, with ``detail`` ``{open,
 open_id}``: the open project's name and open id; ``invalid_input`` 422 for a
 request the routes cannot read, a ``Proteia-Opening`` not in plain digits too.
+Every error answer is logged (:mod:`proteia.web.logs`) with the request's method
+and path (cut short: :func:`~proteia.web.logs.shorten`), its status, code and
+message, and its ids and ``detail`` when it has them; a 500 with its stack
+trace, in the log file only. A request no route takes (a 404 or 405, which a
+read of the page shell can get without the token) is logged as the guard logs
+a refusal: at most :data:`~proteia.web.logs.REFUSALS_LOGGED` a minute one by
+one, the rest counted.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
+import logging
 import os
 import tempfile
 import threading
@@ -102,6 +111,7 @@ from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import (
@@ -114,6 +124,7 @@ from pydantic import (
     StrictInt,
     ValidationError,
 )
+from starlette.exceptions import HTTPException
 
 from proteia.core import operations as ops
 from proteia.core import storage
@@ -124,7 +135,7 @@ from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import projects, sample_project
+from proteia.web import logs, projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
 from proteia.web.state import has_colour, original_png, preview_png, project_state, revision
@@ -137,6 +148,8 @@ _PREVIEWS_KEPT: Final = 8
 # How long a reopen waits for an operation running on the open session before
 # answering it without reading its project.json again.
 REOPEN_WAIT_S: Final = 5.0
+
+_log = logging.getLogger(__name__)
 
 
 class NoProjectError(RuntimeError):
@@ -447,6 +460,13 @@ class Workspace:
                                 self._charts.reset(self._open_id)
                     finally:
                         session.lock.release()
+                else:
+                    _log.info(
+                        "%r was opened again while a request still used it after %s s: its"
+                        " project.json was not checked for changes made outside Proteia",
+                        session.folder.name,
+                        REOPEN_WAIT_S,
+                    )
             finally:
                 with self._lock:
                     self._reopening = None
@@ -881,6 +901,8 @@ def reveal_project(
     one of its export folders, as ``POST /api/export`` answered it."""
     folder = session.folder if body is None else _export_folder(session.folder, body.folder)
     workspace.reveal(folder)
+    shown = "its folder" if body is None else body.folder
+    _log.info("in %r: showed %s in the file manager", session.folder.name, shown)
     return Response(status_code=204)
 
 
@@ -1236,11 +1258,61 @@ def install(app: FastAPI, workspace: Workspace) -> None:
     }
     for kind, answer in answers.items():
         app.add_exception_handler(kind, _handler(answer))
+    app.add_exception_handler(HTTPException, _http_refusal(logs.Throttle()))
 
 
 def _handler(answer: Callable[[Exception], JSONResponse]):
     async def handle(request: Request, exc: Exception) -> JSONResponse:
-        return answer(exc)
+        response = answer(exc)
+        _log_refusal(request, response, exc)
+        return response
+
+    return handle
+
+
+def _log_refusal(request: Request, response: JSONResponse, exc: Exception) -> None:
+    """Log an error answer: the request's method and path, the status, code and
+    message, and the ids and ``detail`` when it has them; a server error (a file
+    that cannot be written) as an error, with its stack trace."""
+    body = json.loads(response.body)
+    parts = [f"{response.status_code} {body['code']}: {body['message']}"]
+    if body["ids"]:
+        parts.append(f"ids {', '.join(body['ids'])}")
+    if body.get("detail") is not None:
+        parts.append(f"detail {json.dumps(body['detail'], ensure_ascii=False)}")
+    method, path = request.method, logs.shorten(request.url.path)
+    if response.status_code >= 500:
+        # The file only: the console never showed a refusal.
+        _log.error(
+            "refused %s %s: %s",
+            method,
+            path,
+            "; ".join(parts),
+            exc_info=exc,
+            extra=logs.FILE_ONLY,
+        )
+    else:
+        _log.info("refused %s %s: %s", method, path, "; ".join(parts))
+
+
+def _http_refusal(refusals: logs.Throttle):
+    """The handler of a request no route takes (an unknown path, a method a
+    route does not take): answered as FastAPI answers it, and logged, at most
+    as often as ``refusals`` admits."""
+
+    async def handle(request: Request, exc: HTTPException) -> Response:
+        admitted, left_out = refusals.admit()
+        if left_out:
+            _log.info(
+                "refused %d more requests no route takes, not logged one by one"
+                " (more than %d a minute)",
+                left_out,
+                refusals.limit,
+            )
+        if admitted:
+            method, path = request.method, logs.shorten(request.url.path)
+            _log.info("refused %s %s: %s %s", method, path, exc.status_code, exc.detail)
+        return await http_exception_handler(request, exc)
 
     return handle
 
