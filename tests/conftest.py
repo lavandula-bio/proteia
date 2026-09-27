@@ -11,7 +11,8 @@ light-on-dark. The target β-catenin (``img-2``) normalizes against α-tubulin o
 the other membrane; GAPDH is measured on the reprobe. Lane 2 has no β-catenin
 band, and band lists are given out of order. It has no not-detected record, so
 its saved form has no ``undetected`` key; :func:`make_project_with_undetected`
-adds some.
+adds some. :func:`sample_doc_v1` is the same project as schema 1 saved it,
+before #83, for the migration tests.
 
 Image helpers for tests that read real pixels: :func:`write_tiff` and
 :func:`synthetic_blot`. :class:`FakeClock` gives a session predictable log times.
@@ -29,7 +30,7 @@ import pytest
 import tifffile
 from pydantic import BaseModel
 
-from proteia.core.model import Project
+from proteia.core.model import Project, apply_change
 from proteia.core.storage import image_path
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
@@ -95,6 +96,56 @@ def make_project() -> Project:
     return Project.model_validate(_sample_doc())
 
 
+# The content hash schema 1 gave the sample project (sample_doc_v1): what the
+# log of a project saved before #83 holds.
+V1_CONTENT_HASH = "28dfdbcbca235bb7359164954bf76a6d743a2c4448e51049172f42cc00b3df6a"
+
+
+def as_legacy(project: Project) -> Project:
+    """``project`` as a project quantified before #83 holds it (a migrated
+    schema-1 project): the ``global_median`` method, each band's level at its
+    image's median, with that mode and no spread. The nets are left as they are."""
+
+    def change(draft: Project) -> None:
+        draft.background_method = "global_median"
+        for protein in draft.batch.proteins:
+            level = draft.batch.find_image(protein.image_id).background
+            for band in protein.bands:
+                band.background_level = level
+                band.background_mode = "global_median"
+                band.background_spread = 0.0
+
+    return apply_change(project, change)[0]
+
+
+def sample_doc_v1() -> dict:
+    """The sample project as a schema-1 ``project.json`` held it, before #83: no
+    background method and no band background fields. Its nets are the image
+    median's (global_median), and its content hash was :data:`V1_CONTENT_HASH`."""
+    return _sample_doc_v1()
+
+
+def _sample_doc() -> dict:
+    """The sample project in the current schema: the local background method,
+    each band's level at its image's median (a stand-in: the images are not
+    real pixels), measured on a whole ring, with no spread."""
+    doc = _sample_doc_v1()
+    doc["schema_version"] = 2
+    doc["background_method"] = "ring_median_v1"
+    batch = doc["batch"]
+    medians = {
+        image["id"]: image["background"]
+        for membrane in batch["membranes"]
+        for image in membrane["images"]
+    }
+    for protein in batch["proteins"]:
+        for band in protein["bands"]:
+            band["background_level"] = medians[protein["image_id"]]
+            band["background_mode"] = "symmetric"
+            band["background_spread"] = 0.0
+    return doc
+
+
 def _undetected(lane: int, snr: float, region: tuple[int, int, int, int], **fields) -> dict:
     x0, y0, x1, y1 = region
     return {
@@ -123,8 +174,9 @@ def make_project_with_undetected() -> Project:
     return Project.model_validate(doc)
 
 
-def _sample_doc() -> dict:
-    """The sample project as ``project.json`` would hold it (see :func:`make_project`)."""
+def _sample_doc_v1() -> dict:
+    """The sample project as a schema-1 ``project.json`` held it (see
+    :func:`sample_doc_v1`)."""
     lanes = [
         {"index": 0, "label": "vehicle", "sample": "v1"},
         {"index": 1, "label": "vehicle", "sample": "v2"},

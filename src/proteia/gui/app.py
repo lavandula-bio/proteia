@@ -40,14 +40,14 @@ from proteia.core.boxes import normalize_corners, resize_all
 from proteia.core.export import write_lane_table
 from proteia.core.grow import grow_box
 from proteia.core.imaging import LoadedImage, display_rgb, load_image
-from proteia.core.model import Box, BoxSize, overlaps
+from proteia.core.model import BoxSize, overlaps
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
 from proteia.core.project import (
     align_to_lanes,
     spine_axes,
     spine_from_labels,
 )
-from proteia.core.quantify import estimate_background, net_signal
+from proteia.core.quantify import estimate_background, quantify_nets
 
 Rect = tuple[int, int, int, int]
 PALETTE = ["#ff4d4d", "#4dd2ff", "#ffe14d", "#7cfc00", "#ff66ff", "#ffa64d", "#66b3ff", "#b39ddb"]
@@ -66,10 +66,10 @@ def _initial_size(image: np.ndarray) -> BoxSize:
 
 def _make_image(loaded: LoadedImage, name: str, path: str | None) -> dict:
     """One member of a batch's image set: a grayscale ``array`` (analysis) plus an
-    RGB ``original`` (display), its background and dimensions. Net signal is always
-    computed against the protein's own ``array``, so a target and a loading control
-    on different membranes still join correctly by lane; ``original`` only feeds the
-    optional 'show original' display toggle."""
+    RGB ``original`` (display), its median (the grow seed level) and dimensions.
+    Nets are always computed against the protein's own ``array``, so a target and
+    a loading control on different membranes still join correctly by lane;
+    ``original`` only feeds the optional 'show original' display toggle."""
     array = loaded.array  # 2D gray, so the viewer swaps images without a dims crash
     return {
         "name": name,
@@ -102,6 +102,37 @@ def _center_snap(rect: Rect, size: BoxSize, iw: int, ih: int) -> Rect:
 
 def _protein_size(p: dict) -> BoxSize:
     return _padded(p["base"], p["pad_w"], p["pad_h"])
+
+
+def _placed_rects(state: dict, pid: int) -> list[Rect]:
+    return [pl["rect"] for pl in state["placed"] if pl["pid"] == pid]
+
+
+def _boxes_with_nets(state: dict, pid: int) -> list[tuple[int, float]]:
+    """Protein ``pid``'s boxes as (x0, net), left to right. Every box on the
+    protein's image, of every protein, is quantified together through the
+    product's one entry point (quantify_nets, ring_median), since each ring
+    leaves out every box there: the same nets the project operations store."""
+    image = state["proteins"][pid]["image"]
+    img_d = state["images"][image]
+    placed = [
+        (other, _protein_size(p), rect)
+        for other, p in enumerate(state["proteins"])
+        if p["image"] == image
+        for rect in _placed_rects(state, other)
+    ]
+    nets = quantify_nets(
+        img_d["array"],
+        [(x0, y0, x0 + size.width, y0 + size.height) for _, size, (x0, y0, _, _) in placed],
+        [(size.width, size.height) for _, size, _ in placed],
+        method="ring_median",
+        dark_on_light=img_d["dark"],  # polarity of this protein's own image
+        integral=img_d["bit_depth"] is not None,
+    )
+    boxes = [
+        (rect[0], net) for (other, _, rect), net in zip(placed, nets, strict=True) if other == pid
+    ]
+    return sorted(boxes, key=lambda b: b[0])
 
 
 def launch(image_path: str | None = None) -> None:
@@ -244,7 +275,7 @@ def launch(image_path: str | None = None) -> None:
         return None if state["editing"] is None else state["proteins"][state["editing"]]
 
     def _pid_rects(pid: int) -> list[Rect]:
-        return [pl["rect"] for pl in state["placed"] if pl["pid"] == pid]
+        return _placed_rects(state, pid)
 
     def _active() -> dict | None:
         i = state["active"]
@@ -329,17 +360,7 @@ def launch(image_path: str | None = None) -> None:
         _redraw()
 
     def _protein_boxes(pid: int) -> list[tuple[int, float]]:
-        size = _protein_size(state["proteins"][pid])
-        img_d = _img_of(pid)
-        invert = img_d["dark"]  # polarity of this protein's own image
-        boxes = []
-        for rect in _pid_rects(pid):
-            x0, y0 = rect[0], rect[1]
-            net = net_signal(
-                img_d["array"], Box(x=x0, y=y0), size, img_d["background"], dark_on_light=invert
-            )
-            boxes.append((x0, net))
-        return sorted(boxes, key=lambda b: b[0])
+        return _boxes_with_nets(state, pid)
 
     def _aligned_to_spine(n: int) -> list[list[float | None]]:
         """Align every protein's boxes to the n-lane spine, **per image**.
@@ -412,7 +433,7 @@ def launch(image_path: str | None = None) -> None:
         if p is None:
             a = _active()
             readout.value = (
-                f"image: {a['name']}   background: {a['background']:.0f}  ({direction})\n"
+                f"image: {a['name']}   image median: {a['background']:.0f}  ({direction})\n"
                 "IDLE — press New protein (or pick one in 'editing') to place boxes."
             )
             return
@@ -422,14 +443,11 @@ def launch(image_path: str | None = None) -> None:
             f"image: {img_d['name']}",
             f"box: {sz.width} x {sz.height} (base {p['base'].width}x{p['base'].height} + "
             f"{p['pad_w']}/{p['pad_h']} px/side)",
-            f"background: {img_d['background']:.0f}  ({direction})",
+            f"image median: {img_d['background']:.0f}  ({direction}); each net is above"
+            " the membrane around its box",
             "Ctrl+click bands; right-click a box to remove; Confirm when done.",
         ]
-        rects = sorted(_pid_rects(state["editing"]), key=lambda r: r[0])
-        for i, (bx0, by0, _, _) in enumerate(rects):
-            net = net_signal(
-                img_d["array"], Box(x=bx0, y=by0), sz, img_d["background"], dark_on_light=invert
-            )
+        for i, (bx0, net) in enumerate(_protein_boxes(state["editing"])):
             lines.append(f"  {i}: net = {net:.0f}  at x={bx0}")
         readout.value = "\n".join(lines)
 

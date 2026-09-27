@@ -16,6 +16,8 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   that single commit point, in the same project object, so one save writes the
   change and its entry together; refusals and no-ops append nothing. Times come
   from the session's injectable clock (UTC; the offline system clock by default).
+  The one entry made elsewhere is a ``migrate`` entry, appended as a file of an
+  older schema loads; :func:`open_project` then autosaves it like a change.
 * Pixels are read lazily and cached as read-only arrays, after checking the
   stored file's SHA-256 and the array's shape against the image record.
 * The session keeps its undo history: the content of each state it committed,
@@ -434,17 +436,25 @@ class ProjectSession:
             else:
                 self._cursor += 1
             self._steps = self._steps_at_cursor()
-            self.dirty = True
-            self.last_action = action
-            if self.autosave is None:
-                return
-            try:
-                self.autosave(self)
-            except (OSError, storage.ProjectError) as exc:
-                self.save_error = exc
-                _log.warning(
-                    "autosave after %s failed; the change is kept in memory: %s", action, exc
-                )
+            self._changed(action)
+
+    def _changed(self, action: str) -> None:
+        """Mark the committed project unsaved after its change ``action``, then
+        run the autosave hook. Called with the lock held.
+
+        A failed save (``OSError`` or ``ProjectError``) is recorded in
+        ``save_error`` and logged; the change stays in memory. Any other
+        exception from the hook is a bug and propagates.
+        """
+        self.dirty = True
+        self.last_action = action
+        if self.autosave is None:
+            return
+        try:
+            self.autosave(self)
+        except (OSError, storage.ProjectError) as exc:
+            self.save_error = exc
+            _log.warning("autosave after %s failed; the change is kept in memory: %s", action, exc)
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[None]:
@@ -626,9 +636,19 @@ def open_project(
 
     ``FileNotFoundError`` and the :class:`~proteia.core.storage.ProjectError` family
     propagate. Opening deletes nothing, rewrites nothing, reads no pixels and
-    logs nothing.
+    logs nothing, except for a file of an older schema. That is migrated with a
+    ``migrate`` entry timed by ``clock`` (:func:`~proteia.core.storage.read_project`):
+    a logged change like any other, so the session starts dirty and runs the
+    autosave hook at once (whose save also deletes orphans; a failed save is
+    recorded in ``save_error``, as after any change). A record exported before
+    any edit then cites the log ``project.json`` holds. The undo history begins
+    from the migrated state.
     """
-    project = storage.load_project(folder)
-    return ProjectSession(
+    project, migrated = storage.read_project(folder, clock=clock)
+    session = ProjectSession(
         project, folder, autosave=autosave, saved_files=_referenced_files(project), clock=clock
     )
+    if migrated:
+        with session.lock:
+            session._changed("migrate")
+    return session

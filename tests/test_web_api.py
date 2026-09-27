@@ -879,6 +879,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["DELETE /api/images/{image_id}"] = client.ok(
         "DELETE", f"/api/images/{second['image_id']}"
     )
+    answers["POST /api/requantify"] = client.ok("POST", "/api/requantify")  # a no-op here
     answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
 
     revisions = []
@@ -1401,6 +1402,44 @@ RESTORED = ["action", "seq", "removed", "restored", "undetected_removed", "undet
 
 def history(answer: dict) -> dict:
     return answer["project"]["history"]
+
+
+def test_requantify_answers_the_images_and_every_new_net(client, tmp_path):
+    image_id, protein = ready(client, tmp_path)
+    for lane in (0, 1, 2):
+        body = {"protein_id": protein, "x": LANE_X[lane], "y": ROW, "lane_index": lane}
+        placed = client.ok("POST", "/api/boxes", body)
+    state = placed["project"]
+    assert state["background_method"] == "ring_median_v1"  # a new project measures locally
+    assert {band["background_mode"] for band in protein_of(placed, protein)["bands"]} == {
+        "symmetric"
+    }
+    ring_nets = placed["results"]["proteins"][0]["nets"]
+    assert client.ok("POST", "/api/requantify")["images"] == []  # already local: a no-op
+    assert logged(client)[-1] == "place_box"
+
+    # The same boxes as a project quantified before #83 (a migrated one).
+    session = client.workspace.current()
+
+    def legacy(draft: Project) -> None:
+        draft.background_method = "global_median"
+        api.ops._quantify_image(draft, image_id, session.pixels(image_id))
+
+    with session.transaction():
+        project, _ = apply_change(session.project, legacy)
+        session._commit(project, action="plant", params={})
+    before = client.ok("GET", "/api/project")
+    assert before["project"]["background_method"] == "global_median"
+    assert "legacy_background" in notice_codes(before)
+
+    answer = client.ok("POST", "/api/requantify")
+    assert answer["images"] == [image_id]
+    assert answer["project"]["background_method"] == "ring_median_v1"
+    assert "legacy_background" not in notice_codes(answer)
+    assert answer["results"]["proteins"][0]["nets"] == ring_nets
+    assert before["results"]["proteins"][0]["nets"] != ring_nets
+    assert history(answer)["undo"] == {"seq": answer["project"]["revision"], "action": "requantify"}
+    assert logged(client)[-1] == "requantify"
 
 
 def test_undo_and_redo_answer_what_they_took_back_and_did_again(client, tmp_path):

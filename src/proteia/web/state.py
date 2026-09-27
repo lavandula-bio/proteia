@@ -14,6 +14,12 @@ Coordinates are image pixels: a box is ``[x0, y0, x1, y1]`` with the end
 exclusive, as :meth:`~proteia.core.model.Box.rect` gives it, so a box the browser
 draws at any zoom lands on the same pixels the server quantifies.
 
+``background_method`` names how the stored nets' backgrounds were measured
+(``ring_median_v1``, or ``global_median`` for a project quantified before #83,
+until it is requantified), and each band's ``background_mode`` how its own was:
+``symmetric``, ``asymmetric`` or ``image`` (a ring cut short), or
+``global_median``.
+
 Each protein's ``undetected`` lists its not-detected records
 (:class:`~proteia.core.model.UndetectedBand`), in lane order, for the view to
 mark: ``lane_index``, ``band_index``, ``reason``, ``snr`` and ``threshold`` (the
@@ -118,6 +124,7 @@ def project_state(
                         "band_index": band.band_index,
                         "rect": list(band.box.rect(size)),
                         "clipped": band.clipped,
+                        "background_mode": band.background_mode,
                         "source": band.source.value,
                         "manually_edited": band.manually_edited,
                     }
@@ -143,6 +150,7 @@ def project_state(
         "open_id": open_id,
         "revision": revision(project),
         "history": {"undo": _step(undo), "redo": _step(redo)},
+        "background_method": project.background_method,
         "lanes": [
             {
                 "index": lane.index,

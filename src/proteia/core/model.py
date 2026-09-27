@@ -16,9 +16,20 @@ other by stable, project-unique ids (``mem-N``, ``img-N``, ``prot-N``,
 ``band-N``) and to lanes by index, never by list position or name; a
 not-detected record has no id of its own, only its protein, lane and band index.
 
-The stored numbers (each band's net, each image's background) are the raw data.
-Normalization and statistics combine several proteins downstream in
-:mod:`proteia.core.analyze`, whose ``Batch`` is built from this module's ``Batch``.
+The stored numbers (each band's net and the background it was measured above,
+each image's median) are the raw data. Normalization and statistics combine
+several proteins downstream in :mod:`proteia.core.analyze`, whose ``Batch`` is
+built from this module's ``Batch``.
+
+Background method. ``Project.background_method`` names how every stored net's
+background was measured, project-wide, so a batch never mixes methods:
+``ring_median_v1`` (:func:`proteia.core.quantify.band_backgrounds`, #83), each
+band's own level from the membrane around its box, or ``global_median``, the
+one image-wide median of a project quantified before #83 (a schema-1 project,
+migrated: every band's level is its image's ``background``, its mode
+``global_median`` and its spread 0, and nets floor each pixel at 0). The
+model checks that each band's mode agrees with the method; the operations keep
+every value equal to what the pixels give (:mod:`proteia.core.operations`).
 
 Models are mutable. Edits go through :func:`apply_change`, which works on a copy
 and re-validates the whole tree, so a failed edit leaves the project untouched.
@@ -52,9 +63,10 @@ from pydantic import (
     model_validator,
 )
 
-# Bumped, with a registered migration, by every change to the saved form after
-# the v0.1 tag (see proteia.core.storage). Stays 1 until then.
-SCHEMA_VERSION: Final = 1
+# Bumped, with a registered migration, by every change to the saved form (see
+# proteia.core.storage). 2 (#83): the band background fields and the project's
+# background method.
+SCHEMA_VERSION: Final = 2
 # Stored image suffixes: what the import dialog accepts today (#45 may change it).
 IMAGE_SUFFIXES: Final = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
@@ -180,6 +192,17 @@ class FitMethod(StrEnum):
     LOG_LINEAR = "log_linear"  # log(MW) fitted linearly against vertical position (#58)
 
 
+# How a band's background level was measured: a ring_median mode
+# (proteia.core.quantify.BandBackground), or the image-wide median of a band
+# quantified before #83.
+BackgroundMode = Literal["symmetric", "asymmetric", "image", "global_median"]
+# How every stored net's background was measured, project-wide (see the module
+# docstring). A new ring_median version is a new value, reached by requantifying.
+ProjectBackgroundMethod = Literal["global_median", "ring_median_v1"]
+LEGACY_BACKGROUND_METHOD: Final = "global_median"
+LOCAL_BACKGROUND_METHOD: Final = "ring_median_v1"  # what a new project starts with
+
+
 # --- Geometry and the lane table ---
 
 # (x0, y0, x1, y1), half-open on the high edge.
@@ -294,7 +317,9 @@ class ImageRef(_Model):
     height: int = Field(gt=0)
     bit_depth: int | None = Field(default=None, ge=8, le=16)  # None = not recorded yet (#45)
     polarity: Polarity  # required: the import chooses it; there is no silent default
-    background: Finite  # quantify.estimate_background of the analysis array
+    # quantify.estimate_background, the global median of the analysis array: the
+    # grow seed threshold, the image-mode fallback and the legacy background.
+    background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -378,13 +403,24 @@ class Membrane(_Model):
 
 
 class Band(_Model):
-    """One box of one protein in one lane."""
+    """One box of one protein in one lane.
+
+    ``net`` and the ``background_*`` fields are what quantifying the band's image
+    gave (:mod:`proteia.core.operations` recomputes them whenever a box on the
+    image changes); loading never recomputes them. ``background_level`` is what
+    :func:`~proteia.core.quantify.net_signal` subtracted, in pixel units;
+    ``background_mode`` says how it was measured and ``background_spread`` is its
+    QC, in level units (:class:`~proteia.core.quantify.BandBackground`).
+    """
 
     id: BandId
     lane_index: int = Field(ge=0)  # index into Batch.lanes: the band's stored identity
     band_index: int = Field(default=0, ge=0)  # which expected band; 0 for single-band proteins
     box: Box  # top-left in the protein's image; its size is Protein.box_size
-    net: NonNegative  # quantify.net_signal at placement; load never recomputes it
+    net: NonNegative  # quantify.net_signal above background_level
+    background_level: Finite
+    background_mode: BackgroundMode
+    background_spread: NonNegative
     apparent_mw: Kda | None = None  # from the calibration (#58); None = not computed
     clipped: bool | None = None  # #44; None = not checked (not "passed")
     source: ProposalSource
@@ -633,7 +669,8 @@ class Batch(_Model):
 class Project(_Model):
     """The whole saved project: ``project.json`` is its JSON form."""
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[2] = SCHEMA_VERSION
+    background_method: ProjectBackgroundMethod = LOCAL_BACKGROUND_METHOD
     # Bookkeeping, excluded from the content hash: the number of the next new id.
     next_id: int = Field(default=1, ge=1, le=10**9)
     batch: Batch = Field(default_factory=Batch)
@@ -669,6 +706,28 @@ class Project(_Model):
             if number >= self.next_id:
                 raise ValueError(f"id {obj_id} is not below next_id {self.next_id}")
             seen[number] = obj_id
+        return self
+
+    @model_validator(mode="after")
+    def _check_background_method(self) -> Project:
+        # One method for the whole batch; under the legacy one, the legacy values.
+        legacy = self.background_method == LEGACY_BACKGROUND_METHOD
+        medians = {image.id: image.background for image in self.batch.iter_images()}
+        for protein in self.batch.proteins:
+            for band in protein.bands:
+                if (band.background_mode == LEGACY_BACKGROUND_METHOD) != legacy:
+                    raise ValueError(
+                        f"band {band.id}: background mode {band.background_mode!r} does not"
+                        f" belong to the project's background method {self.background_method!r}"
+                    )
+                if legacy and (
+                    band.background_level != medians[protein.image_id]
+                    or band.background_spread != 0
+                ):
+                    raise ValueError(
+                        f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background is its"
+                        " image's median, with no spread"
+                    )
         return self
 
     @model_validator(mode="after")

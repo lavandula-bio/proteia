@@ -6,8 +6,9 @@ export happens and never stored in the project. It says what the exported
 numbers came from and how:
 
 * ``content``: the project content exactly as :func:`~proteia.core.storage.content_hash`
-  hashes it: each image's SHA-256, background and polarity, each protein's box
-  size, the lane table with its include flags and the reference condition;
+  hashes it: the background method, each image's SHA-256, median and polarity,
+  each protein's box size, each band's net and background, the lane table with
+  its include flags and the reference condition;
 * ``content_hash``: the SHA-256 of that content, so a record verifies itself
   (``sha256(canonical_json(record["content"])) == record["content_hash"]``) with
   no Proteia and no knowledge of which keys the hash leaves out;
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import itertools
 import platform
 from collections.abc import Mapping
 from typing import Any, Final
@@ -73,8 +75,13 @@ def software_versions() -> dict[str, str | None]:
 
 
 def settings() -> dict[str, JsonValue]:
-    """The code-level settings behind the stored numbers and the exported table."""
+    """The code-level settings behind the stored numbers and the exported table.
+
+    ``background`` is the local background method this build quantifies with
+    (:func:`~proteia.core.quantify.background_settings`); a record also names
+    the method the project's stored nets used (:func:`build_record`)."""
     return {
+        "background": quantify.background_settings(),
         # What place_box passes to grow_box: no width or height cap.
         "grow_box": {
             "rel_threshold": grow.REL_THRESHOLD,
@@ -114,13 +121,23 @@ def _undo_mismatch(log: tuple[LogEntry, ...]) -> bool:
     return False
 
 
+def _changed_before_migration(log: tuple[LogEntry, ...]) -> bool:
+    """Whether a ``migrate`` entry started from other content than the entry
+    before it left: the file was changed outside the log before it was migrated
+    (:func:`proteia.core.storage.project_from_json`)."""
+    return any(
+        entry.action == "migrate" and entry.params.get("from_content_hash") != before.content_hash
+        for before, entry in itertools.pairwise(log)
+    )
+
+
 def _history_issues(project: Project, digest: str) -> list[str]:
     if not project.log:
         return ["no_history"]
     issues = []
     if project.log[0].action != "new_project":
         issues.append("history_starts_late")
-    if project.log[-1].content_hash != digest:
+    if project.log[-1].content_hash != digest or _changed_before_migration(project.log):
         issues.append("content_changed_outside_log")
     if _undo_mismatch(project.log):
         issues.append("undo_mismatch")
@@ -133,7 +150,9 @@ def history_issues(project: Project) -> list[str]:
     * ``no_history``: the project has no log (made before the log existed);
     * ``history_starts_late``: the log does not begin with the project's creation;
     * ``content_changed_outside_log``: the content differs from what the last
-      entry left (``project.json`` edited by hand, or an unlogged change);
+      entry left (``project.json`` edited by hand, or an unlogged change), or a
+      ``migrate`` entry started from other content than the entry before it
+      left (the file was edited before it was migrated to a newer schema);
     * ``undo_mismatch``: an undo or redo restored content that no earlier entry
       left, as its ``returns_to_seq`` should name (``project.json`` was edited
       by hand before the session whose undo went back past the edit).
@@ -159,7 +178,9 @@ def build_record(
         "record_format": RECORD_FORMAT,
         "exported_at": _TIMESTAMP.validate_python(exported_at, strict=True),
         "software": software_versions(),
-        "settings": settings(),
+        # The method the stored nets used: ring_median_v1 (settings()["background"])
+        # or, until the project is requantified, the legacy global_median.
+        "settings": {**settings(), "background_method": project.background_method},
         "content": content,
         "content_hash": digest,
         "log": [entry.model_dump(mode="json") for entry in project.log],

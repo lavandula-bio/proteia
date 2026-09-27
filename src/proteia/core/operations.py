@@ -15,7 +15,8 @@ then autosaves. So an edit is all or nothing:
   refusal changes nothing: the project (the same object), ``next_id``, the
   pixel cache and the ``images/`` listing are as they were, and the autosave
   hook does not run.
-* Pixels are fetched before the change, so an image-file problem changes nothing.
+* Pixels are fetched before the change (:func:`requantify` reads them inside
+  it, one image at a time), so an image-file problem changes nothing.
   New ids come only from ``new_id`` inside the change, so a refusal uses up no
   number.
 * An edit that leaves the project equal to the committed one is a no-op: nothing
@@ -35,13 +36,28 @@ then autosaves. So an edit is all or nothing:
   change stays in the log.
 
 Stored values that depend on pixels or geometry are recomputed by the operation
-that invalidates them: :func:`_quantify` is the one place a band's net is
-computed, with its ``clipped`` flag, and :func:`_set_box` the
-one place a box moves (it clears the position-derived ``apparent_mw``). A size
-change or a polarity change recomputes every affected net, so every stored net
-always equals ``net_signal`` of the stored pixels, box, size, background and
-polarity, and every clipping flag these operations store is ``is_clipped`` of
-the same.
+that invalidates them, in the same change, so the logged content hash covers
+them: :func:`_quantify_image` is the one writer of a band's net, background
+fields and ``clipped`` flag, and :func:`_set_box` the one place a box moves (it
+clears the position-derived ``apparent_mw``). The invariant: for every image,
+every band's stored net, ``background_level``, ``background_mode``,
+``background_spread`` and ``clipped`` equal
+:func:`~proteia.core.quantify.band_backgrounds`,
+:func:`~proteia.core.quantify.net_signal` and
+:func:`~proteia.core.quantify.is_clipped` of the stored pixels, all the boxes
+on that image (every protein's, each with its protein's box size), the
+polarity, the bit depth and the project's background method. A band's ring
+excludes every other box on its image, so any edit that adds, moves, resizes or
+removes a box re-quantifies the whole image: :func:`place_box`,
+:func:`move_box`, :func:`remove_box`, :func:`set_box_size`,
+:func:`remove_protein`, :func:`clear_boxes` and :func:`detect_row_boxes`; a
+polarity change re-quantifies its image and :func:`requantify` every image.
+Removing an image removes its bands and changes no other image. Undo and redo
+restore a committed state whole, which met the invariant, and recompute
+nothing. A project quantified before #83 keeps the legacy method
+(``global_median``) until :func:`requantify`: each band's level is its image's
+median, its mode ``global_median``, its spread 0, and its net floors each
+pixel at 0, so edits of a legacy project keep the legacy invariant.
 
 A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
 detector's measurement that cannot be redone from the model alone, so an edit
@@ -86,6 +102,8 @@ from proteia.core.imaging import clipping_depth, load_image
 from proteia.core.model import (
     DETECTING_SOURCES,
     IMAGE_SUFFIXES,
+    LEGACY_BACKGROUND_METHOD,
+    LOCAL_BACKGROUND_METHOD,
     Band,
     Batch,
     Box,
@@ -126,7 +144,15 @@ from proteia.core.project import (
     propose_lane,
     spine_axes,
 )
-from proteia.core.quantify import estimate_background, is_clipped, net_signal
+from proteia.core.quantify import (
+    RING_CLAMP,
+    BandBackground,
+    NetClamp,
+    band_backgrounds,
+    estimate_background,
+    is_clipped,
+    net_signal,
+)
 from proteia.core.results import Results
 from proteia.core.session import (
     ErrorCode,
@@ -168,6 +194,7 @@ __all__ = [
     "remove_image",
     "remove_protein",
     "remove_undetected",
+    "requantify",
     "save",
     "set_box_lane",
     "set_box_size",
@@ -399,34 +426,92 @@ def _drop_undetected(
     return dropped[0] if dropped else None
 
 
-def _quantify(band: Band, protein: Protein, image: ImageRef, array: np.ndarray) -> None:
-    """The one place a stored net and its clipping flag are computed. An image
-    without a limit the check can trust leaves the band unchecked (None)."""
+# What a band built in a change holds until _quantify_image, later in the same
+# change, writes its values.
+_UNQUANTIFIED: Final = {
+    "net": 0.0,
+    "background_level": 0.0,
+    "background_mode": "image",
+    "background_spread": 0.0,
+}
+
+
+def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
+    """The one writer of a band's net, background fields and clipping flag:
+    quantify every band on one image, of every protein, together (protein order,
+    then band order; the results do not depend on it), since each band's ring
+    leaves out every box on the image. ``array`` is the image's analysis array.
+
+    Under the project's legacy method (``global_median``) each level is the
+    image's median and each net floors every pixel at 0, as before #83;
+    otherwise :func:`~proteia.core.quantify.band_backgrounds` measures each
+    level (falling back to the image's median) and the net floors the box total
+    (:data:`~proteia.core.quantify.RING_CLAMP`). An image without a limit the
+    clipping check can trust leaves its bands unchecked (None).
+    """
+    batch = draft.batch
+    image = batch.find_image(image_id)
+    placed = [
+        (protein.box_size, band)
+        for protein in batch.proteins
+        if protein.image_id == image_id
+        for band in protein.bands
+    ]
+    if not placed:
+        return
     dark_on_light = image.polarity.dark_on_light
-    band.net = net_signal(
-        array, band.box, protein.box_size, image.background, dark_on_light=dark_on_light
-    )
-    band.clipped = is_clipped(
-        array,
-        band.box,
-        protein.box_size,
-        bit_depth=clipping_depth(image.bit_depth, image.import_warnings),
-        dark_on_light=dark_on_light,
-    )
+    clamp: NetClamp
+    if draft.background_method == LEGACY_BACKGROUND_METHOD:
+        legacy = BandBackground(level=image.background, mode="global_median", spread=0.0)
+        found, clamp = [legacy] * len(placed), "pixel"
+    else:
+        found = band_backgrounds(
+            array,
+            [band.box.rect(size) for size, band in placed],
+            [(size.width, size.height) for size, _ in placed],
+            dark_on_light=dark_on_light,
+            integral=image.bit_depth is not None,
+            fallback=image.background,
+        )
+        clamp = RING_CLAMP
+    depth = clipping_depth(image.bit_depth, image.import_warnings)
+    for (size, band), background in zip(placed, found, strict=True):
+        band.net = net_signal(
+            array, band.box, size, background.level, dark_on_light=dark_on_light, clamp=clamp
+        )
+        band.background_level = background.level
+        band.background_mode = background.mode
+        band.background_spread = background.spread
+        band.clipped = is_clipped(
+            array, band.box, size, bit_depth=depth, dark_on_light=dark_on_light
+        )
+
+
+def _bands_on(batch: Batch, image_id: str) -> list[str]:
+    """The ids of every band on one image, of every protein."""
+    return [
+        band.id
+        for protein in batch.proteins
+        if protein.image_id == image_id
+        for band in protein.bands
+    ]
+
+
+def _pixels_left(
+    session: ProjectSession, image_id: str, removed: Collection[str]
+) -> np.ndarray | None:
+    """The image's pixels, for a removal of the bands ``removed`` from it: the
+    bands that stay are re-quantified, since their rings no longer leave out the
+    removed boxes. None when no band stays: there is nothing to quantify."""
+    gone = set(removed)
+    if all(band_id in gone for band_id in _bands_on(session.project.batch, image_id)):
+        return None
+    return session.pixels(image_id)
 
 
 def _set_box(band: Band, rect: Rect) -> None:
     band.box = Box(x=rect[0], y=rect[1])
     band.apparent_mw = None  # position-derived (#58); stale once the box changes
-
-
-def _requantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
-    """Recompute every stored net on one image (its polarity or background changed)."""
-    image = draft.batch.find_image(image_id)
-    for protein in draft.batch.proteins:
-        if protein.image_id == image_id:
-            for band in protein.bands:
-                _quantify(band, protein, image, array)
 
 
 # --- Input checks ---
@@ -812,8 +897,9 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
 
 @_locked
 def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> None:
-    """Set an image's polarity and recompute the nets of every band on it (the
-    background, a median, does not depend on it).
+    """Set an image's polarity and re-quantify every band on it: the signal
+    direction turns each ring's clip, level and haze lift around (the image's
+    median does not depend on it).
 
     The not-detected records of every protein on the image are dropped and
     logged: their SNR was measured with the other signal direction, against the
@@ -824,13 +910,12 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     batch = session.project.batch
     if batch.find_image(image_id).polarity is polarity:
         return
-    has_bands = any(p.bands for p in batch.proteins if p.image_id == image_id)
-    array = session.pixels(image_id) if has_bands else None
+    array = session.pixels(image_id) if _bands_on(batch, image_id) else None
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         draft.batch.find_image(image_id).polarity = polarity
         if array is not None:
-            _requantify_image(draft, image_id, array)
+            _quantify_image(draft, image_id, array)
         return [
             dropped
             for protein in draft.batch.proteins
@@ -1129,8 +1214,13 @@ def edit_protein(
 def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
     """Remove a protein with its bands and not-detected records; targets using it
     as their loading control, by name or as the batch's only one, are detached
-    and reported. The log lists the records in full (``removed_undetected``)."""
-    session.project.batch.find_protein(protein_id)
+    and reported. The log lists the records in full (``removed_undetected``).
+    The other bands on its image are re-quantified: their rings no longer leave
+    out its boxes."""
+    protein = session.project.batch.find_protein(protein_id)
+    image_id = protein.image_id
+    band_ids = [band.id for band in protein.bands]
+    array = _pixels_left(session, image_id, band_ids) if band_ids else None
 
     def change(draft: Project) -> tuple[Cascade, list[JsonValue]]:
         batch = draft.batch
@@ -1139,6 +1229,8 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
         records: list[JsonValue] = [_undetected_json(protein_id, u) for u in gone.undetected]
         implicit = set(_implicit_users(batch, protein_id))
         batch.proteins = [p for p in batch.proteins if p.id != protein_id]
+        if array is not None:
+            _quantify_image(draft, image_id, array)
         detached = []
         for protein in batch.proteins:
             if protein_id in protein.loading_control_ids:
@@ -1189,9 +1281,11 @@ def place_box(
 
     ``grow=True`` is a seed click: the band is grown from the point and the
     protein's shared size fitted to it (the first box sets the size, later ones
-    only grow it, and the other boxes are re-centred and re-quantified).
+    only grow it, and the other boxes are re-centred).
     ``grow=False`` drops a box of the current size centred on the point, shifted
-    inside the image. A protein's own boxes never overlap.
+    inside the image. A protein's own boxes never overlap. Every band on the
+    image, of every protein, is then re-quantified: the new box leaves every
+    ring.
 
     A not-detected record in the lane is replaced by the box, with no
     confirmation: the log entry names it (``replaced_undetected``, else null).
@@ -1270,24 +1364,20 @@ def place_box(
 
     def change(draft: Project) -> tuple[str, dict[str, JsonValue] | None]:
         edited = draft.batch.find_protein(protein_id)
-        edited_image = draft.batch.find_image(edited.image_id)
-        size_changed = edited.box_size != size
         edited.box_size = size
         for band, old, new in zip(edited.bands, rects, resized, strict=True):
             if new != old:
                 _set_box(band, new)
-            if size_changed or new != old:
-                _quantify(band, edited, edited_image, array)
         band = Band(
             id=draft.new_id("band"),
             lane_index=lane_index,
             band_index=0,
             box=Box(x=rect[0], y=rect[1]),
-            net=0.0,  # set by _quantify
             source=source,
+            **_UNQUANTIFIED,
         )
-        _quantify(band, edited, edited_image, array)
         edited.bands.append(band)
+        _quantify_image(draft, edited.image_id, array)
         return band.id, _drop_undetected(edited, lane_index, 0)
 
     def params(result: tuple[str, dict[str, JsonValue] | None]) -> _Params:
@@ -1314,8 +1404,9 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
     """Move a box to where the user dragged or resized it.
 
     ``rect`` is read by its centre: the box keeps the protein's size, centred
-    there and shifted inside the image. Only that band's net is recomputed; its
-    lane never changes. Marks the band as manually edited.
+    there and shifted inside the image. Every band on the image is
+    re-quantified, since the box leaves one ring and may cut another; its lane
+    never changes. Marks the band as manually edited.
     """
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
@@ -1338,20 +1429,26 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         edited, moved = draft.batch.find_band(band_id)
         _set_box(moved, new)
         moved.manually_edited = True
-        _quantify(moved, edited, draft.batch.find_image(edited.image_id), array)
+        _quantify_image(draft, edited.image_id, array)
 
     _apply(session, "move_box", change, lambda _: {"band_id": band_id, "rect": list(new)})
 
 
 @_locked
 def remove_box(session: ProjectSession, band_id: str) -> None:
-    """Remove one box. The protein's size and its other boxes are unchanged."""
+    """Remove one box. The protein's size and its other boxes are unchanged; the
+    bands left on the image are re-quantified, since their rings no longer leave
+    out the box."""
     protein, band = session.project.batch.find_band(band_id)
     params = {"band_id": band_id, "protein_id": protein.id, "lane_index": band.lane_index}
+    image_id = protein.image_id
+    array = _pixels_left(session, image_id, [band_id])
 
     def change(draft: Project) -> None:
         protein, _ = draft.batch.find_band(band_id)
         protein.bands = [band for band in protein.bands if band.id != band_id]
+        if array is not None:
+            _quantify_image(draft, image_id, array)
 
     _apply(session, "remove_box", change, lambda _: params)
 
@@ -1401,8 +1498,9 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
 @_locked
 def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> None:
     """Change a protein's shared box size: every box is re-sized around its centre
-    (shifted inside the image) and re-quantified. A size that would make boxes
-    overlap is refused."""
+    (shifted inside the image), and every band on the image is re-quantified
+    (the other proteins' rings leave out the resized boxes). A size that would
+    make boxes overlap is refused."""
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     image = batch.find_image(protein.image_id)
@@ -1420,12 +1518,12 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
 
     def change(draft: Project) -> None:
         edited = draft.batch.find_protein(protein_id)
-        edited_image = draft.batch.find_image(edited.image_id)
         edited.box_size = size
         for band, old, new in zip(edited.bands, rects, resized, strict=True):
             if new != old:
                 _set_box(band, new)
-            _quantify(band, edited, edited_image, array)
+        if array is not None:
+            _quantify_image(draft, edited.image_id, array)
 
     _apply(
         session,
@@ -1443,16 +1541,22 @@ def clear_boxes(session: ProjectSession, protein_id: str) -> ClearedBoxes:
     The protein's box size is kept (the width and height fields show it). A seed
     click or a row box on the protein, which then has no boxes, sets the size
     afresh from the band or bands found; a fixed box uses the kept size. A
-    protein with neither boxes nor records is a no-op. The log entry lists the
-    band ids with their lanes, and the records in full (``dropped_undetected``).
+    protein with neither boxes nor records is a no-op. The other proteins'
+    bands on the image are re-quantified: their rings no longer leave out the
+    boxes. The log entry lists the band ids with their lanes, and the records
+    in full (``dropped_undetected``).
     """
     protein = session.project.batch.find_protein(protein_id)
     removed = [band.id for band in protein.bands]
     lanes = [band.lane_index for band in protein.bands]
+    image_id = protein.image_id
+    array = _pixels_left(session, image_id, removed) if removed else None
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         edited = draft.batch.find_protein(protein_id)
         edited.bands = []
+        if array is not None:
+            _quantify_image(draft, image_id, array)
         return _drop_undetected_where(edited, lambda _: True)
 
     dropped = _apply(
@@ -1652,13 +1756,14 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     The shared size is the detector's. If a box of the protein survives (one
     kept, or of another band index), the size only grows, as a seed
     click grows it, even when every band found is in a kept lane and nothing is
-    placed: the survivors are re-centred and re-quantified and the new boxes
-    centred on the detected ones. That size making survivors overlap, or
-    new boxes overlap each other, is refused (``SIZE_WOULD_OVERLAP``), and so is
-    a new box over a survivor (``OVERLAP``, with the survivor). If none
-    survives, this detection sets the size afresh. A box may then extend beyond
-    the row box, never beyond the image. Nets use ``image.background``; the
-    detector's local background only finds the bands.
+    placed: the survivors are re-centred and the new boxes centred on the
+    detected ones. That size making survivors overlap, or new boxes overlap
+    each other, is refused (``SIZE_WOULD_OVERLAP``), and so is a new box over a
+    survivor (``OVERLAP``, with the survivor). If none survives, this detection
+    sets the size afresh. A box may then extend beyond
+    the row box, never beyond the image. Every band on the image, of every
+    protein, is then re-quantified with the project's background method; the
+    detector's own local background only finds the bands.
 
     The lanes already placed on the image are its first-band boxes, of any
     protein and from any source (:func:`~proteia.core.project.lane_anchors`),
@@ -1857,17 +1962,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         draft: Project,
     ) -> tuple[list[str | None], list[Rect | None], list[JsonValue], list[JsonValue]]:
         edited = draft.batch.find_protein(protein_id)
-        edited_image = draft.batch.find_image(edited.image_id)
         old_size = edited.box_size
-        size_changed = old_size != size
         edited.box_size = size
         by_id = {band.id: band for band in edited.bands}
         for band_id, before, after in zip(survivors, old, resized, strict=True):
-            band = by_id[band_id]
             if after != before:
-                _set_box(band, after)
-            if size_changed or after != before:
-                _quantify(band, edited, edited_image, array)
+                _set_box(by_id[band_id], after)
         edited.bands = [by_id[band_id] for band_id in survivors]
         for lane, rect in rects.items():  # in lane order: new ids too
             if lane in yielding:  # the band found takes the box nobody edited
@@ -1881,11 +1981,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                     lane_index=lane,
                     band_index=0,
                     box=Box(x=rect[0], y=rect[1]),
-                    net=0.0,  # set by _quantify
                     source=ProposalSource.ROW_BOX,
+                    **_UNQUANTIFIED,
                 )
-            _quantify(band, edited, edited_image, array)
             edited.bands.append(band)
+        # The boxes placed, moved and removed change every ring on the image.
+        _quantify_image(draft, edited.image_id, array)
         # Every band-index-0 record gives way to this run's outcome in its lane (a
         # kept box's lane holds none).
         dropped: list[JsonValue] = list(
@@ -2007,6 +2108,45 @@ def remove_undetected(
             "removed": removed,
         },
     )
+
+
+# --- The background method ---
+
+
+@_locked
+def requantify(session: ProjectSession) -> tuple[str, ...]:
+    """Switch the project to the local background (``ring_median_v1``) and
+    re-quantify every band with it, in one change; return the ids of the images
+    re-quantified (those with bands), in membrane then image order.
+
+    A project quantified before #83 keeps the legacy method (``global_median``)
+    until this runs, so its stored nets never change unasked. A project already
+    on ``ring_median_v1`` is a no-op. The pixels are read image by image inside
+    the change, and those not cached already are not kept, so memory holds one
+    image beyond the cache; a missing or changed image file still refuses the
+    whole change (``IMAGE_FILE_CHANGED``), which then changes nothing. The log
+    entry names the method left (``from``), the method taken (``to``) and the
+    images re-quantified (``images``).
+    """
+    project = session.project
+    old = project.background_method
+    if old == LOCAL_BACKGROUND_METHOD:
+        return ()
+    batch = project.batch
+    images = [image.id for image in batch.iter_images() if _bands_on(batch, image.id)]
+
+    def change(draft: Project) -> None:
+        draft.background_method = LOCAL_BACKGROUND_METHOD
+        for image_id in images:
+            _quantify_image(draft, image_id, session.pixels(image_id, keep=False))
+
+    _apply(
+        session,
+        "requantify",
+        change,
+        lambda _: {"from": old, "to": LOCAL_BACKGROUND_METHOD, "images": list(images)},
+    )
+    return tuple(images)
 
 
 # --- Undo and redo ---

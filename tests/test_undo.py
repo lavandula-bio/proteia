@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 import proteia
-from conftest import FakeClock, make_project
+from conftest import V1_CONTENT_HASH, FakeClock, make_project, sample_doc_v1, write_image_files
 from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core import storage
@@ -768,19 +768,33 @@ def test_a_clean_history_has_no_undo_mismatch(tmp_path):
     assert history_issues(s.project) == []
 
 
-def test_a_project_saved_before_not_detected_records_seeds_with_its_last_entry(tmp_path):
-    # The content hash a build without not-detected records stored for the
-    # sample project (test_storage and test_record pin the same value).
-    entry = LogEntry(
-        seq=1,
-        time="2026-09-20T08:00:00.000Z",
-        action="new_project",
-        version="0.1.0.dev0",
-        content_hash="28dfdbcbca235bb7359164954bf76a6d743a2c4448e51049172f42cc00b3df6a",
-    )
-    s = open_sample(tmp_path, project=make_project().model_copy(update={"log": (entry,)}))
+def test_a_migrated_project_seeds_its_history_with_the_migration(tmp_path):
+    # A schema-1 file (before #83), its log holding the hash that build computed.
+    folder = tmp_path / "v1 µ"
+    write_image_files(folder, make_project())
+    doc = sample_doc_v1()
+    created = {
+        "seq": 1,
+        "time": "2026-09-20T08:00:00.000Z",
+        "action": "new_project",
+        "version": "0.1.0.dev0",
+        "params": {},
+        "content_hash": V1_CONTENT_HASH,
+    }
+    (folder / storage.PROJECT_FILE).write_bytes(document_bytes({**doc, "log": [created]}))
+    s = ops.open_project(folder, clock=FakeClock())
+    migrated = s.project.log[-1]
+    assert (migrated.seq, migrated.action) == (2, "migrate")
+    assert migrated.time == "2026-09-26T08:00:00.000Z"  # the session's clock
+    assert s.undo_step is None  # the history begins with the migrated state
+
     ops.set_reference_condition(s, None)
+    assert s.undo_step == HistoryStep(seq=3, action="set_reference_condition")
     ops.undo(s)
-    assert s.project.log[-1].params["returns_to_seq"] == 1
-    assert s.project.log[-1].content_hash == entry.content_hash
+    assert s.project.log[-1].params["returns_to_seq"] == 2  # to the migration, not before it
+    assert s.project.log[-1].content_hash == migrated.content_hash
+    assert s.project.background_method == "global_median"  # nets as they were
     assert history_issues(s.project) == []
+    with pytest.raises(OperationError) as info:
+        ops.undo(s)
+    assert info.value.code is ErrorCode.NOTHING_TO_UNDO
