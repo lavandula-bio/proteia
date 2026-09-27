@@ -1446,6 +1446,8 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "GET /api/diagnostics",
         "POST /api/diagnostics",
         "POST /api/diagnostics/reveal",
+        "GET /api/notices",
+        "POST /api/notices/cloud_sync/dismiss",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -3910,6 +3912,11 @@ NEEDS_NO_OPENING = {
         "/api/handoffs/{handoff_id}/discard",
     ): "drops files handed off, as the page shows them",
     ("POST", "/api/diagnostics/reveal"): "shows the diagnostics folder, in the state folder",
+    ("GET", "/api/notices"): "says whether the projects folder is synced: no project's",
+    (
+        "POST",
+        "/api/notices/cloud_sync/dismiss",
+    ): "dismisses that notice, in the state folder",
 }
 
 
@@ -4088,6 +4095,8 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         "refused": [{"name": "a.bmp", "code": "x", "message": "y"}]
     }
     bodies[("POST", "/api/diagnostics/reveal")] = None
+    bodies[("GET", "/api/notices")] = None
+    bodies[("POST", "/api/notices/cloud_sync/dismiss")] = None
     bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
     paths = {incoming: "/api/incoming?name=a.tif", discard: f"/api/handoffs/{handoff_id}/discard"}
     assert set(bodies) == set(NEEDS_NO_OPENING)
@@ -4112,6 +4121,8 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         discard: 204,
         ("POST", "/api/handoffs"): 201,
         ("POST", "/api/diagnostics/reveal"): 204,
+        ("GET", "/api/notices"): 200,
+        ("POST", "/api/notices/cloud_sync/dismiss"): 204,
         ("POST", "/api/quit"): 202,
     }
     opened = [
@@ -4937,6 +4948,7 @@ def test_an_offer_hands_off_uploaded_files_once(client, tmp_path, ticks):
             "refused": [],
             "more_refused": 0,
             "more_may_arrive": True,
+            "claimed": False,
         }
     ]
 
@@ -5096,12 +5108,16 @@ def test_the_workspace_lists_each_hand_off_with_the_name_its_project_would_take(
         False,
     ]
 
-    # A hand-off an accept has claimed is not listed.
+    # A hand-off an accept has claimed is listed as claimed, as it was: the
+    # accept may be refused and release it.
     inbox = client.workspace.inbox
-    claimed = inbox.claim(first, [file["file_id"] for file in listed(client, first)["files"]])
-    assert [h["id"] for h in client.ok("GET", "/api/workspace")["handoffs"]] == [second]
+    before = listed(client, first)
+    claimed = inbox.claim(first, [file["file_id"] for file in before["files"]])
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [(h["id"], h["claimed"]) for h in handoffs] == [(first, True), (second, False)]
+    assert handoffs[0] == {**before, "claimed": True}
     inbox.release(claimed)
-    assert [h["id"] for h in client.ok("GET", "/api/workspace")["handoffs"]] == [first, second]
+    assert client.ok("GET", "/api/workspace")["handoffs"][0] == before
 
 
 def test_an_accept_imports_the_images_into_a_new_project_named_after_the_first(client, tmp_path):
@@ -5172,6 +5188,37 @@ def test_an_accept_takes_the_name_typed_or_refuses_it_changing_nothing(client, t
         assert client.refused("POST", path, {"name": name, "files": choices(files)})[:2] == refused
         assert in_root(client) == ["Taken"] and listed(client, handoff_id)["files"] == files
     assert accept(client, handoff_id, files, name="  My  blot ")["project"]["name"] == "My blot"
+
+
+def test_a_hand_off_listed_as_claimed_is_pending_again_once_its_accept_is_refused(
+    client, tmp_path, monkeypatch, ticks
+):
+    # Another tab's accept claims the hand-off a page shows: the listing keeps
+    # it, claimed, so the page keeps its rows and choices; no second accept or
+    # discard takes it meanwhile; and once that accept is refused (a name
+    # taken), it is listed as it was, to import.
+    client.ok("POST", "/api/projects", {"name": "Taken"})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif", "b.tif"])
+    before = listed(client, handoff_id)
+    assert (before["claimed"], before["more_may_arrive"]) == (False, True)  # young
+    entered, release = _held_until_released(monkeypatch, api.projects, "create_set_up")
+    path = f"/api/handoffs/{handoff_id}"
+    accepting, accepted = _in_thread(
+        lambda: client.call("POST", f"{path}/accept", {"name": "taken", "files": choices(files)})
+    )
+    try:
+        assert entered.wait(20)
+        assert listed(client, handoff_id) == {**before, "claimed": True, "more_may_arrive": False}
+        ids = [file["file_id"] for file in files]
+        for route, body in (("accept", {"files": choices(files)}), ("discard", {"files": ids})):
+            assert client.refused("POST", f"{path}/{route}", body)[:2] == (409, "handoff_claimed")
+    finally:
+        release.set()
+        accepting.join(30)
+    status, answer = accepted[0]
+    assert (status, answer["code"]) == (409, "project_exists")
+    assert listed(client, handoff_id) == before
+    assert accept(client, handoff_id, files)["project"]["name"] == "a"
 
 
 def _missing_polarity(body: dict) -> None:
@@ -5547,7 +5594,8 @@ def test_files_offered_while_an_accept_runs_start_another_hand_off(
     )
     try:
         assert entered.wait(20)
-        assert client.ok("GET", "/api/workspace")["handoffs"] == []  # claimed: not listed
+        (entry,) = client.ok("GET", "/api/workspace")["handoffs"]
+        assert (entry["id"], entry["files"], entry["claimed"]) == (handoff_id, files, True)
         late = staged(client, blot_bytes(tmp_path), "late.tif")["file_id"]
         offered = client.ok("POST", "/api/handoffs", {"files": [late]})
         assert not offered["merged"] and offered["handoff_id"] != handoff_id

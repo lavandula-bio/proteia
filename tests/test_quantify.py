@@ -271,6 +271,29 @@ def test_possibly_over_exposed_is_not_assessed_without_a_depth():
     assert _possibly(img, None, dark_on_light=True) is None
 
 
+@pytest.mark.parametrize(
+    ("exact", "near", "dark_on_light", "level"),
+    [
+        (16, None, True, 0.0),  # the exact check's limit
+        (16, None, False, 65535.0),
+        (8, 8, True, 0.0),  # the exact depth wins
+        (None, 8, True, 2.0),  # the near-limit check's: 2 levels in from it
+        (None, 8, False, 253.0),
+        (None, 16, True, 514.0),
+        (None, 16, False, 65021.0),
+        (None, None, True, None),  # no known limit
+    ],
+)
+def test_the_saturation_level_is_where_the_over_exposure_checks_count_pixels(
+    exact, near, dark_on_light, level
+):
+    # Row detection calls a band hollow from the pixels these checks count
+    # (#121): at or below the level on a dark-on-light image, at or above it
+    # on a light-on-dark one. The near levels are the last values the
+    # possibly-over-exposed test above counts.
+    assert quantify.saturation_level(exact, near, dark_on_light=dark_on_light) == level
+
+
 # --- local background: ring_median (#83) ---
 
 # A 24 x 10 box whose centre is (71.5, 54.5), on a 160 x 120 image.

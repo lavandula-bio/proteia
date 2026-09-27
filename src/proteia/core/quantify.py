@@ -695,3 +695,24 @@ def is_possibly_clipped(
         return None
     count = near_limit_pixels(image, box, size, bit_depth=bit_depth, dark_on_light=dark_on_light)
     return count >= POSSIBLY_CLIPPED_PIXELS
+
+
+def saturation_level(
+    exact_depth: int | None, near_depth: int | None, *, dark_on_light: bool
+) -> float | None:
+    """The pixel value from which on a pixel counts as saturated, as the
+    over-exposure checks count them: at or below it on a dark-on-light image,
+    at or above it on a light-on-dark one. The detector limit of
+    ``exact_depth`` (:func:`is_clipped`), else the limit of ``near_depth``
+    moved in by :func:`near_limit_tolerance` (:func:`is_possibly_clipped`);
+    None when neither is given (:func:`proteia.core.imaging.clipping_depth`
+    and :func:`~proteia.core.imaging.possible_clipping_depth` give them).
+    Row detection calls a band lighter in its centre than such pixels on
+    either side of it hollow (#121)."""
+    if exact_depth is not None:
+        return float(detector_limit(exact_depth, dark_on_light=dark_on_light))
+    if near_depth is None:
+        return None
+    limit = detector_limit(near_depth, dark_on_light=dark_on_light)
+    tolerance = near_limit_tolerance(near_depth)
+    return limit + tolerance if dark_on_light else limit - tolerance
