@@ -52,8 +52,9 @@ Rotation and retention: when the next record would take ``proteia.log`` past
 up one number, and the file past :data:`BACKUPS` (``proteia.log.9``) is deleted.
 So the folder holds at most 10 files, 20 MiB, whatever the number of sessions;
 files are not deleted by age. Every launch appends to ``proteia.log``: a
-second launch, which only opens the running one in the browser, writes its few
-lines there too, so the process id tells two processes' lines apart. A
+second launch, which opens the running one, or hands it the images named on
+its command line (:mod:`proteia.web.launch`), writes its few lines there too,
+so the process id tells two processes' lines apart. A
 rotation moves every file to a free name and deletes the oldest only once all
 have moved, so a file another program holds open (Windows can then neither
 rename it nor replace it), ``proteia.log`` or a rotated one, stops the whole

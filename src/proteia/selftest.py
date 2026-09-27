@@ -412,8 +412,8 @@ def _web_app(folder: Path, report: Report) -> None:
     state = folder / "state α"
     workspace = api.Workspace(root, reveal=revealed.append)
     instance = launch.start(folder=state, opener=opened.append, workspace=workspace)
-    check(instance is not None, "another instance holds the lock in a new folder")
-    assert instance is not None
+    check(isinstance(instance, launch.Instance), "another instance holds the lock in a new folder")
+    assert isinstance(instance, launch.Instance)
     thread = threading.Thread(target=instance.serve, name="proteia self-test", daemon=True)
     thread.start()
     try:

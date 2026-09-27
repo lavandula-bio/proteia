@@ -1441,6 +1441,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "GET /api/images/{image_id}/preview",
         "GET /api/charts/{key}.svg",
         "POST /api/incoming",
+        "GET /api/incoming/room",
         "POST /api/handoffs",
         "POST /api/handoffs/{handoff_id}/discard",
         "GET /api/diagnostics",
@@ -3906,6 +3907,7 @@ NEEDS_NO_OPENING = {
     ("POST", "/api/projects/sample"): "creates the sample project, and opens it",
     ("GET", "/api/workspace"): "says which opening is open: how a page finds it changed",
     ("POST", "/api/incoming"): "stages a file a launch hands to the app",
+    ("GET", "/api/incoming/room"): "says whether a file a launch would hand over is taken",
     ("POST", "/api/handoffs"): "hands off staged files, for the page to ask about",
     (
         "POST",
@@ -4088,8 +4090,10 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
     }
     handoff_id, files = handed_off(client, tmp_path, ["dropped.tif"])
     incoming = ("POST", "/api/incoming")
+    room = ("GET", "/api/incoming/room")
     discard = ("POST", "/api/handoffs/{handoff_id}/discard")
     bodies[incoming] = None
+    bodies[room] = None
     bodies[discard] = {"files": [file["file_id"] for file in files]}
     bodies[("POST", "/api/handoffs")] = {
         "refused": [{"name": "a.bmp", "code": "x", "message": "y"}]
@@ -4098,7 +4102,11 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
     bodies[("GET", "/api/notices")] = None
     bodies[("POST", "/api/notices/cloud_sync/dismiss")] = None
     bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
-    paths = {incoming: "/api/incoming?name=a.tif", discard: f"/api/handoffs/{handoff_id}/discard"}
+    paths = {
+        incoming: "/api/incoming?name=a.tif",
+        room: "/api/incoming/room?name=a.tif&size=1",
+        discard: f"/api/handoffs/{handoff_id}/discard",
+    }
     assert set(bodies) == set(NEEDS_NO_OPENING)
     answers = {
         route: client.call(
@@ -4118,6 +4126,7 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         ("POST", "/api/projects/open"): 200,
         ("POST", "/api/projects/sample"): 201,
         incoming: 201,
+        room: 204,
         discard: 204,
         ("POST", "/api/handoffs"): 201,
         ("POST", "/api/diagnostics/reveal"): 204,
@@ -4878,6 +4887,49 @@ def test_uploads_beyond_the_pending_limits_are_refused(client, tmp_path, monkeyp
     assert (status, answer["code"]) == (409, "too_many_pending")
     assert len(staging(client)) == 2
     assert staged(client, b"x" * 30, "e.tif")["size"] == 30
+
+
+def room(name: str, size: int | str) -> str:
+    return f"/api/incoming/room?name={quote(name, safe='')}&size={size}"
+
+
+def test_the_room_for_an_incoming_file_is_checked_without_holding_any(
+    client, tmp_path, ticks, monkeypatch
+):
+    # A launch asks before it sends a file's bytes, so that it sends none an
+    # upload would refuse. The check refuses as the upload would before its
+    # body is read, and holds nothing.
+    assert client.call("GET", room("a µ.tif", 10)) == (204, ("", b""))
+    assert staging(client) == [] and client.ok("GET", "/api/workspace")["handoffs"] == []
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 1)
+    for _ in range(2):
+        assert client.call("GET", room("a.tif", 10))[0] == 204  # held nothing
+    staged(client, b"x" * 10, "a.tif")
+    status, payload = client.call("GET", room("b.tif", 10))
+    assert (status, payload["code"]) == (409, "too_many_pending")
+    assert payload["message"] == "1 images are waiting in Proteia: import or discard them first"
+    assert client.refused("POST", incoming("b.tif"), raw=b"x" * 10)[:2] == (409, "too_many_pending")
+    # An upload no offer took expires as an upload's check finds it.
+    ticks.advance(handoff.UPLOAD_EXPIRY_S)
+    assert client.call("GET", room("b.tif", 10))[0] == 204
+    assert staging(client) == []
+
+    # The bytes: those staged and held, and the file's size.
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 32)
+    monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 50)
+    staged(client, b"x" * 20, "c.tif")
+    assert client.call("GET", room("d.tif", 30))[0] == 204
+    assert client.refused("GET", room("d.tif", 31))[:2] == (409, "too_many_pending")
+    # The name and the size, as an upload's are checked before its body.
+    monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 25)
+    assert client.refused("GET", room("d.tif", 26))[:2] == (413, "image_too_large")
+    assert client.refused("GET", room("notes.txt", 1))[:2] == (422, "unsupported_image_type")
+    assert client.refused("GET", room("../d.tif", 1))[:2] == (422, "invalid_image")
+    for path in (room("d.tif", -1), room("d.tif", "x"), "/api/incoming/room?name=d.tif"):
+        assert client.refused("GET", path)[:2] == (422, "invalid_input"), path
+    client.workspace.inbox.stop()
+    assert client.refused("GET", room("d.tif", 1))[:2] == (409, "stopping")
+    assert len(staging(client)) == 1
 
 
 def test_nothing_is_staged_offered_or_imported_once_proteia_is_stopping(client, tmp_path):

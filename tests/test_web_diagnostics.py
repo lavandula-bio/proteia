@@ -59,7 +59,7 @@ def served(tmp_path) -> Iterator[Served]:
     state = tmp_path / "state µ"  # a non-ASCII state folder
     workspace = api.Workspace(root, reveal=revealed.append, clock=FakeClock())
     instance = launch.start(folder=state, opener=lambda url: True, workspace=workspace)
-    assert instance is not None
+    assert isinstance(instance, launch.Instance)
     thread = threading.Thread(target=instance.serve, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
@@ -283,7 +283,7 @@ def test_a_real_session_log_brings_no_token_into_it(tmp_path):
     try:
         workspace = api.Workspace(root, reveal=lambda folder: None, clock=FakeClock())
         instance = launch.start(folder=state, opener=lambda url: True, workspace=workspace)
-        assert instance is not None
+        assert isinstance(instance, launch.Instance)
         thread = threading.Thread(target=instance.serve, daemon=True)
         thread.start()
         while not instance.server.started:

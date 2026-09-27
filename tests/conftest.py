@@ -33,6 +33,40 @@ from pydantic import BaseModel
 from proteia.core.model import Project, apply_change
 from proteia.core.storage import image_path
 
+
+class _NoBrowser:
+    """A browser that fails the test that asks for it."""
+
+    def open(self, url, new=0, autoraise=True):
+        raise AssertionError(f"a test tried to open the real browser at {url!r}")
+
+    open_new = open_new_tab = open
+
+
+@pytest.fixture(autouse=True)
+def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
+    """No test opens the user's browser or writes the user's state folder.
+
+    ``launch.start`` takes ``webbrowser.open`` as its default opener, bound when
+    the module loads, so the default browser is replaced where
+    ``webbrowser.open`` looks it up: its order of browsers holds only one that
+    fails the test. A browser named by its command (``webbrowser.get(command)``,
+    as the packaging checks use) is still read as before. The state folder
+    (``launch.state_dir``) follows ``LOCALAPPDATA`` on Windows and
+    ``XDG_STATE_HOME`` elsewhere: both point at a folder of the test's own. A
+    test that needs a browser passes its own opener; one that sets either
+    variable itself still does."""
+    import webbrowser
+
+    guard = "proteia-test-guard"
+    browsers = {**getattr(webbrowser, "_browsers", {}), guard: [None, _NoBrowser()]}
+    monkeypatch.setattr(webbrowser, "_browsers", browsers)
+    monkeypatch.setattr(webbrowser, "_tryorder", [guard])
+    state = tmp_path_factory.mktemp("user-state")
+    monkeypatch.setenv("LOCALAPPDATA", str(state))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+
+
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
 
 

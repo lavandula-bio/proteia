@@ -106,7 +106,9 @@ Images handed to the running app by a launch wait in the workspace's inbox
 (:mod:`proteia.web.handoff`) until the page imports or discards them. ``POST
 /api/incoming?name=<name>`` takes one file's bytes, as ``POST /api/images``
 does, into the private staging folder under a name the server makes, and
-answers ``{file_id, name, size}``; ``POST /api/handoffs`` offers uploaded files
+answers ``{file_id, name, size}``; ``GET /api/incoming/room?name=<name>&size=<bytes>``
+answers 204 if it would take that file now, or the refusal it would get before
+its body is read, holding nothing; ``POST /api/handoffs`` offers uploaded files
 (``files``, their ids) with the arguments the launch refused (``refused``,
 ``{name, code, message}`` each, bounded, never refusing the offer), and answers
 ``{handoff_id, merged, files, refused}``: the hand-off they went to, whether it
@@ -1415,14 +1417,13 @@ async def receive_file(
     :data:`~proteia.web.handoff.UPLOAD_EXPIRY_S`. Answers ``{file_id, name,
     size}``. The name is checked before any of the body is read
     (:func:`~proteia.web.handoff.check_name`), and so are the size the request
-    declares and the limits; an empty body is ``invalid_image``. One that
-    cannot be stored is ``file_error``, with a message that names no path: the
-    launch passes it on to the page. A refused upload leaves no file."""
-    handoff.check_name(name)
+    declares and the limits (as ``GET /api/incoming/room`` checks them); an
+    empty body is ``invalid_image``. One that cannot be stored is
+    ``file_error``, with a message that names no path: the launch passes it on
+    to the page. A refused upload leaves no file."""
     given = request.headers.get("content-length")
     declared = int(given) if given is not None and given.isdigit() else None
-    if declared is not None and declared > MAX_UPLOAD_BYTES:
-        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
+    _check_incoming(name, declared)
     inbox = workspace.inbox
     upload = await run_in_threadpool(inbox.begin_upload, name, declared)
     try:
@@ -1450,6 +1451,36 @@ async def receive_file(
             raise OSError(f"{name!r} could not be stored: {_reason(exc)}") from exc
         raise
     return {"file_id": stored.file_id, "name": stored.name, "size": stored.size}
+
+
+@router.get("/incoming/room", status_code=204)
+def incoming_room(
+    workspace: WorkspaceDep,
+    name: Annotated[str, Query(min_length=1)],
+    size: Annotated[int, Query(ge=0)],
+) -> Response:
+    """Whether ``POST /api/incoming`` would take a file named ``name`` of
+    ``size`` bytes now: 204 if so, else the refusal that upload would get
+    before reading any of its body (the name, the size, ``stopping``,
+    ``too_many_pending``). Nothing is held or stored
+    (:meth:`~proteia.web.handoff.Inbox.check_room`). A launch asks before it
+    sends a file's bytes. An upload refused before its body is read is still
+    sent whole, for nothing: the server answers at once, then reads the rest
+    and throws it away; and if the rest stops arriving for a while (the
+    server's keep-alive time), it closes the connection, which the launch may
+    find reset before it can read the answer."""
+    _check_incoming(name, size)
+    workspace.inbox.check_room(size)
+    return Response(status_code=204)
+
+
+def _check_incoming(name: str, size: int | None) -> None:
+    """The checks of a file a launch hands over, before any of its bytes are
+    read: its name (:func:`~proteia.web.handoff.check_name`), and its size, if
+    known, against :data:`MAX_UPLOAD_BYTES`."""
+    handoff.check_name(name)
+    if size is not None and size > MAX_UPLOAD_BYTES:
+        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
 
 
 @router.post("/handoffs", status_code=201)
