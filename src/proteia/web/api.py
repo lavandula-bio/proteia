@@ -42,12 +42,25 @@ results are shown with, and answers the folder, relative to the project folder
 with ``{"folder": "exports/<name>"}`` as the export answered it, that export
 folder.
 
+Every route that reads or edits the open project takes an optional
+``Proteia-Opening`` header (:data:`OPENING_HEADER`): the open id of the project
+the page shows, as its answers carry it. A request that names another opening
+is refused before anything is done, so a page still showing a project opened
+before (another tab opened one since, or Proteia read the open one's
+``project.json`` again) neither edits nor reads the one open now (#134).
+Without the header there is no check. ``GET /api/workspace`` answers which
+project is open, and its open id, without reading it: for a page to find out.
+The routes that list, create or open projects, and the status and quit routes,
+need no opening.
+
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
 refusal carries one (a row box's: what the detector saw); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
-``no_project`` 409 before a project is open; ``invalid_input`` 422 for a request
-the routes cannot read.
+``no_project`` 409 before a project is open; ``project_changed`` 409 for a
+request that names an opening no longer open, with ``detail`` ``{open,
+open_id}``: the open project's name and open id; ``invalid_input`` 422 for a
+request the routes cannot read, a ``Proteia-Opening`` not in plain digits too.
 """
 
 from __future__ import annotations
@@ -92,6 +105,8 @@ from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
 from proteia.web.state import has_colour, original_png, preview_png, project_state, revision
 
+# The request header that names the opening of a project a page shows (its open id).
+OPENING_HEADER: Final = "Proteia-Opening"
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
@@ -102,6 +117,19 @@ REOPEN_WAIT_S: Final = 5.0
 
 class NoProjectError(RuntimeError):
     """No project is open."""
+
+
+class ProjectChangedError(RuntimeError):
+    """A request names an opening of a project that is no longer the open one:
+    ``open`` (the open project's name) and ``open_id`` say which is."""
+
+    def __init__(self, named: int, name: str, open_id: int) -> None:
+        super().__init__(
+            f"the request names opening {named}, but {name!r} is open now (opening {open_id}):"
+            " read the project again"
+        )
+        self.open = name
+        self.open_id = open_id
 
 
 class UnsavedChangesError(RuntimeError):
@@ -144,7 +172,10 @@ class Workspace:
     """The server's state: the projects root and the one open project.
 
     A request keeps the session it started with: a project switch while it runs
-    does not redirect it (one user, one tab, so this only matters in a race).
+    does not redirect it (so this only matters in a race). A request that names
+    the opening its page shows gets the session only while that is the open one
+    (:meth:`current`): a page showing a project no longer open, in another tab
+    say, neither edits nor reads the one open now.
     Every create, and every open of another project, gives the new session the
     next open id, so answers about different openings never compare equal, even
     at the same revision. Opening the project already open answers its session
@@ -178,11 +209,24 @@ class Workspace:
         self._previews: OrderedDict[tuple[str, str, bool], bytes] = OrderedDict()
         self._charts = ChartStore()
 
-    def current(self) -> ProjectSession:
+    def current(self, opening: int | None = None) -> ProjectSession:
+        """The open project's session; with ``opening``, only if that is its open
+        id (:class:`ProjectChangedError` otherwise), checked and answered under
+        one lock, so the session answered is the one checked."""
         with self._lock:
             if self._session is None:
                 raise NoProjectError("create or open a project first")
+            if opening is not None and opening != self._open_id:
+                raise ProjectChangedError(opening, self._session.folder.name, self._open_id)
             return self._session
+
+    def opened(self) -> tuple[str | None, int | None]:
+        """The open project's name and open id, read together; (None, None)
+        before a project is open."""
+        with self._lock:
+            if self._session is None:
+                return None, None
+            return self._session.folder.name, self._open_id
 
     @property
     def settings(self) -> ResultSettings:
@@ -501,6 +545,35 @@ def _workspace(request: Request) -> Workspace:
 WorkspaceDep = Annotated[Workspace, Depends(_workspace)]
 
 
+def _opening(request: Request) -> int | None:
+    """The opening of a project the request's page shows: its
+    :data:`OPENING_HEADER`, an open id in plain digits (:func:`_url_index`), or
+    None without one. ``invalid_input`` for any other text, or for two."""
+    given = request.headers.getlist(OPENING_HEADER)
+    if not given:
+        return None
+    try:
+        if len(given) > 1:
+            raise ValueError("given more than once")
+        return int(_url_index(given[0]))  # type: ignore[call-overload]
+    except ValueError as exc:
+        raise OperationError(ErrorCode.INVALID_INPUT, f"{OPENING_HEADER}: {exc}") from exc
+
+
+def _open_session(request: Request) -> ProjectSession:
+    """The open project's session, for a route that reads or edits it: if the
+    request names an opening (:func:`_opening`), only while that is the open
+    one; ``project_changed`` otherwise. A dependency runs before the route
+    checks its path, query and body (only a body that is not JSON is refused
+    first), so such a request is refused before anything is done, an upload
+    before its bytes are read. A sync dependency, so it runs in the thread pool
+    and never blocks the event loop."""
+    return _workspace(request).current(_opening(request))
+
+
+OpenSession = Annotated[ProjectSession, Depends(_open_session)]
+
+
 def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
     """A route's answer: ``extra``, then the project state and its results, both
     from one snapshot of ``session``. Every answer registers its charts, kept
@@ -571,6 +644,15 @@ def list_projects(workspace: WorkspaceDep) -> dict[str, Any]:
     }
 
 
+@router.get("/workspace")
+def get_workspace(workspace: WorkspaceDep) -> dict[str, Any]:
+    """Which project is open, without reading it: the projects root, and the
+    open project's name and open id (null before one is open). A page checks it
+    to know whether the project it shows is still the one open."""
+    name, open_id = workspace.opened()
+    return {"root": str(workspace.root), "open": name, "open_id": open_id}
+
+
 @router.post("/projects", status_code=201)
 def create_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, workspace.create(body.name))
@@ -592,8 +674,8 @@ def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 
 @router.get("/project")
-def get_project(workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace, workspace.current())
+def get_project(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
+    return _answer(workspace, session)
 
 
 def _export_folder(project: Path, folder: str) -> Path:
@@ -622,10 +704,11 @@ def _export_folder(project: Path, folder: str) -> Path:
 
 
 @router.post("/project/reveal", status_code=204)
-def reveal_project(workspace: WorkspaceDep, body: RevealBody | None = None) -> Response:
+def reveal_project(
+    session: OpenSession, workspace: WorkspaceDep, body: RevealBody | None = None
+) -> Response:
     """Show the project folder in the system file manager or, with ``folder``,
     one of its export folders, as ``POST /api/export`` answered it."""
-    session = workspace.current()
     folder = session.folder if body is None else _export_folder(session.folder, body.folder)
     workspace.reveal(folder)
     return Response(status_code=204)
@@ -634,6 +717,7 @@ def reveal_project(workspace: WorkspaceDep, body: RevealBody | None = None) -> R
 @router.post("/images", status_code=201)
 async def import_image(
     request: Request,
+    session: OpenSession,
     workspace: WorkspaceDep,
     name: Annotated[str, Query(min_length=1)],
     kind: str,
@@ -642,7 +726,6 @@ async def import_image(
 ) -> dict[str, Any]:
     """The request body is the file's bytes; ``name`` is its original name
     (percent-encoded in the URL), kept only as metadata."""
-    session = await run_in_threadpool(workspace.current)  # never block the event loop
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
         raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
@@ -678,22 +761,25 @@ async def import_image(
 
 
 @router.delete("/images/{image_id}")
-def remove_image(image_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def remove_image(image_id: str, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     cascade = ops.remove_image(session, image_id)
     return _answer(workspace, session, **_cascade(cascade))
 
 
 @router.put("/images/{image_id}/polarity")
-def set_polarity(image_id: str, body: PolarityBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def set_polarity(
+    image_id: str, body: PolarityBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     ops.set_polarity(session, image_id, body.polarity)
     return _answer(workspace, session)
 
 
 @router.get("/images/{image_id}/preview")
 def image_preview(
-    image_id: str, workspace: WorkspaceDep, colour: Literal["original"] | None = None
+    image_id: str,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+    colour: Literal["original"] | None = None,
 ) -> Response:
     """The image as the view draws it, a PNG of the image's own size: its gray
     analysis array, which the nets are measured on, or with ``colour=original``
@@ -701,12 +787,11 @@ def image_preview(
     for a file without colour to show: ``colour`` in the project state says
     which have it). Either is read after the stored file's SHA-256 is checked:
     ``image_file_changed`` or ``unreadable_image`` (422) otherwise."""
-    session = workspace.current()
     data = workspace.preview(session, image_id, original=colour == "original")
     return Response(data, media_type="image/png")
 
 
-@router.get("/charts/{key}.svg")
+@router.get("/charts/{key}.svg", dependencies=[Depends(_open_session)])
 def chart(key: str, workspace: WorkspaceDep) -> Response:
     """A chart of an answer, at its ``chart_url``; 404 ``unknown_id`` for a key
     not given in the open project's answers, or no longer kept."""
@@ -714,8 +799,7 @@ def chart(key: str, workspace: WorkspaceDep) -> Response:
 
 
 @router.put("/lanes")
-def set_lanes(body: LanesBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def set_lanes(body: LanesBody, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     lanes = [ops.LaneInput(lane.condition, lane.sample, lane.included) for lane in body.lanes]
     if "reference_condition" in body.model_fields_set:
         update = ops.set_lanes(session, lanes, reference_condition=body.reference_condition)
@@ -730,15 +814,15 @@ def set_lanes(body: LanesBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 
 @router.put("/reference")
-def set_reference_condition(body: ReferenceBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def set_reference_condition(
+    body: ReferenceBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     ops.set_reference_condition(session, body.condition)
     return _answer(workspace, session)
 
 
 @router.post("/proteins", status_code=201)
-def add_protein(body: ProteinBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def add_protein(body: ProteinBody, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     size = (
         None if body.box_size is None else BoxSize(width=body.box_size[0], height=body.box_size[1])
     )
@@ -755,41 +839,46 @@ def add_protein(body: ProteinBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 
 @router.patch("/proteins/{protein_id}")
-def edit_protein(protein_id: str, body: ProteinEditBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def edit_protein(
+    protein_id: str, body: ProteinEditBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     # Only the fields the request set: the operation keeps the others (KEEP).
     ops.edit_protein(session, protein_id, **body.model_dump(exclude_unset=True))
     return _answer(workspace, session)
 
 
 @router.delete("/proteins/{protein_id}")
-def remove_protein(protein_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def remove_protein(
+    protein_id: str, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     cascade = ops.remove_protein(session, protein_id)
     return _answer(workspace, session, **_cascade(cascade))
 
 
 @router.put("/proteins/{protein_id}/box-size")
-def set_box_size(protein_id: str, body: BoxSizeBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def set_box_size(
+    protein_id: str, body: BoxSizeBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     ops.set_box_size(session, protein_id, BoxSize(width=body.width, height=body.height))
     return _answer(workspace, session)
 
 
 @router.delete("/proteins/{protein_id}/undetected/{lane_index}")
 def remove_undetected(
-    protein_id: str, lane_index: UrlIndex, workspace: WorkspaceDep, band_index: UrlIndex = 0
+    protein_id: str,
+    lane_index: UrlIndex,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+    band_index: UrlIndex = 0,
 ) -> dict[str, Any]:
     """Remove the protein's not-detected record in the lane, for its first band
     unless ``band_index`` names a later one; no record there is a no-op."""
-    session = workspace.current()
     ops.remove_undetected(session, protein_id, lane_index, band_index=band_index)
     return _answer(workspace, session)
 
 
 @router.post("/boxes", status_code=201)
-def place_box(body: PlaceBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def place_box(body: PlaceBody, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     band_id = ops.place_box(
         session, body.protein_id, body.x, body.y, lane_index=body.lane_index, grow=body.grow
     )
@@ -797,42 +886,43 @@ def place_box(body: PlaceBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 
 @router.post("/boxes/row", status_code=201)
-def detect_row_boxes(body: RowBody, workspace: WorkspaceDep) -> dict[str, Any]:
+def detect_row_boxes(
+    body: RowBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     """Box the protein's first band in every declared lane from the row box
     dragged over its row (:func:`~proteia.core.operations.detect_row_boxes`),
     in image pixels. Answers what the row did in each lane
     (:func:`_row_placement`); the same drag again changes nothing."""
-    session = workspace.current()
     placement = ops.detect_row_boxes(session, body.protein_id, body.rect)
     return _answer(workspace, session, **_row_placement(placement))
 
 
 @router.put("/boxes/{band_id}")
-def move_box(band_id: str, body: MoveBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def move_box(
+    band_id: str, body: MoveBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     ops.move_box(session, band_id, body.rect)
     return _answer(workspace, session)
 
 
 @router.delete("/boxes/{band_id}")
-def remove_box(band_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def remove_box(band_id: str, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     ops.remove_box(session, band_id)
     return _answer(workspace, session)
 
 
 @router.put("/boxes/{band_id}/lane")
-def set_box_lane(band_id: str, body: LaneIndexBody, workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def set_box_lane(
+    band_id: str, body: LaneIndexBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
     ops.set_box_lane(session, band_id, body.lane_index)
     return _answer(workspace, session)
 
 
 @router.delete("/proteins/{protein_id}/boxes")
-def clear_boxes(protein_id: str, workspace: WorkspaceDep) -> dict[str, Any]:
+def clear_boxes(protein_id: str, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     """Remove every box and not-detected record of the protein; it keeps its box
     size. A protein with neither is a no-op."""
-    session = workspace.current()
     cleared = ops.clear_boxes(session, protein_id)
     return _answer(
         workspace,
@@ -856,17 +946,18 @@ def _restored(restored: ops.Restored) -> dict[str, Any]:
 
 
 @router.post("/requantify")
-def requantify(workspace: WorkspaceDep) -> dict[str, Any]:
+def requantify(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     """Switch the project to the local background and re-quantify every band;
     answers the images re-quantified (``images``; empty for a project already
     on the local background, a no-op)."""
-    session = workspace.current()
     images = ops.requantify(session)
     return _answer(workspace, session, images=list(images))
 
 
 @router.post("/export", status_code=201)
-def export_bundle(workspace: WorkspaceDep, body: ExportBody | None = None) -> dict[str, Any]:
+def export_bundle(
+    session: OpenSession, workspace: WorkspaceDep, body: ExportBody | None = None
+) -> dict[str, Any]:
     """Write the results into a new export folder
     (:func:`~proteia.core.operations.export_bundle`), computed with the settings
     they are shown with, in the chart ``formats`` asked for (by default
@@ -875,7 +966,6 @@ def export_bundle(workspace: WorkspaceDep, body: ExportBody | None = None) -> di
     /api/project/reveal``), and the files in it, by name, in the order written.
     Refusals are 422 with the operation's codes: ``no_lanes``,
     ``image_file_changed``, ``path_too_long`` and ``invalid_input``."""
-    session = workspace.current()
     formats = DEFAULT_CHART_FORMATS if body is None or body.formats is None else body.formats
     bundle = ops.export_bundle(session, formats=formats, **dataclasses.asdict(workspace.settings))
     return _answer(
@@ -887,14 +977,12 @@ def export_bundle(workspace: WorkspaceDep, body: ExportBody | None = None) -> di
 
 
 @router.post("/undo")
-def undo(workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def undo(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, session, **_restored(ops.undo(session)))
 
 
 @router.post("/redo")
-def redo(workspace: WorkspaceDep) -> dict[str, Any]:
-    session = workspace.current()
+def redo(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, session, **_restored(ops.redo(session)))
 
 
@@ -924,6 +1012,9 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         UnknownIdError: lambda e: _error(404, "unknown_id", str(e)),
         FolderNotFoundError: lambda e: _error(404, "folder_not_found", str(e)),
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
+        ProjectChangedError: lambda e: _error(
+            409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
+        ),
         UnsavedChangesError: lambda e: _error(409, "unsaved_changes", str(e)),
         UploadTooLargeError: lambda e: _error(413, "image_too_large", str(e)),
         projects.ProjectNameError: lambda e: _error(422, "invalid_project_name", str(e)),

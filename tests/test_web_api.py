@@ -13,11 +13,13 @@ import http.client
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,7 +28,9 @@ from urllib.parse import quote
 import numpy as np
 import pytest
 import tifffile
+from fastapi.routing import APIRoute
 from PIL import Image
+from starlette.routing import Mount
 
 from conftest import (
     MEMBRANE_LEVEL,
@@ -79,9 +83,16 @@ class Client:
         self.workspace = workspace
 
     def call(
-        self, method: str, path: str, body: Any = None, *, raw: bytes | None = None
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        raw: bytes | None = None,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, Any]:
-        headers = {"Authorization": f"Bearer {self.token}"}
+        """``headers`` are sent too, such as the opening the request names."""
+        headers = {"Authorization": f"Bearer {self.token}", **(headers or {})}
         data = raw
         if raw is not None:
             headers["Content-Type"] = "application/octet-stream"
@@ -1231,6 +1242,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     # Every route that answers with the project is exercised above.
     others = {
         "GET /api/projects",
+        "GET /api/workspace",
         "POST /api/project/reveal",
         "GET /api/images/{image_id}/preview",
         "GET /api/charts/{key}.svg",
@@ -2259,7 +2271,9 @@ def test_reading_the_project_never_waits_for_a_running_operation(tmp_path):
     session = workspace.create("A µ")
     blot_upload(session, tmp_path, "α.tif")
     answers: list[dict[str, Any]] = []
-    reader = threading.Thread(target=lambda: answers.append(api.get_project(workspace)))
+    reader = threading.Thread(
+        target=lambda: answers.append(api.get_project(workspace.current(), workspace))
+    )
     with session.lock:  # as an operation holds it while it runs, e.g. a large import
         reader.start()
         reader.join(10)
@@ -3324,3 +3338,254 @@ def test_a_sample_project_in_a_projects_root_that_cannot_be_written_answers_json
     client.root.write_text("a file where the projects folder should be", encoding="utf-8")
     assert client.refused("POST", "/api/projects/sample")[:2] == (500, "file_error")
     assert client.refused("GET", "/api/project")[:2] == (409, "no_project")
+
+
+# --- A page that shows a project no longer open (#134) ---
+
+OPENING = "Proteia-Opening"
+
+# The routes that need no opening, since none reads or edits the open project,
+# and why. Every other route under /api refuses a request that names another
+# opening (found from the app's routes), so a new route is guarded unless it is
+# added here.
+NEEDS_NO_OPENING = {
+    ("GET", "/api/status"): "says which app answers",
+    ("POST", "/api/quit"): "stops Proteia, whichever project the page shows",
+    ("GET", "/api/projects"): "lists the projects root",
+    ("POST", "/api/projects"): "creates the project the request names, and opens it",
+    ("POST", "/api/projects/open"): "opens the project the request names",
+    ("POST", "/api/projects/sample"): "creates the sample project, and opens it",
+    ("GET", "/api/workspace"): "says which opening is open: how a page finds it changed",
+}
+
+
+def _declared(routes: list[Any]) -> Iterator[APIRoute]:
+    """The routes in ``routes`` and in the routers included there: FastAPI keeps
+    an included router as one route that holds it (``original_router``)."""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        elif hasattr(route, "original_router"):
+            yield from _declared(route.original_router.routes)
+        else:
+            assert isinstance(route, Mount) and route.path == "/static", route
+
+
+def api_routes() -> set[tuple[str, str]]:
+    """Every (method, path) the app serves under /api, as its routes declare them."""
+    workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
+    app = server.create_app(
+        token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
+    ).app
+    routes = {
+        (method, route.path)
+        for route in _declared(app.routes)
+        if route.path.startswith("/api/")
+        for method in route.methods
+    }
+    described = {
+        (method.upper(), path)
+        for path, methods in app.openapi()["paths"].items()
+        for method in methods
+    }
+    assert described <= routes  # every route found
+    return routes
+
+
+def files_of(folder: Path) -> dict[str, bytes]:
+    """Every file in ``folder``, by its path there, with its bytes."""
+    return {
+        path.relative_to(folder).as_posix(): path.read_bytes()
+        for path in sorted(folder.rglob("*"))
+        if path.is_file()
+    }
+
+
+def opened_elsewhere(client: Client, tmp_path: Path) -> tuple[dict, int]:
+    """Blot set up (:func:`live`); then a page opened Other, and another page
+    Blot again. Gives the answer that page got, and the opening the first page
+    shows (Other's)."""
+    live(client, tmp_path, DOSES)
+    shown = client.ok("POST", "/api/projects", {"name": "Other"})["project"]["open_id"]
+    return client.ok("POST", "/api/projects/open", {"name": "Blot"}), shown
+
+
+def test_every_route_on_the_open_project_refuses_another_opening(client, tmp_path):
+    # A page still showing Other must neither edit nor read Blot, whose ids are
+    # Other's too (img-1, prot-1). Each route is sent with the ids Blot has and
+    # no body: the refusal comes before the body is read, and changes nothing.
+    routes = api_routes()
+    assert set(NEEDS_NO_OPENING) <= routes  # none of them has gone
+    guarded = sorted(routes - set(NEEDS_NO_OPENING))
+    assert {("GET", "/api/project"), ("PUT", "/api/boxes/{band_id}")} <= set(guarded)
+    answer, shown = opened_elsewhere(client, tmp_path)
+    project = answer["project"]
+    protein = next(p for p in project["proteins"] if p["bands"])
+    ids = {
+        "image_id": project["images"][0]["id"],
+        "protein_id": protein["id"],
+        "band_id": protein["bands"][0]["id"],
+        "lane_index": "0",
+        "key": only_series(answer)["chart_url"].removeprefix("/api/charts/").removesuffix(".svg"),
+    }
+    paths = [
+        (method, re.sub(r"\{(\w+)\}", lambda m: ids.get(m[1], "0"), path))
+        for method, path in guarded
+    ]
+    paths.append(("GET", f"/api/images/{ids['image_id']}/preview?colour=original"))
+    folder = client.root / "Blot"
+    before = files_of(folder)
+
+    answered = {}
+    for method, path in paths:
+        status, payload = client.call(method, path, headers={OPENING: str(shown)})
+        got = (payload["code"], payload.get("detail")) if isinstance(payload, dict) else payload
+        answered[f"{method} {path}"] = (status, got)
+    status, payload = client.call(  # an upload: refused before its body is stored
+        "POST",
+        "/api/images?name=a.tif&kind=chemiluminescence&polarity=dark_on_light",
+        raw=blot_bytes(tmp_path),
+        headers={OPENING: str(shown)},
+    )
+    answered["POST /api/images with a file"] = (status, (payload["code"], payload.get("detail")))
+
+    refused = (409, ("project_changed", {"open": "Blot", "open_id": project["open_id"]}))
+    assert {route: got for route, got in answered.items() if got != refused} == {}
+    assert files_of(folder) == before
+    assert client.revealed == []
+    after = client.ok("GET", "/api/project")["project"]
+    assert (after["open_id"], after["revision"]) == (project["open_id"], project["revision"])
+
+
+def test_a_request_naming_the_open_opening_or_none_is_served(client, tmp_path):
+    answer, _ = opened_elsewhere(client, tmp_path)
+    project = answer["project"]
+    now = {OPENING: str(project["open_id"])}
+    read = client.ok("GET", "/api/project", headers=now)["project"]
+    assert (read["open_id"], read["revision"]) == (project["open_id"], project["revision"])
+    band = next(p for p in project["proteins"] if p["bands"])["bands"][0]
+    x0, y0, x1, y1 = band["rect"]
+    rect = [x0 + 2, y0, x1 + 2, y1]
+    moved = client.ok("PUT", f"/api/boxes/{band['id']}", {"rect": rect}, headers=now)
+    assert moved["project"]["revision"] == project["revision"] + 1
+    image_id = project["images"][0]["id"]
+    status, (kind, _) = client.call("GET", f"/api/images/{image_id}/preview", headers=now)
+    assert (status, kind) == (200, "image/png")
+    status, (kind, _) = client.call("GET", only_series(moved)["chart_url"], headers=now)
+    assert (status, kind) == (200, "image/svg+xml")
+    # Without the header a request acts on whichever project is open, as before.
+    assert client.ok("POST", "/api/undo")["action"] == "move_box"
+
+
+@pytest.mark.parametrize(
+    "given",
+    ["", "one", "01", "+2", "2.0", "2_0", "0x2", pytest.param("9" * 5000, id="5000 digits")],
+)
+def test_an_opening_not_in_plain_digits_is_refused(client, given):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("POST", "/api/projects", {"name": "Other"})  # open id 2
+    before = files_of(client.root / "Other")
+    lanes = {"lanes": [{"condition": "vehicle"}]}
+    status, code, _ = client.refused("PUT", "/api/lanes", lanes, headers={OPENING: given})
+    assert (status, code) == (422, "invalid_input")
+    assert files_of(client.root / "Other") == before
+
+
+def test_two_openings_in_one_request_are_refused(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        conn.putrequest("GET", "/api/project")
+        conn.putheader("Authorization", f"Bearer {client.token}")
+        conn.putheader(OPENING, "1")
+        conn.putheader(OPENING, "1")
+        conn.endheaders()
+        response = conn.getresponse()
+        status, body = response.status, json.loads(response.read())
+    finally:
+        conn.close()
+    assert (status, body["code"]) == (422, "invalid_input")
+
+
+def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    stale = {OPENING: "7"}  # an opening that never was
+    # The page shell, served without the token, holds no user data.
+    for path in ("/", "/static/app.js"):
+        assert client.call("GET", path, headers=stale)[0] == 200
+    bodies: dict[tuple[str, str], Any] = {
+        ("GET", "/api/status"): None,
+        ("GET", "/api/projects"): None,
+        ("GET", "/api/workspace"): None,
+        ("POST", "/api/projects"): {"name": "Other"},
+        ("POST", "/api/projects/open"): {"name": "Blot"},
+        ("POST", "/api/projects/sample"): None,
+        ("POST", "/api/quit"): None,  # last: it stops the server
+    }
+    assert set(bodies) == set(NEEDS_NO_OPENING)
+    answers = {route: client.call(*route, body, headers=stale) for route, body in bodies.items()}
+    assert {route: status for route, (status, _) in answers.items()} == {
+        ("GET", "/api/status"): 200,
+        ("GET", "/api/projects"): 200,
+        ("GET", "/api/workspace"): 200,
+        ("POST", "/api/projects"): 201,
+        ("POST", "/api/projects/open"): 200,
+        ("POST", "/api/projects/sample"): 201,
+        ("POST", "/api/quit"): 202,
+    }
+    opened = [
+        answers[("POST", path)][1]["project"] for path in ("/api/projects", "/api/projects/open")
+    ]
+    assert [(p["name"], p["open_id"]) for p in opened] == [("Other", 2), ("Blot", 3)]
+
+
+def test_the_workspace_says_which_opening_is_open_without_reading_it(client, monkeypatch):
+    calls: list = []
+    _counting(monkeypatch, calls)
+    root = str(client.root)
+    assert client.ok("GET", "/api/workspace") == {"root": root, "open": None, "open_id": None}
+    client.ok("POST", "/api/projects", {"name": "Blot µ"})
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    computed = len(calls)
+    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Other", "open_id": 2}
+    client.ok("POST", "/api/projects/open", {"name": "Blot µ"})
+    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Blot µ", "open_id": 3}
+    assert len(calls) == computed + 1  # the open's answer only
+
+
+def test_the_open_session_is_given_only_for_its_own_opening(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    with pytest.raises(api.NoProjectError):
+        workspace.current(1)
+    first = workspace.create("A µ")
+    assert workspace.current(1) is first
+    second = workspace.create("B")
+    with pytest.raises(api.ProjectChangedError) as refused:
+        workspace.current(1)
+    assert (refused.value.open, refused.value.open_id) == ("B", 2)
+    assert workspace.current(2) is workspace.current() is second
+
+
+def test_a_project_read_again_refuses_its_earlier_opening(client, tmp_path):
+    # Its project.json changed outside Proteia (a synced copy): the reopen reads
+    # it again under the next open id, and a page showing it as it was before
+    # is refused until it reads it again.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    session = client.workspace.current()
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    remote = api.ops.open_project(other, clock=FakeClock())
+    api.ops.set_lanes(remote, [api.ops.LaneInput("drug")])
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+    assert client.ok("POST", "/api/projects/open", {"name": "Blot"})["project"]["open_id"] == 2
+
+    lanes = {"lanes": [{"condition": "vehicle"}, {"condition": "stale"}]}
+    status, payload = client.call("PUT", "/api/lanes", lanes, headers={OPENING: "1"})
+    assert (status, payload["code"], payload["detail"]) == (
+        409,
+        "project_changed",
+        {"open": "Blot", "open_id": 2},
+    )
+    saved = storage.load_project(session.folder)
+    assert [lane.label for lane in saved.batch.lanes] == ["drug"]

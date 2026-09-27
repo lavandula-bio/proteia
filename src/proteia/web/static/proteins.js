@@ -74,8 +74,9 @@ export class ProteinPanel {
 
   // No edit made before this, nor the answer to one, is applied from now on:
   // called just before another project is asked for, since its ids repeat those
-  // of the one open (prot-3 in each). After settled() nothing is left to drop;
-  // this keeps it so.
+  // of the one open (prot-3 in each), and again once it is shown, since an edit
+  // made in the one before could still be waiting then (behind a refusal
+  // answered late). After settled() nothing is left to drop; this keeps it so.
   invalidateEdits() {
     this.opening += 1;
   }
@@ -404,10 +405,12 @@ export class ProteinPanel {
   // Run `task(current)` once the edits queued before it have their answers and
   // `after` (a Promise of edits sent before it outside the queue) has settled,
   // so edits reach the server in the order they were made. It is not run once
-  // another project is asked for (invalidateEdits), and `current()` turns false
-  // then: nothing about its answer is shown. The app's undo and redo run here
-  // too, so they take back what was sent before them, and an open waits for
-  // them. Gives the task's result, or null.
+  // another project is asked for or shown (invalidateEdits), and `current()`
+  // turns false then: nothing about its answer is shown. Each `task` sends its
+  // request before it awaits anything, so the request names the opening shown
+  // when the edit was made (the app's request()). The app's undo and redo run
+  // here too, so they take back what was sent before them, and an open waits
+  // for them. Gives the task's result, or null.
   queueEdit(task, { after = null } = {}) {
     const opening = this.opening;
     const current = () => opening === this.opening;

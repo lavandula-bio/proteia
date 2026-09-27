@@ -28,7 +28,7 @@ import pytest
 
 import proteia
 from proteia.core import results, rowdetect
-from proteia.web import launch, server
+from proteia.web import api, launch, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
 
 OMIT = object()  # send no Host header
@@ -403,7 +403,9 @@ def test_a_server_error_carries_the_security_headers():
 # --- The guard ---
 
 
-@pytest.mark.parametrize("path", ["/api/status", "/api/quit", "/api/nothing", "/docs"])
+@pytest.mark.parametrize(
+    "path", ["/api/status", "/api/quit", "/api/workspace", "/api/nothing", "/docs"]
+)
 @pytest.mark.parametrize("token", [None, "z" * 43, "wrong"])
 def test_a_request_without_the_right_token_is_refused(running, path, token):
     method = "POST" if path == "/api/quit" else "GET"
@@ -628,3 +630,117 @@ def test_the_page_shows_a_notice_about_one_series_under_that_series_only():
     # loading control (#52); for that it keeps the core's list of such notices.
     script = (server.STATIC_DIR / "charts.js").read_text(encoding="utf-8")
     assert _set_members(script, "ONE_SERIES") == set(results.SERIES_NOTICE_CODES)
+
+
+# --- A page that shows a project no longer open (#134) ---
+
+
+def _code(name: str) -> str:
+    """A page script without its comments (no string in the scripts holds ``//``)."""
+    script = (server.STATIC_DIR / name).read_text(encoding="utf-8")
+    return re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", "", script, flags=re.DOTALL))
+
+
+def _function(script: str, head: str) -> tuple[int, str]:
+    """Where the top-level function that starts with ``head`` begins, and its text."""
+    start = script.index(head)
+    return start, script[start : script.index("\n}\n", start) + 2]
+
+
+def test_every_request_of_the_page_goes_through_request():
+    # request() names the opening of the project the page shows in every
+    # request, so the server refuses one about a project no longer open: the
+    # page calls the global fetch there only, and nothing else sends requests.
+    found = {}
+    for path in sorted(server.STATIC_DIR.glob("*.js")):
+        script = _code(path.name)
+        found[path.name] = [m.start() for m in re.finditer(r"(?<![\w.$])fetch\(", script)]
+        for other in ("XMLHttpRequest", "sendBeacon", "EventSource", "WebSocket"):
+            assert other not in script, (path.name, other)
+    assert {name: len(at) for name, at in found.items() if at} == {"app.js": 1}
+    start, request = _function(_code("app.js"), "async function request(")
+    assert start < found["app.js"][0] < start + len(request)
+
+
+def test_the_page_names_its_opening_and_follows_another_only_when_it_did_not_open_it():
+    script = _code("app.js")
+    assert f'const OPENING_HEADER = "{api.OPENING_HEADER}";' in script
+    assert 'const PROJECT_CHANGED = "project_changed";' in script
+    _, request = _function(script, "async function request(")
+    assert "headers.set(OPENING_HEADER," in request
+    assert "projectChanged(" in request.split("fetch(", 1)[1]  # on a refusal
+    # Not while the page opens a project itself (its reads sent before come
+    # back refused), nor about an opening no newer than the one it shows.
+    _, rule = _function(script, "function projectChanged(")
+    follow = rule.index("followOpening(")
+    assert -1 < rule.find("opening !== null") < follow
+    assert -1 < rule.find("open_id") < follow
+    # Both a page's own create or open and a follow show the project as new.
+    _, switch = _function(script, "async function switchTo(")
+    assert switch.index("setOpening(name)") < switch.index('call("POST"')
+    assert "showOpened(" in switch
+    assert "showOpened(" in _function(script, "function followOpening(")[1]
+    _, shown = _function(script, "function showOpened(")
+    assert "state.originalColours.clear()" in shown and "charts.forget()" in shown
+
+
+def test_a_page_shown_again_checks_which_project_is_open():
+    script = _code("app.js")
+    assert re.search(r'addEventListener\("visibilitychange",[^;]*checkOpening\(', script)
+    assert re.search(r'window\.addEventListener\("focus",[^;]*checkOpening\(', script)
+    assert '"/api/workspace"' in _function(script, "function checkOpening(")[1]
+    # The shortcuts (single keys, and Ctrl+Z) are off under any open dialog.
+    assert '$("projects-dialog").open' not in script
+    assert script.count('document.querySelector("dialog[open]")') == 2
+
+
+def _method(script: str, head: str) -> str:
+    """The text of the class method that starts with ``head`` (indented two spaces)."""
+    start = script.index(f"\n  {head}") + 1
+    return script[start : script.index("\n  }\n", start) + 4]
+
+
+def test_an_edit_made_while_another_project_was_shown_is_never_sent():
+    # An edit waits for the edits made before it: the panel's queue, and the box
+    # and image edits in flight. So one made while the page still showed a
+    # project no longer open (Ctrl+Z, a band clicked) can wait, behind a
+    # refusal answered late, past the moment the page shows the project open
+    # now. Sent then, it would name that project's opening (request() names the
+    # one shown when it sends), and what was made in the project before would
+    # be made in this one. It is not sent: the panel drops the edits queued
+    # before another project is shown, and a box or image edit checks that the
+    # opening shown is still the one shown when it was made.
+    script = _code("app.js")
+    assert "proteinPanel.invalidateEdits()" in _function(script, "function showOpened(")[1]
+    _, ordered = _function(script, "function ordered(")
+    waits = ordered.index("proteinPanel.queue.then(")
+    assert -1 < ordered.find("shownOpening()") < waits  # when it is made
+    checked = ordered.index("shownOpening()", waits)  # when it would be sent
+    assert checked < ordered.index("sendIt()")
+    # The panel runs a queued edit, and sends an add, only while no other
+    # project was asked for or shown since it was made (invalidateEdits).
+    panel = _code("proteins.js")
+    assert "return current() ? task(current) : null;" in _method(panel, "queueEdit(")
+    add = _method(panel, "async add(")
+    assert -1 < add.find("opening !== this.opening") < add.index("this.handlers.send(")
+
+
+def test_a_refused_undo_or_redo_is_not_called_a_change():
+    # A request refused as project_changed did nothing, and the status line says
+    # what, after "A is saved". A refused undo or redo lost no change: the
+    # change it would have taken back or made again was made, and is saved.
+    script = _code("app.js")
+    body = script[script.index("const NOT_DONE = {") :].split("};", 1)[0]
+    not_done = dict(re.findall(r'(\w+): "([^"]*)"', body))
+    assert not_done == {
+        "change": "Your last change was not made.",
+        "undo": "Nothing was undone.",
+        "redo": "Nothing was redone.",
+        "export": "Nothing was exported.",
+    }
+    body = script[script.index("const REFUSED_AS = {") :].split("};", 1)[0]
+    refused_as = dict(re.findall(r'"([^"]+)": "(\w+)"', body))
+    assert refused_as == {"/api/undo": "undo", "/api/redo": "redo", "/api/export": "export"}
+    posts = {route.path for route in api.router.routes if "POST" in route.methods}
+    assert set(refused_as) <= posts
+    assert "REFUSED_AS[path]" in _function(script, "function projectChanged(")[1]
