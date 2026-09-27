@@ -1414,10 +1414,20 @@ function exportResults() {
         applyAnswer(answer);
         if (current() && sameOpening(answer)) {
           showExported(answer);
+        } else if (current()) {
+          // The project was read again from its folder while it exported (an
+          // outside change): the files are of the version before, and written.
+          const files = counted(answer.files.length, "file", "files");
+          showStatus(
+            `Exported ${files} to ${answer.folder}, from the project as it was before` +
+              " it was read again from its folder.",
+          );
         }
       } catch (error) {
         if (current() && opened === shownOpening()) {
           await reportExport(error);
+        } else if (current()) {
+          showStatus("Not exported: the project was read again from its folder meanwhile. Export again.");
         }
       }
       return null;
