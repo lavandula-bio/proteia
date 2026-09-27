@@ -125,9 +125,11 @@ from proteia.core.export import (
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
     UNTRUSTED_WARNINGS,
+    assess_processed,
     clipping_depth,
     load_image,
     possible_clipping_depth,
+    reads_as_palette,
 )
 from proteia.core.model import (
     DETECTING_SOURCES,
@@ -141,6 +143,7 @@ from proteia.core.model import (
     BoxSize,
     ImageKind,
     ImageRef,
+    ImageWarning,
     Lane,
     Membrane,
     Polarity,
@@ -1000,9 +1003,11 @@ def import_image(
     """Store an image stream in the project and record it; return its id.
 
     The file is copied byte for byte into ``images/``, then read back: the
-    recorded size, bit depth, background and warnings come from the stored copy.
-    Without ``membrane_id`` the image starts a new membrane. ``kind`` and
-    ``polarity`` are required (the model has no silent default).
+    recorded size, bit depth, background and warnings come from the stored copy,
+    with ``looks_processed`` assessed for ``polarity``
+    (:func:`~proteia.core.imaging.assess_processed`). Without ``membrane_id`` the
+    image starts a new membrane. ``kind`` and ``polarity`` are required (the
+    model has no silent default).
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1047,6 +1052,14 @@ def import_image(
                 ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
             ) from exc
         background = estimate_background(loaded.array)
+        warnings = assess_processed(
+            loaded.warnings,
+            loaded.array,
+            loaded.bit_depth,
+            dark_on_light=polarity.dark_on_light,
+            background=background,
+            palette=loaded.palette,
+        )
 
         def change(draft: Project) -> str:
             if draft.new_id("img") != image_id:  # the lock makes this impossible
@@ -1068,7 +1081,7 @@ def import_image(
                     bit_depth=loaded.bit_depth,
                     polarity=polarity,
                     background=background,
-                    import_warnings=loaded.warnings,
+                    import_warnings=warnings,
                 )
             )
             return membrane.id
@@ -1205,7 +1218,9 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
 def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> None:
     """Set an image's polarity and re-quantify every band on it: the signal
     direction turns each ring's clip, level and haze lift around (the image's
-    median does not depend on it).
+    median does not depend on it). Its ``looks_processed`` warning, which counts
+    the pixels at the background's end of the range, is assessed again
+    (:func:`_processed_again`).
 
     The not-detected records of every protein on the image are dropped and
     logged: their SNR was measured with the other signal direction, against the
@@ -1214,12 +1229,16 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     """
     polarity = _member(Polarity, polarity, "polarity")
     batch = session.project.batch
-    if batch.find_image(image_id).polarity is polarity:
+    image = batch.find_image(image_id)
+    if image.polarity is polarity:
         return
     array = session.pixels(image_id) if _bands_on(batch, image_id) else None
+    warnings = _processed_again(session, image, polarity, array)
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
-        draft.batch.find_image(image_id).polarity = polarity
+        drafted = draft.batch.find_image(image_id)
+        drafted.polarity = polarity
+        drafted.import_warnings = warnings
         if array is not None:
             _quantify_image(draft, image_id, array)
         return [
@@ -1238,6 +1257,33 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
             "polarity": polarity.value,
             "dropped_undetected": dropped,
         },
+    )
+
+
+def _processed_again(
+    session: ProjectSession, image: ImageRef, polarity: Polarity, array: np.ndarray | None
+) -> list[ImageWarning]:
+    """The image's import warnings with ``looks_processed`` assessed for
+    ``polarity`` (:func:`~proteia.core.imaging.assess_processed`), from its
+    analysis array (``array``, or read now without keeping it, since an image
+    with no band has no other use for it) and its file's header. An image whose
+    file cannot be read loses a ``looks_processed`` assessed for the old
+    polarity, which would name the wrong limit, and keeps its other warnings:
+    with no band to re-quantify, its polarity changes as before #127, and every
+    analysis of it is refused until the file is back."""
+    try:
+        if array is None:
+            array = session.pixels(image.id, keep=False)
+        palette = reads_as_palette(storage.image_path(session.folder, image))
+    except (OperationError, ValueError, OSError):
+        return [w for w in image.import_warnings if w.code != "looks_processed"]
+    return assess_processed(
+        image.import_warnings,
+        array,
+        image.bit_depth,
+        dark_on_light=polarity.dark_on_light,
+        background=image.background,
+        palette=palette,
     )
 
 
