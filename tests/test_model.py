@@ -28,9 +28,11 @@ from proteia.core.model import (
     FitMethod,
     ImageKind,
     ImageRef,
+    LadderSide,
     Lane,
     LogEntry,
     Membrane,
+    MwCalibration,
     Polarity,
     Project,
     ProposalSource,
@@ -83,6 +85,51 @@ def _edit(project: Project, obj_id: str, **fields) -> Project:
 def _point(project: Project, membrane_id: str = "mem-1") -> CalibrationPoint:
     # mem-1's first point (by y) is on img-3, which is 150 px high.
     return _get(project, membrane_id).calibration.points[0]
+
+
+def _point_at(project: Project, mw: float, membrane_id: str = "mem-1") -> CalibrationPoint:
+    return next(p for p in _get(project, membrane_id).calibration.points if p.mw == mw)
+
+
+def _right_ladder(
+    project: Project, *, left_x: float | None = 77.0, right_x: float = 300.0
+) -> Project:
+    """mem-1 with a right ladder on its marker (250 and 100 kDa, at ``right_x``)
+    and every left point at ``left_x``, in place."""
+    calibration = _get(project, "mem-1").calibration
+    for point in calibration.points:
+        point.x = left_x
+    calibration.points += [
+        CalibrationPoint(
+            image_id="img-3",
+            y=y,
+            mw=mw,
+            source="visible_marker",
+            x=right_x,
+            side=LadderSide.RIGHT,
+        )
+        for y, mw in ((22.0, 250), (63.5, 100))
+    ]
+    return project
+
+
+def _strip_beside_a_right_ladder(project: Project) -> Project:
+    """mem-5's strip edges, clicked at x, beside a right ladder on the same image."""
+    calibration = _get(project, "mem-5").calibration
+    for point in calibration.points:
+        point.x = 10.0
+    calibration.points += [
+        CalibrationPoint(
+            image_id="img-6",
+            y=y,
+            mw=mw,
+            source="chemiluminescence_marker",
+            x=150.0,
+            side=LadderSide.RIGHT,
+        )
+        for y, mw in ((20.0, 95), (80.0, 80))
+    ]
+    return project
 
 
 def _rejected(project: Project, match: str) -> None:
@@ -399,6 +446,15 @@ def test_protein_names_unique_and_non_blank():
             "marker image",
             id="merged-image-with-a-marker",
         ),
+        pytest.param(
+            lambda p: _edit(
+                _edit(p, "img-4", kind=ImageKind.MERGED), "img-2", marker_image_id="img-4"
+            ),
+            None,
+            id="to-a-merged-image",
+        ),
+        pytest.param(lambda p: _edit(p, "img-3", width=300), "differ in size", id="other-size"),
+        pytest.param(lambda p: _edit(p, "img-2", height=151), "differ in size", id="other-height"),
     ],
 )
 def test_marker_pairing(project, edit, match):
@@ -416,12 +472,172 @@ def test_marker_pairing(project, edit, match):
         ),
         pytest.param(lambda p: _set(_point(p), y=150.5), "calibration point", id="below-bottom"),
         pytest.param(lambda p: _set(_point(p), mw=0.0), "greater than 0", id="zero-mw"),
-        pytest.param(lambda p: _set(_point(p), y=150.0), None, id="at-the-bottom"),
+        # The lowest point: moving 250 kDa there would put it out of order.
+        pytest.param(lambda p: _set(_point_at(p, 55), y=150.0), None, id="at-the-bottom"),
+        pytest.param(lambda p: _set(_point(p), x=341.0), "right of the edge", id="x-right-of-edge"),
+        pytest.param(lambda p: _set(_point(p), x=340.0), None, id="x-at-the-edge"),
+        pytest.param(
+            lambda p: _set(_point(p), side=LadderSide.RIGHT), "needs its x", id="right-without-x"
+        ),
+        pytest.param(
+            lambda p: _set(_point(p, "mem-5"), side=LadderSide.RIGHT, x=10.0),
+            "strip edge belongs to the left",
+            id="right-strip-edge",
+        ),
+        pytest.param(lambda p: _set(_point(p, "mem-5"), x=10.0), None, id="strip-edge-with-x"),
+        pytest.param(
+            lambda p: _set(_point_at(p, 100), y=100.0),
+            "out of order on the left ladder",
+            id="out-of-order",
+        ),
+        pytest.param(
+            lambda p: _set(_point_at(p, 55), mw=100.0),
+            "two calibration points at 100 kDa",
+            id="duplicate-mw",
+        ),
+        pytest.param(
+            lambda p: _set(_point_at(p, 55), y=61.5),
+            "two calibration points at y=",
+            id="duplicate-y",
+        ),
+        # 100.00000000000001 above 100 kDa: distinct floats, in order, but one
+        # log10, which is what the curve is fitted on.
+        pytest.param(
+            lambda p: _set(_point_at(p, 250), mw=math.nextafter(100.0, math.inf)),
+            "two calibration points at 100 kDa",
+            id="mws-one-float-step-apart",
+        ),
+        pytest.param(_right_ladder, None, id="same-mw-both-sides"),
+        pytest.param(
+            lambda p: _right_ladder(p, left_x=None),
+            "needs a ladder band's x",
+            id="two-ladder-point-without-x",
+        ),
+        pytest.param(
+            lambda p: _right_ladder(p, right_x=70.0),
+            "is not right of its left ladder",
+            id="sides-crossing",
+        ),
+        pytest.param(
+            lambda p: _right_ladder(p, right_x=77.0),
+            "is not right of its left ladder",
+            id="sides-at-one-x",
+        ),
+        pytest.param(
+            _strip_beside_a_right_ladder, "is a strip edge", id="strip-edge-with-right-ladder"
+        ),
     ],
 )
 def test_calibration_point_rules(project, edit, match):
     edit(project)
     _check(project, match)
+
+
+def test_calibration_messages_name_the_membrane_the_images_and_the_point():
+    cases = [
+        (
+            lambda p: _set(_point(p), x=341.0),
+            "membrane mem-1: calibration point at x=341.0 is right of the edge of img-3",
+        ),
+        (
+            lambda p: _set(_point_at(p, 55), mw=100.0),
+            "membrane mem-1: two calibration points at 100 kDa on the left ladder of img-2, img-3",
+        ),
+        (
+            lambda p: _set(_point_at(p, 55), y=61.5),
+            "membrane mem-1: two calibration points at y=61.5 on the left ladder of img-2, img-3",
+        ),
+        (
+            lambda p: _set(_point_at(p, 100), y=100.0),
+            "membrane mem-1: calibration points out of order on the left ladder of img-2,"
+            " img-3: 100 kDa at y=100.0 lies below 55 kDa at y=95.25",
+        ),
+        (
+            lambda p: _right_ladder(p, left_x=None),
+            "membrane mem-1: img-2, img-3 have a right ladder, so every calibration point"
+            " there needs a ladder band's x (250 kDa has none)",
+        ),
+        (
+            _strip_beside_a_right_ladder,
+            "membrane mem-5: img-6 has a right ladder, so every calibration point there"
+            " needs a ladder band's x (100 kDa is a strip edge)",
+        ),
+        (
+            lambda p: _right_ladder(p, right_x=70.0),
+            "membrane mem-1: the right ladder of img-2, img-3 (x=70.0) is not right of its"
+            " left ladder (x=77.0)",
+        ),
+        (
+            lambda p: _edit(p, "img-3", width=300),
+            "image img-2 (340x150) and its marker image img-3 (300x150) differ in size;"
+            " linked images must match pixel for pixel",
+        ),
+        (
+            lambda p: _edit(p, "img-2", marker_image_id="img-4"),
+            "image img-2: marker image 'img-4' is not a visible-light marker or merged image"
+            " of membrane mem-1",
+        ),
+    ]
+    for edit, message in cases:
+        project = make_project()
+        edit(project)
+        with pytest.raises(ValidationError) as info:
+            revalidate(project)
+        assert message in str(info.value)
+
+
+def test_register_groups(project):
+    mem_1 = _get(project, "mem-1")
+    assert mem_1.register_groups() == [frozenset({"img-2", "img-3"}), frozenset({"img-4"})]
+    assert mem_1.group_of("img-2") == mem_1.group_of("img-3") == frozenset({"img-2", "img-3"})
+    assert mem_1.group_of("img-4") == frozenset({"img-4"})
+    assert _get(project, "mem-5").register_groups() == [frozenset({"img-6"})]
+    assert Membrane(id="mem-2").register_groups() == []
+    for unknown in ("img-6", "img-99"):  # on another membrane, or on none
+        with pytest.raises(UnknownIdError):
+            mem_1.group_of(unknown)
+    # A marker shared by two chemiluminescence images: one group of three.
+    shared = revalidate(_edit(project, "img-4", marker_image_id="img-3"))
+    assert _get(shared, "mem-1").register_groups() == [frozenset({"img-2", "img-3", "img-4"})]
+
+
+def test_ladder_kda_rules():
+    held = MwCalibration(ladder="pageruler_plus/tris_glycine", ladder_kda=[250, 130, 100])
+    assert held.ladder_kda == [250.0, 130.0, 100.0]
+    with pytest.raises(ValidationError, match=r"decrease strictly from top to bottom \(100, 100"):
+        MwCalibration(ladder="custom", ladder_kda=[250, 100, 100])
+    with pytest.raises(ValidationError, match="decrease strictly from top to bottom"):
+        MwCalibration(ladder="custom", ladder_kda=[100, 250])
+    # One float step apart: one log10, so not a decrease on the fitted scale.
+    with pytest.raises(ValidationError, match=r"decrease strictly from top to bottom \(100, 100"):
+        MwCalibration(ladder="custom", ladder_kda=[math.nextafter(100.0, math.inf), 100])
+    with pytest.raises(ValidationError, match="ladder MWs need a ladder name"):
+        MwCalibration(ladder_kda=[250, 130])
+    with pytest.raises(ValidationError, match="greater than 0"):
+        MwCalibration(ladder="custom", ladder_kda=[10, 0])
+    assert MwCalibration(ladder="custom").ladder_kda == []
+
+
+def test_new_calibration_fields_are_left_out_at_their_defaults():
+    point = CalibrationPoint(image_id="img-3", y=20.0, mw=250, source="visible_marker")
+    assert (point.x, point.side) == (None, LadderSide.LEFT)
+    # An explicit default (a hand-edited file) is the same point.
+    assert point == CalibrationPoint(
+        image_id="img-3", y=20.0, mw=250, source="visible_marker", x=None, side="left"
+    )
+    for mode in ("python", "json"):
+        assert set(point.model_dump(mode=mode)) == {"image_id", "y", "mw", "source"}
+        placed = point.model_copy(update={"x": 77.0, "side": LadderSide.RIGHT})
+        dumped = placed.model_dump(mode=mode)
+        assert (dumped["x"], dumped["side"]) == (77.0, "right")
+        assert point.model_copy(update={"x": 0.0}).model_dump(mode=mode)["x"] == 0.0
+        assert "ladder_kda" not in MwCalibration().model_dump(mode=mode)
+        listed = MwCalibration(ladder="custom", ladder_kda=[100, 50]).model_dump(mode=mode)
+        assert listed["ladder_kda"] == [100.0, 50.0]
+        for membrane in make_project().model_dump(mode=mode)["batch"]["membranes"]:
+            assert "ladder_kda" not in membrane["calibration"]
+            for saved in membrane["calibration"]["points"]:
+                assert "x" not in saved and "side" not in saved
 
 
 def test_fit_quality_needs_two_points(project):

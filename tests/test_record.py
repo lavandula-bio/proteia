@@ -22,7 +22,7 @@ from conftest import (
     synthetic_blot,
     write_tiff,
 )
-from proteia.core import analyze, quantify, rowdetect
+from proteia.core import analyze, ladders, mwcal, quantify, rowdetect
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod, StatisticsSetting
 from proteia.core.export import CHART_PNG_DPI, LANE_TABLE_DECIMALS, LANE_TABLE_RATIO_DECIMALS
@@ -250,6 +250,8 @@ def test_settings_are_the_code_constants():
                 " is called hollow (hollow_band)"
             ),
         },
+        # How molecular weights are calibrated (#58), with the ladder presets' version.
+        "mw": {**mwcal.settings(), "presets_version": ladders.PRESETS_VERSION},
         "statistics": {
             "alpha": 0.05,
             "dunnett_rng_seed": 0,
