@@ -342,6 +342,31 @@ button:disabled {
   width: 4.5rem;
 }
 
+/* A row per direction (its label, its field, its share of the fitted size),
+   each note under its row, Apply last. */
+.box-padding {
+  display: grid;
+  grid-template-columns: max-content 4.5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.3rem 0.35rem;
+  margin: 0.4rem 0;
+}
+
+.box-padding input {
+  width: 100%;
+}
+
+.box-padding > .box-size-label,
+.box-padding > .note {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.box-padding > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
 .subhead {
   margin: 0.5rem 0 0.2rem;
 }

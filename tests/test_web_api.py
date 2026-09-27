@@ -1313,7 +1313,10 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     body = {"protein_id": protein, "x": LANE_X[0], "y": ROW, "lane_index": 0}
     answers["POST /api/boxes"] = client.ok("POST", "/api/boxes", body)
     band = answers["POST /api/boxes"]["band_id"]
-    x0, y0, x1, y1 = bands(answers["POST /api/boxes"])[band]["rect"]
+    answers["PUT /api/proteins/{protein_id}/box-padding"] = client.ok(
+        "PUT", f"/api/proteins/{protein}/box-padding", {"along": 1}
+    )
+    x0, y0, x1, y1 = bands(answers["PUT /api/proteins/{protein_id}/box-padding"])[band]["rect"]
     answers["PUT /api/boxes/{band_id}"] = client.ok(
         "PUT", f"/api/boxes/{band}", {"rect": [x0 + 2, y0, x1 + 2, y1]}
     )
@@ -1608,6 +1611,195 @@ def test_the_box_size_route_takes_the_fitted_size_the_state_shows(client, tmp_pa
     for band in state["bands"]:
         x0, y0, x1, y1 = band["rect"]
         assert (x1 - x0, y1 - y0) == (22, 16)
+
+
+# --- Box padding (#57) ---
+
+# What a padding change answers besides the project and its results: every
+# field of PaddingChange, its padding as box_padding (the state's name).
+PADDING_FIELDS = {
+    "box_padding" if field.name == "padding" else field.name
+    for field in dataclasses.fields(api.ops.PaddingChange)
+}
+
+
+def padding_path(protein_id: str) -> str:
+    return f"/api/proteins/{protein_id}/box-padding"
+
+
+def lane_nets(answer: dict, protein_id: str) -> dict[str, float]:
+    """A protein's nets in the answer's results, by band id."""
+    lanes = column(answer, protein_id)
+    return {b: net for b, net in zip(lanes["band_ids"], lanes["nets"], strict=True) if b}
+
+
+def test_a_box_padding_change_answers_sizes_and_net_change(client, tmp_path):
+    # Every box of the protein grows by the padding on each side around its own
+    # centre; the fitted size is kept, and the nets take in more of the bands'
+    # tails. The answer says how the protein's nets moved, and the state
+    # carries every protein's padding.
+    target, loading, before = live(client, tmp_path, DOSES)
+    assert protein_of(before, target)["box_padding"] == {"across": 0, "along": 0}
+    old = {band["id"]: band["rect"] for band in protein_of(before, target)["bands"]}
+    answer = client.ok("PUT", padding_path(target), {"along": 2})
+    assert set(answer) - {"project", "results"} == PADDING_FIELDS
+    state = protein_of(answer, target)
+    assert state["box_padding"] == answer["box_padding"] == {"across": 0, "along": 2}
+    assert state["fitted_size"] == answer["fitted_size"] == {"width": 14, "height": 10}  # SIZE
+    assert state["box_size"] == answer["box_size"] == {"width": 14, "height": 10 + 2 * 2}
+    for band in state["bands"]:
+        x0, y0, x1, y1 = old[band["id"]]
+        assert band["rect"] == [x0, y0 - 2, x1, y1 + 2]
+    assert protein_of(answer, loading)["box_padding"] == {"across": 0, "along": 0}
+    new, was = lane_nets(answer, target), lane_nets(before, target)
+    changes = [new[band] / was[band] - 1 for band in was]
+    assert min(changes) > 0
+    assert answer["net_change"] == pytest.approx([min(changes), max(changes)])
+    assert (answer["edge_shifted"], answer["overlapping"]) == ([], [])
+    new, was = lane_nets(answer, loading), lane_nets(before, loading)
+    changed = [
+        {"band_id": band, "net_before": was[band], "net_after": new[band]}
+        for band in was
+        if new[band] != was[band]
+    ]
+    assert answer["remeasured"] == changed
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1
+    assert logged(client)[-1] == "set_box_padding"
+
+    for body in ({"along": 2}, {"across": 0, "along": 2}, {}):  # the same: a no-op
+        same = client.ok("PUT", padding_path(target), body)
+        assert same["project"] == client.ok("GET", "/api/project")["project"]
+        assert same["project"]["revision"] == answer["project"]["revision"]
+        assert (same["box_padding"], same["net_change"]) == ({"across": 0, "along": 2}, None)
+    assert logged(client).count("set_box_padding") == 1
+
+
+def test_a_box_padding_field_left_out_keeps_its_value(client, tmp_path):
+    # A page sends only the direction it changed: a tab that still shows the
+    # padding before another tab set the other direction does not reset it.
+    target, _, _ = live(client, tmp_path, DOSES)
+    client.ok("PUT", padding_path(target), {"across": 1, "along": 2})
+    answer = client.ok("PUT", padding_path(target), {"across": 0})
+    assert protein_of(answer, target)["box_padding"] == {"across": 0, "along": 2}
+    answer = client.ok("PUT", padding_path(target), {"along": 3})
+    assert protein_of(answer, target)["box_padding"] == {"across": 0, "along": 3}
+    assert protein_of(answer, target)["box_size"] == {"width": 14, "height": 10 + 2 * 3}
+
+
+def test_a_box_padding_reports_boxes_the_edge_shifts_and_boxes_it_overlaps(client, tmp_path):
+    # A fitted height of 60 puts the target's boxes against the image's top
+    # edge (their centre, y 30, is 30 px down), so 8 px more above and below
+    # shifts them down, onto the loading control's boxes (y 70 to 80): each
+    # box then counts part of the other's band, which is allowed and said.
+    target, loading, _ = live(client, tmp_path, DOSES)
+    client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 14, "height": 60})
+    answer = client.ok("PUT", padding_path(target), {"along": 8})
+    state = protein_of(answer, target)
+    assert all(band["rect"][1::2] == [0, 76] for band in state["bands"])
+    assert answer["edge_shifted"] == [band["id"] for band in state["bands"]]
+    assert answer["overlapping"] == [band["id"] for band in protein_of(answer, loading)["bands"]]
+
+
+def test_a_box_padding_answers_the_other_proteins_nets_it_changed(client, tmp_path):
+    # The loading control boxed just above two of the target's bands: every
+    # ring on the image leaves out the target's boxes, so padding them left
+    # and right changes those two nets, which the answer names as a row box
+    # does (#124), with the largest change.
+    target, loading, _ = live(client, tmp_path, DOSES)
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
+    for lane in (1, 2):
+        y = TARGET_ROW - 12
+        body = {"protein_id": loading, "x": LANE_X[lane], "y": y, "lane_index": lane}
+        before = client.ok("POST", "/api/boxes", body)
+    answer = client.ok("PUT", padding_path(target), {"across": 7})  # half of 14
+    old, new = lane_nets(before, loading), lane_nets(answer, loading)
+    assert len(old) == 2
+    changed = [
+        {"band_id": band_id, "net_before": old[band_id], "net_after": new[band_id]}
+        for band_id in old
+        if new[band_id] != old[band_id]
+    ]
+    assert changed and answer["remeasured"] == changed
+    shares = {
+        c["band_id"]: abs(c["net_after"] - c["net_before"]) / c["net_before"] for c in changed
+    }
+    largest = max(shares, key=shares.__getitem__)
+    assert answer["largest_change"] == {"band_id": largest, "change": shares[largest]}
+
+
+def _no_box_yet(client: Client, tmp_path: Path) -> str:
+    return ready(client, tmp_path)[1]
+
+
+def _live_target(client: Client, tmp_path: Path) -> str:
+    return live(client, tmp_path, DOSES)[0]
+
+
+def _wide_target(client: Client, tmp_path: Path) -> str:
+    """The target's boxes 60 px wide, and 60 px tall, on lanes 70 px apart."""
+    target = live(client, tmp_path, DOSES)[0]
+    client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 60, "height": 60})
+    return target
+
+
+@pytest.mark.parametrize(
+    ("setup", "body", "code", "words"),
+    [
+        (_no_box_yet, {"along": 2}, "invalid_input", "place a box of 'β-actin' first"),
+        (_live_target, {"along": 6}, "invalid_input", "at most 5 px"),  # half of 10
+        (_live_target, {"across": 8}, "invalid_input", "at most 7 px"),  # half of 14
+        (_wide_target, {"across": 6}, "size_would_overlap", "at most 5 px fits"),
+        (_wide_target, {"along": 21}, "size_out_of_bounds", "exceed"),  # 102 on 100
+    ],
+)
+def test_a_box_padding_that_does_not_fit_changes_nothing(
+    client, tmp_path, setup, body, code, words
+):
+    protein = setup(client, tmp_path)
+    before = client.ok("GET", "/api/project")
+    status, payload = client.call("PUT", padding_path(protein), body)
+    assert (status, payload["code"]) == (422, code)
+    assert words in payload["message"]
+    assert client.ok("GET", "/api/project") == before
+    boxes = [band["id"] for band in protein_of(before, protein)["bands"]]
+    assert payload["ids"] == (boxes if code == "size_would_overlap" else [])
+    assert unchanged_refusal(client, "PUT", padding_path("prot-99"), body) == ("unknown_id", [])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"along": -1},
+        {"across": -1, "along": 2},
+        {"along": 2.0},
+        {"along": "2"},  # a number as text
+        {"along": True},
+        {"along": None},  # left out is how a direction is kept
+        {"along": 2, "depth": 1},  # an unknown field
+        [0, 2],
+    ],
+)
+def test_a_malformed_box_padding_is_refused(client, tmp_path, body):
+    target, _, _ = live(client, tmp_path, DOSES)  # it has boxes: a read body would be applied
+    assert unchanged_refusal(client, "PUT", padding_path(target), body) == ("invalid_input", [])
+
+
+def test_a_box_padding_from_a_page_showing_another_opening_changes_nothing(client, tmp_path):
+    # #134: the page names the opening it shows; a padding asked for from a
+    # page still showing Other is refused before anything is done in Blot.
+    answer, shown = opened_elsewhere(client, tmp_path)
+    project = answer["project"]
+    target = next(p["id"] for p in project["proteins"] if p["role"] == "target")
+    status, payload = client.call(
+        "PUT", padding_path(target), {"along": 2}, headers={OPENING: str(shown)}
+    )
+    assert (status, payload["code"]) == (409, "project_changed")
+    now = client.ok("GET", "/api/project")
+    assert now["project"]["revision"] == project["revision"]
+    assert protein_of(now, target)["box_padding"] == {"across": 0, "along": 0}
+    named = {OPENING: str(project["open_id"])}
+    done = client.ok("PUT", padding_path(target), {"along": 2}, headers=named)
+    assert protein_of(done, target)["box_padding"] == {"across": 0, "along": 2}
 
 
 def test_a_seed_click_grows_a_box_over_the_band_and_answers_its_net(client, tmp_path):
