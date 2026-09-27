@@ -617,6 +617,21 @@ button:disabled {
   margin-top: 0.6rem;
 }
 
+.sync-notice {
+  width: min(34rem, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.sync-notice h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.sync-notice-actions {
+  justify-content: flex-end;
+}
+
 .error {
   color: var(--error);
 }

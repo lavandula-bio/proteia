@@ -2971,6 +2971,51 @@ $("quit").addEventListener("click", async () => {
   }
 });
 
+// --- The notice that the projects folder is synced (#139) ---
+
+// Once per user: when the projects folder lies in a folder a sync service
+// uploads, the notice says so, and how to change it. Closed however it is
+// (OK, Escape), it is dismissed for good: the server records that in the
+// per-user state folder, not in a project. It names the service only; the
+// Projects dialog shows where projects are saved. Gives true once it is
+// closed, or false at once when there is none to show. Shown at start before
+// the Import or Projects dialog, never with one (start): two modal dialogs
+// opened without a click close together on one Escape, which would leave a
+// page with no project and no dialog to open one.
+async function showSyncNotice() {
+  const notices = await request("GET", "/api/notices", { anyProject: true, answer: true });
+  const notice = notices.cloud_sync;
+  if (!notice) {
+    return false;
+  }
+  for (const name of document.querySelectorAll(".sync-service")) {
+    name.textContent = notice.service;
+  }
+  const dialog = $("sync-notice");
+  const closed = new Promise((resolve) => {
+    dialog.addEventListener(
+      "close",
+      () => {
+        request("POST", "/api/notices/cloud_sync/dismiss", { anyProject: true }).catch((error) => {
+          if (!saidElsewhere(error)) {
+            showStatus(
+              `Proteia could not remember that the notice about ${notice.service} was read,` +
+                ` so it shows it again at the next start: ${error.message}`,
+            );
+          }
+        });
+        resolve();
+      },
+      { once: true },
+    );
+  });
+  dialog.showModal();
+  await closed;
+  return true;
+}
+
+$("sync-notice-ok").addEventListener("click", () => $("sync-notice").close());
+
 // --- Start ---
 
 async function start() {
@@ -2980,7 +3025,12 @@ async function start() {
   }
   // The project open, if one is, then the images waiting on top of it
   // (takeListing: the first in the Import dialog); with neither, the Projects
-  // dialog.
+  // dialog. The notice that the projects folder is synced comes before either
+  // dialog, over the project open if one is, and is closed first
+  // (showSyncNotice); one that cannot be asked for now is asked for at the
+  // next start. No check takes a listing while it is up (not started), and
+  // once it is closed the page checks (checkOpening): what was listed before
+  // it may have changed meanwhile.
   try {
     const workspace = await readWorkspace();
     $("quit").hidden = false;
@@ -2989,7 +3039,12 @@ async function start() {
     if (workspace.open) {
       applyAnswer(await call("GET", "/api/project"));
     }
+    const noticed = await showSyncNotice().catch(() => false);
     started = true;
+    if (noticed) {
+      await checkOpening();
+      return;
+    }
     const found = takeListing(workspace);
     if (found) {
       showStatus(found);

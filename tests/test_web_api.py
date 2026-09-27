@@ -1413,6 +1413,8 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "GET /api/diagnostics",
         "POST /api/diagnostics",
         "POST /api/diagnostics/reveal",
+        "GET /api/notices",
+        "POST /api/notices/cloud_sync/dismiss",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -3877,6 +3879,11 @@ NEEDS_NO_OPENING = {
         "/api/handoffs/{handoff_id}/discard",
     ): "drops files handed off, as the page shows them",
     ("POST", "/api/diagnostics/reveal"): "shows the diagnostics folder, in the state folder",
+    ("GET", "/api/notices"): "says whether the projects folder is synced: no project's",
+    (
+        "POST",
+        "/api/notices/cloud_sync/dismiss",
+    ): "dismisses that notice, in the state folder",
 }
 
 
@@ -4055,6 +4062,8 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         "refused": [{"name": "a.bmp", "code": "x", "message": "y"}]
     }
     bodies[("POST", "/api/diagnostics/reveal")] = None
+    bodies[("GET", "/api/notices")] = None
+    bodies[("POST", "/api/notices/cloud_sync/dismiss")] = None
     bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
     paths = {incoming: "/api/incoming?name=a.tif", discard: f"/api/handoffs/{handoff_id}/discard"}
     assert set(bodies) == set(NEEDS_NO_OPENING)
@@ -4079,6 +4088,8 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         discard: 204,
         ("POST", "/api/handoffs"): 201,
         ("POST", "/api/diagnostics/reveal"): 204,
+        ("GET", "/api/notices"): 200,
+        ("POST", "/api/notices/cloud_sync/dismiss"): 204,
         ("POST", "/api/quit"): 202,
     }
     opened = [
