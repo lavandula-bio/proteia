@@ -1320,8 +1320,9 @@ function showRequantified(answer, before) {
         }
       : null;
   const button = showStatus(text, undo);
-  // The offer has gone: the keyboard goes on to that Undo.
-  if (button && focusLost()) {
+  // The offer has gone: the keyboard goes on to that Undo. The hidden button
+  // may still hold the focus until the browser moves it, as Clear boxes may.
+  if (button && (focusLost() || document.activeElement === $("requantify"))) {
     button.focus();
   }
 }
