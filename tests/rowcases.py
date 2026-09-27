@@ -267,6 +267,8 @@ def adversarial_row(
     img_h: int = 160,
     x_jitter: float = 2.0,
     y_jitter: float = 1.0,
+    margin_left: int = 70,
+    margin_right: int = 70,
 ) -> RowCase:
     """A row from the accuracy judge's generator (acc_adv), the same draws.
 
@@ -281,11 +283,12 @@ def adversarial_row(
     spanning them;
     ``artefacts`` add darkening maps ``f(X, Y, lane_cx, lane_cy)``; ``widths``,
     ``heights`` and ``depths`` override single bands; ``box_adjust`` moves the
-    row box's edges."""
+    row box's edges; ``margin_left`` and ``margin_right`` are the membrane
+    left of the first band and right of the last (room for what lies beside
+    the row, :func:`beside`)."""
     rng = np.random.default_rng(seed)
     steps = list(pitches) if pitches is not None else [pitch] * (n - 1)
-    margin = 70
-    lane_cx = (margin + w / 2 + np.concatenate([[0.0], np.cumsum(steps)])) + rng.uniform(
+    lane_cx = (margin_left + w / 2 + np.concatenate([[0.0], np.cumsum(steps)])) + rng.uniform(
         -x_jitter, x_jitter, n
     )
     row_cy = img_h / 2
@@ -304,7 +307,7 @@ def adversarial_row(
     dps = rng.uniform(*depth_range, n)
     for k, v in (depths or {}).items():
         dps[k] = v
-    width_img = int(math.ceil(lane_cx[-1] + ws[-1] / 2 + margin))
+    width_img = int(math.ceil(lane_cx[-1] + ws[-1] / 2 + margin_right))
     xs = np.arange(width_img, dtype=float)
     ys = np.arange(img_h, dtype=float)
     base = np.full((img_h, width_img), MEMBRANE)
@@ -401,6 +404,37 @@ def band_between(left: int, w: float, h: float, depth: float, dy: float = 0.0) -
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
         cx = 0.5 * (lcx[left] + lcx[left + 1])
         return _band(X[0], Y[:, 0], cx, lcy[left] + dy, w, h, depth, "super")
+
+    return f
+
+
+def beside(
+    lanes: float,
+    w: float,
+    h: float,
+    depth: float,
+    *,
+    marks: int = 1,
+    gap: float = 0.0,
+    dy: float = 0.0,
+) -> Artefact:
+    """What lies beside the row and is no lane of it: ``marks`` flat-topped
+    marks ``w`` x ``h`` px at 20%, ``gap`` px apart, the first centred
+    ``lanes`` lane steps past the last lane's centre (before the first lane's
+    if negative, the marks then running left), at the row's mean band height
+    (``dy`` px below it). A ladder's band or a tick mark is one narrow mark, a
+    label's text a few thin strokes, a neighbouring panel's lane a band."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        if lanes >= 0:
+            x0, step = lcx[-1] + lanes * (lcx[-1] - lcx[-2]), w + gap
+        else:
+            x0, step = lcx[0] + lanes * (lcx[1] - lcx[0]), -(w + gap)
+        cy = float(np.mean(lcy)) + dy
+        out = np.zeros((Y.shape[0], X.shape[1]))
+        for k in range(marks):
+            out += _band(X[0], Y[:, 0], x0 + k * step, cy, w, h, depth, "super")
+        return out
 
     return f
 
@@ -548,6 +582,38 @@ ADVERSARIAL: dict[str, dict] = {
     # A tilted row (lane 1 highest) whose box's top edge runs 3 px above the
     # highest band's centre: it cuts the bands of lanes 1 and 2 only.
     "tilt_cut": {"tilt": 10.0, "box_adjust": (0, 9, 0, 0)},
+    # #111: a first row box that also covers what lies beside the row, read a
+    # lane or more off. A ladder's band 1.8 lane steps past the last lane,
+    # lane 0 empty: read as the last lane, each band a lane early.
+    "ladder_beside": {
+        "missing": [0],
+        "artefacts": [beside(1.8, 26, 12, 14000)],
+        "margin_right": 200,
+        "box_adjust": (0, 0, 150, 0),
+    },
+    # The same before the first lane, the last lane empty.
+    "ladder_before": {
+        "missing": [5],
+        "artefacts": [beside(-1.8, 26, 12, 14000)],
+        "margin_left": 200,
+        "box_adjust": (-150, 0, 0, 0),
+    },
+    # A label's text, four strokes 1.3 lane steps past the last lane, lane 0 empty.
+    "label_beside": {
+        "missing": [0],
+        "artefacts": [beside(1.3, 10, 14, 20000, marks=4, gap=4)],
+        "margin_right": 200,
+        "box_adjust": (0, 0, 150, 0),
+    },
+    # Five lanes, the first two empty; an arrow 0.8 lane steps past the last
+    # and a neighbouring panel's band 2.2 past it.
+    "panel_beside": {
+        "n": 5,
+        "missing": [0, 1],
+        "artefacts": [beside(0.8, 20, 6, 15000), beside(2.2, 44, 12, 25000)],
+        "margin_right": 240,
+        "box_adjust": (0, 0, 190, 0),
+    },
 }
 
 

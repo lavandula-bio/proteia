@@ -618,6 +618,19 @@ def test_the_page_words_every_row_warning_and_empty_lane_reason():
     assert _object_keys(script, "NOT_MEASURED") == set(get_args(rowdetect.LaneReason)) - {"band"}
 
 
+def test_a_row_whose_lanes_are_doubtful_asks_to_check_them_with_an_undo():
+    # #111: the doubtful_lanes warning, as signal that fits no lane does
+    # (#106), makes the row's report ask to check the lane numbers, naming
+    # the cause; placing the row then offers an Undo of it.
+    script = _code("app.js")
+    _, report = _function(script, "function rowReport(")
+    assert 'answer.flags.includes("doubtful_lanes")' in report
+    assert "a row box that also covers a ladder, labels or" in report
+    assert "(Undo, then drag over the ${all} lanes only)" in report
+    _, place = _function(script, "async function placeRow(")
+    assert "check && step" in place and 'label: "Undo"' in place
+
+
 def test_the_page_offers_the_boxes_in_the_way_of_a_box_or_a_row():
     # A box placed or moved, or a row, refused over boxes in its way (an
     # overlap: another box of the protein, or most of another protein's box,
