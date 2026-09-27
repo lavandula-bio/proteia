@@ -27,6 +27,7 @@ from typing import get_args
 import pytest
 
 import proteia
+from proteia.core import operations as ops
 from proteia.core import results, rowdetect
 from proteia.web import api, launch, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
@@ -641,6 +642,32 @@ def test_the_page_offers_the_boxes_in_the_way_of_a_box_or_a_row():
     assert "found.protein" in named and "lanesPhrase(" in named
 
 
+def _logged_actions() -> set[str]:
+    """Every action the operations log, found in their source: each ``_apply``
+    of an operation, each entry committed with its own ``action`` (an import,
+    a new project) and undo and redo. Not ``migrate``: storage logs it when it
+    upgrades a file, and it cannot be undone."""
+    core = Path(ops.__file__).parent
+    operations = (core / "operations.py").read_text(encoding="utf-8")
+    session = (core / "session.py").read_text(encoding="utf-8")
+    applied = re.findall(r'\b_apply\(\s*session,\s*"(\w+)"', operations)
+    # Each call is found, however it is laid out.
+    assert len(applied) == len(re.findall(r"(?<!def )\b_apply\(", operations))
+    moves = re.findall(r'\._move\("(\w+)"\)', operations)
+    own = re.findall(r'\baction="(\w+)"', operations + session)
+    return {*applied, *moves, *own}
+
+
+def test_the_page_words_every_logged_action():
+    # Undo and Redo name the change they take back or make again, and so does
+    # the status line after a step, in the words of the control that made it
+    # (ACTION_WORDS); a change without them would be named by its log id.
+    actions = _logged_actions()
+    assert {"set_box_padding", "import_image", "new_project", "undo", "redo"} <= actions
+    script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert _object_keys(script, "ACTION_WORDS") == actions
+
+
 def _set_members(script: str, name: str) -> set[str]:
     """The strings of the set literal ``const <name> = new Set([...]);`` in a script."""
     body = script[script.index(f"const {name} = new Set([") :].split("]);", 1)[0]
@@ -818,3 +845,77 @@ def test_the_box_size_fields_show_and_send_the_fitted_size():
         assert f'this.fill("{field}", protein.fitted_size.{dimension},' in editor
     assert "box_size" not in panel
     assert "const { width, height } = protein.box_size;" in _code("app.js")
+
+
+# --- The padding fields (#57) ---
+
+
+def _form(html: str, form_id: str) -> str:
+    """The markup of the form ``form_id`` in the page shell."""
+    start = html.index(f'<form id="{form_id}"')
+    return html[start : html.index("</form>", start)]
+
+
+def test_the_padding_form_offers_above_and_below_first_in_whole_pixels():
+    # The size fields read as the fitted size, which the boxes extend beyond by
+    # the padding. The padding is set in whole pixels per side, above and below
+    # first (where padding helps fold changes), then left and right, in one
+    # form with its own Apply after the size's: Tab runs W, H, Apply, above
+    # and below, left and right, Apply.
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    parser = _Tags()
+    parser.feed(html)
+    assert "Fitted size" in _form(html, "box-size")
+    form = _form(html, "box-padding")
+    assert html.index('<form id="box-size"') < html.index('<form id="box-padding"')
+    assert -1 < form.index('id="pad-along"') < form.index('id="pad-across"') < form.index("submit")
+    for field in ("pad-along", "pad-across"):
+        tags = parser.by_id[field]
+        assert (tags["type"], tags["min"], tags["step"]) == ("number", "0", "1"), field
+        assert "required" in tags and f"{field}-share" in tags["aria-describedby"]
+        assert "tabindex" not in tags
+    assert "novalidate" not in form
+    # The hint says to pad a target and its loading control alike, and the
+    # partner line shows the other one's padding.
+    assert "loading control alike" in html
+    assert "pad-partners" in parser.by_id
+
+
+def test_the_padding_fields_send_only_what_changed_and_wait_for_a_box():
+    panel = _code("proteins.js")
+    # Only the directions whose value differs from the stored padding are sent
+    # (a padding set in another tab in the other direction stays). Through the
+    # panel's queue, so the request names the opening shown and is dropped once
+    # another project is shown (#134). The values are read when Apply is
+    # pressed, but compared once the edits before it have their answers, with
+    # the protein as the last answer stored it (editChosen's `request`): a
+    # second Apply pressed before the first is answered is compared with what
+    # the first set, not with the padding shown when it was pressed, so it is
+    # neither dropped as "the same" nor sent without the directions it changed
+    # back. With none different, the body is empty: the server's no-op answer.
+    apply = _method(panel, "async applyPadding(")
+    queued = apply.index("this.editChosen(")
+    assert "shown.box_padding" not in apply
+    assert queued < apply.index("(protein) => {") < apply.index("!== protein.box_padding[key]")
+    assert queued < apply.index("before = this.project;")
+    assert "Object.keys(body).length" not in apply
+    assert apply.index("$(field).value") < queued
+    assert "/box-padding`" in apply
+    # Filled from the stored padding, as the size fields are; at most half the
+    # fitted size or the stored value; disabled until the protein has a box.
+    render = _method(panel, "renderPadding(")
+    assert "this.fill(field, protein.box_padding[key], force(field))" in render
+    assert "Math.max(Math.floor(protein.fitted_size[dimension] / 2), stored)" in render
+    assert "const none = !protein.bands.length;" in render
+    assert "renderPadding(" in _method(panel, "renderEditor(")
+
+
+def test_a_box_at_the_image_edge_shows_no_fitted_outline():
+    # A padding may shift a box at the image's edge inward, off its fit's
+    # centre: an outline inset from the drawn box would lie off the fit, so
+    # such a box shows none.
+    script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    block = script[script.index("const { across, along } = protein.box_padding;") :]
+    block = block[: block.index("color,")]
+    assert "x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height" in block
+    assert "inset && !atEdge ?" in block

@@ -11,6 +11,7 @@ import {
   focusLost,
   inWords,
   isolate,
+  lanesPhrase,
   netText,
   rebuild,
   sentence,
@@ -419,6 +420,7 @@ const proteinPanel = new ProteinPanel({
   undo: (seq) => takeStep("undo", { seq }),
   pending,
   laneName: (index) => laneName(state.project, index),
+  remeasured: (answer) => remeasuredText(answer),
 });
 
 // Its edits run in the panel's queue: in order with the protein edits, the
@@ -807,7 +809,7 @@ function render() {
       : "Saving…";
   const image = project.images.find((i) => i.id === state.imageId) || null;
   renderImages(project, image);
-  proteinPanel.render(project, image, state.proteinId);
+  proteinPanel.render(project, image, state.proteinId, state.results);
   renderBox(project);
   renderNotices(project);
   renderHint(project, image);
@@ -1114,10 +1116,18 @@ function renderView(project) {
   const marks = [];
   for (const protein of project.proteins.filter((p) => p.image_id === image.id)) {
     const color = colorOf(project, protein.id);
+    // The chosen protein's padded boxes show their fitted size inside. Not a
+    // box at the image's edge: the padding may have shifted it inward, off
+    // the fit's centre, and the outline would be drawn off the fit.
+    const { across, along } = protein.box_padding;
+    const inset = protein.id === state.proteinId && (across > 0 || along > 0);
     for (const band of protein.bands) {
+      const [x0, y0, x1, y1] = band.rect;
+      const atEdge = x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height;
       boxes.push({
         id: band.id,
         rect: band.rect,
+        fitted: inset && !atEdge ? [x0 + across, y0 + along, x1 - across, y1 - along] : null,
         color,
         clipped: band.clipped === true,
         label: `${band.lane_index + 1}${band.clipped === true ? " over-exposed" : ""}`,
@@ -1284,12 +1294,6 @@ $("lane-picker-cancel").addEventListener("click", () => {
 });
 
 // --- A row of boxes from a row box ---
-
-// Stored lane indices in words, numbered from 1: "lane 8", "lanes 4 and 8".
-function lanesPhrase(indices) {
-  const numbers = indices.map((index) => String(index + 1));
-  return `${numbers.length === 1 ? "lane" : "lanes"} ${inWords(numbers)}`;
-}
 
 // Why a row left a lane with neither a box nor an n.d. mark, by the
 // detector's reason for the empty lane (LaneReason in core/rowdetect.py). A
@@ -2046,6 +2050,7 @@ const ACTION_WORDS = {
   remove_box: "delete box",
   set_box_lane: "change box lane",
   set_box_size: "change box size",
+  set_box_padding: "change box padding",
   clear_boxes: "clear boxes",
   detect_row_boxes: "detect row boxes",
   remove_undetected: "remove n.d. mark",
