@@ -3,10 +3,12 @@
 // overlays. Everything it reports is in image pixels (x right, y down, a box's
 // end exclusive), so a box drawn at any zoom lands on the same pixels the server
 // quantifies. It edits nothing itself: it asks the app through its handlers.
+import { counted } from "/static/dom.js";
 
 const MIN_SCALE_FACTOR = 0.5; // of the fitted scale
 const MAX_SCALE = 40; // screen pixels per image pixel
 const CLICK_SLOP = 4; // screen pixels a click may wander before it is a drag
+const MIDDLE_BUTTON = 1;
 
 export const CLIPPED_COLOR = "#e0187a";
 export const MISSING_COLOR = "#8a8a8a";
@@ -16,12 +18,57 @@ function inside(rect, x, y) {
   return x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3];
 }
 
+// Input types where Space is not typed.
+const PRESSED = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "image",
+  "radio",
+  "reset",
+  "submit",
+]);
+
+// Whether Space types or chooses in `element`: a text field, a select, editable text.
+function typesSpace(element) {
+  return (
+    (element instanceof HTMLInputElement && !PRESSED.has(element.type)) ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement ||
+    (element instanceof HTMLElement && element.isContentEditable)
+  );
+}
+
+// Whether `element` is a text field with a caret (whose typing can be taken back).
+function hasCaret(element) {
+  return (
+    (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) &&
+    element.selectionStart !== null
+  );
+}
+
+// The row box dragged between two image points, as the server takes it: the
+// corners rounded to whole pixels, x0 < x1 and y0 < y1 (end exclusive).
+function rowRect(a, b) {
+  const x0 = Math.round(Math.min(a.x, b.x));
+  const y0 = Math.round(Math.min(a.y, b.y));
+  const x1 = Math.max(x0 + 1, Math.round(Math.max(a.x, b.x)));
+  const y1 = Math.max(y0 + 1, Math.round(Math.max(a.y, b.y)));
+  return [x0, y0, x1, y1];
+}
+
 export class ImageView {
   // handlers: place(x, y, {grow, clientX, clientY, proteinId, laneIndex}),
+  // row(rect, proteinId) (a Promise, settled once the row has its answer),
   // move(boxId, rect), select(boxId or null). A click on the membrane grows a
   // box from the band under it and Shift+click drops a box of the protein's
   // size; inside a lane's placeholder or n.d. mark, the click names its protein
-  // and lane (otherwise both are null).
+  // and lane (otherwise both are null). A drag from the membrane draws a row
+  // box while the app offers one (setRowTool), and pans otherwise; a drag with
+  // Space held (whatever has the focus) or with the middle button always pans,
+  // and so does a second finger on a touch screen. Esc cancels a drag, and so
+  // does another image being shown.
   constructor(canvas, handlers) {
     this.canvas = canvas;
     this.context = canvas.getContext("2d");
@@ -37,6 +84,11 @@ export class ImageView {
     this.marks = []; // {rect, color, label, proteinId, laneIndex}: not-detected records
     this.selectedId = null;
     this.gesture = null;
+    this.rowTool = null; // {proteinId, color, lanes}: what a drag on the membrane boxes, or null
+    this.sentRow = null; // {rect, color}: the row box sent, shown until its answer
+    this.spaceHeld = false; // Space is down: a drag pans
+    this.spaceTaken = false; // ...and its default (a scroll, a button press) was prevented
+    this.spaceTyped = null; // {field, value, start, end}: the text field it types into, before
     this.bindEvents();
     new ResizeObserver(() => this.resize()).observe(canvas);
   }
@@ -49,6 +101,10 @@ export class ImageView {
     this.width = width;
     this.height = height;
     if (changed) {
+      // A drag, and a row box sent, belong to the image they were made on
+      // (another project's image may share its ids).
+      this.cancelGesture();
+      this.sentRow = null;
       this.fit();
     }
     this.draw();
@@ -60,6 +116,12 @@ export class ImageView {
     this.marks = marks;
     this.selectedId = selectedId;
     this.draw();
+  }
+
+  // A drag from the membrane boxes a row of this protein ({proteinId, color,
+  // lanes}), or pans (null). A drag under way keeps what it started with.
+  setRowTool(tool) {
+    this.rowTool = tool;
   }
 
   // --- View transform ---
@@ -147,6 +209,13 @@ export class ImageView {
         label: box.label,
         clipped: box.clipped,
       });
+    }
+    const g = this.gesture;
+    if (g && g.kind === "row") {
+      const label = `Row box → ${counted(g.row.lanes, "lane", "lanes")}`;
+      this.drawRect(rowRect(g.start, g.end), g.row.color, { dashed: true, label });
+    } else if (this.sentRow) {
+      this.drawRect(this.sentRow.rect, this.sentRow.color, { dashed: true });
     }
   }
 
@@ -237,19 +306,43 @@ export class ImageView {
       );
     }, { passive: false });
 
+    // The middle button pans here: no auto-scroll.
+    canvas.addEventListener("mousedown", (event) => {
+      if (event.button === MIDDLE_BUTTON) {
+        event.preventDefault();
+      }
+    });
+
     canvas.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || !this.bitmap) {
+      const g = this.gesture;
+      if (g && event.pointerId !== g.pointerId) {
+        this.secondPointer(g);
+        return;
+      }
+      const middle = event.button === MIDDLE_BUTTON;
+      if ((event.button !== 0 && !middle) || !this.bitmap) {
         return;
       }
       canvas.setPointerCapture(event.pointerId);
       const point = this.toImage(event);
-      const box = this.boxAt(point);
+      const pan = middle || this.spaceHeld;
+      if (pan && !middle) {
+        this.untype();
+      }
+      const box = pan ? null : this.boxAt(point);
+      const onImage = point.x >= 0 && point.y >= 0 && point.x < this.width && point.y < this.height;
       this.gesture = {
-        kind: "press",
+        kind: pan ? "pan" : "press",
+        pointerId: event.pointerId,
         boxId: box ? box.id : null,
+        // What a drag from here boxes: a row, from the membrane only.
+        row: !pan && !box && onImage ? this.rowTool : null,
         startX: event.clientX,
         startY: event.clientY,
+        lastX: event.clientX, // where the pointer is now
+        lastY: event.clientY,
         start: point,
+        end: point,
         offsetX: this.offsetX,
         offsetY: this.offsetY,
         dx: 0,
@@ -258,17 +351,21 @@ export class ImageView {
       if (box && box.id !== this.selectedId) {
         this.handlers.select(box.id);
       }
+      this.showCursor();
     });
 
     canvas.addEventListener("pointermove", (event) => {
       const g = this.gesture;
-      if (!g) {
-        return;
+      if (!g || event.pointerId !== g.pointerId) {
+        return; // another finger: the gesture follows the first one
       }
+      g.lastX = event.clientX;
+      g.lastY = event.clientY;
       const sx = event.clientX - g.startX;
       const sy = event.clientY - g.startY;
       if (g.kind === "press" && Math.hypot(sx, sy) > CLICK_SLOP) {
-        g.kind = g.boxId ? "move" : "pan";
+        g.kind = g.boxId ? "move" : g.row ? "row" : "pan";
+        this.showCursor();
       }
       if (g.kind === "pan") {
         this.offsetX = g.offsetX - sx / this.scale;
@@ -278,12 +375,19 @@ export class ImageView {
         g.dx = Math.round(sx / this.scale);
         g.dy = Math.round(sy / this.scale);
         this.draw();
+      } else if (g.kind === "row") {
+        g.end = this.toImage(event);
+        this.draw();
       }
     });
 
     const finish = (event, cancelled) => {
       const g = this.gesture;
+      if (g && event.pointerId !== g.pointerId) {
+        return; // a second finger lifted: the first one still drags
+      }
       this.gesture = null;
+      this.showCursor();
       if (!g || cancelled) {
         this.draw();
         return;
@@ -294,6 +398,8 @@ export class ImageView {
           const r = box.rect;
           this.handlers.move(box.id, [r[0] + g.dx, r[1] + g.dy, r[2] + g.dx, r[3] + g.dy]);
         }
+      } else if (g.kind === "row") {
+        this.sendRow(rowRect(g.start, g.end), g.row);
       } else if (g.kind === "press" && !g.boxId) {
         const x = Math.floor(g.start.x);
         const y = Math.floor(g.start.y);
@@ -316,5 +422,152 @@ export class ImageView {
     };
     canvas.addEventListener("pointerup", (event) => finish(event, false));
     canvas.addEventListener("pointercancel", (event) => finish(event, true));
+    // The capture lost otherwise (not by a pointerup or cancel): the drag ends,
+    // so no press is left waiting for a release that never comes.
+    canvas.addEventListener("lostpointercapture", (event) => {
+      if (this.gesture && this.gesture.pointerId === event.pointerId) {
+        this.cancelGesture();
+      }
+    });
+
+    // Space held makes a drag pan, whatever has the focus. With the pointer
+    // over the image it is also taken (it neither scrolls nor presses a focused
+    // button, which it would on its release after the drag), but never from a
+    // field it types into, a select or a dialog: typed into a text field, the
+    // press on the image takes the spaces back (untype).
+    const isSpace = (event) => event.code === "Space" || event.key === " ";
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && this.gesture) {
+        this.cancelGesture();
+        return;
+      }
+      if (!isSpace(event) || event.ctrlKey || event.metaKey || event.altKey || event.isComposing) {
+        return;
+      }
+      const target = event.target;
+      const overImage = !document.querySelector("dialog[open]") && canvas.matches(":hover");
+      if (target instanceof HTMLSelectElement) {
+        // Space opens a select's list, and the page may never see its release:
+        // over the image it pans instead (the list stays shut); elsewhere it
+        // opens the list and is not held.
+        if (overImage) {
+          event.preventDefault();
+          this.spaceTaken = true;
+          this.holdSpace(true);
+        }
+        return;
+      }
+      if (!this.spaceHeld && hasCaret(target)) {
+        const { value, selectionStart: start, selectionEnd: end } = target;
+        this.spaceTyped = { field: target, value, start, end };
+      }
+      this.holdSpace(true);
+      if (
+        !typesSpace(target) &&
+        !document.querySelector("dialog[open]") &&
+        canvas.matches(":hover")
+      ) {
+        event.preventDefault();
+        this.spaceTaken = true;
+      }
+    });
+    document.addEventListener("keyup", (event) => {
+      if (isSpace(event)) {
+        if (this.spaceTaken) {
+          event.preventDefault();
+        }
+        this.holdSpace(false);
+      }
+    });
+    window.addEventListener("blur", () => this.holdSpace(false));
+  }
+
+  holdSpace(held) {
+    if (!held) {
+      this.spaceTaken = false;
+      this.spaceTyped = null;
+    }
+    if (this.spaceHeld !== held) {
+      this.spaceHeld = held;
+      this.showCursor();
+    }
+  }
+
+  // The press that makes Space+drag a pan leaves the text field Space was
+  // typed into: the spaces it typed there go, and the field is as it was.
+  untype() {
+    const typed = this.spaceTyped;
+    this.spaceTyped = null;
+    if (!typed || document.activeElement !== typed.field) {
+      return;
+    }
+    const { field, value, start, end } = typed;
+    const head = value.slice(0, start);
+    const tail = value.slice(end);
+    const now = field.value;
+    const spaces = now.slice(head.length, now.length - tail.length);
+    if (
+      now.length > head.length + tail.length &&
+      now.startsWith(head) &&
+      now.endsWith(tail) &&
+      /^ +$/.test(spaces)
+    ) {
+      field.value = value;
+      field.setSelectionRange(start, end);
+    }
+  }
+
+  // A second finger while one drags: from here the drag pans with the first
+  // finger (a pinch); it moves no box and draws no row.
+  secondPointer(g) {
+    if (g.kind !== "pan") {
+      Object.assign(g, {
+        kind: "pan",
+        boxId: null,
+        row: null,
+        startX: g.lastX,
+        startY: g.lastY,
+        offsetX: this.offsetX,
+        offsetY: this.offsetY,
+        dx: 0,
+        dy: 0,
+      });
+      this.showCursor();
+      this.draw();
+    }
+  }
+
+  // An open hand while a drag would pan (Space held), a closed one while it does.
+  showCursor() {
+    const g = this.gesture;
+    this.canvas.classList.toggle("grabbing", Boolean(g && g.kind === "pan"));
+    this.canvas.classList.toggle("grab", this.spaceHeld && !g);
+  }
+
+  // The drag under way, if any, does nothing more (a box being moved goes back).
+  cancelGesture() {
+    const g = this.gesture;
+    if (!g) {
+      return;
+    }
+    this.gesture = null;
+    if (this.canvas.hasPointerCapture(g.pointerId)) {
+      this.canvas.releasePointerCapture(g.pointerId);
+    }
+    this.showCursor();
+    this.draw();
+  }
+
+  // Send a row box; it stays drawn, without its label, until it has its answer.
+  sendRow(rect, tool) {
+    const sent = { rect, color: tool.color };
+    this.sentRow = sent;
+    const done = () => {
+      if (this.sentRow === sent) {
+        this.sentRow = null;
+        this.draw();
+      }
+    };
+    Promise.resolve(this.handlers.row(rect, tool.proteinId)).then(done, done);
   }
 }

@@ -215,6 +215,25 @@ def lane_anchors(
     whose ids are in ``without`` (boxes a change is about to replace) and, when
     ``only`` is given, those whose ids are not in it.
     """
+    return [(centre, lane) for _, centre, lane in _anchored(batch, image, without, only)]
+
+
+def lane_anchor_ids(
+    batch: Batch,
+    image: ImageRef,
+    *,
+    without: Collection[str] = (),
+    only: Collection[str] | None = None,
+) -> list[str]:
+    """The ids of the bands :func:`lane_anchors` takes with the same arguments,
+    in its order."""
+    return [band_id for band_id, _, _ in _anchored(batch, image, without, only)]
+
+
+def _anchored(
+    batch: Batch, image: ImageRef, without: Collection[str], only: Collection[str] | None
+) -> list[tuple[str, float, int]]:
+    """``(band id, centre x, stored lane)`` of each anchor (:func:`lane_anchors`)."""
     anchors = []
     for protein in batch.proteins:
         if protein.image_id == image.id:
@@ -227,7 +246,7 @@ def lane_anchors(
                     and band.id not in without
                     and (only is None or band.id in only)
                 ):
-                    anchors.append(((x0 + x1) / 2, band.lane_index))
+                    anchors.append((band.id, (x0 + x1) / 2, band.lane_index))
     return anchors
 
 

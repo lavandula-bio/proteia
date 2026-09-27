@@ -141,9 +141,10 @@ button:disabled {
 }
 
 /* Empty, it keeps its place while a project is shown (app.js placeStatus), as
-   tall as a line with an Undo in it: a message coming or going moves nothing. */
+   tall as two lines, one with an Undo in it (a row's report, a refusal): a
+   message coming or going moves nothing. */
 .status {
-  min-height: 2.4rem;
+  min-height: 3.7rem;
   margin: 0;
   padding: 0.4rem 1rem;
   background: color-mix(in srgb, #e0a800 25%, Canvas);
@@ -420,6 +421,16 @@ button:disabled {
   height: 100%;
   cursor: crosshair;
   touch-action: none;
+}
+
+/* An open hand while Space is held (a drag would pan), a closed one while a drag
+   pans (with Space, the middle button, two fingers, or over nothing to box). */
+.view.grab {
+  cursor: grab;
+}
+
+.view.grabbing {
+  cursor: grabbing;
 }
 
 .view-hint {
