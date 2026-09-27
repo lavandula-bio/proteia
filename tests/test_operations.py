@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -87,7 +88,16 @@ from proteia.core.rowdetect import DETECT_K, RowDetection
 from proteia.core.session import save_to_folder
 from proteia.core.storage import canonical_json, content_hash, load_project
 from proteia.web.state import project_state
-from rowcases import RowCase, adversarial, adversarial_row, bench_cases, synthetic_row
+from rowcases import (
+    RowCase,
+    adversarial,
+    adversarial_row,
+    band_between,
+    bench_cases,
+    hstripe,
+    synthetic_row,
+    vstreak,
+)
 from test_background_truth import LANES as TRUTH_LANES
 from test_background_truth import _blot as truth_blot
 from test_background_truth import _fold_changes as truth_fold_changes
@@ -3829,8 +3839,9 @@ def test_lanes_without_a_band_get_a_not_detected_record(tmp_path):
 # Adversarial rows whose one empty lane the detector cannot read.
 UNREADABLE_LANES = [
     ("blotch_empty", 4, "artefact"),  # a stain over the empty lane
-    ("vstreak_empty", 4, "unassigned"),  # a streak kept, but in no piece
+    ("wide_next_empty", 3, "unassigned"),  # lane 2's band spills over it, in no piece
     ("nbr_above_miss", 2, "edge_signal"),  # only the neighbouring row reaches the limit
+    ("vstreak_empty", 4, "edge_signal"),  # a streak peaking on an edge row of the box
 ]
 
 
@@ -3864,12 +3875,14 @@ def test_other_empty_lanes_are_left_not_measured(tmp_path, key, lane, reason):
 # something the detector cannot read.
 EMPTY_LANES = [
     pytest.param("missing_middle", 2, "no_band", id="no_band"),
-    *(pytest.param(*lane, id=lane[2]) for lane in UNREADABLE_LANES),
+    *(pytest.param(*lane, id=f"{lane[2]}-{lane[0]}") for lane in UNREADABLE_LANES),
 ]
+# Lane 2's box in wide_next_empty would overlap a box kept in its empty lane 3.
+KEPT_EMPTY_LANES = [lane for lane in EMPTY_LANES if lane.values[0] != "wide_next_empty"]
 
 
 @pytest.mark.parametrize("source", [ProposalSource.CLICK, ProposalSource.MANUAL])
-@pytest.mark.parametrize(("key", "lane", "reason"), EMPTY_LANES)
+@pytest.mark.parametrize(("key", "lane", "reason"), KEPT_EMPTY_LANES)
 def test_a_box_the_user_placed_where_no_band_is_found_is_kept(tmp_path, key, lane, reason, source):
     # The user placed the box where the detector finds nothing (a band too
     # faint for it, a lane it cannot read): it is kept as a box edited by hand
@@ -5215,3 +5228,289 @@ def test_a_band_is_off_its_lane_on_lanes_numbered_right_to_left():
     assert expected == {-1: 400.0, 0: 330.0, 1: 270.0, 2: 190.0, 3: 120.0, 4: 50.0}
     assert ops._off_lanes({0: 301.0, 1: 231.0, 2: 225.0, 3: 154.0}, expected) == []
     assert ops._off_lanes({0: 299.0, 1: 301.0, 2: 231.0, 3: 156.0}, expected) == [0, 1, 2, 3]
+
+
+# Kept lanes 0, 2, 4 and 7, at 60 px per lane.
+NAMING = [(30.0, 0), (150.0, 2), (270.0, 4), (450.0, 7)]
+
+
+@pytest.mark.parametrize(
+    ("off", "named"),
+    [
+        ([4], {2, 4, 7}),  # its own box, and those of lanes 3 and 5 beside it
+        ([2], {0, 2, 4}),
+        ([3], {2, 4}),  # between 2 and 4, as are its neighbours
+        ([8], {7}),  # past the last kept lane
+        ([1, 5], {0, 2, 4, 7}),
+        ([], set()),
+    ],
+)
+def test_an_off_lane_names_the_boxes_its_yardstick_comes_from(off, named):
+    # _off_lanes measures a lane against its own expected x and a
+    # neighbour's: a wrong box behind either can make it off.
+    assert ops._named_lanes(NAMING, off) == named
+
+
+# --- #117: a refused row says why, by what the detector saw ---
+
+CENTRE_ROW = round(float(np.mean(SCENE.lane_cy)))  # the row through SCENE's band centres
+CUT_UNCLEAR_ROW = (AMBIGUOUS_ROW[0], CENTRE_ROW - 2, *AMBIGUOUS_ROW[2:])
+EDGE_ROW = (SCENE.row[0], CENTRE_ROW, *SCENE.row[2:])  # top edge through the band centres
+BLANK_ROW = (SCENE.row[0], 5, SCENE.row[2], 40)  # membrane above the bands
+
+UNCLEAR = (
+    "the row box does not show which lane each band is in; draw it over every"
+    " declared lane, empty end lanes included, or place the boxes by clicking"
+)
+CUT_UNCLEAR = (
+    "the row box cuts through the bands, so it does not show which lane each band is in;"
+    " draw it over the whole band height and every declared lane, empty end lanes included"
+)
+UNFIT = (
+    "bands were found in the row box but do not fit the lanes; draw it over every"
+    " declared lane, empty end lanes included, or place the boxes by clicking"
+)
+AT_THE_EDGE = (
+    "the only signal in the row box lies at its top or bottom edge: the box cuts through"
+    " the bands or reaches into a neighbouring row; include the whole band height"
+)
+FILLS_THE_BOX = (
+    "the only signal in the row box runs through its whole height: a streak or stain,"
+    " or bands the box cuts through; include the whole band height"
+)
+TOO_LITTLE_MEMBRANE = (
+    "the row box holds too little membrane to measure the bands against; include some"
+    " membrane above and below the bands"
+)
+NO_BAND = "no band found in the row box"
+
+# Six touching, saturated bands filling a snug box: the detector takes their
+# level for the membrane and finds nothing.
+THICK = adversarial_row(
+    "thick", 1000, h=30.0, pitch=48.0, w=60.0, depth_range=(75000.0, 80000.0), my=0
+)
+# A box just inside the 20% extents of six saturated bands: no membrane above
+# or below them, and the detector's noise estimate takes them in.
+SNUG = adversarial_row("snug", 1000, w=56.0, h=12.0, depth_range=(75000.0, 80000.0), my=-1)
+STREAK = adversarial_row(
+    "streak", 1000, missing=range(6), artefacts=[vstreak(2, 14, 3000)]
+)  # nothing but a streak down lane 2
+# No band, on a darker stretch of membrane: 3000 (7.5 noise sigmas) to the band
+# side of the stored background, the image's median.
+DARK_STRIPE = adversarial_row(
+    "dark stripe", 1000, missing=range(6), artefacts=[hstripe(30.0, 3000.0)]
+)
+# A stray band under the middle of the row, and a box whose top edge runs
+# through the bands' centres: the stray band is the only one kept, midway
+# between two lanes (an ambiguous reading), and every lane's band peaks on
+# the box's top row, so none of them reaches the edge as a kept extent.
+STRAY = adversarial_row("stray", 1001, artefacts=[band_between(2, 10.0, 6.0, 20000.0, dy=12.0)])
+STRAY_ROW = (STRAY.row[0], round(float(np.mean(STRAY.lane_cy))), STRAY.row[2], STRAY.row[3] + 4)
+
+
+def row_refused(s: ProjectSession, protein_id: str, row) -> OperationError:
+    """The row's refusal, which changes nothing and carries the detector's raw
+    reason as JSON-plain detail."""
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein_id, row)
+    assert s.project is before
+    detail = info.value.detail
+    assert detail is not None
+    assert json.loads(json.dumps(detail, allow_nan=False)) == detail
+    return info.value
+
+
+def assert_raw_reason(detail: dict, found: RowDetection) -> None:
+    """The refusal's detail holds what the detector saw, lane by lane."""
+    assert detail["flags"] == list(found.flags)
+    assert detail["notes"] == list(found.notes)
+    assert detail["margin"] == (
+        None if found.margin is None or not math.isfinite(found.margin) else found.margin
+    )
+    assert detail["membrane_shift"] == found.membrane_shift
+    assert detail["lanes"] == [
+        {"lane_index": lane.lane, "reason": lane.reason, "snr": lane.snr, "cut": lane.cut}
+        for lane in found.lanes
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "row", "code", "message", "cause"),
+    [
+        pytest.param(
+            SCENE,
+            UNCLEAR_ROW,
+            ErrorCode.ROW_LANES_UNCLEAR,
+            UNCLEAR,
+            "lanes_outside_row",
+            id="lanes-outside-row",
+        ),
+        pytest.param(
+            SCENE,
+            AMBIGUOUS_ROW,
+            ErrorCode.ROW_LANES_UNCLEAR,
+            UNCLEAR,
+            "ambiguous_lanes",
+            id="ambiguous",
+        ),
+        # A box a lane short whose top edge also runs through the bands: the
+        # cut comes first, whatever else is unclear.
+        pytest.param(
+            SCENE,
+            CUT_UNCLEAR_ROW,
+            ErrorCode.ROW_LANES_UNCLEAR,
+            CUT_UNCLEAR,
+            "cut_by_row_box",
+            id="cut-and-unclear",
+        ),
+        # The bands the box cuts through peak on its edge row and are not kept;
+        # a lone stray band leaves the reading unclear. Still the cut first.
+        pytest.param(
+            STRAY,
+            STRAY_ROW,
+            ErrorCode.ROW_LANES_UNCLEAR,
+            CUT_UNCLEAR,
+            "cut_by_row_box",
+            id="cut-bands-not-kept",
+        ),
+        # Every band peaks on the box's top row: none is kept, and not "no band".
+        pytest.param(
+            SCENE, EDGE_ROW, ErrorCode.NO_BAND_FOUND, AT_THE_EDGE, "edge_signal", id="at-the-edge"
+        ),
+        pytest.param(
+            STREAK, None, ErrorCode.NO_BAND_FOUND, FILLS_THE_BOX, "artefact", id="streak-only"
+        ),
+        pytest.param(
+            THICK,
+            None,
+            ErrorCode.NO_BAND_FOUND,
+            TOO_LITTLE_MEMBRANE,
+            "too_little_membrane",
+            id="filled-by-bands",
+        ),
+        pytest.param(
+            SNUG,
+            None,
+            ErrorCode.NO_BAND_FOUND,
+            TOO_LITTLE_MEMBRANE,
+            "too_little_membrane",
+            id="snug",
+        ),
+        # Membrane darker than the stored background is still membrane.
+        pytest.param(
+            DARK_STRIPE, None, ErrorCode.NO_BAND_FOUND, NO_BAND, "no_band", id="darker-membrane"
+        ),
+        pytest.param(SCENE, BLANK_ROW, ErrorCode.NO_BAND_FOUND, NO_BAND, "no_band", id="blank"),
+    ],
+)
+def test_a_refused_row_is_worded_by_its_cause(tmp_path, case, row, code, message, cause):
+    row = case.row if row is None else row
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, row)
+    error = row_refused(s, protein, row)
+    assert (error.code, str(error), error.ids) == (code, message, ())
+    assert error.detail["cause"] == cause
+    assert_raw_reason(error.detail, found)
+
+
+@pytest.mark.parametrize(("case", "row"), [(SCENE, CUT_UNCLEAR_ROW), (STRAY, STRAY_ROW)])
+def test_a_cut_row_that_is_refused_names_the_cut_lanes_in_its_detail(tmp_path, case, row):
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, row)
+    assert found.refused and any(lane.cut for lane in found.lanes)
+    error = row_refused(s, protein, row)
+    assert "cut_by_row_box" in error.detail["flags"]
+    assert [lane["cut"] for lane in error.detail["lanes"]] == [lane.cut for lane in found.lanes]
+
+
+def test_bands_that_fit_no_lane_are_not_no_band(tmp_path, monkeypatch):
+    # Kept bands the lane reading could not place (every lane "unassigned",
+    # nothing sized): the words say they were found.
+    s, _, protein = row_session(tmp_path, SCENE)
+    blank = detected(s, protein, BLANK_ROW)
+    unfit = dataclasses.replace(
+        blank,
+        lanes=tuple(
+            dataclasses.replace(lane, reason="unassigned", snr=40.0 + lane.lane)
+            for lane in blank.lanes
+        ),
+    )
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: unfit)
+    error = row_refused(s, protein, BLANK_ROW)
+    assert (error.code, str(error)) == (ErrorCode.NO_BAND_FOUND, UNFIT)
+    assert error.detail["cause"] == "unassigned"
+    assert_raw_reason(error.detail, unfit)
+
+
+def test_a_refusal_before_detection_carries_no_detail(tmp_path):
+    s, _, protein = row_session(tmp_path, SCENE)
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein, (SCENE_W + 10, 0, SCENE_W + 50, 20))
+    assert (info.value.code, info.value.detail) == (ErrorCode.OUT_OF_IMAGE, None)
+
+
+def test_a_row_off_the_lanes_names_only_the_boxes_next_to_the_off_bands(tmp_path):
+    # Another protein's boxes in lanes 0 and 1, and the target's box put on
+    # lane 4's band but given lane 5: lanes 2 to 4, interpolated between the
+    # boxes of lanes 1 and 5, are squeezed, so the bands of lanes 3, 4 and 5
+    # lie nearer a neighbouring lane than their own. The refusal names the
+    # boxes those lanes are read from (lanes 1 and 5), not lane 0's.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    ops.set_box_size(s, protein, BoxSize(width=40, height=12))
+    clicked = ops.place_box(s, protein, *at_lane(case, 4), lane_index=5, grow=False)
+    other = other_protein_in_lanes(s, image, case, (0, 1))
+    error = row_refused(s, protein, case.row)
+    assert (error.code, str(error)) == (ErrorCode.ROW_LANES_UNCLEAR, OFF_LANES)
+    assert error.ids == (clicked, lane_bands(s, other)[1].id)
+    assert error.detail == {"cause": "off_lanes", "off_lanes": [3, 4, 5]}
+
+
+# --- #124: a row says which other proteins' nets it changed ---
+
+
+def test_a_row_reports_the_nets_it_changed_of_other_proteins_on_its_image(tmp_path):
+    # GAPDH's boxes over two of the target's bands: every ring on the image
+    # leaves out the row's boxes, so GAPDH's nets change with the row.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    for lane in (1, 2):
+        ops.place_box(s, other, *at_lane(case, lane), lane_index=lane, grow=True)
+    before = {b.id: b.net for b in protein_of(s, other).bands}
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    after = {b.id: b.net for b in protein_of(s, other).bands}
+    changed = tuple((i, before[i], after[i]) for i in before if after[i] != before[i])
+    assert changed and placement.remeasured == changed
+    band_id, change = placement.largest_change
+    assert change == max(abs(a - b) / b for _, b, a in changed)
+    assert change == abs(after[band_id] - before[band_id]) / before[band_id]
+
+    # The same drag again changes nothing, and says so.
+    again = ops.detect_row_boxes(s, protein, case.row)
+    assert (again.remeasured, again.largest_change) == ((), None)
+
+
+def test_a_row_alone_on_its_image_remeasures_no_other_protein(tmp_path):
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, (0, 1))  # in a row of its own, far above
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert (placement.remeasured, placement.largest_change) == ((), None)
+
+
+def test_a_net_that_was_zero_is_remeasured_but_sets_no_largest_change(tmp_path):
+    # A net measured from 0 changes by no share of it: listed, but no largest
+    # change. (GAPDH's net planted at 0; the row measures it again.)
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    band_id = ops.place_box(s, other, *at_lane(case, 1), lane_index=1, grow=True)
+    plant(s, lambda draft: setattr(draft.batch.find_band(band_id)[1], "net", 0.0))
+
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    net = band_of(s, band_id).net
+    assert net > 0
+    assert (placement.remeasured, placement.largest_change) == (((band_id, 0.0, net),), None)

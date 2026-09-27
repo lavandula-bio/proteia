@@ -130,12 +130,24 @@ class OperationError(ValueError):
     object), ``next_id``, the undo history and the pixel cache are as they were, no
     file was added to ``images/``, and the autosave hook did not run. (An import
     removes orphan files, which no project or undo state references, before it can
-    be refused.)"""
+    be refused.)
 
-    def __init__(self, code: ErrorCode, message: str, *, ids: Sequence[str] = ()) -> None:
+    ``detail``, when a refusal has one, is JSON-plain data about why, for a
+    client that words or shows it its own way (a row box's: what the detector
+    saw); None otherwise."""
+
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        ids: Sequence[str] = (),
+        detail: Mapping[str, JsonValue] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.ids: tuple[str, ...] = tuple(ids)  # the objects involved, e.g. an overlapped band
+        self.detail: dict[str, JsonValue] | None = None if detail is None else dict(detail)
 
 
 AutosaveHook = Callable[["ProjectSession"], None]

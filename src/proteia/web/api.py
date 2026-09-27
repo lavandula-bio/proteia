@@ -17,7 +17,9 @@ back (:class:`~proteia.core.operations.Restored`); clearing a protein's boxes
 answers the band ids removed and the (lane index, band index) of each record
 dropped; a row box answers what it did in each lane: every field of
 :class:`~proteia.core.operations.RowPlacement`, each empty lane as
-``{lane_index, reason, snr, expected_x}``; requantifying answers the images
+``{lane_index, reason, snr, expected_x}``, each other protein's band it
+re-measured as ``{band_id, net_before, net_after}`` and the largest change as
+``{band_id, change}`` (or null); requantifying answers the images
 re-quantified. Lane indices in requests and answers are 0-based, as stored. Any
 box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
@@ -37,7 +39,8 @@ with ``{"folder": "exports/<name>"}`` as the export answered it, that export
 folder.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
-with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404, and
+with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
+refusal carries one (a row box's: what the detector saw); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
 ``no_project`` 409 before a project is open; ``invalid_input`` 422 for a request
 the routes cannot read.
@@ -509,9 +512,10 @@ def _cascade(cascade: ops.Cascade) -> dict[str, list[str]]:
 def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
     """Every field of what a row box did
     (:class:`~proteia.core.operations.RowPlacement`), with lists for tuples, the
-    box size as ``{width, height}`` and each empty lane as ``{lane_index,
-    reason, snr, expected_x}``."""
-    size = placement.box_size
+    box size as ``{width, height}``, each empty lane as ``{lane_index,
+    reason, snr, expected_x}``, each band re-measured as ``{band_id, net_before,
+    net_after}`` and the largest change as ``{band_id, change}`` (or None)."""
+    size, largest = placement.box_size, placement.largest_change
     return {
         "band_ids": list(placement.band_ids),
         "box_size": {"width": size.width, "height": size.height},
@@ -527,6 +531,13 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
         "flags": list(placement.flags),
         "notes": list(placement.notes),
         "right_to_left": placement.right_to_left,
+        "remeasured": [
+            {"band_id": band_id, "net_before": before, "net_after": after}
+            for band_id, before, after in placement.remeasured
+        ],
+        "largest_change": None
+        if largest is None
+        else {"band_id": largest[0], "change": largest[1]},
     }
 
 
@@ -866,8 +877,18 @@ def redo(workspace: WorkspaceDep) -> dict[str, Any]:
 # --- Errors ---
 
 
-def _error(status: int, code: str, message: str, ids: tuple[str, ...] = ()) -> JSONResponse:
-    return JSONResponse({"code": code, "message": message, "ids": list(ids)}, status_code=status)
+def _error(
+    status: int,
+    code: str,
+    message: str,
+    ids: tuple[str, ...] = (),
+    detail: dict[str, Any] | None = None,
+) -> JSONResponse:
+    """An error answer: ``{code, message, ids}``, and ``detail`` when given."""
+    body: dict[str, Any] = {"code": code, "message": message, "ids": list(ids)}
+    if detail is not None:
+        body["detail"] = detail
+    return JSONResponse(body, status_code=status)
 
 
 def install(app: FastAPI, workspace: Workspace) -> None:
@@ -875,7 +896,7 @@ def install(app: FastAPI, workspace: Workspace) -> None:
     app.state.workspace = workspace
     app.include_router(router)
     answers: dict[type[Exception], Callable[[Exception], JSONResponse]] = {
-        OperationError: lambda e: _error(422, e.code.value, str(e), e.ids),
+        OperationError: lambda e: _error(422, e.code.value, str(e), e.ids, e.detail),
         UnknownIdError: lambda e: _error(404, "unknown_id", str(e)),
         FolderNotFoundError: lambda e: _error(404, "folder_not_found", str(e)),
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
