@@ -37,18 +37,25 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    or a light strip) and the stored level's spreads less. The detection signal
    is the 3x5 box-smoothed crop on the band side of it; its noise is the
    smaller of two robust spreads.
-3. Rows of the row: a hump of the row-mean signal cut by the top or bottom box
-   edge (a neighbouring row) is left out up to its valley, if an interior hump
-   remains.
+3. Lines and strips across the lanes are taken out of the signal: a thin
+   structure that holds its level along x over ``LINE_SPAN`` pitches beside
+   the bands (a frame line), and a candidate that does so along the image's
+   top or bottom edge across the whole box, cut by it (a dark strip or
+   border, a vignette), up to its valley. Rows of the row: a hump of the
+   row-mean signal cut by the top or bottom box edge (a neighbouring row) is
+   left out up to its valley, if an interior hump remains.
 4. Components of the signal above ``NOISE_K`` sigma that reach ``DETECT_K``
    sigma (hysteresis), with a 30%-core at least a dust floor wide, a peak off
    the box's edge rows, and not a flat structure spanning the rows (a streak or
-   stain). Their column profile is cut into pieces between peaks.
+   stain). Their column profile is cut into pieces between peaks; a piece that
+   rises into the box's left or right edge is marked (a band the box cuts
+   through there, or a dark image edge).
 5. An ordered dynamic programme over the pieces and a pitch search assigns
    each piece to one lane, or a touching run to several, with empty lanes as
    gaps; the second-best reading measures how certain that is.
 6. Per lane: growth with the click's rule (:func:`~proteia.core.grow.grow_region`
    at ``EXTENT_LEVEL`` of the lane's strongest pixel) between the lane's walls.
+   A lane read from a marked piece is not grown: it stays empty.
 7. Stage 2: the plane (or the stored background, chosen as in stage 1) and the
    noise again from the band-free pixels of the row, then steps 3 to 6 again.
 8. Each band's lane: its separate components counted (peaks split as pieces
@@ -91,10 +98,15 @@ import numpy as np
 from pydantic import JsonValue
 from scipy.ndimage import (
     find_objects,
+    grey_opening,
     label,
+    maximum,
+    maximum_filter,
     maximum_filter1d,
     maximum_position,
     median_filter,
+    minimum_filter1d,
+    sum_labels,
     uniform_filter,
 )
 from scipy.signal import find_peaks
@@ -125,6 +137,9 @@ ROW_WALK_TOL: Final = 0.02  # the row-mean walk passes rises and dips below this
 ROW_MIN_ROWS: Final = 5  # a neighbouring row is left out only of a row this high or higher...
 ROW_MIN_KEEP: Final = 3  # ...and only if at least this many rows remain
 FLAT_EDGE: Final = 0.8  # a row-spanning core whose end rows are >= this of its peak: a streak
+LINE_SPAN: Final = 2.0  # a line or strip holds its level along x over this many box pitches...
+LINE_FLAT: Final = 0.8  # ...each of its pixels within this fraction of it (no dip at a lane gap)
+LINE_PX: Final = 4  # a line is at most this many px high at half its height (drawn, smoothed)
 VALLEY_FRAC: Final = 0.75  # cut two near peaks at a low point below this of the lower (x and y)
 GAP_FRAC: Final = 0.1  # cut any two peaks at a low point below this of the lower (empty lane)
 NEAR_PEAKS: Final = 1.5  # peaks closer than this many box pitches hold no band between them
@@ -175,11 +190,14 @@ WARNING_FLAGS: Final = (
 )
 
 RowDetectErrorCode = Literal["invalid_row", "invalid_image", "row_outside_image", "row_too_small"]
-LaneReason = Literal["band", "no_band", "artefact", "edge_signal", "unassigned"]
+LaneReason = Literal[
+    "band", "no_band", "artefact", "line", "edge_signal", "side_signal", "unassigned"
+]
 
 _TAIL_Z: Final = float(ndtri(0.5 + TAIL_Q / 200.0))  # Gaussian |z| at the TAIL_Q percentile
 _P_SIGMA: Final = 68.27  # the percentile of |deviation| at one Gaussian sigma
 _CROSS: Final = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)  # 4-connectivity, as label()
+_COLUMN: Final = np.array([[0, 1, 0], [0, 1, 0], [0, 1, 0]], bool)  # runs down one column
 
 
 class RowDetectError(ValueError):
@@ -208,12 +226,17 @@ class LaneDetection:
     * ``rect``: the proposed box, of the shared size; None for an empty lane.
     * ``reason``: ``band``, or why the lane is empty: ``no_band`` (nothing
       but dust reaches ``DETECT_K``; ``snr`` says how close it came),
-      ``artefact`` (a rejected streak or stain covers it), ``edge_signal``
-      (only signal at the box's edge reaches ``DETECT_K``: in the rows left out
-      as a neighbouring row, or peaking on the box's top or bottom row, as a
-      band the box cuts through does), ``unassigned`` (a kept candidate in the
-      row's rows reaches ``DETECT_K`` but is in no assigned piece: a piece
-      dropped for want of lanes, or too weak beside the bands around it).
+      ``artefact`` (a rejected streak or stain covers it), ``line`` (a line or
+      strip running across the lanes reaches ``DETECT_K`` in its slot: a frame
+      line, a dark strip along the image's edge; a band may lie under it),
+      ``edge_signal`` (only signal at the box's edge reaches ``DETECT_K``: in
+      the rows left out as a neighbouring row, or peaking on the box's top or
+      bottom row, as a band the box cuts through does), ``side_signal`` (only
+      signal rising into the box's left or right edge reaches it: a band the
+      box cuts through there, the lane read from it but given no box, or a dark
+      image edge), ``unassigned`` (a kept candidate in the row's rows reaches
+      ``DETECT_K`` but is in no assigned piece: a piece dropped for want of
+      lanes, or too weak beside the bands around it).
     * ``snr``: the strongest smoothed signal in the lane (the growth seed; for an
       empty lane, within ``EMPTY_WINDOW`` pitch of its centre, leaving out the
       candidates the detector rejected, dust among them) over the noise.
@@ -523,6 +546,21 @@ def _signal(
 # --- In-row signal: rows, components, pieces ---
 
 
+def _hump(v: np.ndarray, order: Sequence[int]) -> tuple[int, int]:
+    """The hump of the profile ``v`` at the first index of ``order``, walked
+    in that order: up to its peak (over dips below ``ROW_WALK_TOL`` of the
+    profile's maximum), then down to its valley (over rises below that).
+    ``(peak, valley)``, as indices of ``v``."""
+    tol = ROW_WALK_TOL * float(v.max())
+    k = 0
+    while k + 1 < len(order) and v[order[k + 1]] >= v[order[k]] - tol:
+        k += 1
+    peak = order[k]
+    while k + 1 < len(order) and v[order[k + 1]] <= v[order[k]] + tol:
+        k += 1
+    return peak, order[k]
+
+
 def _row_rows(s: np.ndarray, sigma_sm: float) -> tuple[int, int]:
     """Rows ``[lo, hi)`` that hold the row. A hump of the row-mean signal cut by
     the top or bottom box edge (the edge value is at least ``EDGE_HUMP`` of its
@@ -532,18 +570,12 @@ def _row_rows(s: np.ndarray, sigma_sm: float) -> tuple[int, int]:
     v = s.mean(axis=1)
     if hc < ROW_MIN_ROWS or v.max() <= 0:
         return 0, hc
-    tol = ROW_WALK_TOL * float(v.max())
     sig = NOISE_K * sigma_sm / math.sqrt(max(1, s.shape[1] / SMOOTH[1]))
 
     def walk(order: list[int]) -> tuple[bool, int]:
-        k = 0
-        while k + 1 < len(order) and v[order[k + 1]] >= v[order[k]] - tol:
-            k += 1
-        peak = v[order[k]]
-        edge = peak > sig and v[order[0]] >= EDGE_HUMP * peak
-        while k + 1 < len(order) and v[order[k + 1]] <= v[order[k]] + tol:
-            k += 1
-        return edge, order[k]
+        peak, valley = _hump(v, order)
+        edge = v[peak] > sig and v[order[0]] >= EDGE_HUMP * v[peak]
+        return edge, valley
 
     top_edge, top_valley = walk(list(range(hc)))
     bot_edge, bot_valley = walk(list(range(hc - 1, -1, -1)))
@@ -558,12 +590,14 @@ def _row_rows(s: np.ndarray, sigma_sm: float) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class _Piece:
-    """A stretch of the column profile: crop x ``[l, r)``, its peak and mass."""
+    """A stretch of the column profile: crop x ``[l, r)``, its peak and mass;
+    ``side``: it rises into the box's left or right edge (:func:`_rises_to_side`)."""
 
     l: float  # noqa: E741
     r: float
     peak: float
     mass: float
+    side: bool = False
 
     @property
     def w(self) -> float:
@@ -583,6 +617,8 @@ class _Candidates:
     dropped: np.ndarray  # mask of the candidates rejected by any rule (not kept)
     dust: np.ndarray  # mask of the candidates the dust floor rejected
     cut: np.ndarray  # mask of the band-like candidates peaking on the box's edge row
+    lines: np.ndarray  # mask of the lines and strips running across the lanes (_lines)
+    side: np.ndarray  # mask of the kept pieces rising into the box's left or right edge
     rows: tuple[int, int]  # rows of the row (edge humps left out)
     rejected: list[tuple[str, Region]]  # (reason, region) of rejected structures
     pieces: list[_Piece]
@@ -639,20 +675,234 @@ def _dust(comp: np.ndarray, ds: np.ndarray, peak: float, thr: float, min_w: floa
     return dcore is None or dcore[2] - dcore[0] < min_w  # below the width floor: noise, dust
 
 
-def _candidates(sig: _Signal, n: int) -> _Candidates:
+def _lines(s: np.ndarray, sigma_sm: float, n: int, image_rows: tuple[bool, bool]) -> np.ndarray:
+    """The pixels of the lines and strips that run across the lanes in the
+    signal ``s``: not bands, whatever they reach.
+
+    A pixel is flat along x when the level its row holds over ``LINE_SPAN`` box
+    pitches around it (a horizontal opening of that length) is at least
+    ``LINE_FLAT`` of its own: a band holds its level over one lane at most, and
+    a row of bands dips between them, so only a structure that crosses the gaps
+    between lanes does. So is a pixel whose level is held within
+    ``LINE_PX // 2`` px up or down (the opening of the rows' running maximum
+    over that height), at ``LINE_FLAT`` of its own either way: a line turned a
+    little, as in a scan turned by a degree or two, drifts across the rows (a
+    pixel beside a line, far lower, is not on it). A row of touching bands with
+    no dip between them (and a saturated one, clipped flat) is flat too, but
+    thick; and the tails of a row of thin bands are flat while their tops are
+    not. So a flat pixel counts only in a run down its column that is the
+    column's top there (the pixels just above and below it lower than its
+    highest) and no more than ``LINE_PX`` px high at half that, a drawn line's
+    height once smoothed; a thin structure is a 4-connected set of such
+    pixels (pieces of them on the same rows less than a box pitch apart
+    joined: a band's tail lifting a close line's edge row breaks it there over
+    a band's width) over ``LINE_SPAN`` pitches along x that reaches
+    ``DETECT_K``, with its fringe (up to ``LINE_PX`` px down each column from
+    it while the signal falls). A row of thin touching bands is such a
+    structure too, and alone in the box it is the row; a frame line runs
+    beside the bands, above or below them. So a thin structure is a line
+    when, in its own columns, above or below it and past the slope it falls
+    down, something reaches ``DETECT_K`` over at least a band's width
+    (``_min_width``) that the detector keeps (a band, or the frame's other
+    line): in the row's rows (a neighbouring row's hump at the box's edge
+    left out, :func:`_row_rows`), and not peaking on the box's top or bottom
+    row. But a thin structure that holds its level (``LINE_FLAT`` of its
+    median) a band's width past both ends of another's is that one's frame,
+    no sign of it being a line: a frame's line runs on across the box past a
+    row of thin bands' end shoulders, where the row's level ends, while a
+    frame's two lines end alike. A band next to a line keeps its own pixels:
+    a line is taken out of a component, not the component with it.
+
+    ``image_rows`` says whether the box's top and bottom rows are the image's.
+    A candidate that is flat along one of those rows over ``LINE_SPAN`` pitches
+    runs along the image's edge, whatever its height, when it runs across the
+    whole box (on that row, within a band's width of each of the box's sides
+    it holds ``LINE_FLAT`` of its median level there) and the image cuts it
+    (that row holds at least ``CUT_LEVEL`` of the hump its mean profile over
+    its columns there has at the edge): a dark strip or border, or a
+    vignette. It is taken out from that row to its hump's valley
+    (:func:`_hump`), so bands beyond the valley keep theirs. A row of bands
+    is none: it ends inside the box, which spans every lane with its margin,
+    or holds far less at its sides (the tails of deep bands), and the image
+    ending just past it leaves only its tails on that row.
+
+    With ``LINE_SPAN`` pitches wider than the box (a box of fewer than two
+    lanes) nothing is a line: a band may fill it."""
+    hc, wc = s.shape
+    span = int(math.ceil(LINE_SPAN * wc / n))
+    lines = np.zeros(s.shape, bool)
+    if span > wc:
+        return lines
+    thr = NOISE_K * sigma_sm
+    strong = s >= DETECT_K * sigma_sm
+    held = grey_opening(s, size=(1, span), mode="constant", cval=0.0)
+    flat = (s > thr) & (held >= LINE_FLAT * s)
+    # A line turned a little drifts across the rows: it holds its level
+    # within half its height up or down, at about the pixel's own level.
+    drift = maximum_filter1d(s, size=2 * (LINE_PX // 2) + 1, axis=0, mode="constant", cval=0.0)
+    held = grey_opening(drift, size=(1, span), mode="constant", cval=0.0)
+    flat |= (s > thr) & (held >= LINE_FLAT * s) & (LINE_FLAT * held <= s)
+    runs, count = label(flat, structure=_COLUMN)
+    if count:
+        idx = np.arange(1, count + 1)
+        tops = np.zeros(count + 1)
+        tops[1:] = maximum(s, runs, idx)
+        heights = np.zeros(count + 1)
+        heights[1:] = sum_labels(s >= 0.5 * tops[runs], runs, idx)
+        # The pixels just above and below each run (0 past the box): a run
+        # beside a higher pixel is a flank of a taller hump, not its top.
+        above = np.zeros_like(s)
+        above[1:] = s[:-1]
+        below = np.zeros_like(s)
+        below[:-1] = s[1:]
+        first = flat.copy()  # each run's top pixel
+        first[1:] &= ~flat[:-1]
+        last = flat.copy()  # ...and its bottom pixel
+        last[:-1] &= ~flat[1:]
+        beside = np.zeros(count + 1)
+        beside[runs[first]] = above[first]
+        beside[runs[last]] = np.maximum(beside[runs[last]], below[last])
+        flat_tops = flat & (heights[runs] <= LINE_PX) & (beside[runs] < tops[runs])
+        # Pieces of them on the same rows less than a pitch apart are one: a
+        # band's tail lifting a line's edge row there breaks it over a band's
+        # width (a closing along x, over an odd width of about a pitch, that
+        # never runs a piece on past its end).
+        gap = 2 * (int(math.ceil(wc / n)) // 2) + 1
+        closed = maximum_filter1d(flat_tops.view(np.uint8), gap, axis=1, mode="constant")
+        closed = minimum_filter1d(closed, gap, axis=1, mode="constant").view(bool)
+        parts, _ = label(closed | flat_tops)
+        thin = np.zeros(s.shape, bool)
+        for k, (_, xs) in enumerate(find_objects(parts)):
+            if xs.stop - xs.start >= span:
+                part = (parts == k + 1) & flat_tops
+                if strong[part].any():
+                    thin |= part
+        # Its slope: down each column from it while the signal falls (its
+        # edges, less flat than its top), not up into a band beside it. Up to
+        # LINE_PX px of it is the fringe taken out with a line, not far into a
+        # band beside it; all of it is the structure's own when looking for
+        # what lies beside it (the flank of a taller hump whose top it is, as
+        # the image's edge leaves of bands it cuts, is no band beside it).
+        slope = thin.copy()
+        for step in range(hc):
+            grown = np.zeros_like(slope)
+            grown[:-1] |= slope[1:] & (s[:-1] <= s[1:])
+            grown[1:] |= slope[:-1] & (s[1:] <= s[:-1])
+            grown &= (s > thr) & ~slope
+            if not grown.any():
+                break
+            slope |= grown
+            if step < LINE_PX:
+                thin |= grown
+        # A line has something beside it, above or below in its own columns,
+        # that the detector keeps: in the row's rows, not a candidate peaking
+        # on the box's top or bottom row (a neighbouring row's edge,
+        # _candidates), which a row of thin bands has beside it as a frame
+        # line has the bands, or its other line.
+        rest, others = label((s > thr) & ~slope)
+        at_edge = np.zeros(others + 1, bool)
+        if others:
+            tops_at = maximum_position(s, rest, np.arange(1, others + 1))
+            at_edge[1:] = [y in (0, hc - 1) for y, _ in tops_at]
+        other = strong & ~slope & ~at_edge[rest]
+        structures, count = label(thin)
+        regions = find_objects(structures)
+        at_edge = np.zeros(count + 1, bool)
+        if count:
+            tops_at = maximum_position(s, structures, np.arange(1, count + 1))
+            at_edge[1:] = [y in (0, hc - 1) for y, _ in tops_at]
+        other_thin = strong & thin & ~at_edge[structures]
+        lo, hi = _row_rows(np.where(slope, 0.0, s), sigma_sm)
+        for mask in (other, other_thin):
+            mask[:lo] = False
+            mask[hi:] = False
+        # Where each holds its level along x: its first and last column at
+        # LINE_FLAT of its median level (a row of bands' end shoulders left out).
+        ends = np.zeros((count + 1, 2))
+        for k, sl in enumerate(regions):
+            top = np.where(structures[sl] == k + 1, s[sl], 0.0).max(axis=0)
+            on = np.flatnonzero(top >= LINE_FLAT * float(np.median(top[top > 0])))
+            ends[k + 1] = sl[1].start + on[0], sl[1].start + on[-1]
+        w = _min_width(wc, n)
+        down = np.arange(hc)[:, None]
+        for k, sl in enumerate(regions):
+            one = structures[sl] == k + 1
+            cols = one.any(axis=0)
+            upper = np.argmax(one, axis=0) + sl[0].start  # its first row per column
+            lower = sl[0].stop - 1 - np.argmax(one[::-1], axis=0)  # ...and its last
+            # A thin structure holding its level a band's width past both its
+            # ends is its frame's line, beside the row: no sign of a line.
+            frames = (ends[:, 0] <= ends[k + 1, 0] - w) & (ends[:, 1] >= ends[k + 1, 1] + w)
+            beside = other[:, sl[1]] | (other_thin[:, sl[1]] & ~frames[structures[:, sl[1]]])
+            off = beside & ((down < upper) | (down > lower)) & cols
+            if np.count_nonzero(off.any(axis=0)) >= w:
+                lines[:, sl[1]] |= structures[:, sl[1]] == k + 1
+    if image_rows[0] or image_rows[1]:
+        comps, _ = label(s > thr)
+        big = set(np.unique(comps[strong]).tolist())
+        w = int(math.ceil(_min_width(wc, n)))  # the box's sides: a band's width in from each
+        for row, at in ((0, image_rows[0]), (hc - 1, image_rows[1])):
+            if not at:
+                continue
+            along = np.concatenate([[False], flat[row], [False]])
+            edges = np.flatnonzero(along[1:] != along[:-1])
+            flat_along = {
+                int(c)
+                for a, b in zip(edges[0::2], edges[1::2], strict=True)
+                if b - a >= span
+                for c in np.unique(comps[row, a:b])
+            }
+            for c in sorted(flat_along & big):
+                on = comps[row] == c
+                # Across the whole box at its level: a row of bands ends inside
+                # it, or, deep enough for its tails to reach the box's sides,
+                # holds far less there.
+                level = LINE_FLAT * float(np.median(s[row, on]))
+                ends = [s[row, cols][on[cols]] for cols in (slice(0, w), slice(wc - w, wc))]
+                if any(end.size == 0 or float(end.max()) < level for end in ends):
+                    continue
+                v = s[:, on].mean(axis=1)
+                peak, valley = _hump(v, range(hc) if row == 0 else range(hc - 1, -1, -1))
+                if v[row] < CUT_LEVEL * v[peak]:
+                    continue  # the image ends past it: a row of bands' tails
+                strip = slice(0, valley + 1) if row == 0 else slice(valley, hc)
+                lines[strip] |= comps[strip] == c
+    return lines
+
+
+def _rises_to_side(p: np.ndarray, left: bool, depth: int) -> bool:
+    """Whether the profile ``p`` of a piece that reaches the box's left
+    (``left``) or right edge rises into it: highest on the edge column, and
+    nowhere ``depth`` px or more inside it at ``VALLEY_FRAC`` of that, so no
+    hump of a band lies inside the box (a band the box's side edge cuts
+    through, a dark image edge). A band peaking inside, or a flat top that
+    runs on inside (a saturated band), stays."""
+    edge = float(p[0] if left else p[-1])
+    if edge < float(p.max()):
+        return False
+    inner = p[depth:] if left else p[: max(0, p.size - depth)]
+    return inner.size == 0 or float(inner.max()) < VALLEY_FRAC * edge
+
+
+def _candidates(sig: _Signal, n: int, image_rows: tuple[bool, bool]) -> _Candidates:
     """The kept components and the pieces of their column profile.
 
-    A candidate peaking on the box's top or bottom row is rejected
+    Lines and strips running across the lanes (:func:`_lines`) are taken out
+    first. A candidate peaking on the box's top or bottom row is rejected
     (``edge_signal``) whatever it is; of those, dust counts as dust, and one
     that holds a band's hump (not flat across the rows, as a streak is) is a
-    band the box cuts through (``cut``)."""
-    s_all = sig.s_sm
+    band the box cuts through (``cut``). A piece reaching the box's left or
+    right edge that rises into it (:func:`_rises_to_side`) stays in the lane
+    reading, as the band of the lane there the box cuts through may be, but
+    is marked ``side``: its lane gets no box (``side_signal``)."""
+    lines = _lines(sig.s_sm, sig.sigma_sm, n, image_rows)
+    s_all = np.where(lines, 0.0, sig.s_sm)
     hc, wc = s_all.shape
     lo, hi = _row_rows(s_all, sig.sigma_sm)
     s = np.zeros_like(s_all)
     s[lo:hi] = s_all[lo:hi]
     ds = np.zeros_like(s_all)
-    ds[lo:hi] = sig.s_ds[lo:hi]
+    ds[lo:hi] = np.where(lines, 0.0, sig.s_ds)[lo:hi]
     rejected: list[tuple[str, Region]] = []
     if lo > 0:
         rejected.append(("edge_signal", (slice(0, lo), slice(0, wc))))
@@ -660,10 +910,12 @@ def _candidates(sig: _Signal, n: int) -> _Candidates:
         rejected.append(("edge_signal", (slice(hi, hc), slice(0, wc))))
     thr = NOISE_K * sig.sigma_sm
     min_w = _min_width(wc, n)
+    depth = int(math.ceil(min_w))  # _rises_to_side: a band's width inside the edge
     lab, count = label(s > thr)
     kept = np.zeros(s.shape, bool)
     dust = np.zeros(s.shape, bool)
     cut = np.zeros(s.shape, bool)
+    side = np.zeros(s.shape, bool)
     candidates = np.zeros(s.shape, bool)
     if count:
         regions = find_objects(lab)
@@ -721,12 +973,19 @@ def _candidates(sig: _Signal, n: int) -> _Candidates:
             if j1 + 1 - j0 < min_w:
                 continue
             i = j0 + int(np.argmax(seg[j0 : j1 + 1]))
+            cols = slice(a + j0, a + j1 + 1)
             if _flat(s, lo, hi, a + j0, a + j1 + 1):  # a stain attached to a band
-                rejected.append(("artefact", (slice(lo, hi), slice(a + j0, a + j1 + 1))))
-                kept[:, a + j0 : a + j1 + 1] = False
+                rejected.append(("artefact", (slice(lo, hi), cols)))
+                kept[:, cols] = False
                 continue
-            pieces.append(_Piece(a + j0, a + j1 + 1, float(seg[i]), float(seg[j0 : j1 + 1].sum())))
-    return _Candidates(kept, candidates & ~kept, dust, cut, (lo, hi), rejected, pieces)
+            ends = [left for left, at in ((True, a + j0 == 0), (False, a + j1 + 1 == wc)) if at]
+            at_side = any(_rises_to_side(seg[j0 : j1 + 1], left, depth) for left in ends)
+            if at_side:  # its tails too: the part of the run it was cut from
+                side[:, a:b] |= kept[:, a:b]
+            pieces.append(
+                _Piece(a + j0, a + j1 + 1, float(seg[i]), float(seg[j0 : j1 + 1].sum()), at_side)
+            )
+    return _Candidates(kept, candidates & ~kept, dust, cut, lines, side, (lo, hi), rejected, pieces)
 
 
 def _reduce(pieces: list[_Piece], n: int, x_offset: int, notes: list[str]) -> list[_Piece]:
@@ -743,7 +1002,8 @@ def _reduce(pieces: list[_Piece], n: int, x_offset: int, notes: list[str]) -> li
             notes.append(f"dropped a weak piece at x={x_offset + p.l:.0f}..{x_offset + p.r:.0f}")
         else:
             notes.append(f"merged pieces at x={x_offset + a.l:.0f}..{x_offset + b.r:.0f}")
-            pieces[i : i + 2] = [_Piece(a.l, b.r, max(a.peak, b.peak), a.mass + b.mass)]
+            merged = _Piece(a.l, b.r, max(a.peak, b.peak), a.mass + b.mass, a.side and b.side)
+            pieces[i : i + 2] = [merged]
     return pieces
 
 
@@ -924,6 +1184,7 @@ class _Lane:
     components: int = 0
     window: Rect | None = None  # an empty lane's measured slot (crop coordinates)
     cut: bool = False  # an empty lane's band peaks on the box's edge row (_empty_lanes)
+    side: bool = False  # read from a piece rising into the box's side: not measured
 
 
 def _lanes_from(assign: _Assignment, pieces: list[_Piece], n: int) -> list[_Lane]:
@@ -932,6 +1193,7 @@ def _lanes_from(assign: _Assignment, pieces: list[_Piece], n: int) -> list[_Lane
         for i in range(q):
             ln = lanes[k + i]
             ln.present = True
+            ln.side = p.side
             ln.cell = q > 1
             ln.x_range = (p.l, p.r) if q == 1 else (p.l + i * p.w / q, p.l + (i + 1) * p.w / q)
             ln.centre = 0.5 * (ln.x_range[0] + ln.x_range[1])
@@ -1070,12 +1332,14 @@ def _saddles(
 def _measure(lanes: list[_Lane], s: np.ndarray, kept: np.ndarray, sigma_sm: float) -> None:
     """Grow each present lane from its strongest kept pixel, confined between its
     walls: the midpoint to a present neighbour, the centre of an empty one, the
-    box edge at the ends. A touching cell keeps its own x-range."""
+    box edge at the ends. A touching cell keeps its own x-range. A lane read
+    from a piece rising into the box's side is not grown, and ends up empty,
+    but walls its neighbour in as a present one does."""
     wc = s.shape[1]
     n = len(lanes)
     ks = np.where(kept, s, 0.0)
     for i, ln in enumerate(lanes):
-        if not ln.present or ln.x_range is None:
+        if not ln.present or ln.x_range is None or ln.side:
             continue
         a0, b0 = ln.x_range
         if ln.cell:  # seed away from the sides of a touching cell (the central half)
@@ -1116,6 +1380,9 @@ def _measure(lanes: list[_Lane], s: np.ndarray, kept: np.ndarray, sigma_sm: floa
         ln.snr = v / sigma_sm
         ln.reason = "band"
         ln.span = (max(ga, int(math.floor(c0))), min(gb, int(math.ceil(c1))))
+    for ln in lanes:
+        if ln.side:
+            ln.present = False
 
 
 def _count_components(res: _Pass) -> None:
@@ -1181,11 +1448,12 @@ class _Pass:
     notes: list[str]
 
 
-def _run_pass(sig: _Signal, n: int, x_offset: int) -> _Pass:
-    """Steps 3 to 6 of the pipeline on one signal."""
+def _run_pass(sig: _Signal, n: int, x_offset: int, image_rows: tuple[bool, bool]) -> _Pass:
+    """Steps 3 to 6 of the pipeline on one signal; ``image_rows``: whether the
+    box's top and bottom rows are the image's (:func:`_lines`)."""
     wc = sig.s_sm.shape[1]
     notes: list[str] = []
-    cand = _candidates(sig, n)
+    cand = _candidates(sig, n, image_rows)
     pieces = _reduce(cand.pieces, n, x_offset, notes)
     assign, alt = (None, math.inf) if not pieces else _assign(pieces, n, float(wc))
     if assign is None:
@@ -1201,7 +1469,8 @@ def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
     minus every kept pixel outside those (a piece dropped or left unassigned, a
     lane whose growth failed, a doublet's other band, a band's tail): each
     connected part's bounding box dilated by ``BG_GUARD_MIN`` px; minus the
-    rejected regions.
+    rejected regions, and the lines and strips (:func:`_lines`) dilated by
+    ``BG_GUARD_MIN`` px (a frame's bounding box can be the whole box).
 
     An extent is a band at ``EXTENT_LEVEL`` of its peak, so its guard grows
     with it to take in the tails below that level. A kept component already
@@ -1230,6 +1499,8 @@ def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
     free &= ~blocked
     for _, region in res.cand.rejected:
         free[region] = False
+    g = 2 * BG_GUARD_MIN + 1
+    free &= ~maximum_filter(res.cand.lines, size=(g, g), mode="constant", cval=False)
     return free
 
 
@@ -1237,13 +1508,17 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
     """Expected centre, window SNR and reason of every empty lane.
 
     The SNR leaves out the candidates the detector rejected (dust, a peak on
-    the box's edge rows, a streak or stain), so only a kept candidate reaches
-    ``DETECT_K`` there (``unassigned``); signal short of a candidate stays, so
-    the SNR tells how close a faint band came. Signal at the box's edge (in
-    the rows left out, or a candidate peaking on an edge row) makes a lane
-    ``edge_signal``; dust counts nowhere. An ``edge_signal`` lane is ``cut``
-    when a band the box's edge runs through (``_Candidates.cut``) reaches
-    ``DETECT_K`` in its slot."""
+    the box's edge rows, a streak or stain, a line, signal rising into the
+    box's side), so only a kept candidate reaches ``DETECT_K`` there
+    (``unassigned``); signal short of a candidate stays, so the SNR tells how
+    close a faint band came. A line or strip across the lanes reaching
+    ``DETECT_K`` in the slot makes a lane ``line``, and then signal rising into
+    the box's left or right edge ``side_signal``: a band may lie under the
+    one, and the other is a band the box cuts through or the image's edge.
+    Signal at the box's top or bottom edge (in the rows left out, or a
+    candidate peaking on an edge row) makes a lane ``edge_signal``; dust counts
+    nowhere. An ``edge_signal`` lane is ``cut`` when a band the box's edge runs
+    through (``_Candidates.cut``) reaches ``DETECT_K`` in its slot."""
     sig, cand, lanes = res.sig, res.cand, res.lanes
     if res.assign is None or not any(ln.present for ln in lanes):
         for i, ln in enumerate(lanes):
@@ -1253,9 +1528,11 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
     lo, hi = cand.rows
     s_row = np.zeros_like(sig.s_sm)
     s_row[lo:hi] = sig.s_sm[lo:hi]
-    s_row[cand.dropped] = 0.0
-    s_all = np.where(cand.dust, 0.0, sig.s_sm)
+    s_row[cand.dropped | cand.lines | cand.side] = 0.0
+    s_all = np.where(cand.dust | cand.lines | cand.side, 0.0, sig.s_sm)
     s_cut = np.where(cand.cut, sig.s_sm, 0.0)
+    s_line = np.where(cand.lines, sig.s_sm, 0.0)
+    s_side = np.where(cand.side, sig.s_sm, 0.0)
     for ln in lanes:
         if ln.present:
             continue
@@ -1273,6 +1550,10 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
             ln.reason = "artefact"
         elif ln.snr >= DETECT_K:
             ln.reason = "unassigned"
+        elif float(s_line[:, a:b].max()) / sig.sigma_sm >= DETECT_K:
+            ln.reason = "line"
+        elif float(s_side[:, a:b].max()) / sig.sigma_sm >= DETECT_K:
+            ln.reason = "side_signal"
         elif full >= DETECT_K:
             ln.reason = "edge_signal"
             ln.cut = float(s_cut[:, a:b].max()) / sig.sigma_sm >= DETECT_K
@@ -1365,7 +1646,8 @@ def detect_row(
     if coef is not None:
         plane = _surface(crop, _subsample(np.arange(crop.size)), coef, flat, sign, sigma_px)
     crop_ds = _despeckle(crop, _despeckle_width(wc, n))
-    res = _run_pass(_signal(crop, crop_ds, plane, sign, sigma_px, floor, None), n, x0)
+    image_rows = (y0 == 0, y1 == gray.shape[0])
+    res = _run_pass(_signal(crop, crop_ds, plane, sign, sigma_px, floor, None), n, x0, image_rows)
 
     # Stage 2: the plane (or the stored background, the same choice) and the
     # noise from the band-free pixels of the row.
@@ -1376,7 +1658,9 @@ def detect_row(
         if coef2 is not None:
             idx = _subsample(np.flatnonzero(free.ravel()))
             plane = _surface(crop, idx, coef2, flat, sign, sigma_px)
-        res = _run_pass(_signal(crop, crop_ds, plane, sign, sigma_px, floor, free), n, x0)
+        res = _run_pass(
+            _signal(crop, crop_ds, plane, sign, sigma_px, floor, free), n, x0, image_rows
+        )
     sig, assign, lanes = res.sig, res.assign, res.lanes
     # The membrane's level in the signal, for bg_offset: stage 2 measured it on
     # the band-free pixels. Too few of them to fit and detect again may still
@@ -1553,6 +1837,9 @@ def settings() -> dict[str, JsonValue]:
         "row_min_rows": ROW_MIN_ROWS,
         "row_min_keep": ROW_MIN_KEEP,
         "flat_edge": FLAT_EDGE,
+        "line_span": LINE_SPAN,
+        "line_flat": LINE_FLAT,
+        "line_px": LINE_PX,
         "valley_frac": VALLEY_FRAC,
         "gap_frac": GAP_FRAC,
         "near_peaks": NEAR_PEAKS,
