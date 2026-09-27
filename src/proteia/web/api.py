@@ -72,6 +72,13 @@ file's ``name``, ``path`` and ``size``, how many files it holds and how many
 were left out. ``POST /api/diagnostics/reveal`` shows the folder it is written
 in. These read the open project if one is open, and work with none.
 
+``GET /api/notices`` answers the notices the page shows once per user:
+``cloud_sync``, ``{service}``, while the projects folder lies in a folder that
+sync service uploads (:mod:`proteia.web.cloudsync`) and the notice is not
+dismissed, else null. ``POST /api/notices/cloud_sync/dismiss`` dismisses it for
+good, recorded in the per-user state folder. Without a state folder the notice
+is never offered, and a dismissal answers ``no_state_folder``.
+
 Every route that reads or edits the open project takes an optional
 ``Proteia-Opening`` header (:data:`OPENING_HEADER`): the open id of the project
 the page shows, as its answers carry it. A request that names another opening
@@ -92,14 +99,16 @@ then written once the session is released: one that takes minutes (with the
 images) holds up no reopen either. ``GET
 /api/workspace`` answers which project is open, and its open id, without
 reading it: for a page to find out. The routes that list, create or open
-projects, the status and quit routes, and the one that shows the diagnostics
-folder, need no opening.
+projects, the status and quit routes, the one that shows the diagnostics
+folder, and the notices', need no opening.
 
 Images handed to the running app by a launch wait in the workspace's inbox
 (:mod:`proteia.web.handoff`) until the page imports or discards them. ``POST
 /api/incoming?name=<name>`` takes one file's bytes, as ``POST /api/images``
 does, into the private staging folder under a name the server makes, and
-answers ``{file_id, name, size}``; ``POST /api/handoffs`` offers uploaded files
+answers ``{file_id, name, size}``; ``GET /api/incoming/room?name=<name>&size=<bytes>``
+answers 204 if it would take that file now, or the refusal it would get before
+its body is read, holding nothing; ``POST /api/handoffs`` offers uploaded files
 (``files``, their ids) with the arguments the launch refused (``refused``,
 ``{name, code, message}`` each, bounded, never refusing the offer), and answers
 ``{handoff_id, merged, files, refused}``: the hand-off they went to, whether it
@@ -124,7 +133,8 @@ with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
 refusal carries one (a row box's: what the detector saw); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
 ``no_project`` 409 before a project is open; ``no_state_folder`` 409 for a
-diagnostic file when Proteia was served without its state folder, and
+diagnostic file, or a notice's dismissal, when Proteia was served without its
+state folder, and
 ``files_changed`` 409 for one whose project files are not those listed;
 ``project_changed`` 409 for a
 request that names an opening no longer open, with ``detail`` ``{open,
@@ -188,7 +198,7 @@ from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import diagnostics, handoff, logs, projects, sample_project
+from proteia.web import cloudsync, diagnostics, handoff, logs, projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.handoff import HandoffView, Inbox, Refusal
 from proteia.web.results_view import results_payload
@@ -373,6 +383,8 @@ class Workspace:
     charts of the answers about the latest opening (:class:`ChartStore`).
     Images handed to the app wait in :attr:`inbox` until an accept imports
     them into a new project (:meth:`accept`), a switch like any other.
+    Whether the projects root lies in a folder a sync service uploads is
+    checked once, when first asked (:meth:`synced_folder`).
 
     The locks, in the order they are taken: the switch lock (a create or an
     open holds it throughout), a session's lock (an operation holds it while it
@@ -384,8 +396,9 @@ class Workspace:
     it takes any of them, on this lock's condition, which releases it
     meanwhile; a reopen waits for the requests using the session holding only
     the switch lock, which no request takes, and at most :data:`REOPEN_WAIT_S`.
-    The inbox's lock is taken with none of these held, and none is taken
-    while it is.
+    The inbox's lock, and the lock of the check whether the projects root is
+    synced (:meth:`synced_folder`), are taken with none of these held, and none
+    is taken while either is.
     """
 
     def __init__(
@@ -396,15 +409,22 @@ class Workspace:
         clock: Clock = utc_now,
         inbox: Inbox | None = None,
         state: Path | None = None,
+        sync_check: Callable[[Path], cloudsync.SyncedFolder | None] = cloudsync.check,
     ) -> None:
         self.root = root
         self.reveal = reveal
         self.clock = clock
         # Images handed to the app; a launch gives it its staging folder.
         self.inbox = Inbox() if inbox is None else inbox
-        # The per-user state folder, which holds the session log and the
-        # diagnostics folder; a launch gives it (proteia.web.launch).
+        # The per-user state folder, which holds the session log, the
+        # diagnostics folder and the notices dismissed; a launch gives it
+        # (proteia.web.launch).
         self.state = state
+        # Whether the projects root lies in a folder a sync service uploads:
+        # checked once, when first asked (synced_folder), under its own lock.
+        self._sync_check = sync_check
+        self._sync_lock = threading.Lock()
+        self._synced: tuple[cloudsync.SyncedFolder | None] | None = None  # None: not checked
         # Guards the open session, the open ids, the sessions in use, the reopen
         # under way, the settings, the previews and the results; never held while
         # computing. Taken before the chart store's own lock, never while holding it.
@@ -507,6 +527,38 @@ class Workspace:
                 " nowhere to write a diagnostic file"
             )
         return self.state
+
+    def synced_folder(self) -> cloudsync.SyncedFolder | None:
+        """The folder a sync service uploads that the projects root lies in
+        (:func:`~proteia.web.cloudsync.check`, or the check this workspace was
+        given), or None: checked once, when first asked, and logged by the
+        service's name and where it was found, never by path. A check that
+        fails is logged, with its stack trace in the log file, and taken as
+        none."""
+        with self._sync_lock:
+            if self._synced is None:
+                try:
+                    synced = self._sync_check(self.root)
+                except Exception:
+                    synced = None
+                    _log.warning(
+                        "could not check whether the projects folder is synced to the cloud",
+                        exc_info=True,
+                        extra=logs.FILE_ONLY,
+                    )
+                else:
+                    if synced is None:
+                        _log.info(
+                            "the projects folder is in no folder a sync service Proteia recognises"
+                        )
+                    else:
+                        _log.info(
+                            "the projects folder is in a folder %s uploads (found from %s)",
+                            synced.service,
+                            synced.source,
+                        )
+                self._synced = (synced,)
+            return self._synced[0]
 
     @contextlib.contextmanager
     def answering(self, session: ProjectSession) -> Iterator[None]:
@@ -1365,14 +1417,13 @@ async def receive_file(
     :data:`~proteia.web.handoff.UPLOAD_EXPIRY_S`. Answers ``{file_id, name,
     size}``. The name is checked before any of the body is read
     (:func:`~proteia.web.handoff.check_name`), and so are the size the request
-    declares and the limits; an empty body is ``invalid_image``. One that
-    cannot be stored is ``file_error``, with a message that names no path: the
-    launch passes it on to the page. A refused upload leaves no file."""
-    handoff.check_name(name)
+    declares and the limits (as ``GET /api/incoming/room`` checks them); an
+    empty body is ``invalid_image``. One that cannot be stored is
+    ``file_error``, with a message that names no path: the launch passes it on
+    to the page. A refused upload leaves no file."""
     given = request.headers.get("content-length")
     declared = int(given) if given is not None and given.isdigit() else None
-    if declared is not None and declared > MAX_UPLOAD_BYTES:
-        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
+    _check_incoming(name, declared)
     inbox = workspace.inbox
     upload = await run_in_threadpool(inbox.begin_upload, name, declared)
     try:
@@ -1400,6 +1451,36 @@ async def receive_file(
             raise OSError(f"{name!r} could not be stored: {_reason(exc)}") from exc
         raise
     return {"file_id": stored.file_id, "name": stored.name, "size": stored.size}
+
+
+@router.get("/incoming/room", status_code=204)
+def incoming_room(
+    workspace: WorkspaceDep,
+    name: Annotated[str, Query(min_length=1)],
+    size: Annotated[int, Query(ge=0)],
+) -> Response:
+    """Whether ``POST /api/incoming`` would take a file named ``name`` of
+    ``size`` bytes now: 204 if so, else the refusal that upload would get
+    before reading any of its body (the name, the size, ``stopping``,
+    ``too_many_pending``). Nothing is held or stored
+    (:meth:`~proteia.web.handoff.Inbox.check_room`). A launch asks before it
+    sends a file's bytes. An upload refused before its body is read is still
+    sent whole, for nothing: the server answers at once, then reads the rest
+    and throws it away; and if the rest stops arriving for a while (the
+    server's keep-alive time), it closes the connection, which the launch may
+    find reset before it can read the answer."""
+    _check_incoming(name, size)
+    workspace.inbox.check_room(size)
+    return Response(status_code=204)
+
+
+def _check_incoming(name: str, size: int | None) -> None:
+    """The checks of a file a launch hands over, before any of its bytes are
+    read: its name (:func:`~proteia.web.handoff.check_name`), and its size, if
+    known, against :data:`MAX_UPLOAD_BYTES`."""
+    handoff.check_name(name)
+    if size is not None and size > MAX_UPLOAD_BYTES:
+        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
 
 
 @router.post("/handoffs", status_code=201)
@@ -1921,6 +2002,37 @@ def reveal_diagnostics(workspace: WorkspaceDep) -> Response:
     diagnostics.make_folder(folder)
     workspace.reveal(folder)
     _log.info("showed the diagnostics folder in the file manager")
+    return Response(status_code=204)
+
+
+@router.get("/notices")
+def get_notices(workspace: WorkspaceDep) -> dict[str, Any]:
+    """The notices the page shows once per user: ``cloud_sync``, the service
+    that uploads the projects folder as ``{service}`` (no path), while it lies
+    in a folder a sync service uploads (:meth:`Workspace.synced_folder`) and
+    the notice is not dismissed (:mod:`proteia.web.cloudsync`); else null. Null
+    too without a state folder: its dismissal could not be remembered, and it
+    would be shown at every start."""
+    synced = workspace.synced_folder()
+    state = workspace.state
+    shown = (
+        synced is not None
+        and state is not None
+        and cloudsync.CLOUD_SYNC not in cloudsync.dismissed(state)
+    )
+    return {"cloud_sync": {"service": synced.service} if shown else None}
+
+
+@router.post("/notices/cloud_sync/dismiss", status_code=204)
+def dismiss_cloud_sync(workspace: WorkspaceDep) -> Response:
+    """Dismiss the ``cloud_sync`` notice for good: recorded in the per-user
+    state folder (:func:`~proteia.web.cloudsync.dismiss`), never in a project.
+    A folder that cannot be written is answered as a file error naming no path."""
+    try:
+        cloudsync.dismiss(workspace.state_folder(), cloudsync.CLOUD_SYNC)
+    except OSError as exc:  # the page shows the message: no path
+        raise OSError(f"the notice could not be dismissed: {_reason(exc)}") from exc
+    _log.info("the notice that the projects folder is synced to the cloud was dismissed for good")
     return Response(status_code=204)
 
 

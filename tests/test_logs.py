@@ -368,22 +368,31 @@ def test_opening_migrating_reading_again_exporting_and_closing_reach_the_log(log
         f"in {name}: the nets are measured with the legacy background (global_median),"
         " each image's median, until the project is requantified"
     )
+    # The backup of the schema-1 file (#140): the one kept at the first
+    # migration holds the file restored, so the second names it too.
+    backup = (
+        f"in {name}: kept its schema-1 project.json as 'project.schema1.json' before migrating it"
+    )
     messages = log.messages("INFO")
     assert [m.split(":")[0] for m in messages] == [
         f"opened {name}",
+        f"in {name}",
         f"in {name}",
         f"committed #2 migrate in {name}",
         f"committed #3 set_reference_condition in {name}",
         f"read {name} again, as its project.json was changed outside Proteia",
         f"in {name}",
+        f"in {name}",
         f"committed #2 migrate in {name}",
         f"in {name}",
         f"closed {name}",
     ]
-    assert messages[1] == messages[5] == legacy
-    migrated = json.loads(messages[6].split(": ", 1)[1])
+    assert messages[1] == messages[6] == legacy
+    assert messages[2] == messages[7] == backup
+    migrated = json.loads(messages[8].split(": ", 1)[1])
     assert migrated == s.project.log[1].params  # as project.json holds them
-    assert messages[7] == f"in {name}: exported the lane table to exports/{ops.LANE_TABLE_FILE}"
+    assert migrated["backup"] == "project.schema1.json"
+    assert messages[9] == f"in {name}: exported the lane table to exports/{ops.LANE_TABLE_FILE}"
 
 
 def test_a_row_box_that_left_lanes_unlocated_logs_them(log, tmp_path):
@@ -519,12 +528,12 @@ def test_a_file_error_is_logged_with_its_stack_trace_and_no_full_path(log, clien
 def test_an_error_that_stops_the_app_is_logged_in_the_file_only(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(launch, "state_dir", lambda: tmp_path / "state")
 
-    def fail() -> None:
+    def fail(**kwargs: object) -> None:
         raise RuntimeError("a bug at start")
 
     monkeypatch.setattr(launch, "start", fail)
     with pytest.raises(RuntimeError, match="a bug at start"):
-        launch.main()
+        launch.main([])
     lines = (tmp_path / "state" / logs.LOG_DIR / logs.LOG_FILE).read_text("utf-8").splitlines()
     (at,) = [
         i
@@ -656,8 +665,8 @@ def test_no_token_reaches_the_log_or_the_console(tmp_path, monkeypatch, capsys):
     failed: list[BaseException] = []
     start = launch.start
 
-    def start_quietly() -> launch.Instance | None:
-        instance = start(opener=lambda url: True)  # never a real browser
+    def start_quietly(**kwargs: object) -> launch.Instance | launch.Opened:
+        instance = start(opener=lambda url: True, **kwargs)  # never a real browser
         started.append(instance)
         return instance
 
@@ -685,7 +694,7 @@ def test_no_token_reaches_the_log_or_the_console(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(launch, "start", start_quietly)
     helper = threading.Thread(target=use_then_quit, daemon=True)
     helper.start()
-    assert launch.main() == 0
+    assert launch.main([]) == 0
     helper.join(10)
     assert not failed, failed
 
@@ -891,8 +900,9 @@ def test_an_unwritable_log_folder_does_not_stop_the_app(tmp_path, monkeypatch, c
     state.mkdir()
     (state / logs.LOG_DIR).write_text("a file where the logs folder should be", encoding="utf-8")
     monkeypatch.setattr(launch, "state_dir", lambda: state)
-    monkeypatch.setattr(launch, "start", lambda: None)  # another instance is running
-    assert launch.main() == 0
+    # another instance is running
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
+    assert launch.main([]) == 0
     console = capsys.readouterr()
     assert "already running" in console.out
     assert console.err.count("cannot write its log file") == 1
@@ -912,8 +922,9 @@ def test_no_usable_temporary_folder_does_not_stop_the_app(tmp_path, monkeypatch,
 
     monkeypatch.setattr(tempfile, "gettempdir", none)
     monkeypatch.setattr(launch, "state_dir", lambda: tmp_path / "state")
-    monkeypatch.setattr(launch, "start", lambda: None)  # another instance is running
-    assert launch.main() == 0
+    # another instance is running
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
+    assert launch.main([]) == 0
     assert "already running" in capsys.readouterr().out
     text = (tmp_path / "state" / logs.LOG_DIR / logs.LOG_FILE).read_text(encoding="utf-8")
     assert "Proteia is already running; it has been opened in the browser" in text

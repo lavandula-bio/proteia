@@ -896,13 +896,16 @@ def test_the_launch_check_reads_the_session_log_the_launcher_writes(tmp_path, mo
     class Served:  # the first launch, which serves until Quit
         port = 1234
         redirect_path = state / launch.REDIRECT_FILE
+        taken = 0
+        unread = ()
 
         def serve(self) -> None:
             pass
 
-    monkeypatch.setattr(launch, "start", Served)
+    monkeypatch.setattr(launch, "start", lambda **kwargs: Served())
     assert launch.main([]) == 0
-    monkeypatch.setattr(launch, "start", lambda: None)  # the second opens the first
+    # the second opens the first
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
     assert launch.main([]) == 0
     assert [path.name for path in state.iterdir()] == [smoke.LOG_DIR]
     assert smoke.session_log_problems(state, token, sessions=2) == []

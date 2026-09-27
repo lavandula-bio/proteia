@@ -346,6 +346,24 @@ def test_the_staged_bytes_count_what_waits_and_what_uploads_hold(tmp_path, inbox
         inbox.begin_upload("c.tif", 1)  # the 6 held count
 
 
+def test_the_room_check_refuses_as_an_upload_would_and_holds_nothing(inbox, monkeypatch):
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 2)
+    monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 10)
+    stage(inbox, "a.tif", b"x" * 4)
+    for _ in range(3):
+        inbox.check_room(6)  # holds nothing: an upload of 6 bytes is still taken
+    with pytest.raises(handoff.TooManyPendingError):
+        inbox.check_room(7)
+    upload = inbox.begin_upload("b.tif", 6)
+    with pytest.raises(handoff.TooManyPendingError):  # the files, uploads under way too
+        inbox.check_room(0)
+    inbox.upload_failed(upload)
+    inbox.check_room(None)
+    inbox.stop()
+    with pytest.raises(handoff.StoppingError):
+        inbox.check_room(1)
+
+
 def test_an_upload_no_offer_takes_expires(tmp_path, inbox, ticks):
     old = stage(inbox, "old.tif")
     ticks.now += handoff.UPLOAD_EXPIRY_S - 1

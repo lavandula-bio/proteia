@@ -351,6 +351,29 @@
   </div>
 </dialog>
 
+<!-- Once per user (#139): the projects folder lies in a folder a sync service
+  uploads. app.js showSyncNotice names the service in each sync-service span;
+  closed however it is, the notice is dismissed for good. It shows no path: the
+  Projects dialog shows where projects are saved. -->
+<dialog id="sync-notice" class="sync-notice" aria-labelledby="sync-notice-title">
+  <h2 id="sync-notice-title">Your projects folder is synced to <span class="sync-service"></span></h2>
+  <p>Proteia keeps your projects in a folder that <span class="sync-service"></span> syncs, so
+    <span class="sync-service"></span> uploads every project's files, the images you import
+    included, to its cloud storage. Proteia itself sends nothing.</p>
+  <p>Unpublished data in your projects is then kept on that service's servers too, under its
+    terms. If your lab or institution has rules on where unpublished research data may be kept,
+    check that they allow this.</p>
+  <p>To keep projects off the cloud, change which folders <span class="sync-service"></span>
+    syncs in its own settings; Proteia does not change them. That can move your projects, or
+    leave them only in the cloud: afterwards, check that they are where the Projects dialog says
+    they are saved. A setting to choose another projects folder is planned for a later
+    version.</p>
+  <p class="hint">This notice is not shown again.</p>
+  <div class="actions sync-notice-actions">
+    <button id="sync-notice-ok" type="button" autofocus>OK</button>
+  </div>
+</dialog>
+
 <!-- A chart card enlarged (Enlarge on a card); charts.js fills it. -->
 <dialog id="chart-dialog" class="chart-dialog" aria-labelledby="chart-dialog-title">
   <div class="chart-dialog-head">

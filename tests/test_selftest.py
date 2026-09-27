@@ -74,6 +74,14 @@ def test_the_web_step_loads_every_static_file_the_page_needs(report):
     assert served <= {f"/static/{path.name}" for path in STATIC_DIR.iterdir()}
 
 
+def test_the_web_step_names_another_instance_that_answered_in_its_folder(tmp_path, monkeypatch):
+    _no_state_folder_and_no_session_log(monkeypatch)
+    # A launch that found an instance answering opened it: it started none.
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
+    with pytest.raises(selftest.CheckError, match="another instance holds the lock"):
+        selftest._web_app(tmp_path, {})
+
+
 def test_a_failing_step_is_named_and_the_others_still_run(tmp_path, monkeypatch):
     def broken(folder, report):
         raise selftest.CheckError("left out of the bundle")
