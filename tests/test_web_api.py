@@ -1590,14 +1590,15 @@ def test_a_box_padding_field_left_out_keeps_its_value(client, tmp_path):
 
 def test_a_box_padding_reports_boxes_the_edge_shifts_and_boxes_it_overlaps(client, tmp_path):
     # A fitted height of 60 puts the target's boxes against the image's top
-    # edge (their centre, y 30, is 30 px down), so 8 px more above and below
-    # shifts them down, onto the loading control's boxes (y 70 to 80): each
-    # box then counts part of the other's band, which is allowed and said.
+    # edge (their centre, y 30, is 30 px down), so 6 px more above and below
+    # shifts them down, onto 2 of the 10 rows of the loading control's boxes
+    # (y 70 to 80): each box then counts part of the other's band, which is
+    # allowed and said (more than half of the smaller box is refused, #114).
     target, loading, _ = live(client, tmp_path, DOSES)
     client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 14, "height": 60})
-    answer = client.ok("PUT", padding_path(target), {"along": 8})
+    answer = client.ok("PUT", padding_path(target), {"along": 6})
     state = protein_of(answer, target)
-    assert all(band["rect"][1::2] == [0, 76] for band in state["bands"])
+    assert all(band["rect"][1::2] == [0, 72] for band in state["bands"])
     assert answer["edge_shifted"] == [band["id"] for band in state["bands"]]
     assert answer["overlapping"] == [band["id"] for band in protein_of(answer, loading)["bands"]]
 
