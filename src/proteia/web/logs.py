@@ -264,7 +264,10 @@ class _ConsoleFormatter(logging.Formatter):
 
     def __init__(self) -> None:
         super().__init__()  # the message alone
-        self._uvicorn = DefaultFormatter("%(levelprefix)s %(message)s", use_colors=None)
+        # Colours only on a terminal; a build without a console has no stderr
+        # (None), and uvicorn's own check would call isatty() on sys.stdout.
+        colours = sys.stderr is not None and sys.stderr.isatty()
+        self._uvicorn = DefaultFormatter("%(levelprefix)s %(message)s", use_colors=colours)
 
     def format(self, record: logging.LogRecord) -> str:
         if record.name == "uvicorn" or record.name.startswith("uvicorn."):
@@ -396,14 +399,28 @@ def _move_all(moves: list[tuple[str, str]]) -> bool:
     return True
 
 
-def _prune(folder: Path, backups: int) -> None:
+# A file a rotation set aside is left to it for this long: a rotation takes
+# milliseconds, so one older than this belongs to a rotation that did not finish.
+ASIDE_GRACE_S: Final = 60.0
+
+
+def _prune(folder: Path, backups: int, *, now: float | None = None) -> None:
     """Delete the rotated files past ``backups`` (left by a version that kept
-    more) and the files set aside by a rotation that did not finish."""
+    more) and the files set aside by a rotation that did not finish: only once
+    they are :data:`ASIDE_GRACE_S` old, since another process (the running
+    instance, when a second launch sets up its log) may be rotating now."""
+    now = time.time() if now is None else now
     for path in folder.glob(f"{LOG_FILE}.*"):
         suffix = path.name[len(LOG_FILE) + 1 :]
-        if suffix in ("rotating", "deleting") or (suffix.isdigit() and int(suffix) > backups):
-            with contextlib.suppress(OSError):
-                path.unlink()
+        try:
+            if suffix in ("rotating", "deleting"):
+                if now - path.stat().st_mtime < ASIDE_GRACE_S:
+                    continue
+            elif not (suffix.isdigit() and int(suffix) > backups):
+                continue
+            path.unlink()
+        except OSError:
+            continue
 
 
 def _log_thread_error(args: threading.ExceptHookArgs) -> None:

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -725,8 +726,10 @@ def test_rotation_and_retention_remove_old_files(tmp_path):
     folder = tmp_path / logs.LOG_DIR
     folder.mkdir()
     # Kept by an older version, or by a rotation that did not finish.
+    an_hour_ago = time.time() - 3600
     for stale in ("proteia.log.7", "proteia.log.rotating", "proteia.log.deleting"):
         (folder / stale).write_text("old", encoding="utf-8")
+        os.utime(folder / stale, (an_hour_ago, an_hour_ago))
     (folder / "notes.txt").write_text("the user's", encoding="utf-8")
     logs.setup(folder, max_bytes=1000, backups=2)
     try:
@@ -745,6 +748,33 @@ def test_rotation_and_retention_remove_old_files(tmp_path):
     flat = [n for part in numbers for n in part]
     assert flat == list(range(flat[0], 60))  # in order, the newest kept, none twice
     assert flat[0] > 0  # the oldest records are gone
+
+
+def test_a_file_another_process_is_rotating_now_is_left_to_it(tmp_path):
+    # A second launch sets up its log while the running instance rotates: the
+    # file it set aside a moment ago is its own, not one a rotation left.
+    folder = tmp_path / logs.LOG_DIR
+    folder.mkdir()
+    aside = folder / "proteia.log.rotating"
+    aside.write_text("the running instance's newest records", encoding="utf-8")
+    logs._prune(folder, logs.BACKUPS)
+    assert aside.exists()
+    logs._prune(folder, logs.BACKUPS, now=time.time() + logs.ASIDE_GRACE_S + 1)
+    assert not aside.exists()
+
+
+def test_a_build_without_a_console_sets_up_its_log(tmp_path, monkeypatch):
+    # A windowed build has no standard streams: the console formatter must not
+    # ask them whether they are a terminal.
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    folder = tmp_path / logs.LOG_DIR
+    assert logs.setup(folder) is not None
+    try:
+        logging.getLogger("proteia.test").warning("started")
+    finally:
+        logs.shutdown()
+    assert "started" in (folder / logs.LOG_FILE).read_text(encoding="utf-8")
 
 
 # The log files, oldest first, when every one is kept.
