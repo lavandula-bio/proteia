@@ -7,8 +7,8 @@ numbers came from and how:
 
 * ``content``: the project content exactly as :func:`~proteia.core.storage.content_hash`
   hashes it: the background method, each image's SHA-256, median and polarity,
-  each protein's box size, each band's net and background, the lane table with
-  its include flags and the reference condition;
+  each protein's box size and padding, each band's net and background, the lane
+  table with its include flags and the reference condition;
 * ``content_hash``: the SHA-256 of that content, so a record verifies itself
   (``sha256(canonical_json(record["content"])) == record["content_hash"]``) with
   no Proteia and no knowledge of which keys the hash leaves out;

@@ -30,6 +30,7 @@ from proteia.core.model import (
     SCHEMA_VERSION,
     Band,
     Box,
+    BoxPadding,
     ImageKind,
     ImageRef,
     LogEntry,
@@ -386,6 +387,68 @@ def test_record_order_does_not_change_the_hash():
     for protein in doc["batch"]["proteins"]:
         protein.get("undetected", []).reverse()
     assert content_hash(Project.model_validate(doc)) == content_hash(project)
+
+
+# --- Box padding in the saved form (#57) ---
+
+
+def _padded(across: int, along: int) -> Project:
+    """The sample project with α-tubulin's 20x10 boxes padded (its fitted size
+    is the box size less the padding)."""
+    project, _ = apply_change(
+        make_project(),
+        lambda p: setattr(
+            p.batch.find_protein("prot-8"), "box_padding", BoxPadding(across=across, along=along)
+        ),
+    )
+    return project
+
+
+def test_padding_round_trips_and_resaves_byte_identical(tmp_path):
+    project = _padded(3, 2)
+    first = _saved(tmp_path / "a", project)
+    data = first.read_bytes()
+    assert data.count(b'"box_padding"') == 1  # α-tubulin's; the others have none
+    saved = json.loads(data)["batch"]["proteins"][1]
+    assert (saved["box_size"], saved["box_padding"]) == (
+        {"width": 20, "height": 10},  # the size quantified
+        {"across": 3, "along": 2},
+    )
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project
+    assert loaded.batch.find_protein("prot-8").fitted_size.model_dump() == {
+        "width": 14,
+        "height": 6,
+    }
+    assert content_hash(loaded) == content_hash(project)
+    second = _saved(tmp_path / "b", loaded)
+    assert second.read_bytes() == data
+
+
+def test_padding_moves_the_content_hash():
+    # The padding is content: the same boxes under another split between the
+    # fitted size and the padding hash differently, and so does each direction.
+    plain = content_hash(make_project())
+    hashes = {content_hash(_padded(across, along)) for across, along in [(1, 0), (0, 1), (1, 1)]}
+    assert len(hashes) == 3
+    assert plain not in hashes
+    assert "box_padding" in content_document(_padded(0, 1))["batch"]["proteins"][1]
+
+
+def test_a_zero_padding_is_never_written():
+    project = make_project()
+    doc = _doc(project)
+    assert all("box_padding" not in protein for protein in doc["batch"]["proteins"])
+    for protein in doc["batch"]["proteins"]:
+        # A hand-edited file: loads, hashes as if the key were absent, and is saved without it.
+        protein["box_padding"] = {"across": 0, "along": 0}
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)
+    assert project_to_json(loaded) == project_to_json(project)
+    # Writing the zero padding would have moved the hash of every existing project.
+    written = {key: value for key, value in doc.items() if key not in HASH_EXCLUDE}
+    assert document_hash(written) != content_hash(project)
 
 
 # --- The action log in project.json ---

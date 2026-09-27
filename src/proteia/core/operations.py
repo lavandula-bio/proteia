@@ -50,8 +50,9 @@ polarity, the bit depth and the project's background method. A band's ring
 excludes every other box on its image, so any edit that adds, moves, resizes or
 removes a box re-quantifies the whole image: :func:`place_box`,
 :func:`move_box`, :func:`remove_box`, :func:`set_box_size`,
-:func:`remove_protein`, :func:`clear_boxes` and :func:`detect_row_boxes`; a
-polarity change re-quantifies its image and :func:`requantify` every image.
+:func:`set_box_padding`, :func:`remove_protein`, :func:`clear_boxes` and
+:func:`detect_row_boxes`; a polarity change re-quantifies its image and
+:func:`requantify` every image.
 Removing an image removes its bands and changes no other image. Undo and redo
 restore a committed state whole, which met the invariant, and recompute
 nothing. A project quantified before #83 keeps the legacy method
@@ -115,6 +116,7 @@ from proteia.core.model import (
     Band,
     Batch,
     Box,
+    BoxPadding,
     BoxSize,
     ImageKind,
     ImageRef,
@@ -186,6 +188,7 @@ __all__ = [
     "LaneInput",
     "LanesUpdate",
     "OperationError",
+    "PaddingChange",
     "ProjectSession",
     "Restored",
     "RowPlacement",
@@ -210,6 +213,7 @@ __all__ = [
     "requantify",
     "save",
     "set_box_lane",
+    "set_box_padding",
     "set_box_size",
     "set_lanes",
     "set_polarity",
@@ -337,6 +341,27 @@ class ClearedBoxes:
 
     band_ids: tuple[str, ...]
     undetected: tuple[tuple[int, int], ...]  # (lane index, band index) of each dropped record
+
+
+@dataclass(frozen=True)
+class PaddingChange:
+    """What :func:`set_box_padding` did.
+
+    ``net_change`` is the smallest and the largest ``after / before - 1`` of
+    the protein's nets, over its bands with a net above 0 before; None without
+    one, or when nothing changed. ``remeasured`` and ``largest_change`` are the
+    other proteins' nets on the image the change moved, as for
+    :class:`RowPlacement`.
+    """
+
+    box_size: BoxSize  # every box of the protein after: the fitted size plus the padding
+    fitted_size: BoxSize
+    padding: BoxPadding
+    net_change: tuple[float, float] | None
+    edge_shifted: tuple[str, ...]  # its boxes the image edge kept from growing evenly
+    overlapping: tuple[str, ...]  # other proteins' boxes on the image its boxes newly overlap
+    remeasured: tuple[tuple[str, float, float], ...] = ()  # other proteins' nets it changed
+    largest_change: tuple[str, float] | None = None  # (band id, share of its net before)
 
 
 # --- Common machinery ---
@@ -538,6 +563,33 @@ def _set_box(band: Band, rect: Rect) -> None:
     band.apparent_mw = None  # position-derived (#58); stale once the box changes
 
 
+def _remeasured(
+    before: Batch, after: Batch, image_id: str, protein_id: str
+) -> tuple[tuple[tuple[str, float, float], ...], tuple[str, float] | None]:
+    """The other proteins' bands on an image whose net a change of one protein's
+    boxes moved (their rings leave out its boxes), as ``(band id, net before,
+    net after)``, protein by protein and band by band as stored; and the band
+    among them whose net changed by the largest share of its net before,
+    ``(band id, |after - before| / before)``, None when none had a net before.
+    A no-op, ``after`` the same as ``before``, moves none."""
+    nets = {
+        band.id: band.net
+        for other in after.proteins
+        if other.image_id == image_id and other.id != protein_id
+        for band in other.bands
+    }
+    remeasured = tuple(
+        (band.id, band.net, nets[band.id])
+        for other in before.proteins
+        if other.image_id == image_id and other.id != protein_id
+        for band in other.bands
+        if nets[band.id] != band.net
+    )
+    shares = [(abs(new - old) / old, band_id) for band_id, old, new in remeasured if old > 0]
+    largest = max(shares, key=lambda share: share[0], default=None)
+    return remeasured, None if largest is None else (largest[1], largest[0])
+
+
 # --- Input checks ---
 
 
@@ -656,16 +708,36 @@ def _loading_controls(batch: Batch, protein_id: str | None, role: Role, ids: obj
     return chosen
 
 
-def _fitting_size(size: object, image: ImageRef) -> BoxSize:
+def _box_size(size: object) -> BoxSize:
     if not isinstance(size, BoxSize):
         raise _invalid(f"box size must be a BoxSize, not {size!r}")
+    return size
+
+
+def _within(size: BoxSize, image: ImageRef, pad: BoxPadding = boxes.NO_PADDING) -> BoxSize:
+    """``size``, a protein's boxes under the padding ``pad``, if the image holds
+    it; else ``SIZE_OUT_OF_BOUNDS``, naming the fitted size and the padding."""
     if size.width > image.width or size.height > image.height:
         raise OperationError(
             ErrorCode.SIZE_OUT_OF_BOUNDS,
-            f"box size {size.width}x{size.height} exceeds the"
+            f"box size {boxes.size_words(size, pad)} exceeds the"
             f" {image.width}x{image.height} image {image.id}",
         )
     return size
+
+
+def _fitting_size(size: object, image: ImageRef) -> BoxSize:
+    return _within(_box_size(size), image)
+
+
+# A padding's directions, as (BoxPadding field, in words, the BoxSize field it pads).
+_PADDING: Final = (("across", "left and right", "width"), ("along", "above and below", "height"))
+_WHERE: Final = {name: where for name, where, _ in _PADDING}
+
+
+def _padded(fitted: BoxSize, pad: BoxPadding) -> BoxSize:
+    """The boxes' size: ``fitted`` plus ``pad`` on each side."""
+    return BoxSize(width=fitted.width + 2 * pad.across, height=fitted.height + 2 * pad.along)
 
 
 def _loading_control_ids(batch: Batch) -> list[str]:
@@ -1313,12 +1385,14 @@ def place_box(
     boxes never changes it.
 
     ``grow=True`` is a seed click: the band is grown from the point and the
-    protein's shared size fitted to it (the first box sets the size, later ones
-    only grow it, and the other boxes are re-centred).
-    ``grow=False`` drops a box of the current size centred on the point, shifted
-    inside the image. A protein's own boxes never overlap. Every band on the
-    image, of every protein, is then re-quantified: the new box leaves every
-    ring.
+    protein's shared size fitted to it (the first box sets the fitted size,
+    later ones only grow it, and the other boxes are re-centred); the
+    protein's padding (:func:`set_box_padding`) is added to the fitted size and
+    stays, even if it is then more than half of it.
+    ``grow=False`` drops a box of the current size, padding included, centred
+    on the point, shifted inside the image. A protein's own boxes never
+    overlap. Every band on the image, of every protein, is then re-quantified:
+    the new box leaves every ring.
 
     A not-detected record in the lane is replaced by the box, with no
     confirmation: the log entry names it (``replaced_undetected``, else null).
@@ -1372,7 +1446,7 @@ def place_box(
             raise OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})")
         try:
             size, resized, rect = boxes.grow_to_fit(
-                rects, protein.box_size, grown, width=width, height=height
+                rects, protein.box_size, grown, width=width, height=height, pad=protein.box_padding
             )
         except boxes.BoxRuleError as exc:  # overlap, or size_would_overlap
             raise OperationError(ErrorCode(exc.code), str(exc)) from exc
@@ -1530,28 +1604,59 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
 
 @_locked
 def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> None:
-    """Change a protein's shared box size: every box is re-sized around its centre
-    (shifted inside the image), and every band on the image is re-quantified
-    (the other proteins' rings leave out the resized boxes). A size that would
-    make boxes overlap is refused."""
+    """Change a protein's fitted size. Its boxes become that size plus its
+    padding (:func:`set_box_padding`) on each side: every box is re-sized around
+    its centre (shifted inside the image), and every band on the image is
+    re-quantified (the other proteins' rings leave out the resized boxes). A
+    typed fitted size is kept until the next fit that needs more, the next seed
+    click on the protein while it has no box, or the next row that keeps none of
+    its boxes. The same fitted size is a no-op.
+
+    Refused, changing nothing: ``size`` not a :class:`~proteia.core.model.BoxSize`
+    or smaller than the fitted size in a dimension where the padding would then
+    be more than half of it (``INVALID_INPUT``: type at least twice the padding,
+    or lower the padding first, which only a protein with a box can); boxes
+    beyond the image (``SIZE_OUT_OF_BOUNDS``) or overlapping each other
+    (``SIZE_WOULD_OVERLAP``). The log entry holds the size used (``box_size``)
+    and the fitted size typed (``fitted_size``)."""
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     image = batch.find_image(protein.image_id)
-    size = _fitting_size(size, image)
-    if size == protein.box_size:
+    size = _box_size(size)
+    fitted, pad = protein.fitted_size, protein.box_padding
+    if size == fitted:
         return
+    for typed, current, (name, where, dimension) in zip(
+        (size.width, size.height), (fitted.width, fitted.height), _PADDING, strict=True
+    ):
+        padding = getattr(pad, name)
+        if typed < current and 2 * padding > typed:
+            larger = f"type a {dimension} of at least {2 * padding}"
+            if protein.bands:  # without a box, set_box_padding refuses to lower it
+                lower = (
+                    f"lower that padding to {typed // 2} px or less"
+                    if typed > 1
+                    else "remove that padding"
+                )
+                larger = f"{lower} first, or {larger}"
+            raise _invalid(
+                f"a fitted {dimension} of {typed} px would leave the {padding} px of padding"
+                f" {where} more than half of it; {larger}"
+            )
+    effective = _within(_padded(size, pad), image, pad)
     rects = [band.box.rect(protein.box_size) for band in protein.bands]
-    resized = boxes.resize_all(rects, size, width=image.width, height=image.height)
+    resized = boxes.resize_all(rects, effective, width=image.width, height=image.height)
     if resized is None:
         raise OperationError(
             ErrorCode.SIZE_WOULD_OVERLAP,
-            f"box size {size.width}x{size.height} would make boxes of {protein.name!r} overlap",
+            f"box size {boxes.size_words(effective, pad)} would make boxes of"
+            f" {protein.name!r} overlap",
         )
     array = session.pixels(image.id) if protein.bands else None
 
     def change(draft: Project) -> None:
         edited = draft.batch.find_protein(protein_id)
-        edited.box_size = size
+        edited.box_size = effective
         for band, old, new in zip(edited.bands, rects, resized, strict=True):
             if new != old:
                 _set_box(band, new)
@@ -1562,7 +1667,182 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
         session,
         "set_box_size",
         change,
-        lambda _: {"protein_id": protein_id, "box_size": _size(size)},
+        lambda _: {
+            "protein_id": protein_id,
+            "box_size": _size(effective),
+            "fitted_size": _size(size),
+        },
+    )
+
+
+def _padding_overlap(
+    protein: Protein,
+    rects: Sequence[Rect],
+    old: BoxPadding,
+    new: BoxPadding,
+    clashing: Sequence[int],
+    image: ImageRef,
+) -> OperationError:
+    """The refusal of a padding ``new`` that makes the protein's boxes (at
+    ``rects`` now, under ``old``) overlap, the boxes ``clashing`` named. It names
+    the direction raised (left and right if raising it alone makes boxes
+    overlap), and the most that fits of it, the other held as asked, when any
+    does: overlap only grows with a padding, so a bisection finds it."""
+    fitted = protein.fitted_size
+
+    def fits(pad: BoxPadding) -> bool:
+        _, hits = boxes.resize_checked(
+            rects, _padded(fitted, pad), width=image.width, height=image.height
+        )
+        return not hits
+
+    raised = [name for name, _, _ in _PADDING if getattr(new, name) > getattr(old, name)]
+    alone = BoxPadding(across=new.across, along=old.along)
+    name = "across" if raised == ["across"] or ("across" in raised and not fits(alone)) else "along"
+    other = "along" if name == "across" else "across"
+    value = getattr(new, name)
+
+    def at(v: int) -> BoxPadding:
+        return BoxPadding(**{**new.model_dump(), name: v})
+
+    most = None
+    if fits(at(0)):
+        most, over = 0, value  # fits(at(most)); not fits(at(over))
+        while over - most > 1:
+            mid = (most + over) // 2
+            most, over = (mid, over) if fits(at(mid)) else (most, mid)
+    held = ""
+    if other in raised:
+        held = f", with {getattr(new, other)} px {_WHERE[other]},"
+    lanes = lanes_phrase({protein.bands[i].lane_index for i in clashing})
+    message = (
+        f"{value} px of padding {_WHERE[name]}{held} would make the boxes of"
+        f" {protein.name!r} in {lanes} overlap"
+    )
+    if most is not None:
+        message += f"; at most {most} px fits"
+    return OperationError(
+        ErrorCode.SIZE_WOULD_OVERLAP, message, ids=[protein.bands[i].id for i in clashing]
+    )
+
+
+@_locked
+def set_box_padding(
+    session: ProjectSession,
+    protein_id: str,
+    *,
+    across: int | Keep = KEEP,
+    along: int | Keep = KEEP,
+) -> PaddingChange:
+    """Set how far every box of a protein extends beyond its fitted size, in
+    whole pixels on each side: ``across`` left and right, ``along`` above and
+    below; ``KEEP`` leaves one unchanged. The fitted size is kept. Every box is
+    re-sized to fitted + 2 * padding around its own centre, so each lane's box
+    keeps its place in the row. A box the image edge stops is shifted inside it
+    (``edge_shifted``). Every band on the image is re-quantified. A padding may
+    be raised only to half the fitted size and lowered at any time, and only
+    once the protein has a box. Later clicks, row boxes and MW placement fit the
+    fitted size and keep the padding. The same padding is a no-op.
+
+    Refused, in this order, changing nothing: a given value not an integer, or
+    below 0 (``INVALID_INPUT``); then, unless the padding is the same (a no-op,
+    even when a fit has left it above half), a protein with no box, or a value
+    raised above half its fitted size (``INVALID_INPUT``); boxes beyond the
+    image (``SIZE_OUT_OF_BOUNDS``); the protein's own boxes overlapping
+    (``SIZE_WOULD_OVERLAP``, with those boxes, and the most of the raised
+    direction that fits); an image file changed or unreadable. Other proteins'
+    boxes may overlap its boxes: they are reported (``overlapping``), not
+    refused. No box counts as edited by the user: the padding is a protein-level
+    setting.
+
+    The log entry holds both directions as they took effect and the size used.
+    """
+    batch = session.project.batch
+    protein = batch.find_protein(protein_id)
+    given = {"across": across, "along": along}
+    wanted = {
+        name: _int(given[name], f"padding {where}")
+        for name, where, _ in _PADDING
+        if given[name] is not KEEP
+    }
+    for name, value in wanted.items():
+        if value < 0:
+            raise _invalid(f"padding {_WHERE[name]} must be 0 or more, not {value}")
+    old = protein.box_padding
+    new = BoxPadding(**{**old.model_dump(), **wanted})
+    fitted = protein.fitted_size
+    if new == old:
+        return PaddingChange(
+            box_size=protein.box_size.model_copy(),
+            fitted_size=fitted,
+            padding=old.model_copy(),
+            net_change=None,
+            edge_shifted=(),
+            overlapping=(),
+        )
+    if not protein.bands:
+        raise _invalid(
+            f"place a box of {protein.name!r} first: its padding follows the fitted size the"
+            " bands set"
+        )
+    for name, where, dimension in _PADDING:
+        value, half = getattr(new, name), getattr(fitted, dimension) // 2
+        if value > getattr(old, name) and value > half:
+            raise _invalid(
+                f"padding {where} can be raised to at most {half} px for {protein.name!r}"
+                f" (half its fitted {dimension}, {getattr(fitted, dimension)} px), not {value}"
+            )
+    image = batch.find_image(protein.image_id)
+    size = _within(_padded(fitted, new), image, new)
+    rects = [band.box.rect(protein.box_size) for band in protein.bands]
+    resized, clashing = boxes.resize_checked(rects, size, width=image.width, height=image.height)
+    if clashing:
+        raise _padding_overlap(protein, rects, old, new, clashing, image)
+    array = session.pixels(image.id)
+
+    def change(draft: Project) -> None:
+        edited = draft.batch.find_protein(protein_id)
+        edited.box_padding = new.model_copy()
+        edited.box_size = size
+        for band, before, after in zip(edited.bands, rects, resized, strict=True):
+            if after != before:
+                _set_box(band, after)
+        _quantify_image(draft, edited.image_id, array)
+
+    params = {
+        "protein_id": protein_id,
+        "box_padding": {"across": new.across, "along": new.along},
+        "box_size": _size(size),
+    }
+    _apply(session, "set_box_padding", change, lambda _: params)
+
+    after = session.project.batch
+    nets = {band.id: band.net for band in after.find_protein(protein_id).bands}
+    changes = [nets[band.id] / band.net - 1 for band in protein.bands if band.net > 0]
+    da, dl = new.across - old.across, new.along - old.along
+    shifted = tuple(
+        band.id
+        for band, (x0, y0, x1, y1), rect in zip(protein.bands, rects, resized, strict=True)
+        if rect != (x0 - da, y0 - dl, x1 + da, y1 + dl)
+    )
+    others = [
+        band.id
+        for other in batch.proteins
+        if other.image_id == image.id and other.id != protein_id
+        for band in other.bands
+        if boxes.overlaps_any(band.box.rect(other.box_size), resized)
+        and not boxes.overlaps_any(band.box.rect(other.box_size), rects)
+    ]
+    remeasured, largest = _remeasured(batch, after, image.id, protein_id)
+    return PaddingChange(
+        box_size=size,
+        fitted_size=fitted,
+        padding=new,
+        net_change=(min(changes), max(changes)) if changes else None,
+        edge_shifted=shifted,
+        overlapping=tuple(others),
+        remeasured=remeasured,
+        largest_change=largest,
     )
 
 
@@ -1571,13 +1851,14 @@ def clear_boxes(session: ProjectSession, protein_id: str) -> ClearedBoxes:
     """Remove every box and every not-detected record of a protein, of every band
     index, in one change; undo is the way back.
 
-    The protein's box size is kept (the width and height fields show it). A seed
-    click or a row box on the protein, which then has no boxes, sets the size
-    afresh from the band or bands found; a fixed box uses the kept size. A
-    protein with neither boxes nor records is a no-op. The other proteins'
-    bands on the image are re-quantified: their rings no longer leave out the
-    boxes. The log entry lists the band ids with their lanes, and the records
-    in full (``dropped_undetected``).
+    The protein's box size and padding are kept (the width and height fields
+    show the fitted size). A seed click or a row box on the protein, which then
+    has no boxes, sets the fitted size afresh from the band or bands found, and
+    the padding stays even if it is then more than half of it; a fixed box uses
+    the kept size. A protein with neither boxes nor records is a no-op. The
+    other proteins' bands on the image are re-quantified: their rings no longer
+    leave out the boxes. The log entry lists the band ids with their lanes, and
+    the records in full (``dropped_undetected``).
     """
     protein = session.project.batch.find_protein(protein_id)
     removed = [band.id for band in protein.bands]
@@ -1880,17 +2161,19 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
 
     Boxes and records of another band index are left alone.
 
-    The shared size is the detector's. If a box of the protein survives (one
-    kept, or of another band index), the size only grows, as a seed
-    click grows it, even when every band found is in a kept lane and nothing is
-    placed: the survivors are re-centred and the new boxes centred on the
-    detected ones. That size making survivors overlap, or new boxes overlap
+    The detector's size is the fitted size; the protein's padding
+    (:func:`set_box_padding`) is added to it, on each side. If a box of the
+    protein survives (one kept, or of another band index), the size only grows,
+    as a seed click grows it, even when every band found is in a kept lane and
+    nothing is placed: the survivors are re-centred and the new boxes centred on
+    the detected ones. That size making survivors overlap, or new boxes overlap
     each other, is refused (``SIZE_WOULD_OVERLAP``), and so is a new box over a
     survivor (``OVERLAP``, with the survivor). If none survives, this detection
-    sets the size afresh. A box may then extend beyond
-    the row box, never beyond the image. Every band on the image, of every
-    protein, is then re-quantified with the project's background method; the
-    detector's own local background only finds the bands.
+    sets the fitted size afresh, and the padding stays, even if it is then more
+    than half of it. A box may then extend beyond the row box, never beyond the
+    image. Every band on the image, of every protein, is then re-quantified
+    with the project's background method; the detector's own local background
+    only finds the bands.
 
     The lanes already placed on the image are its first-band boxes, of any
     protein and from any source (:func:`~proteia.core.project.lane_anchors`),
@@ -2059,9 +2342,11 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     survivors = [b.id for b in surviving]
     old = [b.box.rect(protein.box_size) for b in surviving]
     placed = [lane for lane in found.lanes if lane.rect is not None and lane.lane not in kept]
+    pad = protein.box_padding
     try:
-        # The detector's size; while a box survives it only grows the size, even
-        # if every band found is in a kept lane and nothing is placed.
+        # The detector's size, the fitted size, plus the protein's padding; while
+        # a box survives it only grows the size, even if every band found is in a
+        # kept lane and nothing is placed.
         size, resized, new_rects = boxes.grow_to_fit_all(
             old,
             protein.box_size,
@@ -2069,9 +2354,10 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             need=found.size,
             width=width,
             height=height,
+            pad=pad,
         )
     except boxes.BoxRuleError as exc:
-        grown = f"{exc.size.width}x{exc.size.height}"
+        grown = boxes.size_words(exc.size, pad)
         if exc.code == "overlap":
             raise OperationError(
                 ErrorCode.OVERLAP,
@@ -2083,11 +2369,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                 f"box size {grown} would make the boxes of {protein.name!r}"
                 " that the row keeps overlap"
             )
-        else:  # the new boxes do
-            message = (
-                f"the row's boxes would overlap each other at the box size {grown}"
-                f" that the kept boxes of {protein.name!r} need"
-            )
+        else:  # the new boxes do: at the size the kept boxes need, or under the padding
+            message = f"the row's boxes would overlap each other at the box size {grown}"
+            if surviving:
+                message += f" that the kept boxes of {protein.name!r} need"
+        if pad.across:
+            message += "; lower the padding left and right"
         raise OperationError(ErrorCode.SIZE_WOULD_OVERLAP, message) from exc
     rects = {lane.lane: rect for lane, rect in zip(placed, new_rects, strict=True)}
     records = [
@@ -2185,23 +2472,9 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         }
 
     band_ids, _, _, _ = _apply(session, "detect_row_boxes", change, params)
-    # The other proteins' nets on the image the row changed (their rings leave
-    # out its boxes); the same drag again, a no-op, changes none.
-    after = {
-        band.id: band.net
-        for other in session.project.batch.proteins
-        if other.image_id == image.id and other.id != protein_id
-        for band in other.bands
-    }
-    remeasured = tuple(
-        (band.id, band.net, after[band.id])
-        for other in batch.proteins
-        if other.image_id == image.id and other.id != protein_id
-        for band in other.bands
-        if after[band.id] != band.net
-    )
-    shares = [(abs(new - old) / old, band_id) for band_id, old, new in remeasured if old > 0]
-    largest = max(shares, key=lambda share: share[0], default=None)
+    # The other proteins' nets on the image the row changed; the same drag
+    # again, a no-op, changes none.
+    remeasured, largest = _remeasured(batch, session.project.batch, image.id, protein_id)
     empty = tuple(
         (lane.lane, lane.reason, lane.snr, lane.expected_x)
         for lane in found.lanes
@@ -2223,7 +2496,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         notes=found.notes,
         right_to_left=right_to_left,
         remeasured=remeasured,
-        largest_change=None if largest is None else (largest[1], largest[0]),
+        largest_change=largest,
     )
 
 
