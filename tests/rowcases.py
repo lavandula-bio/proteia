@@ -416,6 +416,79 @@ def hstripe(half_h: float, depth: float) -> Artefact:
     return f
 
 
+def frame(dy: float, px: int, depth: float, *, dx: float = 50.0, slope: float = 0.0) -> Artefact:
+    """A panel's drawn frame: sharp lines ``px`` px thick, ``dy`` px above and
+    below the row's mean band height, joined by sides ``dx`` px outside the
+    end lanes' centres. ``slope`` tilts the lines about the row's centre (a
+    scan turned a little); the sides run between them."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        cy = float(np.mean(lcy))
+        shift = slope * (X - 0.5 * (lcx[0] + lcx[-1]))
+        top, bottom = np.floor(cy - dy + shift), np.floor(cy + dy + shift)
+        left, right = math.floor(lcx[0] - dx), math.floor(lcx[-1] + dx)
+        across = (X >= left) & (X < right + px)
+        down = (Y >= top) & (Y < bottom + px)
+        lines = ((Y >= top) & (Y < top + px)) | ((Y >= bottom) & (Y < bottom + px))
+        sides = ((X >= left) & (X < left + px)) | ((X >= right) & (X < right + px))
+        return depth * ((across & lines) | (down & sides))
+
+    return f
+
+
+def bottom_strip(rows: int, depth: float, fade: float = 0.25) -> Artefact:
+    """A dark strip over the image's bottom ``rows`` rows, across its whole
+    width (a screenshot's toolbar): ``depth`` on its top row, fading by
+    ``fade`` of that to the image's last row."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        top = Y.max() + 1 - rows
+        return depth * (Y >= top) * (1.0 - fade * (Y - top) / max(1, rows - 1)) + 0 * X
+
+    return f
+
+
+def dark_edge(cols: int, depth: float) -> Artefact:
+    """The image's right edge darkening over its last ``cols`` columns, to
+    ``depth`` on its last one (a vignetted scan)."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        ramp = np.clip((X - (X.max() - cols)) / cols, 0.0, 1.0)
+        return depth * ramp**2 + 0 * Y
+
+    return f
+
+
+def shade_above(end: int, rows: int, depth: float) -> Artefact:
+    """The membrane darkening over the ``rows`` rows above image row ``end``,
+    to ``depth`` on the last of them, across the whole width: a vignetted
+    scan whose image ends at ``end`` (cut it there with :func:`image_cut`)."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        ramp = np.clip((Y - (end - 1 - rows)) / rows, 0.0, 1.0)
+        return depth * ramp**2 * (Y < end) + 0 * X
+
+    return f
+
+
+def image_cut(case: RowCase, *, top: int = 0, bottom: int | None = None) -> RowCase:
+    """``case`` with its image cut to the rows ``[top, bottom)`` and its row
+    box dragged to each cut (to the image's new top or bottom row), as over a
+    tightly cropped image; the reference and the lanes' heights move with the
+    image."""
+    x0, y0, x1, y1 = case.row
+    end = case.image.shape[0] if bottom is None else bottom
+    return dataclasses.replace(
+        case,
+        image=case.image[top:end],
+        row=(x0, 0 if top else y0, x1, (end if bottom is not None else y1) - top),
+        reference={
+            lane: (r[0], r[1] - top, r[2], r[3] - top) for lane, r in case.reference.items()
+        },
+        lane_cy=tuple(cy - top for cy in case.lane_cy),
+    )
+
+
 # The judge's recipes the tests use (seeds 1000 and up, as the judge ran them),
 # then rows of the tests' own.
 ADVERSARIAL: dict[str, dict] = {

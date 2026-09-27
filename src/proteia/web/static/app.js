@@ -1044,10 +1044,13 @@ function lanesPhrase(indices) {
 // Why a row left a lane with neither a box nor an n.d. mark, by the
 // detector's reason for the empty lane (LaneReason in core/rowdetect.py). A
 // lane where no band reaches the detection limit (no_band) gets an n.d. mark,
-// unless its place lies outside the row box.
+// unless its place lies outside the row box, or rests on the one band the row
+// found (the answer's unlocated_lanes, worded apart).
 const NOT_MEASURED = {
   artefact: "a stain or streak",
+  line: "a line or strip across the lanes",
   edge_signal: "only signal at the row box's top or bottom edge",
+  side_signal: "only signal at the row box's left or right edge",
   unassigned: "signal that fits no lane",
   no_band: "outside the row box",
 };
@@ -1157,13 +1160,20 @@ function rowReport(answer, name, before) {
     const boxes = yours.length === 1 ? "box" : "boxes";
     parts.push(`kept your ${boxes} in ${lanesPhrase(yours)} (no band found)`);
   }
+  const unlocated = new Set(answer.unlocated_lanes);
   const unmeasured = new Map(); // reason -> lanes
-  for (const lane of answer.unmeasured_lanes) {
+  for (const lane of answer.unmeasured_lanes.filter((index) => !unlocated.has(index))) {
     const reason = empty.has(lane) ? empty.get(lane).reason : "";
     unmeasured.set(reason, [...(unmeasured.get(reason) || []), lane]);
   }
   for (const [reason, lanes] of unmeasured) {
     parts.push(`${lanesPhrase(lanes)} not measured: ${NOT_MEASURED[reason] || reason}`);
+  }
+  if (unlocated.size) {
+    parts.push(
+      `${lanesPhrase([...unlocated])} not recorded: one band cannot show where the other` +
+        " lanes lie",
+    );
   }
   if (answer.removed_band_ids.length) {
     const was = answer.removed_band_ids.map((id) => (before ? findBox(before, id) : null));

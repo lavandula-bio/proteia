@@ -553,6 +553,7 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
         "largest_change": None
         if largest is None
         else {"band_id": largest[0], "change": largest[1]},
+        "unlocated_lanes": list(placement.unlocated_lanes),
     }
 
 

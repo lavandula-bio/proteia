@@ -2498,6 +2498,7 @@ def test_a_row_box_boxes_every_lane_and_answers_the_nets_and_the_chart(client, t
         # The loading control's row lies beyond every ring the new boxes change.
         "remeasured": [],
         "largest_change": None,
+        "unlocated_lanes": [],
     }
 
     # The nets of the new boxes and the chart they make, in the same answer.
@@ -2563,6 +2564,28 @@ def test_a_lane_without_a_band_gets_a_not_detected_record(client, tmp_path):
     assert "below_detection" in notice_codes(answer)
     assert bar(only_series(answer), "10 µM")["lane_indices"] == [3, 4]
     assert logged(client)[-1] == "detect_row_boxes"
+
+
+def test_one_band_on_an_image_without_lanes_placed_answers_the_lanes_it_cannot_locate(
+    client, tmp_path
+):
+    # The target's band in lane 2 alone and nothing else boxed on the image:
+    # the other lanes' slots rest on that one band, so they get no record, and
+    # the answer names them apart from the lanes not measured for a reason of
+    # the detector's.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    depths = (0.0, 0.0, 30000.0, 0.0, 0.0)
+    status, answer = upload(client, two_row_bytes(tmp_path, depths, (25000.0,) * 5))
+    assert status == 201, answer
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": c} for c in DOSES]})
+    body = {"name": "β-catenin", "role": "target", "image_id": answer["image_id"], "box_size": SIZE}
+    target = client.ok("POST", "/api/proteins", body)["protein_id"]
+    answer = drag(client, target)
+    assert [lane for lane, band_id in enumerate(answer["band_ids"]) if band_id] == [2]
+    assert (answer["undetected_lanes"], answer["unlocated_lanes"]) == ([], [0, 1, 3, 4])
+    assert answer["unmeasured_lanes"] == [0, 1, 3, 4]
+    assert {entry["reason"] for entry in answer["empty"]} == {"no_band"}
+    assert protein_of(answer, target)["undetected"] == []
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary

@@ -58,7 +58,13 @@ from rowcases import (
     band_between,
     bench_cases,
     blob,
+    bottom_strip,
+    dark_edge,
+    frame,
     fuzz_row,
+    hstripe,
+    image_cut,
+    shade_above,
     synthetic_row,
 )
 
@@ -1003,6 +1009,344 @@ def test_flag_vocabulary():
     for name in INVARIANT_CASES:
         seen.update(_detected(name).flags)
     assert seen <= set(REFUSING_FLAGS) | set(WARNING_FLAGS)
+
+
+# --- #116: lines, strips and edges that are not bands ---
+
+
+def _framed(dy: int, px: int) -> RowCase:
+    """A row with lane 2 empty inside a panel's drawn frame, lines ``px`` px
+    thick ``dy`` px above and below the bands' centres, and a box drawn over
+    the whole frame, its sides included."""
+    return adversarial_row(
+        "framed",
+        1000,
+        missing=[2],
+        artefacts=[frame(dy, px, 20000.0)],
+        box_adjust=(-30, -(dy - 4), 30, dy - 4),
+    )
+
+
+def _rules_off(monkeypatch) -> None:
+    """Detection without #116's rules: no line, no piece rising into a side."""
+    monkeypatch.setattr(rowdetect, "_lines", lambda s, *_: np.zeros(s.shape, bool))
+    monkeypatch.setattr(rowdetect, "_rises_to_side", lambda *_: False)
+
+
+@pytest.mark.parametrize(
+    ("dy", "px"),
+    [(16, 2), (16, 1), (16, 4), (10, 2)],
+    ids=["frame", "hairline", "thick-line", "close-to-the-bands"],
+)
+def test_frame_lines_across_the_row_are_no_bands(monkeypatch, dy, px):
+    # The lines cross every gap between the lanes: taken out, they leave each
+    # band its box and the empty lane unmeasured (a band may lie under a
+    # line), as the same row without the frame is boxed.
+    case = _framed(dy, px)
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert found.lanes[2].reason == "line"
+    unframed = adversarial_row("unframed", 1000, missing=[2])
+    assert found.size == detect(unframed).size
+    assert "multiple_components" not in found.flags
+    # Without the rule the frame takes boxes: the empty lane's, on a line.
+    _rules_off(monkeypatch)
+    off = detect(case)
+    assert off.lanes[2].rect is not None and off.size != found.size
+
+
+def test_a_frame_around_empty_lanes_is_no_band():
+    # Each of the frame's lines lies beside the other, where a row of thin
+    # touching bands lies beside nothing: a box over a frame and no band finds
+    # nothing.
+    case = adversarial_row(
+        "empty frame",
+        1000,
+        missing=range(6),
+        artefacts=[frame(16, 2, 20000.0)],
+        box_adjust=(-30, -12, 30, 12),
+    )
+    found = detect(case)
+    assert found.size is None
+    assert [lane.reason for lane in found.lanes] == ["line"] * 6
+
+
+@pytest.mark.parametrize("degrees", [0.75, 1.5, 2.0])
+def test_a_frame_turned_a_little_is_no_band(degrees):
+    # A scan turned by a degree or two: the frame's lines drift 2 to 6 px
+    # across the rows over two pitches, and still hold their level within
+    # half a line's height up or down.
+    case = adversarial_row(
+        "tilted frame",
+        1000,
+        missing=[2],
+        artefacts=[frame(16, 2, 20000.0, slope=math.tan(math.radians(degrees)))],
+        box_adjust=(-30, -12, 30, 12),
+    )
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert found.lanes[2].reason == "line"
+
+
+@pytest.mark.parametrize(
+    ("dy", "missing"), [(10, [0, 5]), (9, [2])], ids=["end-lanes-empty", "closer"]
+)
+def test_a_hairline_just_past_the_bands_is_no_band(dy, missing):
+    # A 1 px frame line 3-4 px past the bands' 20% extents: where a band's
+    # tail crosses it, the tail lifts its edge row and breaks it over the
+    # band's width, yet it runs on across the lanes. The empty lanes are not
+    # boxed on it (the piece under the bands' tails stays with them).
+    case = adversarial_row(
+        "hairline",
+        1000,
+        missing=missing,
+        artefacts=[frame(dy, 1, 20000.0)],
+        box_adjust=(-30, -(dy - 4), 30, dy - 4),
+    )
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert [found.lanes[lane].reason for lane in missing] == ["line"] * len(missing)
+    unframed = adversarial_row("unframed", 1000, missing=missing)
+    assert found.size == detect(unframed).size
+
+
+def test_a_dark_strip_along_the_image_edge_is_no_row_of_bands(monkeypatch):
+    # A screenshot's toolbar along the image's bottom, darkest at its top: a
+    # box over it finds nothing, where without the rule the strip was cut
+    # into one box per lane.
+    case = adversarial_row(
+        "strip",
+        1000,
+        missing=range(6),
+        artefacts=[bottom_strip(14, 20000.0)],
+        box_adjust=(0, 52, 0, 80),
+    )
+    assert case.row[3] == case.image.shape[0]  # the box reaches the image's bottom row
+    found = detect(case)
+    assert found.size is None
+    assert [lane.reason for lane in found.lanes] == ["line"] * 6
+    _rules_off(monkeypatch)
+    assert detect(case).slots.count(None) == 0
+
+
+def test_bands_above_a_dark_strip_keep_their_boxes():
+    case = adversarial_row(
+        "strip row",
+        1000,
+        missing=[2],
+        artefacts=[bottom_strip(14, 20000.0)],
+        box_adjust=(0, 0, 0, 80),
+    )
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert found.lanes[2].reason == "line"
+
+
+def test_a_dark_image_edge_on_a_faint_row_is_no_band(monkeypatch):
+    # Bands too faint to detect, and the image darkening into its right edge,
+    # which the box reaches: nothing is boxed, where without the rule the edge
+    # was boxed as the last lane's band (and the other lanes' slots rested on
+    # that one box).
+    case = adversarial_row(
+        "edge",
+        1000,
+        depth_range=(300.0, 300.0),
+        artefacts=[dark_edge(30, 1500.0)],
+        box_adjust=(0, 0, 200, 0),
+    )
+    assert case.row[2] == case.image.shape[1]  # the box reaches the image's right edge
+    found = detect(case)
+    assert found.size is None and found.lanes[-1].reason != "band"
+    _rules_off(monkeypatch)
+    off = detect(case)
+    assert off.slots[:-1] == (None,) * 5 and off.slots[-1][2] == case.row[2]
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_band_the_box_side_cuts_past_its_centre_is_read_but_not_boxed(side):
+    # The box's side edge runs 8 px beyond the end band's centre: its piece
+    # rises into the edge, so its lane is read (the others keep their lanes)
+    # but gets no box, and the box leaves out most of that lane.
+    base = adversarial_row("side", 1000)
+    x0, y0, x1, y1 = base.row
+    if side == "left":
+        lane, row = 0, (math.ceil(base.lane_cx[0]) + 8, y0, x1, y1)
+    else:
+        lane, row = 5, (x0, y0, math.floor(base.lane_cx[-1]) - 8, y1)
+    found = detect(dataclasses.replace(base, row=row))
+    assert (found.lanes[lane].reason, found.lanes[lane].rect) == ("side_signal", None)
+    assert found.flags == ("lanes_outside_row",)
+    for other in set(range(6)) - {lane}:
+        assert iou(found.lanes[other].rect, base.reference[other]) >= 0.5
+
+
+@pytest.mark.parametrize(
+    ("depth", "dx"),
+    [(None, 5), (None, 0), (80000.0, 0)],
+    ids=["peak-inside", "edge-at-centre", "saturated-top-to-the-edge"],
+)
+def test_a_band_the_box_side_only_trims_keeps_its_box(depth, dx):
+    # A band whose top lies inside the box, or runs on inside it (flat-topped,
+    # or clipped flat by saturation), however the edge trims it.
+    base = adversarial_row("side", 1000, depths=None if depth is None else {5: depth})
+    x0, y0, _, y1 = base.row
+    found = detect(dataclasses.replace(base, row=(x0, y0, math.floor(base.lane_cx[-1]) + dx, y1)))
+    assert [lane.reason for lane in found.lanes] == ["band"] * 6
+
+
+def test_rising_into_a_side_is_read_on_the_profile_at_the_edge():
+    ramp = np.linspace(0.0, 10.0, 40)
+    assert rowdetect._rises_to_side(ramp, False, 10)
+    assert rowdetect._rises_to_side(ramp[::-1], True, 10)
+    assert not rowdetect._rises_to_side(ramp, True, 10)  # it peaks at the far end
+    plateau = np.concatenate([np.linspace(0.0, 10.0, 10), np.full(30, 10.0)])
+    assert not rowdetect._rises_to_side(plateau, False, 10)  # a flat top runs on inside
+    hump = np.concatenate([np.linspace(0.0, 10.0, 20), np.linspace(10.0, 9.0, 5)])
+    assert not rowdetect._rises_to_side(hump, False, 10)  # it peaks inside
+
+
+_TOUCHING = {"pitch": 48.0, "w": 60.0, "depth_range": (22000.0, 26000.0)}
+_SATURATED_TOUCHING = {"pitch": 48.0, "w": 60.0, "depth_range": (75000.0, 80000.0)}
+
+# Rows whose bands run together along x, flat or nearly (no dip between them,
+# or saturated), thick or thin, alone in the box or with the image's top or
+# bottom edge a few px past them or through them: #116's rules leave them
+# exactly as they were.
+UNCHANGED_ROWS = {
+    "touching": BENCH["touching"],
+    "overexposed": BENCH["overexposed"],
+    "touch12": adversarial_row("touch12", 1036, n=12, pitch=40.0, w=44.0, h=12.0, mx=4, my=3),
+    "touching_weak_end": adversarial("touching_weak_end", 1000),
+    "saturated_touching": adversarial_row(
+        "saturated touching", 1000, pitch=48.0, w=60.0, depth_range=(75000.0, 80000.0)
+    ),
+    "saturated_touching_thin": adversarial_row(
+        "thin saturated touching", 1000, pitch=48.0, w=60.0, h=6.0, depth_range=(75000.0, 80000.0)
+    ),
+    "saturated_filling_the_box": adversarial_row(
+        "thick", 1000, h=30.0, pitch=48.0, w=60.0, depth_range=(75000.0, 80000.0), my=0
+    ),
+    "bloom": adversarial_row("bloom", 1000, depths={2: 80000.0}, widths={2: 62.0}, missing=[3]),
+    "thin_touching": adversarial_row(
+        "thin touching", 1000, n=9, pitch=15.0, w=15.0, h=4.0, mx=3, my=4
+    ),
+    "scratch_through_the_bands": adversarial_row("scratch", 1000, artefacts=[hstripe(0.5, 6000.0)]),
+    # Thin touching bands (a 20% extent of 4-5 px) with no dip between them,
+    # flat along x and no higher than a drawn line: alone in the box, they are
+    # the row, not a line beside it.
+    "thin_touching_no_dip": adversarial_row("thin", 1000, h=5.0, mx=4, **_TOUCHING),
+    "thin_touching_twelve": adversarial_row(
+        "thin", 1000, n=12, pitch=30.0, w=38.0, h=5.0, mx=4, my=6
+    ),
+    "thin_saturated_touching_no_dip": adversarial_row(
+        "thin", 1000, h=4.0, mx=4, **_SATURATED_TOUCHING
+    ),
+    # The image cropped 3 to 10 px past the bands' centres, the box dragged to
+    # its edge: the bands' tails, flat along that edge, or the bands
+    # themselves, cut there, are no strip along the image's edge.
+    "cropped_below_saturated_touching": image_cut(
+        adversarial_row("crop", 1002, **_SATURATED_TOUCHING), bottom=90
+    ),
+    "cropped_above_saturated_touching": image_cut(
+        adversarial_row("crop", 1001, **_SATURATED_TOUCHING), top=72
+    ),
+    "cropped_below_touching": image_cut(adversarial_row("crop", 1001, **_TOUCHING), bottom=87),
+    "cut_through_by_the_image": image_cut(adversarial_row("crop", 1000, **_TOUCHING), bottom=83),
+}
+
+
+@pytest.mark.parametrize("name", UNCHANGED_ROWS)
+def test_touching_and_saturated_rows_are_unchanged(monkeypatch, name):
+    case = UNCHANGED_ROWS[name]
+    found = detect(case)
+    _rules_off(monkeypatch)
+    assert detect(case) == found
+
+
+@pytest.mark.parametrize(
+    ("seed", "shade", "bands"),
+    [
+        (1000, (105, 30, 6000.0), {}),
+        (1001, (105, 30, 6000.0), _TOUCHING),
+        (1002, (110, 40, 10000.0), {}),
+    ],
+    ids=["separate", "touching", "deeper"],
+)
+def test_bands_above_an_image_edge_darkening_into_it_keep_their_boxes(
+    monkeypatch, seed, shade, bands
+):
+    # The membrane darkens into the image's bottom edge, 25-30 px below the
+    # bands, and the box runs to it: the shade, flat along that edge, is a
+    # strip there, but the bands above its valley are no part of it.
+    case = image_cut(
+        adversarial_row("vignette", seed, artefacts=[shade_above(*shade)], **bands), bottom=shade[0]
+    )
+    found = detect(case)
+    assert [lane.reason for lane in found.lanes] == ["band"] * 6
+    _rules_off(monkeypatch)
+    off = detect(case)
+    assert (found.slots, found.flags) == (off.slots, off.flags)
+
+
+def _side_cut() -> RowCase:
+    base = adversarial_row("side", 1000)
+    x0, y0, _, y1 = base.row
+    return dataclasses.replace(base, row=(x0, y0, math.floor(base.lane_cx[-1]) - 8, y1))
+
+
+# The rows #116's rules act on: lines, strips, the image's edge, a side cut.
+RULE_ROWS = {
+    "frame": lambda: _framed(16, 2),
+    "strip": lambda: adversarial_row(
+        "strip",
+        1000,
+        missing=range(6),
+        artefacts=[bottom_strip(14, 20000.0)],
+        box_adjust=(0, 52, 0, 80),
+    ),
+    "strip_row": lambda: adversarial_row(
+        "strip row",
+        1000,
+        missing=[2],
+        artefacts=[bottom_strip(14, 20000.0)],
+        box_adjust=(0, 0, 0, 80),
+    ),
+    "dark_edge": lambda: adversarial_row(
+        "edge",
+        1000,
+        depth_range=(300.0, 300.0),
+        artefacts=[dark_edge(30, 1500.0)],
+        box_adjust=(0, 0, 200, 0),
+    ),
+    "side_cut": _side_cut,
+}
+
+
+@pytest.mark.parametrize("name", RULE_ROWS)
+def test_rule_rows_keep_the_invariants_and_polarity_symmetry(name):
+    case = RULE_ROWS[name]()
+    found = detect(case)
+    check_invariants(case, found)
+    inverse = detect_row(
+        FULL_SCALE - case.image,
+        case.row,
+        case.n_lanes,
+        background=FULL_SCALE - estimate_background(case.image),
+        dark_on_light=not case.dark_on_light,
+    )
+    assert (inverse.slots, inverse.flags) == (found.slots, found.flags)
+    assert [lane.reason for lane in inverse.lanes] == [lane.reason for lane in found.lanes]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"), [("LINE_SPAN", 100.0), ("LINE_FLAT", 1.01), ("LINE_PX", 0)]
+)
+def test_each_line_setting_takes_part(monkeypatch, name, value):
+    case = _framed(16, 2)
+    found = detect(case)
+    monkeypatch.setattr(rowdetect, name, value)
+    assert settings()[name.lower()] == value
+    assert detect(case) != found
 
 
 # --- What the result reports ---
