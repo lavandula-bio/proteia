@@ -86,7 +86,10 @@ in, and no answer is about, an opening the request did not name. An upload
 (``POST /api/images``) is checked before any of its body is read, and again
 once the body is stored: only its import and answer run within the opening,
 so a file that takes minutes to arrive holds up no reopen, and an upload
-whose opening ended meanwhile is refused, with nothing imported. ``GET
+whose opening ended meanwhile is refused, with nothing imported. A diagnostic
+file (``POST /api/diagnostics``) is checked, and planned, within the opening,
+then written once the session is released: one that takes minutes (with the
+images) holds up no reopen either. ``GET
 /api/workspace`` answers which project is open, and its open id, without
 reading it: for a page to find out. The routes that list, create or open
 projects, the status and quit routes, and the one that shows the diagnostics
@@ -437,6 +440,19 @@ class Workspace:
             raise ProjectChangedError(opening, self._session.folder.name, self._open_id)
         return self._session
 
+    def current_any(self, opening: int | None = None) -> ProjectSession | None:
+        """:meth:`current`, for a request that reads the open project if there is
+        one: None when none is open and ``opening`` is None, as
+        :meth:`using_any` gives it; checked and answered under one lock."""
+        with self._lock:
+            return self._checked_any(opening)
+
+    def _checked_any(self, opening: int | None) -> ProjectSession | None:
+        """:meth:`current_any`'s answer. Called with the lock held."""
+        if self._session is None and opening is None:
+            return None
+        return self._checked(opening)
+
     @contextlib.contextmanager
     def using(self, opening: int | None = None) -> Iterator[ProjectSession]:
         """The open project's session, as :meth:`current` gives it, for a request
@@ -463,10 +479,8 @@ class Workspace:
         no opening; checked and taken under one lock, as :meth:`using` does."""
         with self._lock:
             self._changed.wait_for(lambda: self._reopening is None)
-            if self._session is None and opening is None:
-                session = None
-            else:
-                session = self._checked(opening)
+            session = self._checked_any(opening)
+            if session is not None:
                 self._in_use[session] = self._in_use.get(session, 0) + 1
         try:
             yield session
@@ -1159,6 +1173,16 @@ def _any_session(request: Request) -> Iterator[ProjectSession | None]:
 AnySession = Annotated[ProjectSession | None, Depends(_any_session, scope="function")]
 
 
+def _checked_any_session(request: Request) -> ProjectSession | None:
+    """:func:`_checked_session`, for a route that works with no project open
+    (:func:`write_diagnostics`): None when none is open and the request names
+    no opening, as :func:`_any_session` gives it. Checked as early, but not
+    taken in use: the route takes it in use itself, only while it needs it
+    (:meth:`Workspace.using_any`), checked again. A sync function, so it runs
+    in the thread pool and never blocks the event loop."""
+    return _workspace(request).current_any(_opening(request))
+
+
 def _no_other_opening(request: Request) -> int | None:
     """The opening the request names (:func:`_opening`), or None, checked as
     :func:`_checked_session` checks it, and as early, for a route that closes
@@ -1829,27 +1853,39 @@ def list_diagnostics(session: AnySession, workspace: WorkspaceDep) -> dict[str, 
     }
 
 
-@router.post("/diagnostics", status_code=201)
+@router.post("/diagnostics", status_code=201, dependencies=[Depends(_checked_any_session)])
 def write_diagnostics(
-    body: DiagnosticsBody, session: AnySession, workspace: WorkspaceDep
+    request: Request, body: DiagnosticsBody, workspace: WorkspaceDep
 ) -> dict[str, Any]:
     """Write a diagnostic file (:func:`~proteia.web.diagnostics.write`) in the
     diagnostics folder of the state folder, with the project's image files if
     ``images``; only for the opening the page listed (``open_id``), and only
     while the project's files are those it listed (``digest``), so the file
-    holds no project, and no project file, the page did not show."""
-    open_id = workspace.opening_of(session)
-    if body.open_id != open_id:
-        if session is None or open_id is None:
-            raise NoProjectError("the page listed a project, but none is open now")
-        raise ProjectChangedError(body.open_id, session.folder.name, open_id)
-    state = workspace.state_folder()
-    plan = diagnostics.plan(state, session)
-    if plan.digest() != body.digest:
-        raise FilesChangedError(
-            "the project's files are not those listed (an export made or an image imported or"
-            " removed since): list them again"
-        )
+    holds no project, and no project file, the page did not show.
+
+    The opening the request names is checked as early as every other route's
+    (:func:`_checked_any_session`), but the session is in use only while the
+    file is planned (:meth:`Workspace.using_any`): the opening and the files
+    are checked then, and ``project.json`` read, within one opening. The plan
+    holds what the write needs (``project.json``'s bytes, the other files'
+    paths), so the file is written once the session is released, which with
+    the images may take minutes: a reopen meanwhile does not wait for it
+    (:meth:`Workspace.open`). A file the plan names that is removed meanwhile
+    is left out, and the manifest says why."""
+    opening = _opening(request)  # as _checked_any_session read it
+    with workspace.using_any(opening) as session:
+        open_id = workspace.opening_of(session)
+        if body.open_id != open_id:
+            if session is None or open_id is None:
+                raise NoProjectError("the page listed a project, but none is open now")
+            raise ProjectChangedError(body.open_id, session.folder.name, open_id)
+        state = workspace.state_folder()
+        plan = diagnostics.plan(state, session)
+        if plan.digest() != body.digest:
+            raise FilesChangedError(
+                "the project's files are not those listed (an export made or an image imported"
+                " or removed since): list them again"
+            )
     written = diagnostics.write(
         plan, state / diagnostics.DIAGNOSTICS_DIR, images=body.images, moment=workspace.clock()
     )

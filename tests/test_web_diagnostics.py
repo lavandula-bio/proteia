@@ -590,6 +590,67 @@ def test_the_readme_calls_project_openable_only_with_every_image_file_it_needs(s
     assert "project/ is not a copy of the project that Proteia can open" in said[1]
 
 
+def test_a_reopen_does_not_wait_for_a_file_being_written(served, tmp_path, monkeypatch):
+    # With the images ticked, a large project's file takes a while to write.
+    # Were the session in use meanwhile, a reopen from another tab would hold up
+    # every request on the project for REOPEN_WAIT_S, then give up and leave
+    # the changed project.json unread. The session is in use only while the
+    # file is planned (its opening and files checked, project.json read), so
+    # the reopen reads the file at once, and the file holds what was listed.
+    client = served.client
+    client.ok("POST", "/api/projects", {"name": PROJECT})
+    status, answer = upload(client, blot_bytes(tmp_path))
+    assert status == 201, answer
+    folder = client.root / PROJECT
+    earlier = (folder / storage.PROJECT_FILE).read_bytes()
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    listed = listing(served)
+    in_use: list[int] = []
+    planned = diagnostics.plan
+
+    def plan(state: Path, session: Any) -> diagnostics.Plan:
+        in_use.append(client.workspace._in_use.get(session, 0))
+        return planned(state, session)
+
+    writing, finish = threading.Event(), threading.Event()
+    add = diagnostics._add
+
+    def slow(archive: zipfile.ZipFile, item: diagnostics.Item, moment: datetime) -> Any:
+        writing.set()  # a large image, say, on its way into the file
+        assert finish.wait(30)
+        return add(archive, item, moment)
+
+    monkeypatch.setattr(diagnostics, "plan", plan)
+    monkeypatch.setattr(diagnostics, "_add", slow)
+    answered: list[tuple[int, Any]] = []
+    asked = body(listed, images=True)
+    thread = threading.Thread(
+        target=lambda: answered.append(client.call("POST", "/api/diagnostics", asked))
+    )
+    thread.start()
+    try:
+        assert writing.wait(20)
+        started = time.monotonic()
+        reopened = client.ok("POST", "/api/projects/open", {"name": PROJECT})["project"]
+        took = time.monotonic() - started
+    finally:
+        finish.set()
+        thread.join(30)
+    assert took < api.REOPEN_WAIT_S
+    assert (reopened["open_id"], reopened["lanes"]) == (shown["open_id"] + 1, [])
+    assert in_use == [1]  # in use while it was planned
+    ((status, written),) = answered
+    assert status == 201, written
+    (path,) = served.written()
+    files, manifest = opened(path)
+    assert files["project/project.json"] == earlier  # as listed
+    assert project_names(files) == project_names(
+        file["name"] for file in listed["files"] + listed["images"]
+    )
+    assert (manifest["images_included"], manifest["left_out"]) == (True, [])
+
+
 def test_a_page_showing_another_opening_is_refused_before_anything_is_listed(served):
     client = served.client
     shown = client.ok("POST", "/api/projects", {"name": "Blot"})["project"]["open_id"]
@@ -759,6 +820,23 @@ def test_the_page_lists_the_file_before_writing_it_for_the_opening_listed():
     for control in ("diagnostics", "projects-diagnostics"):
         assert f'$("{control}").addEventListener("click", () => diagnostics.show());' in app
     assert '$("diagnostics").hidden = false;' in _function(app, "async function start(")[1]
+
+
+def test_a_list_that_fails_leaves_nothing_to_write():
+    # A list refused otherwise than as project_changed (the state folder gone,
+    # say) drops the one before: kept, it would be shown again (a write's
+    # finally renders the list), and Write file would send its opening and
+    # digest, which the dialog no longer shows. Write stays disabled until a
+    # list comes in, and no images are ticked for a list not shown.
+    script = _code("diagnostics.js")
+    load = _method(script, "async load(")
+    failed = load[load.index("} catch (error) {") :]
+    failed = failed[: failed.index("return;")]
+    assert "Nothing can be listed" in failed
+    assert failed.index("this.listing = null;") < failed.index("this.renderList();")
+    assert '$("diagnostics-images").checked = false;' in failed
+    assert "write.disabled = this.writing || !listing;" in _method(script, "renderList(")
+    assert "if (this.writing || !this.listing) {" in _method(script, "async write(")
 
 
 def test_non_ascii_names_are_kept_in_the_file(served, tmp_path):

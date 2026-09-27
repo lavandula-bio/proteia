@@ -91,7 +91,10 @@ export class DiagnosticsDialog {
 
   // Ask what a file written now would hold, and list it; `note` says why it
   // is listed again. A refusal as project_changed (the page shows a project no
-  // longer open) is followed by the page; then it asks again, once.
+  // longer open) is followed by the page; then it asks again, once. A list
+  // that fails drops the one before: nothing is shown, and Write file stays
+  // disabled until a list comes in, so no file is asked for with an opening and
+  // digest the dialog no longer shows.
   async load(note = "", again = true) {
     const line = $("diagnostics-state");
     line.className = "hint";
@@ -106,6 +109,9 @@ export class DiagnosticsDialog {
       }
       line.textContent = "";
       $("diagnostics-error").textContent = `Nothing can be listed: ${sentence(error.message)}`;
+      this.listing = null;
+      $("diagnostics-images").checked = false; // ticked for a list no longer shown
+      this.renderList();
       return;
     }
     if (this.listing && this.listing.open_id !== listing.open_id) {

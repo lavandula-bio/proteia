@@ -4336,10 +4336,14 @@ def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_
 
 # The routes on the open project that check the opening their request names as
 # early as every other (before its path, query and body are), but take the
-# session in use only later, themselves, and why. Each has a test of its own
-# that it holds the session while it uses it.
+# session in use only later, or only for a while, themselves, and why. Each has
+# a test of its own that it holds the session while it uses it.
 USES_ITS_SESSION_LATER = {
     ("POST", "/api/images"): "reads its body first, which may take minutes: no reopen waits for it",
+    ("POST", "/api/diagnostics"): (
+        "writes its file after planning it, which with images may take minutes: no reopen"
+        " waits for it"
+    ),
 }
 # The routes on the open project that check the opening their request names as
 # early as every other, but never use its session: they close it, and open
@@ -4350,7 +4354,9 @@ REPLACES_ITS_SESSION = {
 # The routes that read the open project if one is open, and work with none (a
 # diagnostic file with no project, #138): they get the session, or None, from
 # _any_session, which checks the opening and keeps the session in use as
-# _open_session does.
+# _open_session does; or, when they also use it later
+# (USES_ITS_SESSION_LATER), from _checked_any_session, which checks it and no
+# more, as _checked_session does.
 WORKS_WITH_NO_PROJECT = {
     ("GET", "/api/diagnostics"): "lists the files of a diagnostic file",
     ("POST", "/api/diagnostics"): "writes a diagnostic file",
@@ -4362,8 +4368,10 @@ def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
     # finds them: each gets its session from _open_session, which keeps it in
     # use (Workspace.using) until the route returns, so no reopen reads the
     # project again while one runs. Those in USES_ITS_SESSION_LATER get it from
-    # _checked_session, which checks it and no more, and take it in use
-    # themselves (test_an_upload_holds_its_session_while_it_imports_and_answers).
+    # _checked_session (or _checked_any_session), which checks it and no more,
+    # and take it in use themselves
+    # (test_an_upload_holds_its_session_while_it_imports_and_answers,
+    # test_a_reopen_does_not_wait_for_a_file_being_written).
     workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
     app = server.create_app(
         token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
@@ -4384,20 +4392,22 @@ def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
             [sub.scope for sub in given(route.dependant, api._checked_session)],
             [sub.scope for sub in given(route.dependant, api._no_other_opening)],
             [sub.scope for sub in given(route.dependant, api._any_session)],
+            [sub.scope for sub in given(route.dependant, api._checked_any_session)],
         )
         for route in _declared(app.routes)
         for method in route.methods
         if (method, route.path) in guarded
     }
 
-    def expected(route: tuple[str, str]) -> tuple[list, list, list, list]:
-        if route in USES_ITS_SESSION_LATER:
-            return [], [None], [], []
-        if route in REPLACES_ITS_SESSION:
-            return [], [], [None], []
+    def expected(route: tuple[str, str]) -> tuple[list, list, list, list, list]:
+        later = route in USES_ITS_SESSION_LATER
         if route in WORKS_WITH_NO_PROJECT:
-            return [], [], [], ["function"]
-        return ["function"], [], [], []
+            return [], [], [], ([] if later else ["function"]), ([None] if later else [])
+        if later:
+            return [], [None], [], [], []
+        if route in REPLACES_ITS_SESSION:
+            return [], [], [None], [], []
+        return ["function"], [], [], [], []
 
     assert found == {route: expected(route) for route in guarded}
 
