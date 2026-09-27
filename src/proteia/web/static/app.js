@@ -378,13 +378,16 @@ async function showProjects() {
   $("projects-error").textContent = "";
   const listing = await call("GET", "/api/projects");
   $("projects-root").textContent = `Projects are saved in ${listing.root}`;
+  $("projects-empty").hidden = listing.projects.length > 0;
   const list = $("project-list");
   list.replaceChildren();
   for (const entry of listing.projects) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = entry.name;
-    button.addEventListener("click", () => openProject("/api/projects/open", entry.name));
+    button.addEventListener("click", () =>
+      openProject("/api/projects/open", entry.name, { name: entry.name }),
+    );
     const item = document.createElement("li");
     item.append(button);
     list.append(item);
@@ -398,7 +401,7 @@ async function showProjects() {
 // One create or open at a time: while it runs the dialog stays open and takes
 // no other choice, so no two opens race and no edit is made from the page
 // until the server's newly open project is shown.
-let opening = null; // the name being opened, or null
+let opening = null; // what is being opened ("Opening …" names it), or null
 
 function setOpening(name) {
   opening = name;
@@ -409,9 +412,13 @@ function setOpening(name) {
   line.hidden = name === null;
 }
 
-async function openProject(path, name) {
+// Create or open a project: POST `json` (no body if undefined) to `path`,
+// then show the project answered in place of the one shown. `name` is what
+// "Opening …" says meanwhile. Gives the answer once the project is shown, or
+// null.
+async function openProject(path, name, json) {
   if (opening !== null) {
-    return;
+    return null;
   }
   setOpening(name);
   $("projects-error").textContent = "";
@@ -425,10 +432,10 @@ async function openProject(path, name) {
     // change of that project.
     await Promise.all([proteinPanel.settled(), pending()]);
     proteinPanel.invalidateEdits();
-    const answer = await call("POST", path, { name });
+    const answer = await call("POST", path, json);
     if (!isCurrent(answer.project)) {
       $("projects-error").textContent = "Another project was opened meanwhile.";
-      return;
+      return null;
     }
     // Image ids repeat across projects (img-1 in each): drop everything shown.
     view.setImage(null, 0, 0);
@@ -445,17 +452,41 @@ async function openProject(path, name) {
     lastBoxStep = null; // log numbers repeat across projects
     $("projects-dialog").close();
     showStatus("");
+    return answer;
   } catch (error) {
     $("projects-error").textContent = error.message;
+    return null;
   } finally {
     setOpening(null);
   }
 }
 
+// "Open sample project": a new project on the synthetic sample blot, with its
+// lanes and proteins set up and each protein's row left to drag
+// (sample_project.py on the server). The status line says what to do next.
+// The first-use tour will start here: the answer's sample.rows gives each
+// protein's row, top to bottom, as a drag over it, for the tour to point at.
+async function openSample() {
+  const answer = await openProject("/api/projects/sample", "the sample project");
+  if (answer === null || !sameOpening(answer)) {
+    return;
+  }
+  const names = answer.sample.rows
+    .map((row) => answer.project.proteins.find((p) => p.id === row.protein_id))
+    .filter(Boolean)
+    .map((protein) => protein.name);
+  showStatus(
+    "For each protein, choose it on the left and drag across its row to box its bands" +
+      ` (rows from the top: ${names.join(", ")}); the table and charts fill in.`,
+  );
+}
+
 $("new-project").addEventListener("submit", (event) => {
   event.preventDefault();
-  openProject("/api/projects", $("new-project-name").value);
+  const name = $("new-project-name").value;
+  openProject("/api/projects", name, { name });
 });
+$("open-sample").addEventListener("click", () => openSample());
 $("projects-close").addEventListener("click", () => {
   if (opening === null) {
     $("projects-dialog").close();
