@@ -6,17 +6,23 @@ A project's name is its folder's name. Paths come only from the server: a name
 from the client must be one plain folder name that every supported file system
 accepts (:func:`project_name`), and it is only ever joined to the projects root.
 Names are unique ignoring case and look-alike spellings, as file systems on
-Windows and macOS compare them.
+Windows and macOS compare them. A project made from an image file is named
+after it (:func:`name_from_file`), numbered if that name is taken
+(:func:`free_name`). A project set up as it is created (the sample project, a
+hand-off's images) is created by :func:`create_set_up`, which removes its folder
+if the setup fails.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Final
 
 from proteia.core import storage
@@ -27,6 +33,10 @@ from proteia.core.session import Clock, ProjectSession, new_project, utc_now
 ROOT_NAME: Final = "Proteia"
 MAX_NAME: Final = 100  # characters; well inside every file system's limit
 MAX_NUMBERED: Final = 1000  # names free_name tries: the plain one, then numbered
+# The longest name taken from a file: room left for free_name's " (1000)".
+MAX_FILE_NAME: Final = MAX_NAME - len(f" ({MAX_NUMBERED})")
+# The name of a project made from files whose names give none.
+FALLBACK_NAME: Final = "Imported images"
 # Characters Windows refuses in a file name.
 _FORBIDDEN: Final = frozenset('<>:"/\\|?*')
 # Device names Windows reserves, with or without an extension: COM and LPT with
@@ -47,6 +57,12 @@ class ProjectExistsError(ValueError):
 
 class ProjectNotFoundError(LookupError):
     """No project with this name in the projects root."""
+
+
+class FolderLeftError(OSError):
+    """A new project's setup failed (:func:`create_set_up`), and its folder
+    could not all be removed after: it is left in the projects root,
+    unfinished."""
 
 
 def _windows_documents() -> Path | None:
@@ -104,6 +120,27 @@ def project_name(name: object) -> str:
     return text
 
 
+def name_from_file(original_name: str) -> str:
+    """A project name for images imported from the file ``original_name``: its
+    stem as stored (:func:`~proteia.core.names.clean_text`), with each character
+    Windows refuses in a file name (``<>:"/\\|?*``) made a space, cut to
+    :data:`MAX_FILE_NAME` characters (so :func:`free_name` can still number
+    it) and without spaces and dots at the end; :data:`FALLBACK_NAME` when
+    nothing is left or :func:`project_name` still refuses it (a device name
+    such as ``CON``, or a control character). ``β-actin 10 µM.tif`` gives
+    ``β-actin 10 µM``, ``a:b.png`` ``a b``, ``blot..tif`` ``blot``."""
+    try:
+        text = clean_text(PurePosixPath(original_name).stem)
+    except TextError:
+        return FALLBACK_NAME
+    text = " ".join("".join(" " if c in _FORBIDDEN else c for c in text).split())
+    text = text[:MAX_FILE_NAME].rstrip(" .")
+    try:
+        return project_name(text) if text else FALLBACK_NAME
+    except ProjectNameError:
+        return FALLBACK_NAME
+
+
 @dataclass(frozen=True)
 class ProjectEntry:
     """A project in the projects root."""
@@ -148,15 +185,27 @@ def _existing(root: Path, name: str) -> Path | None:
     return None
 
 
-def free_name(root: Path, name: object) -> str:
+def names_in(root: Path) -> list[str]:
+    """The names of the files and folders in ``root``, listed once; none if it
+    is not a folder (yet)."""
+    if not root.is_dir():
+        return []
+    return [child.name for child in root.iterdir()]
+
+
+def free_name(root: Path, name: object, *, existing: Iterable[str] | None = None) -> str:
     """``name`` as stored (:func:`project_name`), or ``name (2)``, ``name (3)``
     and so on: the first that no file or folder in ``root`` has, ignoring case
-    and look-alike spellings (:func:`_existing`), as export folders are
-    numbered. :class:`ProjectExistsError` once :data:`MAX_NUMBERED` are taken."""
+    and look-alike spellings (as :func:`_existing` compares them), as export
+    folders are numbered. ``root`` is listed once (:func:`names_in`), or not at
+    all when ``existing`` gives that listing: for a caller that names several
+    projects at once. :class:`ProjectExistsError` once :data:`MAX_NUMBERED`
+    are taken."""
     text = project_name(name)
+    taken = {name_key(other) for other in (names_in(root) if existing is None else existing)}
     for number in range(1, MAX_NUMBERED + 1):
         candidate = text if number == 1 else project_name(f"{text} ({number})")
-        if _existing(root, candidate) is None:
+        if name_key(candidate) not in taken:
             return candidate
     raise ProjectExistsError(f"no free project name for {text!r}: {MAX_NUMBERED} are taken")
 
@@ -168,6 +217,41 @@ def create_project(root: Path, name: object, *, clock: Clock = utc_now) -> Proje
         raise ProjectExistsError(f"a project named {text!r} already exists")
     root.mkdir(parents=True, exist_ok=True)
     return new_project(root / text, clock=clock)
+
+
+def create_set_up(
+    root: Path,
+    name: object,
+    set_up: Callable[[ProjectSession], None],
+    *,
+    clock: Clock = utc_now,
+    what: str = "the new project",
+) -> ProjectSession:
+    """Create the project ``name`` in ``root`` (:func:`create_project`), set it
+    up with ``set_up`` and open it; saved before it is returned, so an
+    ``OSError`` or :class:`~proteia.core.storage.ProjectError` while saving
+    propagates too. If ``set_up`` or that save fails, the folder is removed
+    with everything written into it, and the error propagates. If some of it
+    cannot be removed (a file in it held open by another program, which
+    Windows refuses to delete), the folder stays, without a ``project.json``:
+    the Projects dialog does not list it, but its name is taken.
+    :class:`FolderLeftError` then says so, naming ``what`` and the folder, in
+    place of the error."""
+    session = create_project(root, name, clock=clock)
+    try:
+        set_up(session)
+        if session.dirty:  # an autosave failed: fail now, not when it is next edited
+            session.save()
+    except BaseException as exc:
+        shutil.rmtree(session.folder, ignore_errors=True)
+        if isinstance(exc, Exception) and session.folder.exists():
+            raise FolderLeftError(
+                f"{what} could not be set up ({exc}), and its unfinished folder"
+                f" {session.folder.name!r} could not be removed: delete it from the projects"
+                " folder"
+            ) from exc
+        raise
+    return session
 
 
 def project_folder(root: Path, name: object) -> Path:

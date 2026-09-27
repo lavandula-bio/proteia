@@ -12,6 +12,7 @@ import hashlib
 import http.client
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -58,7 +59,7 @@ from proteia.core.model import (
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import compute_results
 from proteia.viz import render_svg
-from proteia.web import api, charts, launch, sample_project, server
+from proteia.web import api, charts, handoff, launch, sample_project, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 from rowcases import RowCase, adversarial
@@ -1355,6 +1356,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
     # Another project, so another opening, whose revisions start again.
     answers["POST /api/projects/sample"] = client.ok("POST", "/api/projects/sample")
+    # And another: images handed to the app, imported into a new project.
+    handoff_id, files = handed_off(client, tmp_path, ["handed.tif"])
+    answers["POST /api/handoffs/{handoff_id}/accept"] = accept(client, handoff_id, files)
 
     revisions = []
     blot = answers["POST /api/projects"]["project"]["open_id"]
@@ -1367,7 +1371,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         assert {"lanes", "proteins", "sets", "settings"} <= set(results), route
         if project["open_id"] == blot:
             revisions.append(project["revision"])
-    assert len(revisions) == len(answers) - 1
+    assert len(revisions) == len(answers) - 2
     assert revisions == sorted(revisions)
     # Every route that answers with the project is exercised above.
     others = {
@@ -1376,6 +1380,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "POST /api/project/reveal",
         "GET /api/images/{image_id}/preview",
         "GET /api/charts/{key}.svg",
+        "POST /api/incoming",
+        "POST /api/handoffs",
+        "POST /api/handoffs/{handoff_id}/discard",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -3754,7 +3761,7 @@ def test_a_sample_folder_that_cannot_be_removed_is_named_in_the_error(
 
     with monkeypatch.context() as patch:
         patch.setattr(sample_project.ops, "set_lanes", fail)
-        patch.setattr(sample_project, "shutil", SimpleNamespace(rmtree=rmtree_but_images))
+        patch.setattr(api.projects, "shutil", SimpleNamespace(rmtree=rmtree_but_images))
         status, answer = client.call("POST", "/api/projects/sample")
     # A file error whatever failed: the folder left needs deleting by hand.
     assert (status, answer["code"]) == (500, "file_error")
@@ -3817,6 +3824,12 @@ NEEDS_NO_OPENING = {
     ("POST", "/api/projects/open"): "opens the project the request names",
     ("POST", "/api/projects/sample"): "creates the sample project, and opens it",
     ("GET", "/api/workspace"): "says which opening is open: how a page finds it changed",
+    ("POST", "/api/incoming"): "stages a file a launch hands to the app",
+    ("POST", "/api/handoffs"): "hands off staged files, for the page to ask about",
+    (
+        "POST",
+        "/api/handoffs/{handoff_id}/discard",
+    ): "drops files handed off, as the page shows them",
 }
 
 
@@ -3971,7 +3984,7 @@ def test_two_openings_in_one_request_are_refused(client):
     assert (status, body["code"]) == (422, "invalid_input")
 
 
-def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
+def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
     client.ok("POST", "/api/projects", {"name": "Blot"})
     stale = {OPENING: "7"}  # an opening that never was
     # The page shell, served without the token, holds no user data.
@@ -3986,8 +3999,27 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
         ("POST", "/api/projects/sample"): None,
         ("POST", "/api/quit"): None,  # last: it stops the server
     }
+    handoff_id, files = handed_off(client, tmp_path, ["dropped.tif"])
+    incoming = ("POST", "/api/incoming")
+    discard = ("POST", "/api/handoffs/{handoff_id}/discard")
+    bodies[incoming] = None
+    bodies[discard] = {"files": [file["file_id"] for file in files]}
+    bodies[("POST", "/api/handoffs")] = {
+        "refused": [{"name": "a.bmp", "code": "x", "message": "y"}]
+    }
+    bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
+    paths = {incoming: "/api/incoming?name=a.tif", discard: f"/api/handoffs/{handoff_id}/discard"}
     assert set(bodies) == set(NEEDS_NO_OPENING)
-    answers = {route: client.call(*route, body, headers=stale) for route, body in bodies.items()}
+    answers = {
+        route: client.call(
+            route[0],
+            paths.get(route, route[1]),
+            body,
+            raw=blot_bytes(tmp_path) if route == incoming else None,
+            headers=stale,
+        )
+        for route, body in bodies.items()
+    }
     assert {route: status for route, (status, _) in answers.items()} == {
         ("GET", "/api/status"): 200,
         ("GET", "/api/projects"): 200,
@@ -3995,6 +4027,9 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
         ("POST", "/api/projects"): 201,
         ("POST", "/api/projects/open"): 200,
         ("POST", "/api/projects/sample"): 201,
+        incoming: 201,
+        discard: 204,
+        ("POST", "/api/handoffs"): 201,
         ("POST", "/api/quit"): 202,
     }
     opened = [
@@ -4007,13 +4042,29 @@ def test_the_workspace_says_which_opening_is_open_without_reading_it(client, mon
     calls: list = []
     _counting(monkeypatch, calls)
     root = str(client.root)
-    assert client.ok("GET", "/api/workspace") == {"root": root, "open": None, "open_id": None}
+    none: dict[str, Any] = {"handoffs": []}
+    assert client.ok("GET", "/api/workspace") == {
+        "root": root,
+        "open": None,
+        "open_id": None,
+        **none,
+    }
     client.ok("POST", "/api/projects", {"name": "Blot µ"})
     client.ok("POST", "/api/projects", {"name": "Other"})
     computed = len(calls)
-    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Other", "open_id": 2}
+    assert client.ok("GET", "/api/workspace") == {
+        "root": root,
+        "open": "Other",
+        "open_id": 2,
+        **none,
+    }
     client.ok("POST", "/api/projects/open", {"name": "Blot µ"})
-    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Blot µ", "open_id": 3}
+    assert client.ok("GET", "/api/workspace") == {
+        "root": root,
+        "open": "Blot µ",
+        "open_id": 3,
+        **none,
+    }
     assert len(calls) == computed + 1  # the open's answer only
 
 
@@ -4268,6 +4319,12 @@ def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_
 USES_ITS_SESSION_LATER = {
     ("POST", "/api/images"): "reads its body first, which may take minutes: no reopen waits for it",
 }
+# The routes on the open project that check the opening their request names as
+# early as every other, but never use its session: they close it, and open
+# another. Each checks it again once no other switch can run.
+REPLACES_ITS_SESSION = {
+    ("POST", "/api/handoffs/{handoff_id}/accept"): "imports images into a new project it opens",
+}
 
 
 def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
@@ -4289,20 +4346,26 @@ def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
             yield from given(sub, call)
 
     guarded = api_routes() - set(NEEDS_NO_OPENING)
-    assert set(USES_ITS_SESSION_LATER) <= guarded
+    assert set(USES_ITS_SESSION_LATER) | set(REPLACES_ITS_SESSION) <= guarded
     found = {
         (method, route.path): (
             [sub.scope for sub in given(route.dependant, api._open_session)],
             [sub.scope for sub in given(route.dependant, api._checked_session)],
+            [sub.scope for sub in given(route.dependant, api._no_other_opening)],
         )
         for route in _declared(app.routes)
         for method in route.methods
         if (method, route.path) in guarded
     }
-    assert found == {
-        route: ([], [None]) if route in USES_ITS_SESSION_LATER else (["function"], [])
-        for route in guarded
-    }
+
+    def expected(route: tuple[str, str]) -> tuple[list, list, list]:
+        if route in USES_ITS_SESSION_LATER:
+            return [], [None], []
+        if route in REPLACES_ITS_SESSION:
+            return [], [], [None]
+        return ["function"], [], []
+
+    assert found == {route: expected(route) for route in guarded}
 
 
 # --- An upload holds its session only once its body is stored (#134's review) ---
@@ -4499,3 +4562,1045 @@ def test_an_upload_holds_its_session_while_it_imports_and_answers(
         assert (after["open_id"], after["revision"]) == (shown["open_id"], project["revision"])
     else:
         assert (after["open_id"], after["lanes"], after["images"]) == (shown["open_id"] + 1, [], [])
+
+
+# --- Images handed to the app (#57, N3) ---
+
+
+class Ticks:
+    """A monotonic clock for the inbox that moves only when told."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def ticks(client, monkeypatch) -> Ticks:
+    """The inbox's clock, stopped: hand-offs stay young until it is advanced."""
+    clock = Ticks()
+    monkeypatch.setattr(client.workspace.inbox, "_clock", clock)
+    return clock
+
+
+def incoming(name: str) -> str:
+    return f"/api/incoming?name={quote(name, safe='')}"
+
+
+def staged(client: Client, data: bytes, name: str = "blot.tif") -> dict:
+    """One file staged as a launch hands it to the app: the answer."""
+    status, answer = client.call("POST", incoming(name), raw=data)
+    assert status == 201, answer
+    return answer
+
+
+def listed(client: Client, handoff_id: str) -> dict:
+    """The hand-off as GET /api/workspace lists it."""
+    (entry,) = [h for h in client.ok("GET", "/api/workspace")["handoffs"] if h["id"] == handoff_id]
+    return entry
+
+
+def handed_off(
+    client: Client, tmp_path: Path, names: list[str], *, refused: list[dict] | None = None
+) -> tuple[str, list[dict]]:
+    """A synthetic blot staged under each name, offered at once: the hand-off's
+    id and its files as listed."""
+    ids = [staged(client, blot_bytes(tmp_path), name)["file_id"] for name in names]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids, "refused": refused or []})
+    return offered["handoff_id"], listed(client, offered["handoff_id"])["files"]
+
+
+def choices(
+    files: list[dict],
+    *,
+    kinds: dict[int, str] | None = None,
+    membranes: dict[int, int] | None = None,
+    polarity: str = "dark_on_light",
+) -> list[dict]:
+    """An accept's files: chemiluminescence unless ``kinds`` says, each on a new
+    membrane unless ``membranes`` names an earlier file's."""
+    return [
+        {
+            "file_id": file["file_id"],
+            "kind": (kinds or {}).get(index, "chemiluminescence"),
+            "polarity": polarity,
+            "membrane": (membranes or {}).get(index, "new"),
+        }
+        for index, file in enumerate(files)
+    ]
+
+
+def accept(
+    client: Client,
+    handoff_id: str,
+    files: list[dict],
+    *,
+    name: str | None = None,
+    headers: dict[str, str] | None = None,
+    **chosen: Any,
+) -> dict:
+    body = {"name": name, "files": choices(files, **chosen)}
+    return client.ok("POST", f"/api/handoffs/{handoff_id}/accept", body, headers=headers)
+
+
+def staging(client: Client) -> list[str]:
+    """The names of the files in the staging folder."""
+    folder = client.workspace.inbox.folder
+    assert folder is not None
+    return sorted(path.name for path in folder.iterdir()) if folder.is_dir() else []
+
+
+def in_root(client: Client) -> list[str]:
+    return sorted(path.name for path in client.root.iterdir()) if client.root.is_dir() else []
+
+
+def test_an_incoming_file_is_staged_under_a_name_the_server_makes(client, tmp_path):
+    data = blot_bytes(tmp_path)
+    answer = staged(client, data, NAME)
+    assert (answer["name"], answer["size"]) == (NAME, len(data))
+    folder = client.workspace.inbox.folder
+    assert folder == tmp_path / "state" / "incoming"
+    (stored,) = folder.iterdir()
+    assert re.fullmatch(r"[0-9a-f]{32}", stored.name) and stored.read_bytes() == data
+    assert answer["file_id"] not in stored.name
+    # Nothing in the projects root, and nothing listed until it is offered.
+    assert not client.root.exists()
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "status", "code"),
+    [
+        ("notes.txt", b"x", 422, "unsupported_image_type"),
+        ("blot.bmp", b"x", 422, "unsupported_image_type"),
+        ("C:\\x\\a.tif", b"x", 422, "invalid_image"),
+        ("../a.tif", b"x", 422, "invalid_image"),
+        ("a/b.tif", b"x", 422, "invalid_image"),
+        ("x" * 252 + ".tif", b"x", 422, "invalid_image"),  # 256 characters
+        ("blot.tif", b"", 422, "invalid_image"),
+    ],
+    ids=["txt", "bmp", "windows path", "parent", "folder", "256 characters", "empty"],
+)
+def test_an_incoming_file_that_cannot_be_an_image_is_refused_and_leaves_nothing(
+    client, name, data, status, code
+):
+    assert client.refused("POST", incoming(name), raw=data)[:2] == (status, code)
+    assert staging(client) == []
+    assert not client.root.exists()
+
+
+def _stage_chunked(client: Client, chunks: list[bytes], name: str = "a.tif") -> tuple[int, Any]:
+    """A file staged in chunks, with no size declared (Transfer-Encoding: chunked)."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        conn.request(
+            "POST",
+            incoming(name),
+            body=iter(chunks),
+            headers={
+                "Authorization": f"Bearer {client.token}",
+                "Content-Type": "application/octet-stream",
+            },
+            encode_chunked=True,
+        )
+        response = conn.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        conn.close()
+
+
+def test_an_incoming_file_over_the_size_limit_is_refused(client, monkeypatch):
+    monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 100)
+    assert client.refused("POST", incoming("a.tif"), raw=b"x" * 101)[:2] == (
+        413,
+        "image_too_large",
+    )
+    status, answer = _stage_chunked(client, [b"x" * 60, b"x" * 60])  # no size declared
+    assert (status, answer["code"]) == (413, "image_too_large")
+    assert staging(client) == []
+    assert staged(client, b"x" * 100)["size"] == 100
+
+
+def test_an_incoming_file_that_cannot_be_stored_is_refused_naming_no_path(client, tmp_path):
+    # The launch passes the message on to the page, which sees no path: the
+    # staging folder's is in the per-user state folder.
+    folder = client.workspace.inbox.folder
+    assert folder is not None
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    folder.write_bytes(b"")  # the staging folder cannot be made
+    status, payload = client.call("POST", incoming("a µ.tif"), raw=b"x" * 10)
+    assert (status, payload["code"]) == (500, "file_error")
+    assert payload["message"].startswith("'a µ.tif' could not be stored: ")
+    for path in (str(tmp_path), str(folder), folder.name):
+        assert path not in payload["message"]
+    folder.unlink()
+    assert staged(client, b"x" * 10)["size"] == 10
+
+
+def test_uploads_beyond_the_pending_limits_are_refused(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 2)
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    staged(client, b"x" * 10, "b.tif")  # not offered: waiting too
+    status, code, _ = client.refused("POST", incoming("c.tif"), raw=b"x" * 10)
+    assert (status, code) == (409, "too_many_pending")
+    assert len(staging(client)) == 2
+    body = {"files": [file["file_id"] for file in files]}
+    assert client.call("POST", f"/api/handoffs/{handoff_id}/discard", body)[0] == 204
+    staged(client, b"x" * 10, "c.tif")  # room again
+
+    # The bytes staged: those waiting, and those an upload declares or has sent.
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 32)
+    monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 50)
+    status, code, _ = client.refused("POST", incoming("d.tif"), raw=b"x" * 31)
+    assert (status, code) == (409, "too_many_pending")
+    monkeypatch.setattr(api, "_WRITE_BYTES", 10)  # written, and counted, 10 bytes at a time
+    status, answer = _stage_chunked(client, [b"x" * 20, b"x" * 20])
+    assert (status, answer["code"]) == (409, "too_many_pending")
+    assert len(staging(client)) == 2
+    assert staged(client, b"x" * 30, "e.tif")["size"] == 30
+
+
+def test_nothing_is_staged_offered_or_imported_once_proteia_is_stopping(client, tmp_path):
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    waiting = staged(client, blot_bytes(tmp_path), "b.tif")
+    client.workspace.inbox.stop()
+    assert client.refused("POST", incoming("c.tif"), raw=b"x")[:2] == (409, "stopping")
+    body: dict[str, Any] = {"files": [waiting["file_id"]]}
+    assert client.refused("POST", "/api/handoffs", body)[:2] == (409, "stopping")
+    body = {"files": choices(files)}
+    assert client.refused("POST", f"/api/handoffs/{handoff_id}/accept", body)[:2] == (
+        409,
+        "stopping",
+    )
+    assert not client.root.exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "code"),
+    [
+        ({"files": ["0" * 16]}, 404, "unknown_id"),
+        ({"files": ["A", "A"]}, 422, "invalid_input"),
+        ({}, 422, "invalid_input"),
+        ({"files": ["A"], "more": 1}, 422, "invalid_input"),
+        ({"files": ["A"], "refused": [{"name": 1, "code": "x", "message": "y"}]}, 422, None),
+        ({"files": ["A"], "refused": [{"name": "a.bmp", "code": "x"}]}, 422, None),
+        ({"files": "A"}, 422, "invalid_input"),
+    ],
+    ids=[
+        "unknown id",
+        "an id twice",
+        "nothing",
+        "unknown key",
+        "a name not text",
+        "no message",
+        "files not a list",
+    ],
+)
+def test_an_offer_that_cannot_be_taken_hands_off_nothing(client, tmp_path, body, status, code):
+    staged_id = staged(client, blot_bytes(tmp_path), "a.tif")["file_id"]
+    body = json.loads(json.dumps(body).replace('"A"', json.dumps(staged_id)))
+    assert client.refused("POST", "/api/handoffs", body)[:2] == (status, code or "invalid_input")
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+    assert client.ok("POST", "/api/handoffs", {"files": [staged_id]})["files"] == 1  # still waiting
+
+
+def test_an_offer_hands_off_uploaded_files_once(client, tmp_path, ticks):
+    a = staged(client, blot_bytes(tmp_path), "a.tif")
+    b = staged(client, b"x" * 7, "b µ.png")
+    offered = client.ok("POST", "/api/handoffs", {"files": [a["file_id"], b["file_id"]]})
+    assert offered == {
+        "handoff_id": offered["handoff_id"],
+        "merged": False,
+        "files": 2,
+        "refused": 0,
+    }
+    body = {"files": [a["file_id"]]}
+    assert client.refused("POST", "/api/handoffs", body)[:2] == (409, "file_claimed")
+    assert client.ok("GET", "/api/workspace")["handoffs"] == [
+        {
+            "id": offered["handoff_id"],
+            "kind": "images",
+            "files": [
+                {"file_id": a["file_id"], "name": "a.tif", "size": a["size"]},
+                {"file_id": b["file_id"], "name": "b µ.png", "size": 7},
+            ],
+            "suggested_name": "a",
+            "refused": [],
+            "more_refused": 0,
+            "more_may_arrive": True,
+        }
+    ]
+
+
+def test_refused_arguments_are_kept_bounded_and_never_refuse_the_offer(client, tmp_path):
+    file_id = staged(client, blot_bytes(tmp_path), "a.tif")["file_id"]
+    refused = [
+        {"name": "β" * 300 + ".tif", "code": "missing", "message": "no such file or folder"},
+        {"name": "bad\x07name\u202e.tif", "code": "made_up", "message": "m" * 500},
+        {"name": "half\ud800.tif", "code": "unreadable", "message": "cannot be read: \udfff"},
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"files": [file_id], "refused": refused})
+    assert (offered["files"], offered["refused"]) == (1, 3)
+    entry = listed(client, offered["handoff_id"])
+    assert [file["file_id"] for file in entry["files"]] == [file_id]
+    first, second, third = entry["refused"]
+    assert first == {
+        "name": "β" * 119 + "…",
+        "code": "missing",
+        "message": "no such file or folder",
+    }
+    assert second == {
+        "name": "bad\ufffdname\ufffd.tif",
+        "code": "other",
+        "message": "m" * 199 + "…",
+    }
+    assert third == {
+        "name": "half\ufffd.tif",
+        "code": "unreadable",
+        "message": "cannot be read: \ufffd",
+    }
+
+
+def test_only_the_first_hundred_refused_entries_are_kept(client):
+    refused = [
+        {"name": f"{i}.bmp", "code": "unsupported_type", "message": "not an image type"}
+        for i in range(150)
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"refused": refused})
+    assert (offered["merged"], offered["files"], offered["refused"]) == (False, 0, 150)
+    entry = listed(client, offered["handoff_id"])
+    assert (entry["kind"], entry["files"], entry["suggested_name"]) == ("notice", [], None)
+    assert [r["name"] for r in entry["refused"]] == [f"{i}.bmp" for i in range(100)]
+    assert entry["more_refused"] == 50
+
+
+def test_offers_whose_uploads_began_within_the_window_join_one_hand_off(
+    client, tmp_path, ticks, monkeypatch
+):
+    def offer(name: str) -> dict:
+        file_id = staged(client, blot_bytes(tmp_path), name)["file_id"]
+        return client.ok("POST", "/api/handoffs", {"files": [file_id]})
+
+    first = offer("a.tif")
+    ticks.advance(handoff.MERGE_WINDOW_S - 1)
+    second = offer("b.tif")
+    assert (second["handoff_id"], second["merged"], second["files"]) == (
+        first["handoff_id"],
+        True,
+        2,
+    )
+    ticks.advance(handoff.MERGE_WINDOW_S)  # from b.tif's start
+    third = offer("c.tif")
+    assert third["handoff_id"] != first["handoff_id"] and not third["merged"]
+    monkeypatch.setattr(handoff, "MAX_HANDOFF_FILES", 2)
+    fourth = offer("d.tif")
+    assert fourth["handoff_id"] == third["handoff_id"]
+    fifth = offer("e.tif")  # within the window, but the hand-off is full
+    assert fifth["handoff_id"] not in (first["handoff_id"], third["handoff_id"])
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [[file["name"] for file in h["files"]] for h in handoffs] == [
+        ["a.tif", "b.tif"],
+        ["c.tif", "d.tif"],
+        ["e.tif"],
+    ]
+
+
+def _staging_begun(client: Client, name: str, size: int) -> http.client.HTTPConnection:
+    """A file staged with its request line and headers sent, and none of its
+    body (as :func:`_upload_begun`)."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    conn.putrequest("POST", incoming(name))
+    for header, value in {
+        "Authorization": f"Bearer {client.token}",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(size),
+    }.items():
+        conn.putheader(header, value)
+    conn.endheaders()
+    return conn
+
+
+def test_a_slow_upload_joins_the_hand_off_its_start_was_near(client, tmp_path, ticks, monkeypatch):
+    # An Explorer selection of a large file and a small one: the small one is
+    # offered first; the large one, begun as early, arrives a minute later and
+    # still joins it, so the selection gives one project. Meanwhile the
+    # hand-off says more may arrive.
+    inbox = client.workspace.inbox
+    began = threading.Event()
+    begin = inbox.begin_upload
+
+    def beginning(*args: Any, **kwargs: Any) -> Any:
+        upload = begin(*args, **kwargs)
+        began.set()
+        return upload
+
+    monkeypatch.setattr(inbox, "begin_upload", beginning)
+    data = blot_bytes(tmp_path)
+    conn = _staging_begun(client, "slow.tif", len(data))
+    try:
+        conn.send(data[:1000])
+        assert began.wait(20)
+        ticks.advance(2)
+        quick = staged(client, data, "quick.tif")["file_id"]
+        offered = client.ok("POST", "/api/handoffs", {"files": [quick]})
+        ticks.advance(60)  # the slow file takes a minute more
+        assert listed(client, offered["handoff_id"])["more_may_arrive"]
+        conn.send(data[1000:])
+        status, slow = _answered(conn)
+    finally:
+        conn.close()
+    assert status == 201, slow
+    assert listed(client, offered["handoff_id"])["more_may_arrive"]  # staged, not offered
+    joined = client.ok("POST", "/api/handoffs", {"files": [slow["file_id"]]})
+    assert (joined["handoff_id"], joined["merged"]) == (offered["handoff_id"], True)
+    entry = listed(client, offered["handoff_id"])
+    assert [file["name"] for file in entry["files"]] == ["quick.tif", "slow.tif"]
+    assert not entry["more_may_arrive"]
+
+
+def test_the_workspace_lists_each_hand_off_with_the_name_its_project_would_take(
+    client, tmp_path, ticks, monkeypatch
+):
+    client.ok("POST", "/api/projects", {"name": "blot"})
+    first, _ = handed_off(client, tmp_path, ["Blot.TIF"])
+    ticks.advance(handoff.MERGE_WINDOW_S)
+    second, _ = handed_off(client, tmp_path, [NAME, "marker α.tif"])
+    listings: list[Path] = []
+    iterdir = Path.iterdir
+
+    def counting(self: Path) -> Any:
+        if self == client.root:
+            listings.append(self)
+        return iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", counting)
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [(h["id"], h["suggested_name"]) for h in handoffs] == [
+        (first, "Blot (2)"),  # blot is taken, ignoring case
+        (second, "β-actin 10 µM"),
+    ]
+    assert len(listings) == 1  # the root, once for both
+    assert [h["more_may_arrive"] for h in handoffs] == [False, True]  # the first is older
+    ticks.advance(handoff.MERGE_WINDOW_S)
+    assert [h["more_may_arrive"] for h in client.ok("GET", "/api/workspace")["handoffs"]] == [
+        False,
+        False,
+    ]
+
+    # A hand-off an accept has claimed is not listed.
+    inbox = client.workspace.inbox
+    claimed = inbox.claim(first, [file["file_id"] for file in listed(client, first)["files"]])
+    assert [h["id"] for h in client.ok("GET", "/api/workspace")["handoffs"]] == [second]
+    inbox.release(claimed)
+    assert [h["id"] for h in client.ok("GET", "/api/workspace")["handoffs"]] == [first, second]
+
+
+def test_an_accept_imports_the_images_into_a_new_project_named_after_the_first(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    before = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    old = client.workspace.current()
+    handoff_id, files = handed_off(client, tmp_path, [NAME, "marker α.tif"])
+    answer = accept(client, handoff_id, files, kinds={1: "visible_marker"}, membranes={1: 0})
+
+    project = answer["project"]
+    assert project["name"] == "β-actin 10 µM" and project["open_id"] == before["open_id"] + 1
+    images = project["images"]
+    assert [(i["original_name"], i["kind"], i["polarity"]) for i in images] == [
+        (NAME, "chemiluminescence", "dark_on_light"),
+        ("marker α.tif", "visible_marker", "dark_on_light"),
+    ]
+    membrane = images[0]["membrane_id"]
+    assert images[1]["membrane_id"] == membrane
+    assert answer["handoff"] == {
+        "imported": [
+            {
+                "file_id": files[0]["file_id"],
+                "name": NAME,
+                "image_id": images[0]["id"],
+                "membrane_id": membrane,
+                "new_membrane": True,
+            },
+            {
+                "file_id": files[1]["file_id"],
+                "name": "marker α.tif",
+                "image_id": images[1]["id"],
+                "membrane_id": membrane,
+                "new_membrane": False,
+            },
+        ],
+        "refused": [],
+        "launch_refused": [],
+        "more_refused": 0,
+        "notes": [],
+    }
+    saved = storage.load_project(client.root / "β-actin 10 µM")
+    assert [entry.action for entry in saved.log] == ["new_project", "import_image", "import_image"]
+    assert staging(client) == []
+    workspace = client.ok("GET", "/api/workspace")
+    assert (workspace["open"], workspace["handoffs"]) == ("β-actin 10 µM", [])
+    # The project open before is saved and closed.
+    assert (old.undo_step, old.redo_step) == (None, None)
+    assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["vehicle"]
+
+
+def test_an_accept_says_what_the_launches_refused(client, tmp_path, ticks):
+    refused = [{"name": "photo.bmp", "code": "unsupported_type", "message": "not an image type"}]
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"], refused=refused)
+    late = [{"name": "gone.tif", "code": "missing", "message": "no such file or folder"}]
+    assert client.ok("POST", "/api/handoffs", {"refused": late})["merged"]  # a notice, merged
+    handed = accept(client, handoff_id, files)["handoff"]
+    assert (handed["launch_refused"], handed["more_refused"]) == (refused + late, 0)
+
+
+def test_an_accept_takes_the_name_typed_or_refuses_it_changing_nothing(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Taken"})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    path = f"/api/handoffs/{handoff_id}/accept"
+    for name, refused in (
+        ("taken", (409, "project_exists")),
+        ("a/b", (422, "invalid_project_name")),
+    ):
+        assert client.refused("POST", path, {"name": name, "files": choices(files)})[:2] == refused
+        assert in_root(client) == ["Taken"] and listed(client, handoff_id)["files"] == files
+    assert accept(client, handoff_id, files, name="  My  blot ")["project"]["name"] == "My blot"
+
+
+def _missing_polarity(body: dict) -> None:
+    del body["files"][1]["polarity"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        _missing_polarity,
+        lambda body: body["files"][0].update(kind="photo"),
+        lambda body: body["files"][1].update(polarity="dark"),
+        lambda body: body["files"][1].update(polarity=None),
+        lambda body: body["files"][0].update(membrane=0),  # itself
+        lambda body: body["files"][0].update(membrane=1),  # a later file
+        lambda body: body["files"][1].update(membrane=-1),
+        lambda body: body["files"][1].update(membrane="same"),
+        lambda body: body["files"][1].update(membrane=True),
+        lambda body: body.update(files="all"),
+        lambda body: body.update(extra=1),
+    ],
+    ids=[
+        "no polarity",
+        "unknown kind",
+        "unknown polarity",
+        "null polarity",
+        "membrane of itself",
+        "membrane of a later file",
+        "negative membrane",
+        "membrane text",
+        "membrane true",
+        "files not a list",
+        "unknown key",
+    ],
+)
+def test_an_accept_that_cannot_be_read_changes_nothing(client, tmp_path, change):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif", "b.tif"])
+    body: dict[str, Any] = {"name": None, "files": choices(files)}
+    change(body)
+    path = f"/api/handoffs/{handoff_id}/accept"
+    assert client.refused("POST", path, body)[:2] == (422, "invalid_input")
+    assert in_root(client) == ["Blot"]
+    assert client.ok("GET", "/api/workspace")["open"] == "Blot"
+    assert listed(client, handoff_id)["files"] == files
+    assert len(staging(client)) == 2
+
+
+def test_an_accept_of_other_files_than_those_waiting_is_refused_with_them(client, tmp_path, ticks):
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    late = staged(client, blot_bytes(tmp_path), "b.tif")["file_id"]
+    assert client.ok("POST", "/api/handoffs", {"files": [late]})["merged"]
+    path = f"/api/handoffs/{handoff_id}/accept"
+    status, payload = client.call("POST", path, {"files": choices(files)})
+    assert (status, payload["code"]) == (409, "handoff_changed")
+    assert payload["detail"] == listed(client, handoff_id)
+    now = payload["detail"]["files"]
+    assert [file["name"] for file in now] == ["a.tif", "b.tif"]
+    assert not client.root.exists()
+    assert client.refused("POST", "/api/handoffs/nothing/accept", {"files": []})[:2] == (
+        404,
+        "handoff_not_found",
+    )
+    project = accept(client, handoff_id, now)["project"]
+    assert [image["original_name"] for image in project["images"]] == ["a.tif", "b.tif"]
+
+
+def test_a_notice_has_nothing_to_accept(client):
+    refused = [{"name": "photo.bmp", "code": "unsupported_type", "message": "not an image type"}]
+    handoff_id = client.ok("POST", "/api/handoffs", {"refused": refused})["handoff_id"]
+    path = f"/api/handoffs/{handoff_id}/accept"
+    assert client.refused("POST", path, {"files": []})[:2] == (422, "invalid_input")
+    assert client.call("POST", f"/api/handoffs/{handoff_id}/discard", {"files": [], "refused": 1})[
+        0
+    ] == (204)
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+
+
+def test_a_file_that_cannot_be_imported_is_left_out_and_said(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    ids = [
+        staged(client, b"not an image" * 100, "bad.tif")["file_id"],
+        staged(client, blot_bytes(tmp_path), "blot.tif")["file_id"],
+        staged(client, blot_bytes(tmp_path), "marker α.tif")["file_id"],
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids})
+    files = listed(client, offered["handoff_id"])["files"]
+    # blot.tif to join bad.tif's membrane, the marker to join blot.tif's.
+    answer = accept(client, offered["handoff_id"], files, membranes={1: 0, 2: 1})
+    handed = answer["handoff"]
+    assert [(f["name"], f["new_membrane"]) for f in handed["imported"]] == [
+        ("blot.tif", True),
+        ("marker α.tif", False),
+    ]
+    assert handed["imported"][0]["membrane_id"] == handed["imported"][1]["membrane_id"]
+    (refused,) = handed["refused"]
+    assert (refused["file_id"], refused["name"], refused["code"]) == (
+        ids[0],
+        "bad.tif",
+        "unreadable_image",
+    )
+    assert handed["notes"] == [
+        "blot.tif was put on a new membrane because bad.tif was not imported"
+    ]
+    # Named after the first file, though it was left out: the name is chosen first.
+    assert answer["project"]["name"] == "bad"
+    assert [image["original_name"] for image in answer["project"]["images"]] == [
+        "blot.tif",
+        "marker α.tif",
+    ]
+    assert staging(client) == []
+
+
+def test_an_accept_with_nothing_importable_leaves_no_project(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    ids = [staged(client, b"not an image", name)["file_id"] for name in ("a.tif", "b.png")]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids})
+    files = listed(client, offered["handoff_id"])["files"]
+    path = f"/api/handoffs/{offered['handoff_id']}/accept"
+    status, payload = client.call("POST", path, {"files": choices(files)})
+    assert (status, payload["code"]) == (422, "nothing_imported")
+    assert [(r["file_id"], r["name"], r["code"]) for r in payload["detail"]["refused"]] == [
+        (ids[0], "a.tif", "unreadable_image"),
+        (ids[1], "b.png", "unreadable_image"),
+    ]
+    assert in_root(client) == ["Blot"]
+    workspace = client.ok("GET", "/api/workspace")
+    # Discarded: an accept again would fail again.
+    assert (workspace["open"], workspace["handoffs"]) == ("Blot", [])
+    assert staging(client) == []
+
+
+def test_an_accept_while_the_open_project_cannot_be_saved_changes_nothing(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    project_file = client.root / "Blot" / storage.PROJECT_FILE
+    project_file.unlink()
+    project_file.mkdir()  # the autosave cannot replace it
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    path = f"/api/handoffs/{handoff_id}/accept"
+    status, payload = client.call("POST", path, {"files": choices(files)})
+    assert (status, payload["code"]) == (409, "unsaved_changes") and "detail" not in payload
+    assert in_root(client) == ["Blot"]
+    assert listed(client, handoff_id)["files"] == files and len(staging(client)) == 1
+
+    project_file.rmdir()
+    assert accept(client, handoff_id, files)["project"]["name"] == "a"
+    saved = storage.load_project(client.root / "Blot")
+    assert [lane.label for lane in saved.batch.lanes] == ["vehicle"]
+
+
+@pytest.mark.parametrize("switch", ["create", "accept"])
+def test_an_edit_made_while_a_switch_runs_is_saved_before_the_old_project_closes(
+    client, tmp_path, monkeypatch, switch
+):
+    # While a switch creates its project (for an accept: and imports into it)
+    # the old project is still open, and another page may edit it. If that
+    # edit's autosave fails, the old project is saved again before it is
+    # closed; if that fails too, the switch is abandoned: the old project stays
+    # open with the edit, and the answer names the project created.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    old = client.workspace.current()
+    project_file = old.folder / storage.PROJECT_FILE
+    edits: list[str] = []
+    fixed = threading.Event()  # the file can be written again once the edit is made
+    create_project = api.projects.create_project
+
+    def edited_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        project_file.unlink()
+        project_file.mkdir()  # the edit's autosave fails
+        edits.append(f"c{len(edits) + 1}")
+        api.ops.set_lanes(old, [api.ops.LaneInput(condition) for condition in edits])
+        assert old.dirty
+        if fixed.is_set():
+            project_file.rmdir()
+        return create_project(*args, **kwargs)
+
+    monkeypatch.setattr(api.projects, "create_project", edited_meanwhile)
+
+    def switch_to(name: str) -> tuple[int, Any]:
+        if switch == "create":
+            return client.call("POST", "/api/projects", {"name": name})
+        handoff_id, files = handed_off(client, tmp_path, [f"{name}.tif"])
+        return client.call("POST", f"/api/handoffs/{handoff_id}/accept", {"files": choices(files)})
+
+    status, payload = switch_to("First")
+    assert (status, payload["code"], payload["detail"]) == (
+        409,
+        "unsaved_changes",
+        {"created": "First"},
+    )
+    assert "'First'" in payload["message"] and "'Blot'" in payload["message"]
+    assert client.workspace.current() is old and old.dirty
+    assert [lane.label for lane in old.project.batch.lanes] == ["c1"]
+    assert client.ok("GET", "/api/workspace")["open"] == "Blot"
+    created = storage.load_project(client.root / "First")  # complete, and closed
+    assert len(list(created.batch.iter_images())) == (1 if switch == "accept" else 0)
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []  # its images are in First
+    assert staging(client) == []
+
+    project_file.rmdir()  # saved again before the switch, then while it runs
+    fixed.set()
+    status, payload = switch_to("Second")
+    assert status == 201, payload
+    assert payload["project"]["name"] == "Second"
+    saved = storage.load_project(old.folder)
+    assert [lane.label for lane in saved.batch.lanes] == ["c1", "c2"]
+    assert not old.dirty
+
+
+def test_an_open_whose_old_project_cannot_be_saved_after_it_names_nothing_created(
+    client, monkeypatch
+):
+    # An open makes no project: if an edit made while it runs cannot be saved,
+    # it is refused as when the open project cannot be saved first. Nothing is
+    # named as created, and the old project stays open with the edit.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    other = (client.root / "Other" / storage.PROJECT_FILE).read_bytes()
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    old = client.workspace.current()
+    project_file = old.folder / storage.PROJECT_FILE
+    open_project = api.ops.open_project
+
+    def edited_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        project_file.unlink()
+        project_file.mkdir()  # the edit's autosave fails
+        api.ops.set_lanes(old, [api.ops.LaneInput("c1")])
+        assert old.dirty
+        return open_project(*args, **kwargs)
+
+    monkeypatch.setattr(api.ops, "open_project", edited_meanwhile)
+    status, payload = client.call("POST", "/api/projects/open", {"name": "Other"})
+    assert (status, payload["code"]) == (409, "unsaved_changes")
+    assert "detail" not in payload and "created" not in payload["message"]
+    assert payload["message"].startswith("the open project could not be saved: ")
+    assert client.workspace.current() is old and old.dirty
+    assert client.ok("GET", "/api/workspace")["open"] == "Blot"
+    assert (client.root / "Other" / storage.PROJECT_FILE).read_bytes() == other
+
+    monkeypatch.setattr(api.ops, "open_project", open_project)
+    project_file.rmdir()
+    assert client.ok("POST", "/api/projects/open", {"name": "Other"})["project"]["name"] == "Other"
+    assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["c1"]
+
+
+def test_a_switch_waits_for_an_edit_running_on_the_old_project(tmp_path, monkeypatch):
+    # An edit running on the open project when a create has made its project
+    # holds that project's lock and has not changed it yet. The switch waits
+    # for it before replacing the project, so an edit whose autosave fails is
+    # saved again, or stays open, never left only in a closed session. Here the
+    # save fails again: the switch is abandoned, and the edit stays open.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    old = workspace.create("Blot")
+    project_file = old.folder / storage.PROJECT_FILE
+    project_file.unlink()
+    project_file.mkdir()  # every save of Blot fails
+    made = threading.Event()
+    create_project = api.projects.create_project
+
+    def creating(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return create_project(*args, **kwargs)
+        finally:
+            made.set()
+
+    monkeypatch.setattr(api.projects, "create_project", creating)
+    holding, go = threading.Event(), threading.Event()
+
+    def editing() -> None:  # a request's operation on Blot, e.g. a slow detection
+        with old.lock:
+            holding.set()
+            assert go.wait(20)
+            api.ops.set_lanes(old, [api.ops.LaneInput("vehicle")])  # its autosave fails
+
+    def switching() -> None:
+        with pytest.raises(api.UnsavedChangesError) as refused:
+            workspace.create("New")
+        errors.append(refused.value)
+
+    errors: list[api.UnsavedChangesError] = []
+    edit = threading.Thread(target=editing)
+    edit.start()
+    assert holding.wait(20)
+    switch = threading.Thread(target=switching)
+    switch.start()
+    assert made.wait(20)
+    deadline = time.monotonic() + 0.5  # time enough for a switch that does not wait
+    while workspace.current() is old and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert workspace.current() is old  # waiting for the edit
+    go.set()
+    for thread in (edit, switch):
+        thread.join(20)
+        assert not thread.is_alive()
+
+    (error,) = errors
+    assert error.created == "New"
+    assert workspace.current() is old and old.dirty
+    assert [lane.label for lane in old.project.batch.lanes] == ["vehicle"]
+    assert storage.load_project(tmp_path / "root" / "New").batch.lanes == []  # created, closed
+
+
+@pytest.mark.parametrize("saves", [True, False], ids=["saved", "logged"])
+def test_an_edit_made_on_the_old_project_once_replaced_is_saved_after_the_close(
+    tmp_path, monkeypatch, caplog, saves
+):
+    # A request that took the open project before a switch replaced it may
+    # edit it after, before the close. If that edit's autosave fails, the old
+    # project is saved once more after the close; a failure then is logged.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    old = workspace.create("Blot")
+    project_file = old.folder / storage.PROJECT_FILE
+    close = old.close
+
+    def edited_then_closed(**kwargs: Any) -> None:
+        assert workspace.current() is not old  # replaced
+        project_file.unlink()
+        project_file.mkdir()  # the edit's autosave fails
+        api.ops.set_lanes(old, [api.ops.LaneInput("vehicle")])
+        assert old.dirty
+        if saves:
+            project_file.rmdir()
+        close(**kwargs)
+
+    monkeypatch.setattr(old, "close", edited_then_closed)
+    with caplog.at_level(logging.WARNING, logger=api.__name__):
+        new = workspace.create("New")
+    assert workspace.current() is new
+    logged = [record.getMessage() for record in caplog.records if record.name == api.__name__]
+    if saves:
+        assert not old.dirty and logged == []
+        assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["vehicle"]
+    else:
+        assert old.dirty
+        (message,) = logged
+        assert message.startswith("'Blot' was closed with changes that could not be saved: ")
+
+
+def test_an_accept_from_a_page_showing_another_opening_changes_nothing(client, tmp_path):
+    shown = client.ok("POST", "/api/projects", {"name": "Blot"})["project"]["open_id"]
+    now = client.ok("POST", "/api/projects", {"name": "Other"})["project"]["open_id"]
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    path = f"/api/handoffs/{handoff_id}/accept"
+    status, payload = client.call(
+        "POST", path, {"files": choices(files)}, headers={OPENING: str(shown)}
+    )
+    assert (status, payload["code"], payload["detail"]) == (
+        409,
+        "project_changed",
+        {"open": "Other", "open_id": now},
+    )
+    assert in_root(client) == ["Blot", "Other"] and listed(client, handoff_id)["files"] == files
+    answer = accept(client, handoff_id, files, headers={OPENING: str(now)})
+    assert (answer["project"]["name"], answer["project"]["open_id"]) == ("a", now + 1)
+
+
+def test_files_offered_while_an_accept_runs_start_another_hand_off(
+    client, tmp_path, monkeypatch, ticks
+):
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    ids = [file["file_id"] for file in files]
+    entered, release = _held_until_released(monkeypatch, api.ops, "import_image")
+    path = f"/api/handoffs/{handoff_id}"
+    accepting, accepted = _in_thread(
+        lambda: client.call("POST", f"{path}/accept", {"files": choices(files)})
+    )
+    try:
+        assert entered.wait(20)
+        assert client.ok("GET", "/api/workspace")["handoffs"] == []  # claimed: not listed
+        late = staged(client, blot_bytes(tmp_path), "late.tif")["file_id"]
+        offered = client.ok("POST", "/api/handoffs", {"files": [late]})
+        assert not offered["merged"] and offered["handoff_id"] != handoff_id
+        for route, body in (("accept", {"files": choices(files)}), ("discard", {"files": ids})):
+            assert client.refused("POST", f"{path}/{route}", body)[:2] == (409, "handoff_claimed")
+    finally:
+        release.set()
+        accepting.join(30)
+    status, answer = accepted[0]
+    assert status == 201, answer
+    assert [image["original_name"] for image in answer["project"]["images"]] == ["a.tif"]
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [(h["id"], [f["name"] for f in h["files"]]) for h in handoffs] == [
+        (offered["handoff_id"], ["late.tif"])
+    ]
+
+
+def test_a_discard_drops_only_what_the_page_shows(client, tmp_path, ticks):
+    refused = [{"name": "photo.bmp", "code": "unsupported_type", "message": "not an image type"}]
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"], refused=refused)
+    shown = [file["file_id"] for file in files]
+    late = staged(client, blot_bytes(tmp_path), "b.tif")["file_id"]
+    assert client.ok("POST", "/api/handoffs", {"files": [late]})["merged"]
+    path = f"/api/handoffs/{handoff_id}/discard"
+    status, payload = client.call("POST", path, {"files": shown, "refused": 1})
+    assert (status, payload["code"]) == (409, "handoff_changed")
+    assert payload["detail"] == listed(client, handoff_id)
+    assert len(staging(client)) == 2
+    now = [file["file_id"] for file in payload["detail"]["files"]]
+    status, payload = client.call("POST", path, {"files": now, "refused": 0})  # it holds 1
+    assert (status, payload["code"]) == (409, "handoff_changed")
+
+    assert client.call("POST", path, {"files": list(reversed(now)), "refused": 1})[0] == 204
+    assert staging(client) == []
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+    assert client.refused("POST", path, {"files": now, "refused": 1})[:2] == (
+        404,
+        "handoff_not_found",
+    )
+    assert not client.root.exists()
+
+
+def test_files_named_on_the_servers_command_line_are_read_where_they_are_never_deleted(
+    client, tmp_path
+):
+    # The first launch registers the files on its own command line: read
+    # where they are when imported, never copied into the staging folder, and
+    # never deleted, whether imported, discarded, or dropped when Proteia stops.
+    originals = tmp_path / "originals α"
+    blot = synthetic_blot((H, W), [(50, ROW, 5.0, 3.0, 30000.0)])
+    gone = write_tiff(originals / "gone β.tif", blot)
+    kept = write_tiff(originals / "kept µ.tif", blot)
+
+    def unchanged() -> tuple[bytes, int]:
+        return kept.read_bytes(), kept.stat().st_mtime_ns
+
+    before = unchanged()
+    inbox = client.workspace.inbox
+    offered = inbox.add_local([(gone, gone.name), (kept, kept.name)])
+    assert offered is not None and staging(client) == []
+    files = listed(client, offered.handoff_id)["files"]
+    assert [(f["name"], f["size"]) for f in files] == [
+        (gone.name, gone.stat().st_size),
+        (kept.name, kept.stat().st_size),
+    ]
+    gone.unlink()  # removed before Import is pressed
+    handed = accept(client, offered.handoff_id, files)["handoff"]
+    assert [f["name"] for f in handed["imported"]] == ["kept µ.tif"]
+    (refused,) = handed["refused"]
+    assert (refused["name"], refused["code"]) == ("gone β.tif", "file_error")
+    assert str(originals) not in json.dumps(handed, ensure_ascii=False)  # no path
+    assert unchanged() == before
+
+    offered = inbox.add_local([(kept, kept.name)])
+    ids = [f["file_id"] for f in listed(client, offered.handoff_id)["files"]]
+    path = f"/api/handoffs/{offered.handoff_id}/discard"
+    assert client.call("POST", path, {"files": ids})[0] == 204
+    assert unchanged() == before
+    inbox.add_local([(kept, kept.name)])
+    inbox.close()  # as when Proteia stops
+    assert unchanged() == before
+
+
+def _stage_in(inbox: handoff.Inbox, name: str, data: bytes) -> str:
+    """``data`` staged as ``name`` straight into ``inbox``: its file id."""
+    upload = inbox.begin_upload(name, len(data))
+    with upload.open() as out:
+        out.write(data)
+    return inbox.upload_stored(upload, len(data)).file_id
+
+
+def _placed_workspace(tmp_path: Path) -> tuple[api.Workspace, handoff.Inbox]:
+    inbox = handoff.Inbox()
+    inbox.place(tmp_path / "incoming")
+    workspace = api.Workspace(
+        tmp_path / "root", reveal=lambda folder: None, clock=FakeClock(), inbox=inbox
+    )
+    return workspace, inbox
+
+
+def _chosen(file_ids: list[str]) -> list[api.FileChoice]:
+    return [
+        api.FileChoice(file_id, api.ImageKind.CHEMILUMINESCENCE, api.Polarity.DARK_ON_LIGHT)
+        for file_id in file_ids
+    ]
+
+
+def test_a_stop_during_an_accept_waits_for_the_file_being_imported(tmp_path, monkeypatch):
+    # Stopping waits for the accept (it holds the switch lock), but no longer
+    # than the file being imported: the rest are not imported, the project is
+    # saved with what was, and the staged files are deleted once the accept
+    # no longer reads them.
+    workspace, inbox = _placed_workspace(tmp_path)
+    workspace.create("Blot")
+    data = blot_bytes(tmp_path)
+    ids = [_stage_in(inbox, name, data) for name in ("a.tif", "b.tif")]
+    offered = inbox.offer(ids)
+    entered, release = _held_until_released(monkeypatch, api.ops, "import_image")
+    accepting, accepted = _in_thread(
+        lambda: workspace.accept(offered.handoff_id, None, _chosen(ids))
+    )
+    try:
+        assert entered.wait(20)
+        stopping, _ = _in_thread(workspace.close)
+        deadline = time.monotonic() + 10
+        while not inbox.stopping:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        stopping.join(0.3)
+        assert stopping.is_alive()  # it waits for the accept
+        assert len(list((tmp_path / "incoming").iterdir())) == 2
+    finally:
+        release.set()
+    for thread in (accepting, stopping):
+        thread.join(30)
+        assert not thread.is_alive()
+    session, done = accepted[0]
+    assert [file.name for file in done.imported] == ["a.tif"]
+    assert [(file.name, file.code) for file in done.refused] == [("b.tif", "stopping")]
+    saved = storage.load_project(session.folder)
+    assert [image.original_name for image in saved.batch.iter_images()] == ["a.tif"]
+    assert list((tmp_path / "incoming").iterdir()) == []
+
+
+def test_an_accept_checks_the_opening_again_once_no_other_switch_runs(tmp_path):
+    workspace, inbox = _placed_workspace(tmp_path)
+    workspace.create("Blot")  # opening 1, as a page shows it
+    ids = [_stage_in(inbox, "a.tif", blot_bytes(tmp_path))]
+    offered = inbox.offer(ids)
+    workspace.create("Other")  # another page's switch, after the route's first check
+    with pytest.raises(api.ProjectChangedError):
+        workspace.accept(offered.handoff_id, None, _chosen(ids), opening=1)
+    assert [view.id for view in inbox.listing()] == [offered.handoff_id]  # pending again
+    assert workspace.current().folder.name == "Other"
+    session, _ = workspace.accept(offered.handoff_id, None, _chosen(ids), opening=2)
+    assert session.folder.name == "a"
+
+
+def test_the_status_says_proteia_takes_handed_off_files(client):
+    assert client.ok("GET", "/api/status")["handoff"] == server.HANDOFF == 1

@@ -75,6 +75,28 @@ whose opening ended meanwhile is refused, with nothing imported. ``GET
 reading it: for a page to find out. The routes that list, create or open
 projects, and the status and quit routes, need no opening.
 
+Images handed to the running app by a launch wait in the workspace's inbox
+(:mod:`proteia.web.handoff`) until the page imports or discards them. ``POST
+/api/incoming?name=<name>`` takes one file's bytes, as ``POST /api/images``
+does, into the private staging folder under a name the server makes, and
+answers ``{file_id, name, size}``; ``POST /api/handoffs`` offers uploaded files
+(``files``, their ids) with the arguments the launch refused (``refused``,
+``{name, code, message}`` each, bounded, never refusing the offer), and answers
+``{handoff_id, merged, files, refused}``: the hand-off they went to, whether it
+was pending already, and how many files and refused entries it holds. ``GET
+/api/workspace`` lists the pending hand-offs as ``handoffs``, each ``{id, kind,
+files: [{file_id, name, size}], suggested_name, refused, more_refused,
+more_may_arrive}``, with the name its project would take now. ``POST
+/api/handoffs/{id}/accept`` imports a hand-off into a new project
+(:meth:`Workspace.accept`), with a kind, a polarity and a membrane (``"new"``,
+or the index of an earlier file whose membrane it joins) for each file, and
+answers as a create does, with ``handoff``: what was imported, what was not and
+why, the launch's refused entries and notes. ``POST /api/handoffs/{id}/discard``
+drops one as the page shows it. No path crosses HTTP: the page sees file ids,
+names and sizes only. These routes need no opening, except the accept: it
+closes the open project, so it is refused, as an edit is, for a page that
+shows another.
+
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
 refusal carries one (a row box's: what the detector saw); an unknown id 404, and
@@ -83,19 +105,26 @@ an export folder to reveal that does not exist 404 ``folder_not_found``;
 request that names an opening no longer open, with ``detail`` ``{open,
 open_id}``: the open project's name and open id; ``invalid_input`` 422 for a
 request the routes cannot read, a ``Proteia-Opening`` not in plain digits too.
+The hand-off routes add: ``stopping``, ``too_many_pending``, ``file_claimed``,
+``handoff_claimed`` and ``handoff_changed`` (``detail``: the hand-off as it is
+listed now) 409, ``handoff_not_found`` 404, and ``nothing_imported`` 422
+(``detail.refused``: each file and why). ``unsaved_changes`` carries
+``detail.created`` when a switch created its project but then could not save
+the one open, which stays open.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
 import os
 import tempfile
 import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
@@ -119,15 +148,18 @@ from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import DEFAULT_CHART_FORMATS
-from proteia.core.model import BoxSize, UnknownIdError
+from proteia.core.model import BoxSize, ImageKind, Polarity, UnknownIdError
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import projects, sample_project
+from proteia.web import handoff, projects, sample_project
 from proteia.web.charts import ChartStore
+from proteia.web.handoff import HandoffView, Inbox, Refusal
 from proteia.web.results_view import results_payload
 from proteia.web.state import has_colour, original_png, preview_png, project_state, revision
+
+_log = logging.getLogger(__name__)
 
 # The request header that names the opening of a project a page shows (its open id).
 OPENING_HEADER: Final = "Proteia-Opening"
@@ -157,7 +189,84 @@ class ProjectChangedError(RuntimeError):
 
 
 class UnsavedChangesError(RuntimeError):
-    """The open project has changes that could not be saved; it stays open."""
+    """The open project has changes that could not be saved; it stays open.
+    ``created``: the project a switch created before that save failed, which
+    exists, complete, and stays closed; None if none was."""
+
+    def __init__(self, message: str, *, created: str | None = None) -> None:
+        super().__init__(message)
+        self.created = created
+
+
+class NothingImportedError(RuntimeError):
+    """No file of a hand-off could be imported: ``refused`` says why, for each."""
+
+    def __init__(self, refused: tuple[NotImported, ...]) -> None:
+        super().__init__("none of the images could be imported")
+        self.refused = refused
+
+
+@dataclass(frozen=True)
+class FileChoice:
+    """How a file of a hand-off is imported: its kind and polarity, and
+    ``membrane``, the index (in the accept's list) of an earlier file whose
+    membrane it joins, or None for a new membrane."""
+
+    file_id: str
+    kind: ImageKind
+    polarity: Polarity
+    membrane: int | None = None
+
+
+@dataclass(frozen=True)
+class Imported:
+    """A file of a hand-off imported, as the image ``image_id`` on
+    ``membrane_id`` (``new_membrane``: one it started)."""
+
+    file_id: str
+    name: str
+    image_id: str
+    membrane_id: str
+    new_membrane: bool
+
+
+@dataclass(frozen=True)
+class NotImported:
+    """A file of a hand-off not imported: the operation's code and message, or
+    ``file_error`` (it could not be read or stored) or ``stopping``."""
+
+    file_id: str
+    name: str
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class Accepted:
+    """What an accept did (:meth:`Workspace.accept`): the files imported and not,
+    in order; ``notes`` (a file put on a new membrane because the one it was to
+    join was not imported); and the arguments the launches refused
+    (``launch_refused``, and ``more_refused`` not kept)."""
+
+    imported: tuple[Imported, ...]
+    refused: tuple[NotImported, ...]
+    notes: tuple[str, ...]
+    launch_refused: tuple[Refusal, ...]
+    more_refused: int
+
+
+def _was_created(name: str) -> str:
+    return f"{name!r} was created"
+
+
+def _reason(exc: OSError) -> str:
+    """Why a file could not be read or written, naming no path: its strerror."""
+    return exc.strerror or type(exc).__name__
+
+
+def _not_saved(exc: Exception) -> UnsavedChangesError:
+    """The open project could not be saved (``exc``), and nothing was made."""
+    return UnsavedChangesError(f"the open project could not be saved: {exc}")
 
 
 class UploadTooLargeError(ValueError):
@@ -212,24 +321,36 @@ class Workspace:
     (with the open id, the revision and the settings they belong to), since
     reading them again is common and computing them is not cheap. So are the
     charts of the answers about the latest opening (:class:`ChartStore`).
+    Images handed to the app wait in :attr:`inbox` until an accept imports
+    them into a new project (:meth:`accept`), a switch like any other.
 
     The locks, in the order they are taken: the switch lock (a create or an
     open holds it throughout), a session's lock (an operation holds it while it
-    runs; a reopen takes it to read ``project.json`` again), this workspace's
+    runs; a reopen takes it to read ``project.json`` again; a switch takes the
+    old session's to save it a last time and replace it), this workspace's
     lock (held briefly, never while computing or waiting for another lock),
     then the chart store's. None is taken while one after it is held. Waiting
     adds no cycle: a request waits for a reopen under way (:meth:`using`) before
     it takes any of them, on this lock's condition, which releases it
     meanwhile; a reopen waits for the requests using the session holding only
     the switch lock, which no request takes, and at most :data:`REOPEN_WAIT_S`.
+    The inbox's lock is taken with none of these held, and none is taken
+    while it is.
     """
 
     def __init__(
-        self, root: Path, *, reveal: Callable[[Path], None], clock: Clock = utc_now
+        self,
+        root: Path,
+        *,
+        reveal: Callable[[Path], None],
+        clock: Clock = utc_now,
+        inbox: Inbox | None = None,
     ) -> None:
         self.root = root
         self.reveal = reveal
         self.clock = clock
+        # Images handed to the app; a launch gives it its staging folder.
+        self.inbox = Inbox() if inbox is None else inbox
         # Guards the open session, the open ids, the sessions in use, the reopen
         # under way, the settings, the previews and the results; never held while
         # computing. Taken before the chart store's own lock, never while holding it.
@@ -335,7 +456,7 @@ class Workspace:
         try:
             session.save()
         except (OSError, ProjectError) as exc:
-            raise UnsavedChangesError(f"the open project could not be saved: {exc}") from exc
+            raise _not_saved(exc) from exc
 
     def flush(self) -> None:
         """Save the open project if it has unsaved changes (an autosave failed);
@@ -344,16 +465,34 @@ class Workspace:
         if session is not None and session.dirty:
             self._save(session)
 
-    def _switch(self, make: Callable[[], ProjectSession]) -> ProjectSession:
+    def _switch(
+        self,
+        make: Callable[[], ProjectSession],
+        *,
+        created: Callable[[str], str] | None = _was_created,
+    ) -> ProjectSession:
         """Replace the open project with ``make()``; the old one is saved first,
         and stays open, with its undo history, if ``make`` fails or its unsaved
-        changes cannot be saved. Once replaced, the old one is closed
-        (:meth:`~proteia.core.session.ProjectSession.close`): its history is
-        gone, and so are the image files only that history kept, unless the new
-        session's folder is, or may be, the old one's. Then the close deletes
+        changes cannot be saved. While ``make`` runs the old one is still open,
+        and edited if a request asks. So once ``make`` returns, the old one's
+        lock is taken, which waits for an operation running on it, and it is
+        saved again if an edit's autosave failed meanwhile; it is replaced
+        before the lock is released, so no edit falls between. If that save
+        fails, the new project is not opened, while the old one stays open with
+        its changes. A project ``make`` created stays on disk, closed, and
+        :class:`UnsavedChangesError` names it (``created``, and ``created(name)``
+        says so in its message); with ``created`` None (an open, which creates
+        nothing) the error is the one a failed first save raises. Once replaced,
+        the old one is closed (:meth:`~proteia.core.session.ProjectSession.close`):
+        its history is gone, and so are the image files only that history
+        kept, unless the new session's folder is, or may be, the old one's.
+        Then it is replaced without waiting for its lock, and the close deletes
         nothing, since the new session may already be storing files the old one
         does not know (the close waits for any request still running on the old
-        one), and the new session's first save or import deletes those files.
+        one), and the new session's first save or import deletes those files;
+        nor is the old one saved again, over the new one's file. After the
+        close, an edit that took the old session before it was replaced, and
+        whose autosave failed, is saved once more; a failure then is logged.
         Opening the open project never switches (:meth:`open`), but a project
         created where the open one's folder was removed outside Proteia does.
         Saving, opening and closing run outside the lock readers take. Called
@@ -362,6 +501,40 @@ class Workspace:
         if old is not None and old.dirty:
             self._save(old)
         session = make()
+        if old is None:
+            self._opened(session)
+            return session
+        shared = _same_folder(old.folder, session.folder, unknown=True)
+        if shared:  # without waiting for a request running on the old one
+            self._opened(session)
+        else:
+            with old.lock:
+                if old.dirty:
+                    try:
+                        old.save()
+                    except (OSError, ProjectError) as exc:
+                        session.close(remove_files=False)
+                        if created is None:
+                            raise _not_saved(exc) from exc
+                        name = old.folder.name
+                        raise UnsavedChangesError(
+                            f"{name!r} could not be saved: {exc}. {created(session.folder.name)};"
+                            f" open it from Projects once {name!r} can be saved",
+                            created=session.folder.name,
+                        ) from exc
+                self._opened(session)
+        old.close(remove_files=not shared)
+        if old.dirty and not shared:
+            try:
+                old.save()
+            except (OSError, ProjectError) as exc:
+                _log.warning(
+                    "%r was closed with changes that could not be saved: %s", old.folder.name, exc
+                )
+        return session
+
+    def _opened(self, session: ProjectSession) -> None:
+        """Make ``session`` the open one, under the next open id."""
         with self._lock:
             self._session = session
             self._open_id += 1
@@ -369,18 +542,22 @@ class Workspace:
             self._previews.clear()
             self._results = None
             self._charts.reset(self._open_id)
-        if old is not None:
-            old.close(remove_files=not _same_folder(old.folder, session.folder, unknown=True))
-        return session
 
     def close(self) -> None:
         """Close the open project: its undo history is gone, and so are the image
         files only that history kept. Called when the server stops, after
-        :meth:`flush`."""
+        :meth:`flush`. First the inbox stops (:meth:`~proteia.web.handoff.Inbox.stop`):
+        no upload, offer or accept starts, and an accept under way imports no
+        further file, so this waits for one file's import at most; then the
+        open project is closed, once no switch runs; then the staged files are
+        deleted (:meth:`~proteia.web.handoff.Inbox.close`), once no accept reads
+        them (Windows cannot delete a file held open)."""
+        self.inbox.stop()
         with self._switching:
             session = self._peek()
             if session is not None:
                 session.close()
+        self.inbox.close()
 
     def create(self, name: object) -> ProjectSession:
         with self._switching:
@@ -394,6 +571,136 @@ class Workspace:
             return self._switch(
                 lambda: sample_project.create_sample_project(self.root, clock=self.clock)
             )
+
+    def accept(
+        self,
+        handoff_id: str,
+        name: object,
+        choices: Sequence[FileChoice],
+        *,
+        opening: int | None = None,
+    ) -> tuple[ProjectSession, Accepted]:
+        """Import the hand-off ``handoff_id`` into a new project and open it, as
+        a create does (:meth:`_switch`): each file in the order of ``choices``,
+        which must name its files, each once, with its kind, polarity and
+        membrane, through the ordinary import (each logged and undoable).
+
+        The project is named ``name`` (:func:`~proteia.web.projects.project_name`;
+        ``project_exists`` if taken) or, with None, after the first file
+        (:func:`~proteia.web.projects.name_from_file`), numbered if taken
+        (:func:`~proteia.web.projects.free_name`), under the switch lock, so no
+        other create takes the name meanwhile. A file that cannot be imported
+        (an operation's refusal, a file that cannot be read) is left out, and
+        the answer says why; one to join the membrane of a file left out starts
+        a new one, and a note says so. Once Proteia is stopping, the files left
+        are not imported (``stopping``).
+
+        ``opening``: the opening the page shows, as a request names it; the
+        accept is refused (:class:`ProjectChangedError`) if it is no longer the
+        open one, checked under the switch lock, since the open project is
+        closed. The hand-off is claimed first (:meth:`~proteia.web.handoff.Inbox.claim`),
+        so another accept or a discard of it is refused meanwhile, and files
+        offered meanwhile start another hand-off. Afterwards it is gone, and its
+        staged files are deleted, when its files were imported; when none could
+        be (:class:`NothingImportedError`: no project is left, and the open one
+        stays open), since trying again would fail again; and when the open
+        project could not be saved after the imports
+        (:class:`UnsavedChangesError` with ``created``), since the images are in
+        the project created. Any other refusal changes nothing, and it is
+        pending again."""
+        typed = None if name is None else projects.project_name(name)
+        claimed = self.inbox.claim(handoff_id, [choice.file_id for choice in choices])
+        files = {file.file_id: file for file in claimed.files}
+        imported: list[Imported] = []
+        refused: list[NotImported] = []
+        notes: list[str] = []
+
+        def set_up(session: ProjectSession) -> None:
+            membranes: dict[int, str] = {}  # choice index -> the membrane its file went on
+            for index, choice in enumerate(choices):
+                file = files[choice.file_id]
+                if self.inbox.stopping:
+                    refused.append(
+                        NotImported(file.file_id, file.name, "stopping", "Proteia is stopping")
+                    )
+                    continue
+                membrane_id = None
+                if choice.membrane is not None:
+                    membrane_id = membranes.get(choice.membrane)
+                    if membrane_id is None:
+                        earlier = files[choices[choice.membrane].file_id].name
+                        notes.append(
+                            f"{file.name} was put on a new membrane because {earlier} was not"
+                            " imported"
+                        )
+                try:
+                    with file.source.open() as stream:
+                        image_id = ops.import_image(
+                            session,
+                            stream,
+                            file.name,
+                            kind=choice.kind,
+                            polarity=choice.polarity,
+                            membrane_id=membrane_id,
+                            max_bytes=MAX_UPLOAD_BYTES,
+                        )
+                except OperationError as exc:
+                    refused.append(NotImported(file.file_id, file.name, exc.code.value, str(exc)))
+                    continue
+                except OSError as exc:
+                    refused.append(NotImported(file.file_id, file.name, "file_error", _reason(exc)))
+                    continue
+                membranes[index] = session.project.batch.membrane_of(image_id).id
+                imported.append(
+                    Imported(
+                        file.file_id,
+                        file.name,
+                        image_id,
+                        membranes[index],
+                        new_membrane=membrane_id is None,
+                    )
+                )
+            if not imported:
+                raise NothingImportedError(tuple(refused))
+
+        def make() -> ProjectSession:
+            new = typed
+            if new is None:
+                first = files[choices[0].file_id].name
+                new = projects.free_name(self.root, projects.name_from_file(first))
+            return projects.create_set_up(self.root, new, set_up, clock=self.clock)
+
+        def into(new: str) -> str:
+            return f"the images were imported into {new!r}"
+
+        try:
+            with self._switching:
+                if opening is not None:
+                    self.current(opening)
+                if self.inbox.stopping:
+                    raise handoff.StoppingError("Proteia is stopping")
+                session = self._switch(make, created=into)
+        except NothingImportedError:
+            self.inbox.finish(claimed)
+            raise
+        except UnsavedChangesError as exc:
+            if exc.created is None:
+                self.inbox.release(claimed)
+            else:
+                self.inbox.finish(claimed)
+            raise
+        except BaseException:
+            self.inbox.release(claimed)
+            raise
+        self.inbox.finish(claimed)
+        accepted = Accepted(
+            imported=tuple(imported),
+            refused=tuple(refused),
+            notes=tuple(notes),
+            launch_refused=tuple(claimed.refused),
+            more_refused=claimed.more_refused,
+        )
+        return session, accepted
 
     def open(self, name: object) -> ProjectSession:
         """Open the project ``name`` (:func:`~proteia.web.projects.project_folder`)
@@ -426,7 +733,9 @@ class Workspace:
             folder = projects.project_folder(self.root, name)
             session = self._peek()
             if session is None or not _same_folder(session.folder, folder, unknown=False):
-                return self._switch(lambda: ops.open_project(folder, clock=self.clock))
+                return self._switch(
+                    lambda: ops.open_project(folder, clock=self.clock), created=None
+                )
             deadline = time.monotonic() + REOPEN_WAIT_S
             try:
                 with self._lock:
@@ -648,6 +957,38 @@ class RevealBody(_Body):
     folder: str  # an export folder as POST /api/export answered it: "exports/<name>"
 
 
+class RefusedBody(_Body):
+    """An argument a launch refused: its base name, a code and a message, taken
+    as sent and bounded by the inbox (:meth:`~proteia.web.handoff.Refusal.bounded`)."""
+
+    name: str
+    code: str
+    message: str
+
+
+class OfferBody(_Body):
+    files: list[str] = []  # the ids POST /api/incoming answered, in order
+    refused: list[RefusedBody] = []
+
+
+class AcceptFileBody(_Body):
+    file_id: str
+    kind: str
+    polarity: str  # required: the model has no silent default
+    # "new", or the index in the accept's list of an earlier file whose membrane it joins.
+    membrane: Literal["new"] | NonNegativeInt = "new"
+
+
+class AcceptBody(_Body):
+    name: str | None = None  # None: named after the first file, numbered if taken
+    files: list[AcceptFileBody]
+
+
+class DiscardBody(_Body):
+    files: list[str]  # the hand-off's file ids as the page shows them
+    refused: NonNegativeInt = 0  # its refused entries as the page counts them
+
+
 # --- Routes ---
 
 
@@ -704,6 +1045,22 @@ def _checked_session(request: Request) -> ProjectSession:
 
 
 CheckedSession = Annotated[ProjectSession, Depends(_checked_session)]
+
+
+def _no_other_opening(request: Request) -> int | None:
+    """The opening the request names (:func:`_opening`), or None, checked as
+    :func:`_checked_session` checks it, and as early, for a route that closes
+    the open project to open another (:func:`accept_handoff`): a page that
+    shows a project no longer open does not close the one open now. The route
+    checks it again once no other switch can run. A sync function, so it runs
+    in the thread pool."""
+    opening = _opening(request)
+    if opening is not None:
+        _workspace(request).current(opening)
+    return opening
+
+
+NamedOpening = Annotated[int | None, Depends(_no_other_opening)]
 
 
 def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
@@ -813,9 +1170,163 @@ def list_projects(workspace: WorkspaceDep) -> dict[str, Any]:
 def get_workspace(workspace: WorkspaceDep) -> dict[str, Any]:
     """Which project is open, without reading it: the projects root, and the
     open project's name and open id (null before one is open). A page checks it
-    to know whether the project it shows is still the one open."""
+    to know whether the project it shows is still the one open. And the
+    hand-offs pending (:func:`_handoffs`)."""
     name, open_id = workspace.opened()
-    return {"root": str(workspace.root), "open": name, "open_id": open_id}
+    return {
+        "root": str(workspace.root),
+        "open": name,
+        "open_id": open_id,
+        "handoffs": _handoffs(workspace.root, workspace.inbox.listing()),
+    }
+
+
+def _handoffs(root: Path, views: list[HandoffView]) -> list[dict[str, Any]]:
+    """The hand-offs ``views`` as the page lists them, each with the name its
+    project would take now (``suggested_name``, a hint: the accept names it
+    again; null for a notice, or when no name is free). The projects root is
+    listed once for all of them, and not at all without files."""
+    names: list[str] = []
+    if any(view.files for view in views):
+        with contextlib.suppress(OSError):
+            names = projects.names_in(root)
+    return [_handoff(root, view, names) for view in views]
+
+
+def _handoff(root: Path, view: HandoffView, names: list[str]) -> dict[str, Any]:
+    suggested = None
+    if view.files:
+        with contextlib.suppress(projects.ProjectExistsError, projects.ProjectNameError):
+            first = projects.name_from_file(view.files[0].name)
+            suggested = projects.free_name(root, first, existing=names)
+    return {
+        "id": view.id,
+        "kind": view.kind,
+        "files": [
+            {"file_id": file.file_id, "name": file.name, "size": file.size} for file in view.files
+        ],
+        "suggested_name": suggested,
+        "refused": [dataclasses.asdict(entry) for entry in view.refused],
+        "more_refused": view.more_refused,
+        "more_may_arrive": view.more_may_arrive,
+    }
+
+
+@router.post("/incoming", status_code=201)
+async def receive_file(
+    request: Request, workspace: WorkspaceDep, name: Annotated[str, Query(min_length=1)]
+) -> dict[str, Any]:
+    """Stage a file a launch hands to the app: the request body is its bytes,
+    ``name`` its original name (percent-encoded in the URL), metadata only. It
+    is stored in the private staging folder under a name the server makes
+    (:meth:`~proteia.web.handoff.Inbox.begin_upload`), and waits there for an
+    offer (``POST /api/handoffs``), which must come within
+    :data:`~proteia.web.handoff.UPLOAD_EXPIRY_S`. Answers ``{file_id, name,
+    size}``. The name is checked before any of the body is read
+    (:func:`~proteia.web.handoff.check_name`), and so are the size the request
+    declares and the limits; an empty body is ``invalid_image``. One that
+    cannot be stored is ``file_error``, with a message that names no path: the
+    launch passes it on to the page. A refused upload leaves no file."""
+    handoff.check_name(name)
+    given = request.headers.get("content-length")
+    declared = int(given) if given is not None and given.isdigit() else None
+    if declared is not None and declared > MAX_UPLOAD_BYTES:
+        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
+    inbox = workspace.inbox
+    upload = await run_in_threadpool(inbox.begin_upload, name, declared)
+    try:
+        size = 0
+        with upload.open() as out:
+            pending = bytearray()
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
+                pending += chunk
+                if len(pending) >= _WRITE_BYTES:
+                    inbox.make_room(upload, size)
+                    await run_in_threadpool(out.write, bytes(pending))
+                    pending.clear()
+            if pending:
+                inbox.make_room(upload, size)
+                await run_in_threadpool(out.write, bytes(pending))
+        if size == 0:
+            raise OperationError(ErrorCode.INVALID_IMAGE, f"image {name!r} is empty")
+        stored = inbox.upload_stored(upload, size)
+    except BaseException as exc:
+        inbox.upload_failed(upload)  # closed by now: Windows cannot delete an open file
+        if isinstance(exc, OSError):  # the launch shows the page this: no path
+            raise OSError(f"{name!r} could not be stored: {_reason(exc)}") from exc
+        raise
+    return {"file_id": stored.file_id, "name": stored.name, "size": stored.size}
+
+
+@router.post("/handoffs", status_code=201)
+def offer_handoff(body: OfferBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Hand off staged files, with the arguments the launch refused, as one
+    hand-off or into one pending (:meth:`~proteia.web.handoff.Inbox.offer`).
+    Answers ``{handoff_id, merged, files, refused}``: ``merged`` if the
+    hand-off was pending already (a launch then opens no tab: one is open on
+    it), and how many files and refused entries it holds now."""
+    refused = [Refusal(entry.name, entry.code, entry.message) for entry in body.refused]
+    offered = workspace.inbox.offer(body.files, refused)
+    return dataclasses.asdict(offered)
+
+
+@router.post("/handoffs/{handoff_id}/accept", status_code=201)
+def accept_handoff(
+    handoff_id: str, body: AcceptBody, opening: NamedOpening, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Import the hand-off into a new project and open it
+    (:meth:`Workspace.accept`); answers as a create does, with ``handoff``:
+    ``imported`` (``{file_id, name, image_id, membrane_id, new_membrane}``
+    each), ``refused`` (``{file_id, name, code, message}`` each: the files not
+    imported), ``launch_refused`` and ``more_refused`` (the arguments the
+    launches refused), and ``notes``. Refused, changing nothing, for a page
+    that shows another opening than the open one (``project_changed``)."""
+    session, accepted = workspace.accept(
+        handoff_id, body.name, _file_choices(body.files), opening=opening
+    )
+    with workspace.answering(session):
+        return _answer(workspace, session, handoff=_accepted(accepted))
+
+
+def _file_choices(files: list[AcceptFileBody]) -> list[FileChoice]:
+    """The accept's files as choices: ``invalid_input`` for a kind or polarity
+    the model does not know, or a membrane that is not an earlier file's."""
+    choices = []
+    for index, file in enumerate(files):
+        try:
+            kind, polarity = ImageKind(file.kind), Polarity(file.polarity)
+        except ValueError as exc:
+            raise OperationError(ErrorCode.INVALID_INPUT, f"files.{index}: {exc}") from exc
+        membrane = None if file.membrane == "new" else file.membrane
+        if membrane is not None and membrane >= index:
+            raise OperationError(
+                ErrorCode.INVALID_INPUT,
+                f"files.{index}.membrane: {membrane} is not an earlier file's index",
+            )
+        choices.append(FileChoice(file.file_id, kind, polarity, membrane))
+    return choices
+
+
+def _accepted(accepted: Accepted) -> dict[str, Any]:
+    return {
+        "imported": [dataclasses.asdict(file) for file in accepted.imported],
+        "refused": [dataclasses.asdict(file) for file in accepted.refused],
+        "launch_refused": [dataclasses.asdict(entry) for entry in accepted.launch_refused],
+        "more_refused": accepted.more_refused,
+        "notes": list(accepted.notes),
+    }
+
+
+@router.post("/handoffs/{handoff_id}/discard", status_code=204)
+def discard_handoff(handoff_id: str, body: DiscardBody, workspace: WorkspaceDep) -> Response:
+    """Discard the hand-off as the page shows it: its files and its count of
+    refused entries (``handoff_changed`` if it holds others, and nothing is
+    deleted). Its staged copies are deleted; the originals are never touched."""
+    workspace.inbox.discard(handoff_id, body.files, body.refused)
+    return Response(status_code=204)
 
 
 @router.post("/projects", status_code=201)
@@ -1217,8 +1728,27 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         ProjectChangedError: lambda e: _error(
             409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
         ),
-        UnsavedChangesError: lambda e: _error(409, "unsaved_changes", str(e)),
+        UnsavedChangesError: lambda e: _error(
+            409,
+            "unsaved_changes",
+            str(e),
+            detail=None if e.created is None else {"created": e.created},
+        ),
         UploadTooLargeError: lambda e: _error(413, "image_too_large", str(e)),
+        NothingImportedError: lambda e: _error(
+            422,
+            "nothing_imported",
+            str(e),
+            detail={"refused": [dataclasses.asdict(file) for file in e.refused]},
+        ),
+        handoff.StoppingError: lambda e: _error(409, "stopping", str(e)),
+        handoff.TooManyPendingError: lambda e: _error(409, "too_many_pending", str(e)),
+        handoff.FileClaimedError: lambda e: _error(409, "file_claimed", str(e)),
+        handoff.HandoffNotFoundError: lambda e: _error(404, "handoff_not_found", str(e)),
+        handoff.HandoffClaimedError: lambda e: _error(409, "handoff_claimed", str(e)),
+        handoff.HandoffChangedError: lambda e: _error(
+            409, "handoff_changed", str(e), detail=_handoffs(workspace.root, [e.view])[0]
+        ),
         projects.ProjectNameError: lambda e: _error(422, "invalid_project_name", str(e)),
         projects.ProjectExistsError: lambda e: _error(409, "project_exists", str(e)),
         projects.ProjectNotFoundError: lambda e: _error(404, "project_not_found", str(e)),
