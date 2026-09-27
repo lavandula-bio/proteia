@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 import numpy as np
 import pytest
+import tifffile
 from PIL import Image
 
 from conftest import (
@@ -38,6 +39,7 @@ from conftest import (
     write_tiff,
 )
 from proteia import samples
+from proteia.core import session as session_module
 from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
@@ -319,6 +321,265 @@ def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
     assert image_id in answer["removed"]
     assert [image["id"] for image in answer["project"]["images"]] == [second["image_id"]]
     assert client.refused("GET", f"/api/images/{image_id}/preview")[:2] == (404, "unknown_id")
+
+
+# --- Original colours (#57) ---
+
+PONCEAU = "Ponceau S α.png"  # alpha
+
+
+def ponceau(dtype: type = np.uint8) -> np.ndarray:
+    """A blot as a Ponceau S stain shows it: red bands on a pale pink membrane,
+    so its red, green and blue differ; 8-bit RGB, or 16-bit at 257 times."""
+    gray = synthetic_blot((H, W), [(x, ROW, 5.0, 3.0, 30000.0) for x in LANE_X], dtype=float)
+    depth = 1 - gray / MEMBRANE_LEVEL  # 0 on the membrane, 0.6 at a band's centre
+    rgb = np.stack([245 - 40 * depth, 225 - 330 * depth, 228 - 300 * depth], axis=-1)
+    rgb = np.clip(np.round(rgb), 0, 255)
+    return (rgb * 257).astype(np.uint16) if dtype is np.uint16 else rgb.astype(np.uint8)
+
+
+def png_bytes(pixels: np.ndarray | Image.Image) -> bytes:
+    """A PNG of pixels (gray, gray with alpha, RGB or RGBA by their channels) or of an image."""
+    image = pixels if isinstance(pixels, Image.Image) else Image.fromarray(pixels)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def preview_of(client: Client, image_id: str, query: str = "") -> bytes:
+    status, (kind, png) = client.call("GET", f"/api/images/{image_id}/preview{query}")
+    assert (status, kind) == (200, "image/png")
+    return png
+
+
+def decoded(png: bytes) -> tuple[str, np.ndarray]:
+    with Image.open(io.BytesIO(png)) as image:
+        return image.mode, np.asarray(image)
+
+
+def test_a_colour_image_is_previewed_in_its_original_colours_on_request(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    stain = ponceau()
+    status, answer = upload(client, png_bytes(stain), name=PONCEAU, kind="visible_marker")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert image["colour"] is True
+    assert [w["code"] for w in image["warnings"]] == ["color_channels_differ"]
+
+    # The default stays the gray analysis image: the mean the nets are measured on.
+    mode, gray = decoded(preview_of(client, image_id))
+    assert (mode, gray.shape) == ("L", (H, W))
+    # The original colours, on the same pixel grid: 8-bit colour is shown as stored.
+    mode, colour = decoded(preview_of(client, image_id, "?colour=original"))
+    assert (mode, colour.shape) == ("RGB", (H, W, 3))
+    assert np.array_equal(colour, stain)
+    band, membrane = colour[ROW, LANE_X[0]].astype(int), colour[5, LANE_X[0]].astype(int)
+    assert band[0] > band[1] + 100 and band[0] > band[2] + 100  # a red band
+    assert (membrane < 250).all() and membrane[0] > membrane[1]  # on a pink membrane
+    # Nothing about the colours reaches the project: it is a view, not an edit.
+    assert client.ok("GET", "/api/project")["project"]["revision"] == answer["project"]["revision"]
+
+
+def test_a_gray_image_answers_its_gray_preview_for_its_original_colours(client, tmp_path):
+    # A gray file's original colours are its gray levels: the same PNG as the
+    # gray preview, so a page asking with a switch left on still draws the image.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, blot_bytes(tmp_path))  # 16-bit gray
+    level = np.linspace(40, 220, W).round().astype(np.uint8)
+    gray = np.tile(level, (H, 1))
+    alpha = np.full_like(gray, 200)
+    ids = {
+        "16-bit gray": answer["image_id"],
+        # Three equal channels: gray stored as RGB, as many scanners save it.
+        "gray as RGB": upload(client, png_bytes(np.dstack([gray] * 3)), name="rgb.png")[1],
+        "gray with alpha": upload(client, png_bytes(np.dstack([gray, alpha])), name="la.png")[1],
+    }
+    ids = {what: got if isinstance(got, str) else got["image_id"] for what, got in ids.items()}
+    images = {i["id"]: i for i in client.ok("GET", "/api/project")["project"]["images"]}
+    for what, image_id in ids.items():
+        assert images[image_id]["colour"] is False, what
+        plain = preview_of(client, image_id)
+        assert preview_of(client, image_id, "?colour=original") == plain, what
+        assert decoded(plain)[0] == "L", what
+
+
+@pytest.mark.parametrize("query", ["?colour=grey", "?colour=ORIGINAL", "?colour="])
+def test_an_unknown_colours_choice_is_refused(client, tmp_path, query):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, png_bytes(ponceau()), name=PONCEAU)
+    path = f"/api/images/{answer['image_id']}/preview{query}"
+    assert client.refused("GET", path)[:2] == (422, "invalid_input")
+
+
+def test_original_colours_need_the_token_and_a_known_image(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, png_bytes(ponceau()), name=PONCEAU)
+    path = f"/api/images/{answer['image_id']}/preview?colour=original"
+    status, headers, body = fetch(client, path, token=False)
+    assert (status, headers["www-authenticate"]) == (401, "Bearer")
+    assert not body.startswith(b"\x89PNG")
+    assert fetch(client, path)[0] == 200
+    assert not_found(client, "/api/images/img-99/preview?colour=original") == "unknown_id"
+
+
+def test_original_colours_are_read_only_from_the_unchanged_stored_file(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, png_bytes(ponceau()), name=PONCEAU)
+    image_id = answer["image_id"]
+    stored = client.root / "Blot" / storage.IMAGES_DIR / f"{image_id}.png"
+    # Other bytes of the same size and layout, written outside Proteia.
+    stored.write_bytes(png_bytes(ponceau()[:, ::-1].copy()))
+    path = f"/api/images/{image_id}/preview?colour=original"
+    assert client.refused("GET", path) == (422, "image_file_changed", [image_id])
+    stored.unlink()
+    assert client.refused("GET", path) == (422, "image_file_changed", [image_id])
+
+
+def test_original_colours_are_kept_with_the_last_previews_shown(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A")
+    with io.BytesIO(png_bytes(ponceau())) as stream:
+        image_id = api.ops.import_image(
+            session, stream, "a.png", kind="visible_marker", polarity="dark_on_light"
+        )
+    session._pixels.clear()  # as if the image had not been worked on in this session
+    reads: list[str] = []
+    colour_pixels = type(session).colour_pixels
+
+    def counting(self, image_id: str) -> np.ndarray:
+        reads.append(image_id)
+        return colour_pixels(self, image_id)
+
+    monkeypatch.setattr(type(session), "colour_pixels", counting)
+    colour = workspace.preview(session, image_id, original=True)
+    assert workspace.preview(session, image_id, original=True) == colour
+    assert reads == [image_id]  # read once, then kept
+
+    monkeypatch.setattr(api, "_PREVIEWS_KEPT", 1)
+    # The gray one is another preview: kept in place of the colour one, the last shown.
+    assert workspace.preview(session, image_id) != colour
+    assert image_id not in session._pixels  # neither holds the image in memory
+    assert workspace.preview(session, image_id, original=True) == colour
+    assert reads == [image_id, image_id]
+
+
+def test_original_colours_of_other_colour_files(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    stain = ponceau()
+    # A palette PNG, read as its palette's colours.
+    indices = (np.arange(H * W).reshape(H, W) % 3).astype(np.uint8)
+    table = [200, 30, 40, 250, 220, 225, 120, 10, 20] + [0] * (253 * 3)
+    palette = Image.frombytes("P", (W, H), indices.tobytes())
+    palette.putpalette(table)
+    # RGBA: the alpha channel is dropped, as the analysis ignores it.
+    rgba = np.dstack([stain, np.full((H, W), 90, dtype=np.uint8)])
+    # 16-bit RGB: stretched to 8 bits over the three channels at once.
+    ids = {
+        "palette": upload(client, png_bytes(palette), name="palette.png")[1]["image_id"],
+        "rgba": upload(client, png_bytes(rgba), name="rgba.png")[1]["image_id"],
+        "16-bit": upload(
+            client, write_tiff(tmp_path / "rgb16.tif", ponceau(np.uint16)).read_bytes()
+        )[1]["image_id"],
+    }
+    images = {i["id"]: i for i in client.ok("GET", "/api/project")["project"]["images"]}
+    assert all(images[image_id]["colour"] for image_id in ids.values())
+    shown = {what: decoded(preview_of(client, i, "?colour=original")) for what, i in ids.items()}
+    assert all(mode == "RGB" and pixels.shape == (H, W, 3) for mode, pixels in shown.values())
+    expected = np.array(table[:9], dtype=np.uint8).reshape(3, 3)[indices]
+    assert np.array_equal(shown["palette"][1], expected)
+    assert np.array_equal(shown["rgba"][1], stain)
+    sixteen = shown["16-bit"][1].astype(int)
+    assert (sixteen.min(), sixteen.max()) == (0, 255)
+    stretched = (stain.astype(float) - stain.min()) * 255 / (int(stain.max()) - int(stain.min()))
+    assert np.abs(sixteen - stretched).max() <= 1  # one stretch: the hues keep their balance
+
+
+def palette_tiff(colormap: np.ndarray) -> tuple[bytes, np.ndarray]:
+    """An 8-bit TIFF whose pixels index ``colormap`` (3 x 256, 16-bit), as ImageJ
+    saves one with a lookup table, and its indices: a dark band under each lane."""
+    gray = synthetic_blot((H, W), [(x, ROW, 5.0, 3.0, 30000.0) for x in LANE_X], dtype=float)
+    indices = np.clip(np.round(gray / 257), 0, 255).astype(np.uint8)
+    buffer = io.BytesIO()
+    tifffile.imwrite(buffer, indices, photometric="palette", colormap=colormap)
+    return buffer.getvalue(), indices
+
+
+def test_a_palette_tiff_is_shown_through_its_colour_map(client, tmp_path):
+    # The nets are measured on the indices; its own colours are the map's.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    level = np.arange(256, dtype=np.uint16)
+    fire = np.stack([level * 257, level * 128, (255 - level) * 64])
+    data, indices = palette_tiff(fire)
+    status, answer = upload(client, data, name="Fire LUT α.tif")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert (image["colour"], image["warnings"]) == (True, [])
+    mode, colour = decoded(preview_of(client, image_id, "?colour=original"))
+    assert (mode, colour.shape) == ("RGB", (H, W, 3))
+    np.testing.assert_array_equal(colour, (fire.T >> 8).astype(np.uint8)[indices])
+    assert decoded(preview_of(client, image_id))[0] == "L"
+    # A gray lookup table (inverted, say) has no colour to show.
+    gray_map = np.stack([(255 - level) * 257] * 3)
+    other = upload(client, palette_tiff(gray_map)[0], name="inverted.tif")[1]["image_id"]
+    images = {i["id"]: i for i in client.ok("GET", "/api/project")["project"]["images"]}
+    assert images[other]["colour"] is False
+    assert preview_of(client, other, "?colour=original") == preview_of(client, other)
+
+
+@pytest.mark.parametrize("fmt", ["TIFF", "JPEG"])
+def test_a_cmyk_file_is_not_offered_in_colours_it_does_not_hold(client, tmp_path, fmt):
+    # Its cyan, magenta and yellow would be drawn as red, green and blue: the
+    # page offers no original colours, and asking answers the gray preview.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    buffer = io.BytesIO()
+    Image.fromarray(ponceau()).convert("CMYK").save(buffer, format=fmt)
+    suffix = ".tif" if fmt == "TIFF" else ".jpg"
+    status, answer = upload(client, buffer.getvalue(), name=f"cmyk{suffix}", kind="visible_marker")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert "color_channels_differ" in [w["code"] for w in image["warnings"]]
+    assert image["colour"] is False
+    plain = preview_of(client, image_id)
+    assert preview_of(client, image_id, "?colour=original") == plain
+    assert decoded(plain)[0] == "L"
+
+
+def test_the_state_reads_a_file_header_once_and_only_where_colour_can_hide(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A")
+    level = np.linspace(40, 220, W).round().astype(np.uint8)
+    files = {
+        "gray.png": png_bytes(np.tile(level, (H, 1))),
+        "stain.png": png_bytes(ponceau()),
+        "gray.tif": blot_bytes(tmp_path),
+    }
+    ids = {}
+    for name, data in files.items():
+        with io.BytesIO(data) as stream:
+            ids[name] = api.ops.import_image(
+                session, stream, name, kind="visible_marker", polarity="dark_on_light"
+            )
+    reads: list[str] = []
+    file_colours = session_module.file_colours
+
+    def counting(path: Path) -> str | None:
+        reads.append(Path(path).stem)  # the stored file: the image id
+        return file_colours(path)
+
+    monkeypatch.setattr(session_module, "file_colours", counting)
+    session._file_colours.clear()
+    for _ in range(3):
+        state = project_state("A", session, session.project, open_id=1)
+        assert {i["id"]: i["colour"] for i in state["images"]} == {
+            ids["gray.png"]: False,
+            ids["stain.png"]: True,
+            ids["gray.tif"]: False,  # a TIFF: read, as a palette would show only there
+        }
+    # A gray PNG is never read; the colour PNG and the TIFF once each.
+    assert sorted(reads) == sorted([ids["stain.png"], ids["gray.tif"]])
 
 
 # --- Boxes ---

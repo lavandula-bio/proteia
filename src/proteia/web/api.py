@@ -25,6 +25,10 @@ box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
 
+``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
+gray analysis array, which the nets are measured on, or, with
+``?colour=original``, its stored file in its own colours, for display only.
+
 ``POST /api/projects/sample`` creates the sample project, set up on the
 synthetic sample blot up to the row boxes (:mod:`proteia.web.sample_project`),
 and answers as a create does, with ``sample``: the truth table's name in the
@@ -57,7 +61,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -86,7 +90,7 @@ from proteia.core.storage import ProjectError
 from proteia.web import projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
-from proteia.web.state import preview_png, project_state, revision
+from proteia.web.state import has_colour, original_png, preview_png, project_state, revision
 
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
@@ -170,7 +174,8 @@ class Workspace:
         self._open_ids: weakref.WeakKeyDictionary[ProjectSession, int] = weakref.WeakKeyDictionary()
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
-        self._previews: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        # (image id, SHA-256, original colours) -> preview PNG, least recently shown first.
+        self._previews: OrderedDict[tuple[str, str, bool], bytes] = OrderedDict()
         self._charts = ChartStore()
 
     def current(self) -> ProjectSession:
@@ -343,15 +348,25 @@ class Workspace:
         given in the open project's answers, or no longer kept."""
         return self._charts.svg(key)
 
-    def preview(self, session: ProjectSession, image_id: str) -> bytes:
-        """The image's preview PNG, kept for the last few images shown."""
+    def preview(self, session: ProjectSession, image_id: str, *, original: bool = False) -> bytes:
+        """The image's preview PNG: of its gray analysis array, or, with
+        ``original``, of its stored file in its own colours
+        (:func:`~proteia.web.state.original_png`) if the file has colour to
+        show (:func:`~proteia.web.state.has_colour`); otherwise it answers the
+        gray one: a gray file's original colours are its gray levels, and the
+        colours of a CMYK file, say, are not converted. The last few previews
+        shown are kept, gray and colour alike."""
         image = session.project.batch.find_image(image_id)
-        key = (image_id, image.sha256)
+        original = original and has_colour(session, image)
+        key = (image_id, image.sha256, original)
         with self._lock:
             if key in self._previews:
                 self._previews.move_to_end(key)
                 return self._previews[key]
-        data = preview_png(session.pixels(image_id, keep=False))
+        if original:
+            data = original_png(session.colour_pixels(image_id))
+        else:
+            data = preview_png(session.pixels(image_id, keep=False))
         with self._lock:
             self._previews[key] = data
             while len(self._previews) > _PREVIEWS_KEPT:
@@ -677,9 +692,18 @@ def set_polarity(image_id: str, body: PolarityBody, workspace: WorkspaceDep) -> 
 
 
 @router.get("/images/{image_id}/preview")
-def image_preview(image_id: str, workspace: WorkspaceDep) -> Response:
+def image_preview(
+    image_id: str, workspace: WorkspaceDep, colour: Literal["original"] | None = None
+) -> Response:
+    """The image as the view draws it, a PNG of the image's own size: its gray
+    analysis array, which the nets are measured on, or with ``colour=original``
+    its stored file in the file's own colours, for display only (the gray one
+    for a file without colour to show: ``colour`` in the project state says
+    which have it). Either is read after the stored file's SHA-256 is checked:
+    ``image_file_changed`` or ``unreadable_image`` (422) otherwise."""
     session = workspace.current()
-    return Response(workspace.preview(session, image_id), media_type="image/png")
+    data = workspace.preview(session, image_id, original=colour == "original")
+    return Response(data, media_type="image/png")
 
 
 @router.get("/charts/{key}.svg")

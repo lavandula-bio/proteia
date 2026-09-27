@@ -582,6 +582,24 @@ def test_the_import_file_input_can_take_the_keyboard_focus():
     assert "display" not in rule and "visibility" not in rule
 
 
+def test_the_original_colours_switch_is_a_toggle_button_the_keyboard_reaches():
+    # "Original colours" (#57): a button, so Tab reaches it and Enter or Space
+    # presses it; aria-pressed tells a screen reader whether it is on, and a
+    # status line says which colours the view shows once they are shown.
+    parser = _Tags()
+    parser.feed((server.STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    fields = parser.by_id["original-colours"]
+    assert (fields["type"], fields["aria-pressed"], fields["aria-keyshortcuts"]) == (
+        "button",
+        "false",
+        "C",
+    )
+    assert "hidden" in fields  # until an image whose file has colour is shown
+    assert fields.get("tabindex") != "-1"
+    assert "grey analysis image" in fields["title"]  # what the nets are measured on
+    assert parser.by_id["view-colours-state"]["role"] == "status"
+
+
 def _object_keys(script: str, name: str) -> set[str]:
     """The keys of the object literal ``const <name> = {...};`` in a script."""
     body = script[script.index(f"const {name} = {{") :].split("\n};", 1)[0]
