@@ -62,6 +62,8 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    are along x). Empty lanes get a reason; flags; one shared size by
    :data:`SIZE_RULE`, capped by the lane spacing and the box; bounded isotonic
    placement (:func:`~proteia.core.boxes.place_in_row`).
+9. The row's line through the boxes' centres (:func:`_row_line`): a box off
+   it is off the row.
 
 Flags (:attr:`RowDetection.flags`):
 
@@ -70,6 +72,12 @@ Flags (:attr:`RowDetection.flags`):
 * ``ambiguous_lanes`` (refusing): a different lane reading costs less than
   :data:`AMBIGUITY_MARGIN` more than the chosen one, or two neighbouring
   lanes' extents are closer than the narrowest band (or out of order);
+* ``off_row_line`` (refusing): a box's centre lies more than
+  :data:`ROW_LINE_K` box heights above or below the row's line through the
+  other boxes (see ``line_offset``), or boxes in neighbouring lanes lie more
+  than :data:`ROW_SMILE` box heights apart: the row box covers more than one
+  row (a neighbouring row's band is stronger in some lanes), or a lane's band
+  lies above or below the others (a montage's panel, a mark beside the row);
 * ``background_mismatch``: the membrane under a box differs from the stored
   background by more than :data:`BG_WARN_K` pixel sigmas;
 * ``size_outlier``: an extent above :data:`SIZE_GUARD` times the median of the
@@ -88,6 +96,7 @@ Every setting is a module constant, reported by :func:`settings`.
 
 from __future__ import annotations
 
+import itertools
 import math
 import numbers
 from collections.abc import Sequence
@@ -125,6 +134,15 @@ EXTENT_LEVEL: Final = REL_THRESHOLD  # sized extent: this fraction of the band's
 SIZE_RULE: Final = "max_guarded"  # the shared size: the largest extent, outliers left out
 SIZE_GUARD: Final = 2.0  # an extent above this times the others' median does not set the size
 CUT_LEVEL: Final = EXTENT_LEVEL  # cut_by_row_box: the box's edge row holds this of a band's peak
+# The row's line (#114): a box whose centre lies more than ROW_LINE_K box heights
+# off it is off the row; it bends by at most ROW_SMILE box heights across the
+# boxes (a smile), and is fitted from ROW_LINE_MIN boxes, as most of them lie
+# within ROW_LINE_TOL box heights or ROW_LINE_TOL_PX px of it, whichever is more.
+ROW_LINE_K: Final = 0.75
+ROW_SMILE: Final = 2.0
+ROW_LINE_MIN: Final = 4
+ROW_LINE_TOL: Final = 0.25
+ROW_LINE_TOL_PX: Final = 3.0
 
 # --- Technical settings ---
 
@@ -181,7 +199,7 @@ MIN_BOX: Final = 2  # smallest box side, as boxes.grow_to_fit
 # --- Vocabularies ---
 
 SIZE_RULES: Final = ("max", "max_guarded")
-REFUSING_FLAGS: Final = ("lanes_outside_row", "ambiguous_lanes")
+REFUSING_FLAGS: Final = ("lanes_outside_row", "ambiguous_lanes", "off_row_line")
 WARNING_FLAGS: Final = (
     "background_mismatch",
     "size_outlier",
@@ -266,6 +284,11 @@ class LaneDetection:
       is empty (``edge_signal``) because its band peaks on that edge row, where
       a candidate at least the dust floor wide and not flat across the rows (a
       band's hump, not a streak) reaches ``DETECT_K`` in the lane's slot.
+    * ``line_offset``: how far the box's centre lies below (positive) or above
+      (negative) the row's line (:func:`_row_line`), in box heights; beyond
+      ``ROW_LINE_K`` either way the box is off the row (``off_row_line``).
+      None for an empty lane, and for every lane of a row with fewer than
+      ``ROW_LINE_MIN`` boxes (not checked) unless they lie on two rows.
     """
 
     lane: int
@@ -278,6 +301,7 @@ class LaneDetection:
     components: int
     window: Rect | None
     cut: bool
+    line_offset: float | None
 
 
 @dataclass(frozen=True)
@@ -1602,6 +1626,160 @@ def _shared_size(
     return int(w[within_w].max()), int(h[within_h].max()), outliers
 
 
+def _bounded_fits(u: np.ndarray, y: np.ndarray, w: np.ndarray, cmax: float) -> np.ndarray:
+    """``(K, 3)`` coefficients ``(a, b, c)`` of ``a + b*u + c*u**2`` fitted by
+    least squares to the boxes each row of the 0/1 weights ``w`` (``(K, n)``,
+    at least three distinct ``u`` each) holds, ``c`` clipped to ``+/-cmax``
+    and ``a``, ``b`` fitted again under it."""
+    x = np.stack([np.ones_like(u), u, u * u], axis=1)
+    gram = np.einsum("kn,ni,nj->kij", w, x, x)
+    rhs = np.einsum("kn,ni,n->ki", w, x, y)
+    coef = np.linalg.solve(gram, rhs[..., None])[..., 0]
+    over = np.abs(coef[:, 2]) > cmax
+    if over.any():
+        c = np.clip(coef[over, 2], -cmax, cmax)
+        rhs2 = rhs[over, :2] - c[:, None] * np.einsum("kn,ni,n->ki", w[over], x[:, :2], u * u)
+        ab = np.linalg.solve(gram[over][:, :2, :2], rhs2[..., None])[..., 0]
+        coef[over] = np.column_stack([ab, c])
+    return coef
+
+
+def _row_line(
+    centres: Sequence[tuple[float, float]], height: int, lanes: Sequence[int] = ()
+) -> np.ndarray | None:
+    """Each box's offset from the row's line, in box heights (positive below
+    it), for the box centres ``centres`` ``(x, y)``, the box height and the
+    boxes' lanes ``lanes`` (lane indices in the same order, to tell
+    neighbouring lanes; none given, no two are neighbours); None when the row
+    is not checked.
+
+    The row's line is ``a + b*x + c*x**2``: straight (a tilt), bent by a smile
+    of at most ``ROW_SMILE`` box heights across the boxes (``c`` bounded), as
+    a gel's lanes bend a row. From ``ROW_LINE_MIN`` boxes it is fitted through
+    the other boxes, so a box off it cannot drag it there. First the fit most
+    boxes lie near, each counting its squared distance from it up to a
+    tolerance of ``ROW_LINE_TOL`` box heights or ``ROW_LINE_TOL_PX`` px,
+    whichever is more, past which a box counts as off however far (M-estimator
+    sample consensus), from the exact fit of every pair and triple of boxes,
+    each refitted once on the boxes within the tolerance of it, and at least
+    the half of the boxes (at least ``ROW_LINE_MIN``) nearest it; then the fit
+    through every box within ``ROW_LINE_K`` box heights of it, again until
+    those boxes stay the same. So one lane's box a box height off is fitted
+    around, and four boxes are fitted all together.
+
+    Fitted by the half of the boxes nearest it alone (least trimmed squares),
+    four boxes of thin bands a pixel apart could pick a smile that fits them
+    exactly and passes the others by box heights: 9% of flat rows of five
+    4 px boxes with a pixel of jitter were refused, and 47 of 3000 such rows
+    of 4 to 8 lanes through detection. Counting every box, up to the
+    tolerance, none of those 3000 is, none of 10,000 flat rows of 4 to 8 px
+    boxes with 1 to 1.5 px of jitter (3 of 2500 of 12 px boxes with 2 px, 5
+    before), nor of 2000 rows of 5 and 6 px boxes bent by smiles and tilts
+    (14 before). A lane 1.0 box height off is found at the end of a row of
+    12 px boxes 92% of the time (77% before), of 6 px boxes 30% (55%; 1.5
+    box heights off, 78% and 84%; 2 box heights off, 99%); in the middle, 98%
+    or more. The tolerance: a box's centre lies on a whole pixel, and a thin
+    band's centre wanders by a pixel or so.
+
+    A box over two rows: when the boxes' heights fall in two groups more than
+    a smile (``ROW_SMILE`` box heights) apart, and the fit leaves a box off,
+    or a box of each group lies in neighbouring lanes (no smile or tilt steps
+    a row that far from one lane to the next), the line runs through the
+    larger group (on a tie, the one the fit kept more of; with nothing to
+    break it, level midway, so both lie off) and the other group lies off it
+    whole. So a row of two or three boxes, which no line checks (three
+    centres lie on some smile), is checked for two rows alone; with four
+    boxes or fewer, two rows whose boxes lie in no neighbouring lanes pass,
+    as a sparse row's steep tilt does.
+
+    A straight line alone leaves a smile's end boxes off it: through the
+    other boxes, by 0.9 box heights on the bench's smile and up to 3 on the
+    accuracy judge's strongest (1.8 box heights of sag), while a montage's
+    lane lay 1.17 off; no threshold told them apart. Bent by a smile, no box
+    of the 628 rows of the bench, the judge's rows, the recipes and the fuzz
+    rows that main placed lies more than 0.44 box heights off (smiles and
+    tilts 0.19; the rest a doublet's box on one of its bands), nor of 37 real
+    rows placed more than 0.33; that montage's lane lies 1.17 off, a mark
+    beside a row 2.4, and a row box over two rows 4.1 to 4.4."""
+    n = len(centres)
+    if n < 2:
+        return None
+    xs = np.array([c[0] for c in centres], float)
+    ys = np.array([c[1] for c in centres], float)
+    u = (xs - xs.mean()) / max(float(np.ptp(xs)), 1.0)  # across the boxes: -0.5..0.5
+    y = ys - ys.mean()
+    h = float(height)
+    cmax = 4.0 * ROW_SMILE * h  # the sag of c*u**2 across -0.5..0.5 is c/4
+    powers = np.stack([np.ones_like(u), u, u * u])
+    offsets = None
+    if n >= ROW_LINE_MIN:
+        # Starts: the exact fit of every triple (a smile) and pair (a line).
+        triples = np.array(list(itertools.combinations(range(n), 3)))
+        w3 = np.zeros((len(triples), n))
+        np.put_along_axis(w3, triples, 1.0, axis=1)
+        starts = [_bounded_fits(u, y, w3, cmax)]
+        pairs = np.array(list(itertools.combinations(range(n), 2)))
+        b = (y[pairs[:, 1]] - y[pairs[:, 0]]) / (u[pairs[:, 1]] - u[pairs[:, 0]])
+        starts.append(np.column_stack([y[pairs[:, 0]] - b * u[pairs[:, 0]], b, np.zeros(len(b))]))
+        starts = np.concatenate(starts)
+        # One refit of each on the boxes within the tolerance of it and the
+        # half nearest it; the least sum of squares, each box's capped at the
+        # tolerance, wins.
+        tol = max(ROW_LINE_TOL * h, ROW_LINE_TOL_PX)
+        dist = np.abs(y - starts @ powers)
+        w = (dist <= tol).astype(float)
+        m = max(ROW_LINE_MIN, -(-n // 2))
+        np.put_along_axis(w, np.argsort(dist, axis=1, kind="stable")[:, :m], 1.0, axis=1)
+        coef = _bounded_fits(u, y, w, cmax)
+        cost = np.sum(np.minimum((y - coef @ powers) ** 2, tol * tol), axis=1)
+        fit = coef[int(np.argmin(cost))]
+        # Then through every box within ROW_LINE_K box heights of it.
+        inside = np.abs(y - fit @ powers) <= ROW_LINE_K * h
+        for _ in range(n):
+            if inside.sum() < 3:
+                break
+            fit = _bounded_fits(u, y, inside[None, :].astype(float), cmax)[0]
+            now = np.abs(y - fit @ powers) <= ROW_LINE_K * h
+            if np.array_equal(now, inside):
+                break
+            inside = now
+        offsets = (y - fit @ powers) / h
+    # Two rows: the boxes' heights in two groups more than a smile
+    # (ROW_SMILE box heights) apart, and a box off the fit, or a box of each
+    # group in neighbouring lanes. The fit bent towards the other row may keep
+    # some of its boxes, or all: the row's line runs through the larger group
+    # (on a tie, the group the fit kept more of), and the other group lies off
+    # it whole.
+    order = np.argsort(y, kind="stable")
+    gaps = np.diff(y[order])
+    k = int(np.argmax(gaps))
+    if gaps[k] <= ROW_SMILE * h:
+        return offsets
+    split = (order[: k + 1], order[k + 1 :])
+    off = offsets is not None and bool(np.any(np.abs(offsets) > ROW_LINE_K))
+    lane = list(lanes)
+    neighbours = len(lane) == n and any(
+        abs(lane[i] - lane[j]) == 1 for i in split[0] for j in split[1]
+    )
+    if not (off or neighbours):
+        return offsets
+
+    def key(group: np.ndarray) -> tuple[int, int]:
+        kept = 0 if offsets is None else int(np.sum(np.abs(offsets[group]) <= ROW_LINE_K))
+        return (group.size, kept)
+
+    if key(split[0]) == key(split[1]):  # nothing tells the row's group: level midway
+        fit = np.array([float(y[order[k]] + y[order[k + 1]]) / 2, 0.0, 0.0])
+        return (y - fit @ powers) / h
+    kept = np.zeros(n, bool)
+    kept[max(split, key=key)] = True
+    if kept.sum() >= 3:
+        fit = _bounded_fits(u, y, kept[None, :].astype(float), cmax)[0]
+    else:  # one or two boxes: level through them
+        fit = np.array([float(y[kept].mean()), 0.0, 0.0])
+    return (y - fit @ powers) / h
+
+
 def detect_row(
     gray: np.ndarray,
     row: Sequence[int],
@@ -1711,6 +1889,7 @@ def detect_row(
     size = None
     out: dict[int, Rect] = {}
     outliers: tuple[int, ...] = ()
+    offsets: dict[int, float] = {}  # each box's offset from the row's line (_row_line)
     if present:
         rects = list(extents.values())
         w, h, outliers = _shared_size(
@@ -1739,6 +1918,29 @@ def detect_row(
             y = max(0, min((r[1] + r[3]) // 2 - h // 2, hc - h))
             out[i] = (x0 + x, y0 + y, x0 + x + w, y0 + y + h)
         size = BoxSize(width=w, height=h)
+        # The row's line through the boxes' centres (crop coordinates, so a
+        # shifted row gives the same offsets): a box off it is off the row.
+        line = _row_line(
+            [((r[0] + r[2]) / 2 - x0, (r[1] + r[3]) / 2 - y0) for r in out.values()],
+            h,
+            list(out),
+        )
+        if line is not None:
+            offsets = {i: float(v) for i, v in zip(out, line, strict=True)}
+        off_line = [i for i, v in offsets.items() if abs(v) > ROW_LINE_K]
+        if off_line:
+            flags.append("off_row_line")
+            if len(off_line) == len(out):  # two rows, neither the row's
+                notes.append(
+                    f"{lanes_phrase(numbered(off_line))}: box centres more than {ROW_SMILE:g}"
+                    f" box heights ({ROW_SMILE * h:.0f} px) apart, on two rows"
+                )
+            else:
+                notes.append(
+                    f"{lanes_phrase(numbered(off_line))}: box centre more than {ROW_LINE_K:g}"
+                    f" box height ({ROW_LINE_K * h:.0f} px) off the row's line through the"
+                    " other boxes"
+                )
 
     result: list[LaneDetection] = []
     for i, ln in enumerate(lanes):
@@ -1768,6 +1970,7 @@ def detect_row(
                 components=ln.components if rect is not None else 0,
                 window=window,
                 cut=i in cut,
+                line_offset=offsets.get(i),
             )
         )
     if right_to_left:
@@ -1828,6 +2031,11 @@ def settings() -> dict[str, JsonValue]:
         "size_rule": SIZE_RULE,
         "size_guard": SIZE_GUARD,
         "cut_level": CUT_LEVEL,
+        "row_line_k": ROW_LINE_K,
+        "row_smile": ROW_SMILE,
+        "row_line_min": ROW_LINE_MIN,
+        "row_line_tol": ROW_LINE_TOL,
+        "row_line_tol_px": ROW_LINE_TOL_PX,
         "smooth": list(SMOOTH),
         "min_width_px": MIN_WIDTH_PX,
         "min_width_pitch": MIN_WIDTH_PITCH,

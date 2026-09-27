@@ -1590,14 +1590,15 @@ def test_a_box_padding_field_left_out_keeps_its_value(client, tmp_path):
 
 def test_a_box_padding_reports_boxes_the_edge_shifts_and_boxes_it_overlaps(client, tmp_path):
     # A fitted height of 60 puts the target's boxes against the image's top
-    # edge (their centre, y 30, is 30 px down), so 8 px more above and below
-    # shifts them down, onto the loading control's boxes (y 70 to 80): each
-    # box then counts part of the other's band, which is allowed and said.
+    # edge (their centre, y 30, is 30 px down), so 6 px more above and below
+    # shifts them down, onto 2 of the 10 rows of the loading control's boxes
+    # (y 70 to 80): each box then counts part of the other's band, which is
+    # allowed and said (more than half of the smaller box is refused, #114).
     target, loading, _ = live(client, tmp_path, DOSES)
     client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 14, "height": 60})
-    answer = client.ok("PUT", padding_path(target), {"along": 8})
+    answer = client.ok("PUT", padding_path(target), {"along": 6})
     state = protein_of(answer, target)
-    assert all(band["rect"][1::2] == [0, 76] for band in state["bands"])
+    assert all(band["rect"][1::2] == [0, 72] for band in state["bands"])
     assert answer["edge_shifted"] == [band["id"] for band in state["bands"]]
     assert answer["overlapping"] == [band["id"] for band in protein_of(answer, loading)["bands"]]
 
@@ -2717,6 +2718,7 @@ def test_a_read_from_the_kept_results_registers_their_charts_again(client, tmp_p
 
 ROW_FIELDS = [field.name for field in dataclasses.fields(api.ops.RowPlacement)]
 TARGET_ROW_BOX = [15, TARGET_ROW - 12, W - 35, TARGET_ROW + 12]  # every lane of the target row
+BOTH_ROWS_BOX = [15, TARGET_ROW - 12, W - 35, LOADING_ROW + 12]  # the target's row and the LC's
 
 
 def drag(client: Client, protein_id: str, rect: list[int] = TARGET_ROW_BOX) -> dict:
@@ -2854,8 +2856,10 @@ def test_one_band_on_an_image_without_lanes_placed_answers_the_lanes_it_cannot_l
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
 def test_a_second_row_box_corrects_the_first_and_removes_a_box_its_lane_lost(client, tmp_path):
     depths = (20000.0, 22000.0, 0.0, 33000.0, 36000.0)  # lane 2 of the target row: no band
-    target, _, _ = live(client, tmp_path, DOSES, target=depths, boxed=())
-    # Dragged over the loading control's row first, by mistake: a box in every lane.
+    target, loading, _ = live(client, tmp_path, DOSES, target=depths, boxed=())
+    # Dragged over the loading control's row first, by mistake, before that row
+    # was boxed (over its boxes the row is refused, #114): a box in every lane.
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
     first = drag(client, target, [15, LOADING_ROW - 12, W - 35, LOADING_ROW + 12])
     ids = first["band_ids"]
     assert None not in ids
@@ -2876,6 +2880,77 @@ def test_a_second_row_box_corrects_the_first_and_removes_a_box_its_lane_lost(cli
     assert all(band["rect"][1] < TARGET_ROW < band["rect"][3] for band in state["bands"])
     assert [record["lane_index"] for record in state["undetected"]] == [2]
     assert column(answer, target)["detected"] == [True, True, False, True, True]
+
+
+def test_a_row_box_over_two_rows_answers_the_lanes_off_its_line(client, tmp_path):
+    # The target's bands are deeper than the loading control's in lanes 2-4,
+    # shallower in lanes 0 and 1: there the row's boxes would lie on the
+    # loading control's row (#114).
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    status, payload = client.call(
+        "POST", "/api/boxes/row", {"protein_id": target, "rect": BOTH_ROWS_BOX}
+    )
+    assert (status, payload["code"], payload["ids"]) == (422, "row_off_line", [])
+    assert payload["message"] == (
+        "the bands found in lanes 1, 2 lie above or below the row's line through the other"
+        " bands, by more than 0.75 of a box's height: the row box covers more than one row,"
+        " or those bands lie off the row; draw it over one row only, or box those lanes by"
+        " clicking their bands"
+    )
+    detail = payload["detail"]
+    assert detail["cause"] == "off_row_line" and detail["flags"][0] == "off_row_line"
+    offsets = [lane["line_offset"] for lane in detail["lanes"]]
+    assert [lane for lane, v in enumerate(offsets) if abs(v) > 0.75] == [0, 1]
+    assert all(v > 0 for v in offsets[:2])  # below the target's row
+
+
+def test_a_box_over_another_proteins_box_is_refused_naming_it(client, tmp_path):
+    # Clicked, shift+clicked or moved onto the loading control's box in lane 1
+    # (#114): refused, naming that box for the page to offer it.
+    target, loading, answer = live(client, tmp_path, DOSES, boxed=(0,))
+    in_the_way = column(answer, loading)["band_ids"][1]
+    moved = column(answer, target)["band_ids"][0]
+    click = {"protein_id": target, "x": LANE_X[1], "y": LOADING_ROW, "lane_index": 1}
+    over = [LANE_X[1] - 7, LOADING_ROW - 5, LANE_X[1] + 7, LOADING_ROW + 5]
+    for method, path, body in (
+        ("POST", "/api/boxes", {**click, "grow": True}),
+        ("POST", "/api/boxes", {**click, "grow": False}),
+        ("PUT", f"/api/boxes/{moved}", {"rect": over}),
+    ):
+        assert unchanged_refusal(client, method, path, body) == ("overlap", [in_the_way])
+        _, payload = client.call(method, path, body)
+        assert payload["message"] == (
+            "the box would overlap the box of 'α-tubulin' in lane 2 by more than 50% of the"
+            " smaller box's area: two proteins' boxes would measure the same band"
+        )
+        [covered] = payload["detail"]["covered"]
+        assert payload["detail"]["cause"] == "other_protein"
+        assert (covered["band_id"], covered["protein_id"], covered["lane_index"]) == (
+            in_the_way,
+            loading,
+            1,
+        )
+        assert 0.5 < covered["share"] <= 1.0
+    assert "move_box" not in logged(client)
+
+
+def test_a_box_size_over_another_proteins_boxes_is_refused_naming_them(client, tmp_path):
+    # The loading control's boxes made 90 px high reach up over the target's,
+    # 45 px above (#114): refused, naming the target's boxes.
+    target, loading, answer = live(client, tmp_path, DOSES)
+    covered = column(answer, target)["band_ids"]
+    path = f"/api/proteins/{loading}/box-size"
+    body = {"width": 14, "height": 90}
+    assert unchanged_refusal(client, "PUT", path, body) == ("overlap", covered)
+    _, payload = client.call("PUT", path, body)
+    assert payload["message"] == (
+        "at the box size 14x90, boxes of 'α-tubulin' would overlap the boxes of 'β-catenin' in"
+        " lanes 1, 2, 3, 4, 5 by more than 50% of the smaller box's area: two proteins' boxes"
+        " would measure the same band"
+    )
+    assert payload["detail"]["cause"] == "other_protein"
+    assert [c["band_id"] for c in payload["detail"]["covered"]] == covered
+    assert "set_box_size" not in logged(client)
 
 
 def adversarial_project(client: Client, tmp_path: Path, key: str) -> tuple[RowCase, str]:
@@ -3072,6 +3147,12 @@ def _loading_lanes(client: Client, target: str, loading: str) -> list[str]:
     return column(client.ok("GET", "/api/project"), loading)["band_ids"][:5]
 
 
+def _loading_boxes(client: Client, target: str, loading: str) -> list[str]:
+    """Nothing to set up: the loading control's boxes, which a row over its
+    row would cover (#114)."""
+    return column(client.ok("GET", "/api/project"), loading)["band_ids"]
+
+
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:
     """A non-finite pixel in the row, as a damaged file would read."""
     session = client.workspace.current()
@@ -3101,6 +3182,16 @@ ROW_BOX_REFUSALS = [
     pytest.param(None, [15, 45, W - 35, 60], "no_band_found", id="no-band"),
     pytest.param(_wide_kept_box, TARGET_ROW_BOX, "size_would_overlap", id="size-would-overlap"),
     pytest.param(_kept_box_on_lane_2, TARGET_ROW_BOX, "overlap", id="onto-a-kept-box"),
+    # Over both rows: the target's bands in lanes 2-4, the loading control's
+    # (deeper there) in lanes 0 and 1, so the boxes would lie on two rows (#114).
+    pytest.param(None, BOTH_ROWS_BOX, "row_off_line", id="over-two-rows"),
+    # Over the loading control's row: its boxes are in the way (#114).
+    pytest.param(
+        _loading_boxes,
+        [15, LOADING_ROW - 12, W - 35, LOADING_ROW + 12],
+        "overlap",
+        id="onto-another-proteins-row",
+    ),
 ]
 
 
