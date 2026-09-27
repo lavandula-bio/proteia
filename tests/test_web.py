@@ -29,6 +29,7 @@ import pytest
 import proteia
 from proteia.core import operations as ops
 from proteia.core import results, rowdetect
+from proteia.core.model import ImageKind, Polarity
 from proteia.web import api, launch, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
 
@@ -566,6 +567,7 @@ def test_every_module_the_page_imports_is_served(running):
         "/static/diagnostics.js",
         "/static/dock.js",
         "/static/dom.js",
+        "/static/handoffs.js",
         "/static/lanes.js",
         "/static/proteins.js",
         "/static/view.js",
@@ -820,7 +822,8 @@ def test_a_page_shown_again_checks_which_project_is_open():
     script = _code("app.js")
     assert re.search(r'addEventListener\("visibilitychange",[^;]*checkOpening\(', script)
     assert re.search(r'window\.addEventListener\("focus",[^;]*checkOpening\(', script)
-    assert '"/api/workspace"' in _function(script, "function checkOpening(")[1]
+    assert "readWorkspace()" in _function(script, "function checkOpening(")[1]
+    assert '"/api/workspace"' in _function(script, "function readWorkspace(")[1]
     # The shortcuts (single keys, and Ctrl+Z) are off under any open dialog.
     assert '$("projects-dialog").open' not in script
     assert script.count('document.querySelector("dialog[open]")') == 2
@@ -899,22 +902,364 @@ def test_an_answer_about_a_newer_opening_than_its_request_named_is_never_applied
     assert -1 < request.find("answered.project.open_id") < checked
     follows = request.index("projectChanged(error, method, path, { answered: true });", checked)
     assert follows < request.index("throw error;", follows) < request.index("return answered;")
-    # Every answer about a project is read there: call() asks for it, and the
-    # only JSON read elsewhere is GET /api/workspace's, about no project.
+    # Every answer is read there: call() asks for it, and so does the read of
+    # GET /api/workspace (about no project), so no JSON is read elsewhere.
     assert "answer: true" in _function(script, "async function call(")[1]
     outside = [
         m.start()
         for m in re.finditer(r"\.json\(\)", script)
         if not start < m.start() < start + len(request)
     ]
-    at, check = _function(script, "function checkOpening(")
-    assert len(outside) == 1 and at < outside[0] < at + len(check)
+    assert outside == []
+    assert "answer: true" in _function(script, "function readWorkspace(")[1]
     # The requests answered about another opening on purpose name none: a
     # create or open, and the follow's read of the project open now.
     assert "anyProject: true" in _function(script, "async function switchTo(")[1]
     assert "anyProject: true" in _function(script, "function followOpening(")[1]
     # Answered, the request was not refused: nothing is said to be not done.
     assert "answered ||" in _function(script, "function projectChanged(")[1]
+
+
+# --- The Import dialog: images handed to Proteia (#57) ---
+
+
+def _markup(html: str, start: str, end: str) -> str:
+    """The markup of the page shell from ``start`` up to ``end``."""
+    at = html.index(start)
+    return html[at : html.index(end, at)]
+
+
+class _Controls(HTMLParser):
+    """The form controls of some markup, each with whether a label holds it, and
+    each select's options as (value, selected, disabled)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.labels = 0
+        self.controls: list[tuple[str, dict[str, str | None], bool]] = []
+        self.options: dict[str, list[tuple[str, bool, bool]]] = {}
+        self._select: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        fields = dict(attrs)
+        if tag == "label":
+            self.labels += 1
+        elif tag in ("input", "select", "button"):
+            self.controls.append((tag, fields, self.labels > 0))
+            if tag == "select":
+                self._select = fields.get("id") or fields.get("class")
+                self.options[self._select] = []
+        elif tag == "option" and self._select is not None:
+            self.options[self._select].append(
+                (fields.get("value", ""), "selected" in fields, "disabled" in fields)
+            )
+
+    def handle_endtag(self, tag):
+        if tag == "label":
+            self.labels -= 1
+        elif tag == "select":
+            self._select = None
+
+
+def test_the_import_dialog_is_a_labelled_modal_dialog_whose_bands_start_unchosen():
+    # A real dialog element, named by its heading; each image a group (a
+    # fieldset named by its file) of labelled choices: the kinds of the page's
+    # own import, and whether its bands are dark or light, required and
+    # unchosen (a disabled, selected placeholder), since the model has no
+    # silent default. Import starts disabled, and says why.
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    parser = _Tags()
+    parser.feed(html)
+    dialog = parser.by_id["handoff-dialog"]
+    assert parser.by_id[dialog["aria-labelledby"]] is not None
+    assert "<dialog" in _markup(html, '<dialog id="handoff-dialog"', ">")
+    assert '<h2 id="handoff-title">' in html
+    assert dialog["aria-describedby"] in parser.by_id
+    template = _markup(html, '<template id="handoff-row">', "</template>")
+    assert template.index("<fieldset") < template.index("<legend>") < template.index("<select")
+    controls = _Controls()
+    controls.feed(_markup(html, '<dialog id="handoff-dialog"', "</dialog>") + template)
+    labelled = [labelled for tag, _, labelled in controls.controls if tag != "button"]
+    assert labelled and all(labelled)  # each field and choice in a label
+    polarity = controls.options["handoff-polarity"]
+    assert polarity[0] == ("", True, True)
+    assert {value for value, _, _ in polarity[1:]} == {p.value for p in Polarity}
+    assert "required" in re.search(r'<select class="handoff-polarity"[^>]*>', template).group(0)
+    assert controls.options["handoff-set-all-polarity"] == polarity  # "Set all" says the same
+    page_import = _Controls()
+    page_import.feed(_markup(html, '<select id="import-kind">', "</select>"))
+    assert controls.options["handoff-kind"] == page_import.options["import-kind"]
+    assert {value for value, _, _ in page_import.options["import-kind"]} == {
+        k.value for k in ImageKind
+    }
+    assert controls.options["handoff-membrane"] == [("new", False, False)]
+    button = parser.by_id["handoff-import"]
+    assert (button["type"], button["aria-describedby"]) == ("submit", "handoff-needs")
+    assert "disabled" in button
+    assert (
+        parser.by_id["handoff-discard"]["type"] == parser.by_id["handoff-later"]["type"] == "button"
+    )
+
+
+def test_the_import_dialog_never_chooses_a_polarity_the_user_did_not():
+    # Whether an image's bands are dark or light is set only by the user: in
+    # its own row, or by "Set all", which fills the rows listed when it is
+    # pressed. A row added later (more files joined the hand-off) starts
+    # unchosen, and Import waits for it; a row already shown keeps its choices.
+    dialog = _code("handoffs.js")
+    sets = [m.start() for m in re.finditer(r"polarityOf\(row\)\.value = ", dialog)]
+    set_all = _method(dialog, "setAll(")
+    at = dialog.index(set_all)
+    assert len(sets) == 1 and at < sets[0] < at + len(set_all)
+    assert "for (const row of this.rows.values())" in set_all
+    assert "polarity" not in _method(dialog, "newRow(")
+    fill = _method(dialog, "fill(")
+    assert "this.rows.get(file.file_id)" in fill and "this.newRow(file)" in fill
+    assert "this.missing() === 0" in _method(dialog, "ready(")
+    assert '$("handoff-import").disabled = !this.ready();' in _method(dialog, "renderActions(")
+    assert "polarity: polarityOf(row).value," in _method(dialog, "choices(")
+    # The listing refreshes the rows, never while this page's own import or
+    # discard of the hand-off is awaited (its own claim lists it as claimed).
+    app = _code("app.js")
+    _, take = _function(app, "function takeListing(")
+    assert take.index("if (shown && !importDialog.busy)") < take.index("importDialog.refresh(now)")
+    assert "importDialog.hide();" in take
+
+
+def test_the_page_finds_images_waiting_at_start_on_focus_and_before_quitting():
+    app = _code("app.js")
+    _, start = _function(app, "async function start(")
+    assert start.index("readWorkspace()") < start.index("takeListing(workspace)")
+    assert "takeListing(workspace)" in _function(app, "function checkOpening(")[1]
+    # Quit reads them first; with images waiting it shows them and does not stop.
+    quit_press = app[app.index('$("quit").addEventListener("click"') :].split("\n});\n", 1)[0]
+    shown = quit_press.index('takeListing(workspace, { show: "asked" });')
+    assert quit_press.index("readWorkspace()") < shown < quit_press.index("return;", shown)
+    assert shown < quit_press.index('request("POST", "/api/quit")')
+    # While the hand-off shown may still grow, or another tab's import holds
+    # it, the listing is read every 2 s; not while this page's own import or
+    # discard of it is awaited.
+    assert "const SETTLE_MS = 2000;" in app
+    _, settle = _function(app, "function keepSettling(")
+    assert "!(shown.more_may_arrive || shown.claimed)" in settle and "importDialog.busy" in settle
+    assert "SETTLE_MS" in settle and "checkOpening()" in settle
+
+
+def test_an_import_of_images_waiting_is_the_pages_own_switch_naming_what_it_closes():
+    # #134's rules: an import opens a project as the Projects dialog does
+    # (switchTo), so the page shows it with no word of another tab; and its
+    # request names the opening the page shows, which it closes, so the server
+    # refuses it if another project is open now; its answer, about the
+    # opening it makes, is not taken for a newer one than the request named.
+    app = _code("app.js")
+    _, imports = _function(app, "async function importHandoff(")
+    assert "switchTo(`/api/handoffs/${handoff.id}/accept`" in imports and "exporting" in imports
+    # It names the opening the dialog says the import closes, no other.
+    named = imports.index("const closes = importDialog.closes;")
+    assert named < imports.index("closes: closes ? closes.open_id : null,")
+    _, switch = _function(app, "async function switchTo(")
+    assert "{ anyProject: true, closes }" in switch
+    _, request = _function(app, "async function request(")
+    assert request.index("} else if (closes) {") < request.index(
+        "headers.set(OPENING_HEADER, String(closes));"
+    )
+    route = next(r for r in api.router.routes if r.path == "/api/handoffs/{handoff_id}/accept")
+    assert route.methods == {"POST"}
+
+
+def test_an_import_from_a_page_showing_no_project_names_the_project_open_now():
+    # A page showing no project (its Import dialog up at start, say) closes by
+    # an import whatever project another tab opened meanwhile. So what the
+    # dialog says an import closes, and what its request names, is the project
+    # shown or, with none shown, the one open as last listed; and such a page
+    # reads the listing again before it sends, and asks again should a
+    # project be open that the dialog did not name.
+    app = _code("app.js")
+    _, closes = _function(app, "function importCloses(")
+    assert closes.index("if (state.project)") < closes.index("return listedOpen;")
+    assert "open_id: shownOpening()" in closes
+    _, take = _function(app, "function takeListing(")
+    listed = take.index("listedOpen =")
+    assert "{ name: workspace.open, open_id: workspace.open_id }" in take
+    assert listed < take.index("importDialog.renderCloses(importCloses());")
+    assert listed < take.index("importDialog.show(next, importCloses());")
+    assert "importDialog.renderCloses(importCloses());" in _function(app, "function render(")[1]
+    assert app.count("renderCloses(") == app.count("renderCloses(importCloses())")
+    _, imports = _function(app, "async function importHandoff(")
+    reread = imports.index("await checkAgain();")
+    assert imports.index("if (!state.project) {") < reread
+    assert reread < imports.index("askAgain(now.name);") < imports.index("switchTo(")
+    assert "this.closes = opening;" in _method(_code("handoffs.js"), "renderCloses(")
+
+
+def test_the_import_dialog_answers_each_refusal_of_an_import_or_a_discard():
+    # Each refusal the server gives an import or a discard has its answer in
+    # the page: the dialog closes once another tab imported or discarded the
+    # hand-off, waits while another tab's import holds it, shows it grown when
+    # more files joined, says a name clash next to the name, and follows
+    # another tab's opening before asking again.
+    app = _code("app.js")
+    handled = _function(app, "async function importRefused(")[1]
+    handled += _function(app, "function handoffRefused(")[1]
+    codes = {
+        "handoff_changed",
+        "handoff_claimed",
+        "handoff_not_found",
+        "nothing_imported",
+        "unsaved_changes",
+        "project_exists",
+        "invalid_project_name",
+    }
+    source = Path(api.__file__).read_text(encoding="utf-8")
+    for code in codes:
+        assert f'error.code === "{code}"' in handled, code
+        assert f'"{code}"' in source, code  # an error the server answers
+    assert "error.code === PROJECT_CHANGED" in handled
+    assert "detail.created" in handled  # the images went into a project after all
+    _, discard = _function(app, "async function discardHandoff(")
+    assert "json: importDialog.shownParts()," in discard
+    dialog = _code("handoffs.js")
+    assert "refused: refusedCount(handoff)," in _method(dialog, "shownParts(")
+    assert (
+        "handoff.refused.length + handoff.more_refused"
+        in _function(dialog, "function refusedCount(")[1]
+    )
+
+
+def test_the_import_dialog_waits_while_another_tab_imports_its_images():
+    # The listing keeps a hand-off another tab's import holds (claimed), since
+    # that import may be refused (a name taken, say) and let it go unchanged.
+    # The dialog showing it keeps its rows and choices; Import and Discard
+    # wait, and a line says why; the listing is read again meanwhile (as while
+    # more may arrive), and once the claim is let go they can be pressed
+    # again. Only once the listing no longer has it is it gone: the dialog
+    # closes and says so. A hand-off held elsewhere is never shown anew,
+    # counted as waiting, or taken to hold Quit back.
+    dialog = _code("handoffs.js")
+    assert 'const ELSEWHERE = "Another tab is importing these images.";' in dialog
+    assert "return this.handoff !== null && this.handoff.claimed === true;" in _method(
+        dialog, "elsewhere("
+    )
+    assert "!this.elsewhere()" in _method(dialog, "ready(")
+    actions = _method(dialog, "renderActions(")
+    assert '$("handoff-import").disabled = !this.ready();' in actions
+    assert (
+        '$("handoff-discard").disabled = !this.handoff || this.busy || this.elsewhere();' in actions
+    )
+    needs = re.compile(r'\$\("handoff-needs"\)\.textContent = this\.elsewhere\(\)\s*\? ELSEWHERE')
+    assert needs.search(actions)
+    assert "elsewhere" not in _method(dialog, "fill(")  # the rows are drawn as ever
+    app = _code("app.js")
+    _, take = _function(app, "function takeListing(")
+    images = take.index('const images = listed.filter((handoff) => handoff.kind === "images");')
+    waiting = take.index("handoffs = images.filter((handoff) => !handoff.claimed);")
+    assert images < waiting
+    assert "if (!images.some((handoff) => handoff.id === id)) {" in take  # set aside: kept
+    now = take.index("const now = images.find((handoff) => handoff.id === shown.id);")
+    gone = take.index("finished.add(shown.id);", now)
+    assert gone < take.index("importDialog.hide();", gone) < take.index("gone = GONE;", gone)
+    assert take.count("importDialog.hide();") == 1
+    # Its own import or discard refused as another tab's import holds it.
+    _, refused = _function(app, "function handoffRefused(")
+    claimed = refused.index('if (error.code === "handoff_claimed") {')
+    branch = refused[claimed : refused.index("} else if", claimed)]
+    assert "importDialog.refresh({ ...importDialog.handoff, claimed: true" in branch
+    assert "checkAgain();" in branch and "hide()" not in branch
+    assert refused.count("importDialog.hide();") == 1  # handoff_not_found only
+    not_found = refused.index('if (error.code === "handoff_not_found") {')
+    assert not_found < refused.index("importDialog.hide();") < claimed
+    assert "BEING_IMPORTED" not in app
+    quit_press = app[app.index('$("quit").addEventListener("click"') :].split("\n});\n", 1)[0]
+    assert "!handoff.claimed" in quit_press
+
+
+def test_a_refused_discard_says_what_joined_the_images_since_they_were_listed():
+    # A discard names the files and the "Not opened" entries shown, so it is
+    # refused (handoff_changed) once either grew. The dialog says which grew:
+    # images, to choose for, or only files a launch could not open, when "More
+    # images arrived" would send the user looking for rows that did not come.
+    refresh = _method(_code("handoffs.js"), "refresh(")
+    before = refresh.index("const before = refusedCount(this.handoff);")
+    assert before < refresh.index("return { images, refused: refusedCount(handoff) - before };")
+    _, refused = _function(_code("app.js"), "function handoffRefused(")
+    joined = refused.index("const joined = importDialog.refresh(error.detail);")
+    images = refused.index("joined.images", joined)
+    assert images < refused.index('"More images arrived: check them"', images)
+    only = refused.index("joined.refused", images)
+    assert only < refused.index('"More files could not be opened: check the list"', only)
+
+
+def test_esc_closes_the_import_dialog_and_leaves_the_images_waiting():
+    # Esc (or Later) only closes it, not while its import or discard is
+    # awaited; the images keep waiting, and the header's (or the Projects
+    # dialog's) "N images waiting…" shows them again, with the choices made.
+    dialog = _code("handoffs.js")
+    constructor = _method(dialog, "constructor(")
+    cancel = constructor[constructor.index('addEventListener("cancel"') :]
+    assert cancel.index("if (this.busy)") < cancel.index("event.preventDefault();")
+    close = constructor[constructor.index('addEventListener("close"') :]
+    assert "this.handlers.closed(handoff);" in close and "reset()" not in close
+    assert '$("handoff-later").addEventListener("click", () => dialog.close());' in constructor
+    app = _code("app.js")
+    closed = app[app.index("closed: (handoff) => {") :].split("\n  },\n", 1)[0]
+    assert "setAside.add(handoff.id);" in closed and "discard" not in closed
+    for button in ("handoffs-waiting", "projects-handoffs"):
+        assert f'$("{button}").addEventListener("click", () => showWaiting());' in app
+
+
+def test_the_import_dialog_stays_up_while_its_import_or_discard_is_awaited():
+    # A second Esc with no click between gives a cancel event the page cannot
+    # stop (the browser's close watcher), so the key itself is stopped while
+    # the answer is awaited; and a dialog closed all the same then comes back
+    # up, to say how the import or discard went (a refusal is said there).
+    constructor = _method(_code("handoffs.js"), "constructor(")
+    keys = constructor[constructor.index('document.addEventListener("keydown"') :]
+    stopped = keys.index('this.busy && dialog.open && event.key === "Escape"')
+    assert stopped < keys.index("event.preventDefault();")
+    close = constructor[constructor.index('addEventListener("close"') :]
+    busy = close.index("if (this.busy) {")
+    assert busy < close.index("dialog.showModal();") < close.index("this.handlers.closed(handoff);")
+
+
+def test_a_launch_notice_is_said_then_discarded_as_said():
+    # A notice (the arguments a launch could not open, and no image) is said
+    # in the status line, then discarded with the count of entries said, so
+    # one that grew meanwhile is refused and said whole next time.
+    _, notices = _function(_code("app.js"), "function sayNotices(")
+    assert notices.index("finished.add(notice.id);") < notices.index("/discard`")
+    assert "json: { files: [], refused: notice.refused.length + notice.more_refused }" in notices
+    changed = notices.index('error.code === "handoff_changed"')
+    assert changed < notices.index("finished.delete(notice.id);") < notices.index("checkAgain();")
+    assert "return `Not opened: " in notices
+
+
+def test_a_notice_is_said_with_what_the_page_just_said_never_over_it():
+    # The status line holds one message. A notice a listing finds is said
+    # after what the page just said there (an import's result, the Import
+    # dialog closed, another tab's project followed, Quit held back), never in
+    # its place, nor put in its place later: the listing gives it to say
+    # (takeListing), and each caller says it with its own message. It waits
+    # while this page's own import or discard is awaited, whose answer comes
+    # next: the check after that answer says both.
+    app = _code("app.js")
+    assert "showStatus(" not in _function(app, "function sayNotices(")[1]
+    _, take = _function(app, "function takeListing(")
+    assert "showStatus(" not in take and "importDialog.busy ? [] :" in take
+    assert 'return [gone, sayNotices(notices)].filter(Boolean).join(" ") || null;' in take
+    _, check = _function(app, "function checkOpening(")
+    said = check.index('const said = [note, found].filter(Boolean).join(" ") || null;')
+    assert said < check.index("showStatus(said);") < check.index("followOpening({ note: said })")
+    for head in ("async function importHandoff(", "async function discardHandoff("):
+        _, body = _function(app, head)
+        assert body.index("showStatus(said);") < body.index("checkAgain(said);"), head
+    quit_press = app[app.index('$("quit").addEventListener("click"') :].split("\n});\n", 1)[0]
+    assert 'showStatus([WAITING_AT_QUIT, found].filter(Boolean).join(" "));' in quit_press
+    for head in ("async function start(", "async function showWaiting("):
+        _, body = _function(app, head)
+        assert body.index("const found = takeListing(") < body.index("showStatus(found);"), head
+    # Every listing taken says what it gives.
+    calls = re.findall(r"(?<!function )takeListing\(", app)
+    assert len(calls) == len(re.findall(r"const found = takeListing\(", app)) == 4
 
 
 # --- The box size fields (#57) ---
