@@ -310,6 +310,14 @@ def test_the_console_command_starts_the_web_app():
     assert entry.value == "proteia.web.launch:main"
 
 
+@pytest.fixture
+def state(tmp_path, monkeypatch):
+    """The launcher's state folder in ``tmp_path``: :func:`launch.main` writes its
+    session log there, not in the user's."""
+    monkeypatch.setattr(launch, "state_dir", lambda: tmp_path / "state")
+    return tmp_path / "state"
+
+
 class _FakeInstance:
     port = 1234
     redirect_path = Path("µ α β") / "open-proteia.html"
@@ -322,7 +330,7 @@ class _FakeInstance:
         self.served = True
 
 
-def test_main_serves_without_printing_the_token(monkeypatch, capsys):
+def test_main_serves_without_printing_the_token(state, monkeypatch, capsys):
     fake = _FakeInstance()
     monkeypatch.setattr(launch, "start", lambda: fake)
     assert launch.main() == 0
@@ -335,16 +343,19 @@ def test_main_serves_without_printing_the_token(monkeypatch, capsys):
     assert "already running" in capsys.readouterr().out
 
 
-def test_main_reports_an_instance_that_does_not_respond(monkeypatch, capsys):
+def test_main_reports_an_instance_that_does_not_respond(state, monkeypatch, capsys):
     def refuse():
         raise launch.NotRespondingError("no answer")
 
     monkeypatch.setattr(launch, "start", refuse)
     assert launch.main() == 1
-    assert "does not respond" in capsys.readouterr().out
+    console = capsys.readouterr()
+    assert "does not respond" in console.out and not console.err  # printed once
+    log = (state / "logs" / "proteia.log").read_text(encoding="utf-8")
+    assert "ERROR proteia.web.launch: Proteia is already running but does not respond" in log
 
 
-def test_main_prints_a_non_ascii_path_to_a_narrow_console(monkeypatch):
+def test_main_prints_a_non_ascii_path_to_a_narrow_console(state, monkeypatch):
     stdout = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(launch, "start", _FakeInstance)

@@ -18,6 +18,10 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   from the session's injectable clock (UTC; the offline system clock by default).
   The one entry made elsewhere is a ``migrate`` entry, appended as a file of an
   older schema loads; :func:`open_project` then autosaves it like a change.
+  Every entry is also logged (Python's :mod:`logging`, at INFO: the session log
+  of #137), with its params as the entry holds them and the project named by
+  its folder's name, never its path; and so are opening, reading again and
+  closing a project.
 * Pixels are read lazily and cached as read-only arrays, after checking the
   stored file's SHA-256 and the array's shape against the image record.
 * The session keeps its undo history: the content of each state it committed,
@@ -49,6 +53,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -74,7 +79,14 @@ from proteia.core.imaging import (
     load_image,
     read_colours,
 )
-from proteia.core.model import IMAGE_SUFFIXES, ImageRef, LogEntry, Project, format_timestamp
+from proteia.core.model import (
+    IMAGE_SUFFIXES,
+    LEGACY_BACKGROUND_METHOD,
+    ImageRef,
+    LogEntry,
+    Project,
+    format_timestamp,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -190,6 +202,39 @@ def _entry(
         params=dict(params),
         content_hash=content_hash,
     )
+
+
+def _log_entry(folder: Path, entry: LogEntry) -> None:
+    """Log a committed change: its seq, action and params, and the project's
+    folder by name."""
+    if _log.isEnabledFor(logging.INFO):
+        params = json.dumps(entry.params, ensure_ascii=False)
+        _log.info("committed #%d %s in %r: %s", entry.seq, entry.action, folder.name, params)
+
+
+def _log_opened(folder: Path, project: Project, *, again: bool = False) -> None:
+    """Log that ``project`` was read from ``folder`` (``again``: read again, as
+    changed outside Proteia), and the legacy background it still uses."""
+    batch = project.batch
+    _log.info(
+        "%s: %d images, %d proteins, %d boxes, %d log entries",
+        f"read {folder.name!r} again, as its project.json was changed outside Proteia"
+        if again
+        else f"opened {folder.name!r}",
+        sum(1 for _ in batch.iter_images()),
+        len(batch.proteins),
+        sum(len(protein.bands) for protein in batch.proteins),
+        len(project.log),
+    )
+    if project.background_method == LEGACY_BACKGROUND_METHOD and any(
+        protein.bands for protein in batch.proteins
+    ):
+        _log.info(
+            "in %r: the nets are measured with the legacy background (%s), each image's"
+            " median, until the project is requantified",
+            folder.name,
+            LEGACY_BACKGROUND_METHOD,
+        )
 
 
 @dataclass(frozen=True)
@@ -576,6 +621,7 @@ class ProjectSession:
             else:
                 self._cursor += 1
             self._steps = self._steps_at_cursor()
+            _log_entry(self._folder, entry)
             self._changed(action)
 
     def _changed(self, action: str) -> None:
@@ -725,7 +771,9 @@ class ProjectSession:
             self._states, self._cursor = [], -1
             self._steps = (None, None)
             self.last_action = None
+            _log_opened(self._folder, project, again=True)
             if migrated:
+                _log_entry(self._folder, project.log[-1])
                 self._changed("migrate")
             return True
 
@@ -743,6 +791,7 @@ class ProjectSession:
             if remove_files:
                 with contextlib.suppress(OSError):
                     self._remove_orphans()
+            _log.info("closed %r", self._folder.name)
 
     def _retained_files(self) -> frozenset[str]:
         """The files of every image a state in the undo history references."""
@@ -794,6 +843,7 @@ def new_project(
     )
     project = Project(log=(created,))
     storage.save_project(project, path)
+    _log_entry(path, created)
     return ProjectSession(project, path, autosave=autosave, saved_files=(), clock=clock)
 
 
@@ -819,7 +869,9 @@ def open_project(
     session = ProjectSession(
         project, folder, autosave=autosave, saved_files=_referenced_files(project), clock=clock
     )
+    _log_opened(session.folder, project)
     if migrated:
         with session.lock:
+            _log_entry(session.folder, project.log[-1])
             session._changed("migrate")
     return session
