@@ -28,7 +28,9 @@ and the result holds at most :data:`MAX_HANDOFF_FILES` files; measured from the
 start of each upload, so a large file does not split a selection. The page
 lists the hand-offs (:meth:`Inbox.listing`), then imports one (an accept claims
 it, :meth:`Inbox.claim`; files offered meanwhile start another) or discards it
-(:meth:`Inbox.discard`).
+(:meth:`Inbox.discard`). A claimed hand-off is still listed, as claimed: no
+other accept or discard takes it, but the accept may be refused and release it
+as it was, so a page showing it keeps its choices until it is gone.
 
 Limits: at most :data:`MAX_PENDING_FILES` files wait at a time, in hand-offs
 or uploaded but not yet offered, and at most :data:`MAX_STAGED_BYTES` are
@@ -267,7 +269,9 @@ class FileView:
 class HandoffView:
     """A pending hand-off as the page lists it. ``more_may_arrive``: files may
     still join it (it is young, or an upload that may join it is under way or
-    not yet offered)."""
+    not yet offered). ``claimed``: an accept is importing it, so no other
+    accept or discard takes it, and no file joins it; refused, that accept
+    releases it as it was."""
 
     id: str
     kind: Literal["images", "notice"]
@@ -275,6 +279,7 @@ class HandoffView:
     refused: tuple[Refusal, ...]
     more_refused: int
     more_may_arrive: bool
+    claimed: bool
 
 
 @dataclass
@@ -576,11 +581,10 @@ class Inbox:
     # --- The page ---
 
     def listing(self) -> list[HandoffView]:
-        """The hand-offs no accept has claimed, in the order they began."""
+        """The pending hand-offs, in the order they began: those an accept has
+        claimed too, as claimed (:meth:`claim`), since it may release them."""
         with self._lock:
-            return [
-                self._view(handoff) for handoff in self._handoffs.values() if not handoff.claimed
-            ]
+            return [self._view(handoff) for handoff in self._handoffs.values()]
 
     def _view(self, handoff: Handoff) -> HandoffView:
         """``handoff`` as the page lists it. Called with the lock held."""
@@ -591,6 +595,7 @@ class Inbox:
             refused=tuple(handoff.refused),
             more_refused=handoff.more_refused,
             more_may_arrive=self._more_may_arrive(handoff),
+            claimed=handoff.claimed,
         )
 
     def _more_may_arrive(self, handoff: Handoff) -> bool:
@@ -616,8 +621,9 @@ class Inbox:
 
     def claim(self, handoff_id: str, file_ids: Sequence[str]) -> Handoff:
         """Claim the hand-off ``handoff_id`` for an accept that lists its files
-        as ``file_ids`` (in any order): no other accept or discard takes it, the
-        page no longer lists it, and files offered later start another.
+        as ``file_ids`` (in any order): no other accept or discard takes it
+        (:class:`HandoffClaimedError`), the page lists it as claimed, and files
+        offered later start another; until :meth:`release` or :meth:`finish`.
         :class:`HandoffNotFoundError`, :class:`HandoffClaimedError`,
         :class:`HandoffChangedError` if it holds other files,
         ``invalid_input`` for a notice (it has none to import),
@@ -635,7 +641,8 @@ class Inbox:
             return handoff
 
     def release(self, handoff: Handoff) -> None:
-        """An accept that claimed ``handoff`` changed nothing: it is pending again."""
+        """An accept that claimed ``handoff`` changed nothing: it is pending
+        again, and listed as it was before the claim."""
         with self._lock:
             handoff.claimed = False
 

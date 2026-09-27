@@ -27,6 +27,10 @@
     aria-keyshortcuts="Control+Shift+Z Control+Y Meta+Shift+Z">Redo</button>
   <span id="save-state" class="save-state" role="status"></span>
   <span class="spacer"></span>
+  <!-- Images handed to Proteia that the Import dialog does not show (closed with
+    Esc or Later, or found while another dialog was up): it shows them (app.js). -->
+  <button id="handoffs-waiting" class="waiting" type="button" hidden
+    title="Images handed to Proteia wait for you to import or discard them"></button>
   <!-- A zip file to attach to a bug report (diagnostics.js); Proteia sends nothing. -->
   <button id="diagnostics" type="button" hidden aria-haspopup="dialog"
     title="Write a file to attach to a bug report: the session log, the versions and the open project's records. Proteia sends nothing.">Diagnostics…</button>
@@ -286,6 +290,8 @@
   <p id="projects-empty" hidden>No projects yet. Create one, or open the sample project to
     try Proteia on a synthetic blot first.</p>
   <ul id="project-list" class="choices"></ul>
+  <!-- As in the header: images handed to Proteia, waiting (app.js renderWaiting). -->
+  <button id="projects-handoffs" class="waiting" type="button" hidden></button>
   <form id="new-project" class="new-project">
     <label class="field">New project
       <input id="new-project-name" type="text" maxlength="100" required>
@@ -353,5 +359,83 @@
   </div>
   <div id="chart-dialog-body"></div>
 </dialog>
+
+<!-- Images a launch handed to Proteia (proteia a.tif, or Open with), waiting to be
+  imported into a new project or discarded (handoffs.js fills it, app.js sends
+  it). Nothing is imported until Import. Esc or Later closes it: the images keep
+  waiting, and the header's "N images waiting…" shows them again. -->
+<dialog id="handoff-dialog" class="handoff-dialog" aria-labelledby="handoff-title"
+  aria-describedby="handoff-intro">
+  <form id="handoff-form">
+    <h2 id="handoff-title">Import images into a new project</h2>
+    <p id="handoff-intro" class="hint">Proteia was given these images. Nothing is imported until
+      you press Import; Discard leaves the original files as they are.</p>
+    <fieldset id="handoff-fields" class="handoff-fields">
+      <label class="field">New project name
+        <input id="handoff-name" type="text" maxlength="100" autocomplete="off" spellcheck="false"
+          placeholder="named after the first image" aria-describedby="handoff-name-error">
+      </label>
+      <p id="handoff-name-error" class="error" role="alert" hidden></p>
+      <!-- Fills the images listed when it is pressed, never one that arrives later. -->
+      <div id="handoff-set-all" class="handoff-set-all">
+        <label class="inline">Bands in every image listed are
+          <select id="handoff-set-all-polarity">
+            <option value="" selected disabled>choose…</option>
+            <option value="dark_on_light">dark on a light background</option>
+            <option value="light_on_dark">light on a dark background</option>
+          </select>
+        </label>
+        <button id="handoff-set-all-apply" type="button" disabled>Set all</button>
+      </div>
+      <ul id="handoff-files" class="handoff-files"></ul>
+    </fieldset>
+    <p id="handoff-arriving" class="hint" hidden>More images may still arrive…</p>
+    <p id="handoff-news" class="hint" role="status"></p>
+    <section id="handoff-refused" class="handoff-refused" aria-labelledby="handoff-refused-title"
+      hidden>
+      <h3 id="handoff-refused-title">Not opened</h3>
+      <ul id="handoff-refused-list" class="notices"></ul>
+    </section>
+    <p id="handoff-closes" class="hint" hidden></p>
+    <p id="handoff-state" class="hint" role="status" hidden></p>
+    <p id="handoff-error" class="error" role="alert"></p>
+    <div class="actions handoff-actions">
+      <button id="handoff-import" type="submit" disabled aria-describedby="handoff-needs">Import</button>
+      <button id="handoff-discard" type="button">Discard</button>
+      <button id="handoff-later" type="button"
+        title="Close; the images keep waiting (the header's “images waiting” shows them again)">Later</button>
+      <span id="handoff-needs" class="hint"></span>
+    </div>
+  </form>
+</dialog>
+
+<!-- One image of the Import dialog. Whether its bands are dark or light starts
+  unchosen: the model has no silent default, so Import waits for it. -->
+<template id="handoff-row">
+  <li>
+    <fieldset class="handoff-file">
+      <legend><bdi class="handoff-file-name"></bdi> <span class="handoff-file-size hint"></span></legend>
+      <label class="field">Import as
+        <select class="handoff-kind">
+          <option value="chemiluminescence">Chemiluminescence</option>
+          <option value="visible_marker">Marker (visible light)</option>
+          <option value="merged">Merged</option>
+        </select>
+      </label>
+      <label class="field">Membrane
+        <select class="handoff-membrane">
+          <option value="new">New membrane</option>
+        </select>
+      </label>
+      <label class="field">Bands are
+        <select class="handoff-polarity" required>
+          <option value="" selected disabled>choose…</option>
+          <option value="dark_on_light">dark on a light background</option>
+          <option value="light_on_dark">light on a dark background</option>
+        </select>
+      </label>
+    </fieldset>
+  </li>
+</template>
 </body>
 </html>
