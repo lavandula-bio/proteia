@@ -5274,6 +5274,31 @@ def test_clicks_grown_wider_than_the_lane_pitch_are_not_among_the_lanes_numbered
     assert at_true_lanes(s, protein, case) == {lane: lane for lane in range(case.n_lanes)}
 
 
+@pytest.mark.parametrize("mirrored", [False, True], ids=["clicked-ltr", "clicked-rtl"])
+def test_clicks_padded_wider_than_the_lane_pitch_count_among_the_lanes_numbered(
+    tmp_path, monkeypatch, mirrored
+):
+    # Another protein's boxes clicked in true lanes 0, 2 and 4, each grown over
+    # its own band (41 px, under the pitch of 70), then padded 16 px left and
+    # right (#57): 73 px wide, but centred on their lanes as before. What grew
+    # from the click is the fitted size, so they number their lanes, the other
+    # way from a third protein's boxes in the other lanes.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, image, protein = row_session(tmp_path, case)
+    actin = ops.add_protein(s, "actin", Role.TARGET, image)
+    for true in (0, 2, 4):
+        lane = n - 1 - true if mirrored else true
+        ops.place_box(s, actin, *at_lane(case, true), lane_index=lane, grow=True)
+    ops.set_box_padding(s, actin, across=16)
+    grown = protein_of(s, actin)
+    assert grown.fitted_size.width < 69 and grown.box_size.width > 71
+    gapdh = other_protein_in_lanes(s, image, case, (1, 3, 5), mirrored=not mirrored)
+    names = ("'GAPDH'", "'actin'") if mirrored else ("'actin'", "'GAPDH'")
+    ids = numbering_refused(s, protein, case.row, both_ways(*names), monkeypatch)
+    assert ids == ((gapdh, actin) if mirrored else (actin, gapdh))
+
+
 def test_a_mirrored_image_numbered_one_way_is_read_right_to_left(tmp_path):
     # Two proteins' boxes and the protein's own clicked ones all number the
     # lanes right to left.

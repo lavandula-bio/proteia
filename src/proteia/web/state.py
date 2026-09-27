@@ -16,6 +16,13 @@ Coordinates are image pixels: a box is ``[x0, y0, x1, y1]`` with the end
 exclusive, as :meth:`~proteia.core.model.Box.rect` gives it, so a box the browser
 draws at any zoom lands on the same pixels the server quantifies.
 
+Each protein's ``box_size`` is the size of every one of its boxes, the one
+quantified and drawn, and ``fitted_size`` the size its clicks, rows or typing
+asked for, which the boxes extend beyond by the protein's padding on each side
+(:attr:`~proteia.core.model.Protein.fitted_size`), both as ``{width, height}``.
+The page's size fields show the fitted size, which ``PUT
+/api/proteins/{id}/box-size`` takes.
+
 ``background_method`` names how the stored nets' backgrounds were measured
 (``ring_median_v1``, or ``global_median`` for a project quantified before #83,
 until it is requantified), and each band's ``background_mode`` how its own was:
@@ -115,7 +122,7 @@ def project_state(
     anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
-        size = protein.box_size
+        size, fitted = protein.box_size, protein.fitted_size
         proteins.append(
             {
                 "id": protein.id,
@@ -125,6 +132,7 @@ def project_state(
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
                 "box_size": {"width": size.width, "height": size.height},
+                "fitted_size": {"width": fitted.width, "height": fitted.height},
                 "bands": [
                     {
                         "id": band.id,

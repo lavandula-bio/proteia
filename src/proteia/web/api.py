@@ -25,6 +25,12 @@ box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
 
+``PUT /api/proteins/{protein_id}/box-size`` takes a protein's fitted size, as the
+state shows it (``fitted_size``), not its box size: every box becomes that size
+plus the protein's padding on each side
+(:func:`~proteia.core.operations.set_box_size`), so the size shown, sent back
+as it is, changes nothing.
+
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
 ``?colour=original``, its stored file in its own colours, for display only.

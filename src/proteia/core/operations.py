@@ -1951,13 +1951,14 @@ def _misnumbered_lanes(
     The lanes placed are the first-band boxes on the image, of every protein
     and from any source (:func:`~proteia.core.project.lane_anchors`), less
     those whose ids are in ``without`` and the boxes grown from a click
-    (source ``click``, edited by hand or not) of a protein whose boxes are
-    wider than the lane pitch (:func:`~proteia.core.project.lane_pitch` of
+    (source ``click``, edited by hand or not) of a protein whose fitted size
+    is wider than the lane pitch (:func:`~proteia.core.project.lane_pitch` of
     each protein's): such a box is centred on what grew from the click, which
     may span several lanes' bands (touching bands), so its centre need not lie
-    on its lane's column. A box dropped where the user clicked, moved there by
-    hand or centred on a band a detector found shows its lane whatever its
-    width.
+    on its lane's column. The padding is left out: it widens every box of the
+    protein around its centre, and what grew is no wider for it. A box dropped
+    where the user clicked, moved there by hand or centred on a band a
+    detector found shows its lane whatever its width.
 
     The lanes placed are numbered inconsistently when two proteins' boxes,
     each in two or more kept lanes, number the lanes opposite ways
@@ -1984,7 +1985,7 @@ def _misnumbered_lanes(
     grown = {
         b.id
         for p in proteins
-        if p.box_size.width > pitch
+        if p.fitted_size.width > pitch
         for b in p.bands
         if b.source is ProposalSource.CLICK
     }

@@ -1456,6 +1456,34 @@ def test_a_malformed_box_size_is_refused(client, tmp_path, body):
     assert unchanged_refusal(client, "PUT", path, body) == ("invalid_input", [])
 
 
+def test_the_box_size_route_takes_the_fitted_size_the_state_shows(client, tmp_path):
+    # A padding (#57) makes every box the fitted size plus the padding on each
+    # side. The state carries both sizes, and the route takes the fitted one:
+    # the size the page shows, sent back as it is, changes nothing (it is not
+    # padded again), and a new one is padded once.
+    target, _, _ = live(client, tmp_path, DOSES)
+    api.ops.set_box_padding(client.workspace.current(), target, across=3, along=2)
+    before = client.ok("GET", "/api/project")
+    state = protein_of(before, target)
+    assert state["fitted_size"] == {"width": 14, "height": 10}  # SIZE
+    assert state["box_size"] == {"width": 14 + 2 * 3, "height": 10 + 2 * 2}
+    path = f"/api/proteins/{target}/box-size"
+
+    same = client.ok("PUT", path, state["fitted_size"])  # a no-op: no log entry
+    assert same == client.ok("GET", "/api/project")
+    assert same["project"]["revision"] == before["project"]["revision"]
+    assert protein_of(same, target) == state
+    assert "set_box_size" not in logged(client)
+
+    answer = client.ok("PUT", path, {"width": 16, "height": 12})
+    state = protein_of(answer, target)
+    assert state["fitted_size"] == {"width": 16, "height": 12}
+    assert state["box_size"] == {"width": 16 + 2 * 3, "height": 12 + 2 * 2}
+    for band in state["bands"]:
+        x0, y0, x1, y1 = band["rect"]
+        assert (x1 - x0, y1 - y0) == (22, 16)
+
+
 def test_a_seed_click_grows_a_box_over_the_band_and_answers_its_net(client, tmp_path):
     _, protein = ready(client, tmp_path)
     cx = LANE_X[2]
