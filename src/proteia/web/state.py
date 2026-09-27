@@ -29,6 +29,11 @@ detector's statistic and the limit it stayed below), ``region`` (the slot the
 detector measured, ``[x0, y0, x1, y1]`` like a box) and ``source`` (the
 detector). A lane with a first-band record was examined, so it is not offered as
 a missing box.
+
+Each image's ``colour`` says whether its stored file has colour that its gray
+analysis view does not show (:func:`has_colour`): then the page offers a view of
+it in its original colours (:func:`original_png`), for display only. Only that
+reads a stored file here: a header, once per image (TIFF, or a colour file).
 """
 
 from __future__ import annotations
@@ -40,8 +45,8 @@ import numpy as np
 from PIL import Image
 from pydantic import JsonValue
 
-from proteia.core.imaging import preview
-from proteia.core.model import Batch, Project, Protein
+from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
+from proteia.core.model import Batch, ImageRef, Project, Protein
 from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import HistoryStep, ProjectSession
 
@@ -98,6 +103,7 @@ def project_state(
             "width": image.width,
             "height": image.height,
             "bit_depth": image.bit_depth,
+            "colour": has_colour(session, image),
             "warnings": [
                 {"code": warning.code, "message": warning.message}
                 for warning in image.import_warnings
@@ -170,9 +176,45 @@ def project_state(
     }
 
 
+def has_colour(session: ProjectSession, image: ImageRef) -> bool:
+    """Whether the image's stored file has colour its gray analysis array does not
+    show, so the page offers its original colours:
+
+    * red, green and blue that differ, which the import records as the
+      ``color_channels_differ`` warning (the gray is their mean); a palette PNG
+      reads as its colours, so a colour palette counts;
+    * a palette TIFF's colour map that is not gray: its pixels read as the
+      indices (the gray levels, as an ImageJ lookup table colours them).
+
+    A file whose channels are not red, green and blue (CMYK, CIELAB) is not
+    offered: Proteia does not convert them, so its colours would be shown
+    wrong. Equal channels are gray, and so is gray with alpha. The stored
+    file's header is read for a TIFF, or a file with the warning
+    (:meth:`~proteia.core.session.ProjectSession.file_colours`, once each)."""
+    differ = any(warning.code == "color_channels_differ" for warning in image.import_warnings)
+    if not differ and not image.file.endswith(TIFF_SUFFIXES):
+        return False  # gray: only a TIFF has colours its pixels do not read as (a palette)
+    colours = session.file_colours(image)
+    return colours == "palette" or (colours == "rgb" and differ)
+
+
+def _png(pixels: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    Image.fromarray(pixels).save(buffer, format="PNG", compress_level=1)
+    return buffer.getvalue()
+
+
 def preview_png(array: np.ndarray) -> bytes:
     """A grayscale PNG of an analysis array for display
     (:func:`~proteia.core.imaging.preview`: 16-bit levels stretched to 8 bits)."""
-    buffer = io.BytesIO()
-    Image.fromarray(preview(array)).save(buffer, format="PNG", compress_level=1)
-    return buffer.getvalue()
+    return _png(preview(array))
+
+
+def original_png(pixels: np.ndarray) -> bytes:
+    """An RGB PNG of an image's pixels in its file's own colours
+    (:func:`~proteia.core.imaging.read_colours`), for display only
+    (:func:`~proteia.core.imaging.display_rgb`: alpha dropped, levels
+    other than 8-bit stretched to 8 bits over all three channels at once, so
+    the hues keep their balance). Pixel for pixel the analysis array's grid:
+    same size, same orientation, so boxes drawn on it stay in place."""
+    return _png(display_rgb(pixels))

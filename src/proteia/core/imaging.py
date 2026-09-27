@@ -13,6 +13,9 @@ sets the detector limit for the over-exposure check. Other pixel types (float,
 32-bit) have no fixed limit, so their depth is ``None`` and the import records a
 warning. Problems found on import become :class:`~proteia.core.model.ImageWarning`
 records, which the project keeps with the image.
+
+For display only, :func:`read_colours` reads a file in its own colours, and
+:func:`file_colours` says from the header whether it has colour to show.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import tifffile
@@ -297,3 +301,90 @@ def display_rgb(pixels: np.ndarray) -> np.ndarray:
         return preview(pixels[..., :3])
     view = preview(to_grayscale(pixels))
     return np.stack([view, view, view], axis=-1)
+
+
+# PNG and JPEG modes whose pixels read as red, green and blue (then alpha): a
+# palette is read as its colours.
+_RGB_MODES = frozenset({"RGB", "RGBA", "P", "PA"})
+
+FileColours = Literal["rgb", "palette"]
+
+
+def _tiff_colours(path: Path) -> tuple[int, np.ndarray | None]:
+    """The photometric interpretation of a TIFF's image and its colour map (3 x N,
+    16-bit), from the header."""
+    with tifffile.TiffFile(path) as tif:
+        if not tif.series:
+            raise ValueError(f"{path.name}: holds no image")
+        page = tif.series[0].keyframe
+        photometric, colormap = int(page.photometric), page.colormap
+    if colormap is not None and (colormap.ndim != 2 or colormap.shape[0] != 3):
+        colormap = None  # not red, green and blue levels
+    return photometric, colormap
+
+
+def _is_gray_map(colormap: np.ndarray) -> bool:
+    return bool(
+        np.array_equal(colormap[0], colormap[1]) and np.array_equal(colormap[0], colormap[2])
+    )
+
+
+def file_colours(path: str | os.PathLike[str]) -> FileColours | None:
+    """How a file holds colour, read from its header alone.
+
+    ``"rgb"``: the channels :func:`read_pixels` gives, when there are three or
+    four, are red, green and blue (then alpha); a palette PNG reads as its
+    colours. ``"palette"``: a TIFF whose pixels read as indices into a colour
+    map that is not gray, as an 8-bit ImageJ image with a colour lookup table
+    is saved. None otherwise: a gray file (a gray colour map too), or one whose
+    channels are not red, green and blue (CMYK, CIELAB), which are not
+    converted, so they cannot be shown as the file's own colours. For display
+    only. Raises ``ValueError`` or ``OSError`` for a file it cannot read.
+    """
+    path = Path(path)
+    try:
+        if path.suffix.lower() in TIFF_SUFFIXES:
+            photometric, colormap = _tiff_colours(path)
+            if photometric == tifffile.PHOTOMETRIC.RGB:
+                return "rgb"
+            if (
+                photometric == tifffile.PHOTOMETRIC.PALETTE
+                and colormap is not None
+                and not _is_gray_map(colormap)
+            ):
+                return "palette"
+            return None
+        from PIL import Image
+
+        with warnings.catch_warnings():
+            # A local file already imported: Pillow's size guard is for untrusted input.
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                mode = image.mode
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+    return "rgb" if mode in _RGB_MODES else None
+
+
+def read_colours(path: str | os.PathLike[str]) -> np.ndarray:
+    """A file's pixels in its own colours, for display only: as :func:`read_pixels`
+    gives them, except that a palette TIFF's indices are looked up in its colour
+    map (8-bit, 3 channels last), as a viewer shows them. Analysis never uses it.
+    """
+    path = Path(path)
+    pixels = read_pixels(path)
+    if pixels.ndim != 2 or path.suffix.lower() not in TIFF_SUFFIXES:
+        return pixels
+    try:
+        photometric, colormap = _tiff_colours(path)
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+    if photometric != tifffile.PHOTOMETRIC.PALETTE or colormap is None:
+        return pixels
+    # A TIFF colour map is 16-bit: its high byte is the 8-bit level.
+    table = (np.asarray(colormap, dtype=np.uint16).T >> 8).astype(np.uint8)
+    return table[np.minimum(pixels, len(table) - 1)]

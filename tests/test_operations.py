@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tifffile
 
 import proteia
 from conftest import (
@@ -41,8 +42,9 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
-from proteia.core import boxes, record, results, rowdetect, storage
+from proteia.core import boxes, imaging, record, results, rowdetect, storage
 from proteia.core import operations as ops
+from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
 from proteia.core.grow import grow_box
 from proteia.core.imaging import clipping_depth
@@ -1140,6 +1142,86 @@ def test_pixels_of_another_shape_are_refused(tmp_path):
     with pytest.raises(OperationError) as info:
         s.pixels(image_id)
     assert info.value.code is ErrorCode.IMAGE_FILE_CHANGED
+    with pytest.raises(OperationError) as info:
+        s.colour_pixels(image_id)
+    assert (info.value.code, info.value.ids) == (ErrorCode.IMAGE_FILE_CHANGED, (image_id,))
+
+
+def test_colour_pixels_are_the_files_own_read_with_the_same_checks(tmp_path):
+    # For showing a colour file in its own colours (#57): the pixels as stored,
+    # channels last, never cached; refused as the analysis array would be.
+    s = session_on(tmp_path)
+    gray = blot()
+    rgb = np.dstack([gray, gray // 2, gray // 3])
+    image_id = import_blot(s, rgb, "stain.tif")
+    s._pixels.clear()
+    stored = s.colour_pixels(image_id)
+    assert stored.shape == (H, W, 3) and np.array_equal(stored, rgb)
+    assert s._pixels == {}  # display only: nothing kept
+    path = s.folder / storage.IMAGES_DIR / f"{image_id}.tif"
+    write_tiff(path, rgb[:, ::-1])  # other bytes, same shape
+    for problem in ("other bytes", "missing"):
+        if problem == "missing":
+            path.unlink()
+        with pytest.raises(OperationError) as info:
+            s.colour_pixels(image_id)
+        assert (info.value.code, info.value.ids) == (ErrorCode.IMAGE_FILE_CHANGED, (image_id,))
+    with pytest.raises(UnknownIdError):
+        s.colour_pixels("img-99")
+
+
+def test_a_palette_tiff_is_analysed_as_its_indices_and_shown_through_its_map(tmp_path):
+    # An 8-bit TIFF with a colour lookup table, as ImageJ saves one: the nets
+    # are measured on the indices, its own colours come from the map (#57).
+    s = session_on(tmp_path)
+    indices = (blot() // 257).astype(np.uint8)
+    level = np.arange(256, dtype=np.uint16)
+    colormap = np.stack([level * 257, level * 128, (255 - level) * 257])  # 16-bit, as TIFF keeps it
+    data = io.BytesIO()
+    tifffile.imwrite(data, indices, photometric="palette", colormap=colormap)
+    data.seek(0)
+    image_id = ops.import_image(s, data, "fire µ.tif", kind=CHEMI, polarity=DARK)
+    np.testing.assert_array_equal(s.pixels(image_id), indices)
+    shown = s.colour_pixels(image_id)
+    assert (shown.shape, shown.dtype) == ((H, W, 3), np.uint8)
+    np.testing.assert_array_equal(shown, (colormap.T >> 8).astype(np.uint8)[indices])
+    assert s.file_colours(s.project.batch.find_image(image_id)) == "palette"
+
+
+def test_file_colours_read_the_header_once_per_image_without_the_lock(tmp_path, monkeypatch):
+    s = session_on(tmp_path)
+    gray = blot()
+    image_id = import_blot(s, np.dstack([gray, gray // 2, gray // 3]), "stain.tif")
+    image = s.project.batch.find_image(image_id)
+    reads: list[Path] = []
+
+    def counting(path: Path) -> str | None:
+        reads.append(path)
+        return imaging.file_colours(path)
+
+    monkeypatch.setattr(session_module, "file_colours", counting)
+    path = storage.image_path(s.folder, image)
+    moved = path.with_name("away.tif")
+    path.rename(moved)
+    assert s.file_colours(image) is None  # unreadable: not kept, read again next time
+    moved.rename(path)
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with s.lock:  # an operation running
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert held.wait(10)
+        assert s.file_colours(image) == "rgb"  # not waiting for the operation
+        assert s.file_colours(image) == "rgb"
+    finally:
+        release.set()
+        holder.join()
+    assert reads == [path, path]  # kept once read
 
 
 # --- lanes and the reference ---

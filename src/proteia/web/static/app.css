@@ -459,6 +459,14 @@ button:disabled {
   gap: 0.3rem;
 }
 
+/* "Original colours" while on: filled, outlined and bold, not told by a hue alone. */
+.view-tools button[aria-pressed="true"] {
+  border-color: Highlight;
+  background: var(--chosen);
+  color: CanvasText;
+  font-weight: 600;
+}
+
 .lane-picker {
   position: absolute;
   max-width: 22rem;

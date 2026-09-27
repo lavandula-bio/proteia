@@ -66,8 +66,8 @@ from pydantic import JsonValue
 
 import proteia
 from proteia.core import storage
-from proteia.core.imaging import load_image
-from proteia.core.model import IMAGE_SUFFIXES, LogEntry, Project, format_timestamp
+from proteia.core.imaging import FileColours, file_colours, load_image, read_colours
+from proteia.core.model import IMAGE_SUFFIXES, ImageRef, LogEntry, Project, format_timestamp
 
 _log = logging.getLogger(__name__)
 
@@ -250,6 +250,8 @@ class ProjectSession:
         self.save_error: Exception | None = None
         self.last_action: str | None = None
         self._pixels: dict[str, np.ndarray] = {}
+        # (image id, SHA-256) -> how its stored file holds colour (file_colours).
+        self._file_colours: dict[tuple[str, str], FileColours | None] = {}
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -321,39 +323,74 @@ class ProjectSession:
             if cached is not None:
                 return cached
             image = self._project.batch.find_image(image_id)
-            path = storage.image_path(self._folder, image)
-            if not path.is_file():
-                raise OperationError(
-                    ErrorCode.IMAGE_FILE_CHANGED,
-                    f"the stored file of image {image_id} is missing",
-                    ids=(image_id,),
-                )
-            try:
-                with path.open("rb") as f:
-                    digest = hashlib.file_digest(f, "sha256").hexdigest()
-            except OSError as exc:
-                raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
-            if digest != image.sha256:
-                raise OperationError(
-                    ErrorCode.IMAGE_FILE_CHANGED,
-                    f"the stored file of image {image_id} was changed outside Proteia",
-                    ids=(image_id,),
-                )
-            try:
-                array = load_image(path).array
-            except (ValueError, OSError) as exc:
-                raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
-            if array.shape != (image.height, image.width):
-                raise OperationError(
-                    ErrorCode.IMAGE_FILE_CHANGED,
-                    f"image {image_id} reads as {array.shape[1]}x{array.shape[0]} pixels,"
-                    f" not the recorded {image.width}x{image.height}",
-                    ids=(image_id,),
-                )
+            array = self._read_checked(image, lambda path: load_image(path).array)
             array.flags.writeable = False
             if keep:
                 self._pixels[image_id] = array
             return array
+
+    def colour_pixels(self, image_id: str) -> np.ndarray:
+        """The image's stored file in its own colours, for display only (2-D gray,
+        or 3-D with the channels last: :func:`~proteia.core.imaging.read_colours`).
+        Read and checked as :meth:`pixels` reads the analysis array, with the
+        same errors; never cached. Analysis never uses them."""
+        with self.lock:
+            image = self._project.batch.find_image(image_id)
+            return self._read_checked(image, read_colours)
+
+    def file_colours(self, image: ImageRef) -> FileColours | None:
+        """How the image's stored file holds colour
+        (:func:`~proteia.core.imaging.file_colours`), read from its header once
+        per image record (id and SHA-256); None while the file cannot be read,
+        and the next call reads it again. Never waits for the lock, so a state
+        is drawn while an operation runs: Proteia writes a stored file once, on
+        import, and never changes it (a file changed outside Proteia is refused
+        when its pixels are read)."""
+        key = (image.id, image.sha256)
+        if key in self._file_colours:
+            return self._file_colours[key]
+        try:
+            colours = file_colours(storage.image_path(self._folder, image))
+        except (ValueError, OSError):
+            return None
+        self._file_colours[key] = colours
+        return colours
+
+    def _read_checked(self, image: ImageRef, read: Callable[[Path], np.ndarray]) -> np.ndarray:
+        """``read`` of the image's stored file, once the file's bytes match the
+        recorded SHA-256; its first two dimensions must be the recorded height
+        and width. Called with the lock held."""
+        image_id = image.id
+        path = storage.image_path(self._folder, image)
+        if not path.is_file():
+            raise OperationError(
+                ErrorCode.IMAGE_FILE_CHANGED,
+                f"the stored file of image {image_id} is missing",
+                ids=(image_id,),
+            )
+        try:
+            with path.open("rb") as f:
+                digest = hashlib.file_digest(f, "sha256").hexdigest()
+        except OSError as exc:
+            raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
+        if digest != image.sha256:
+            raise OperationError(
+                ErrorCode.IMAGE_FILE_CHANGED,
+                f"the stored file of image {image_id} was changed outside Proteia",
+                ids=(image_id,),
+            )
+        try:
+            pixels = read(path)
+        except (ValueError, OSError) as exc:
+            raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
+        if pixels.shape[:2] != (image.height, image.width):
+            raise OperationError(
+                ErrorCode.IMAGE_FILE_CHANGED,
+                f"image {image_id} reads as {pixels.shape[1]}x{pixels.shape[0]} pixels,"
+                f" not the recorded {image.width}x{image.height}",
+                ids=(image_id,),
+            )
+        return pixels
 
     def save(self) -> Path:
         """Write ``project.json`` now and return its path; then delete the orphans

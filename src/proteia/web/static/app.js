@@ -103,14 +103,19 @@ const state = {
   imageId: null,
   proteinId: null, // the protein a click on the image places a box of
   boxId: null,
-  bitmaps: new Map(), // image id -> Promise of its preview's ImageBitmap
+  // image id -> {grey, original}: Promises of its previews' ImageBitmaps, each
+  // fetched when first shown
+  bitmaps: new Map(),
   shownImageId: null, // the image the view shows (null while a preview loads)
+  // The images shown in their original colours ("Original colours" on): kept
+  // for this page only, never in the project.
+  originalColours: new Set(),
 };
 
 function forgetBitmap(imageId) {
-  const pending = state.bitmaps.get(imageId);
+  const previews = state.bitmaps.get(imageId);
   state.bitmaps.delete(imageId);
-  if (pending) {
+  for (const pending of Object.values(previews || {})) {
     pending.then((bitmap) => bitmap.close()).catch(() => {});
   }
 }
@@ -444,6 +449,7 @@ async function openProject(path, name, json) {
     for (const id of [...state.bitmaps.keys()]) {
       forgetBitmap(id);
     }
+    state.originalColours.clear();
     proteinPanel.forgetTyped();
     laneTable.forgetTyped();
     charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
@@ -567,6 +573,7 @@ function render() {
   renderBox(project);
   renderNotices(project);
   renderHint(project, image);
+  renderColours(image);
   renderView(project);
   laneTable.render(project, state.results);
   charts.render(state.results);
@@ -776,20 +783,70 @@ function renderHint(project, image) {
   }
 }
 
+// The preview of each colours: the grey analysis image, or the stored file's
+// original colours (the server answers the grey one for a file without colour).
+const PREVIEW_QUERY = { grey: "", original: "?colour=original" };
+
 // One fetch per preview, shared by every render that waits for it.
-function bitmapOf(imageId) {
+function bitmapOf(imageId, colours) {
   if (!state.bitmaps.has(imageId)) {
-    const pending = request("GET", `/api/images/${imageId}/preview`)
+    state.bitmaps.set(imageId, {});
+  }
+  const previews = state.bitmaps.get(imageId);
+  if (!previews[colours]) {
+    const pending = request("GET", `/api/images/${imageId}/preview${PREVIEW_QUERY[colours]}`)
       .then((response) => response.blob())
       .then((blob) => createImageBitmap(blob));
     pending.catch(() => {
-      if (state.bitmaps.get(imageId) === pending) {
-        state.bitmaps.delete(imageId); // the next render tries again
+      if (previews[colours] === pending) {
+        delete previews[colours]; // the next render tries again
       }
     });
-    state.bitmaps.set(imageId, pending);
+    previews[colours] = pending;
   }
-  return state.bitmaps.get(imageId);
+  return previews[colours];
+}
+
+// The colours the view shows `image` in: "original" while its "Original
+// colours" is on (offered only for a file with colour), else "grey".
+function coloursOf(image) {
+  return image.colour && state.originalColours.has(image.id) ? "original" : "grey";
+}
+
+function renderColours(image) {
+  const button = $("original-colours");
+  button.hidden = !image || !image.colour;
+  button.setAttribute("aria-pressed", String(Boolean(image) && coloursOf(image) === "original"));
+}
+
+// The image whose colours were just switched: the view says which it shows
+// once it shows them (for a screen reader: the switch may be the C key).
+let switchedColours = null;
+
+// "Original colours" (the button, or C): the chosen image in the stored file's
+// own colours, or back to the grey analysis image. The view keeps its zoom.
+function toggleColours() {
+  const project = state.project;
+  const image = project && project.images.find((i) => i.id === state.imageId);
+  if (!image || !image.colour || $("workspace").hidden) {
+    return;
+  }
+  if (!state.originalColours.delete(image.id)) {
+    state.originalColours.add(image.id);
+  }
+  switchedColours = image.id;
+  renderColours(image);
+  renderView(project);
+}
+
+$("original-colours").addEventListener("click", () => toggleColours());
+
+function sayColours(image, colours) {
+  const name = isolate(image.original_name);
+  $("view-colours-state").textContent =
+    colours === "original"
+      ? `${name} in its original colours, for display only`
+      : `${name} as the grey analysis image, which the nets are measured on`;
 }
 
 let renderGeneration = 0;
@@ -848,16 +905,47 @@ function renderView(project) {
       });
     }
   }
-  bitmapOf(image.id)
+  const colours = coloursOf(image);
+  if (state.shownImageId === image.id) {
+    // Shown already: its boxes are drawn now, over the bitmap shown, not once the
+    // preview in these colours has loaded (both cover the same pixels), so the
+    // view never shows, nor takes a click on, a box the server no longer has.
+    view.setOverlay(boxes, ghosts, state.boxId, marks);
+  }
+  bitmapOf(image.id, colours)
     .then((bitmap) => {
       if (generation !== renderGeneration) {
         return; // a later render owns the view
       }
-      view.setImage(bitmap, image.width, image.height);
-      state.shownImageId = image.id;
-      view.setOverlay(boxes, ghosts, state.boxId, marks);
+      if (state.shownImageId === image.id) {
+        view.setBitmap(bitmap); // this image, maybe in other colours: the zoom stays
+      } else {
+        view.setImage(bitmap, image.width, image.height);
+        view.setOverlay(boxes, ghosts, state.boxId, marks);
+        state.shownImageId = image.id;
+      }
+      const switched = switchedColours === image.id;
+      switchedColours = null;
+      if (switched) {
+        sayColours(image, colours);
+      }
     })
-    .catch(report);
+    .catch((error) => {
+      if (colours !== "original" || generation !== renderGeneration) {
+        report(error);
+        return;
+      }
+      // Not shown in its colours (its file changed outside Proteia, say): the
+      // switch goes back off, and the grey analysis image is shown.
+      state.originalColours.delete(image.id);
+      switchedColours = null;
+      renderColours(image);
+      renderView(state.project);
+      if (!(error instanceof ApiError && error.status === 401)) {
+        const name = isolate(image.original_name);
+        showStatus(`${name} not shown in its original colours: ${sentence(error.message)}`);
+      }
+    });
 }
 
 // --- Edits ---
@@ -1825,6 +1913,8 @@ document.addEventListener("keydown", (event) => {
     view.zoomCentre(1.25);
   } else if (event.key === "-") {
     view.zoomCentre(0.8);
+  } else if (event.key === "c" || event.key === "C") {
+    toggleColours();
   }
 });
 

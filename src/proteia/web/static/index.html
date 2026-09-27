@@ -157,7 +157,14 @@
     <section class="stage">
       <canvas id="view" class="view"></canvas>
       <p id="view-hint" class="view-hint" hidden></p>
+      <!-- Says which colours the view shows once "Original colours" is switched (app.js). -->
+      <p id="view-colours-state" class="sr-only" role="status"></p>
       <div class="view-tools">
+        <!-- Only for an image whose stored file has colour (app.js renderColours); remembered
+          per image in this page, never in the project. -->
+        <button id="original-colours" type="button" aria-pressed="false" aria-keyshortcuts="C" hidden
+          title="Show the image in the original file's colours (C). For display only: the nets are always measured on the grey analysis image.">Original
+          colours</button>
         <button id="zoom-in" type="button" title="Zoom in (+)">+</button>
         <button id="zoom-out" type="button" title="Zoom out (−)">−</button>
         <button id="zoom-fit" type="button" title="Fit to window (F)">Fit</button>
