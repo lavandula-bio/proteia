@@ -497,6 +497,23 @@ def test_without_a_state_folder_the_notice_is_never_offered(serve):
     )
 
 
+def test_a_dismissal_that_cannot_be_written_names_no_path(serve, monkeypatch, tmp_path):
+    # The page shows the answer's message: a folder that cannot be written is
+    # said without the per-user path.
+    client = serve(Check(SYNCED))
+    where = str(tmp_path / "state µ" / ".notices.json.tmp")
+
+    def refuse(folder, notice):
+        raise PermissionError(13, "Permission denied", where)
+
+    monkeypatch.setattr(cloudsync, "dismiss", refuse)
+    status, answer = client.call("POST", "/api/notices/cloud_sync/dismiss")
+    assert status == 500
+    assert answer["message"] == "the notice could not be dismissed: Permission denied"
+    assert str(tmp_path) not in json.dumps(answer)
+    assert client.ok("GET", "/api/notices")["cloud_sync"] is not None  # not dismissed
+
+
 def test_the_check_and_the_dismissal_are_logged_by_label(serve, caplog):
     client = serve(Check(SYNCED))
     with caplog.at_level(logging.INFO, logger=api.__name__):

@@ -1995,8 +1995,12 @@ def get_notices(workspace: WorkspaceDep) -> dict[str, Any]:
 @router.post("/notices/cloud_sync/dismiss", status_code=204)
 def dismiss_cloud_sync(workspace: WorkspaceDep) -> Response:
     """Dismiss the ``cloud_sync`` notice for good: recorded in the per-user
-    state folder (:func:`~proteia.web.cloudsync.dismiss`), never in a project."""
-    cloudsync.dismiss(workspace.state_folder(), cloudsync.CLOUD_SYNC)
+    state folder (:func:`~proteia.web.cloudsync.dismiss`), never in a project.
+    A folder that cannot be written is answered as a file error naming no path."""
+    try:
+        cloudsync.dismiss(workspace.state_folder(), cloudsync.CLOUD_SYNC)
+    except OSError as exc:  # the page shows the message: no path
+        raise OSError(f"the notice could not be dismissed: {_reason(exc)}") from exc
     _log.info("the notice that the projects folder is synced to the cloud was dismissed for good")
     return Response(status_code=204)
 
