@@ -122,7 +122,12 @@ def test_the_payload_is_a_translation_of_one_result_set():
     results = _results()
     payload = strict(results_payload(results, open_id=3, revision=12))
     assert payload["open_id"] == 3 and payload["revision"] == 12
-    assert payload["settings"] == {"error_type": "SD", "plot_conditions": None, "method": "mean"}
+    assert payload["settings"] == {
+        "error_type": "SD",
+        "plot_conditions": None,
+        "method": "mean",
+        "statistics": {"family": "auto", "comparisons": "auto", "scale": "auto"},
+    }
     assert payload["reference_condition"] is None
     assert payload["lanes"] == [
         {"index": i, "condition": condition, "sample": None, "included": True}
@@ -313,12 +318,14 @@ def test_the_settings_are_those_the_results_used():
         plot_conditions=["10 µM", " vehicle"],  # one respelled, and not in lane order
         error_type="SEM",
         method="representative",
+        statistics={"family": "welch"},
     )
     payload = strict(results_payload(results, open_id=1, revision=1))
     assert payload["settings"] == {
         "error_type": "SEM",
         "plot_conditions": ["vehicle", "10 µM"],  # the stored labels, in lane order
         "method": "representative",
+        "statistics": {"family": "welch", "comparisons": "auto", "scale": "auto"},
     }
 
 
@@ -352,3 +359,19 @@ def test_notices_keep_their_objects():
             "conditions": [],
         }
     ]
+
+
+def test_each_chart_carries_its_statement_coverage_and_test():
+    results = compute_results(make_project_with_undetected().batch)
+    payload = strict(results_payload(results, open_id=1, revision=1))
+    for one_set, computed in zip(payload["sets"], (results, results.all_lanes), strict=True):
+        for series, model in zip(one_set["series"], computed.series, strict=True):
+            chart = series["chart"]
+            if model.chart is None:
+                assert chart is None
+                continue
+            assert chart["statement"] == model.chart.statement
+            assert [c["label"] for c in chart["coverage"]] == [b["label"] for b in chart["bars"]]
+            assert (chart["test"] is None) == (model.chart.test is None)
+            for bar in chart["bars"]:  # a slot with no bar has null, never NaN
+                assert (bar["mean"] is None) == (bar["error"] is None)

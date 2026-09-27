@@ -26,7 +26,7 @@ from conftest import FakeClock, make_project, make_project_with_clashing_names, 
 from proteia import viz
 from proteia.core import operations as ops
 from proteia.core import record, storage
-from proteia.core.analyze import compare, describe
+from proteia.core.analyze import StatisticsSetting, compare, describe
 from proteia.core.export import (
     BUNDLE_README_FILE,
     BUNDLE_RECORD_FILE,
@@ -287,24 +287,30 @@ def test_the_charts_are_the_screens_drawings_of_each_set(tmp_path):
         assert b"CreationDate" not in pdf  # the same bytes for the same chart
 
 
+def _test(groups):
+    return compare(groups, StatisticsSetting(), ratio=True, reference="vehicle")
+
+
 def test_a_chart_states_its_error_bars():
     groups = {"vehicle": [1.0, 1.1, 0.9], "10 µM": [2.0, 2.2, 1.9]}
     for error_type in ErrorType:
         spec = build_plotspec(
             groups,
             describe(groups),
-            compare(groups),
+            _test(groups),
             value_kind=ValueKind.FOLD_CHANGE,
             error_type=error_type,
             title="β-catenin / α-tubulin",
         )
-        assert render_figure(spec).axes[0].get_xlabel() == f"Bars: mean ± {error_type.value}"
+        [key] = render_figure(spec).legends  # the key under the axes
+        assert key.get_texts()[0].get_text() == f"Mean ± {error_type.value}"
+        assert spec.statement[0] == f"Bars: mean ± {error_type.value}; points: replicates"
 
 
 def test_a_png_and_a_pdf_are_the_same_bytes_every_time():
     groups = {"vehicle": [1.0, 1.1, 0.9], "10 µM": [2.0, 2.2, 1.9]}
     spec = build_plotspec(
-        groups, describe(groups), compare(groups), value_kind=ValueKind.FOLD_CHANGE, title="β"
+        groups, describe(groups), _test(groups), value_kind=ValueKind.FOLD_CHANGE, title="β"
     )
     assert render_png(spec, dpi=72) == render_png(spec, dpi=72) != render_png(spec, dpi=150)
     assert render_pdf(spec) == render_pdf(spec)
@@ -318,7 +324,7 @@ def test_a_pdf_embeds_truetype_fonts():
     # journals and vector editors refuse.
     groups = {"vehicle": [1.0, 1.1, 0.9], "10 µM": [2.0, 2.2, 1.9]}
     spec = build_plotspec(
-        groups, describe(groups), compare(groups), value_kind=ValueKind.FOLD_CHANGE, title="β"
+        groups, describe(groups), _test(groups), value_kind=ValueKind.FOLD_CHANGE, title="β"
     )
     pdf = render_pdf(spec)
     assert b"/FontFile2" in pdf
@@ -352,6 +358,7 @@ def test_the_record_is_the_projects_current_record_and_lists_every_file(tmp_path
         "error_type": "SD",
         "plot_conditions": None,
         "excluded_lanes": [3],
+        "statistics": record.results_statistics(ops.compute(s)),
     }
     assert doc["settings"]["lane_table_ratio_decimals"] == LANE_TABLE_RATIO_DECIMALS
     assert doc["settings"]["lane_table_first_lane"] == 1
@@ -367,15 +374,16 @@ def test_the_export_uses_the_compute_settings_given(tmp_path):
         s, formats=["svg"], error_type="SEM", method="representative", plot_conditions=["vehicle"]
     )
     doc = json.loads((bundle.folder / BUNDLE_RECORD_FILE).read_bytes())
+    res = ops.compute(
+        s, error_type=ErrorType.SEM, method="representative", plot_conditions=["vehicle"]
+    )
     assert doc["results"] == {
         "method": "representative",
         "error_type": "SEM",
         "plot_conditions": ["vehicle"],
         "excluded_lanes": [3],
+        "statistics": record.results_statistics(res),
     }
-    res = ops.compute(
-        s, error_type=ErrorType.SEM, method="representative", plot_conditions=["vehicle"]
-    )
     svg = (bundle.folder / f"chart {SERIES} ({APPLIED}).svg").read_bytes()
     assert svg == render_svg(res.series[0].chart)
     # The README states the settings the charts were drawn with.
@@ -418,6 +426,191 @@ def test_the_readme_names_every_file(tmp_path):
     ):
         assert words in joined, words
     assert "SEM" not in joined and "represented by one lane" not in joined
+
+
+# --- #52: statistics, legends and replicates not detected ---
+
+
+def _readme_lines(bundle: ops.ExportBundle) -> list[str]:
+    return (bundle.folder / BUNDLE_README_FILE).read_text(encoding="utf-8").splitlines()
+
+
+def test_the_readme_states_how_the_charts_were_tested(tmp_path):
+    s = open_sample(tmp_path)
+    bundle = ops.export_bundle(s)
+    text = readme_text(bundle)
+    for words in (
+        "each chart's test was chosen automatically from the design",
+        "never from the shape of the values",
+        # A ratio with a value of 0 or below has no log: its chart says so.
+        "Ratios (normalized values and fold changes) are tested on log values (natural log),"
+        " or on linear values when a tested value is 0 or below, which the chart's legend"
+        " then says",
+        "with equal n per condition, Student's t-test for two conditions, Dunnett's test"
+        " of each condition against the reference for three or more when the reference"
+        " is tested, and One-way ANOVA + Tukey-Kramer otherwise",
+        "with unequal n, Welch's t-test for two conditions, Welch's t-tests (Holm) of each"
+        " condition against the reference",
+        "Every test is two-sided at alpha 0.05",
+        "with no correction across charts",
+        "* p < 0.05, ** p < 0.01, *** p < 0.001",
+        "Each chart's legend states its test with its p-value (for comparisons with the"
+        " reference, each one's)",
+        f"{BUNDLE_RECORD_FILE} pins what each chart's test resolved to and every p-value it"
+        " gave, unrounded",
+    ):
+        assert words in text, words
+    assert "not detected" not in text  # no replicate of this project was
+    assert "Mann-Whitney" not in text  # the rule never picks a rank test
+
+
+@pytest.mark.parametrize(
+    ("setting", "present", "absent"),
+    [
+        (
+            {"scale": "linear"},
+            [
+                "the test setting was family auto, comparisons auto, scale linear; the fields"
+                " left auto were resolved from the design",
+                "Values are tested on linear values.",
+            ],
+            ["log values"],
+        ),
+        (
+            {"scale": "log"},
+            [
+                "Values are tested on log values (natural log); a chart with a tested value"
+                " of 0 or below has no test, and its legend says why."
+            ],
+            ["linear values"],
+        ),
+        (
+            {"family": "rank"},
+            [
+                "The tests (rank): Mann-Whitney U test for two conditions, Dunn's test (Holm)"
+                " of each condition against the reference for three or more when the"
+                " reference is tested, and Kruskal-Wallis + Dunn's test (Holm) otherwise.",
+                "Rank tests compare the order of the values, which no scale changes.",
+                "The Mann-Whitney U test is exact; with tied values and more than 20,000 ways"
+                " to arrange them, it is the normal approximation with the tie correction",
+                "The Kruskal-Wallis p is the chi-square approximation.",
+            ],
+            ["Student's", "Dunnett", "Welch", "log values", "linear values"],
+        ),
+        (
+            {"family": "welch", "comparisons": "all_pairs"},
+            [
+                "The tests (welch): Welch's t-test for two conditions and Welch's ANOVA +"
+                " Games-Howell for three or more."
+            ],
+            ["Student's", "Dunnett", "Holm", "Mann-Whitney"],
+        ),
+        (
+            {"family": "pooled", "comparisons": "vs_reference", "scale": "linear"},
+            [
+                "the test setting was family pooled, comparisons vs_reference, scale linear.",
+                "The tests (pooled): Student's t-test for two conditions and Dunnett's test"
+                " of each condition against the reference for three or more.",
+                "A chart whose reference is not tested has no test, and its legend says why.",
+            ],
+            ["Tukey", "Welch", "left auto", "log values"],
+        ),
+    ],
+)
+def test_the_readme_describes_the_statistics_setting_given(tmp_path, setting, present, absent):
+    s = open_sample(tmp_path)
+    text = readme_text(ops.export_bundle(s, formats=["svg"], statistics=setting))
+    for words in present:
+        assert words in text, words
+    for words in absent:
+        assert words not in text, words
+
+
+def test_the_readme_gives_each_charts_legend_as_its_caption(tmp_path):
+    s = open_sample(tmp_path)
+    bundle = ops.export_bundle(s)
+    lines = _readme_lines(bundle)
+    res = ops.compute(s)
+    legends = [*lines[lines.index("Legends") :], ""]  # the file ends with its last caption
+    for label, one in ((APPLIED, res), (ALL, res.all_lanes)):
+        stem = f"chart {SERIES} ({label})"
+        at = legends.index(stem)
+        end = legends.index("", at)  # the caption is one paragraph, indented under its chart
+        caption = " ".join(line.strip() for line in legends[at + 1 : end])
+        assert all(line.startswith("    ") for line in legends[at + 1 : end])
+        assert caption == " ".join(f"{line}." for line in one.series[0].chart.statement)
+    text = readme_text(bundle)
+    assert "The images draw a key of their marks, not the legend" in text
+
+
+def test_the_statement_can_be_drawn_under_each_chart(tmp_path):
+    s = open_sample(tmp_path)
+    bundle = ops.export_bundle(s, formats=["svg", "pdf"], statement_in_charts=True)
+    res = ops.compute(s)
+    for label, one in ((APPLIED, res), (ALL, res.all_lanes)):
+        stem = f"chart {SERIES} ({label})"
+        chart = one.series[0].chart
+        assert (bundle.folder / f"{stem}.svg").read_bytes() == render_svg(chart, statement=True)
+        assert (bundle.folder / f"{stem}.pdf").read_bytes() == render_pdf(chart, statement=True)
+    assert "Each image also draws its legend under the chart" in readme_text(bundle)
+
+
+def test_the_export_uses_the_statistics_setting_given(tmp_path):
+    s = open_sample(tmp_path)
+    bundle = ops.export_bundle(s, formats=["svg"], statistics={"family": "none"})
+    doc = json.loads((bundle.folder / BUNDLE_RECORD_FILE).read_bytes())
+    assert doc["results"]["statistics"]["setting"] == {
+        "family": "none",
+        "comparisons": "auto",
+        "scale": "auto",
+    }
+    res = ops.compute(s, statistics={"family": "none"})
+    assert res.statistics == StatisticsSetting(family="none")
+    svg = (bundle.folder / f"chart {SERIES} ({APPLIED}).svg").read_bytes()
+    assert svg == render_svg(res.series[0].chart)
+    text = readme_text(bundle)
+    assert "Statistics: none were computed (the test family was set to none)" in text
+    assert "No test: statistics are turned off." in text
+
+
+def test_an_unknown_statistics_setting_is_refused(tmp_path):
+    s = open_sample(tmp_path)
+    for bad in ({"family": "anova"}, {"tests": "all"}):
+        with pytest.raises(OperationError) as refused:
+            ops.export_bundle(s, statistics=bad)
+        assert refused.value.code is ErrorCode.INVALID_INPUT
+        with pytest.raises(OperationError):
+            ops.compute(s, statistics=bad)
+    assert exports(s) == []
+
+
+def test_the_readme_explains_replicates_not_detected(tmp_path):
+    def undetected(draft: Project) -> None:
+        from proteia.core.model import ProposalSource, Region, UndetectedBand, UndetectedReason
+
+        beta = draft.batch.find_protein("prot-7")
+        beta.bands = [b for b in beta.bands if b.lane_index != 3]
+        beta.undetected.append(
+            UndetectedBand(
+                lane_index=2,
+                band_index=0,
+                reason=UndetectedReason.BELOW_DETECTION_LIMIT,
+                snr=1.25,
+                threshold=6.0,
+                region=Region(x0=20, y0=30, x1=30, y1=60),
+                source=ProposalSource.ROW_BOX,
+            )
+        )
+
+    s = open_sample(tmp_path, project=apply_change(make_project(), undetected)[0])
+    bundle = ops.export_bundle(s, formats=["svg"])
+    text = readme_text(bundle)
+    assert (
+        "A condition with a replicate not detected (below the detection limit) keeps its place"
+        " with no bar" in text
+    )
+    svg = (bundle.folder / f"chart {SERIES} ({APPLIED}).svg").read_bytes().decode()
+    assert 'id="nd-1-0"' in svg  # the open circle of lane 3
 
 
 # --- Folders ---

@@ -9,8 +9,9 @@
 // no card awaits any more is cancelled). An image stays in place, dimmed,
 // until the one that replaces it has loaded. With two result sets (excluded
 // lanes hold values, #71) each card shows both charts side by side, each
-// labelled with its set. Under each chart: its test, what the bars and dots
-// are, the set's notices about the series, and its values in a table. A
+// labelled with its set. Under each chart: its legend (the chart's statement:
+// what the marks are, its test or why there is none, the conditions it leaves
+// out), the set's notices about the series, and its values in a table. A
 // series with no chart says why. In the dock a chart is as large as the dock
 // allows, often too small to read the text drawn in it: a card's header counts
 // its warnings, and Enlarge (or a click on a chart) shows the card in a
@@ -27,53 +28,47 @@ const NO_CHART = new Set([
   "loading_control_ambiguous",
 ]);
 
-// The tests the core runs, named as a caption names them; `pairs`: the test the
-// brackets come from, when it is another.
-const TESTS = {
-  welch_t: { name: "Welch t-test" },
-  anova_oneway: { name: "One-way ANOVA", pairs: "Tukey HSD" },
-  tukey_hsd: { name: "Tukey HSD" },
-  dunnett: { name: "Dunnett" },
-};
-
-// A p-value to three significant digits, as the chart writes it; a tiny one as a bound.
-function pText(p) {
-  return p < 0.0001 ? "p < 0.0001" : `p = ${Number(p.toPrecision(3))}`;
-}
-
-// The chart's test, then why it has none or which bars it leaves out; `pairs`
-// comes before the test its brackets come from, when that is another.
-function testLines(chart, pairs = " · ") {
-  const lines = [];
-  if (chart.test_name && chart.test_p !== null) {
-    const test = TESTS[chart.test_name] || { name: chart.test_name.replaceAll("_", " ") };
-    const also = test.pairs ? `${pairs}pairs: ${test.pairs}` : "";
-    lines.push(`${test.name}: ${pText(chart.test_p)}${also}`);
-  }
-  if (chart.test_note) {
-    lines.push(sentence(chart.test_note));
-  }
-  return lines.length ? lines : ["No test."];
-}
-
-// A bar's error as written, or null: one sample has no SD (nor SEM), though
-// the core stores 0 for it.
+// A bar's error as written, or null: a condition with no bar has none, and
+// one sample has no SD (nor SEM), though the core stores 0 for it.
 function errorText(bar) {
-  return bar.n > 1 ? ratioText(bar.error) : null;
+  return bar.mean !== null && bar.n > 1 ? ratioText(bar.error) : null;
 }
 
-// What the image shows, in words: each bar's mean ± error and n, and the
-// test, each line of it a sentence.
+// Why a condition draws no bar: replicates not detected, or no value at all.
+function noBarText(chart, bar, i) {
+  const undetected = bar.not_detected_lanes.length;
+  if (!undetected) {
+    return "no value";
+  }
+  const cover = chart.coverage[i];
+  const replicates = cover ? cover.replicates : bar.n + undetected;
+  return `${undetected} of ${replicates} not detected`;
+}
+
+// What the image shows, in words: each bar's mean ± error and n, or why a
+// condition has none, then the chart's legend, each line of it a sentence.
 function altText(title, label, chart) {
-  const bars = chart.bars.map((bar) => {
+  const bars = chart.bars.map((bar, i) => {
+    if (bar.mean === null) {
+      return `${bar.label} no bar (${noBarText(chart, bar, i)})`;
+    }
     const error = errorText(bar);
     const n = `n=${bar.n}${error === null ? `, no ${chart.error_type}` : ""}`;
     return `${bar.label} ${ratioText(bar.mean)}${error === null ? "" : ` ± ${error}`} (${n})`;
   });
   const set = label ? ` (${label})` : "";
-  const test = testLines(chart, "; ").map(sentence).join(" ");
-  const what = `${title}${set}, ${chart.y_label}, mean ± ${chart.error_type}`;
-  return `${what}: ${bars.join(", ")}. ${test}`;
+  const legend = chart.statement.map(sentence).join(" ");
+  return `${title}${set}, ${chart.y_label}: ${bars.join(", ")}. ${legend}`;
+}
+
+// A bar's replicates in lane order, as [lane, text]: each value, and "n.d."
+// for each replicate not detected.
+function replicateCells(bar) {
+  const rows = bar.points.map((value, j) => [bar.lane_indices[j], ratioText(value)]);
+  for (const lane of bar.not_detected_lanes) {
+    rows.push([lane, "n.d."]);
+  }
+  return rows.sort((a, b) => a[0] - b[0]);
 }
 
 function cell(tag, text, className = "") {
@@ -85,7 +80,9 @@ function cell(tag, text, className = "") {
   return element;
 }
 
-// The chart's values: per bar its n, mean, error, samples and their lanes (1-based).
+// The chart's values: per bar its n, mean, error, samples and their lanes
+// (1-based); a replicate not detected is "n.d.", and a condition with no bar
+// has no mean.
 function valuesTable(chart) {
   const table = document.createElement("table");
   table.className = "chart-table";
@@ -106,53 +103,91 @@ function valuesTable(chart) {
   const thead = document.createElement("thead");
   thead.append(head);
   const body = document.createElement("tbody");
-  for (const bar of chart.bars) {
+  chart.bars.forEach((bar, i) => {
     const row = document.createElement("tr");
     const name = cell("th", bar.label, "label");
     name.scope = "row";
     const error = errorText(bar);
     const spread = cell("td", error === null ? "—" : error);
-    if (error === null) {
+    const mean = cell("td", bar.mean === null ? "—" : ratioText(bar.mean));
+    if (bar.mean === null) {
+      mean.title = `No bar: ${noBarText(chart, bar, i)}`;
+      spread.title = mean.title;
+    } else if (error === null) {
       spread.title = `One sample: no ${chart.error_type}`;
     }
+    const undetected = bar.not_detected_lanes.length;
+    const cover = chart.coverage[i];
+    const n = undetected
+      ? `${cover ? cover.replicates : bar.n + undetected} (${undetected} n.d.)`
+      : String(bar.n);
+    const cells = replicateCells(bar);
     row.append(
       name,
-      cell("td", String(bar.n)),
-      cell("td", ratioText(bar.mean)),
+      cell("td", n),
+      mean,
       spread,
-      cell("td", bar.points.map(ratioText).join(", "), "label samples"),
-      cell("td", bar.lane_indices.map((i) => i + 1).join(", ")),
+      cell("td", cells.map(([, text]) => text).join(", "), "label samples"),
+      cell("td", cells.map(([lane]) => (lane === undefined ? "" : lane + 1)).join(", ")),
     );
     body.append(row);
-  }
+  });
   table.append(thead, body);
   return table;
 }
 
 const noticeKey = (notice) => `${notice.code}\n${notice.protein_ids.join("\n")}`;
 
+// The notices about one set only: its excluded reference lanes, and its charts'
+// tests (each set tests its own charts, and keeps these notices even when the
+// other set has the same).
+const OWN_SET = new Set([
+  "reference_all_excluded",
+  "conditions_not_tested",
+  "test_not_applicable",
+  "log_scale_unavailable",
+  "rank_test_cannot_reach_alpha",
+]);
+
 // The notices that apply to each set, by set id. The all-lanes set carries
 // only those the applied set lacks: of the applied set's, those apply to it as
 // well, but for one it has its own of the same kind about the same proteins (a
-// clipped notice over more lanes), and the one about excluded reference lanes
-// (it excludes none).
+// clipped notice over more lanes), and those about the applied set only.
 function setNotices(sets) {
   const [applied, every] = sets;
   const notices = new Map([[applied.id, applied.notices]]);
   if (every) {
     const own = new Set(every.notices.map(noticeKey));
-    const shared = applied.notices.filter(
-      (n) => n.code !== "reference_all_excluded" && !own.has(noticeKey(n)),
-    );
+    const shared = applied.notices.filter((n) => !OWN_SET.has(n.code) && !own.has(noticeKey(n)));
     notices.set(every.id, [...every.notices, ...shared]);
   }
   return notices;
 }
 
+// The notices about one series (its test, its values), not about each of its
+// proteins: their protein ids are its target and its loading control, in that
+// order (the core's SERIES_NOTICE_CODES).
+const ONE_SERIES = new Set([
+  "reference_unusable",
+  "loading_not_positive",
+  "no_values",
+  "no_plotted_values",
+  "conditions_not_tested",
+  "test_not_applicable",
+  "log_scale_unavailable",
+  "rank_test_cannot_reach_alpha",
+]);
+
+// Whether a notice is about a series: one about a series, only its own (not
+// that of another target over the same loading control); one about proteins,
+// if it names either of the series' (a loading control's over-exposure is
+// about every target normalized to it).
 function aboutSeries(notice, series) {
-  return (
-    notice.protein_ids.includes(series.target_id) || notice.protein_ids.includes(series.loading_id)
-  );
+  const ids = notice.protein_ids;
+  if (ONE_SERIES.has(notice.code)) {
+    return ids[0] === series.target_id && ids[1] === series.loading_id;
+  }
+  return ids.includes(series.target_id) || ids.includes(series.loading_id);
 }
 
 // Why a series has no chart: its own notice that says so, else the set's.
@@ -434,7 +469,7 @@ export class ChartCards {
     const table = document.createElement("div");
     table.className = "chart-table-scroll";
     details.append(summary, table);
-    caption.append(test, bars, notes, details);
+    caption.append(bars, test, notes, details); // the legend: its marks line first
     figure.append(label, frame, caption);
     return {
       figure,
@@ -464,10 +499,13 @@ export class ChartCards {
       this.fillMissing(slot, text, series ? captionNotices(notices, series, null, reason) : []);
       return;
     }
-    slot.test.replaceChildren(...testLines(chart).map((line) => cell("p", line)));
-    slot.test.hidden = false;
-    slot.bars.textContent = `mean ± ${chart.error_type}; dots are samples`;
-    slot.bars.hidden = false;
+    // The legend, in its order: what the marks are, then the test (or why
+    // there is none) and the conditions it leaves out.
+    const [marks = "", ...statistics] = chart.statement;
+    slot.bars.textContent = marks ? sentence(marks) : "";
+    slot.bars.hidden = !marks;
+    slot.test.replaceChildren(...statistics.map((line) => cell("p", sentence(line))));
+    slot.test.hidden = !statistics.length;
     this.fillNotices(slot, captionNotices(notices, series, chart, null));
     slot.table.replaceChildren(valuesTable(chart));
     slot.details.hidden = false;

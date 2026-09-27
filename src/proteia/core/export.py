@@ -11,9 +11,11 @@ Two exports are built from these pieces (:mod:`proteia.core.operations`): the
 lane table alone (:func:`lane_table_bytes`), and the export bundle (#53), a new
 folder per export (:func:`bundle_folder_name`) with each result set's lane table
 and charts and a README (:func:`bundle_files`), next to which the operation
-writes the reproducibility record. Every file numbers lanes from 1, as the app
-does (:func:`~proteia.core.model.lane_number`); the record's content keeps the
-stored 0-based index.
+writes the reproducibility record. The README says how the charts were tested
+and gives each chart's legend as its caption; the images draw a key of their
+marks, and the legend under the chart only when asked. Every file numbers
+lanes from 1, as the app does (:func:`~proteia.core.model.lane_number`); the
+record's content keeps the stored 0-based index.
 
 A bundle's file names come from protein names and result-set labels, made safe
 for every supported file system (:func:`file_stem`, which keeps µ, α and β),
@@ -45,7 +47,17 @@ from pathlib import Path
 from typing import Final, NamedTuple
 
 import proteia
-from proteia.core.analyze import LaneNets, ReduceMethod
+from proteia.core.analyze import (
+    ALPHA,
+    MANN_WHITNEY_PERMUTATIONS,
+    LaneNets,
+    ReduceMethod,
+    StatisticsSetting,
+    TestComparisons,
+    TestFamily,
+    TestScale,
+    registered_test,
+)
 from proteia.core.model import lane_number
 from proteia.core.names import name_key
 from proteia.core.plotspec import PlotSpec, ValueKind
@@ -493,15 +505,16 @@ def _fits_anywhere(name: str) -> bool:
     return True
 
 
-def chart_bytes(spec: PlotSpec, chart_format: ChartFormat) -> bytes:
-    """``spec`` drawn as the screen draws it (:mod:`proteia.viz`), in ``chart_format``."""
+def chart_bytes(spec: PlotSpec, chart_format: ChartFormat, *, statement: bool = False) -> bytes:
+    """``spec`` drawn as the screen draws it (:mod:`proteia.viz`), in
+    ``chart_format``; with ``statement``, its legend text drawn under it."""
     from proteia import viz  # matplotlib loads only when a chart is drawn
 
     if chart_format is ChartFormat.SVG:
-        return viz.render_svg(spec)
+        return viz.render_svg(spec, statement=statement)
     if chart_format is ChartFormat.PNG:
-        return viz.render_png(spec, dpi=CHART_PNG_DPI)
-    return viz.render_pdf(spec)
+        return viz.render_png(spec, dpi=CHART_PNG_DPI, statement=statement)
+    return viz.render_pdf(spec, statement=statement)
 
 
 def bundle_files(
@@ -510,6 +523,7 @@ def bundle_files(
     formats: Sequence[ChartFormat],
     exported_at: str,
     name_fits: Callable[[str], bool] = _fits_anywhere,
+    statement_in_charts: bool = False,
 ) -> dict[str, bytes]:
     """Every file of a bundle but its record, by name, in the order to write them.
 
@@ -520,7 +534,9 @@ def bundle_files(
     (:data:`BUNDLE_RECORD_FILE`) too. With two sets, each file name carries its
     set's label, as each chart does in its subtitle: ``lane-table (All
     lanes).csv``, ``chart β-catenin ÷ α-tubulin (All lanes).svg``. A series with
-    no chart (no value, or no usable reference) has no chart file.
+    no chart (no value, or no usable reference) has no chart file. The README
+    gives each chart's legend (its statement) as its caption; with
+    ``statement_in_charts`` each image draws it under the chart too.
 
     ``name_fits`` tells whether the folder takes a file name
     (:func:`~proteia.core.storage.name_fits` for the folder's path). The
@@ -558,7 +574,7 @@ def bundle_files(
         where = f', set "{one.label}"' if one.label else ""
         for chart_format in formats:
             name = f"{stem}.{chart_format.value}"
-            files[name] = chart_bytes(chart, chart_format)
+            files[name] = chart_bytes(chart, chart_format, statement=statement_in_charts)
             about[name] = (
                 f"Chart of {series.target} / {series.loading} ({kind}){where};"
                 f" {_FORMAT_WORDS[chart_format]}."
@@ -583,6 +599,10 @@ def bundle_files(
         no_chart=no_chart,
         exported_at=exported_at,
         renamed=columns.renamed,
+        legends=[
+            (stem, chart.statement) for (_, _, chart), stem in zip(charted, stems, strict=True)
+        ],
+        statement_in_charts=statement_in_charts,
     )
     return files
 
@@ -599,6 +619,105 @@ def _paragraph(text: str, indent: str = "") -> list[str]:
     return [*lines, ""]
 
 
+_DESIGN: Final = (
+    "the design (the value kind, the replicates per condition, the reference, and"
+    " whether every tested value is above 0)"
+)
+
+
+def _tests_of(family: TestFamily, comparisons: TestComparisons) -> str:
+    """The registered tests of ``family`` that ``comparisons`` can run, by the
+    number of conditions, in the names the charts' legends use."""
+    two = registered_test(family, TestComparisons.ALL_PAIRS, 2).name
+    pairs = registered_test(family, TestComparisons.ALL_PAIRS, 3).name
+    each = (
+        f"{registered_test(family, TestComparisons.VS_REFERENCE, 3).name} of each"
+        " condition against the reference"
+    )
+    if comparisons is TestComparisons.ALL_PAIRS:
+        return f"{two} for two conditions and {pairs} for three or more"
+    if comparisons is TestComparisons.VS_REFERENCE:
+        return f"{two} for two conditions and {each} for three or more"
+    return (
+        f"{two} for two conditions, {each} for three or more when the reference is"
+        f" tested, and {pairs} otherwise"
+    )
+
+
+def _statistics_text(setting: StatisticsSetting) -> str:
+    """How a bundle's charts were tested, for its README: the setting, and for
+    each field left ``auto`` the rule that resolved it, naming the tests as the
+    charts' legends do (:data:`~proteia.core.analyze.TESTS`)."""
+    if setting.family is TestFamily.NONE:
+        return "Statistics: none were computed (the test family was set to none)."
+    fields = setting.model_dump(mode="json")
+    listed = ", ".join(f"{name} {value}" for name, value in fields.items())
+    if all(value == "auto" for value in fields.values()):
+        chosen = (
+            f"each chart's test was chosen automatically from {_DESIGN}, never from the"
+            " shape of the values"
+        )
+    elif "auto" in fields.values():
+        chosen = (
+            f"the test setting was {listed}; the fields left auto were resolved from"
+            f" {_DESIGN}, never from the shape of the values"
+        )
+    else:
+        chosen = f"the test setting was {listed}"
+    sentences = [f"Statistics: {chosen}."]
+    if setting.family is TestFamily.RANK:
+        sentences.append("Rank tests compare the order of the values, which no scale changes.")
+    elif setting.scale is TestScale.LOG:
+        sentences.append(
+            "Values are tested on log values (natural log); a chart with a tested value of"
+            " 0 or below has no test, and its legend says why."
+        )
+    elif setting.scale is TestScale.LINEAR:
+        sentences.append("Values are tested on linear values.")
+    else:
+        sentences.append(
+            "Ratios (normalized values and fold changes) are tested on log values (natural"
+            " log), or on linear values when a tested value is 0 or below, which the chart's"
+            " legend then says; raw values are tested on linear values."
+        )
+    comparisons = setting.comparisons
+    if setting.family is TestFamily.AUTO:
+        sentences.append(
+            f"The tests: with equal n per condition, {_tests_of(TestFamily.POOLED, comparisons)};"
+            f" with unequal n, {_tests_of(TestFamily.WELCH, comparisons)}."
+        )
+    else:
+        sentences.append(
+            f"The tests ({setting.family.value}): {_tests_of(setting.family, comparisons)}."
+        )
+    if comparisons is TestComparisons.VS_REFERENCE:
+        sentences.append(
+            "A chart whose reference is not tested has no test, and its legend says why."
+        )
+    if setting.family is TestFamily.RANK:
+        sentences.append(
+            "The Mann-Whitney U test is exact; with tied values and more than"
+            f" {MANN_WHITNEY_PERMUTATIONS:,} ways to arrange them, it is the normal"
+            " approximation with the tie correction, which the chart's legend then says."
+            " The Kruskal-Wallis p is the chi-square approximation."
+        )
+    sentences.append(
+        f"Every test is two-sided at alpha {ALPHA:g}. A test leaves out the conditions with"
+        " fewer than 2 replicates or with no value, and those with a replicate below the"
+        " detection limit. Each chart is tested on its own, with no correction across"
+        f" charts. Brackets join the conditions whose adjusted p is below {ALPHA:g}"
+        " (* p < 0.05, ** p < 0.01, *** p < 0.001). Each chart's legend states its test"
+        " with its p-value (for comparisons with the reference, each one's), the"
+        f" conditions it covers and those it leaves out; {BUNDLE_RECORD_FILE} pins what"
+        " each chart's test resolved to and every p-value it gave, unrounded."
+    )
+    return " ".join(sentences)
+
+
+def _sentence(line: str) -> str:
+    return line if line.endswith((".", "!", "?")) else f"{line}."
+
+
 def _readme(
     results: Results,
     sets: Sequence[Results],
@@ -607,11 +726,16 @@ def _readme(
     no_chart: str | None,
     exported_at: str,
     renamed: Sequence[str] = (),
+    legends: Sequence[tuple[str, Sequence[str]]] = (),
+    statement_in_charts: bool = False,
 ) -> bytes:
     """The README of a bundle: what it holds and how to read it, in plain text
     (UTF-8, LF). ``about`` describes each file, in order; ``no_chart`` says why
     there is no chart, if there is none; ``renamed`` says which lane-table
-    columns were renamed, and why (:func:`lane_columns`)."""
+    columns were renamed, and why (:func:`lane_columns`). ``legends`` gives each
+    chart's file stem and its legend lines, which the README gives as the
+    chart's caption; ``statement_in_charts`` says whether the images draw them
+    too."""
     lines = ["Proteia export", "==============", ""]
     lines += _paragraph(
         f"Exported at {exported_at} (UTC) by Proteia {proteia.__version__}. Every file"
@@ -641,6 +765,26 @@ def _readme(
     )
     if no_chart is not None:
         lines += _paragraph(f"No chart was written: {no_chart}.")
+    charts = [chart for one in sets for series in one.series if (chart := series.chart)]
+    if any(bar.not_detected_lanes for chart in charts for bar in chart.bars):
+        lines += _paragraph(
+            "A condition with a replicate not detected (below the detection limit) keeps its"
+            " place with no bar: its detected values are points, each replicate not detected"
+            " is an open circle in the shaded n.d. row under the axis, and it is not tested."
+            " Its axis label counts all its replicates and those not detected: (n=3, 2 n.d.)."
+        )
+    if charts:
+        lines += _paragraph(_statistics_text(results.statistics))
+        if statement_in_charts:
+            lines += _paragraph(
+                "Each image also draws its legend under the chart; the legends are at the"
+                " end of this file too, under Legends, as captions."
+            )
+        else:
+            lines += _paragraph(
+                "The images draw a key of their marks, not the legend: each chart's legend"
+                " is its caption, given at the end of this file under Legends."
+            )
     lines += _paragraph(
         "Lane tables: one row per lane, numbered from 1 as the app numbers them, with"
         " its condition, its sample and whether the set includes it; each protein's"
@@ -669,4 +813,9 @@ def _readme(
             break_long_words=False,
             break_on_hyphens=False,
         )
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    if legends:
+        lines += ["", "Legends", "-------", ""]
+        for stem, statement in legends:
+            lines.append(stem)
+            lines += _paragraph(" ".join(_sentence(line) for line in statement), "    ")
+    return ("\n".join(lines).rstrip("\n") + "\n").encode("utf-8")

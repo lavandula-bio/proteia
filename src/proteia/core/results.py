@@ -32,13 +32,28 @@ never hidden; lanes excluded without any value (a ladder, an empty lane) add no
 second set. Each of the two sets is labelled, and every chart carries its set's
 label as its subtitle, so a chart cannot be mistaken for the other set's.
 
+Each chart is tested once, on its plotted conditions (:func:`chart_test`), by
+the statistics setting (:class:`~proteia.core.analyze.StatisticsSetting`), a
+compute argument like the error type: ``auto`` chooses the test from the design
+(the value kind, the replicates per condition and the reference), and the chart
+states the test that ran, the conditions it covers and those it leaves out
+(:func:`~proteia.core.plotspec.build_plotspec`). A condition with a replicate
+the target was not detected in keeps its place on the chart, draws no bar and
+is not tested; so does a condition with no value while one of its lanes holds a
+box or a not-detected record of the chart's target or loading control. A lane
+holding none (a ladder, an empty lane) is no replicate of the chart and gives
+its condition no place. The two result sets may resolve to different tests (an
+exclusion can make the replicates unequal); each chart states its own. There is
+no correction across charts: the charts of several targets are each their own
+family of comparisons.
+
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping, Sequence
 from enum import StrEnum
 from functools import partial
 
@@ -46,22 +61,34 @@ from pydantic import BaseModel, model_validator
 
 from proteia.core import analyze, model
 from proteia.core.analyze import (
+    ALPHA,
     BaselineError,
     LaneNets,
     ProteinNets,
     ReduceMethod,
+    StatisticsSetting,
+    TestResult,
     Tier,
     assess,
     compare,
     describe,
     normalize_batch,
+    rank_floor_note,
     reduce_samples,
     reference_baseline,
     repeats_message,
+    replicate_lanes,
+    statistics_setting,
 )
 from proteia.core.model import Role, lanes_phrase
 from proteia.core.names import name_key, resolve_label
-from proteia.core.plotspec import ErrorType, PlotSpec, ValueKind, build_plotspec
+from proteia.core.plotspec import (
+    ErrorType,
+    PlotSpec,
+    ValueKind,
+    build_plotspec,
+    not_in_the_test,
+)
 from proteia.core.project import spine_axes
 from proteia.core.quantify import BACKGROUND_UNEVEN_LIMIT
 
@@ -97,6 +124,14 @@ class NoticeCode(StrEnum):
     BACKGROUND_UNEVEN = "background_uneven"
     # Nets above the whole-image median, as quantified before #83: requantify.
     LEGACY_BACKGROUND = "legacy_background"
+    # Per series: a test ran, but some plotted conditions are left out of it.
+    CONDITIONS_NOT_TESTED = "conditions_not_tested"
+    # Per series: a choice of the statistics setting could not apply, so no test ran.
+    TEST_NOT_APPLICABLE = "test_not_applicable"
+    # Per series: ratios with a value of 0 or below, tested on linear values.
+    LOG_SCALE_UNAVAILABLE = "log_scale_unavailable"
+    # Per series: a rank test whose smallest possible p is not below alpha.
+    RANK_TEST_CANNOT_REACH_ALPHA = "rank_test_cannot_reach_alpha"
 
 
 class Level(StrEnum):
@@ -110,6 +145,32 @@ _INFO_CODES = frozenset(
         NoticeCode.REFERENCE_NOT_PLOTTED,
         NoticeCode.EXTRA_BANDS_IGNORED,
         NoticeCode.LEGACY_BACKGROUND,
+        NoticeCode.LOG_SCALE_UNAVAILABLE,
+    }
+)
+# Notices about one set's charts: the tests of the two sets are their own (an
+# exclusion can leave a condition out of one and not the other), so each set
+# keeps these even when the other has the same.
+TEST_NOTICE_CODES = frozenset(
+    {
+        NoticeCode.CONDITIONS_NOT_TESTED,
+        NoticeCode.TEST_NOT_APPLICABLE,
+        NoticeCode.LOG_SCALE_UNAVAILABLE,
+        NoticeCode.RANK_TEST_CANNOT_REACH_ALPHA,
+    }
+)
+# Notices about one series, not about each of its proteins: their protein_ids
+# are the series' target and loading control, in that order, and they concern
+# its chart alone, not that of another series sharing one of the proteins (a
+# second target over the same loading control). The web page keeps the same
+# list, pinned by a test.
+SERIES_NOTICE_CODES = frozenset(
+    {
+        NoticeCode.REFERENCE_UNUSABLE,
+        NoticeCode.LOADING_NOT_POSITIVE,
+        NoticeCode.NO_VALUES,
+        NoticeCode.NO_PLOTTED_VALUES,
+        *TEST_NOTICE_CODES,
     }
 )
 # The background modes of a ring cut short (quantify.band_backgrounds).
@@ -206,6 +267,7 @@ class Results(BaseModel, frozen=True):
     excluded_lanes: list[int] = []
     label: str | None = None
     all_lanes: Results | None = None
+    statistics: StatisticsSetting = StatisticsSetting()
 
     @model_validator(mode="after")
     def _one_level(self) -> Results:
@@ -311,6 +373,20 @@ def _background_notices(
         )
 
 
+def chart_test(
+    shown: Mapping[str, Sequence[float]],
+    *,
+    setting: StatisticsSetting,
+    kind: ValueKind,
+    reference: str | None,
+) -> TestResult:
+    """The test of a chart's tested conditions: the one entry for the charts and
+    the regression baseline, so both run the same test on the same values.
+    Normalized values and fold changes are ratios; the reference, when it is
+    among ``shown``, may be what the conditions are compared with."""
+    return compare(shown, setting, ratio=kind is not ValueKind.RAW, reference=reference)
+
+
 def _clipping_not_checked(
     protein: model.Protein,
     image: model.ImageRef,
@@ -354,6 +430,9 @@ def _clipping_not_checked(
 def _chart(
     groups: dict[str, list[float]],
     point_lanes: dict[str, list[list[int]]],
+    replicates: dict[str, list[list[int]]],
+    values: LaneNets,
+    detected: list[bool | None],
     *,
     chosen: list[str] | None,
     kind: ValueKind,
@@ -361,26 +440,96 @@ def _chart(
     title: str,
     reference: str | None,
     subtitle: str | None,
-) -> PlotSpec | None:
-    """The chart of one series: its groups restricted to the plotted conditions."""
-    shown = {c: g for c, g in groups.items() if chosen is None or c in chosen}
+    setting: StatisticsSetting,
+) -> tuple[PlotSpec, TestResult] | None:
+    """The chart of one series (its groups restricted to the plotted
+    conditions) and its test; None when no plotted condition has a value.
+
+    ``replicates`` is every included replicate's lanes by condition
+    (:func:`~proteia.core.analyze.replicate_lanes`), over the lanes that hold
+    something for the series, so a plotted condition with no value keeps its
+    place while a lane that holds nothing (a ladder) has none. A replicate with
+    no value (``values``) whose target was not detected in one of its lanes
+    (``detected``) is not detected: its condition draws no bar and is left out
+    of the test."""
+    plotted = [c for c in replicates if chosen is None or c in chosen]
+    shown = {c: groups[c] for c in plotted if c in groups}
     if not shown:
         return None
     # Provenance parallel to the points: each sample's first lane (the lane a
     # representative reduction keeps; technical repeats share one point).
     lane_indices = {c: [lanes[0] for lanes in point_lanes[c]] for c in shown}
+    undetected: dict[str, list[int]] = {}
+    for condition in plotted:
+        firsts = [
+            lanes[0]
+            for lanes in replicates[condition]
+            if all(values[i] is None for i in lanes) and any(detected[i] is False for i in lanes)
+        ]
+        if firsts:
+            undetected[condition] = firsts
+    tested = {c: g for c, g in shown.items() if c not in undetected}
     # Statistics run on the plotted subset, as the napari chart does.
-    return build_plotspec(
+    test = chart_test(tested, setting=setting, kind=kind, reference=reference)
+    spec = build_plotspec(
         shown,
         describe(shown),
-        compare(shown),
+        test,
         value_kind=kind,
         error_type=error_type,
         title=title,
         lane_indices=lane_indices,
         first_label=reference,
         subtitle=subtitle,
+        replicates={c: len(replicates[c]) for c in plotted},
+        not_detected_lanes=undetected,
     )
+    return spec, test
+
+
+def _test_notices(
+    chart: PlotSpec,
+    test: TestResult,
+    series: str,
+    protein_ids: tuple[str, ...],
+    note: Callable[..., None],
+) -> None:
+    """The notices of a chart's test: the conditions it leaves out, ratios tested
+    on linear values, a rank test that cannot reach significance, or a choice of
+    the setting that could not apply (``series`` names the series)."""
+    plan = test.plan
+    if chart.test is None:
+        if plan.no_test == "not_applicable":
+            note(
+                NoticeCode.TEST_NOT_APPLICABLE,
+                f"{series}: {plan.no_test_note}",
+                protein_ids=protein_ids,
+            )
+        return
+    out = tuple(c.label for c in chart.coverage if c.left_out is not None)
+    if out:
+        note(
+            NoticeCode.CONDITIONS_NOT_TESTED,
+            f"{series}: {not_in_the_test(chart.coverage)}",
+            protein_ids=protein_ids,
+            conditions=out,
+        )
+    if plan.nonpositive:
+        has = "has" if len(plan.nonpositive) == 1 else "have"
+        note(
+            NoticeCode.LOG_SCALE_UNAVAILABLE,
+            f"{series} is tested on linear values: {_listed(plan.nonpositive)} {has} a value"
+            " of 0 or below, which has no log",
+            protein_ids=protein_ids,
+            conditions=plan.nonpositive,
+        )
+    floor = plan.min_attainable_p
+    if floor is not None and floor >= ALPHA:
+        note(
+            NoticeCode.RANK_TEST_CANNOT_REACH_ALPHA,
+            f"{series}: {rank_floor_note(plan.name, floor)}",
+            protein_ids=protein_ids,
+        )
 
 
 def compute_results(
@@ -389,6 +538,7 @@ def compute_results(
     plot_conditions: Collection[str] | None = None,
     error_type: ErrorType | str = ErrorType.SD,
     method: ReduceMethod | str = ReduceMethod.MEAN,
+    statistics: StatisticsSetting | Mapping[str, str] | None = None,
 ) -> Results:
     """Everything the results view shows, from the stored batch alone.
 
@@ -397,7 +547,9 @@ def compute_results(
     exclusions and its ``all_lanes`` is the same computation with every lane
     included: removing data points is never hidden. Excluded lanes without any
     value (a ladder, an empty lane) change nothing, so they add no second set.
-    Notices the two sets share are kept only in the first. Two sets are labelled
+    Notices the two sets share are kept only in the first, but for those about
+    a set's charts (:data:`TEST_NOTICE_CODES`), which each set keeps: the two
+    sets test on their own. Two sets are labelled
     (see :class:`Results`); one set has no label. A chart with a plotted group
     too small for a test (n < 2) is still drawn. When at least two other groups
     can be tested, the chart shows their test, with brackets only among them and
@@ -405,15 +557,20 @@ def compute_results(
     brackets, and a note saying why (see
     :func:`~proteia.core.plotspec.build_plotspec`).
 
-    ``error_type`` and ``method`` may be their raw values (``"SEM"``, ``"mean"``):
-    they become their enums here, before anything compares them by identity. An
-    unknown value raises ``ValueError``.
+    ``statistics`` chooses every chart's test (None: all ``auto``); both sets use
+    it, and :attr:`Results.statistics` echoes it.
+
+    ``error_type``, ``method`` and ``statistics`` may be their raw values
+    (``"SEM"``, ``"mean"``, ``{"family": "welch"}``): they become their enums
+    here, before anything compares them by identity. An unknown value raises
+    ``ValueError``.
     """
     one_set = partial(
         _compute,
         plot_conditions=plot_conditions,
         error_type=ErrorType(error_type),
         method=ReduceMethod(method),
+        statistics=statistics_setting(statistics),
     )
     per_protein = lane_nets(batch).values()
     removed = [  # the excluded lanes that hold a value: what the exclusion changes
@@ -428,7 +585,11 @@ def compute_results(
         update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
     )
     all_lanes = one_set(every_lane, set_label="All lanes")
-    own = [notice for notice in all_lanes.notices if notice not in results.notices]
+    own = [
+        notice
+        for notice in all_lanes.notices
+        if notice.code in TEST_NOTICE_CODES or notice not in results.notices
+    ]
     return results.model_copy(update={"all_lanes": all_lanes.model_copy(update={"notices": own})})
 
 
@@ -438,6 +599,7 @@ def _compute(
     plot_conditions: Collection[str] | None,
     error_type: ErrorType,
     method: ReduceMethod,
+    statistics: StatisticsSetting,
     set_label: str | None,
 ) -> Results:
     """One result set, over the lane table's included lanes.
@@ -445,8 +607,9 @@ def _compute(
     ``plot_conditions`` chooses the charted conditions (None or empty: all); each
     is resolved against the lane labels (:func:`~proteia.core.names.resolve_label`),
     and one that matches no lane is reported and ignored. ``method`` reduces
-    technical repeats; ``error_type`` picks the charts' error bars. ``set_label``
-    names the set (:attr:`Results.label`) and is every chart's subtitle.
+    technical repeats; ``error_type`` picks the charts' error bars and
+    ``statistics`` their tests. ``set_label`` names the set
+    (:attr:`Results.label`) and is every chart's subtitle.
 
     Series come from :func:`~proteia.core.analyze.normalize_batch`. Each is reduced
     once over the lane table's included lanes. With a reference condition and a
@@ -536,6 +699,7 @@ def _compute(
             plot_conditions=None,
             error_type=error_type,
             method=method,
+            statistics=statistics,
         )
 
     # 3-4. The lane axes, and what the model accepts on purpose but the user should see.
@@ -725,22 +889,37 @@ def _compute(
                     title = f"{s.target} fold-change vs {ref}  (/{s.loading})"
                 else:
                     title = f"{s.target} / {s.loading}"
-                chart = _chart(
+                # A lane is a replicate's when it holds a box or a not-detected
+                # record of the target or its loading control. One holding
+                # neither (a ladder, an empty lane) gives no value, so it gives
+                # no condition a place either, and changes nothing in either set.
+                held = [
+                    included[i] and any(detected[pid][i] is not None for pid in pair_ids)
+                    for i in range(n)
+                ]
+                charted = _chart(
                     groups,
                     red.lanes,
+                    replicate_lanes(conditions, samples, held),
+                    s.values,
+                    detected[target_id],
                     chosen=chosen,
                     kind=kind,
                     error_type=error_type,
                     title=title,
                     reference=ref,
                     subtitle=set_label,
+                    setting=statistics,
                 )
-                if chart is None:
+                if charted is None:
                     note(
                         NoticeCode.NO_PLOTTED_VALUES,
                         f"{s.target!r} / {s.loading!r} has no value in the plotted conditions",
                         protein_ids=pair_ids,
                     )
+                else:
+                    chart, tested = charted
+                    _test_notices(chart, tested, f"{s.target!r} / {s.loading!r}", pair_ids, note)
             series.append(
                 SeriesResult(
                     target_id=target_id,
@@ -778,4 +957,5 @@ def _compute(
         method=method,
         excluded_lanes=[i for i in range(n) if not included[i]],
         label=set_label,
+        statistics=statistics,
     )

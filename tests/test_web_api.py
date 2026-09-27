@@ -2993,14 +2993,21 @@ def test_an_export_uses_the_workspaces_result_settings(client):
     answer = client.ok("POST", "/api/export", {"formats": ["svg"]})
     folder = client.root / SAMPLE / answer["folder"]
     doc = json.loads((folder / "export.record.json").read_bytes())
-    assert doc["results"] == {
+    assert {key: value for key, value in doc["results"].items() if key != "statistics"} == {
         "method": "representative",
         "error_type": "SEM",
         "plot_conditions": ["vehicle"],
         "excluded_lanes": [3],
     }
     # What the screen shows, each setting of it.
-    settings = {"error_type": "SEM", "plot_conditions": ["vehicle"], "method": "representative"}
+    auto = {"family": "auto", "comparisons": "auto", "scale": "auto"}
+    assert doc["results"]["statistics"]["setting"] == auto
+    settings = {
+        "error_type": "SEM",
+        "plot_conditions": ["vehicle"],
+        "method": "representative",
+        "statistics": auto,
+    }
     assert answer["results"]["settings"] == settings
     [chart] = answer["results"]["sets"][0]["series"]
     assert chart["chart"]["error_type"] == "SEM"

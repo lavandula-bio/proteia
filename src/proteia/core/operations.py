@@ -96,7 +96,7 @@ import numpy as np
 from pydantic import JsonValue, ValidationError
 
 from proteia.core import boxes, export, record, results, rowdetect, storage
-from proteia.core.analyze import ReduceMethod
+from proteia.core.analyze import ReduceMethod, StatisticsSetting, statistics_setting
 from proteia.core.export import (
     BUNDLE_RECORD_FILE,
     DEFAULT_CHART_FORMATS,
@@ -559,6 +559,15 @@ def _member[E: Enum](cls: type[E], value: object, what: str) -> E:
     except ValueError as exc:
         choices = ", ".join(repr(member.value) for member in cls)
         raise _invalid(f"{what} must be one of {choices}, not {value!r}") from exc
+
+
+def _statistics(value: object) -> StatisticsSetting:
+    """A statistics setting from its model or raw strings; an unknown key or
+    value is refused (``INVALID_INPUT``)."""
+    try:
+        return statistics_setting(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError) as exc:
+        raise _invalid(str(exc)) from exc
 
 
 def _clean(text: object, what: str) -> str:
@@ -2423,20 +2432,27 @@ def compute_view(
     plot_conditions: Collection[str] | None = None,
     error_type: ErrorType | str = ErrorType.SD,
     method: ReduceMethod | str = ReduceMethod.MEAN,
+    statistics: StatisticsSetting | Mapping[str, str] | None = None,
 ) -> ComputedView:
     """The committed project with every result of it
     (:func:`~proteia.core.results.compute_results`).
 
     Reads ``session.project`` once, so a change committed meanwhile is in neither
-    half of the view: no lock, no pixels, no autosave. ``error_type`` and
-    ``method`` may be their raw values (``"SEM"``, ``"mean"``); an unknown value
-    is refused (``INVALID_INPUT``).
+    half of the view: no lock, no pixels, no autosave. ``error_type``,
+    ``method`` and ``statistics`` may be their raw values (``"SEM"``,
+    ``"mean"``, ``{"family": "welch"}``); an unknown value is refused
+    (``INVALID_INPUT``).
     """
     error_type = _member(ErrorType, error_type, "error type")
     method = _member(ReduceMethod, method, "method")
+    setting = _statistics(statistics)
     project = session.project
     computed = results.compute_results(
-        project.batch, plot_conditions=plot_conditions, error_type=error_type, method=method
+        project.batch,
+        plot_conditions=plot_conditions,
+        error_type=error_type,
+        method=method,
+        statistics=setting,
     )
     return ComputedView(project, computed)
 
@@ -2447,10 +2463,15 @@ def compute(
     plot_conditions: Collection[str] | None = None,
     error_type: ErrorType | str = ErrorType.SD,
     method: ReduceMethod | str = ReduceMethod.MEAN,
+    statistics: StatisticsSetting | Mapping[str, str] | None = None,
 ) -> Results:
     """Every result of the committed project: :func:`compute_view`'s results."""
     return compute_view(
-        session, plot_conditions=plot_conditions, error_type=error_type, method=method
+        session,
+        plot_conditions=plot_conditions,
+        error_type=error_type,
+        method=method,
+        statistics=statistics,
     ).results
 
 
@@ -2553,6 +2574,8 @@ def export_bundle(
     plot_conditions: Collection[str] | None = None,
     error_type: ErrorType | str = ErrorType.SD,
     method: ReduceMethod | str = ReduceMethod.MEAN,
+    statistics: StatisticsSetting | Mapping[str, str] | None = None,
+    statement_in_charts: bool = False,
 ) -> ExportBundle:
     """Write the results into a new folder of their own (#53): each result set's
     lane table and charts, a README and the reproducibility record, so files
@@ -2569,8 +2592,10 @@ def export_bundle(
     labels in them further. It holds, in the order written
     (:func:`~proteia.core.export.bundle_files`): each set's lane table, each
     set's charts in each of ``formats`` (drawn by the renderer the screen uses;
-    a chart names its set in its subtitle and its file name, and its error bars
-    under its axis), ``README.txt``, and ``export.record.json``
+    a chart names its set in its subtitle and its file name, and a key under its
+    axis says what its marks are; with ``statement_in_charts`` its legend is
+    drawn under it too), ``README.txt`` (which gives each chart's legend as its
+    caption), and ``export.record.json``
     (:func:`~proteia.core.record.build_record`), which lists every other file
     with its SHA-256, and the compute settings. When lanes the lane table
     excludes hold values, the all-lanes set is written too, in files of its own
@@ -2578,14 +2603,14 @@ def export_bundle(
     (``"svg"``, ``"png"``, ``"pdf"``), each written once, in the order given;
     an empty list writes no chart. The default,
     :data:`~proteia.core.export.DEFAULT_CHART_FORMATS`, is provisional.
-    ``plot_conditions``, ``error_type`` and ``method`` are
+    ``plot_conditions``, ``error_type``, ``method`` and ``statistics`` are
     :func:`compute_view`'s, so the export shows what the screen does.
 
     Refused as :func:`export_lane_table` is, before anything is written: no
     lanes (``NO_LANES``), or an image file missing or changed since import
     (``IMAGE_FILE_CHANGED``); an unknown chart format, error type or method
-    (``INVALID_INPUT``); and a project folder whose path leaves the file names
-    less than :data:`~proteia.core.export.MIN_NAME_ROOM` characters
+    or statistics setting (``INVALID_INPUT``); and a project folder whose path
+    leaves the file names less than :data:`~proteia.core.export.MIN_NAME_ROOM` characters
     (``PATH_TOO_LONG``: Windows takes no path over 259 characters while long
     paths are off, its default). Every file is built before the folder is made, and
     each is written atomically; a failure while writing (``OSError``, which
@@ -2595,6 +2620,7 @@ def export_bundle(
     chosen = _chart_formats(formats)
     error_type = _member(ErrorType, error_type, "error type")
     method = _member(ReduceMethod, method, "method")
+    setting = _statistics(statistics)
     project = session.project  # one snapshot for every file
     batch = project.batch
     if not batch.lanes:
@@ -2621,13 +2647,18 @@ def export_bundle(
             " to a folder with a shorter path",
         )
     computed = results.compute_results(
-        batch, plot_conditions=plot_conditions, error_type=error_type, method=method
+        batch,
+        plot_conditions=plot_conditions,
+        error_type=error_type,
+        method=method,
+        statistics=setting,
     )
     files = export.bundle_files(
         computed,
         formats=chosen,
         exported_at=exported_at,
         name_fits=functools.partial(storage.name_fits, widest),
+        statement_in_charts=statement_in_charts,
     )
     doc = record.build_record(project, exported_at=exported_at, files=files, results=computed)
     files[BUNDLE_RECORD_FILE] = record.record_bytes(doc)

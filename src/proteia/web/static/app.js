@@ -710,9 +710,16 @@ function renderBox(project) {
 function renderNotices(project) {
   const warnings = [];
   const infos = [];
+  // A notice of both sets (each keeps its charts' test notices) is listed once.
+  const [applied] = state.results.sets;
+  const said = (notice) => JSON.stringify([notice.code, notice.message]);
+  const listed = new Set(applied.notices.map(said));
   for (const set of state.results.sets) {
     const prefix = set.id === "all_lanes" ? "All lanes: " : "";
     for (const notice of set.notices) {
+      if (set !== applied && listed.has(said(notice))) {
+        continue;
+      }
       const line = [`${prefix}${sentence(notice.message)}`, notice.level];
       (notice.level === "warning" ? warnings : infos).push(line);
     }
