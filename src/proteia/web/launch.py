@@ -39,7 +39,8 @@ running instance. The token is concealed from it as soon as the launch makes or
 reads one, so neither the log nor the console ever shows it, nor the redirect
 page's address. The diagnostic files the page writes for bug reports, which
 take the newest session log files, go in the ``diagnostics`` folder there
-(:mod:`proteia.web.diagnostics`).
+(:mod:`proteia.web.diagnostics`). The notices the user dismissed for good are
+recorded in ``notices.json`` there (:mod:`proteia.web.cloudsync`).
 """
 
 from __future__ import annotations
