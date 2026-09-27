@@ -541,22 +541,50 @@ def test_a_palette_tiff_is_shown_through_its_colour_map(client, tmp_path):
 
 
 @pytest.mark.parametrize("fmt", ["TIFF", "JPEG"])
-def test_a_cmyk_file_is_not_offered_in_colours_it_does_not_hold(client, tmp_path, fmt):
-    # Its cyan, magenta and yellow would be drawn as red, green and blue: the
-    # page offers no original colours, and asking answers the gray preview.
+def test_a_cmyk_file_is_imported_converted_and_offered_in_its_converted_colours(
+    client, tmp_path, fmt
+):
+    # #131: its inks are converted to red, green and blue, then to gray as the
+    # RGB original's are, and the import says so; its original colours are the
+    # converted ones (exact for this TIFF, within JPEG's error for the JPEG).
     client.ok("POST", "/api/projects", {"name": "Blot"})
+    stain = ponceau()
+    original = upload(client, png_bytes(stain), name=PONCEAU, kind="visible_marker")[1]
     buffer = io.BytesIO()
-    Image.fromarray(ponceau()).convert("CMYK").save(buffer, format=fmt)
+    quality = {"quality": 95} if fmt == "JPEG" else {}
+    Image.fromarray(stain).convert("CMYK").save(buffer, format=fmt, **quality)
     suffix = ".tif" if fmt == "TIFF" else ".jpg"
     status, answer = upload(client, buffer.getvalue(), name=f"cmyk{suffix}", kind="visible_marker")
     assert status == 201, answer
     image_id = answer["image_id"]
-    (image,) = answer["project"]["images"]
-    assert "color_channels_differ" in [w["code"] for w in image["warnings"]]
-    assert image["colour"] is False
-    plain = preview_of(client, image_id)
-    assert preview_of(client, image_id, "?colour=original") == plain
-    assert decoded(plain)[0] == "L"
+    image = next(i for i in answer["project"]["images"] if i["id"] == image_id)
+    codes = [w["code"] for w in image["warnings"]]
+    lossy = ["lossy_format"] if fmt == "JPEG" else []
+    assert codes == [*lossy, "cmyk_converted", "color_channels_differ"]
+    assert (
+        "converted to red, green and blue with the standard formula"
+        in (image["warnings"][len(lossy)]["message"])
+    )
+    assert image["colour"] is True
+    mode, colour = decoded(preview_of(client, image_id, "?colour=original"))
+    assert (mode, colour.shape) == ("RGB", (H, W, 3))
+    error = 0 if fmt == "TIFF" else 3
+    assert np.abs(colour.astype(int) - stain).max() <= error
+    # Its gray is the RGB original's: the same preview, stretched alike.
+    mode, gray = decoded(preview_of(client, image_id))
+    expected = decoded(preview_of(client, original["image_id"]))[1]
+    assert mode == "L"
+    assert np.abs(gray.astype(int) - expected).max() <= error * 2
+
+
+def test_an_image_in_a_colour_space_proteia_does_not_convert_is_refused(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    buffer = io.BytesIO()
+    Image.fromarray(ponceau()).convert("LAB").save(buffer, format="TIFF")
+    status, answer = upload(client, buffer.getvalue(), name="lab µ.tif")
+    assert (status, answer["code"]) == (422, "unreadable_image")
+    assert "in the CIELAB colour space" in answer["message"]
+    assert client.ok("GET", "/api/project")["project"]["images"] == []
 
 
 def test_the_state_reads_a_file_header_once_and_only_where_colour_can_hide(tmp_path, monkeypatch):

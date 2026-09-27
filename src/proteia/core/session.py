@@ -66,7 +66,14 @@ from pydantic import JsonValue
 
 import proteia
 from proteia.core import storage
-from proteia.core.imaging import FileColours, file_colours, load_image, read_colours
+from proteia.core.imaging import (
+    FileColours,
+    UnsupportedColourSpaceError,
+    converts_cmyk,
+    file_colours,
+    load_image,
+    read_colours,
+)
 from proteia.core.model import IMAGE_SUFFIXES, ImageRef, LogEntry, Project, format_timestamp
 
 _log = logging.getLogger(__name__)
@@ -233,6 +240,29 @@ def _only_in[T](items: Sequence[T], others: Sequence[T]) -> list[T]:
     return [item for item in items if item not in exclude]
 
 
+def _outdated_reading(image: ImageRef, header: bool | str) -> str | None:
+    """Why ``image``'s stored numbers come from a reading of its stored file that
+    this version no longer makes, or None; ``header`` is what its file's header
+    says: whether reading it converts CMYK
+    (:func:`~proteia.core.imaging.converts_cmyk`), or what reading refuses in it
+    (:attr:`~proteia.core.imaging.UnsupportedColourSpaceError.problem`)."""
+    name = image.original_name
+    if isinstance(header, str):
+        return (
+            f"{name!r}: {header}; it was imported before Proteia refused such files, so"
+            " its stored background and nets come from a reading Proteia no longer makes:"
+            " remove the image, save the file as a gray or RGB TIFF and import it again"
+        )
+    if header and not any(w.code == "cmyk_converted" for w in image.import_warnings):
+        return (
+            f"{name!r} is a CMYK file imported before Proteia converted CMYK colours: its"
+            " stored background and nets were measured with its cyan, magenta and yellow"
+            " read as red, green and blue; remove the image and import the file again to"
+            " measure it converted"
+        )
+    return None
+
+
 class ProjectSession:
     """One open project folder. Create it with :func:`new_project` or :func:`open_project`.
 
@@ -264,6 +294,9 @@ class ProjectSession:
         self._pixels: dict[str, np.ndarray] = {}
         # (image id, SHA-256) -> how its stored file holds colour (file_colours).
         self._file_colours: dict[tuple[str, str], FileColours | None] = {}
+        # (image id, SHA-256) -> what its stored file's header says of reading it
+        # (outdated_reading): whether it converts CMYK, or what is refused in it.
+        self._headers: dict[tuple[str, str], bool | str] = {}
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -328,27 +361,71 @@ class ProjectSession:
 
         Raises ``UnknownIdError``, or :class:`OperationError` with
         ``IMAGE_FILE_CHANGED`` (the file is missing, its bytes no longer match the
-        recorded SHA-256, or its shape differs) or ``UNREADABLE_IMAGE``.
+        recorded SHA-256, or its shape differs) or ``UNREADABLE_IMAGE`` (it
+        cannot be decoded, or its stored numbers come from a reading this version
+        no longer makes, which the message says: :meth:`outdated_reading`).
         """
         with self.lock:
             cached = self._pixels.get(image_id)
             if cached is not None:
                 return cached
             image = self._project.batch.find_image(image_id)
-            array = self._read_checked(image, lambda path: load_image(path).array)
+            array = self._read_checked(image, lambda path: self._analysis_array(image, path))
             array.flags.writeable = False
             if keep:
                 self._pixels[image_id] = array
             return array
 
+    def _analysis_array(self, image: ImageRef, path: Path) -> np.ndarray:
+        """The analysis array of the image's stored file (:func:`load_image`),
+        refused (``ValueError``) while its stored numbers come from a reading
+        this version no longer makes (:meth:`outdated_reading`): boxes measured
+        now would mix the two readings."""
+        why = self.outdated_reading(image)
+        if why is not None:
+            raise ValueError(why)
+        return load_image(path).array
+
     def colour_pixels(self, image_id: str) -> np.ndarray:
         """The image's stored file in its own colours, for display only (2-D gray,
         or 3-D with the channels last: :func:`~proteia.core.imaging.read_colours`).
         Read and checked as :meth:`pixels` reads the analysis array, with the
-        same errors; never cached. Analysis never uses them."""
+        same errors, except that a CMYK image imported before CMYK was converted
+        is shown in its converted colours; never cached. Analysis never uses them."""
         with self.lock:
             image = self._project.batch.find_image(image_id)
             return self._read_checked(image, read_colours)
+
+    def outdated_reading(self, image: ImageRef) -> str | None:
+        """Why the image's stored background and nets come from a reading of its
+        stored file that this version no longer makes, and what to do; None if
+        they do not, or while the file cannot be read (reading it says why).
+
+        Two readings changed with #131. A CMYK file whose record has no
+        ``cmyk_converted`` warning was imported before CMYK was converted: its
+        cyan, magenta and yellow were read as red, green and blue, which its
+        stored background, warnings and nets (and maybe its polarity, chosen by
+        how it looked) come from. A file in a colour space reading now refuses
+        (:class:`~proteia.core.imaging.UnsupportedColourSpaceError`: CIELAB,
+        YCbCr, ...) was read as stored. Either way the image's analysis is
+        refused with this message (:meth:`pixels`), the results warn about its
+        nets, and exports refuse them, until it is removed: its stored numbers
+        are not recomputed.
+
+        From the header (:func:`~proteia.core.imaging.converts_cmyk`), read once
+        per image record (id and SHA-256), without the lock, as
+        :meth:`file_colours` reads it."""
+        key = (image.id, image.sha256)
+        header = self._headers.get(key)
+        if header is None:
+            try:
+                header = converts_cmyk(storage.image_path(self._folder, image))
+            except UnsupportedColourSpaceError as exc:
+                header = exc.problem
+            except (ValueError, OSError):
+                return None
+            self._headers[key] = header
+        return _outdated_reading(image, header)
 
     def file_colours(self, image: ImageRef) -> FileColours | None:
         """How the image's stored file holds colour
@@ -371,7 +448,9 @@ class ProjectSession:
     def _read_checked(self, image: ImageRef, read: Callable[[Path], np.ndarray]) -> np.ndarray:
         """``read`` of the image's stored file, once the file's bytes match the
         recorded SHA-256; its first two dimensions must be the recorded height
-        and width. Called with the lock held."""
+        and width. A colour space reading refuses is refused with what that
+        means for the image (:meth:`outdated_reading`), which names it as it was
+        imported. Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -393,6 +472,9 @@ class ProjectSession:
             )
         try:
             pixels = read(path)
+        except UnsupportedColourSpaceError as exc:
+            message = self.outdated_reading(image) or str(exc)
+            raise OperationError(ErrorCode.UNREADABLE_IMAGE, message, ids=(image_id,)) from exc
         except (ValueError, OSError) as exc:
             raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
         if pixels.shape[:2] != (image.height, image.width):

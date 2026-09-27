@@ -534,6 +534,29 @@ def test_a_legacy_project_is_told_to_requantify():
     assert lane_nets(legacy.batch) == lane_nets(make_project().batch)
 
 
+def test_nets_measured_on_a_reading_no_longer_made_are_named():
+    # #131: the session says which images were read differently when imported,
+    # and why; the results warn once about the proteins measured on each. The
+    # marker image img-3 holds no band, so it has no nets to warn about.
+    why = "'blot.tif' is a CMYK file imported before Proteia converted CMYK colours"
+    batch = make_project().batch
+    res = compute_results(batch, outdated={"img-2": why, "img-3": "no bands"})
+    assert _all(res, NoticeCode.OUTDATED_READING) == [
+        results.Notice(
+            code=NoticeCode.OUTDATED_READING,
+            level=Level.WARNING,
+            message=why,
+            protein_ids=("prot-7",),
+        )
+    ]
+    assert res.all_lanes is not None  # both sets hold it: it is kept in the first
+    assert NoticeCode.OUTDATED_READING not in _codes(res.all_lanes)
+    assert NoticeCode.OUTDATED_READING not in _codes(compute_results(batch))
+    # Before any lane is declared too.
+    no_lanes = batch.model_copy(update={"lanes": [], "reference_condition": None})
+    assert NoticeCode.OUTDATED_READING in _codes(compute_results(no_lanes, outdated={"img-2": why}))
+
+
 # --- purity ---
 
 
@@ -1573,6 +1596,7 @@ def test_a_lane_holding_nothing_for_a_series_is_no_replicate():
 # Import warnings as an image holds them; the notice reads their codes only.
 LOSSY = {"code": "lossy_format", "message": "JPEG-type compression can change pixel values."}
 COLOR = {"code": "color_channels_differ", "message": "The channels were averaged."}
+CMYK = {"code": "cmyk_converted", "message": "The CMYK colours were converted."}
 UNKNOWN = {"code": "unknown_bit_depth", "message": "The pixel type has no fixed range."}
 # The sample's bands by protein: β-catenin in lanes 0, 1 and 3 (excluded),
 # α-tubulin in lanes 0-3, GAPDH in lanes 0 and 1.
@@ -1611,6 +1635,12 @@ def _unchecked(res: results.Results) -> list[results.Notice]:
         (None, [], "an unknown bit depth"),  # not recorded: no limit to check against
         (8, [LOSSY, COLOR], "lossy (JPEG-type) compression and color channels averaged into gray"),
         (None, [LOSSY], "lossy (JPEG-type) compression and an unknown bit depth"),
+        (
+            8,
+            [COLOR, LOSSY, CMYK],
+            "lossy (JPEG-type) compression and CMYK converted to RGB and color channels"
+            " averaged into gray",
+        ),
     ],
 )
 def test_a_band_not_checked_for_over_exposure_is_reported_with_the_reason(

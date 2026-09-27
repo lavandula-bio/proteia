@@ -484,10 +484,10 @@ class Workspace:
         """The image's preview PNG: of its gray analysis array, or, with
         ``original``, of its stored file in its own colours
         (:func:`~proteia.web.state.original_png`) if the file has colour to
-        show (:func:`~proteia.web.state.has_colour`); otherwise it answers the
-        gray one: a gray file's original colours are its gray levels, and the
-        colours of a CMYK file, say, are not converted. The last few previews
-        shown are kept, gray and colour alike."""
+        show (:func:`~proteia.web.state.has_colour`; a CMYK file's are its
+        colours converted to red, green and blue); otherwise it answers the
+        gray one: a gray file's original colours are its gray levels. The last
+        few previews shown are kept, gray and colour alike."""
         image = session.project.batch.find_image(image_id)
         original = original and has_colour(session, image)
         key = (image_id, image.sha256, original)

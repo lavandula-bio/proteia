@@ -13,6 +13,7 @@ path, from an imported file to the chart, to the golden numbers of
 import codecs
 import csv
 import dataclasses
+import functools
 import hashlib
 import inspect
 import io
@@ -1197,6 +1198,165 @@ def test_a_palette_tiff_is_analysed_as_its_indices_and_shown_through_its_map(tmp
     assert (shown.shape, shown.dtype) == ((H, W, 3), np.uint8)
     np.testing.assert_array_equal(shown, (colormap.T >> 8).astype(np.uint8)[indices])
     assert s.file_colours(s.project.batch.find_image(image_id)) == "palette"
+
+
+def _cmyk_tiff(gray: np.ndarray) -> io.BytesIO:
+    """A 16-bit gray blot as a CMYK TIFF, in black ink alone."""
+    data = io.BytesIO()
+    inks = np.zeros((*gray.shape, 4), dtype=np.uint16)
+    inks[..., 3] = 65535 - gray
+    tifffile.imwrite(data, inks, photometric="separated")
+    data.seek(0)
+    return data
+
+
+def test_a_cmyk_image_is_measured_on_its_converted_gray(tmp_path):
+    # #131: the gray of a CMYK file is that of its inks converted to RGB, so
+    # its nets are those of the same blot stored as gray.
+    s = session_on(tmp_path)
+    gray = blot()
+    cmyk = ops.import_image(s, _cmyk_tiff(gray), "cmyk µ.tif", kind=CHEMI, polarity=DARK)
+    plain = import_blot(s, gray)
+    image = s.project.batch.find_image(cmyk)
+    assert [w.code for w in image.import_warnings] == ["cmyk_converted"]
+    assert image.background == s.project.batch.find_image(plain).background
+    np.testing.assert_array_equal(s.pixels(cmyk), s.pixels(plain))
+    assert s.file_colours(image) == "rgb"  # converted: its channels are red, green and blue
+
+
+def test_a_cmyk_image_imported_before_conversion_is_refused_until_imported_again(tmp_path):
+    # An image imported before #131 read its CMYK file as C, M and Y taken for
+    # R, G and B: its record has no cmyk_converted warning, and its background
+    # and nets came from that reading. Measured now on the converted gray, its
+    # boxes would mix the two readings, so its pixels are refused.
+    s = session_on(tmp_path)
+    image_id = ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
+
+    def imported_before(draft: Project) -> None:
+        draft.batch.find_image(image_id).import_warnings = []
+
+    project, _ = apply_change(s.project, imported_before)
+    s._commit(project, action="plant", params={}, evict=[image_id])
+    before = s.project
+    place = functools.partial(ops.place_box, s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    for read in (lambda: s.pixels(image_id), place):
+        with pytest.raises(OperationError) as info:
+            read()
+        assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image_id,))
+        assert str(info.value) == (
+            "'old cmyk.tif' is a CMYK file imported before Proteia converted CMYK colours:"
+            " its stored background and nets were measured with its cyan, magenta and yellow"
+            " read as red, green and blue; remove the image and import the file again to"
+            " measure it converted"
+        )
+    assert s.project is before
+    assert s._pixels == {}
+    assert s.colour_pixels(image_id).shape == (H, W, 3)  # display only: its converted colours
+
+
+OLD_CMYK = (
+    "'old cmyk.tif' is a CMYK file imported before Proteia converted CMYK colours:"
+    " its stored background and nets were measured with its cyan, magenta and yellow"
+    " read as red, green and blue; remove the image and import the file again to"
+    " measure it converted"
+)
+OLD_LAB = (
+    "'lab blot µ.tif': its pixels are stored in the CIELAB colour space, which Proteia"
+    " does not convert to gray; it was imported before Proteia refused such files, so"
+    " its stored background and nets come from a reading Proteia no longer makes:"
+    " remove the image, save the file as a gray or RGB TIFF and import it again"
+)
+
+
+def _imported_before_cmyk(s: ProjectSession) -> tuple[str, str]:
+    """An image imported before #131 converted CMYK, with a box in lane 1: its
+    record has no cmyk_converted warning. Its image and protein ids."""
+    image_id = ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK)
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+
+    def imported_before(draft: Project) -> None:
+        draft.batch.find_image(image_id).import_warnings = []
+
+    project, _ = apply_change(s.project, imported_before)
+    s._commit(project, action="plant", params={}, evict=[image_id])
+    return image_id, protein
+
+
+def _imported_before_lab(s: ProjectSession) -> tuple[str, str]:
+    """An image imported before #131 refused CIELAB, with a box in lane 1: its
+    stored file is a CIELAB TIFF, whose L*, a* and b* were read as red, green and
+    blue. Its image and protein ids."""
+    lab = np.dstack([(blot() >> 8).astype(np.uint8)] * 3)
+    image_id = import_blot(s, lab, "lab blot µ.tif")
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    path = storage.image_path(s.folder, s.project.batch.find_image(image_id))
+    tifffile.imwrite(path, lab, photometric="cielab")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def imported_before(draft: Project) -> None:
+        draft.batch.find_image(image_id).sha256 = digest
+
+    project, _ = apply_change(s.project, imported_before)
+    s._commit(project, action="plant", params={}, evict=[image_id])
+    return image_id, protein
+
+
+def test_an_image_in_a_colour_space_now_refused_names_its_file_and_what_to_do(tmp_path):
+    # Refused on import since #131, a CIELAB file imported before is refused
+    # when read: by the name it was imported under, not its stored file's, and
+    # with what its stored numbers are and how to measure it again.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    image_id, protein = _imported_before_lab(s)
+    before = s.project
+    place = functools.partial(ops.place_box, s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    for read in (lambda: s.pixels(image_id), lambda: s.colour_pixels(image_id), place):
+        with pytest.raises(OperationError) as info:
+            read()
+        assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image_id,))
+        assert str(info.value) == OLD_LAB
+    assert s.project is before
+
+
+@pytest.mark.parametrize(
+    ("imported_before", "why"),
+    [(_imported_before_cmyk, OLD_CMYK), (_imported_before_lab, OLD_LAB)],
+    ids=["cmyk", "cielab"],
+)
+def test_nets_measured_on_a_reading_no_longer_made_are_named_and_not_exported(
+    tmp_path, imported_before, why
+):
+    # An image read differently since its import keeps its stored nets until
+    # it is removed: the results warn about them, and no export carries them.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    image_id, protein = imported_before(s)
+    plain = import_blot(s, blot())  # an image read as it was imported: no notice
+    control = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, plain)
+    ops.place_box(s, control, NARROW_X, ROW, lane_index=0, grow=True)
+    outdated = [n for n in ops.compute(s).notices if n.code is NoticeCode.OUTDATED_READING]
+    assert outdated == [
+        results.Notice(
+            code=NoticeCode.OUTDATED_READING,
+            level=Level.WARNING,
+            message=why,
+            protein_ids=(protein,),
+        )
+    ]
+    exports = (
+        functools.partial(ops.export_bundle, s, formats=["svg"]),
+        functools.partial(ops.export_lane_table, s),
+    )
+    for export in exports:
+        with pytest.raises(OperationError) as info:
+            export()
+        assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image_id,))
+        assert str(info.value) == why  # the page says it was not exported
+    assert list((s.folder / storage.EXPORTS_DIR).iterdir()) == []
 
 
 def test_file_colours_read_the_header_once_per_image_without_the_lock(tmp_path, monkeypatch):
