@@ -85,6 +85,10 @@ class NoticeCode(StrEnum):
     REFERENCE_NOT_PLOTTED = "reference_not_plotted"  # the baseline still comes from it
     EXTRA_BANDS_IGNORED = "extra_bands_ignored"  # band_index > 0 is not quantified yet
     CLIPPED = "clipped"  # bands with pixels at the detector limit: over-exposed, still included
+    # Bands with no clipping flag: their image has no limit the check trusts
+    # (imaging.clipping_depth). A warning, as CLIPPED is: the bias it may hide is
+    # the same, and a loading control's biases every value normalized to it.
+    CLIPPING_NOT_CHECKED = "clipping_not_checked"
     BELOW_DETECTION = "below_detection"  # not-detected records in included lanes: no value
     # Bands whose ring is cut short (by the image edge or other boxes): their
     # level is a robust plane or the image median (quantify.band_backgrounds).
@@ -110,6 +114,14 @@ _INFO_CODES = frozenset(
 )
 # The background modes of a ring cut short (quantify.band_backgrounds).
 _FALLBACK_MODES = frozenset({"asymmetric", "image"})
+# What makes imaging.clipping_depth distrust an image, besides an unknown bit
+# depth: its import warnings, as a clipping_not_checked notice names them. The
+# keys are imaging.UNTRUSTED_WARNINGS, kept in step by a test rather than an
+# import, so that loading results does not load the image readers.
+_UNCHECKED_WARNINGS = {
+    "lossy_format": "lossy (JPEG-type) compression",
+    "color_channels_differ": "color channels averaged into gray",
+}
 
 
 class Notice(BaseModel, frozen=True):
@@ -297,6 +309,46 @@ def _background_notices(
             protein_ids=(protein.id,),
             lane_indices=uneven,
         )
+
+
+def _clipping_not_checked(
+    protein: model.Protein,
+    image: model.ImageRef,
+    bands: list[model.Band | None],
+    included: list[bool],
+    note: Callable[..., None],
+) -> None:
+    """The ``clipping_not_checked`` notice of one protein's first bands
+    (``bands``, joined to the lanes) in the included lanes: those with no
+    clipping flag. It names why the check could not run on the protein's image,
+    as :func:`~proteia.core.imaging.clipping_depth` decides it: lossy
+    compression, color averaged into gray, an unknown bit depth. The operations
+    check every other image, so a flag missing there gets no reason."""
+    unchecked = tuple(
+        i
+        for i, band in enumerate(bands)
+        if band is not None and band.clipped is None and included[i]
+    )
+    if not unchecked:
+        return
+    codes = {warning.code for warning in image.import_warnings}
+    reasons = [text for code, text in _UNCHECKED_WARNINGS.items() if code in codes]
+    if image.bit_depth is None:
+        reasons.append("an unknown bit depth")
+    because = ""
+    if reasons:
+        listed = " and ".join(reasons)
+        because = f": its image has {listed}, so saturated pixels cannot be counted"
+    effect = "if it is over-exposed there, its net is an under-estimate"
+    if protein.role is Role.LOADING_CONTROL:
+        effect += ", which biases every value normalized to it"
+    note(
+        NoticeCode.CLIPPING_NOT_CHECKED,
+        f"{protein.name!r} was not checked for over-exposure in {lanes_phrase(unchecked)}"
+        f"{because}; {effect}",
+        protein_ids=(protein.id,),
+        lane_indices=unchecked,
+    )
 
 
 def _chart(
@@ -499,6 +551,9 @@ def _compute(
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
+    for protein in batch.proteins:  # bands not checked for that, in lanes this set includes
+        image = batch.find_image(protein.image_id)
+        _clipping_not_checked(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # backgrounds to check, in lanes this set includes
         _background_notices(protein, joined[protein.id], included, note)
     for column in columns:  # not-detected records in lanes this set includes

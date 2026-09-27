@@ -38,19 +38,25 @@ _LOSSY_TIFF_COMPRESSION = frozenset({6, 7, 34892, 33003, 33005, 34712, 22610, 50
 _SINGLE_IMAGE_AXES = ("YX", "YXS", "SYX")
 _BIT_DEPTHS = {np.dtype(np.uint8): 8, np.dtype(np.uint16): 16}
 
-# Warning codes and messages recorded on import.
+# Warning codes and messages recorded on import. Each of the three turns the
+# over-exposure check off (clipping_depth), and its message says so.
 WARNINGS = {
     "lossy_format": (
-        "JPEG-type compression can change pixel values; quantify an uncompressed or"
-        " losslessly compressed original if you have it."
+        "JPEG-type compression can change pixel values, so over-exposure cannot be"
+        " checked; quantify an uncompressed or losslessly compressed original if you have it."
     ),
     "color_channels_differ": (
-        "The red, green and blue channels differ; they were averaged into one gray channel."
+        "The red, green and blue channels differ; they were averaged into one gray"
+        " channel, so over-exposure cannot be checked."
     ),
     "unknown_bit_depth": (
         "The pixel type has no fixed detector range, so over-exposure cannot be checked."
     ),
 }
+# The warnings that make clipping_depth distrust a known bit depth. results
+# names each in its clipping_not_checked notice (_UNCHECKED_WARNINGS, kept in
+# step by a test), so a code added here needs a reason there.
+UNTRUSTED_WARNINGS = frozenset({"lossy_format", "color_channels_differ"})
 
 
 def _warning(code: str) -> ImageWarning:
@@ -245,8 +251,7 @@ def clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> i
     the mean to the limit. A 12- or 14-bit camera writing a 16-bit file is checked
     against the container limit, so its saturation goes unseen (a known limit).
     """
-    untrusted = {"lossy_format", "color_channels_differ"}
-    if bit_depth is None or any(w.code in untrusted for w in warnings):
+    if bit_depth is None or any(w.code in UNTRUSTED_WARNINGS for w in warnings):
         return None
     return bit_depth
 
