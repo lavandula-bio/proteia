@@ -93,13 +93,14 @@ class ResultSettings:
 _ResultsKey = tuple[int, int, ResultSettings]  # open id, revision, settings
 
 
-def _same_folder(a: Path, b: Path) -> bool:
-    """Whether ``a`` and ``b`` are one folder (however the paths are spelled);
-    True when that cannot be told."""
+def _same_folder(a: Path, b: Path, *, unknown: bool) -> bool:
+    """Whether ``a`` and ``b`` are one folder, however the paths are spelled
+    (case, Unicode normalization, links); ``unknown`` when that cannot be told
+    (one of them is gone or cannot be read)."""
     try:
         return os.path.samefile(a, b)
     except OSError:
-        return True
+        return unknown
 
 
 class Workspace:
@@ -107,8 +108,12 @@ class Workspace:
 
     A request keeps the session it started with: a project switch while it runs
     does not redirect it (one user, one tab, so this only matters in a race).
-    Every create or open gives the new session the next open id, so answers
-    about different openings never compare equal, even at the same revision.
+    Every create, and every open of another project, gives the new session the
+    next open id, so answers about different openings never compare equal, even
+    at the same revision. Opening the project already open answers its session
+    (:meth:`open`), so no two sessions write one folder (#93); that session
+    takes the next open id too if it reads a ``project.json`` changed outside
+    Proteia again.
     The results of the open project's latest revision computed so far are kept
     (with the open id, the revision and the settings they belong to), since
     reading them again is common and computing them is not cheap.
@@ -166,26 +171,28 @@ class Workspace:
         and stays open, with its undo history, if ``make`` fails or its unsaved
         changes cannot be saved. Once replaced, the old one is closed
         (:meth:`~proteia.core.session.ProjectSession.close`): its history is
-        gone, and so are the image files only that history kept, unless the
-        same project was opened again. Then the close deletes nothing, since
-        the new session may already be storing files the old one does not know
-        (the close waits for any request still running on the old one), and
-        the new session's first save or import deletes those files. Saving,
-        opening and closing run outside the lock readers take."""
-        with self._switching:
-            old = self._peek()
-            if old is not None and old.dirty:
-                self._save(old)
-            session = make()
-            with self._lock:
-                self._session = session
-                self._open_id += 1
-                self._open_ids[session] = self._open_id
-                self._previews.clear()
-                self._results = None
-            if old is not None:
-                old.close(remove_files=not _same_folder(old.folder, session.folder))
-            return session
+        gone, and so are the image files only that history kept, unless the new
+        session's folder is, or may be, the old one's. Then the close deletes
+        nothing, since the new session may already be storing files the old one
+        does not know (the close waits for any request still running on the old
+        one), and the new session's first save or import deletes those files.
+        Opening the open project never switches (:meth:`open`), but a project
+        created where the open one's folder was removed outside Proteia does.
+        Saving, opening and closing run outside the lock readers take. Called
+        with the switch lock held."""
+        old = self._peek()
+        if old is not None and old.dirty:
+            self._save(old)
+        session = make()
+        with self._lock:
+            self._session = session
+            self._open_id += 1
+            self._open_ids[session] = self._open_id
+            self._previews.clear()
+            self._results = None
+        if old is not None:
+            old.close(remove_files=not _same_folder(old.folder, session.folder, unknown=True))
+        return session
 
     def close(self) -> None:
         """Close the open project: its undo history is gone, and so are the image
@@ -197,10 +204,50 @@ class Workspace:
                 session.close()
 
     def create(self, name: object) -> ProjectSession:
-        return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
+        with self._switching:
+            return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
 
     def open(self, name: object) -> ProjectSession:
-        return self._switch(lambda: projects.open_named(self.root, name, clock=self.clock))
+        """Open the project ``name`` (:func:`~proteia.web.projects.project_folder`)
+        in place of the open one; or, if its folder is the open project's,
+        however the name is spelled, answer the open session. A second session
+        on that folder would let an edit still running on the first save over
+        the second's ``project.json``, and the cleanup after that save delete
+        image files only the second knows (#93).
+
+        The open session reads its ``project.json`` again if that was changed
+        outside Proteia (:meth:`~proteia.core.session.ProjectSession.reload`), as
+        opening a project reads it: then it takes the next open id (its revision
+        may go back) and has no undo history or kept results. Otherwise it is
+        answered as it is, with its open id: the same opening, whose revisions
+        still order its answers (this one is of its latest revision, so a client
+        that waited for its edits' answers finds it no older than what it
+        shows); and with its undo history and kept results. Its unsaved changes
+        (a failed autosave) are neither saved first, as a switch saves them, nor
+        replaced by the older file: the next change or quitting saves them. The
+        answer never waits for an operation running on the session: while one
+        holds its lock, the file is not read again (an edit saves over it
+        anyway; after a read, opening again reads it). When it cannot be told
+        whether the two folders are one (the open one is gone), the open is a
+        switch, whose close deletes nothing."""
+        with self._switching:
+            folder = projects.project_folder(self.root, name)
+            session = self._peek()
+            if session is None or not _same_folder(session.folder, folder, unknown=False):
+                return self._switch(lambda: ops.open_project(folder, clock=self.clock))
+            if session.lock.acquire(blocking=False):
+                try:
+                    # The new open id under the session's lock: no commit falls
+                    # between the reload and it.
+                    if session.reload():
+                        with self._lock:
+                            self._open_id += 1
+                            self._open_ids[session] = self._open_id
+                            self._previews.clear()
+                            self._results = None
+                finally:
+                    session.lock.release()
+            return session
 
     def view(self, session: ProjectSession) -> tuple[int, ops.ComputedView]:
         """``session``'s open id, and its committed project with the results of

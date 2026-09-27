@@ -84,10 +84,11 @@ def test_names_are_unique_ignoring_case_and_look_alikes(tmp_path):
     for twin in ("µ BLOT", "μ blot"):  # upper case; Greek mu
         with pytest.raises(projects.ProjectExistsError):
             projects.create_project(root, twin, clock=FakeClock())
-    session = projects.open_named(root, "μ BLOT", clock=FakeClock())
-    assert session.folder.name == "µ Blot"
+    for spelling in ("μ BLOT", " µ blot "):
+        folder = projects.project_folder(root, spelling)
+        assert (folder.parent, folder.name) == (root, "µ Blot")  # the folder's own spelling
     with pytest.raises(projects.ProjectNotFoundError):
-        projects.open_named(root, "Other", clock=FakeClock())
+        projects.project_folder(root, "Other")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the Windows Documents known folder")

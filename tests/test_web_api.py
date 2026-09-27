@@ -11,6 +11,7 @@ import dataclasses
 import http.client
 import io
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -825,12 +826,13 @@ def test_the_revision_counts_commits_and_the_open_id_counts_opens(client, tmp_pa
     assert (tubulin["loading_control_ids"], tubulin["expected_mw"]) == ([], None)
     assert [band["source"] for band in proteins["β-catenin"]["bands"]] == ["click", "manual"]
 
-    # Every create or open is a new open id, even of the project already open.
+    # Every create, and every open of another project, is a new open id; opening
+    # the project already open answers its own (#93).
     assert client.ok("POST", "/api/projects", {"name": "Other"})["project"]["open_id"] == 2
-    for open_id in (3, 4):
-        answer = client.ok("POST", "/api/projects/open", {"name": "Blot"})
-        assert (answer["project"]["open_id"], answer["project"]["revision"]) == (open_id, 7)
-        assert (answer["results"]["open_id"], answer["results"]["revision"]) == (open_id, 7)
+    for name in ("Blot", "BLOT"):
+        answer = client.ok("POST", "/api/projects/open", {"name": name})
+        assert (answer["project"]["open_id"], answer["project"]["revision"]) == (3, 7)
+        assert (answer["results"]["open_id"], answer["results"]["revision"]) == (3, 7)
 
 
 def test_every_project_answer_carries_its_results(client, tmp_path):
@@ -922,8 +924,8 @@ def test_a_repeated_read_reuses_the_results_of_its_revision(client, monkeypatch)
     client.ok("PUT", "/api/lanes", lanes)  # a no-op: the same revision
     client.ok("GET", "/api/project")
     assert len(calls) == 2
-    client.ok("POST", "/api/projects/open", {"name": "Blot"})  # the same project, opened again
-    assert len(calls) == 3
+    client.ok("POST", "/api/projects/open", {"name": "Blot"})  # the open project: its session
+    assert len(calls) == 2
 
 
 def test_a_request_keeps_the_open_id_of_the_project_it_started_with(tmp_path, monkeypatch):
@@ -1557,14 +1559,223 @@ def test_a_switch_closes_the_old_project_and_deletes_what_only_its_history_kept(
     assert reopened.undo_step is None  # the history is per session
 
 
-def test_reopening_the_open_project_deletes_no_file_the_new_session_stored(tmp_path):
+@pytest.mark.parametrize(
+    "name",
+    ["Café µ", "CAFÉ µ", "Café µ", "café μ", "  Café  µ "],
+    ids=["exact", "case", "decomposed", "look-alike", "spaces"],
+)
+def test_reopening_the_open_project_answers_its_open_session(client, tmp_path, monkeypatch, name):
+    # Any name that resolves to the open project's folder answers the open
+    # session as it is (#93): no second session on that folder, the same open
+    # id, revision and results, and its undo history kept.
+    client.ok("POST", "/api/projects", {"name": "Café µ"})
+    _, imported = upload(client, blot_bytes(tmp_path))
+    declared = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    session = client.workspace.current()
+    calls: list = []
+    _counting(monkeypatch, calls)
+
+    reopened = client.ok("POST", "/api/projects/open", {"name": name})
+    assert client.workspace.current() is session
+    assert reopened == {"project": declared["project"], "results": declared["results"]}
+    assert reopened == client.ok("GET", "/api/project")
+    assert calls == []  # the open project's kept results
+    assert client.ok("GET", "/api/projects")["open"] == "Café µ"
+
+    undone = client.ok("POST", "/api/undo")
+    assert (undone["action"], undone["project"]["open_id"]) == ("set_lanes", 1)
+    undone = client.ok("POST", "/api/undo")
+    assert undone["action"] == "import_image"
+    assert imported["image_id"] in undone["removed"]
+
+
+def test_opening_another_project_still_switches_and_closes_the_open_one(tmp_path):
     workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
     first = workspace.create("A µ")
-    gone = blot_upload(first, tmp_path, "gone β.tif")
-    api.ops.remove_image(first, gone)  # only the history keeps its file
+    other = workspace.create("B")
+    api.ops.set_lanes(other, [api.ops.LaneInput("vehicle")])
+    assert other.undo_step is not None
+
+    opened = workspace.open("a μ")  # A, spelled otherwise
+    assert workspace.current() is opened and opened not in (first, other)
+    assert opened.folder == first.folder
+    assert (other.undo_step, other.redo_step) == (None, None)  # closed
+    assert workspace.view(opened)[0] == 3
+    assert workspace.open("A µ") is opened  # now the open one
+    assert workspace.view(opened)[0] == 3
+
+
+def test_reopening_during_an_edit_leaves_one_session_saving_the_folder(tmp_path):
+    # #93: a second session on the open folder let an edit still running on the
+    # first save over the project.json of the second and delete the file of an
+    # image only the second had stored. The reopen answers the one session now,
+    # without waiting for the edit, and the import made after it follows the edit.
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    gone = blot_upload(session, tmp_path, "gone β.tif")
+    api.ops.remove_image(session, gone)  # only the history keeps its file
     held, release = threading.Event(), threading.Event()
 
-    def running() -> None:  # a request on the old session, e.g. a preview of a large image
+    def edit() -> None:  # a request that holds the lock while it runs, then commits
+        with session.lock:
+            held.set()
+            release.wait(10)
+            api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+
+    editing = threading.Thread(target=edit)
+    editing.start()
+    assert held.wait(10)
+    answers: list[dict[str, Any]] = []
+    reopening = threading.Thread(
+        target=lambda: answers.append(api.open_project(api.NameBody(name="a µ"), workspace))
+    )
+    reopening.start()
+    reopening.join(10)
+    assert not reopening.is_alive()  # answered while the edit still runs
+    (answer,) = answers
+    assert workspace.current() is session
+    assert (answer["project"]["open_id"], answer["project"]["revision"]) == (1, 3)
+    assert history(answer)["undo"] == {"seq": 3, "action": "remove_image"}
+    stored: list[str] = []
+    importing = threading.Thread(
+        target=lambda: stored.append(blot_upload(workspace.current(), tmp_path, "stored α.tif"))
+    )
+    importing.start()
+    release.set()
+    for thread in (editing, importing):
+        thread.join(10)
+        assert not thread.is_alive()
+
+    saved = storage.load_project(session.folder)
+    assert saved == session.project
+    assert [lane.label for lane in saved.batch.lanes] == ["vehicle"]
+    assert [image.id for image in saved.batch.iter_images()] == stored
+    images = session.folder / storage.IMAGES_DIR
+    assert sorted(p.name for p in images.iterdir()) == [f"{gone}.tif", f"{stored[0]}.tif"]
+    assert [entry.action for entry in saved.log[-2:]] == ["set_lanes", "import_image"]
+    for action in ("import_image", "set_lanes", "remove_image"):  # the history is whole
+        assert api.ops.undo(session).action == action
+    assert gone in {image.id for image in session.project.batch.iter_images()}
+
+
+def test_reopening_reads_the_open_project_again_once_changed_outside_proteia(client, tmp_path):
+    # Its folder synced from another copy: the reopen reads project.json again,
+    # in the one session and under the next open id, so no edit saves the state
+    # it held before over the other copy's changes and files.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, imported = upload(client, blot_bytes(tmp_path))
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    session = client.workspace.current()  # as a request still streaming an upload holds it
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    remote = api.ops.open_project(other, clock=FakeClock())
+    newer = blot_upload(remote, tmp_path, "remote α.tif")
+    api.ops.set_lanes(remote, [api.ops.LaneInput("drug")])
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+
+    reopened = client.ok("POST", "/api/projects/open", {"name": "BLOT"})
+    assert client.workspace.current() is session
+    project = reopened["project"]
+    assert (project["open_id"], project["revision"]) == (2, revision(remote.project))
+    results = reopened["results"]
+    assert (results["open_id"], results["revision"]) == (2, project["revision"])
+    assert [lane["condition"] for lane in project["lanes"]] == ["drug"]
+    assert [image["id"] for image in project["images"]] == [imported["image_id"], newer]
+    assert history(reopened) == {"undo": None, "redo": None}
+    assert client.ok("POST", "/api/projects/open", {"name": "Blot"}) == reopened  # read once
+
+    stored = blot_upload(session, tmp_path, "stored β.tif")
+    saved = storage.load_project(session.folder)
+    assert saved == session.project
+    assert [lane.label for lane in saved.batch.lanes] == ["drug"]
+    assert [image.id for image in saved.batch.iter_images()] == [
+        imported["image_id"],
+        newer,
+        stored,
+    ]
+    images = session.folder / storage.IMAGES_DIR
+    assert sorted(p.name for p in images.iterdir()) == sorted(
+        f"{image_id}.tif" for image_id in (imported["image_id"], newer, stored)
+    )
+
+
+def test_reopening_after_a_restore_shows_the_older_project_under_a_new_open_id(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    project_file = client.root / "Blot" / storage.PROJECT_FILE
+    backup = project_file.read_bytes()
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "drug"}]})["project"]
+    project_file.write_bytes(backup)  # a previous version restored
+
+    # An earlier revision, but a later opening: a client keeping the newest
+    # answer by (open id, revision) shows it.
+    restored = client.ok("POST", "/api/projects/open", {"name": "Blot"})["project"]
+    assert (shown["open_id"], shown["revision"]) == (1, 3)
+    assert (restored["open_id"], restored["revision"]) == (2, 2)
+    assert [lane["condition"] for lane in restored["lanes"]] == ["vehicle"]
+
+    # A file that cannot be read is refused, as opening it is; the session stays.
+    project_file.write_bytes(b"{not json")
+    refused = client.refused("POST", "/api/projects/open", {"name": "Blot"})
+    assert refused[:2] == (422, "unreadable_project")
+    assert client.ok("GET", "/api/project")["project"] == restored
+
+
+def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
+    tmp_path, monkeypatch
+):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    project_file = session.folder / storage.PROJECT_FILE
+    empty = project_file.read_bytes()
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+    project_file.write_bytes(empty)  # changed outside Proteia
+    project = session.project
+
+    # An operation holds the session: the reopen answers it as it is, at once.
+    held, release = threading.Event(), threading.Event()
+
+    def running() -> None:
+        with session.lock:
+            held.set()
+            release.wait(10)
+
+    operation = threading.Thread(target=running)
+    operation.start()
+    assert held.wait(10)
+    try:
+        assert workspace.open("A µ") is session
+        assert session.project is project
+    finally:
+        release.set()
+        operation.join(10)
+    assert workspace.view(session)[0] == 1
+    assert workspace.open("A µ") is session  # nothing holds it now: read again
+    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+
+    # Unsaved changes: the file is older than the session, not changed outside.
+    def refuse(project: Project, folder: Path) -> Path:
+        raise PermissionError(13, "held by another process", str(folder))
+
+    monkeypatch.setattr(storage, "save_project", refuse)
+    api.ops.set_lanes(session, [api.ops.LaneInput("drug")])
+    assert session.dirty
+    project = session.project
+    assert workspace.open("a µ") is session and session.project is project
+    assert workspace.view(session)[0] == 2
+    assert project_file.read_bytes() == empty
+
+
+def test_a_project_created_where_the_open_one_was_removed_keeps_the_files_it_stores(tmp_path):
+    # The open project's folder removed outside Proteia, then a project of that
+    # name created: the switch closes the old session on the new project's
+    # folder, whose files it does not know, so the close deletes none.
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    first = workspace.create("A µ")
+    shutil.rmtree(first.folder)
+    held, release = threading.Event(), threading.Event()
+
+    def running() -> None:  # a request on the old session, e.g. a preview
         with first.lock:
             held.set()
             release.wait(10)
@@ -1572,25 +1783,49 @@ def test_reopening_the_open_project_deletes_no_file_the_new_session_stored(tmp_p
     request = threading.Thread(target=running)
     request.start()
     assert held.wait(10)
-    switch = threading.Thread(target=workspace.open, args=("A µ",))
-    switch.start()
+    creating = threading.Thread(target=workspace.create, args=("A µ",))
+    creating.start()
     deadline = time.monotonic() + 10
-    while workspace.current() is first:  # the switch then waits for the old one's lock
+    while workspace.current() is first:  # the close then waits for the old one's lock
         assert time.monotonic() < deadline
         time.sleep(0.005)
     second = workspace.current()
     stored = blot_upload(second, tmp_path, "stored α.tif")  # an upload that reached it
     release.set()
-    request.join(10)
-    switch.join(10)
-    assert not switch.is_alive()
+    for thread in (request, creating):
+        thread.join(10)
+        assert not thread.is_alive()
 
     assert (first.undo_step, first.redo_step) == (None, None)  # closed
     images = second.folder / storage.IMAGES_DIR
     assert sorted(p.name for p in images.iterdir()) == [f"{stored}.tif"]
     assert storage.load_project(second.folder) == second.project
-    api.ops.set_lanes(second, [api.ops.LaneInput("vehicle")])  # saves again
-    assert storage.load_project(second.folder) == second.project
+
+
+def test_the_open_project_renamed_outside_proteia_opens_as_another(tmp_path):
+    # Its old folder is gone, so whether it is the one named cannot be told: the
+    # open is a switch (whose close deletes nothing), never the session on a
+    # folder that no longer exists.
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    first = workspace.create("A µ")
+    first.folder.rename(first.folder.with_name("C"))
+    opened = workspace.open("C")
+    assert workspace.current() is opened and opened is not first
+    assert opened.folder.name == "C"
+
+
+def test_folders_differing_only_in_case_are_two_projects(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "probe").mkdir()
+    if (root / "PROBE").exists():
+        pytest.skip("two names differing only in case need a case-sensitive file system")
+    workspace = api.Workspace(root, reveal=lambda folder: None, clock=FakeClock())
+    first = workspace.create("blot")
+    api.ops.new_project(root / "Blot")
+    opened = workspace.open("Blot")  # the exact name: the other folder
+    assert opened is not first and opened.folder.name == "Blot"
+    assert workspace.open("blot") is not opened
 
 
 def test_reading_the_project_never_waits_for_a_running_operation(tmp_path):
