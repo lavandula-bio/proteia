@@ -559,6 +559,122 @@ button:disabled {
   margin: 0.3rem 0 0;
 }
 
+/* "N images waiting…": images handed to Proteia, not shown in the Import
+   dialog; outlined so it is seen among the header's buttons. */
+.waiting {
+  border-color: Highlight;
+  font-weight: 600;
+}
+
+.projects-dialog .waiting {
+  margin-bottom: 0.6rem;
+}
+
+/* The Import dialog: images handed to Proteia, one row per image with its
+   three choices side by side where the width allows, stacked where not. The
+   dialog scrolls if it must; its buttons stay at the end. */
+.handoff-dialog {
+  width: min(46rem, 94vw);
+  max-height: 94dvh;
+  padding: 0.75rem 1rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.handoff-dialog[aria-busy="true"] button {
+  cursor: progress;
+}
+
+.handoff-dialog h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1.1rem;
+}
+
+.handoff-dialog h3 {
+  margin: 0.6rem 0 0.2rem;
+  font-size: 0.95rem;
+}
+
+.handoff-dialog p {
+  margin: 0.3rem 0;
+  overflow-wrap: anywhere;
+}
+
+.handoff-dialog p:empty {
+  margin: 0;
+}
+
+.handoff-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.handoff-set-all {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  margin: 0.5rem 0;
+}
+
+.handoff-files {
+  list-style: none;
+  margin: 0.4rem 0;
+  padding: 0;
+}
+
+.handoff-file {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0 0.75rem;
+  min-width: 0;
+  margin: 0 0 0.5rem;
+  padding: 0.2rem 0.6rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.handoff-file legend {
+  padding: 0 0.3rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.handoff-file legend .hint {
+  font-weight: 400;
+}
+
+.handoff-file .field {
+  margin: 0.2rem 0;
+}
+
+/* Whether the bands are dark or light, still to choose: marked by its border
+   and weight, not by a hue alone. */
+.handoff-polarity:invalid {
+  border: 2px solid var(--warn);
+  font-weight: 600;
+}
+
+.handoff-refused .notices li {
+  overflow-wrap: anywhere;
+}
+
+.handoff-actions {
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 0.75rem;
+}
+
+.handoff-actions .hint {
+  flex: 1 1 12rem;
+}
+
+#handoff-import {
+  font-weight: 600;
+}
+
 /* Read by screen readers only. */
 .sr-only {
   position: absolute;
