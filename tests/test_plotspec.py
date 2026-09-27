@@ -24,7 +24,7 @@ from proteia.core.plotspec import (
     left_out_text,
     statement_lines,
 )
-from proteia.viz import render_figure, render_svg, save_figure
+from proteia.viz import render_figure, render_svg
 
 AUTO = StatisticsSetting()
 LINEAR = StatisticsSetting(scale="linear")
@@ -91,12 +91,6 @@ def test_render_figure_has_one_axes():
     fig = render_figure(_spec())
     assert len(fig.axes) == 1
     assert fig.axes[0].get_ylabel()
-
-
-def test_save_figure_writes_file(tmp_path):
-    out = tmp_path / "chart.png"
-    save_figure(_spec(), str(out))
-    assert out.exists() and out.stat().st_size > 0
 
 
 def test_first_label_moves_to_front():
@@ -712,7 +706,7 @@ def test_names_are_kept_as_typed_in_the_statement():
     assert_strict_json(spec)
 
 
-def test_the_napari_chart_has_coverage_from_its_bars():
+def test_a_chart_without_replicates_has_coverage_from_its_bars():
     groups = {"ctl": [1.0, 1.1], "A": [2.0, 2.1], "B": [3.0]}
     spec = _fold_change(groups)  # no replicates, no not-detected lanes
     assert [(c.label, c.n, c.replicates, c.not_detected) for c in spec.coverage] == [
@@ -927,7 +921,7 @@ def test_every_chart_states_its_test_or_why_there_is_none(groups, subtitle):
     assert _statement_text(fig).split() == " ".join(spec.statement).split()
 
 
-_NAPARI_TITLE = "p-ERK fold-change vs vehicle  (/GAPDH)"  # the form napari gives a chart
+_CHART_TITLE = "p-ERK fold-change vs vehicle  (/GAPDH)"  # a fold-change title, with a double space
 
 
 def _boxes_and_texts(spec):
@@ -970,21 +964,21 @@ def _boxes_and_texts(spec):
     ],
 )
 def test_no_title_or_statement_line_runs_past_the_figure_edge(groups, subtitle):
-    spec = _fold_change(groups, title=_NAPARI_TITLE, subtitle=subtitle)
+    spec = _fold_change(groups, title=_CHART_TITLE, subtitle=subtitle)
     title_box, statement_box, figure, title, statement = _boxes_and_texts(spec)
     for box in (title_box, statement_box):  # a saved figure crops what lies outside
         assert 0 <= box.x0 and box.x1 <= figure.width
         assert 0 <= box.y0 and box.y1 <= figure.height
-    wanted = " ".join([_NAPARI_TITLE, *([subtitle] if subtitle else [])])
+    wanted = " ".join([_CHART_TITLE, *([subtitle] if subtitle else [])])
     assert title.split() == wanted.split()  # every word is still drawn, in order
     assert statement.split() == " ".join(spec.statement).split()
 
 
 def test_a_title_that_fits_keeps_its_lines():
     groups = {"vehicle": [1.0, 1.1], "10 µM": [2.0, 2.1]}
-    spec = _fold_change(groups, title=_NAPARI_TITLE)
+    spec = _fold_change(groups, title=_CHART_TITLE)
     title_box, _, figure, title, _ = _boxes_and_texts(spec)
-    assert title.split("\n") == [_NAPARI_TITLE]
+    assert title.split("\n") == [_CHART_TITLE]
     assert 0 <= title_box.x0 and title_box.x1 <= figure.width
 
 

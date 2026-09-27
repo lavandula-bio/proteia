@@ -79,8 +79,6 @@ def _imported_top_levels(path: Path) -> set[str]:
 def test_nothing_the_app_imports_is_left_out():
     excluded = set(bundle.EXCLUDES)
     for path in PACKAGE.rglob("*.py"):
-        if "gui" in path.relative_to(PACKAGE).parts:
-            continue  # the napari GUI, left out as a whole
         for name in _imported_top_levels(path):
             parts = name.split(".")
             prefixes = {".".join(parts[: n + 1]) for n in range(len(parts))}
@@ -417,6 +415,18 @@ def test_an_environment_whose_install_stopped_is_made_again(tmp_path, monkeypatc
 
 
 # --- The notices ---
+
+
+def test_the_notices_table_names_every_direct_runtime_dependency():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    direct = {
+        bundle.normalize(re.match(r"[A-Za-z0-9._-]+", requirement).group())
+        for requirement in pyproject["project"]["dependencies"]
+    }
+    table = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    rows = re.findall(r"^\| ([^|]+?) \| [^|]+ \|$", table, flags=re.MULTILINE)
+    assert rows[:2] == ["Package", "---"]
+    assert direct - {bundle.normalize(name) for name in rows[2:]} == set()
 
 
 def _dist_info(contents: Path, name: str, version: str, meta: str, files: dict[str, str]) -> None:

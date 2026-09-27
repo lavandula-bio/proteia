@@ -5,7 +5,6 @@ import pytest
 
 from proteia.core.analyze import reduce_samples
 from proteia.core.project import (
-    align_to_lanes,
     anchoring_lanes,
     build_spine,
     join_to_spine,
@@ -14,47 +13,7 @@ from proteia.core.project import (
     lanes_run_right_to_left,
     propose_lane,
     spine_axes,
-    spine_from_labels,
 )
-
-# --- align_to_lanes: position-based grid alignment ---
-
-# A full protein at lanes x=10,20,30,40 anchors the 4-column grid for the others.
-FULL = [(10, 1.0), (20, 2.0), (30, 3.0), (40, 4.0)]
-
-
-def test_align_full_protein_maps_one_to_one():
-    assert align_to_lanes([FULL], 4) == [[1.0, 2.0, 3.0, 4.0]]
-
-
-def test_align_missing_middle_leaves_a_gap():
-    missing_mid = [(10, 5.0), (20, 6.0), (40, 8.0)]  # no box at x=30 (lane 2)
-    assert align_to_lanes([FULL, missing_mid], 4) == [
-        [1.0, 2.0, 3.0, 4.0],
-        [5.0, 6.0, None, 8.0],
-    ]
-
-
-def test_align_missing_first_does_not_shift():
-    missing_first = [(20, 9.0), (30, 10.0), (40, 11.0)]  # no box at x=10 (lane 0)
-    assert align_to_lanes([FULL, missing_first], 4) == [
-        [1.0, 2.0, 3.0, 4.0],
-        [None, 9.0, 10.0, 11.0],
-    ]
-
-
-def test_align_single_lane_puts_all_in_column_zero():
-    assert align_to_lanes([[(10, 1.0)], [(99, 2.0)]], 1) == [[1.0], [2.0]]
-
-
-def test_align_no_boxes_all_none():
-    assert align_to_lanes([[], []], 3) == [[None, None, None], [None, None, None]]
-
-
-def test_align_requires_positive_lanes():
-    with pytest.raises(ValueError, match="n_lanes"):
-        align_to_lanes([FULL], 0)
-
 
 # --- build_spine: declare-first lane generation ---
 
@@ -85,23 +44,6 @@ def test_build_spine_rejects_duplicate_labels():
 def test_build_spine_rejects_nonpositive_count():
     with pytest.raises(ValueError, match=">= 1"):
         build_spine([("A", 0)])
-
-
-# --- spine_from_labels: per-lane list preserves order, auto-numbers samples ---
-
-
-def test_spine_from_labels_keeps_order_and_numbers_per_condition():
-    spine = spine_from_labels(["ctl", "A", "ctl", "A"])  # interleaved
-    assert [(lane.index, lane.label, lane.sample) for lane in spine] == [
-        (0, "ctl", "ctl1"),
-        (1, "A", "A1"),
-        (2, "ctl", "ctl2"),  # running count is per condition, not per position
-        (3, "A", "A2"),
-    ]
-
-
-def test_spine_from_labels_empty():
-    assert spine_from_labels([]) == []
 
 
 # --- propose_lane: position proposes a new box's lane from anchored lanes ---
@@ -278,7 +220,7 @@ def test_join_places_by_explicit_position():
 
 def test_join_gap_is_none_and_does_not_shift_neighbours():
     # Box at slot 2 is missing; slot 3 keeps its value (no shift). This is the
-    # property align_to_lanes could not guarantee through re-inference.
+    # property inferring lanes from box positions could not guarantee.
     assert join_to_spine([[(0, 5.0), (1, 6.0), (3, 8.0)]], 4) == [[5.0, 6.0, None, 8.0]]
 
 

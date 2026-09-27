@@ -10,16 +10,15 @@ position) and an *identity* (which lane it is). Identity is the source of truth;
 geometry is only one way to *propose* it. So the pipeline is three separable
 parts:
 
-* :func:`spine_from_labels` (per-lane condition list, used by the napari app) or
-  :func:`build_spine` (condition counts) — declare-first: generate the N lanes
+* :func:`build_spine` (condition counts) — declare-first: generate the N lanes
   (stable positions + auto sample ids). This fixes N before any box is drawn, so
   a missing box becomes an empty slot rather than a shift.
 * :func:`propose_lane` — position demoted from source of truth to a
   *proposal* of a new box's lane, anchored on the boxes already placed.
 * :func:`join_to_spine` — reads the *explicit* lane positions and scatters each
   protein's nets into the spine. A gap is a ``None`` slot that does not move its
-  neighbours — this is what cures the position-inference scramble (see the legacy
-  :func:`align_to_lanes` below, kept only as a no-spine fallback).
+  neighbours — this is what cures the scramble that inferring every box's lane
+  from its position caused when a box was missing.
 
 Downstream (reduce / stats) reads identity and never re-infers it. Future
 auto-detect / OCR are just smarter proposers feeding the same explicit identity.
@@ -55,9 +54,6 @@ def build_spine(declaration: Sequence[tuple[str, int]]) -> list[Lane]:
     contiguous here; a non-contiguous layout is expressed by editing the spine
     afterwards (its lanes are freely mutable). Condition labels must be distinct
     and every count must be >= 1.
-
-    The napari app builds its spine with :func:`spine_from_labels` instead; this
-    form is kept for a lane table that is declared as condition counts.
     """
     labels = [cond for cond, _ in declaration]
     if len(set(labels)) != len(labels):
@@ -70,25 +66,6 @@ def build_spine(declaration: Sequence[tuple[str, int]]) -> list[Lane]:
         for ordinal in range(1, count + 1):
             lanes.append(Lane(index=position, label=cond, sample=f"{cond}{ordinal}"))
             position += 1
-    return lanes
-
-
-def spine_from_labels(labels: Sequence[str]) -> list[Lane]:
-    """Build a spine from a per-lane condition list (the "assign in order" form).
-
-    Where :func:`build_spine` takes ``(condition, count)`` and lays conditions out
-    in contiguous blocks, this takes the already-expanded per-lane labels (e.g.
-    ``["ctl", "A", "ctl"]``) and keeps their exact order, so non-contiguous
-    layouts survive. Each lane's auto sample id is its condition plus a running
-    ordinal *within that condition* (``ctl1`` ... ``ctl2`` even when interleaved),
-    i.e. biological replicates by default; technical repeats are marked later by
-    sharing a sample id.
-    """
-    counts: dict[str, int] = {}
-    lanes: list[Lane] = []
-    for position, label in enumerate(labels):
-        counts[label] = counts.get(label, 0) + 1
-        lanes.append(Lane(index=position, label=label, sample=f"{label}{counts[label]}"))
     return lanes
 
 
@@ -339,41 +316,3 @@ def spine_axes(spine: Sequence[Lane]) -> tuple[list[str], list[str | None], list
     samples = [lane.sample for lane in ordered]
     included = [lane.included for lane in ordered]
     return conditions, samples, included
-
-
-def align_to_lanes(
-    proteins_boxes: Sequence[Sequence[tuple[int, float]]], n_lanes: int
-) -> list[list[float | None]]:
-    """Align every protein's boxes to a shared ``n_lanes``-column grid by position.
-
-    Legacy. Superseded by the explicit spine (:func:`build_spine` +
-    :func:`join_to_spine`); kept only as the fallback when no spine exists, since
-    its grid inference is what scrambles when a box is missing. Prefer the spine.
-
-    Each protein is a sequence of ``(x, net)``. A single grid is built from the
-    x-range across *all* proteins and split into ``n_lanes`` equal columns; every
-    box is placed in its nearest column. Because placement is by position, a box
-    at the second lane's x lands in column 1 even if column 0 was never filled for
-    that protein, so missing-first / -middle / -last all resolve the same way.
-    Columns with no box are ``None``; if two boxes of one protein map to the same
-    column, the later one wins.
-
-    Returns, per protein, a list of ``n_lanes`` cells. Requires ``n_lanes >= 1``.
-    The outer lanes can only be anchored if some protein reaches them; otherwise
-    the grid is a best-effort fit over the observed range.
-    """
-    if n_lanes < 1:
-        raise ValueError("n_lanes must be >= 1")
-    all_x = [x for boxes in proteins_boxes for (x, _) in boxes]
-    rows: list[list[float | None]] = []
-    if not all_x:
-        return [[None] * n_lanes for _ in proteins_boxes]
-    x_min, x_max = min(all_x), max(all_x)
-    span = x_max - x_min
-    for boxes in proteins_boxes:
-        row: list[float | None] = [None] * n_lanes
-        for x, net in boxes:
-            col = 0 if (n_lanes == 1 or span == 0) else round((x - x_min) / span * (n_lanes - 1))
-            row[max(0, min(n_lanes - 1, col))] = net
-        rows.append(row)
-    return rows

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the project operations and the session they work on.
 
-No napari and no Qt: every test drives :mod:`proteia.core.operations` directly,
+With no front end, every test drives :mod:`proteia.core.operations` directly,
 in project folders with non-ASCII names, on real TIFF files written by
 ``conftest.write_tiff``. The box tests use a 16-bit ``synthetic_blot`` with a
 narrow and a wide band in one row; the parity tests at the end pin the whole
@@ -21,8 +21,6 @@ import json
 import math
 import os
 import shutil
-import subprocess
-import sys
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
@@ -938,19 +936,6 @@ def test_parallel_operations_get_distinct_ids(tmp_path):
     assert [entry.seq for entry in log] == list(range(1, len(log) + 1))
     added = [entry.params["protein_id"] for entry in log if entry.action == "add_protein"]
     assert added == [p.id for p in s.project.batch.proteins]  # in commit order
-
-
-def test_core_imports_no_gui_toolkit():
-    code = (
-        "import sys\n"
-        "import proteia.core.operations, proteia.core.results\n"
-        "gui = ('napari', 'qtpy', 'magicgui', 'PySide6')\n"
-        "print([name for name in gui if name in sys.modules])\n"
-    )
-    done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True
-    )
-    assert done.stdout.strip() == "[]"
 
 
 # --- images ---
@@ -2017,35 +2002,6 @@ def test_a_removal_reads_the_pixels_only_when_bands_stay_on_the_image(tmp_path):
     ops.remove_box(reopened, band_a)  # the last box: nothing is left to quantify
     assert _bands_on_image(reopened, image) == []
     assert reopened._pixels == {}
-
-
-def test_the_napari_app_shows_the_nets_the_operations_store(tmp_path):
-    # The app module imports headlessly (napari and Qt are imported inside
-    # launch); #57 retires the app, and this case with it.
-    from proteia.gui import app
-
-    s, image, a, b = two_proteins(tmp_path)
-    for protein, x, lane in ((a, NARROW_X, 0), (b, NARROW_X + 16, 1), (a, WIDE_X, 2)):
-        ops.place_box(s, protein, x, ROW, lane_index=lane, grow=False)  # GAPDH in a ring
-    proteins = [protein_of(s, a), protein_of(s, b)]
-    state = {  # the app's state, as its placement leaves it
-        "images": [
-            {
-                "array": s.pixels(image),
-                "dark": True,
-                "bit_depth": s.project.batch.find_image(image).bit_depth,
-            }
-        ],
-        "proteins": [{"image": 0, "base": p.box_size, "pad_w": 0, "pad_h": 0} for p in proteins],
-        "placed": [
-            {"pid": k, "rect": band.box.rect(p.box_size)}
-            for k, p in enumerate(proteins)
-            for band in p.bands
-        ],
-    }
-    for k, protein in enumerate(proteins):
-        stored = sorted((band.box.x, band.net) for band in protein.bands)
-        assert app._boxes_with_nets(state, k) == stored, protein.name
 
 
 def test_a_ring_cut_short_stores_its_fallback_and_is_reported(tmp_path):

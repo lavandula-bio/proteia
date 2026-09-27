@@ -5,20 +5,18 @@ keep equal area, and forbid overlap.
 These are pure functions over rectangles so the rules can be unit-tested
 without a GUI. :func:`resize_all` enforces the shared size when it changes and
 refuses a size that would force an overlap (:func:`resize_checked` names the
-boxes instead); :func:`normalize_corners` reads napari shape vertices.
+boxes instead).
 
-The placement rules of the napari app's box handlers are lifted here so the
-project operations (:mod:`proteia.core.operations`) apply them too:
-:func:`centered_rect` places a box of the shared size on a point, clamped into
-the image; :func:`center_snap` reads an edited rect by its centre (napari's
-``_center_snap``); :func:`initial_box_size` is a new protein's default size
-(``_initial_size``); and :func:`grow_to_fit` fits the shared size to a
-seed-grown band (``_seed_grow``), :func:`grow_to_fit_all` to several bands at
-once (a detected row), each keeping the protein's padding (#57; its sizes in
-words: :func:`size_words`). Only one protein's own boxes must not overlap
-(:func:`overlaps_any`); boxes of different proteins may. :func:`place_in_row`
-places one row of same-size boxes left to right without overlap (row-box
-detection, :mod:`proteia.core.rowdetect`).
+The project operations (:mod:`proteia.core.operations`) place boxes by these
+rules: :func:`centered_rect` places a box of the shared size on a point,
+clamped into the image; :func:`center_snap` reads an edited rect by its centre;
+:func:`initial_box_size` is a new protein's default size; and
+:func:`grow_to_fit` fits the shared size to a seed-grown band,
+:func:`grow_to_fit_all` to several bands at once (a detected row), each keeping
+the protein's padding (#57; its sizes in words: :func:`size_words`). Only one
+protein's own boxes must not overlap (:func:`overlaps_any`); boxes of different
+proteins may. :func:`place_in_row` places one row of same-size boxes left to
+right without overlap (row-box detection, :mod:`proteia.core.rowdetect`).
 
 Coordinates use the model's :data:`~proteia.core.model.Rect` convention:
 ``(x0, y0, x1, y1)`` in image pixels, half-open on the high edge, with the box
@@ -54,20 +52,6 @@ class BoxRuleError(ValueError):
         self.code: BoxRuleCode = code
         self.size: BoxSize = size
         self.hits: tuple[int, ...] = tuple(hits)
-
-
-def normalize_corners(corners: Sequence[Sequence[float]]) -> Rect:
-    """Convert napari rectangle vertices to a normalized rect.
-
-    napari shape vertices are ``(row, col) = (y, x)`` and may be given in any
-    corner order; return ``(x0, y0, x1, y1)`` with ``x0 <= x1`` and
-    ``y0 <= y1``, rounded to integer pixels.
-    """
-    ys = [c[0] for c in corners]
-    xs = [c[1] for c in corners]
-    x0, x1 = round(min(xs)), round(max(xs))
-    y0, y1 = round(min(ys)), round(max(ys))
-    return (int(x0), int(y0), int(x1), int(y1))
 
 
 def overlaps_any(rect: Rect, others: Iterable[Rect]) -> bool:

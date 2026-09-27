@@ -3,7 +3,7 @@
 #
 # PyInstaller spec for Proteia's Windows bundle (ADR 0003): one folder, with a
 # console window (v0.1), holding Proteia.exe and its _internal folder. build.py
-# runs it in a build environment made from uv.lock without napari's tree:
+# runs it in a build environment made from uv.lock:
 #
 #   python -m PyInstaller --noconfirm --clean --distpath DIST --workpath WORK proteia.spec
 #

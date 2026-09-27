@@ -568,7 +568,7 @@ def _chart(
         if firsts:
             undetected[condition] = firsts
     tested = {c: g for c, g in shown.items() if c not in undetected}
-    # Statistics run on the plotted subset, as the napari chart does.
+    # Statistics run on the plotted subset.
     test = chart_test(tested, setting=setting, kind=kind, reference=reference)
     spec = build_plotspec(
         shown,
@@ -964,7 +964,7 @@ def _compute(
                 try:
                     baseline = reference_baseline(red.groups, ref)
                 except BaselineError as exc:
-                    chartable = False  # the napari chart skips such a series too
+                    chartable = False  # no baseline, so no fold change to chart
                     # Already explained when every reference lane is excluded, or when
                     # the series has no value at all (NO_VALUES below).
                     if not reference_all_excluded and red.groups:

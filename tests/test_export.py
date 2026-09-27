@@ -2,6 +2,7 @@
 """Tests for GUI-independent file exports."""
 
 import csv
+import io
 
 import pytest
 
@@ -11,30 +12,26 @@ from proteia.core.export import (
     SeriesColumn,
     lane_columns,
     lane_table_bytes,
-    write_lane_table,
 )
 
 BOM = b"\xef\xbb\xbf"
 
 
-def _read_rows(path):
-    with path.open(encoding="utf-8-sig", newline="") as fh:
-        return list(csv.reader(fh))
+def _rows(data):
+    return list(csv.reader(io.StringIO(data.decode("utf-8-sig"), newline="")))
 
 
-def test_lane_table_round_trips_non_ascii_names(tmp_path):
+def test_lane_table_keeps_non_ascii_names():
     # µ is not in cp950 (Traditional Chinese Windows), so a locale-encoded write
     # raised UnicodeEncodeError; α and β were written in the locale code page.
-    path = tmp_path / "β-actin 10 µM.csv"
-    write_lane_table(
-        path,
+    data = lane_table_bytes(
         conditions=["vehicle", "10 µM", "10 µM"],
         samples=["α1", "β2", None],
         included=[True, True, False],
         proteins=[("β-actin", [1.0, 2.5, None]), ("α-tubulin", [0.5, None, 3.25])],
     )
-    assert path.read_bytes().startswith(BOM)  # Excel detects UTF-8 from the BOM
-    assert _read_rows(path) == [
+    assert data.startswith(BOM)  # Excel detects UTF-8 from the BOM
+    assert _rows(data) == [
         ["lane", "condition", "sample", "include", "β-actin", "α-tubulin"],
         ["1", "vehicle", "α1", "yes", "1.0", "0.5"],  # lanes numbered from 1, as the app does
         ["2", "10 µM", "β2", "yes", "2.5", ""],
@@ -42,33 +39,29 @@ def test_lane_table_round_trips_non_ascii_names(tmp_path):
     ]
 
 
-def test_lane_table_rounds_nets_to_three_decimals(tmp_path):
-    path = tmp_path / "table.csv"
-    write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.23456])])
-    assert _read_rows(path)[1][-1] == "1.235"
+def test_lane_table_rounds_nets_to_three_decimals():
+    data = lane_table_bytes(["a"], ["s1"], [True], [("p", [1.23456])])
+    assert _rows(data)[1][-1] == "1.235"
 
 
-def test_lane_table_rejects_misaligned_columns(tmp_path):
+def test_lane_table_rejects_misaligned_columns():
     with pytest.raises(ValueError, match="same length"):
-        write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1"], [True, True], [])
+        lane_table_bytes(["a", "b"], ["s1"], [True, True], [])
     with pytest.raises(ValueError, match="same length"):
-        write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1", "s2"], [True], [])
-    assert not (tmp_path / "t.csv").exists()  # checked before the file is opened
+        lane_table_bytes(["a", "b"], ["s1", "s2"], [True], [])
     with pytest.raises(ValueError, match="2 lanes"):
-        write_lane_table(tmp_path / "t.csv", ["a", "b"], ["s1", "s2"], [True, True], [("p", [1])])
+        lane_table_bytes(["a", "b"], ["s1", "s2"], [True, True], [("p", [1])])
 
 
-def test_lane_table_marks_clipped_bands(tmp_path):
-    path = tmp_path / "clipped.csv"
-    write_lane_table(
-        path,
+def test_lane_table_marks_clipped_bands():
+    data = lane_table_bytes(
         ["a", "a", "b"],
         ["s1", "s2", "s3"],
         [True, True, True],
         [("β-actin", [1.0, 2.0, None]), ("α-tubulin", [3.0, 4.0, 5.0])],
         clipped={"β-actin": [True, False, None]},
     )
-    rows = _read_rows(path)
+    rows = _rows(data)
     assert rows[0] == [
         "lane",
         "condition",
@@ -80,12 +73,11 @@ def test_lane_table_marks_clipped_bands(tmp_path):
     ]
     assert [row[5] for row in rows[1:]] == ["yes", "no", ""]
     with pytest.raises(ValueError, match="2 clipping flags but there are 1 lanes"):
-        write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.0])], clipped={"p": [True, False]})
+        lane_table_bytes(["a"], ["s1"], [True], [("p", [1.0])], clipped={"p": [True, False]})
     with pytest.raises(ValueError, match="not in the table"):
-        write_lane_table(path, ["a"], ["s1"], [True], [("p", [1.0])], clipped={"q": [True]})
+        lane_table_bytes(["a"], ["s1"], [True], [("p", [1.0])], clipped={"q": [True]})
     with pytest.raises(ValueError, match="share a name"):
-        write_lane_table(
-            path,
+        lane_table_bytes(
             ["a"],
             ["s1"],
             [True],
@@ -94,17 +86,14 @@ def test_lane_table_marks_clipped_bands(tmp_path):
         )
 
 
-def test_lane_table_bytes_match_the_written_file(tmp_path):
-    table = (
+def test_lane_table_bytes_are_the_csv_text():
+    data = lane_table_bytes(
         ["vehicle", "10 µM"],
         ["α1", None],
         [True, False],
         [("β-actin", [1.23456, None])],
+        clipped={"β-actin": [False, None]},
     )
-    data = lane_table_bytes(*table, clipped={"β-actin": [False, None]})
-    path = tmp_path / "table β.csv"
-    write_lane_table(path, *table, clipped={"β-actin": [False, None]})
-    assert path.read_bytes() == data
     assert LANE_TABLE_DECIMALS == 3
     rows = (
         "lane,condition,sample,include,β-actin,β-actin clipped\r\n"
@@ -112,18 +101,6 @@ def test_lane_table_bytes_match_the_written_file(tmp_path):
         "2,10 µM,,no,,\r\n"
     )
     assert data == BOM + rows.encode()
-
-    collision = tmp_path / "collision.csv"
-    with pytest.raises(ValueError, match="share a name"):
-        write_lane_table(
-            collision,
-            ["a"],
-            ["s1"],
-            [True],
-            [("p", [1.0]), ("p clipped", [2.0])],
-            clipped={"p": [True]},
-        )
-    assert not collision.exists()  # checked before the file is opened
 
 
 def test_lane_table_series_columns_follow_the_proteins():
