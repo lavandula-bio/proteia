@@ -1749,25 +1749,30 @@ def _misnumbered_lanes(
     )
 
 
-def _row_refusal(found: rowdetect.RowDetection) -> OperationError:
+def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationError:
     """The refusal of a row whose detection :func:`detect_row_boxes` cannot
-    commit, worded by what the detector saw.
+    commit, worded by what the detector saw; ``x0`` and ``x1`` are the row
+    box's sides, clipped to the image.
 
     Refused by a refusing flag (``ROW_LANES_UNCLEAR``): a box that cuts through
     the bands says so first (cause ``cut_by_row_box``: a lane ``cut``, whether
     its band's extent reaches the box's edge or the band peaks on the edge row
     and was left out), since drawn over every lane it can still misread them;
-    then a box whose left or right edge cuts through a band (cause
-    ``side_signal``: a lane's band rises into that edge); otherwise the first
-    refusing flag. No band sized (``NO_BAND_FOUND``), by the empty lanes'
-    reasons: bands kept but in no lane (``unassigned``), signal only at the
-    box's top or bottom edge (``edge_signal``: a box through the bands, or over
-    a neighbouring row), only signal rising into its left or right edge
-    (``side_signal``: a band the box cuts through there, or a dark image edge),
-    only a line or strip across the lanes (``line``: a frame line, a dark strip
-    along the image's edge), only a streak or stain filling its height
-    (``artefact``), a box with too little membrane to measure the bands
-    against (``too_little_membrane``:
+    then a box whose left or right edge cuts through a band and so leaves
+    lanes out (cause ``side_signal``: ``lanes_outside_row``, and a lane of
+    signal rising into the box's side past the lanes holding bands, at an end
+    where a lane's expected centre lies outside the box); otherwise the first
+    refusing flag (signal rising into the box's side elsewhere, as a dark
+    image edge leaves, does not make the lanes unclear). No band sized
+    (``NO_BAND_FOUND``), by the empty lanes' reasons: bands kept but in no
+    lane (``unassigned``), signal only at the box's top or bottom edge
+    (``edge_signal``: a box through the bands, or over a neighbouring row),
+    only signal rising into its left or right edge (``side_signal``: a band
+    the box cuts through there, or a dark image edge), only a line or strip
+    across the lanes (``line``: a frame line, a dark strip along the image's
+    edge), only a streak or stain filling its height (``artefact``), a box
+    with too little membrane to measure the bands against
+    (``too_little_membrane``:
     :attr:`~proteia.core.rowdetect.RowDetection.membrane_shift` at least
     :data:`~proteia.core.rowdetect.MEMBRANE_SHIFT_K`: detection took a band for
     its membrane), else no band (``no_band``).
@@ -1781,6 +1786,20 @@ def _row_refusal(found: rowdetect.RowDetection) -> OperationError:
     reasons = {lane.reason for lane in found.lanes}
     if found.refused:
         code = ErrorCode.ROW_LANES_UNCLEAR
+        # Signal rising into the box's side past the bands, at an end where
+        # lanes lie outside the box: the side edge cut a band and left them out.
+        banded = [lane.expected_x for lane in found.lanes if lane.rect is not None]
+        sides = [lane.expected_x for lane in found.lanes if lane.reason == "side_signal"]
+        empty = [lane.expected_x for lane in found.lanes if lane.rect is None]
+        side_cut = (
+            "lanes_outside_row" in found.flags
+            and bool(banded)
+            and any(
+                (x < min(banded) and any(e < x0 for e in empty))
+                or (x > max(banded) and any(e > x1 for e in empty))
+                for x in sides
+            )
+        )
         if any(lane.cut for lane in found.lanes):
             cause = "cut_by_row_box"
             message = (
@@ -1788,7 +1807,7 @@ def _row_refusal(found: rowdetect.RowDetection) -> OperationError:
                 " is in; draw it over the whole band height and every declared lane, empty end"
                 " lanes included"
             )
-        elif "side_signal" in reasons:
+        elif side_cut:
             cause = "side_signal"
             message = (
                 "the row box's left or right edge cuts through a band, so it does not show"
@@ -2053,7 +2072,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         ids = (image.id,) if exc.code == "invalid_image" else ()
         raise OperationError(_ROW_ERRORS[exc.code], str(exc), ids=ids) from exc
     if found.refused or found.size is None:
-        raise _row_refusal(found)
+        raise _row_refusal(found, max(0, given[0]), min(width, given[2]))
 
     # Band index 0, per lane: a box edited by hand stays, and so does one the
     # user placed where no band was found; any other gives way.

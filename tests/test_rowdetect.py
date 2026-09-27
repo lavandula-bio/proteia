@@ -1056,9 +1056,9 @@ def test_frame_lines_across_the_row_are_no_bands(monkeypatch, dy, px):
 
 
 def test_a_frame_around_empty_lanes_is_no_band():
-    # Each of the frame's lines lies beside the other, where a row of thin
-    # touching bands lies beside nothing: a box over a frame and no band finds
-    # nothing.
+    # Each of the frame's lines lies beside the other and ends where it ends
+    # (neither holds its level past the other's ends, as a frame's line does
+    # past a row of thin bands): a box over a frame and no band finds nothing.
     case = adversarial_row(
         "empty frame",
         1000,
@@ -1261,6 +1261,31 @@ def test_touching_and_saturated_rows_are_unchanged(monkeypatch, name):
     found = detect(case)
     _rules_off(monkeypatch)
     assert detect(case) == found
+
+
+@pytest.mark.parametrize(
+    ("up", "down"), [(10, 0), (0, 10), (10, 10)], ids=["line-above", "line-below", "both-lines"]
+)
+def test_thin_touching_bands_beside_a_frame_line_keep_their_boxes(up, down):
+    # Thin touching bands (flat along x, no higher than a drawn line) in a
+    # panel's frame, the box inside its sides reaching up or down to its
+    # lines: each lies beside the other, but a line runs on across the box
+    # past the row's end shoulders, where the row ends inside it. The lines
+    # are taken out; the bands keep their boxes, as without the frame.
+    case = adversarial_row(
+        "thin framed",
+        1000,
+        h=5.0,
+        mx=4,
+        artefacts=[frame(12, 2, 20000.0)],
+        box_adjust=(0, -up, 0, down),
+        **_TOUCHING,
+    )
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert [lane.reason for lane in found.lanes] == ["band"] * 6
+    alone = detect(UNCHANGED_ROWS["thin_touching_no_dip"])
+    assert found.size == alone.size
 
 
 @pytest.mark.parametrize(

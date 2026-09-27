@@ -5621,6 +5621,33 @@ def test_bands_that_fit_no_lane_are_not_no_band(tmp_path, monkeypatch):
     assert_raw_reason(error.detail, unfit)
 
 
+def test_crowded_lanes_beside_signal_at_the_side_are_worded_as_crowded(tmp_path, monkeypatch):
+    # A row over every lane refused because two lanes' extents crowd each
+    # other, whose empty first lane holds only signal rising into the box's
+    # left edge (a dark image edge): that edge leaves no lane out, so the
+    # words are the crowded lanes', not a side edge cutting a band.
+    s, _, protein = row_session(tmp_path, SCENE)
+    measure = rowdetect._measure
+
+    def crowd(lanes, *args):
+        measure(lanes, *args)
+        a, b = lanes[2].rect, lanes[3].rect
+        x = (a[0] + a[2]) // 2 - (b[2] - b[0]) // 2
+        lanes[3].rect = (x, b[1], x + b[2] - b[0], b[3])
+
+    monkeypatch.setattr(rowdetect, "_measure", crowd)
+    found = detected(s, protein, SCENE.row)
+    assert found.flags == ("ambiguous_lanes",) and found.lanes[0].reason == "no_band"
+    assert any("extents closer than the narrowest band" in note for note in found.notes)
+    first = dataclasses.replace(found.lanes[0], reason="side_signal")
+    edged = dataclasses.replace(found, lanes=(first, *found.lanes[1:]))
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: edged)
+    error = row_refused(s, protein, SCENE.row)
+    assert (error.code, str(error)) == (ErrorCode.ROW_LANES_UNCLEAR, UNCLEAR)
+    assert error.detail["cause"] == "ambiguous_lanes"
+    assert_raw_reason(error.detail, edged)
+
+
 def test_a_refusal_before_detection_carries_no_detail(tmp_path):
     s, _, protein = row_session(tmp_path, SCENE)
     with pytest.raises(OperationError) as info:

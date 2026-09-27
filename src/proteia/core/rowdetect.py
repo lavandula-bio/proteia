@@ -706,8 +706,12 @@ def _lines(s: np.ndarray, sigma_sm: float, n: int, image_rows: tuple[bool, bool]
     (``_min_width``) that the detector keeps (a band, or the frame's other
     line): in the row's rows (a neighbouring row's hump at the box's edge
     left out, :func:`_row_rows`), and not peaking on the box's top or bottom
-    row. A band next to a line keeps its own pixels: a line is taken out of a
-    component, not the component with it.
+    row. But a thin structure that holds its level (``LINE_FLAT`` of its
+    median) a band's width past both ends of another's is that one's frame,
+    no sign of it being a line: a frame's line runs on across the box past a
+    row of thin bands' end shoulders, where the row's level ends, while a
+    frame's two lines end alike. A band next to a line keeps its own pixels:
+    a line is taken out of a component, not the component with it.
 
     ``image_rows`` says whether the box's top and bottom rows are the image's.
     A candidate that is flat along one of those rows over ``LINE_SPAN`` pitches
@@ -802,21 +806,36 @@ def _lines(s: np.ndarray, sigma_sm: float, n: int, image_rows: tuple[bool, bool]
             at_edge[1:] = [y in (0, hc - 1) for y, _ in tops_at]
         other = strong & ~slope & ~at_edge[rest]
         structures, count = label(thin)
+        regions = find_objects(structures)
+        at_edge = np.zeros(count + 1, bool)
         if count:
             tops_at = maximum_position(s, structures, np.arange(1, count + 1))
-            at_edge = np.array([False] + [y in (0, hc - 1) for y, _ in tops_at])
-            other |= strong & thin & ~at_edge[structures]
+            at_edge[1:] = [y in (0, hc - 1) for y, _ in tops_at]
+        other_thin = strong & thin & ~at_edge[structures]
         lo, hi = _row_rows(np.where(slope, 0.0, s), sigma_sm)
-        other[:lo] = False
-        other[hi:] = False
+        for mask in (other, other_thin):
+            mask[:lo] = False
+            mask[hi:] = False
+        # Where each holds its level along x: its first and last column at
+        # LINE_FLAT of its median level (a row of bands' end shoulders left out).
+        ends = np.zeros((count + 1, 2))
+        for k, sl in enumerate(regions):
+            top = np.where(structures[sl] == k + 1, s[sl], 0.0).max(axis=0)
+            on = np.flatnonzero(top >= LINE_FLAT * float(np.median(top[top > 0])))
+            ends[k + 1] = sl[1].start + on[0], sl[1].start + on[-1]
+        w = _min_width(wc, n)
         down = np.arange(hc)[:, None]
-        for k, sl in enumerate(find_objects(structures)):
+        for k, sl in enumerate(regions):
             one = structures[sl] == k + 1
             cols = one.any(axis=0)
             upper = np.argmax(one, axis=0) + sl[0].start  # its first row per column
             lower = sl[0].stop - 1 - np.argmax(one[::-1], axis=0)  # ...and its last
-            off = other[:, sl[1]] & ((down < upper) | (down > lower)) & cols
-            if np.count_nonzero(off.any(axis=0)) >= _min_width(wc, n):
+            # A thin structure holding its level a band's width past both its
+            # ends is its frame's line, beside the row: no sign of a line.
+            frames = (ends[:, 0] <= ends[k + 1, 0] - w) & (ends[:, 1] >= ends[k + 1, 1] + w)
+            beside = other[:, sl[1]] | (other_thin[:, sl[1]] & ~frames[structures[:, sl[1]]])
+            off = beside & ((down < upper) | (down > lower)) & cols
+            if np.count_nonzero(off.any(axis=0)) >= w:
                 lines[:, sl[1]] |= structures[:, sl[1]] == k + 1
     if image_rows[0] or image_rows[1]:
         comps, _ = label(s > thr)
