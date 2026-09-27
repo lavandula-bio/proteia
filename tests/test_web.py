@@ -1019,7 +1019,7 @@ def test_the_import_dialog_never_chooses_a_polarity_the_user_did_not():
     assert '$("handoff-import").disabled = !this.ready();' in _method(dialog, "renderActions(")
     assert "polarity: polarityOf(row).value," in _method(dialog, "choices(")
     # The listing refreshes the rows, never while this page's own import or
-    # discard of the hand-off is awaited (its claim hides it from the listing).
+    # discard of the hand-off is awaited (its own claim lists it as claimed).
     app = _code("app.js")
     _, take = _function(app, "function takeListing(")
     assert take.index("if (shown && !importDialog.busy)") < take.index("importDialog.refresh(now)")
@@ -1036,11 +1036,12 @@ def test_the_page_finds_images_waiting_at_start_on_focus_and_before_quitting():
     shown = quit_press.index('takeListing(workspace, { show: "asked" });')
     assert quit_press.index("readWorkspace()") < shown < quit_press.index("return;", shown)
     assert shown < quit_press.index('request("POST", "/api/quit")')
-    # While the hand-off shown may still grow, the listing is read every 2 s;
-    # not while this page's own import or discard of it is awaited.
+    # While the hand-off shown may still grow, or another tab's import holds
+    # it, the listing is read every 2 s; not while this page's own import or
+    # discard of it is awaited.
     assert "const SETTLE_MS = 2000;" in app
     _, settle = _function(app, "function keepSettling(")
-    assert "!shown.more_may_arrive" in settle and "importDialog.busy" in settle
+    assert "!(shown.more_may_arrive || shown.claimed)" in settle and "importDialog.busy" in settle
     assert "SETTLE_MS" in settle and "checkOpening()" in settle
 
 
@@ -1093,9 +1094,10 @@ def test_an_import_from_a_page_showing_no_project_names_the_project_open_now():
 
 def test_the_import_dialog_answers_each_refusal_of_an_import_or_a_discard():
     # Each refusal the server gives an import or a discard has its answer in
-    # the page: the dialog closes once another tab took the hand-off, shows it
-    # grown when more files joined, says a name clash next to the name, and
-    # follows another tab's opening before asking again.
+    # the page: the dialog closes once another tab imported or discarded the
+    # hand-off, waits while another tab's import holds it, shows it grown when
+    # more files joined, says a name clash next to the name, and follows
+    # another tab's opening before asking again.
     app = _code("app.js")
     handled = _function(app, "async function importRefused(")[1]
     handled += _function(app, "function handoffRefused(")[1]
@@ -1122,6 +1124,53 @@ def test_the_import_dialog_answers_each_refusal_of_an_import_or_a_discard():
         "handoff.refused.length + handoff.more_refused"
         in _function(dialog, "function refusedCount(")[1]
     )
+
+
+def test_the_import_dialog_waits_while_another_tab_imports_its_images():
+    # The listing keeps a hand-off another tab's import holds (claimed), since
+    # that import may be refused (a name taken, say) and let it go unchanged.
+    # The dialog showing it keeps its rows and choices; Import and Discard
+    # wait, and a line says why; the listing is read again meanwhile (as while
+    # more may arrive), and once the claim is let go they can be pressed
+    # again. Only once the listing no longer has it is it gone: the dialog
+    # closes and says so. A hand-off held elsewhere is never shown anew,
+    # counted as waiting, or taken to hold Quit back.
+    dialog = _code("handoffs.js")
+    assert 'const ELSEWHERE = "Another tab is importing these images.";' in dialog
+    assert "return this.handoff !== null && this.handoff.claimed === true;" in _method(
+        dialog, "elsewhere("
+    )
+    assert "!this.elsewhere()" in _method(dialog, "ready(")
+    actions = _method(dialog, "renderActions(")
+    assert '$("handoff-import").disabled = !this.ready();' in actions
+    assert (
+        '$("handoff-discard").disabled = !this.handoff || this.busy || this.elsewhere();' in actions
+    )
+    needs = re.compile(r'\$\("handoff-needs"\)\.textContent = this\.elsewhere\(\)\s*\? ELSEWHERE')
+    assert needs.search(actions)
+    assert "elsewhere" not in _method(dialog, "fill(")  # the rows are drawn as ever
+    app = _code("app.js")
+    _, take = _function(app, "function takeListing(")
+    images = take.index('const images = listed.filter((handoff) => handoff.kind === "images");')
+    waiting = take.index("handoffs = images.filter((handoff) => !handoff.claimed);")
+    assert images < waiting
+    assert "if (!images.some((handoff) => handoff.id === id)) {" in take  # set aside: kept
+    now = take.index("const now = images.find((handoff) => handoff.id === shown.id);")
+    gone = take.index("finished.add(shown.id);", now)
+    assert gone < take.index("importDialog.hide();", gone) < take.index("gone = GONE;", gone)
+    assert take.count("importDialog.hide();") == 1
+    # Its own import or discard refused as another tab's import holds it.
+    _, refused = _function(app, "function handoffRefused(")
+    claimed = refused.index('if (error.code === "handoff_claimed") {')
+    branch = refused[claimed : refused.index("} else if", claimed)]
+    assert "importDialog.refresh({ ...importDialog.handoff, claimed: true" in branch
+    assert "checkAgain();" in branch and "hide()" not in branch
+    assert refused.count("importDialog.hide();") == 1  # handoff_not_found only
+    not_found = refused.index('if (error.code === "handoff_not_found") {')
+    assert not_found < refused.index("importDialog.hide();") < claimed
+    assert "BEING_IMPORTED" not in app
+    quit_press = app[app.index('$("quit").addEventListener("click"') :].split("\n});\n", 1)[0]
+    assert "!handoff.claimed" in quit_press
 
 
 def test_a_refused_discard_says_what_joined_the_images_since_they_were_listed():

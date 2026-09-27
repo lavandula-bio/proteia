@@ -12,6 +12,8 @@
 import { $, counted, isolate } from "/static/dom.js";
 
 const SIZES = new Intl.NumberFormat("en", { maximumFractionDigits: 1 });
+// Why Import and Discard wait while another tab's import holds the images shown.
+const ELSEWHERE = "Another tab is importing these images.";
 
 // A file size as a file manager shows one: KB below a megabyte, else MB.
 export function sizeText(bytes) {
@@ -45,7 +47,7 @@ export class ImportDialog {
   // closed with Esc or Later (the images keep waiting on the server).
   constructor(handlers) {
     this.handlers = handlers;
-    this.handoff = null; // the hand-off shown, as last listed, or null
+    this.handoff = null; // the hand-off shown, as last listed (claimed too), or null
     // The hand-off the rows are of: the one shown, or the last one closed with
     // Esc or Later, whose choices are kept should it be shown again.
     this.kept = null;
@@ -107,7 +109,7 @@ export class ImportDialog {
   }
 
   // Show `handoff` ({id, files, suggested_name, refused, more_refused,
-  // more_may_arrive}, as listed); `closes`: what an import closes
+  // more_may_arrive, claimed}, as listed); `closes`: what an import closes
   // (renderCloses). The hand-off last closed with Esc or Later comes back with
   // what was chosen in it; another starts afresh.
   show(handoff, closes) {
@@ -127,10 +129,11 @@ export class ImportDialog {
   }
 
   // The hand-off shown as listed now (more files, or more arguments not
-  // opened, may have joined it): each row keeps what was chosen in it; a new
-  // row starts with its bands unchosen, so Import waits for it again, and the
-  // dialog says so. Gives what joined: {images, refused}, how many rows and
-  // "Not opened" entries are new.
+  // opened, may have joined it; another tab's import may hold it, or have let
+  // it go): each row keeps what was chosen in it; a new row starts with its
+  // bands unchosen, so Import waits for it again, and the dialog says so.
+  // Gives what joined: {images, refused}, how many rows and "Not opened"
+  // entries are new.
   refresh(handoff) {
     const before = refusedCount(this.handoff);
     const images = this.fill(handoff);
@@ -295,7 +298,20 @@ export class ImportDialog {
   }
 
   ready() {
-    return this.handoff !== null && !this.busy && this.blocked === null && this.missing() === 0;
+    return (
+      this.handoff !== null &&
+      !this.busy &&
+      !this.elsewhere() &&
+      this.blocked === null &&
+      this.missing() === 0
+    );
+  }
+
+  // Whether another tab's import holds the hand-off shown (listed claimed):
+  // Import and Discard wait, and say so, while the rows keep their choices,
+  // since that import may be refused and let the images go as they were.
+  elsewhere() {
+    return this.handoff !== null && this.handoff.claimed === true;
   }
 
   // Import waits for every row's polarity, and for `blocked` to clear (why it
@@ -308,13 +324,14 @@ export class ImportDialog {
   renderActions() {
     const missing = this.missing();
     $("handoff-import").disabled = !this.ready();
-    $("handoff-discard").disabled = !this.handoff || this.busy;
+    $("handoff-discard").disabled = !this.handoff || this.busy || this.elsewhere();
     $("handoff-later").disabled = this.busy;
-    $("handoff-needs").textContent =
-      this.blocked ||
-      (missing
-        ? `Choose whether the bands are dark or light in ${counted(missing, "image", "images")}.`
-        : "");
+    $("handoff-needs").textContent = this.elsewhere()
+      ? ELSEWHERE
+      : this.blocked ||
+        (missing
+          ? `Choose whether the bands are dark or light in ${counted(missing, "image", "images")}.`
+          : "");
   }
 
   // The import or discard awaiting its answer (`text` says which), or none

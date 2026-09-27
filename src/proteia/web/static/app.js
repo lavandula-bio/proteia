@@ -719,12 +719,12 @@ function readWorkspace() {
 // project open now before editing. The header is what guarantees it: an edit
 // sent before this answer is refused, not made in another project. It takes
 // the images waiting too (takeListing): the Import dialog shows those found
-// meanwhile, or closes once another tab imported or discarded the ones it
-// shows. What the listing gives to say follows `note` (what the page just
-// said, still in the status line) there, and both stay should it follow. One
-// check at a time (a call meanwhile gives the one under way); none while this
-// page creates or opens a project itself, its own import included. Settles
-// once done, and never rejects.
+// meanwhile, waits while another tab imports the ones it shows, or closes
+// once another tab imported or discarded them. What the listing gives to say
+// follows `note` (what the page just said, still in the status line) there,
+// and both stay should it follow. One check at a time (a call meanwhile gives
+// the one under way); none while this page creates or opens a project itself,
+// its own import included. Settles once done, and never rejects.
 function checkOpening({ note = null } = {}) {
   if (checking || !started || quitting || opening !== null) {
     return checking;
@@ -774,11 +774,11 @@ window.addEventListener("focus", () => checkOpening());
 // How often the listing is read again while the hand-off shown may still grow.
 const SETTLE_MS = 2000;
 const GONE = "These images were imported or discarded in another tab.";
-const BEING_IMPORTED = "These images are being imported in another tab.";
 const WAITING_AT_QUIT = "Import or discard the images waiting in Proteia before quitting.";
 const NOT_RESPONDING = "Proteia is not responding. Start it again to reopen this page.";
 
-// The image hand-offs waiting, as last listed (takeListing).
+// The image hand-offs waiting, as last listed (takeListing): not those another
+// tab's import holds.
 let handoffs = [];
 // Hand-offs closed here with Esc or Later: not shown again unasked ("N
 // images waiting…" shows them).
@@ -818,36 +818,42 @@ function importCloses() {
 }
 
 // Take a listing of the workspace (GET /api/workspace). The hand-off the
-// Import dialog shows is refreshed as listed now, or, no longer listed
-// (another tab imported or discarded it), the dialog closes, and this gives
-// that to say; not while this page's own import or discard of it is awaited
-// (its claim hides it). Its line saying what an import closes follows the
-// project open (importCloses). Then, with no dialog up, the first hand-off
-// not set aside is shown (`show` "auto"); asked for (Quit, "N images
-// waiting…"), the first even if set aside, over another dialog ("asked").
-// With no project shown and no dialog up, the page shows the project open, or
-// the Projects dialog. Gives what to say, or null: the dialog closed, then the
-// notices (sayNotices); the caller says it with its own message, never over
-// it. Notices wait while this page's own import or discard is awaited, whose
+// Import dialog shows is refreshed as listed now: while another tab's import
+// holds it (claimed), the dialog keeps its rows and choices and waits, since
+// that import may be refused and let it go as it was. No longer listed
+// (another tab imported or discarded it), it is gone: the dialog closes, and
+// this gives that to say. Neither while this page's own import or discard of
+// it is awaited (its own claim lists it claimed). Its line saying what an
+// import closes follows the project open (importCloses). Then, with no dialog
+// up, the first hand-off waiting (none another tab's import holds) and not
+// set aside is shown (`show` "auto"); asked for (Quit, "N images waiting…"),
+// the first even if set aside, over another dialog ("asked"). With no project
+// shown and no dialog up, the page shows the project open, or the Projects
+// dialog. Gives what to say, or null: the dialog closed, then the notices
+// (sayNotices); the caller says it with its own message, never over it.
+// Notices wait while this page's own import or discard is awaited, whose
 // answer the status line says next: the check after it says them.
 function takeListing(workspace, { show = "auto" } = {}) {
   const listed = workspace.handoffs.filter((handoff) => !finished.has(handoff.id));
   const notices = importDialog.busy ? [] : listed.filter((handoff) => handoff.kind === "notice");
-  handoffs = listed.filter((handoff) => handoff.kind === "images");
+  const images = listed.filter((handoff) => handoff.kind === "images");
+  handoffs = images.filter((handoff) => !handoff.claimed);
   listedOpen =
     workspace.open_id === null ? null : { name: workspace.open, open_id: workspace.open_id };
   for (const id of [...setAside]) {
-    if (!handoffs.some((handoff) => handoff.id === id)) {
+    if (!images.some((handoff) => handoff.id === id)) {
       setAside.delete(id);
     }
   }
   const shown = importDialog.handoff;
   let gone = null;
   if (shown && !importDialog.busy) {
-    const now = handoffs.find((handoff) => handoff.id === shown.id);
+    const now = images.find((handoff) => handoff.id === shown.id);
     if (now) {
       importDialog.refresh(now);
     } else {
+      // Gone for good: a listing asked for before, and answered late, does not bring it back.
+      finished.add(shown.id);
       importDialog.hide();
       gone = GONE;
     }
@@ -926,11 +932,17 @@ $("projects-handoffs").addEventListener("click", () => showWaiting());
 
 // While the hand-off shown may still grow (more_may_arrive: the launches of a
 // selection opened with Proteia, one per file, are still handing theirs off),
-// the listing is read again every SETTLE_MS until it may not; not while this
-// page's own import or discard of it is awaited.
+// or another tab's import holds it (claimed: refused, it waits here again;
+// done, it is gone), the listing is read again every SETTLE_MS until neither;
+// not while this page's own import or discard of it is awaited.
 function keepSettling() {
   const shown = importDialog.handoff;
-  if (settling !== null || !shown || !shown.more_may_arrive || importDialog.busy) {
+  if (
+    settling !== null ||
+    !shown ||
+    !(shown.more_may_arrive || shown.claimed) ||
+    importDialog.busy
+  ) {
     return;
   }
   settling = window.setTimeout(() => {
@@ -1144,31 +1156,34 @@ async function discardHandoff() {
 }
 
 // An import or discard (`press`: its button) refused, nothing changed. Once
-// another tab took the hand-off (handoff_claimed: it is importing it;
-// handoff_not_found: imported or discarded), the dialog closes, says so, and
-// the page checks again: the next images waiting, or the project that import
-// opened. Once more joined it (handoff_changed), the dialog shows it as it is
-// now, each new image with its bands unchosen, and says what joined (images,
-// or only files a launch could not open), to press again. Anything else is
-// said in the dialog, which stays up.
+// another tab imported or discarded the hand-off (handoff_not_found), the
+// dialog closes, says so, and the page checks again: the next images waiting,
+// or the project that import opened. While another tab's import holds it
+// (handoff_claimed), the dialog keeps its rows and choices and waits, as
+// takeListing has it while the listing says claimed: that import may be
+// refused, and the images wait here again, or be done, and they are gone.
+// Once more joined it (handoff_changed), the dialog shows it as it is now,
+// each new image with its bands unchosen, and says what joined (images, or
+// only files a launch could not open), to press again. Anything else is said
+// in the dialog, which stays up.
 function handoffRefused(error, handoff, press) {
-  if (error.code === "handoff_claimed" || error.code === "handoff_not_found") {
-    if (error.code === "handoff_not_found") {
-      finished.add(handoff.id);
-    }
+  if (error.code === "handoff_not_found") {
+    finished.add(handoff.id);
     if (showsHandoff(handoff)) {
       importDialog.hide();
     }
-    const said = error.code === "handoff_claimed" ? BEING_IMPORTED : GONE;
-    showStatus(said);
-    checkAgain(said);
+    showStatus(GONE);
+    checkAgain(GONE);
     return;
   }
   if (!showsHandoff(handoff)) {
     report(error); // closed meanwhile
     return;
   }
-  if (error.code === "handoff_changed") {
+  if (error.code === "handoff_claimed") {
+    importDialog.refresh({ ...importDialog.handoff, claimed: true, more_may_arrive: false });
+    checkAgain();
+  } else if (error.code === "handoff_changed") {
     const joined = importDialog.refresh(error.detail);
     const what = joined.images
       ? "More images arrived: check them"
@@ -2894,10 +2909,10 @@ function renderQuit() {
   importDialog.block(exporting ? "Import once the export is written." : null);
 }
 
-// Before it stops Proteia, Quit reads which images wait: a stop would drop
-// them, so it shows them instead, to import or discard, and Proteia keeps
-// running. One that cannot be read (Proteia stopped, say) is left to the quit
-// to say.
+// Before it stops Proteia, Quit reads which images wait (not those another
+// tab's import holds): a stop would drop them, so it shows them instead, to
+// import or discard, and Proteia keeps running. One that cannot be read
+// (Proteia stopped, say) is left to the quit to say.
 $("quit").addEventListener("click", async () => {
   if (quitting || exporting) {
     return;
@@ -2909,7 +2924,9 @@ $("quit").addEventListener("click", async () => {
   }
   const workspace = await readWorkspace().catch(() => null);
   const waiting = workspace
-    ? workspace.handoffs.filter((handoff) => handoff.kind === "images" && !finished.has(handoff.id))
+    ? workspace.handoffs.filter(
+        (handoff) => handoff.kind === "images" && !handoff.claimed && !finished.has(handoff.id),
+      )
     : [];
   if (waiting.length) {
     quitting = false;

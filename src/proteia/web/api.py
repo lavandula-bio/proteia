@@ -106,7 +106,9 @@ answers ``{file_id, name, size}``; ``POST /api/handoffs`` offers uploaded files
 was pending already, and how many files and refused entries it holds. ``GET
 /api/workspace`` lists the pending hand-offs as ``handoffs``, each ``{id, kind,
 files: [{file_id, name, size}], suggested_name, refused, more_refused,
-more_may_arrive}``, with the name its project would take now. ``POST
+more_may_arrive, claimed}``, with the name its project would take now;
+``claimed`` while an accept imports it: no other accept or discard takes it
+then (``handoff_claimed``), and an accept refused leaves it as it was. ``POST
 /api/handoffs/{id}/accept`` imports a hand-off into a new project
 (:meth:`Workspace.accept`), with a kind, a polarity and a membrane (``"new"``,
 or the index of an earlier file whose membrane it joins) for each file, and
@@ -698,15 +700,15 @@ class Workspace:
         accept is refused (:class:`ProjectChangedError`) if it is no longer the
         open one, checked under the switch lock, since the open project is
         closed. The hand-off is claimed first (:meth:`~proteia.web.handoff.Inbox.claim`),
-        so another accept or a discard of it is refused meanwhile, and files
-        offered meanwhile start another hand-off. Afterwards it is gone, and its
-        staged files are deleted, when its files were imported; when none could
-        be (:class:`NothingImportedError`: no project is left, and the open one
-        stays open), since trying again would fail again; and when the open
-        project could not be saved after the imports
-        (:class:`UnsavedChangesError` with ``created``), since the images are in
-        the project created. Any other refusal changes nothing, and it is
-        pending again."""
+        so another accept or a discard of it is refused meanwhile, the listing
+        says it is claimed, and files offered meanwhile start another hand-off.
+        Afterwards it is gone, and its staged files are deleted, when its files
+        were imported; when none could be (:class:`NothingImportedError`: no
+        project is left, and the open one stays open), since trying again would
+        fail again; and when the open project could not be saved after the
+        imports (:class:`UnsavedChangesError` with ``created``), since the
+        images are in the project created. Any other refusal changes nothing,
+        and it is pending again, listed as it was."""
         typed = None if name is None else projects.project_name(name)
         claimed = self.inbox.claim(handoff_id, [choice.file_id for choice in choices])
         files = {file.file_id: file for file in claimed.files}
@@ -1307,7 +1309,9 @@ def get_workspace(workspace: WorkspaceDep) -> dict[str, Any]:
     """Which project is open, without reading it: the projects root, and the
     open project's name and open id (null before one is open). A page checks it
     to know whether the project it shows is still the one open. And the
-    hand-offs pending (:func:`_handoffs`)."""
+    hand-offs pending (:func:`_handoffs`), those an accept is importing too, as
+    ``claimed``: that accept may yet be refused, and a page showing one keeps
+    its choices until it is gone from the listing."""
     name, open_id = workspace.opened()
     return {
         "root": str(workspace.root),
@@ -1345,6 +1349,7 @@ def _handoff(root: Path, view: HandoffView, names: list[str]) -> dict[str, Any]:
         "refused": [dataclasses.asdict(entry) for entry in view.refused],
         "more_refused": view.more_refused,
         "more_may_arrive": view.more_may_arrive,
+        "claimed": view.claimed,
     }
 
 

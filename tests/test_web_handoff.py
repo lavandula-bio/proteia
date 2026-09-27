@@ -273,19 +273,33 @@ def test_refused_entries_merge_up_to_the_hundred_kept(inbox, monkeypatch):
     assert view.more_refused == 2
 
 
-def test_a_claimed_hand_off_takes_no_more_files_and_is_not_listed(inbox):
+def test_a_claimed_hand_off_takes_no_more_files_and_is_listed_as_claimed(inbox):
+    # A page showing it keeps its rows while another tab's accept runs: the
+    # accept may be refused and release it, unchanged.
     offered = inbox.offer([stage(inbox, "a.tif")])
     (view,) = inbox.listing()
+    assert not view.claimed
     claimed = inbox.claim(offered.handoff_id, [f.file_id for f in view.files])
-    assert inbox.listing() == []
+    (listed,) = inbox.listing()
+    assert listed.claimed and not listed.more_may_arrive
+    assert (listed.id, listed.files, listed.refused) == (view.id, view.files, view.refused)
     later = inbox.offer([stage(inbox, "b.tif")])
     assert not later.merged and later.handoff_id != offered.handoff_id
+    assert [(v.id, v.claimed) for v in inbox.listing()] == [
+        (offered.handoff_id, True),
+        (later.handoff_id, False),
+    ]
     with pytest.raises(handoff.HandoffClaimedError):
         inbox.claim(offered.handoff_id, [f.file_id for f in view.files])
     with pytest.raises(handoff.HandoffClaimedError):
         inbox.discard(offered.handoff_id, [f.file_id for f in view.files], 0)
     inbox.release(claimed)
-    assert [v.id for v in inbox.listing()] == [offered.handoff_id, later.handoff_id]
+    assert [(v.id, v.claimed) for v in inbox.listing()] == [
+        (offered.handoff_id, False),
+        (later.handoff_id, False),
+    ]
+    inbox.finish(inbox.claim(offered.handoff_id, [f.file_id for f in view.files]))
+    assert [v.id for v in inbox.listing()] == [later.handoff_id]  # imported: gone
 
 
 def test_an_offer_refuses_unknown_repeated_or_offered_files_changing_nothing(inbox):
