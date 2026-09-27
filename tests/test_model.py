@@ -160,6 +160,7 @@ def test_field_defaults():
 
     band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), source="click", **MEASURED)
     assert (band.band_index, band.clipped, band.apparent_mw) == (0, None, None)
+    assert band.possibly_clipped is None
     assert band.manually_edited is False
     for field in MEASURED:  # what quantifying gave: no default
         with pytest.raises(ValidationError, match=field):
@@ -187,6 +188,27 @@ def test_field_defaults():
     calibration = Membrane(id="mem-1").calibration
     assert (calibration.ladder, calibration.points, calibration.fit_quality) == (None, [], None)
     assert calibration.fit_method is FitMethod.LOG_LINEAR
+
+
+def test_a_possible_flag_is_left_out_while_unset_and_never_beside_the_exact_one():
+    # #112: possibly_clipped stands in for clipped where it cannot be checked.
+    band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), source="click", **MEASURED)
+    for mode in ("python", "json"):
+        assert "possibly_clipped" not in band.model_dump(mode=mode)
+        for flag in (True, False):
+            assessed = band.model_copy(update={"possibly_clipped": flag})
+            assert assessed.model_dump(mode=mode)["possibly_clipped"] is flag
+    for clipped in (True, False):
+        with pytest.raises(ValidationError, match="only one of the checks runs"):
+            Band(
+                id="band-1",
+                lane_index=0,
+                box=Box(x=0, y=0),
+                source="click",
+                clipped=clipped,
+                possibly_clipped=False,
+                **MEASURED,
+            )
 
 
 def test_polarity_gives_the_dark_on_light_flag():

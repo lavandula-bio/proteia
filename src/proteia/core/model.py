@@ -420,6 +420,11 @@ class Band(_Model):
     :func:`~proteia.core.quantify.net_signal` subtracted, in pixel units;
     ``background_mode`` says how it was measured and ``background_spread`` is its
     QC, in level units (:class:`~proteia.core.quantify.BandBackground`).
+
+    ``clipped`` is the exact over-exposure check (#44), and ``possibly_clipped``
+    the heuristic that stands in for it where it cannot run (#112,
+    :func:`~proteia.core.quantify.is_possibly_clipped`): a band has at most one
+    of them, the other None.
     """
 
     id: BandId
@@ -432,8 +437,23 @@ class Band(_Model):
     background_spread: NonNegative
     apparent_mw: Kda | None = None  # from the calibration (#58); None = not computed
     clipped: bool | None = None  # #44; None = not checked (not "passed")
+    # #112; None = not assessed: the exact check ran, the image has no known
+    # range, or the project was saved before #112 (requantify assesses it).
+    # False = no sign of it in the gray values, not "passed". Left out of the
+    # saved form while None, so a project without a lossy, colour or CMYK image
+    # keeps its bytes and hash (see "Canonical form" in storage).
+    possibly_clipped: bool | None = Field(default=None, exclude_if=lambda v: v is None)
     source: ProposalSource
     manually_edited: bool = False  # moved or edited by the user after it was proposed
+
+    @model_validator(mode="after")
+    def _one_clipping_check(self) -> Band:
+        if self.clipped is not None and self.possibly_clipped is not None:
+            raise ValueError(
+                f"band {self.id}: checked for over-exposure (clipped) and assessed"
+                " for it (possibly_clipped); only one of the checks runs on an image"
+            )
+        return self
 
 
 class UndetectedBand(_Model):

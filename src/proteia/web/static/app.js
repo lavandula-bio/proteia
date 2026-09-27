@@ -921,6 +921,35 @@ function boxNetText(protein, band) {
   return net === null ? "—" : netText(net);
 }
 
+// A box's over-exposure: the check at the detector limit, or on an image it
+// cannot trust (lossy, colour or converted), how near the limit its pixels come
+// (#112).
+function overExposureText(band) {
+  if (band.clipped !== null) {
+    return band.clipped
+      ? "Yes: pixels at the detector limit, so the net is an under-estimate"
+      : "No";
+  }
+  if (band.possibly_clipped === true) {
+    return "Possibly: pixels near the detector limit, which this image cannot confirm; check the original capture";
+  }
+  if (band.possibly_clipped === false) {
+    // Not "No": a colour channel saturated alone may never bring the grey mean
+    // near the limit, so the heuristic seeing nothing does not clear the band.
+    return "Not checked; no sign of it in the grey analysis image";
+  }
+  return "Not checked";
+}
+
+// What a box's label adds about its over-exposure; a question mark where it
+// cannot be confirmed (#112).
+function overExposureLabel(band) {
+  if (band.clipped === true) {
+    return " over-exposed";
+  }
+  return band.possibly_clipped === true ? " over-exposed?" : "";
+}
+
 function renderBox(project) {
   const found = state.boxId ? findBox(project, state.boxId) : null;
   $("box-panel").hidden = !found;
@@ -929,12 +958,7 @@ function renderBox(project) {
   }
   const { protein, band } = found;
   $("box-summary").textContent = `${protein.name}, ${laneName(project, band.lane_index)}`;
-  $("box-clipped").textContent =
-    band.clipped === true
-      ? "Yes: pixels at the detector limit, so the net is an under-estimate"
-      : band.clipped === null
-        ? "Not checked"
-        : "No";
+  $("box-clipped").textContent = overExposureText(band);
   $("box-net").textContent = boxNetText(protein, band);
   const edited = band.manually_edited ? "; moved or re-laned by hand since" : "";
   $("box-source").textContent = `${PLACED_BY[band.source] || band.source}${edited}`;
@@ -1130,7 +1154,7 @@ function renderView(project) {
         fitted: inset && !atEdge ? [x0 + across, y0 + along, x1 - across, y1 - along] : null,
         color,
         clipped: band.clipped === true,
-        label: `${band.lane_index + 1}${band.clipped === true ? " over-exposed" : ""}`,
+        label: `${band.lane_index + 1}${overExposureLabel(band)}`,
       });
     }
     const { width, height } = protein.box_size;
@@ -1749,11 +1773,31 @@ $("import-polarity").addEventListener("change", (event) => {
   $("import-button").classList.toggle("disabled", !event.target.value);
 });
 
-// --- Requantifying with the local background ---
+// --- Requantifying: the local background, and looking for over-exposure ---
 
 // The background method of a project quantified before the local background:
 // each net above its image's median. It stays until the project is requantified.
 const LEGACY_BACKGROUND = "global_median";
+
+// What the offer says for each reason to requantify (requantifyReason): the
+// legacy background, which moves every net, or boxes on a lossy, colour or
+// CMYK image measured before Proteia looked for pixels near the detector limit
+// there (#112). The note is its own tooltip too, whole where it is cut short.
+const REQUANTIFY_OFFERS = {
+  background: {
+    label: "Requantify with local background",
+    title:
+      "The nets use the whole-image median background, as measured before the local background.",
+    note: "Nets move to the local ring background; Undo takes it back.",
+  },
+  overExposure: {
+    label: "Requantify",
+    title:
+      "Boxes on a lossy, colour or CMYK image were measured before Proteia looked for pixels" +
+      " near the detector limit there.",
+    note: "Looks for pixels near the detector limit; Undo takes it back.",
+  },
+};
 
 let requantifying = false; // a press has no answer yet
 
@@ -1762,19 +1806,39 @@ function hasBoxes(project) {
   return project.proteins.some((protein) => protein.bands.length);
 }
 
-// The offer in the results' header, while the nets use the legacy background
-// and there are boxes to measure again (the Checks say why); it goes once the
-// project is on the local background. In view whatever the side panel shows,
-// next to the numbers it changes.
+// Why the project is offered a requantify (a REQUANTIFY_OFFERS key), or null:
+// the legacy background while there are boxes to measure again (that
+// requantify measures every box, so it looks near the limit too), else images
+// whose boxes were never looked at near the limit (the server's
+// unassessed_images, which a requantify assesses).
+function requantifyReason(project) {
+  if (project.background_method === LEGACY_BACKGROUND && hasBoxes(project)) {
+    return "background";
+  }
+  return project.unassessed_images.length ? "overExposure" : null;
+}
+
+// The offer in the results' header, worded for its reason (the Checks say
+// why); it goes once there is nothing left to requantify. In view whatever the
+// side panel shows, next to the numbers it changes.
 function renderRequantify(project) {
-  $("requantify-offer").hidden = !(
-    project.background_method === LEGACY_BACKGROUND && hasBoxes(project)
-  );
+  const reason = requantifyReason(project);
+  $("requantify-offer").hidden = reason === null;
+  if (reason !== null) {
+    const offer = REQUANTIFY_OFFERS[reason];
+    const button = $("requantify");
+    button.textContent = offer.label;
+    button.title = offer.title;
+    const note = $("requantify-note");
+    note.textContent = offer.note;
+    note.title = offer.note;
+  }
   $("requantify").disabled = requantifying;
 }
 
-// Measure every box again against the local background, in one change the
-// status line offers to Undo. Like an undo or a clear, it runs in the panel's
+// Measure boxes again: every box against the local background, or those not
+// yet looked at near the detector limit, in one change the status line offers
+// to Undo. Like an undo or a clear, it runs in the panel's
 // queue once the edits made before it have their answers (a box being placed
 // is measured again too), so it never reaches a project opened after it was
 // asked for, and the edits made after it wait for it. Pressed twice (a double
@@ -1825,30 +1889,40 @@ function requantify() {
 $("requantify").addEventListener("click", requantify);
 
 // What the requantify did, with an Undo of it that goes once the history moves
-// on. It did nothing if the project was on the local background already: the
-// revision shown did not move, or, once another tab requantified since this
-// page showed the project, no image was measured again although it has boxes
-// (a requantify measures every image with boxes). Then the last change is not
+// on, worded for the offer the page showed. It did nothing if nothing was left
+// to do: the revision shown did not move, or, once another tab requantified
+// since this page showed the project, no image was measured again although it
+// has boxes (a requantify of a legacy project measures every image with boxes,
+// which leaves none to look at near the limit). Then the last change is not
 // this one: no Undo.
 function showRequantified(answer, before) {
   const project = answer.project;
   const count = answer.images.length;
+  const background = before.background_method === LEGACY_BACKGROUND;
   if (
     (before.open_id === project.open_id && before.revision === project.revision) ||
     (!count && hasBoxes(project))
   ) {
-    showStatus("The nets already use the local background."); // nothing logged
+    // Nothing logged.
+    showStatus(
+      background
+        ? "The nets already use the local background."
+        : "Every box has been looked at near the detector limit already.",
+    );
     return;
   }
-  const text = count
-    ? `Requantified ${counted(count, "image", "images")} with the local background`
-    : "Switched to the local background (no boxes to requantify)";
+  const images = counted(count, "image", "images");
+  const text = !background
+    ? `Requantified ${images}: looked for pixels near the detector limit`
+    : count
+      ? `Requantified ${images} with the local background`
+      : "Switched to the local background (no boxes to requantify)";
   const step = project.history.undo;
   const undo =
     step && step.action === "requantify"
       ? {
           label: "Undo",
-          name: "Undo requantifying with the local background",
+          name: background ? "Undo requantifying with the local background" : "Undo requantifying",
           seq: step.seq,
           run: () => takeStep("undo", { seq: step.seq, back: () => $("requantify") }),
         }
@@ -2054,7 +2128,7 @@ const ACTION_WORDS = {
   clear_boxes: "clear boxes",
   detect_row_boxes: "detect row boxes",
   remove_undetected: "remove n.d. mark",
-  requantify: "requantify with local background",
+  requantify: "requantify",
   undo: "undo",
   redo: "redo",
 };

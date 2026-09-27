@@ -1147,9 +1147,11 @@ def _restored(restored: ops.Restored) -> dict[str, Any]:
 
 @router.post("/requantify")
 def requantify(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
-    """Switch the project to the local background and re-quantify every band;
-    answers the images re-quantified (``images``; empty for a project already
-    on the local background, a no-op)."""
+    """Switch the project to the local background and re-quantify every band,
+    or, on the local background already, re-quantify the images whose bands
+    were never assessed for over-exposure (the state's ``unassessed_images``;
+    :func:`~proteia.core.operations.requantify`); answers the images
+    re-quantified (``images``; empty for a no-op: nothing to do)."""
     images = ops.requantify(session)
     return _answer(workspace, session, images=list(images))
 

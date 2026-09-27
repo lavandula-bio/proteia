@@ -111,9 +111,10 @@ _CMYK_CHANNELS_DIFFER = (
     "The red, green and blue channels converted from the file's CMYK differ; they were"
     " averaged into one gray channel, so over-exposure cannot be checked."
 )
-# The warnings that make clipping_depth distrust a known bit depth. results
-# names each in its clipping_not_checked notice (_UNCHECKED_WARNINGS, kept in
-# step by a test), so a code added here needs a reason there.
+# The warnings that make clipping_depth distrust a known bit depth (and so let
+# possible_clipping_depth assess it). results names each in its
+# clipping_not_checked and possibly_clipped notices (_UNCHECKED_WARNINGS, kept
+# in step by a test), so a code added here needs a reason there.
 UNTRUSTED_WARNINGS = frozenset({"lossy_format", "color_channels_differ", "cmyk_converted"})
 
 
@@ -504,6 +505,26 @@ def clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> i
     saturation goes unseen (a known limit).
     """
     if bit_depth is None or any(w.code in UNTRUSTED_WARNINGS for w in warnings):
+        return None
+    return bit_depth
+
+
+def possible_clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> int | None:
+    """The bit depth the "possibly over-exposed" check (#112,
+    :func:`~proteia.core.quantify.is_possibly_clipped`) measures against, or None.
+
+    It runs where the exact check cannot (:func:`clipping_depth` is None) but the
+    range is known: a lossy, colour or CMYK-converted image of 8- or 16-bit
+    pixels. Its limit is that of the pixels as read: 0, or 255 or 65535 for a
+    light-on-dark image; for a CMYK file, that of the red, green and blue it was
+    converted to, which have the inks' bit depth. A file converted through its
+    ICC profile may bring black back well above 0 (a gray ramp made with the
+    relative intent and black point compensation through SWOP press CMYK comes
+    back at about 19), which hides its saturation from this check too (a known
+    limit). An unknown bit depth has no limit to measure against, so neither
+    check runs.
+    """
+    if bit_depth is None or clipping_depth(bit_depth, warnings) is not None:
         return None
     return bit_depth
 

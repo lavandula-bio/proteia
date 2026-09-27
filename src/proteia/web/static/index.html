@@ -216,8 +216,10 @@
       <div class="dock-head">
         <h2 id="dock-title">Results</h2>
         <span id="tier" class="tier" hidden></span>
-        <!-- While the nets use the legacy background (app.js renderRequantify);
-          the Checks say why. Before "Updating…", so its coming never moves the button. -->
+        <!-- While there is something to requantify (app.js renderRequantify, which
+          words it for why): the legacy background, or boxes not yet looked at near the
+          detector limit; the Checks say why. Before "Updating…", so its coming never moves
+          the button. -->
         <span id="requantify-offer" class="requantify-offer" hidden>
           <button id="requantify" type="button" aria-describedby="requantify-note"
             title="The nets use the whole-image median background, as measured before the local background.">Requantify

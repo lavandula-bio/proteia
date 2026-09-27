@@ -636,3 +636,62 @@ def is_clipped(
         return None
     count = clipped_pixels(image, box, size, bit_depth=bit_depth, dark_on_light=dark_on_light)
     return count >= CLIPPED_PIXELS_THRESHOLD
+
+
+# On an image whose limit the exact check cannot trust (lossy compression,
+# colour averaged into gray, CMYK converted), a band is possibly over-exposed
+# when at least POSSIBLY_CLIPPED_PIXELS pixels of its box lie within
+# NEAR_LIMIT_LEVELS grey levels of the detector limit (maintainer decision on
+# #112): compression moves saturated pixels a level or two off the limit, so the
+# exact count misses them. In the measurements behind it, the rule raised no
+# false positive on 480 unclipped synthetic bands and missed no band that lost 1%
+# or more of its signal. A count, not a share of the box: saturated pixels sit in
+# the band's core, whatever the box's size. Changing either makes stored flags
+# stale.
+POSSIBLY_CLIPPED_PIXELS: Final = 5
+NEAR_LIMIT_LEVELS: Final = 2  # on an 8-bit scale; scaled to the image's range
+
+
+def near_limit_tolerance(bit_depth: int) -> float:
+    """How far from the detector limit a pixel counts as near it, in the image's
+    own values: :data:`NEAR_LIMIT_LEVELS` levels of an 8-bit scale, the same
+    share of any range (2 at 8 bits, 514 at 16)."""
+    return NEAR_LIMIT_LEVELS * (2**bit_depth - 1) / 255
+
+
+def near_limit_pixels(
+    image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int, dark_on_light: bool
+) -> int:
+    """How many pixels inside the box lie within :func:`near_limit_tolerance` of
+    the detector limit (:func:`detector_limit`), on the gray analysis values: a
+    colour image's mean of red, green and blue, as it is quantified, never a
+    single channel (a tinted export takes one channel to the limit early).
+    Raises ValueError if the box extends beyond the image bounds."""
+    pixels = _box_pixels(image, box, size)
+    tolerance = near_limit_tolerance(bit_depth)
+    if dark_on_light:
+        near = pixels <= detector_limit(bit_depth, dark_on_light=True) + tolerance
+    else:
+        near = pixels >= detector_limit(bit_depth, dark_on_light=False) - tolerance
+    return int(np.count_nonzero(near))
+
+
+def is_possibly_clipped(
+    image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int | None, dark_on_light: bool
+) -> bool | None:
+    """Whether a band looks over-exposed on an image the exact check
+    (:func:`is_clipped`) cannot trust: :data:`POSSIBLY_CLIPPED_PIXELS` or more
+    pixels of its box near the detector limit (:func:`near_limit_pixels`). None
+    (not assessed) when ``bit_depth`` is None: the exact check runs, or the
+    image has no known limit
+    (:func:`proteia.core.imaging.possible_clipping_depth`).
+
+    False says only that the gray values show no sign of it, never that the
+    band is not over-exposed: a colour channel saturated alone moves the gray
+    mean a third of the way (a known limit). A single-colour export, such as a
+    fluorescence image with a green lookup table, never brings its gray mean
+    near the limit, so its bands are False whatever their exposure."""
+    if bit_depth is None:
+        return None
+    count = near_limit_pixels(image, box, size, bit_depth=bit_depth, dark_on_light=dark_on_light)
+    return count >= POSSIBLY_CLIPPED_PIXELS

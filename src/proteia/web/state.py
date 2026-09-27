@@ -29,7 +29,12 @@ which ``PUT /api/proteins/{id}/box-padding`` takes.
 (``ring_median_v1``, or ``global_median`` for a project quantified before #83,
 until it is requantified), and each band's ``background_mode`` how its own was:
 ``symmetric``, ``asymmetric`` or ``image`` (a ring cut short), or
-``global_median``.
+``global_median``. Each band's ``clipped`` says whether it is over-exposed
+(null: not checked), and ``possibly_clipped`` whether it looks so on an image
+that check cannot trust (null: not assessed; #112). ``unassessed_images`` lists
+the images whose bands were measured before Proteia looked for pixels near the
+detector limit, which ``POST /api/requantify`` assesses
+(:func:`~proteia.core.operations.unassessed_images`).
 
 Each protein's ``undetected`` lists its not-detected records
 (:class:`~proteia.core.model.UndetectedBand`), in lane order, for the view to
@@ -56,6 +61,7 @@ from pydantic import JsonValue
 
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
 from proteia.core.model import Batch, ImageRef, Project, Protein
+from proteia.core.operations import unassessed_images
 from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import HistoryStep, ProjectSession
 
@@ -143,6 +149,7 @@ def project_state(
                         "band_index": band.band_index,
                         "rect": list(band.box.rect(size)),
                         "clipped": band.clipped,
+                        "possibly_clipped": band.possibly_clipped,
                         "background_mode": band.background_mode,
                         "source": band.source.value,
                         "manually_edited": band.manually_edited,
@@ -170,6 +177,7 @@ def project_state(
         "revision": revision(project),
         "history": {"undo": _step(undo), "redo": _step(redo)},
         "background_method": project.background_method,
+        "unassessed_images": unassessed_images(batch),
         "lanes": [
             {
                 "index": lane.index,

@@ -1039,6 +1039,104 @@ def test_a_jpeg_project_says_its_bands_were_not_checked_for_over_exposure(client
     assert {n["protein_ids"][0] for n in unchecked} == {series["target_id"], series["loading_id"]}
 
 
+def test_a_jpeg_project_flags_bands_possibly_over_exposed(client, tmp_path):
+    # #112: on a JPEG, a box with 5 or more pixels within 2 levels of the limit
+    # is flagged, per band in the state and per lane in the results, and each
+    # protein gets a warning naming its lanes.
+    deep = {("target", 1), ("target", 3), ("loading", 0)}  # saturated at 0
+    spots = [
+        (x, row, 5.0, 3.0, 70000.0 if (name, lane) in deep else 25000.0)
+        for name, row in (("target", TARGET_ROW), ("loading", LOADING_ROW))
+        for lane, x in enumerate(LANE_X)
+    ]
+    blot = np.round(synthetic_blot((TWO_ROW_H, W), spots) / 257).astype(np.uint8)
+    jpeg = io.BytesIO()
+    Image.fromarray(blot).save(jpeg, format="JPEG", quality=85)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, jpeg.getvalue(), name="blot β.jpg")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    lanes = [{"condition": condition} for condition in DOSES]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes, "reference_condition": "vehicle"})
+    ids = []
+    for name, role in (("α-tubulin", "loading control"), ("β-catenin", "target")):
+        body = {"name": name, "role": role, "image_id": image_id, "box_size": SIZE}
+        ids.append(client.ok("POST", "/api/proteins", body)["protein_id"])
+    loading_id, target_id = ids
+    for protein, row in ((loading_id, LOADING_ROW), (target_id, TARGET_ROW)):
+        for lane, x in enumerate(LANE_X):
+            body = {"protein_id": protein, "x": x, "y": row, "lane_index": lane}
+            answer = client.ok("POST", "/api/boxes", body)
+
+    # The state: each band's flags (the exact check did not run).
+    flagged = {
+        (protein["id"], band["lane_index"]): (band["clipped"], band["possibly_clipped"])
+        for protein in answer["project"]["proteins"]
+        for band in protein["bands"]
+    }
+    assert flagged == {
+        (protein, lane): (None, (name, lane) in deep)
+        for name, protein in (("target", target_id), ("loading", loading_id))
+        for lane in range(len(LANE_X))
+    }
+    # The results: the columns, and one warning per protein, loading control first.
+    assert column(answer, target_id)["possibly_clipped"] == [False, True, False, True, False]
+    assert column(answer, loading_id)["possibly_clipped"] == [True, False, False, False, False]
+    (result_set,) = answer["results"]["sets"]
+    possibly = [n for n in result_set["notices"] if n["code"] == "possibly_clipped"]
+    assert [(n["protein_ids"], n["lane_indices"], n["level"]) for n in possibly] == [
+        ([loading_id], [0], "warning"),
+        ([target_id], [1, 3], "warning"),
+    ]
+    loading, target = (n["message"] for n in possibly)
+    assert loading.startswith(
+        "'α-tubulin' is possibly over-exposed in lane 1: its box holds 5 or more pixels"
+        " within 2 grey levels of the detector limit, and its image has lossy (JPEG-type)"
+        " compression, so saturation cannot be confirmed;"
+    )
+    assert "which biases every value normalized to it" in loading
+    assert target.startswith("'β-catenin' is possibly over-exposed in lanes 2, 4:")
+    # Both reach the series' chart card: each is about one of its proteins.
+    series = only_series(answer)
+    assert {n["protein_ids"][0] for n in possibly} == {series["target_id"], series["loading_id"]}
+    assert answer["project"]["unassessed_images"] == []
+
+    # The same boxes as a project saved before #112: neither flag on them. The
+    # state names the image, each not-checked notice says to requantify, and a
+    # requantify assesses its bands.
+    session = client.workspace.current()
+
+    def forget(draft: Project) -> None:
+        for protein in draft.batch.proteins:
+            for band in protein.bands:
+                band.possibly_clipped = None
+
+    with session.transaction():
+        project, _ = apply_change(session.project, forget)
+        session._commit(project, action="plant", params={})
+    before = client.ok("GET", "/api/project")
+    assert before["project"]["unassessed_images"] == [image_id]
+    (result_set,) = before["results"]["sets"]
+    assert "possibly_clipped" not in notice_codes(before)
+    unchecked = [n["message"] for n in result_set["notices"] if n["code"] == "clipping_not_checked"]
+    assert len(unchecked) == 2
+    assert all(message.endswith(": requantify to look for them") for message in unchecked)
+
+    requantified = client.ok("POST", "/api/requantify")
+    assert requantified["images"] == [image_id]
+    assert requantified["project"]["unassessed_images"] == []
+    assert {
+        (protein["id"], band["lane_index"]): (band["clipped"], band["possibly_clipped"])
+        for protein in requantified["project"]["proteins"]
+        for band in protein["bands"]
+    } == flagged
+    assert "possibly_clipped" in notice_codes(requantified)
+    assert history(requantified)["undo"] == {
+        "seq": requantified["project"]["revision"],
+        "action": "requantify",
+    }
+
+
 def test_box_edits_answer_with_the_changed_net_and_chart(client, tmp_path):
     target, _, before = live(client, tmp_path, DOSES, boxed=(0, 1, 2, 3))
     assert column(before, target)["nets"][4] is None

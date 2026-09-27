@@ -170,6 +170,107 @@ def test_is_clipped_without_a_trusted_limit_is_not_checked():
     )
 
 
+# --- possibly over-exposed, where the exact check cannot run (#112) ---
+
+# A 6 x 4 box at (3, 3) on a 12 x 10 membrane.
+NEAR_BOX, NEAR_SIZE = Box(x=3, y=3), BoxSize(width=6, height=4)
+
+
+def _near(pixels: int, value: float, *, background: float, dtype=np.float64) -> np.ndarray:
+    """A membrane at ``background`` with ``pixels`` pixels of the box at ``value``."""
+    img = np.full((10, 12), background, dtype=dtype)
+    img[3:7, 3:9][_first(pixels)] = value
+    return img
+
+
+def _first(pixels: int) -> tuple[np.ndarray, np.ndarray]:
+    """The first ``pixels`` pixels of the box, row by row, as indices into it."""
+    return np.unravel_index(np.arange(pixels), (NEAR_SIZE.height, NEAR_SIZE.width))
+
+
+def _possibly(img: np.ndarray, bit_depth: int | None, *, dark_on_light: bool) -> bool | None:
+    return quantify.is_possibly_clipped(
+        img, NEAR_BOX, NEAR_SIZE, bit_depth=bit_depth, dark_on_light=dark_on_light
+    )
+
+
+def test_the_possibly_over_exposed_rule_is_the_decided_one():
+    # The maintainer's decision on #112: at least 5 pixels within 2 grey levels
+    # (8-bit) of the limit.
+    assert quantify.POSSIBLY_CLIPPED_PIXELS == 5
+    assert quantify.NEAR_LIMIT_LEVELS == 2
+    # The same share of any range: 2 levels of 255, so 514 counts of 65535.
+    assert quantify.near_limit_tolerance(8) == 2.0
+    assert quantify.near_limit_tolerance(16) == 514.0
+
+
+@pytest.mark.parametrize(
+    ("bit_depth", "dark_on_light", "near", "beyond", "background"),
+    [
+        (8, True, 2.0, 3.0, 200.0),  # dark on light: the limit is 0
+        (8, False, 253.0, 252.0, 20.0),  # light on dark: the limit is 255
+        (16, True, 514.0, 515.0, 50000.0),
+        (16, False, 65021.0, 65020.0, 1000.0),  # 65535 - 514
+    ],
+)
+def test_five_pixels_within_two_levels_of_the_limit_are_possibly_over_exposed(
+    bit_depth, dark_on_light, near, beyond, background
+):
+    # The two edges of the rule: 4 or 5 pixels, 2 or 3 levels (8-bit scale).
+    def possibly(pixels: int, value: float) -> bool | None:
+        img = _near(pixels, value, background=background)
+        return _possibly(img, bit_depth, dark_on_light=dark_on_light)
+
+    assert possibly(5, near) is True
+    assert possibly(4, near) is False
+    assert possibly(5, beyond) is False
+    assert possibly(24, beyond) is False  # the whole box one level too far
+    img = _near(5, near, background=background)
+    count = quantify.near_limit_pixels(
+        img, NEAR_BOX, NEAR_SIZE, bit_depth=bit_depth, dark_on_light=dark_on_light
+    )
+    assert count == 5
+    # The other polarity's limit is the far end of the range: nothing is near it.
+    assert _possibly(img, bit_depth, dark_on_light=not dark_on_light) is False
+
+
+def test_pixels_near_the_limit_outside_the_box_do_not_count():
+    img = _near(4, 0.0, background=200.0)
+    img[0:2, 0:3] = 0.0  # six pixels at the limit beside the box
+    assert _possibly(img, 8, dark_on_light=True) is False
+    img[3, 8] = 1.0  # the box's last column: now five
+    assert _possibly(img, 8, dark_on_light=True) is True
+
+
+def test_integer_pixels_are_measured_without_wrapping():
+    # The analysis array is float, but raw 8- and 16-bit pixels must give the
+    # same answer: nothing below 0 wraps round to the top of the range.
+    for dtype, bit_depth, background in ((np.uint8, 8, 200), (np.uint16, 16, 50000)):
+        img = _near(5, 0, background=background, dtype=dtype)
+        assert _possibly(img, bit_depth, dark_on_light=True) is True
+        assert _possibly(img, bit_depth, dark_on_light=False) is False
+
+
+def test_a_colour_box_is_measured_on_its_gray_mean():
+    # The mean of red, green and blue, as the image is quantified: (0, 0, 6)
+    # averages to 2, near the limit; (0, 0, 7) to 2.33, not. A tinted export
+    # whose blue channel alone reaches 0 is not flagged (#112's measurements).
+    rgb = np.full((10, 12, 3), 200.0)
+    box = rgb[3:7, 3:9]  # a view into rgb
+    box[_first(5)] = (0.0, 0.0, 6.0)
+    assert _possibly(rgb, 8, dark_on_light=True) is True
+    box[_first(5)] = (0.0, 0.0, 7.0)
+    assert _possibly(rgb, 8, dark_on_light=True) is False
+    box[:] = (40.0, 12.0, 0.0)  # a tint: the gray mean is 17.3
+    assert _possibly(rgb, 8, dark_on_light=True) is False
+
+
+def test_possibly_over_exposed_is_not_assessed_without_a_depth():
+    # None: the exact check runs on the image, or it has no known range.
+    img = _near(24, 0.0, background=200.0)
+    assert _possibly(img, None, dark_on_light=True) is None
+
+
 # --- local background: ring_median (#83) ---
 
 # A 24 x 10 box whose centre is (71.5, 54.5), on a 160 x 120 image.

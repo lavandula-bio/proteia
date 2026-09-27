@@ -38,13 +38,14 @@ then autosaves. So an edit is all or nothing:
 Stored values that depend on pixels or geometry are recomputed by the operation
 that invalidates them, in the same change, so the logged content hash covers
 them: :func:`_quantify_image` is the one writer of a band's net, background
-fields and ``clipped`` flag, and :func:`_set_box` the one place a box moves (it
-clears the position-derived ``apparent_mw``). The invariant: for every image,
-every band's stored net, ``background_level``, ``background_mode``,
-``background_spread`` and ``clipped`` equal
-:func:`~proteia.core.quantify.band_backgrounds`,
-:func:`~proteia.core.quantify.net_signal` and
-:func:`~proteia.core.quantify.is_clipped` of the stored pixels, all the boxes
+fields and ``clipped`` and ``possibly_clipped`` flags, and :func:`_set_box` the
+one place a box moves (it clears the position-derived ``apparent_mw``). The
+invariant: for every image, every band's stored net, ``background_level``,
+``background_mode``, ``background_spread``, ``clipped`` and ``possibly_clipped``
+equal :func:`~proteia.core.quantify.band_backgrounds`,
+:func:`~proteia.core.quantify.net_signal`,
+:func:`~proteia.core.quantify.is_clipped` and
+:func:`~proteia.core.quantify.is_possibly_clipped` of the stored pixels, all the boxes
 on that image (every protein's, each with its protein's box size), the
 polarity, the bit depth and the project's background method. A band's ring
 excludes every other box on its image, so any edit that adds, moves, resizes or
@@ -52,13 +53,18 @@ removes a box re-quantifies the whole image: :func:`place_box`,
 :func:`move_box`, :func:`remove_box`, :func:`set_box_size`,
 :func:`set_box_padding`, :func:`remove_protein`, :func:`clear_boxes` and
 :func:`detect_row_boxes`; a polarity change re-quantifies its image and
-:func:`requantify` every image.
+:func:`requantify` every image of a legacy project, or the images
+:func:`unassessed_images` names.
 Removing an image removes its bands and changes no other image. Undo and redo
 restore a committed state whole, which met the invariant, and recompute
 nothing. A project quantified before #83 keeps the legacy method
 (``global_median``) until :func:`requantify`: each band's level is its image's
 median, its mode ``global_median``, its spread 0, and its net floors each
-pixel at 0, so edits of a legacy project keep the legacy invariant.
+pixel at 0, so edits of a legacy project keep the legacy invariant. A project
+saved before #112 holds no ``possibly_clipped`` on the bands of an image that
+check assesses (a lossy, colour or CMYK image of known bit depth): the one
+exception to the invariant, until an edit re-quantifies the image or
+:func:`requantify` does (:func:`unassessed_images`).
 
 A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
 detector's measurement that cannot be redone from the model alone, so an edit
@@ -107,7 +113,7 @@ from proteia.core.export import (
     lane_table_bytes,
 )
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
-from proteia.core.imaging import clipping_depth, load_image
+from proteia.core.imaging import clipping_depth, load_image, possible_clipping_depth
 from proteia.core.model import (
     DETECTING_SOURCES,
     IMAGE_SUFFIXES,
@@ -164,6 +170,7 @@ from proteia.core.quantify import (
     band_backgrounds,
     estimate_background,
     is_clipped,
+    is_possibly_clipped,
     net_signal,
 )
 from proteia.core.results import Results
@@ -218,6 +225,7 @@ __all__ = [
     "set_lanes",
     "set_polarity",
     "set_reference_condition",
+    "unassessed_images",
     "undo",
 ]
 
@@ -496,7 +504,7 @@ _UNQUANTIFIED: Final = {
 
 
 def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
-    """The one writer of a band's net, background fields and clipping flag:
+    """The one writer of a band's net, background fields and clipping flags:
     quantify every band on one image, of every protein, together (protein order,
     then band order; the results do not depend on it), since each band's ring
     leaves out every box on the image. ``array`` is the image's analysis array.
@@ -506,7 +514,9 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     otherwise :func:`~proteia.core.quantify.band_backgrounds` measures each
     level (falling back to the image's median) and the net floors the box total
     (:data:`~proteia.core.quantify.RING_CLAMP`). An image without a limit the
-    clipping check can trust leaves its bands unchecked (None).
+    clipping check can trust leaves its bands unchecked (``clipped`` None); if
+    its range is known (a lossy, colour or CMYK-converted image), each band is
+    assessed instead (``possibly_clipped``, #112), which is None everywhere else.
     """
     batch = draft.batch
     image = batch.find_image(image_id)
@@ -534,6 +544,7 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
         )
         clamp = RING_CLAMP
     depth = clipping_depth(image.bit_depth, image.import_warnings)
+    near_depth = possible_clipping_depth(image.bit_depth, image.import_warnings)
     for (size, band), background in zip(placed, found, strict=True):
         band.net = net_signal(
             array, band.box, size, background.level, dark_on_light=dark_on_light, clamp=clamp
@@ -543,6 +554,9 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
         band.background_spread = background.spread
         band.clipped = is_clipped(
             array, band.box, size, bit_depth=depth, dark_on_light=dark_on_light
+        )
+        band.possibly_clipped = is_possibly_clipped(
+            array, band.box, size, bit_depth=near_depth, dark_on_light=dark_on_light
         )
 
 
@@ -2807,27 +2821,58 @@ def remove_undetected(
 # --- The background method ---
 
 
+def unassessed_images(batch: Batch) -> list[str]:
+    """The ids of the images whose bands were measured before Proteia looked
+    for pixels near the detector limit (#112), in membrane then image order:
+    an image that check assesses
+    (:func:`~proteia.core.imaging.possible_clipping_depth` known: a lossy,
+    colour or CMYK-converted image of 8- or 16-bit pixels) holding a band with
+    no ``possibly_clipped`` flag, as a project saved before it holds.
+    :func:`requantify` assesses them."""
+    return [
+        image.id
+        for image in batch.iter_images()
+        if possible_clipping_depth(image.bit_depth, image.import_warnings) is not None
+        and any(
+            band.possibly_clipped is None
+            for protein in batch.proteins
+            if protein.image_id == image.id
+            for band in protein.bands
+        )
+    ]
+
+
 @_locked
 def requantify(session: ProjectSession) -> tuple[str, ...]:
-    """Switch the project to the local background (``ring_median_v1``) and
-    re-quantify every band with it, in one change; return the ids of the images
-    re-quantified (those with bands), in membrane then image order.
+    """Re-quantify what a project saved by an earlier version left unmeasured,
+    in one change: switch the project to the local background
+    (``ring_median_v1``) and re-quantify every band with it, or, on the local
+    background already, re-quantify the images whose bands were never assessed
+    for over-exposure (:func:`unassessed_images`). Return the ids of the images
+    re-quantified, in membrane then image order.
 
     A project quantified before #83 keeps the legacy method (``global_median``)
-    until this runs, so its stored nets never change unasked. A project already
-    on ``ring_median_v1`` is a no-op. The pixels are read image by image inside
-    the change, and those not cached already are not kept, so memory holds one
-    image beyond the cache; a missing or changed image file still refuses the
-    whole change (``IMAGE_FILE_CHANGED``), which then changes nothing. The log
-    entry names the method left (``from``), the method taken (``to``) and the
+    until this runs, so its stored nets never change unasked; every image with
+    bands is re-quantified, which assesses them too. A project saved before
+    #112 keeps its bands on a lossy, colour or CMYK image unassessed until an
+    edit re-quantifies their image or this runs, which leaves every other image
+    as it is. With nothing to do it is a no-op. The pixels are read image by
+    image inside the change, and those not cached already are not kept, so
+    memory holds one image beyond the cache; a missing or changed image file
+    still refuses the whole change (``IMAGE_FILE_CHANGED``), which then changes
+    nothing. The log entry names the method left (``from``), the method taken
+    (``to``; the same for a project on the local background already) and the
     images re-quantified (``images``).
     """
     project = session.project
     old = project.background_method
-    if old == LOCAL_BACKGROUND_METHOD:
-        return ()
     batch = project.batch
-    images = [image.id for image in batch.iter_images() if _bands_on(batch, image.id)]
+    if old == LOCAL_BACKGROUND_METHOD:
+        images = unassessed_images(batch)
+        if not images:
+            return ()
+    else:
+        images = [image.id for image in batch.iter_images() if _bands_on(batch, image.id)]
 
     def change(draft: Project) -> None:
         draft.background_method = LOCAL_BACKGROUND_METHOD
