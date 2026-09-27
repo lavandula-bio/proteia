@@ -87,6 +87,7 @@ from proteia.core.quantify import (
     is_possibly_clipped,
     net_signal,
     quantify_nets,
+    saturation_level,
 )
 from proteia.core.record import history_issues
 from proteia.core.results import Level, NoticeCode
@@ -95,6 +96,7 @@ from proteia.core.session import save_to_folder
 from proteia.core.storage import canonical_json, content_hash, load_project
 from proteia.web.state import project_state
 from rowcases import (
+    MEMBRANE,
     RowCase,
     adversarial,
     adversarial_row,
@@ -1139,6 +1141,156 @@ def test_set_polarity_recomputes_the_nets_on_that_image(tmp_path):
         assert band.clipped is False  # recomputed for the new polarity (16-bit, below 65535)
     assert_nets_current(s, only=[bright])  # every band on it, the other signal direction
     assert protein_of(s, on_dark).bands == dark_bands  # the other image is untouched
+
+
+# --- The looks_processed warning at import and on a polarity change (#127) ---
+
+
+def processed(s: ProjectSession, image_id: str) -> str | None:
+    """The image's looks_processed warning message; None without one."""
+    image = s.project.batch.find_image(image_id)
+    found = [w.message for w in image.import_warnings if w.code == "looks_processed"]
+    return found[0] if found else None
+
+
+def rows_at(background: int, dtype, share: float, level: int) -> np.ndarray:
+    """A 40 x 200 image at ``background`` whose top ``share`` of rows is at
+    ``level``, as saturated band cores or a figure's panel cover it."""
+    pixels = np.full((40, 200), background, dtype=dtype)
+    pixels[: round(share * 40)] = level
+    return pixels
+
+
+FIGURE_PREFIX = "This looks like a processed figure rather than a raw scan: "
+
+
+@pytest.mark.parametrize(
+    ("case", "pixels", "polarity"),
+    [
+        # A 16-bit membrane below mid-range, with band cores cut at 0.
+        ("membrane below mid-range", rows_at(20000, np.uint16, 0.2, 0), DARK),
+        # A crop the over-exposed band fills: its median is the band's 0.
+        ("crop of a saturated band", rows_at(215, np.uint8, 0.65, 0), DARK),
+        # A long exposure: light bands at 65535 on a background raised past mid-range.
+        ("raised background", rows_at(34000, np.uint16, 0.2, 65535), LIGHT),
+        ("light crop of a saturated band", rows_at(9000, np.uint16, 0.65, 65535), LIGHT),
+    ],
+)
+def test_saturated_bands_never_look_processed_whichever_half_the_median_is_in(
+    tmp_path, case, pixels, polarity
+):
+    # The background's end of the range comes from the polarity, not from the
+    # half of the range the median falls in: over-exposed band cores, at the
+    # other end, never count as a background levelled to the limit.
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, f"{case} µ.tif", polarity)
+    assert processed(s, image) is None
+    assert s.project.batch.find_image(image).import_warnings == []
+
+
+def test_a_levelled_background_looks_processed_whichever_half_the_median_is_in(tmp_path):
+    # Dark bands filling most of a crop whose background was levelled to white:
+    # the median is the bands', and the background still counts.
+    s = session_on(tmp_path)
+    white = import_blot(s, rows_at(255, np.uint8, 0.7, 60), "white α.tif", DARK)
+    assert processed(s, white) == (
+        f"{FIGURE_PREFIX}30% of its pixels are pure white. Its background may then not be"
+        " the membrane, and over-exposure may be hidden; quantify the original scan if you"
+        " have it."
+    )
+    black = import_blot(s, rows_at(0, np.uint16, 0.7, 50000), "black β.tif", LIGHT)
+    assert processed(s, black).startswith(f"{FIGURE_PREFIX}30% of its pixels are pure black.")
+
+
+def test_a_polarity_change_reassesses_the_looks_processed_warning(tmp_path):
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    figure = rows_at(255, np.uint8, 0.2, 90)  # a background levelled to white
+    image = import_blot(s, figure, "figure α.tif", LIGHT)  # the wrong polarity chosen
+    assert processed(s, image) is None  # nothing at the limit it names: black
+    ops.set_polarity(s, image, DARK)
+    assert processed(s, image).startswith(
+        f"{FIGURE_PREFIX}its median level, the image-wide background, is pure white; 80% of"
+        " its pixels are pure white."
+    )
+    ops.undo(s)
+    assert processed(s, image) is None
+    ops.redo(s)
+    assert processed(s, image) is not None
+    # With bands on the image, whose re-quantification reads its pixels too.
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    ops.place_box(s, protein, NARROW_X, 20, lane_index=0, grow=False)
+    ops.set_polarity(s, image, LIGHT)
+    assert processed(s, image) is None
+
+    # The other warnings stay, in their order; the new one comes last.
+    jpeg = import_encoded(s, "figure β.jpg", Image.fromarray(figure), LIGHT, quality=95)
+    assert [w.code for w in s.project.batch.find_image(jpeg).import_warnings] == ["lossy_format"]
+    ops.set_polarity(s, jpeg, DARK)
+    codes = [w.code for w in s.project.batch.find_image(jpeg).import_warnings]
+    assert codes == ["lossy_format", "looks_processed"]
+    assert "80% of its pixels are at or near pure white" in processed(s, jpeg)
+
+    # A palette's levels do not depend on the polarity: that signal stays.
+    even = np.repeat(np.arange(0, 255, 2, dtype=np.uint8), 20)[None, :]
+    palette = import_encoded(s, "palette γ.png", Image.fromarray(even).convert("P"), LIGHT)
+    only_palette = (
+        f"{FIGURE_PREFIX}it is a palette image using only 128 of the 255 grey levels in its range."
+    )
+    assert processed(s, palette).startswith(only_palette)
+    ops.set_polarity(s, palette, DARK)
+    assert processed(s, palette).startswith(only_palette)
+
+
+def test_a_polarity_change_drops_the_looks_processed_warning_of_an_image_it_cannot_read(
+    tmp_path,
+):
+    # No band needs its pixels, so the polarity still changes, as before #127;
+    # every analysis of the image is refused until its file is back. The
+    # looks_processed warning, assessed for the old polarity, would name the
+    # wrong limit: it goes; the other warnings stay.
+    from PIL import Image
+
+    s = session_on(tmp_path, save_to_folder)
+    figure = rows_at(255, np.uint8, 0.2, 90)
+    image = import_encoded(s, "figure α.jpg", Image.fromarray(figure), DARK, quality=95)
+    warnings = s.project.batch.find_image(image).import_warnings
+    assert [w.code for w in warnings] == ["lossy_format", "looks_processed"]
+    reopened = ops.open_project(s.folder)
+    (reopened.folder / "images" / f"{image}.jpg").unlink()
+    ops.set_polarity(reopened, image, LIGHT)
+    stored = reopened.project.batch.find_image(image)
+    assert stored.polarity is LIGHT
+    assert stored.import_warnings == [warnings[0]]
+
+
+def test_a_polarity_change_on_an_image_with_no_band_keeps_no_pixels(tmp_path):
+    # The warning is assessed from the pixels, which nothing else on an image
+    # with no band needs: they are read, not kept in the session's cache.
+    s = session_on(tmp_path, save_to_folder)
+    image = import_blot(s, rows_at(255, np.uint8, 0.2, 90), "figure α.tif", DARK)
+    reopened = ops.open_project(s.folder)
+    ops.set_polarity(reopened, image, LIGHT)
+    assert image not in reopened._pixels
+
+
+def test_an_import_takes_the_image_median_once(tmp_path, monkeypatch):
+    # The looks_processed warning reuses the background the import stores, the
+    # image's median, which on a large image costs a full copy of it.
+    s = session_on(tmp_path)
+    calls = []
+    median = np.median
+
+    def counted(*args, **kwargs):
+        calls.append(args[0].shape)
+        return median(*args, **kwargs)
+
+    monkeypatch.setattr(np, "median", counted)
+    image = import_blot(s, rows_at(255, np.uint8, 0.2, 90), "figure α.tif", DARK)
+    assert calls == [(40, 200)]
+    assert processed(s, image) is not None
 
 
 def test_changed_image_file_is_refused(tmp_path):
@@ -4274,6 +4426,11 @@ def detected(s: ProjectSession, protein_id: str, row) -> RowDetection:
         len(batch.lanes),
         background=image.background,
         dark_on_light=image.polarity.dark_on_light,
+        saturated_at=saturation_level(
+            clipping_depth(image.bit_depth, image.import_warnings),
+            possible_clipping_depth(image.bit_depth, image.import_warnings),
+            dark_on_light=image.polarity.dark_on_light,
+        ),
     )
 
 
@@ -4922,6 +5079,28 @@ def test_warnings_are_reported_and_logged(tmp_path):
     assert (params["flags"], params["notes"]) == (["size_outlier"], list(found.notes))
 
 
+@pytest.mark.parametrize(("stored", "hollow"), [("uint16", True), ("jpeg", True), ("float", False)])
+def test_a_hollow_band_is_over_exposed_where_the_image_s_limit_is_known(tmp_path, stored, hollow):
+    # #121: lane 2's band clipped flat at 0 around a lighter centre. Its
+    # saturated pixels are counted as the over-exposure checks count them: at
+    # the limit of a 16-bit TIFF, within 2 levels of it on an 8-bit JPEG
+    # export. A float image has no known limit: one band, nothing more.
+    case = adversarial("hollow_band", 1000)
+    s = session_on(tmp_path)
+    if stored == "jpeg":
+        gray8 = np.clip(np.round(case.image * 200.0 / MEMBRANE), 0.0, 255.0).astype(np.uint8)
+        image = import_jpeg(s, gray8, 75)
+    else:
+        image = import_blot(s, case.image.astype(np.uint16 if stored == "uint16" else np.float64))
+    ops.set_lanes(s, _lane_inputs(case.n_lanes, ()))
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.flags == (("hollow_band",) if hollow else ())
+    assert any(note.startswith("lane 2: a hollow band") for note in placement.notes) is hollow
+    assert s.project.log[-1].params["flags"] == list(placement.flags)
+    assert len([b for b in protein_of(s, protein).bands if b.lane_index == 1]) == 1
+
+
 def test_the_row_commit_logs_every_lane(tmp_path):
     case = ROWS["missing_middle"]  # lane 2 is empty
     s, _, protein = row_session(tmp_path, case)
@@ -4970,6 +5149,8 @@ def test_the_row_commit_logs_every_lane(tmp_path):
             "flags": [],
             "notes": [],
             "right_to_left": False,
+            # A 16-bit TIFF: saturated at the exact limit (#121).
+            "saturated_at": 0.0,
             # Dev builds share a version string: the constants that placed the
             # boxes go with each commit.
             "settings": rowdetect.settings(),
@@ -4999,7 +5180,14 @@ def test_record_settings_are_what_the_row_commit_uses(tmp_path, monkeypatch):
         image.background,
         True,
     )
-    assert record.settings()["detect_row"] == rowdetect.settings()
+    # A 16-bit TIFF: saturated at the exact limit, 0 on a dark-on-light image (#121).
+    assert bound.arguments["saturated_at"] == 0.0
+    # The record gives detect_row's settings, and how the commit chose the
+    # saturation level for each image; the log gives the level it used.
+    reported = record.settings()["detect_row"]
+    assert {k: v for k, v in reported.items() if k != "saturated_at"} == rowdetect.settings()
+    assert "saturation_level" in reported["saturated_at"]
+    assert s.project.log[-1].params["saturated_at"] == 0.0
 
 
 # --- #111: a first row read with no lanes on the image to check it ---

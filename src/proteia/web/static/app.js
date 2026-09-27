@@ -1864,6 +1864,14 @@ const ROW_WARNINGS = {
     note: "second separate component",
     words: (lanes) => `two bands in ${lanes || "a lane"}: the box covers the stronger one`,
   },
+  hollow_band: {
+    note: "a hollow band",
+    words: (lanes) => {
+      const bands = lanes && lanes.startsWith("lanes") ? "hollow bands" : "a hollow band";
+      const where = lanes ? `${bands} in ${lanes}` : bands;
+      return `${where}: lighter in the centre and saturated around it, likely over-exposed`;
+    },
+  },
   cut_by_row_box: {
     note: "cuts through the band",
     words: (lanes) => {

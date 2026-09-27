@@ -239,7 +239,17 @@ def test_settings_are_the_code_constants():
         "lane_table_ratio_decimals": LANE_TABLE_RATIO_DECIMALS,
         "lane_table_first_lane": 1,  # the lane column numbers lanes as the app does
         "chart_png_dpi": CHART_PNG_DPI,
-        "detect_row": rowdetect.settings(),  # every row-box detection constant
+        "detect_row": {
+            **rowdetect.settings(),  # every row-box detection constant
+            # How the row commit chooses the saturation level for an image (#121).
+            "saturated_at": (
+                "quantify.saturation_level: the detector limit where the exact over-exposure"
+                " check runs (clipped_pixels_threshold), else that limit moved in by"
+                " possibly_clipped's near_limit_levels (a lossy, colour or CMYK-converted"
+                " image); none for an image of unknown bit depth (float), and then no band"
+                " is called hollow (hollow_band)"
+            ),
+        },
         "statistics": {
             "alpha": 0.05,
             "dunnett_rng_seed": 0,

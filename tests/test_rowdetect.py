@@ -40,6 +40,7 @@ from proteia.core.rowdetect import (
     END_DOUBT,
     EXTENT_LEVEL,
     FIT_MAX_PIXELS,
+    HOLLOW_PIXELS,
     LANES_DOUBT,
     MEMBRANE_SHIFT_K,
     PITCH_DOUBT,
@@ -49,6 +50,7 @@ from proteia.core.rowdetect import (
     ROW_LINE_TOL,
     ROW_LINE_TOL_PX,
     ROW_SMILE,
+    SECOND_SHARE,
     SIZE_GUARD,
     SMOOTH,
     WARNING_FLAGS,
@@ -75,6 +77,7 @@ from rowcases import (
     fuzz_row,
     hstripe,
     image_cut,
+    jpeg,
     shade_above,
     synthetic_row,
 )
@@ -92,6 +95,10 @@ ADVERSARIAL_KEYS = [
     ("bubble_band", 1000),  # a band split in two along x
     ("tall_band", 1000),  # size_outlier
     ("doublet_deep", 1000),  # multiple_components
+    ("dumbbell_band", 1000),  # a dip inside one grown extent
+    ("hollow_band", 1000),  # the same, clipped flat at 0 around it
+    ("hollow_ring", 1000),  # a ring: saturated all around a lighter centre
+    ("notched_band", 1000),  # a saturated band's ends rising above its middle
     ("smile_tall_tight", 1000),  # the vertical placement clamp binds
     ("wide_row", 1000),  # above FIT_MAX_PIXELS: every fit subsamples
 ]
@@ -952,19 +959,281 @@ def test_doublet_boxes_the_strongest_component_and_flags_the_lane():
     assert not found.refused
 
 
-@pytest.mark.parametrize(("dy", "frac"), [(14, 0.2), (14, 0.25), (20, 0.2), (20, 0.3)])
-def test_a_weaker_second_component_is_flagged_and_counted_once(dy, frac):
-    # Lane 2's second band is dy px below the first and a fifth to 0.3 as deep:
-    # under the extent level of the box, yet tens of sigmas above its saddle.
-    # The pair is centred on the row, so the box on the first lies dy / 2 px
-    # above the other boxes' line: 10 px apart, more than ROW_LINE_K of the
-    # 12 px box's height (#114).
-    case = adversarial_row("doublet", 1000, doublet={2: (dy, frac)}, my=12)
+@pytest.mark.parametrize(("frac", "counted"), [(0.2, False), (0.25, True), (0.3, True)])
+def test_a_doublet_s_weaker_band_counts_from_a_quarter_of_the_peak(frac, counted):
+    # #121: lane 2's second band is 14 px below the first and 0.2 to 0.3 as
+    # deep, joined to it by signal above the noise (a doublet not fully
+    # apart): under the extent level of the box, tens of sigmas above its
+    # saddle, and wide as a band. It counts only from SECOND_SHARE of the
+    # lane's peak.
+    case = adversarial_row("doublet", 1000, doublet={2: (14, frac)}, my=12)
     found = detect(case)
-    off = ("off_row_line",) if dy / 2 > ROW_LINE_K * found.size.height else ()
-    assert found.flags == (*off, "multiple_components")
-    assert bool(off) is (dy == 20)
-    assert components(found) == [1, 1, 2, 1, 1, 1]
+    assert found.flags == (("multiple_components",) if counted else ())
+    assert components(found) == [1, 1, 1 + counted, 1, 1, 1]
+    assert (frac >= SECOND_SHARE) is counted
+    if counted:
+        assert found.notes == (
+            "lane 3: a second separate component reaches 25% of the lane's peak;"
+            " the box covers the one with the lane's strongest pixel",
+        )
+
+
+@pytest.mark.parametrize("frac", [0.3, 0.7])
+def test_a_band_apart_from_the_band_s_rows_is_no_second_component(frac):
+    # #121: 20 px apart, with membrane between them, the second band lies
+    # below the band's rows (its signal above the noise): no part of the
+    # band, however deep, as JPEG blocks and specks at the box's edge are not.
+    # The pair is centred on the row, so the box on the first lies 10 px above
+    # the other boxes' line, more than ROW_LINE_K of the 12 px box (#114).
+    case = adversarial_row("doublet", 1000, doublet={2: (20, frac)}, my=12)
+    found = detect(case)
+    assert 10 > ROW_LINE_K * found.size.height
+    assert found.flags == ("off_row_line",)
+    assert components(found) == [1] * 6
+
+
+@pytest.mark.parametrize("seed", [1000, 1002, 1003, 1006, 1007])
+def test_jpeg_block_noise_is_no_second_component(seed):
+    # #121: an 8-bit JPEG export of a row (quality 75, membrane 200, bands 70
+    # to 120 levels deep) on a smooth membrane: its 8x8 block artefacts, a
+    # level or so deep, reach DETECT_K sigma of the smooth membrane beside
+    # the bands and at the box's edges, and were counted as second bands in
+    # lanes of each of these rows. They reach about 1% of the lane's peak.
+    case = jpeg(adversarial_row("jpeg", seed, noise=100.0, my=10))
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_dumbbell_band_is_one_band(seed):
+    # #121: lane 1's band pale across its middle, its ends about 1.7x as dark:
+    # two peaks, but the dip between them stays inside the band's grown
+    # extent. One band, boxed whole, and not hollow: nothing is saturated.
+    case = _adversarial("dumbbell_band", seed)
+    found = detect(case, saturated_at=0.0)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+    assert not any(lane.hollow for lane in found.lanes)
+    x0, _, x1, _ = found.lanes[1].extent
+    ref = case.reference[1]
+    assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2  # both ends
+
+
+HOLLOW_NOTE = (
+    ": a hollow band, lighter in its centre than the saturated pixels on either side of it:"
+    " a sign of over-exposure"
+)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("light_on_dark", [False, True])
+def test_a_hollow_saturated_band_is_over_exposed_not_two_bands(seed, light_on_dark):
+    # #121: lane 1's band over-exposed, clipped flat at the limit around its
+    # lighter centre (a burnt-out band): one band, reported as hollow, a sign
+    # of over-exposure, where the saturation level is known.
+    case = _adversarial("hollow_band", seed)
+    limit = 0.0
+    if light_on_dark:
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    # Its halves, split along x by the lighter centre, are merged into one piece.
+    assert len(found.notes) == 2 and found.notes[0].startswith("merged pieces at x=")
+    assert found.notes[1] == f"lane 2{HOLLOW_NOTE}"
+    # With no known saturation level it is one band, not hollow.
+    unknown = detect(case)
+    assert unknown.flags == ()
+    assert not any(lane.hollow for lane in unknown.lanes)
+    assert unknown.slots == found.slots
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("stored", ["16-bit", "light_on_dark", "jpeg"])
+def test_a_band_burnt_out_in_its_middle_is_hollow(seed, stored):
+    # #121: lane 1's band over-exposed all around a lighter centre (a ring),
+    # clipped at the limit on every side of it: one connected peak, no dip
+    # between two peaks, yet hollow. An 8-bit JPEG export's saturated pixels
+    # lie within 2 levels of 0 (quantify.saturation_level).
+    case = _adversarial("hollow_ring", seed)
+    limit = 0.0
+    if stored == "light_on_dark":
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    elif stored == "jpeg":
+        case, limit = jpeg(case), 2.0
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    assert found.notes[-1] == f"lane 2{HOLLOW_NOTE}"
+    unknown = detect(case)
+    assert unknown.flags == ()
+    assert unknown.slots == found.slots
+
+
+def burnt_out(depth: float, light: float, seed: int) -> RowCase:
+    """Lane 1's band ``depth`` times as deep as the membrane (clipped at 0),
+    its centre lightened by ``light`` through its whole height and more: the
+    band of hollow_band, lightened 45000 there."""
+    blobs = [blob(1, 6.0, -light, ry=12.0)]
+    return adversarial_row("burnt_out", seed, depths={1: depth * MEMBRANE}, artefacts=blobs)
+
+
+# #121: 1.5x as deep lightened by 45000 to 120000, 2x by 60000 to 120000. From
+# 60000 (1.5x) or 90000 (2x) on, the centre falls below the extent level and
+# splits the band along x. Left out: 2x lightened by 45000, its centre still
+# at the limit, and seed 1001's band 1.5x deep lightened by 90000 or more,
+# which reaches the limit at fewer than HOLLOW_PIXELS pixels (both below).
+BURNT_OUT = [
+    (depth, light, seed)
+    for depth, lights in ((1.5, range(45000, 120001, 15000)), (2.0, range(60000, 120001, 15000)))
+    for light in lights
+    for seed in (1000, 1001)
+    if not (depth == 1.5 and seed == 1001 and light >= 90000)
+]
+
+
+@pytest.mark.parametrize("light_on_dark", [False, True])
+@pytest.mark.parametrize(("depth", "light", "seed"), BURNT_OUT)
+def test_a_band_split_by_its_burnt_out_centre_is_one_hollow_band(depth, light, seed, light_on_dark):
+    # #121: lane 1's band clipped at the limit on both sides of a centre
+    # lighter through its whole height, however light: split along x where
+    # the centre falls below the extent level, its halves in the same rows,
+    # saturated on either side of the centre. One band, hollow, not two, and
+    # its extent and box over both halves: a box over one of them, as over
+    # the stronger of two bands, would measure half the band.
+    case = burnt_out(depth, light, seed)
+    limit = 0.0
+    if light_on_dark:
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    assert found.notes[-1] == f"lane 2{HOLLOW_NOTE}"
+    ref = case.reference[1]
+    for x0, _, x1, _ in (found.lanes[1].extent, found.slots[1]):
+        assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2  # both halves
+
+
+def test_a_stroke_across_a_burnt_out_band_s_rows_does_not_join_it():
+    # #121: the halves of a saturated band split by a lighter centre (rows 15
+    # to 24), and a stroke drawn through the centre from row 2 to 37, at the
+    # limit too, as a pen line on a blot. The band's other half shares its
+    # rows and joins it; the stroke shares fewer than JOIN_ROWS of the rows it
+    # and the band span, and does not. (On a real drag, strokes joined in a
+    # chain gave one band a 77 x 37 px extent.)
+    s = np.zeros((40, 60))
+    saturated = np.zeros(s.shape, bool)
+    for c0, c1 in ((5, 25), (36, 56)):
+        s[15:25, c0:c1] = 100.0
+        saturated[17:23, c0 + 3 : c1 - 3] = True
+    s[15:25, 25:36] = 10.0  # the lighter centre
+    s[2:38, 30:32] = 100.0
+    saturated[2:38, 30:32] = True
+    pieces, count = label(s > 30.0)
+    assert count == 3
+    grown = pieces == pieces[20, 10]
+    joined = rowdetect._join_burnt_out(pieces, grown, s, saturated, 6.0, (0, 60))
+    assert joined is not None and joined[20, 45]  # the other half
+    assert np.flatnonzero(joined.any(axis=1)).tolist() == list(range(15, 25))
+    assert np.flatnonzero(joined.any(axis=0)).tolist() == list(range(5, 56))
+
+
+@pytest.mark.parametrize("seed", [1000, 1001])
+def test_a_band_at_the_limit_through_its_centre_is_not_hollow(seed):
+    # 2x as deep, lightened by 45000, lane 1's centre still reaches the limit:
+    # saturated across, no lighter centre. One band, boxed whole.
+    case = burnt_out(2.0, 45000.0, seed)
+    found = detect(case, saturated_at=0.0)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+    ref = case.reference[1]
+    x0, _, x1, _ = found.slots[1]
+    assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2
+
+
+@pytest.mark.parametrize("light", [90000.0, 105000.0, 120000.0])
+def test_a_band_split_where_it_hardly_reaches_the_limit_is_two_peaks(light):
+    # Seed 1001's band, 1.5x as deep, lightened by 90000 or more, reaches the
+    # limit at fewer than HOLLOW_PIXELS pixels: not over-exposed by the
+    # quantification's count (#112), no saturated pixels to enclose a centre.
+    # Its halves are two peaks, as a band's split by a bubble.
+    case = burnt_out(1.5, light, 1001)
+    assert np.count_nonzero(case.image <= 0.0) < HOLLOW_PIXELS
+    found = detect(case, saturated_at=0.0)
+    assert found.flags == ("multiple_components",)
+    assert components(found) == [1, 2, 1, 1, 1, 1]
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize(
+    ("left", "right"), [(24000.0, 24000.0), (1.5 * MEMBRANE, 24000.0), (24000.0, 1.5 * MEMBRANE)]
+)
+def test_two_bands_side_by_side_not_both_saturated_count_as_two(seed, left, right):
+    # #121: lane 1 holds two bands side by side, 28 px apart, membrane between
+    # them: neither saturated, or one only. No centre with saturated pixels on
+    # either side of it: two bands where the saturation level is known too.
+    blobs = [blob(1, 5.0, left, ry=3.5, dx=-14.0), blob(1, 5.0, right, ry=3.5, dx=14.0)]
+    case = adversarial_row("pair", seed, depths={1: 0.0}, artefacts=blobs)
+    found = detect(case, saturated_at=0.0)
+    assert found.flags == ("multiple_components",)
+    assert components(found) == [1, 2, 1, 1, 1, 1]
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize(("frac", "depth"), [(0.5, 1.3 * MEMBRANE), (1.0, 1.6 * MEMBRANE)])
+def test_an_over_exposed_close_doublet_is_not_a_hollow_band(seed, frac, depth):
+    # #121: lane 5 holds two bands 9 px apart, the upper clipped at 0, the
+    # lower half as deep (not saturated) or as deep (saturated too). The
+    # lighter rows between them hold no saturated pixel on either side: two
+    # bands stacked, not a band lighter in its centre, whatever one grown
+    # extent holds (R5). The saturation level changes nothing.
+    case = adversarial_row("doublet", seed, doublet={4: (9, frac)}, depths={4: depth})
+    assert np.count_nonzero(case.image <= 0.0) >= HOLLOW_PIXELS  # over-exposed
+    found = detect(case, saturated_at=0.0)
+    assert not any(lane.hollow for lane in found.lanes)
+    unknown = detect(case)
+    assert (found.flags, found.notes, found.slots) == (unknown.flags, unknown.notes, unknown.slots)
+    assert components(found) == components(unknown)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_notch_in_a_saturated_band_s_edge_is_not_hollow(seed):
+    # Lane 2's band clipped flat at 0, its two ends rising 6 px above its
+    # middle: along the rows above the middle, its lighter edge lies between
+    # saturated pixels, but the band is saturated across below it only. A
+    # notch in its top edge, not a lighter centre.
+    found = detect(_adversarial("notched_band", seed), saturated_at=0.0)
+    assert found.flags == ()
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+def test_a_saturated_band_without_a_dip_is_not_hollow():
+    # Lane 2 of the bench row is clipped flat at 0: saturated, one peak, no
+    # lighter centre. Over-exposure is the quantification's to flag.
+    found = detect(BENCH["overexposed"], saturated_at=0.0)
+    assert found.flags == ()
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, "0"])
+def test_a_saturation_level_that_is_not_a_finite_number_is_refused(value):
+    with pytest.raises(ValueError, match="saturated_at"):
+        detect(BENCH["all_present"], saturated_at=value)
 
 
 def test_a_band_split_by_a_bubble_is_flagged():
@@ -1664,6 +1933,11 @@ def check_invariants(case: RowCase, found: RowDetection) -> None:
             assert lane.reason == "edge_signal"
         assert math.isfinite(lane.snr) and math.isfinite(lane.expected_x)
     assert ("cut_by_row_box" in found.flags) == any(lane.cut for lane in found.lanes)
+    assert ("multiple_components" in found.flags) == any(
+        lane.components > 1 for lane in found.lanes
+    )
+    assert ("hollow_band" in found.flags) == any(lane.hollow for lane in found.lanes)
+    assert all(lane.rect is not None for lane in found.lanes if lane.hollow)
     assert math.isfinite(found.membrane_shift)
 
 
