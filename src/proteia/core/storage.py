@@ -682,12 +682,13 @@ def keep_backup(folder: str | os.PathLike[str], data: bytes, schema: int) -> str
     write is removed).
     """
     folder = Path(folder)
+    mode = _file_mode(folder / PROJECT_FILE)  # the copy is as readable as the original
     number = 1
     try:
         while True:
             name = backup_name(schema, number)
             path = folder / name
-            if _write_new(path, data) or _holds(path, data):
+            if _write_new(path, data, mode) or _holds(path, data):
                 return name
             number += 1
     except OSError as exc:
@@ -699,9 +700,11 @@ def keep_backup(folder: str | os.PathLike[str], data: bytes, schema: int) -> str
         ) from exc
 
 
-def _write_new(path: Path, data: bytes) -> bool:
-    """Write ``data`` into a new file ``path``, durably; False, writing nothing,
-    if something of that name exists. An ``OSError`` removes what was written."""
+def _write_new(path: Path, data: bytes, mode: int | None = None) -> bool:
+    """Write ``data`` into a new file ``path``, durably, with the permission bits
+    ``mode`` on POSIX (:func:`_file_mode`; the default for new files without
+    it); False, writing nothing, if something of that name exists. An
+    ``OSError`` removes what was written."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(path, flags, 0o666)  # the default mode for new files, under the umask
@@ -712,6 +715,8 @@ def _write_new(path: Path, data: bytes) -> bool:
             return False
         raise
     try:
+        if mode is not None:
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()

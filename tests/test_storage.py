@@ -1144,6 +1144,17 @@ def test_orphan_files_lists_unreferenced_files(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_backup_is_as_readable_as_the_project_file_it_copies(tmp_path):
+    # A project.json the user kept to themself (0600): its copy is not left
+    # readable by others.
+    original = tmp_path / "project.json"
+    original.write_bytes(b"{}")
+    original.chmod(0o600)
+    name = keep_backup(tmp_path, b"{}", 1)
+    assert (tmp_path / name).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_saved_files_get_default_permissions(tmp_path):
     umask = os.umask(0)
     os.umask(umask)
