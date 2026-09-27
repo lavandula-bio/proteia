@@ -65,6 +65,9 @@ from proteia.web.state import preview_png, project_state, revision
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
+# How long a reopen waits for an operation running on the open session before
+# answering it without reading its project.json again.
+REOPEN_WAIT_S: Final = 5.0
 
 
 class NoProjectError(RuntimeError):
@@ -224,18 +227,20 @@ class Workspace:
         that waited for its edits' answers finds it no older than what it
         shows); and with its undo history and kept results. Its unsaved changes
         (a failed autosave) are neither saved first, as a switch saves them, nor
-        replaced by the older file: the next change or quitting saves them. The
-        answer never waits for an operation running on the session: while one
-        holds its lock, the file is not read again (an edit saves over it
-        anyway; after a read, opening again reads it). When it cannot be told
-        whether the two folders are one (the open one is gone), the open is a
-        switch, whose close deletes nothing."""
+        replaced by the older file: the next change or quitting saves them. An
+        operation running on the session (an edit, or a read such as a preview)
+        is waited for, up to :data:`REOPEN_WAIT_S`, before the file is checked:
+        after an edit, which saved over it, there is nothing to read; after a
+        read, a changed file is read. One that runs longer leaves the file
+        unread, and the session is answered as it is; opening it again reads
+        it. When it cannot be told whether the two folders are one (the open
+        one is gone), the open is a switch, whose close deletes nothing."""
         with self._switching:
             folder = projects.project_folder(self.root, name)
             session = self._peek()
             if session is None or not _same_folder(session.folder, folder, unknown=False):
                 return self._switch(lambda: ops.open_project(folder, clock=self.clock))
-            if session.lock.acquire(blocking=False):
+            if session.lock.acquire(timeout=REOPEN_WAIT_S):
                 try:
                     # The new open id under the session's lock: no commit falls
                     # between the reload and it.

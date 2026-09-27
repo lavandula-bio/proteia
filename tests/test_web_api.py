@@ -1732,7 +1732,8 @@ def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
     project_file.write_bytes(empty)  # changed outside Proteia
     project = session.project
 
-    # An operation holds the session: the reopen answers it as it is, at once.
+    # An operation holds the session past the wait: the reopen answers it as it is.
+    monkeypatch.setattr(api, "REOPEN_WAIT_S", 0.2)
     held, release = threading.Event(), threading.Event()
 
     def running() -> None:
@@ -1764,6 +1765,32 @@ def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
     assert workspace.open("a µ") is session and session.project is project
     assert workspace.view(session)[0] == 2
     assert project_file.read_bytes() == empty
+
+
+def test_a_reopen_waits_for_a_short_read_and_then_reads_the_changed_file(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    project_file = session.folder / storage.PROJECT_FILE
+    empty = project_file.read_bytes()
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+    project_file.write_bytes(empty)  # changed outside Proteia
+
+    # A read (such as a preview hashing a large image) holds the session briefly.
+    held = threading.Event()
+
+    def reading() -> None:
+        with session.lock:
+            held.set()
+            time.sleep(0.3)
+
+    read = threading.Thread(target=reading)
+    read.start()
+    assert held.wait(10)
+    try:
+        assert workspace.open("A µ") is session  # waits for the read, then reads the file
+    finally:
+        read.join(10)
+    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
 
 
 def test_a_project_created_where_the_open_one_was_removed_keeps_the_files_it_stores(tmp_path):
