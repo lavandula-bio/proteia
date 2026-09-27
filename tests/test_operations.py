@@ -644,6 +644,293 @@ def test_reload_migrates_and_saves_a_file_of_an_older_schema(tmp_path):
     assert load_project(folder) == s.project
 
 
+# --- #140: an older project.json is kept before its migration ---
+
+BACKUP = "project.schema1.json"
+
+
+def backups(folder: Path) -> list[str]:
+    """The backups of an older project.json in ``folder``, by name."""
+    return sorted(path.name for path in folder.iterdir() if path.name.startswith("project.schema"))
+
+
+def files_in(folder: Path) -> dict[str, bytes]:
+    """Every file under ``folder``, by its path relative to it, with its bytes."""
+    return {
+        path.relative_to(folder).as_posix(): path.read_bytes()
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_opening_a_schema_1_project_keeps_its_project_json_first(tmp_path):
+    folder = v1_folder(tmp_path)
+    v1 = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved
+    assert backups(folder) == [BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1  # byte for byte
+    migrated = s.project.log[-1]
+    assert migrated.params == {
+        "from_schema": 1,
+        "to_schema": 2,
+        "from_content_hash": V1_CONTENT_HASH,
+        "backup": BACKUP,
+    }
+    assert load_project(folder) == s.project  # project.json names it too
+    assert history_issues(s.project) == []
+
+    # The migrated project opens as it was saved, and keeps no other backup.
+    s.close()
+    reopened = ops.open_project(folder, clock=FakeClock())
+    assert reopened.project == s.project and not reopened.dirty
+    ops.set_reference_condition(reopened, None)
+    reopened.close()
+    assert backups(folder) == [BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1
+
+    # Renamed back, the backup is the project as it was: migrated again, to
+    # the same content, and kept again.
+    (folder / BACKUP).replace(folder / storage.PROJECT_FILE)
+    restored = ops.open_project(folder, clock=FakeClock())
+    assert restored.project.log[-1].content_hash == migrated.content_hash
+    assert (folder / BACKUP).read_bytes() == v1
+
+
+def test_a_project_of_the_current_schema_gets_no_backup(tmp_path):
+    folder = tmp_path / FOLDER
+    project = make_project()
+    write_image_files(folder, project)
+    storage.save_project(project, folder)
+    s = ops.open_project(folder)
+    ops.set_reference_condition(s, None)
+    assert backups(folder) == []
+    assert "backup" not in json.dumps([entry.params for entry in s.project.log])
+
+
+def test_a_second_migrating_open_never_replaces_a_backup(tmp_path):
+    folder = v1_folder(tmp_path)
+    path = folder / storage.PROJECT_FILE
+    v1 = path.read_bytes()
+    ops.open_project(folder, clock=FakeClock()).close()
+
+    # The same file restored: the backup holding it already is the one named.
+    path.write_bytes(v1)
+    again = ops.open_project(folder, clock=FakeClock())
+    assert again.project.log[-1].params["backup"] == BACKUP
+    assert backups(folder) == [BACKUP]
+    again.close()
+
+    # Other bytes of schema 1 (a BOM and CRLF, as a Windows editor saves them):
+    # a backup of their own, numbered as export folders are; the first stays.
+    edited = codecs.BOM_UTF8 + v1.replace(b"\n", b"\r\n")
+    path.write_bytes(edited)
+    s = ops.open_project(folder, clock=FakeClock())
+    second = "project.schema1 (2).json"
+    assert s.project.log[-1].params["backup"] == second
+    assert backups(folder) == [second, BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1
+    assert (folder / second).read_bytes() == edited
+
+    # Read again while open, the first file names the first backup.
+    ops.set_reference_condition(s, None)
+    path.write_bytes(v1)
+    assert s.reload()
+    assert s.project.log[-1].params["backup"] == BACKUP
+    assert backups(folder) == [second, BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1
+
+
+def _refuse_backups(monkeypatch, failure: str) -> None:
+    """Make writing a backup fail: its file cannot be created (``create``, as in
+    a folder that cannot be written), or fails once created (``write``, as on a
+    full disk)."""
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if Path(path).name.startswith("project.schema"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    def fail(fd):
+        raise OSError(28, "No space left on device")
+
+    if failure == "create":
+        monkeypatch.setattr(storage.os, "open", refuse)
+    else:
+        monkeypatch.setattr(storage.os, "fsync", fail)
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"), [("create", "Permission denied"), ("write", "No space left on device")]
+)
+def test_an_open_that_cannot_keep_the_backup_changes_nothing(
+    tmp_path, monkeypatch, failure, reason
+):
+    folder = v1_folder(tmp_path)
+    before = files_in(folder)
+    recorder = Recorder()
+    with monkeypatch.context() as patch:
+        _refuse_backups(patch, failure)
+        with pytest.raises(storage.BackupError) as info:
+            ops.open_project(folder, autosave=recorder, clock=FakeClock())
+    assert isinstance(info.value, OSError)  # answered as a file error
+    assert str(info.value) == (
+        f"{FOLDER!r} was saved by an older Proteia (schema 1), and a copy of its"
+        f" project.json could not be kept before updating it ({reason}); nothing was changed"
+    )
+    assert str(tmp_path) not in str(info.value)  # the folder by name, never its path
+    assert recorder.actions == []
+    assert files_in(folder) == before  # no backup, not even a partial one
+
+    # Once it can be written, the project opens.
+    s = ops.open_project(folder, clock=FakeClock())
+    assert s.project.log[-1].params["backup"] == BACKUP
+
+
+@pytest.mark.parametrize("failure", ["create", "write"])
+def test_a_reload_that_cannot_keep_the_backup_keeps_the_session(tmp_path, monkeypatch, failure):
+    folder = v1_folder(tmp_path)
+    v1 = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, clock=FakeClock())
+    ops.set_reference_condition(s, None)
+    (folder / BACKUP).unlink()  # deleted by hand
+    (folder / storage.PROJECT_FILE).write_bytes(v1)  # an old copy restored
+    before, project, steps = files_in(folder), s.project, s.history_steps
+    with monkeypatch.context() as patch:
+        _refuse_backups(patch, failure)
+        with pytest.raises(storage.BackupError):
+            s.reload()
+    assert (s.project, s.history_steps, s.dirty, s.save_error) == (project, steps, False, None)
+    assert files_in(folder) == before
+    assert s.reload() and (folder / BACKUP).read_bytes() == v1
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root ignores"
+)
+def test_a_folder_that_cannot_be_written_refuses_to_open_an_older_project(tmp_path):
+    folder = v1_folder(tmp_path)
+    before = files_in(folder)
+    folder.chmod(0o555)
+    try:
+        with pytest.raises(storage.BackupError, match="could not be kept"):
+            ops.open_project(folder, clock=FakeClock())
+    finally:
+        folder.chmod(0o755)
+    assert files_in(folder) == before
+
+
+def _dropping_img_4(doc: dict) -> dict:
+    """A faulty schema 1 to 2 step: it loses the reprobe (img-4) and GAPDH on it."""
+    doc = storage._v1_to_v2(doc)
+    batch = doc["batch"]
+    for membrane in batch["membranes"]:
+        membrane["images"] = [image for image in membrane["images"] if image["id"] != "img-4"]
+    batch["proteins"] = [protein for protein in batch["proteins"] if protein["image_id"] != "img-4"]
+    return doc
+
+
+def test_the_cleanup_keeps_every_image_file_a_backup_names(tmp_path, monkeypatch):
+    # A migration that dropped an image reference would leave its file to the
+    # cleanup of the save that follows: the backup could not be restored.
+    monkeypatch.setitem(storage.MIGRATIONS, 1, _dropping_img_4)
+    folder = v1_folder(tmp_path)
+    reprobe = folder / "images" / "img-4.tif"
+    s = ops.open_project(folder, clock=FakeClock())  # migrated, saved and cleaned up
+    assert "img-4" not in {image.id for image in s.project.batch.iter_images()}
+    assert reprobe.exists()
+    # Nor at the saves and imports that follow, in this session or the next.
+    ops.set_reference_condition(s, None)
+    import_blot(s, blot(), "β.tif")
+    s.close()
+    assert reprobe.exists()
+    reopened = ops.open_project(folder, clock=FakeClock())
+    ops.set_reference_condition(reopened, "vehicle")
+    assert reprobe.exists()
+
+    # Once the backup is deleted, the file is an orphan like any other.
+    (folder / BACKUP).unlink()
+    ops.set_reference_condition(reopened, None)
+    assert not reprobe.exists()
+
+
+def test_the_cleanup_keeps_an_image_file_named_in_any_backup(tmp_path):
+    folder = v1_folder(tmp_path)
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved: next_id 19
+    images = folder / "images"
+    for name in ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-19.tif", "img-25.tif"):
+        (images / name).write_bytes(b"an image no project.json references")
+    # A backup is read as bytes, whatever its schema, even one that no longer
+    # loads; its name is compared ignoring case, as Windows does. Only an id
+    # below next_id is kept: a backup's images hold no other (a migration keeps
+    # next_id, and the project only raises it), and the next import takes 19.
+    (folder / "Project.Schema3 (2).json").write_bytes(
+        b'{"broken": "img-7.tif", img-8.tiff, img-19.tif, img-25.tif'
+    )
+    ops.set_reference_condition(s, None)  # saved, then cleaned up
+    assert listing(s) == [
+        "IMG-8.TIFF",
+        "img-2.tif",
+        "img-3.png",
+        "img-4.tif",
+        "img-6.jpg",
+        "img-7.tif",
+    ]
+
+
+def _crash_after_an_import(folder: Path) -> None:
+    """Import into the project in ``folder`` and never save, as a crash leaves
+    it: the image's file stays in images/, at the id the next import takes."""
+    crashed = ops.open_project(folder, autosave=None, clock=FakeClock())
+    import_blot(crashed, blot(), "lost.tif")
+
+
+def test_a_stored_name_in_a_backup_s_text_never_blocks_the_next_import(tmp_path):
+    # An original name kept in a backup reads as a stored name too, here the
+    # name of the id the next import takes: the leftover file of that id goes
+    # all the same, as no backup's image can hold that id.
+    folder = v1_folder(tmp_path)
+    path = folder / storage.PROJECT_FILE
+    doc = json.loads(path.read_bytes())
+    doc["batch"]["membranes"][0]["images"][0]["original_name"] = "Blot IMG-19.TIF"
+    path.write_bytes(storage.document_bytes(doc))
+    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 19
+    assert b"IMG-19.TIF" in (folder / BACKUP).read_bytes()
+    _crash_after_an_import(folder)
+    leftover = folder / "images" / "img-19.tif"
+    assert leftover.exists()
+
+    s = ops.open_project(folder, clock=FakeClock())
+    assert import_blot(s, blot(), "β.tif") == "img-19"
+    assert load_project(folder) == s.project
+    assert leftover.read_bytes() == (folder.parent / "sources" / "β.tif").read_bytes()
+
+
+def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, monkeypatch):
+    # What such a backup names is unknown, so the cleanup keeps every file it
+    # could name: none at or above next_id, which no backup's image holds.
+    folder = v1_folder(tmp_path)
+    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 19
+    _crash_after_an_import(folder)  # img-19.tif left behind
+    below = folder / "images" / "img-5.tif"
+    below.write_bytes(b"an image no project.json references")
+    read_bytes = Path.read_bytes
+
+    def locked(path: Path) -> bytes:
+        if storage.is_backup(path.name):  # as while another program holds it
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_bytes(path)
+
+    s = ops.open_project(folder, clock=FakeClock())
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", locked)
+        assert import_blot(s, blot(), "β.tif") == "img-19"  # saved, then cleaned up
+        assert below.exists()
+    # Once the backup can be read, it does not name img-5: the file goes.
+    ops.set_reference_condition(s, None)
+    assert not below.exists()
+
+
 # --- refused operations change nothing ---
 
 

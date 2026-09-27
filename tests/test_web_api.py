@@ -63,6 +63,7 @@ from proteia.web import api, charts, handoff, launch, sample_project, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 from rowcases import RowCase, adversarial
+from test_operations import v1_folder
 
 H, W = 60, 400
 ROW = 30
@@ -899,6 +900,38 @@ def test_a_folder_that_cannot_be_written_answers_json(client):
     client.root.write_text("a file where the projects folder should be", encoding="utf-8")
     status, code, _ = client.refused("POST", "/api/projects", {"name": "Blot"})
     assert (status, code) == (500, "file_error")
+
+
+def test_an_older_project_whose_backup_cannot_be_kept_is_not_opened(client, monkeypatch):
+    # #140: a schema-1 project beside the open one; its project.json cannot be
+    # kept before the migration rewrites it.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    folder = v1_folder(client.root)
+    before = {path: path.read_bytes() for path in folder.rglob("*") if path.is_file()}
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if Path(path).name.startswith("project.schema"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.os, "open", refuse)
+        status, answer = client.call("POST", "/api/projects/open", {"name": folder.name})
+    # The page shows the message as it is, in the Projects dialog.
+    assert (status, answer["code"]) == (500, "file_error")
+    assert answer["message"] == (
+        f"{folder.name!r} was saved by an older Proteia (schema 1), and a copy of its"
+        " project.json could not be kept before updating it (Permission denied);"
+        " nothing was changed"
+    )
+    assert {path: path.read_bytes() for path in folder.rglob("*") if path.is_file()} == before
+    assert client.ok("GET", "/api/projects")["open"] == "Blot"  # still open
+
+    opened = client.ok("POST", "/api/projects/open", {"name": folder.name})
+    assert opened["project"]["name"] == folder.name
+    backup = folder / "project.schema1.json"
+    assert backup.read_bytes() == before[folder / storage.PROJECT_FILE]
 
 
 def test_readers_do_not_wait_for_a_project_switch(tmp_path):

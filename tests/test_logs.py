@@ -368,22 +368,31 @@ def test_opening_migrating_reading_again_exporting_and_closing_reach_the_log(log
         f"in {name}: the nets are measured with the legacy background (global_median),"
         " each image's median, until the project is requantified"
     )
+    # The backup of the schema-1 file (#140): the one kept at the first
+    # migration holds the file restored, so the second names it too.
+    backup = (
+        f"in {name}: kept its schema-1 project.json as 'project.schema1.json' before migrating it"
+    )
     messages = log.messages("INFO")
     assert [m.split(":")[0] for m in messages] == [
         f"opened {name}",
+        f"in {name}",
         f"in {name}",
         f"committed #2 migrate in {name}",
         f"committed #3 set_reference_condition in {name}",
         f"read {name} again, as its project.json was changed outside Proteia",
         f"in {name}",
+        f"in {name}",
         f"committed #2 migrate in {name}",
         f"in {name}",
         f"closed {name}",
     ]
-    assert messages[1] == messages[5] == legacy
-    migrated = json.loads(messages[6].split(": ", 1)[1])
+    assert messages[1] == messages[6] == legacy
+    assert messages[2] == messages[7] == backup
+    migrated = json.loads(messages[8].split(": ", 1)[1])
     assert migrated == s.project.log[1].params  # as project.json holds them
-    assert messages[7] == f"in {name}: exported the lane table to exports/{ops.LANE_TABLE_FILE}"
+    assert migrated["backup"] == "project.schema1.json"
+    assert messages[9] == f"in {name}: exported the lane table to exports/{ops.LANE_TABLE_FILE}"
 
 
 def test_a_row_box_that_left_lanes_unlocated_logs_them(log, tmp_path):
