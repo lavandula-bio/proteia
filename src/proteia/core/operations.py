@@ -1264,16 +1264,18 @@ def _processed_again(
 ) -> list[ImageWarning]:
     """The image's import warnings with ``looks_processed`` assessed for
     ``polarity`` (:func:`~proteia.core.imaging.assess_processed`), from its
-    analysis array (``array``, or read now) and its file's header. An image
-    whose file cannot be read keeps its warnings as recorded: with no band to
-    re-quantify, its polarity changes as before #127, and every analysis of it
-    is refused until the file is back."""
+    analysis array (``array``, or read now without keeping it, since an image
+    with no band has no other use for it) and its file's header. An image whose
+    file cannot be read loses a ``looks_processed`` assessed for the old
+    polarity, which would name the wrong limit, and keeps its other warnings:
+    with no band to re-quantify, its polarity changes as before #127, and every
+    analysis of it is refused until the file is back."""
     try:
         if array is None:
-            array = session.pixels(image.id)
+            array = session.pixels(image.id, keep=False)
         palette = reads_as_palette(storage.image_path(session.folder, image))
     except (OperationError, ValueError, OSError):
-        return list(image.import_warnings)
+        return [w for w in image.import_warnings if w.code != "looks_processed"]
     return assess_processed(
         image.import_warnings,
         array,

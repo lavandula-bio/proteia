@@ -1242,18 +1242,36 @@ def test_a_polarity_change_reassesses_the_looks_processed_warning(tmp_path):
     assert processed(s, palette).startswith(only_palette)
 
 
-def test_a_polarity_change_keeps_the_warnings_of_an_image_it_cannot_read(tmp_path):
+def test_a_polarity_change_drops_the_looks_processed_warning_of_an_image_it_cannot_read(
+    tmp_path,
+):
     # No band needs its pixels, so the polarity still changes, as before #127;
-    # every analysis of the image is refused until its file is back.
+    # every analysis of the image is refused until its file is back. The
+    # looks_processed warning, assessed for the old polarity, would name the
+    # wrong limit: it goes; the other warnings stay.
+    from PIL import Image
+
     s = session_on(tmp_path, save_to_folder)
-    image = import_blot(s, rows_at(255, np.uint8, 0.2, 90), "figure α.tif", DARK)
+    figure = rows_at(255, np.uint8, 0.2, 90)
+    image = import_encoded(s, "figure α.jpg", Image.fromarray(figure), DARK, quality=95)
     warnings = s.project.batch.find_image(image).import_warnings
-    assert [w.code for w in warnings] == ["looks_processed"]
+    assert [w.code for w in warnings] == ["lossy_format", "looks_processed"]
     reopened = ops.open_project(s.folder)
-    (reopened.folder / "images" / f"{image}.tif").unlink()
+    (reopened.folder / "images" / f"{image}.jpg").unlink()
     ops.set_polarity(reopened, image, LIGHT)
     stored = reopened.project.batch.find_image(image)
-    assert stored.polarity is LIGHT and stored.import_warnings == warnings
+    assert stored.polarity is LIGHT
+    assert stored.import_warnings == [warnings[0]]
+
+
+def test_a_polarity_change_on_an_image_with_no_band_keeps_no_pixels(tmp_path):
+    # The warning is assessed from the pixels, which nothing else on an image
+    # with no band needs: they are read, not kept in the session's cache.
+    s = session_on(tmp_path, save_to_folder)
+    image = import_blot(s, rows_at(255, np.uint8, 0.2, 90), "figure α.tif", DARK)
+    reopened = ops.open_project(s.folder)
+    ops.set_polarity(reopened, image, LIGHT)
+    assert image not in reopened._pixels
 
 
 def test_an_import_takes_the_image_median_once(tmp_path, monkeypatch):
