@@ -46,8 +46,10 @@ project named after the first, or discards them.
 * A launch that finds Proteia running first checks that its ``/api/status``
   answer says it takes files (``handoff``; an older Proteia does not: the launch
   opens it, hands nothing over, and says so), then uploads each file's bytes
-  with its name, never its path (``POST /api/incoming``), and offers them
-  (``POST /api/handoffs``). Uploaded images are staged in ``incoming/`` in the
+  with its name, never its path (``POST /api/incoming``), once it says it has
+  room for them (``GET /api/incoming/room``; a file it has none for is refused
+  unsent, as is one whose upload is cut short), and offers them (``POST
+  /api/handoffs``). Uploaded images are staged in ``incoming/`` in the
   state folder, under names the server makes; the instance deletes them once
   imported or discarded and when it stops, and a new one deletes what a crash
   left there once it holds the lock.
@@ -566,26 +568,73 @@ def _hand_off(
 
 
 def _upload(info: InstanceInfo, file: ImageFile) -> str | RefusedPath:
-    """Upload ``file``'s bytes, with its name, to the running instance: the id
-    it answers, or the file refused (by the instance, with its code and reason,
-    or because it can no longer be read). :class:`HandoffError` if the instance
-    is stopping, or the connection fails."""
+    """Upload ``file``'s bytes, with its name, to the running instance, once it
+    says it has room for them (:func:`_room`): the id it answers, or the file
+    refused (by the instance, with its code and reason, or because it can no
+    longer be read). An upload whose connection is reset or closed before its
+    answer can be read (:class:`_CutShortError`) is refused too, with the
+    reason the instance gives when asked again, or else as cut short; the
+    instance deletes what it stored of it. :class:`HandoffError` if the
+    instance is stopping, or a connection to it fails."""
     try:
         stream = file.open()
     except OSError as exc:
         return file.refused("unreadable", f"cannot be read: {cli.reason(exc)}")
     with stream:
         size = os.fstat(stream.fileno()).st_size
+        refused = _room(info, file, size)
+        if refused is not None:
+            return refused
         headers = {"Content-Type": "application/octet-stream", "Content-Length": str(size)}
         path = f"/api/incoming?name={quote(file.name, safe='')}"
-        code, answer = _send(info, "POST", path, stream, headers)
+        try:
+            code, answer = _send(info, "POST", path, stream, headers)
+        except _CutShortError as exc:
+            _log.info("an upload was cut short: %s", exc.reason, extra=logs.FILE_ONLY)
+            refused = _room(info, file, size)  # why, if it says; and whether it still answers
+            return refused or file.refused("other", f"the upload was cut short: {exc.reason}")
     file_id = answer.get("file_id")
     if code == 201 and isinstance(file_id, str):
         return file_id
+    return _refused(file, code, answer)
+
+
+def _room(info: InstanceInfo, file: ImageFile, size: int) -> RefusedPath | None:
+    """Whether the running instance would take ``file``, of ``size`` bytes, now
+    (``GET /api/incoming/room``, with no body): None if so, or the file
+    refused as its upload would be. :class:`HandoffError` if the instance is
+    stopping, or the connection fails."""
+    path = f"/api/incoming/room?name={quote(file.name, safe='')}&size={size}"
+    code, answer = _send(info, "GET", path, None, {})
+    return None if code == 204 else _refused(file, code, answer)
+
+
+def _refused(file: ImageFile, code: int, answer: dict[str, Any]) -> RefusedPath:
+    """``file`` refused by the running instance's answer ``code``, ``answer``,
+    with its code and reason; :class:`HandoffError` if it is stopping."""
     if code == 409 and answer.get("code") == "stopping":
         raise HandoffError("Proteia is stopping; the files were not handed to it.")
     kind = answer.get("code")
     return file.refused(kind if isinstance(kind, str) else "other", _message(code, answer))
+
+
+class _CutShortError(HandoffError):
+    """A request's connection was reset or closed once it had connected, and
+    no answer could be read: the instance may have answered an upload it
+    refused before reading its body whole, then closed the connection when
+    the rest stopped arriving (on Windows the reset drops an answer not yet
+    read), or it may have gone. ``reason`` is what the system said."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(_connection_failed(reason))
+        self.reason = reason
+
+
+def _connection_failed(reason: str) -> str:
+    return (
+        "The connection to the running Proteia failed, and the files were not handed to it:"
+        f" {reason}"
+    )
 
 
 def _send(
@@ -593,9 +642,11 @@ def _send(
 ) -> tuple[int, dict[str, Any]]:
     """One request to the running instance, with its token, on a direct loopback
     connection (no proxy): the status and the answer's JSON object (empty if it
-    has none). :class:`HandoffError` if the connection fails. A request refused
-    before its body was sent whole (the instance answers a refused upload at
-    once) is answered all the same, if the answer can still be read."""
+    has none). :class:`HandoffError` if the connection fails; a
+    :class:`_CutShortError` if it was reset or closed once connected and no
+    answer can be read. A request refused before its body was sent whole (the
+    instance answers a refused upload at once) is answered all the same, if the
+    answer can still be read."""
     conn = http.client.HTTPConnection(
         HOST, info.port, timeout=HANDOFF_TIMEOUT, blocksize=UPLOAD_BLOCK
     )
@@ -615,15 +666,13 @@ def _send(
         try:
             response = conn.getresponse()
             data = response.read(_ANSWER_BYTES)
-        except (OSError, http.client.HTTPException):
-            if cut_short is not None:
-                raise cut_short from None
+        except (OSError, http.client.HTTPException) as exc:
+            failed = exc if cut_short is None else cut_short
+            if isinstance(failed, ConnectionError):  # connected, then reset or closed
+                raise _CutShortError(cli.reason(failed)) from failed
             raise
     except (OSError, http.client.HTTPException) as exc:
-        raise HandoffError(
-            f"The connection to the running Proteia failed, and the files were not handed to"
-            f" it: {cli.reason(exc)}"
-        ) from exc
+        raise HandoffError(_connection_failed(cli.reason(exc))) from exc
     finally:
         conn.close()
     try:

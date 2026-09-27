@@ -35,8 +35,10 @@ as it was, so a page showing it keeps its choices until it is gone.
 Limits: at most :data:`MAX_PENDING_FILES` files wait at a time, in hand-offs
 or uploaded but not yet offered, and at most :data:`MAX_STAGED_BYTES` are
 staged; an upload no offer takes within :data:`UPLOAD_EXPIRY_S` is deleted
-(checked at each upload and offer). A refused argument never makes an offer
-fail: its entry is bounded instead (:meth:`Refusal.bounded`).
+(checked at each upload, check of the room for one, and offer). A launch asks
+whether there is room for a file before it sends its bytes
+(:meth:`Inbox.check_room`), which holds none. A refused argument never makes
+an offer fail: its entry is bounded instead (:meth:`Refusal.bounded`).
 
 Staged files are deleted once their hand-off is imported or discarded, when
 their upload expires, when the server stops (:meth:`Inbox.close`), and at the
@@ -374,6 +376,39 @@ class Inbox:
 
     # --- Uploads ---
 
+    def check_room(self, size: int | None) -> None:
+        """Whether an upload of ``size`` bytes (if known) would start now: as
+        :meth:`begin_upload` checks it, after the same expiry, holding no
+        room. :class:`StoppingError` or :class:`TooManyPendingError` if not.
+        A launch asks before it sends a file's bytes (``GET
+        /api/incoming/room``), so that it sends none the upload would refuse."""
+        expired = self._expire()
+        try:
+            with self._lock:
+                self._room_for(size or 0)
+        finally:
+            _delete(expired)
+
+    def _room_for(self, size: int) -> Path:
+        """The staging folder, if one more upload of ``size`` bytes fits the
+        limits; :class:`StoppingError` or :class:`TooManyPendingError` if not.
+        Called with the lock held."""
+        if self._stopping:
+            raise StoppingError("Proteia is stopping")
+        folder = self._folder
+        if folder is None:
+            raise RuntimeError("no staging folder: Inbox.place was not called")
+        if self._pending_count() + 1 > MAX_PENDING_FILES:
+            raise TooManyPendingError(
+                f"{MAX_PENDING_FILES} images are waiting in Proteia: import or discard them first"
+            )
+        if self._staged_bytes() + size > MAX_STAGED_BYTES:
+            raise TooManyPendingError(
+                "the images waiting in Proteia take all the room it keeps for them:"
+                " import or discard them first"
+            )
+        return folder
+
     def begin_upload(self, name: str, declared: int | None) -> Upload:
         """An upload of ``name`` starting now, of ``declared`` bytes if its
         request says; its room is held until it ends (:meth:`upload_stored`,
@@ -383,22 +418,8 @@ class Inbox:
         expired = self._expire()
         try:
             with self._lock:
-                if self._stopping:
-                    raise StoppingError("Proteia is stopping")
-                folder = self._folder
-                if folder is None:
-                    raise RuntimeError("no staging folder: Inbox.place was not called")
-                if self._pending_count() + 1 > MAX_PENDING_FILES:
-                    raise TooManyPendingError(
-                        f"{MAX_PENDING_FILES} images are waiting in Proteia: import or discard"
-                        " them first"
-                    )
                 reserved = declared or 0
-                if self._staged_bytes() + reserved > MAX_STAGED_BYTES:
-                    raise TooManyPendingError(
-                        "the images waiting in Proteia take all the room it keeps for them:"
-                        " import or discard them first"
-                    )
+                folder = self._room_for(reserved)
                 upload = Upload(
                     file_id=_new_id(),
                     name=name,

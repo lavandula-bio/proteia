@@ -655,27 +655,51 @@ def test_launches_at_once_with_none_running_start_one_instance_and_one_hand_off(
     assert sorted(names) == [path.name for path in paths]
 
 
-class _Slow:
-    """A file whose first read waits ``pause`` seconds: an upload that takes long."""
+class _Read:
+    """A file as a launch reads it to upload it, counting the bytes read
+    (``read_bytes``). Its first read waits ``pause`` seconds (an upload that takes
+    long), and each later one ``stall`` seconds (a file on a slow network
+    share)."""
 
-    def __init__(self, stream: BinaryIO, pause: float) -> None:
+    def __init__(self, stream: BinaryIO, *, pause: float = 0.0, stall: float = 0.0) -> None:
         self._stream = stream
         self._pause = pause
+        self._stall = stall
+        self._reads = 0
+        self.read_bytes = 0
 
     def fileno(self) -> int:
         return self._stream.fileno()
 
     def read(self, size: int = -1) -> bytes:
-        if self._pause:
-            time.sleep(self._pause)
-            self._pause = 0
-        return self._stream.read(size)
+        wait = self._stall if self._reads else self._pause
+        if wait:
+            time.sleep(wait)
+        self._reads += 1
+        data = self._stream.read(size)
+        self.read_bytes += len(data)
+        return data
 
-    def __enter__(self) -> _Slow:
+    def __enter__(self) -> _Read:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self._stream.close()
+
+
+def reading(monkeypatch, **waits: dict[str, float]) -> dict[str, _Read]:
+    """Make each file a launch opens a :class:`_Read`, with the waits given by
+    its name (``pause={"b.tif": 2.5}``): the files opened, by name."""
+    opened: dict[str, _Read] = {}
+    plain = cli.ImageFile.open
+
+    def open_read(file: cli.ImageFile) -> _Read:
+        chosen = {kind: by_name.get(file.name, 0.0) for kind, by_name in waits.items()}
+        opened[file.name] = _Read(plain(file), **chosen)
+        return opened[file.name]
+
+    monkeypatch.setattr(cli.ImageFile, "open", open_read)
+    return opened
 
 
 def test_a_file_whose_upload_began_in_the_window_joins_however_long_it_took(
@@ -685,13 +709,7 @@ def test_a_file_whose_upload_began_in_the_window_joins_however_long_it_took(
     a, b = scans(tmp_path, "a.tif", "b.tif")
     state = tmp_path / "state"
     assert not launch.start(folder=state, opener=Opener(), command_line=command(a)).merged
-    plain = cli.ImageFile.open
-
-    def slow_b(file: cli.ImageFile) -> BinaryIO | _Slow:
-        stream = plain(file)
-        return _Slow(stream, 2.5) if file.name == "b.tif" else stream
-
-    monkeypatch.setattr(cli.ImageFile, "open", slow_b)
+    reading(monkeypatch, pause={"b.tif": 2.5})
     began = time.monotonic()
     late = launch.start(folder=state, opener=Opener(), command_line=command(b))
     assert time.monotonic() - began > 2.0  # offered once the window had passed
@@ -812,6 +830,97 @@ def test_a_file_the_running_proteia_refuses_is_reported_and_the_rest_handed_off(
     assert [file["name"] for file in listed["files"]] == ["a.tif"]
     assert [(r["name"], r["code"]) for r in listed["refused"]] == [("b.tif", "too_many_pending")]
     assert len(opener.urls) == 1 and served.token not in console.out + console.err
+
+
+MIB = 1024 * 1024
+
+
+def large_scans(folder: Path, *names: str, size: int) -> list[Path]:
+    """Files of ``size`` bytes, each with bytes of its own: more than a
+    connection's buffers hold, so an upload is sent while the server reads it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = [folder / name for name in names]
+    for path in paths:
+        mark = f"pixels of {path.name} ".encode()
+        path.write_bytes((mark * (size // len(mark) + 1))[:size])
+    return paths
+
+
+def test_files_the_running_proteia_has_no_room_for_are_refused_before_their_bytes_are_sent(
+    served, tmp_path, monkeypatch, capsys
+):
+    # Images waiting in Proteia, and more opened than it has room for (20 and
+    # 16 of at most 32, in small): the launch asks before it sends each file's
+    # bytes (GET /api/incoming/room), so those it has no room for are refused
+    # without being read, however large, and the others are handed off.
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 3)
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    earlier = scans(tmp_path / "earlier", "w1.tif", "w2.tif")
+    assert launch.main([str(path) for path in earlier]) == 0
+    capsys.readouterr()
+    a, b, c = large_scans(tmp_path / "scans µ", "a.tif", "b.tif", "c.tif", size=8 * MIB)
+    opened = reading(monkeypatch)
+    assert launch.main([str(a), str(b), str(c)]) == 3
+    message = "3 images are waiting in Proteia: import or discard them first"
+    assert capsys.readouterr().err.splitlines() == [
+        f"Not opened: {path.resolve()} ({message})" for path in (b, c)
+    ]
+    assert {name: file.read_bytes for name, file in opened.items()} == {
+        "a.tif": 8 * MIB,
+        "b.tif": 0,
+        "c.tif": 0,
+    }
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["w1.tif", "w2.tif", "a.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [
+        ("b.tif", "too_many_pending"),
+        ("c.tif", "too_many_pending"),
+    ]
+    # Nothing is staged but the files handed off.
+    assert staged_bytes(served.instance) == sorted(path.read_bytes() for path in (*earlier, a))
+    assert len(opener.urls) == 1  # the first launch's: the second joined its hand-off
+
+
+def test_an_upload_cut_short_refuses_that_file_and_the_others_are_handed_off(
+    served, tmp_path, monkeypatch, capsys
+):
+    # Proteia refuses b.tif while its bytes arrive (the room ran out after the
+    # launch asked), then closes the connection, as uvicorn does once no more
+    # of a body it has answered arrives for its keep-alive time: 5 s, here 0.1
+    # s, with b.tif on a share whose reads stall 0.5 s. The launch may find the
+    # connection reset before it can read the answer. It reports b.tif not
+    # taken, with the reason Proteia gives when asked again, hands off the
+    # others, and leaves nothing staged but them.
+    monkeypatch.setattr(served.instance.server.config, "timeout_keep_alive", 0.1)
+    a, b = large_scans(tmp_path / "scans µ", "a.tif", "b.tif", size=4 * MIB)
+    (c,) = scans(tmp_path / "scans µ", "c.tif")
+    inbox = served.instance.workspace.inbox
+    make_room = inbox.make_room
+    no_room = (
+        "the images waiting in Proteia take all the room it keeps for them: import or discard"
+        " them first"
+    )
+
+    def room_runs_out(upload: handoff.Upload, size: int) -> None:
+        if upload.name == "b.tif":  # room left for c.tif, not for b.tif
+            monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 4 * MIB + 1024)
+            raise handoff.TooManyPendingError(no_room)
+        make_room(upload, size)
+
+    monkeypatch.setattr(inbox, "make_room", room_runs_out)
+    reading(monkeypatch, stall={"b.tif": 0.5})
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    assert launch.main([str(a), str(b), str(c)]) == 3
+    console = capsys.readouterr()
+    assert "2 images are waiting there: choose how to import them." in console.out
+    assert console.err.splitlines() == [f"Not opened: {b.resolve()} ({no_room})"]
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["a.tif", "c.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [("b.tif", "too_many_pending")]
+    assert staged_bytes(served.instance) == sorted(path.read_bytes() for path in (a, c))
+    assert len(opener.urls) == 1
 
 
 def test_a_launch_that_joined_a_hand_off_says_so(served, tmp_path, monkeypatch, capsys):
@@ -939,6 +1048,113 @@ def test_an_answer_sent_before_the_body_was_read_is_taken_as_the_answer(monkeypa
     with pytest.raises(launch.HandoffError, match="failed.*: the body was cut short$") as failed:
         launch._send(info, "POST", "/api/incoming?name=a.tif", body, {})
     assert isinstance(failed.value.__cause__, ConnectionResetError)
+
+
+class _Played:
+    """Stands in for ``http.client.HTTPConnection``: each connection made plays
+    the next of ``plays``: an answer (:class:`_Answer`); ``"cut"``, a request
+    that connects, then is reset while its body is sent, with no answer to
+    read; or ``"refused"``, one that finds nothing listening. ``requests``
+    holds each request's method and path, and whether it had a body."""
+
+    def __init__(self, *plays: _Answer | str) -> None:
+        self.plays = list(plays)
+        self.requests: list[tuple[str, str, bool]] = []
+        self.sock: object = None
+        self._play: _Answer | str = "refused"
+
+    def __call__(self, host: str, port: int, **kwargs: object) -> _Played:
+        self._play = self.plays.pop(0)
+        self.sock = None
+        return self
+
+    def request(self, method: str, path: str, body: object = None, **kwargs: object) -> None:
+        self.requests.append((method, path, body is not None))
+        if self._play == "refused":
+            raise ConnectionRefusedError("nothing listens there")
+        self.sock = object()  # connected
+        if self._play == "cut":
+            raise ConnectionAbortedError("the connection was reset")
+
+    def getresponse(self) -> _Answer:
+        if isinstance(self._play, str):
+            raise ConnectionAbortedError("no answer to read")
+        return self._play
+
+    def close(self) -> None:
+        pass
+
+
+def _json(status: int, **answer: str) -> _Answer:
+    return _Answer(status, json.dumps(answer).encode() if answer else b"")
+
+
+@pytest.mark.parametrize(
+    ("again", "refused"),
+    [
+        (
+            _json(409, code="too_many_pending", message="32 images are waiting in Proteia"),
+            ("too_many_pending", "32 images are waiting in Proteia"),
+        ),
+        (_json(204), ("other", "the upload was cut short: the connection was reset")),
+    ],
+    ids=["no room now", "room"],
+)
+def test_an_upload_cut_short_is_refused_with_the_reason_proteia_gives_when_asked_again(
+    tmp_path, monkeypatch, caplog, again, refused
+):
+    (blot,) = scans(tmp_path / "scans µ", "blot µ.tif")
+    (file,) = command(blot).files
+    played = _Played(_json(204), "cut", again)
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", played)
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    caplog.set_level("INFO", logger=launch.__name__)
+    uploaded = launch._upload(info, file)
+    assert "an upload was cut short: the connection was reset" in caplog.text
+    assert "blot" not in caplog.text  # no path, nor name
+    assert isinstance(uploaded, cli.RefusedPath)
+    assert (uploaded.shown, uploaded.name) == (str(blot.resolve()), "blot µ.tif")
+    assert (uploaded.code, uploaded.message) == refused
+    room = f"/api/incoming/room?name=blot%20%C2%B5.tif&size={blot.stat().st_size}"
+    assert played.requests == [
+        ("GET", room, False),
+        ("POST", "/api/incoming?name=blot%20%C2%B5.tif", True),
+        ("GET", room, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("again", "said"),
+    [
+        (_json(409, code="stopping", message="Proteia is stopping"), "^Proteia is stopping;"),
+        ("refused", "^The connection to the running Proteia failed"),
+    ],
+    ids=["stopping", "gone"],
+)
+def test_an_upload_cut_short_by_a_proteia_that_stopped_ends_the_hand_off(
+    tmp_path, monkeypatch, again, said
+):
+    (blot,) = scans(tmp_path, "blot.tif")
+    (file,) = command(blot).files
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", _Played(_json(204), "cut", again))
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    with pytest.raises(launch.HandoffError, match=said):
+        launch._upload(info, file)
+
+
+def test_a_file_proteia_has_no_room_for_is_refused_unread(tmp_path, monkeypatch):
+    (blot,) = scans(tmp_path, "blot.tif")
+    (file,) = command(blot).files
+    no_room = _json(409, code="too_many_pending", message="no room")
+    played = _Played(no_room)
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", played)
+    opened = reading(monkeypatch)
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    uploaded = launch._upload(info, file)
+    assert isinstance(uploaded, cli.RefusedPath)
+    assert (uploaded.code, uploaded.message) == ("too_many_pending", "no room")
+    assert [method for method, _, _ in played.requests] == ["GET"]
+    assert opened["blot.tif"].read_bytes == 0
 
 
 def _first(
@@ -1191,6 +1407,7 @@ def test_the_originals_are_never_deleted_or_changed(tmp_path):
         ("GET", "/api/nothing"),
         ("GET", "/docs"),
         ("POST", "/api/incoming?name=a.tif"),
+        ("GET", "/api/incoming/room?name=a.tif&size=1"),
         ("POST", "/api/handoffs"),
         ("POST", "/api/handoffs/0/accept"),
         ("POST", "/api/handoffs/0/discard"),
