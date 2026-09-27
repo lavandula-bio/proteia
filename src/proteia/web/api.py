@@ -23,6 +23,11 @@ box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
 
+``POST /api/projects/sample`` creates the sample project, set up on the
+synthetic sample blot up to the row boxes (:mod:`proteia.web.sample_project`),
+and answers as a create does, with ``sample``: the truth table's name in the
+project folder and each protein's row, as a drag over it.
+
 ``POST /api/export`` writes the results into a new export folder
 (:func:`~proteia.core.operations.export_bundle`), computed with the settings the
 results are shown with, and answers the folder, relative to the project folder
@@ -75,7 +80,7 @@ from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import projects
+from proteia.web import projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
 from proteia.web.state import preview_png, project_state, revision
@@ -241,6 +246,15 @@ class Workspace:
     def create(self, name: object) -> ProjectSession:
         with self._switching:
             return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
+
+    def create_sample(self) -> ProjectSession:
+        """Create the sample project
+        (:func:`~proteia.web.sample_project.create_sample_project`) and open it,
+        as :meth:`create` does."""
+        with self._switching:
+            return self._switch(
+                lambda: sample_project.create_sample_project(self.root, clock=self.clock)
+            )
 
     def open(self, name: object) -> ProjectSession:
         """Open the project ``name`` (:func:`~proteia.web.projects.project_folder`)
@@ -534,6 +548,16 @@ def list_projects(workspace: WorkspaceDep) -> dict[str, Any]:
 @router.post("/projects", status_code=201)
 def create_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, workspace.create(body.name))
+
+
+@router.post("/projects/sample", status_code=201)
+def create_sample_project(workspace: WorkspaceDep) -> dict[str, Any]:
+    """Create the sample project (:mod:`proteia.web.sample_project`), named
+    ``Sample blot`` or the next free ``Sample blot (n)``, and open it. Answers as
+    a create does, with ``sample`` (:func:`~proteia.web.sample_project.sample_payload`):
+    the truth table's name in the project folder and each protein's row."""
+    session = workspace.create_sample()
+    return _answer(workspace, session, sample=sample_project.sample_payload(session.project))
 
 
 @router.post("/projects/open")

@@ -240,6 +240,8 @@
 <dialog id="projects-dialog" class="projects-dialog">
   <h2>Projects</h2>
   <p id="projects-root" class="hint"></p>
+  <p id="projects-empty" hidden>No projects yet. Create one, or open the sample project to
+    try Proteia on a synthetic blot first.</p>
   <ul id="project-list" class="choices"></ul>
   <form id="new-project" class="new-project">
     <label class="field">New project
@@ -247,6 +249,14 @@
     </label>
     <button type="submit">Create</button>
   </form>
+  <!-- A new project on the synthetic sample blot, its lanes and proteins set up,
+    its rows left to drag (app.js openSample). -->
+  <div class="sample-project">
+    <button id="open-sample" type="button" aria-describedby="open-sample-note">Open sample
+      project</button>
+    <span id="open-sample-note" class="hint">A synthetic blot with its lanes and proteins set
+      up: box its rows and see the results.</span>
+  </div>
   <p id="projects-state" class="hint" role="status" hidden></p>
   <p id="projects-error" class="error" role="alert"></p>
   <button id="projects-close" type="button">Close</button>

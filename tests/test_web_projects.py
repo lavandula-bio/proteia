@@ -114,3 +114,23 @@ def test_the_exact_name_wins_over_a_look_alike(tmp_path):
     upper = projects._existing(root, "Blot")
     lower = projects._existing(root, "blot")
     assert (upper.name, lower.name) == ("Blot", "blot")
+
+
+def test_a_free_name_is_the_name_or_the_first_free_number(tmp_path):
+    root = tmp_path / "root"
+    assert projects.free_name(root, "  Sample  blot ") == "Sample blot"  # no root yet; cleaned
+    projects.create_project(root, "Sample blot", clock=FakeClock())
+    (root / "SAMPLE BLOT (2)").mkdir()  # any folder takes its name, ignoring case
+    (root / "sample blot （3）").write_bytes(b"")  # and look-alikes: fullwidth parentheses
+    assert projects.free_name(root, "Sample blot") == "Sample blot (4)"
+    with pytest.raises(projects.ProjectNameError):
+        projects.free_name(root, "a/b")
+
+
+def test_no_free_name_is_refused_as_existing(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    monkeypatch.setattr(projects, "MAX_NUMBERED", 2)
+    for name in ("Blot", "Blot (2)"):
+        projects.create_project(root, name, clock=FakeClock())
+    with pytest.raises(projects.ProjectExistsError):
+        projects.free_name(root, "Blot")

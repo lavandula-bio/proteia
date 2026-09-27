@@ -8,15 +8,18 @@ JSON."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import http.client
 import io
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
 
@@ -34,6 +37,7 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
+from proteia import samples
 from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
@@ -47,7 +51,7 @@ from proteia.core.model import (
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import compute_results
 from proteia.viz import render_svg
-from proteia.web import api, charts, launch, server
+from proteia.web import api, charts, launch, sample_project, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 from rowcases import RowCase, adversarial
@@ -897,8 +901,11 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["POST /api/requantify"] = client.ok("POST", "/api/requantify")  # a no-op here
     answers["POST /api/export"] = client.ok("POST", "/api/export", {"formats": ["svg"]})
     answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+    # Another project, so another opening, whose revisions start again.
+    answers["POST /api/projects/sample"] = client.ok("POST", "/api/projects/sample")
 
     revisions = []
+    blot = answers["POST /api/projects"]["project"]["open_id"]
     for route, answer in answers.items():
         project, results = answer["project"], answer["results"]
         assert (results["open_id"], results["revision"]) == (
@@ -906,7 +913,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
             project["revision"],
         ), route
         assert {"lanes", "proteins", "sets", "settings"} <= set(results), route
-        revisions.append(project["revision"])
+        if project["open_id"] == blot:
+            revisions.append(project["revision"])
+    assert len(revisions) == len(answers) - 1
     assert revisions == sorted(revisions)
     # Every route that answers with the project is exercised above.
     others = {
@@ -2674,3 +2683,253 @@ def test_an_export_under_too_long_a_path_is_refused(client, monkeypatch):
     monkeypatch.setattr(storage, "PATH_LIMIT", len(project) + 60)
     assert client.refused("POST", "/api/export", {})[:2] == (422, "path_too_long")
     assert export_folders(client) == []
+
+
+# --- The sample project (#55) ---
+
+SAMPLE_BLOT = "Sample blot"
+SAMPLE_LOG = [
+    "new_project",
+    "import_image",
+    "import_image",
+    "set_lanes",
+    "add_protein",
+    "add_protein",
+]
+
+
+def open_sample_blot(client: Client) -> dict:
+    """The answer to "Open sample project": 201, as a create."""
+    status, answer = client.call("POST", "/api/projects/sample")
+    assert status == 201, (status, answer)
+    return answer
+
+
+def setup_of(project: dict) -> dict:
+    """What the sample project's setup made, without the revision or history."""
+    return {key: project[key] for key in ("lanes", "reference_condition", "images", "proteins")}
+
+
+def test_the_sample_project_is_set_up_up_to_the_row_boxes(client):
+    answer = open_sample_blot(client)
+    project = answer["project"]
+    assert project["name"] == sample_project.SAMPLE_NAME == SAMPLE_BLOT
+    assert project["saved"] and client.ok("GET", "/api/projects")["open"] == SAMPLE_BLOT
+
+    # The blot and its marker image, on one membrane; the bytes proteia.samples writes.
+    blot, marker = project["images"]
+    fields = ("original_name", "kind", "polarity", "width", "height", "bit_depth", "warnings")
+    assert [[image[field] for field in fields] for image in (blot, marker)] == [
+        ["sample-blot.tif", "chemiluminescence", "dark_on_light", 1200, 500, 16, []],
+        ["sample-marker.tif", "visible_marker", "dark_on_light", 1200, 500, 8, []],
+    ]
+    assert marker["membrane_id"] == blot["membrane_id"]
+    files = samples.sample_files()
+    batch = client.workspace.current().project.batch
+    for image in (blot, marker):
+        data = files[image["original_name"]]
+        assert batch.find_image(image["id"]).sha256 == hashlib.sha256(data).hexdigest()
+
+    # The design, written out here rather than read back from the module.
+    assert [(lane["condition"], lane["sample"], lane["included"]) for lane in project["lanes"]] == [
+        ("vehicle", "V1", True),
+        ("vehicle", "V2", True),
+        ("vehicle", "V3", True),
+        ("vehicle", "V4", True),
+        ("treatment", "T1", True),
+        ("treatment", "T2", True),
+        ("treatment", "T3", True),
+        ("treatment", "T4", True),
+    ]
+    assert project["reference_condition"] == "vehicle"
+    loading, target = project["proteins"]
+    assert [
+        (p["name"], p["role"], p["image_id"], p["loading_control_ids"], p["bands"], p["undetected"])
+        for p in (loading, target)
+    ] == [
+        ("α-tubulin", "loading control", blot["id"], [], [], []),
+        ("β-catenin", "target", blot["id"], [loading["id"]], [], []),
+    ]
+    assert column(answer, target["id"])["nets"] == [None] * 8
+
+    # Each step an ordinary logged operation, saved.
+    folder = client.root / SAMPLE_BLOT
+    assert [entry.action for entry in storage.load_project(folder).log] == SAMPLE_LOG
+    assert project["history"]["undo"]["action"] == "add_protein"
+
+    # The truth table next to project.json, never among the exports.
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "exports",
+        "images",
+        "project.json",
+        "sample-truth.csv",
+    ]
+    assert list((folder / storage.EXPORTS_DIR).iterdir()) == []
+    assert (folder / "sample-truth.csv").read_bytes() == files[samples.TRUTH_FILE]
+
+    # Each protein's row, top to bottom: a drag that spans every lane's band.
+    sample = answer["sample"]
+    assert sample["truth_file"] == "sample-truth.csv"
+    assert [row["protein_id"] for row in sample["rows"]] == [target["id"], loading["id"]]
+    (_, _, _, top_y1), (_, low_y0, _, _) = (row["rect"] for row in sample["rows"])
+    assert top_y1 <= low_y0  # the rows do not overlap
+    half = samples.BAND_WIDTH / 2
+    for row, kda in zip(sample["rows"], (92.0, 50.0), strict=True):
+        x0, y0, x1, y1 = row["rect"]
+        assert x0 < samples.LANE_X[0] - half and samples.LANE_X[-1] + half < x1 <= 1200
+        for x in samples.LANE_X:
+            assert y0 + 10 < samples.band_y(kda, x) < y1 - 10, (kda, x)
+
+
+def test_undo_takes_the_sample_setup_back_step_by_step(client):
+    made = setup_of(open_sample_blot(client)["project"])
+    steps = []
+    for _ in SAMPLE_LOG[1:]:
+        undone = client.ok("POST", "/api/undo")
+        steps.append(undone["action"])
+    assert steps == SAMPLE_LOG[:0:-1]  # every step, the last first
+    assert setup_of(undone["project"]) == {
+        "lanes": [],
+        "reference_condition": None,
+        "images": [],
+        "proteins": [],
+    }
+    assert undone["project"]["history"]["undo"] is None  # the empty project it was created as
+    # The truth table is not part of the project: undo leaves it.
+    assert (client.root / SAMPLE_BLOT / "sample-truth.csv").is_file()
+
+    for _ in SAMPLE_LOG[1:]:
+        redone = client.ok("POST", "/api/redo")
+    assert setup_of(redone["project"]) == made
+
+
+def test_each_sample_project_takes_the_next_free_name(client):
+    first = open_sample_blot(client)
+    second = open_sample_blot(client)
+    assert (first["project"]["name"], second["project"]["name"]) == (
+        SAMPLE_BLOT,
+        "Sample blot (2)",
+    )
+    assert second["project"]["open_id"] > first["project"]["open_id"]
+    # Taken ignoring case and look-alikes, as project names are, by any folder.
+    (client.root / "SAMPLE BLOT （3）").mkdir()  # fullwidth parentheses
+    third = open_sample_blot(client)
+    assert third["project"]["name"] == "Sample blot (4)"
+    listing = client.ok("GET", "/api/projects")
+    assert listing["open"] == "Sample blot (4)"
+    names = [SAMPLE_BLOT, "Sample blot (2)", "Sample blot (4)"]
+    assert sorted(p["name"] for p in listing["projects"]) == names
+    for name in names:  # each a whole sample project of its own
+        assert [e.action for e in storage.load_project(client.root / name).log] == SAMPLE_LOG
+    assert setup_of(third["project"]) == setup_of(first["project"])
+
+
+def test_the_sample_rows_box_every_lane_and_give_the_documented_fold_change(client):
+    answer = open_sample_blot(client)
+    for row in answer["sample"]["rows"]:
+        answer = drag(client, row["protein_id"], row["rect"])
+        assert len(answer["band_ids"]) == 8 and None not in answer["band_ids"]
+        assert (answer["flags"], answer["empty"], answer["notes"]) == ([], [], [])
+    assert [len(protein["bands"]) for protein in answer["project"]["proteins"]] == [8, 8]
+    [result_set] = answer["results"]["sets"]
+    assert result_set["tier"] == "fold_change"
+    series = only_series(answer)
+    vehicle, treatment = bar(series, "vehicle"), bar(series, "treatment")
+    assert (vehicle["n"], treatment["n"]) == (4, 4)
+    assert vehicle["mean"] == pytest.approx(1.0)  # the baseline is the vehicle mean
+    # The truth: a treatment mean of 2.00 (proteia.samples). measured 2.0088
+    assert treatment["mean"] == pytest.approx(2.0, rel=0.03)
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        (OSError(28, "No space left on device"), 500, "file_error"),
+        (api.ops.OperationError(api.ops.ErrorCode.INVALID_INPUT, "refused"), 422, "invalid_input"),
+    ],
+)
+def test_a_sample_project_that_fails_midway_leaves_no_folder(
+    client, monkeypatch, error, status, code
+):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    # After the images are stored: their files go with the folder.
+    monkeypatch.setattr(sample_project.ops, "set_lanes", fail)
+    assert client.refused("POST", "/api/projects/sample")[:2] == (status, code)
+    assert sorted(path.name for path in client.root.iterdir()) == ["Blot"]
+    assert client.ok("GET", "/api/projects")["open"] == "Blot"  # still open
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (OSError(28, "No space left on device"), "[Errno 28] No space left on device"),
+        (api.ops.OperationError(api.ops.ErrorCode.INVALID_INPUT, "refused"), "refused"),
+    ],
+)
+def test_a_sample_folder_that_cannot_be_removed_is_named_in_the_error(
+    client, monkeypatch, error, text
+):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    def rmtree_but_images(path: Path, ignore_errors: bool = False) -> None:
+        # What shutil.rmtree removes while another program holds the stored images open.
+        for item in sorted(Path(path).rglob("*"), reverse=True):  # children first
+            if item.is_dir() and not any(item.iterdir()):
+                item.rmdir()
+            elif item.is_file() and item.parent.name != "images":
+                item.unlink()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sample_project.ops, "set_lanes", fail)
+        patch.setattr(sample_project, "shutil", SimpleNamespace(rmtree=rmtree_but_images))
+        status, answer = client.call("POST", "/api/projects/sample")
+    # A file error whatever failed: the folder left needs deleting by hand.
+    assert (status, answer["code"]) == (500, "file_error")
+    assert answer["message"] == (
+        f"the sample project could not be set up ({text}), and its unfinished folder"
+        f" '{SAMPLE_BLOT}' could not be removed: delete it from the projects folder"
+    )
+    folder = client.root / SAMPLE_BLOT
+    assert {path.relative_to(folder).parts[0] for path in folder.rglob("*")} == {"images"}
+    listing = client.ok("GET", "/api/projects")
+    assert (listing["open"], [entry["name"] for entry in listing["projects"]]) == ("Blot", ["Blot"])
+    # Its name stays taken until it is deleted: the next sample is numbered.
+    assert open_sample_blot(client)["project"]["name"] == f"{SAMPLE_BLOT} (2)"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows refuses to delete a file held open")
+def test_a_sample_image_held_open_leaves_its_folder_named_in_the_error(client, monkeypatch):
+    held: list[io.BufferedReader] = []
+
+    def hold_and_fail(session: Any, *args: Any, **kwargs: Any) -> None:
+        held.append(next((session.folder / "images").iterdir()).open("rb"))
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sample_project.ops, "set_lanes", hold_and_fail)
+    try:
+        status, answer = client.call("POST", "/api/projects/sample")
+    finally:
+        for handle in held:
+            handle.close()
+    assert (status, answer["code"]) == (500, "file_error")
+    assert f"unfinished folder '{SAMPLE_BLOT}' could not be removed" in answer["message"]
+    folder = client.root / SAMPLE_BLOT
+    assert sorted(path.relative_to(folder).as_posix() for path in folder.rglob("*")) == [
+        "images",
+        f"images/{Path(held[0].name).name}",
+    ]
+    assert client.ok("GET", "/api/projects")["projects"] == []
+
+
+def test_a_sample_project_in_a_projects_root_that_cannot_be_written_answers_json(client):
+    client.root.parent.mkdir(parents=True, exist_ok=True)
+    client.root.write_text("a file where the projects folder should be", encoding="utf-8")
+    assert client.refused("POST", "/api/projects/sample")[:2] == (500, "file_error")
+    assert client.refused("GET", "/api/project")[:2] == (409, "no_project")
