@@ -31,14 +31,18 @@ from proteia.core.model import BoxSize, lanes_phrase, overlaps
 from proteia.core.quantify import estimate_background
 from proteia.core.rowdetect import (
     AMBIGUITY_MARGIN,
+    APART_DOUBT,
     BG_GUARD,
     BG_GUARD_MIN,
     CUT_LEVEL,
     DETECT_K,
     EMPTY_WINDOW,
+    END_DOUBT,
     EXTENT_LEVEL,
     FIT_MAX_PIXELS,
+    LANES_DOUBT,
     MEMBRANE_SHIFT_K,
+    PITCH_DOUBT,
     REFUSING_FLAGS,
     ROW_LINE_K,
     ROW_LINE_MIN,
@@ -54,6 +58,7 @@ from proteia.core.rowdetect import (
     settings,
 )
 from rowcases import (
+    ADVERSARIAL,
     FULL_SCALE,
     MEMBRANE,
     NOISE_SIGMA,
@@ -62,6 +67,7 @@ from rowcases import (
     adversarial_row,
     band_between,
     bench_cases,
+    beside,
     blob,
     bottom_strip,
     dark_edge,
@@ -2266,3 +2272,233 @@ def test_each_row_line_setting_takes_part(monkeypatch, name, value, case):
 
 def test_box_size_is_the_model_type():
     assert isinstance(_detected("all_present").size, BoxSize)
+
+
+# --- #111: a first row box over a ladder, a label or a neighbouring panel ---
+
+# The rows whose box also covers what lies beside the row (rowcases).
+BESIDE = ("ladder_beside", "ladder_before", "label_beside", "panel_beside")
+DOUBT_NOTE = "lane numbers doubtful: "
+
+
+def lanes_off(case: RowCase, found: RowDetection) -> list[int]:
+    """The lanes whose band's extent is centred more than half a lane step
+    off the lane's own centre: read into another lane."""
+    step = float(np.median(np.diff(case.lane_cx)))
+    return [
+        lane.lane
+        for lane in found.lanes
+        if lane.extent is not None
+        and abs((lane.extent[0] + lane.extent[2]) / 2 - case.lane_cx[lane.lane]) > step / 2
+    ]
+
+
+def doubts(found: RowDetection) -> str:
+    """The doubtful_lanes note ("" without the flag), flag and note checked
+    together."""
+    note = found.doubt_note
+    assert ("doubtful_lanes" in found.flags) == (note is not None)
+    assert [n for n in found.notes if n.startswith(DOUBT_NOTE)] == ([note] if note else [])
+    return note or ""
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", BESIDE)
+def test_a_row_box_over_what_lies_beside_the_row_is_placed_with_its_lanes_doubtful(key, seed):
+    # With no lanes on the image to check it, the reading takes the ladder's
+    # band, the label or the neighbouring panel for a lane and numbers the
+    # bands a lane or more off, with no refusing flag. The row is placed, its
+    # lane numbers doubtful (the maintainer's decision on #111: flag first).
+    case = _adversarial(key, seed)
+    found = detect(case)
+    assert not found.refused and found.size is not None
+    assert lanes_off(case, found)  # what the flag is there for
+    assert doubts(found).startswith(DOUBT_NOTE)
+
+
+@pytest.mark.parametrize("key", BESIDE)
+def test_the_same_rows_boxed_over_their_lanes_only_are_not_doubtful(key):
+    recipe = {name: value for name, value in ADVERSARIAL[key].items() if name != "box_adjust"}
+    for seed in (1000, 1001, 1002):
+        case = adversarial_row(key, seed, **recipe)
+        found = detect(case)
+        assert_hits_own_lanes(case, found)
+        assert doubts(found) == ""
+
+
+# The accuracy judge's loose boxes and uneven spacings (acc_adv), which
+# stretch the fitted pitch, or the steps between the bands, the most while the
+# reading fits.
+JUDGE_HONEST = {
+    "very_loose_box": {"mx": 70},
+    "very_loose_miss0": {"mx": 70, "missing": [0]},
+    "very_loose_miss5": {"mx": 70, "missing": [5]},
+    "uneven35_miss": {
+        "pitches": [46, 95, 52, 92, 49],
+        "w": 36.0,
+        "x_jitter": 0.0,
+        "missing": [3],
+    },
+    "drift_uneven_miss": {
+        "n": 12,
+        "pitch": 50.0,
+        "w": 32.0,
+        "h": 10.0,
+        "pitches": [60, 60, 60, 60, 60, 50, 40, 40, 40, 40, 40],
+        "x_jitter": 0.0,
+        "missing": [3, 9],
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        *BENCH,
+        *(
+            f"{key}/{seed}"
+            for key in ADVERSARIAL
+            if key not in (*BESIDE, "box_omits_empty_first")  # that one is refused
+            for seed in (1000, 1001, 1002)
+        ),
+    ],
+)
+def test_honest_rows_are_not_doubtful(name):
+    found = _detected(name)
+    assert not found.refused
+    assert doubts(found) == ""
+
+
+@pytest.mark.parametrize("key", JUDGE_HONEST)
+def test_loose_boxes_and_uneven_spacing_are_not_doubtful(key):
+    for seed in range(1000, 1010):
+        case = adversarial_row(key, seed, **JUDGE_HONEST[key])
+        found = detect(case)
+        assert not lanes_off(case, found)
+        assert doubts(found) == "", seed
+
+
+def test_pieces_merged_or_dropped_within_a_lane_are_no_doubt():
+    # Dust midway between two lanes, merged with a band or dropped, and a
+    # band's halves split by a bubble, merged again: pieces half a lane apart
+    # at most, not two bands.
+    for key, seeds in (("blob_gap", (1000, 1003, 1006)), ("bubble_band", (1000, 1001, 1002))):
+        for seed in seeds:
+            found = _detected(f"{key}/{seed}")
+            assert any(note.startswith(("merged", "dropped")) for note in found.notes)
+            assert doubts(found) == "", (key, seed)
+
+
+# A weak speck 0.8 lane steps past the last band.
+SPECK = beside(0.8, 12, 10, 10000)
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        {"mx": 40},  # in a loose box's margin
+        {"mx": 60},
+        {"margin_right": 120, "box_adjust": (0, 0, 50, 0)},  # a box dragged past the row
+    ],
+)
+def test_a_weak_speck_dropped_past_the_end_lane_is_no_doubt(recipe):
+    # The weaker of the closest pair, the speck is dropped: past the pieces
+    # read, it leaves each of their lanes as it was, and the reading is right.
+    dropped = 0
+    for seed in range(1000, 1010):
+        case = adversarial_row("speck", seed, artefacts=[SPECK], **recipe)
+        found = detect(case)
+        assert not found.refused and not lanes_off(case, found)
+        dropped += any(note.startswith("dropped") for note in found.notes)
+        assert doubts(found) == "", seed
+    assert dropped >= 5
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_weak_band_dropped_between_the_pieces_read_is_doubtful(seed):
+    # Seven bands, six lanes declared, the weak fourth band 60 px from the
+    # fifth: dropped between the others to fit, the only doubt.
+    case = adversarial_row("seven", seed, n=7, pitches=[70, 70, 70, 60, 70, 70], depths={3: 4000})
+    note = doubts(detect(dataclasses.replace(case, n_lanes=6)))
+    dropped = (
+        r"two pieces 0\.7 lanes apart, one dropped at x=2\d\d\.\.3\d\d to fit the declared lanes"
+    )
+    assert re.fullmatch(DOUBT_NOTE + dropped, note)
+
+
+@pytest.mark.parametrize("seed", [1000, 1004, 1006])
+def test_more_bands_than_declared_lanes_are_doubtful(seed):
+    # Six bands, five lanes declared: two bands a lane apart are merged to fit.
+    case = dataclasses.replace(adversarial_row("six", seed), n_lanes=5)
+    note = doubts(detect(case))
+    assert re.search(r"two pieces \d\.\d lanes apart, merged at x=\d+\.\.\d+ to fit", note)
+
+
+def test_a_box_with_room_for_another_lane_is_doubtful():
+    # Two lane steps of bare membrane past the last lane and lane 0 empty:
+    # the empty lane is read at the box's right end, every band a lane early,
+    # the pitch stretched by less than PITCH_DOUBT.
+    case = adversarial_row("room", 1000, missing=[0], margin_right=200, box_adjust=(0, 0, 150, 0))
+    found = detect(case)
+    assert lanes_off(case, found) == [0, 1, 2, 3, 4]
+    assert abs(found.pitch / 70.0 - 1.0) < PITCH_DOUBT
+    assert "the row box reaches 1.6 lanes past lane 6's centre" in doubts(found)
+
+
+# Eight lanes 48 px apart, the first three bands 64 px wide and touching: one
+# run the reading cuts into cells.
+TOUCHING_RUN = {
+    "n": 8,
+    "pitch": 48.0,
+    "w": 30.0,
+    "widths": {0: 64.0, 1: 64.0, 2: 64.0},
+    "x_jitter": 0.0,
+}
+
+
+def test_a_touching_run_cut_into_too_few_cells_is_doubtful():
+    # The box reaches past the lanes on both sides: the run of three is read
+    # as two, the lanes after it numbered a lane late.
+    case = adversarial_row(
+        "run", 1000, margin_left=150, margin_right=150, box_adjust=(-60, 0, 60, 0), **TOUCHING_RUN
+    )
+    found = detect(case)
+    assert lanes_off(case, found)
+    assert "the touching bands read as lanes 2 to 3 span 3.2 lanes" in doubts(found)
+    honest = detect(adversarial_row("run", 1000, **TOUCHING_RUN))
+    assert doubts(honest) == ""  # three wide bands in three cells
+
+
+def test_the_doubtful_lanes_are_numbered_as_the_caller_numbers_them():
+    case = _adversarial("panel_beside", 1000)
+    note = doubts(detect(case))
+    back = doubts(detect(case, right_to_left=True))
+    assert "past lane 1's centre" in note
+    assert back == note.replace("past lane 1's centre", "past lane 5's centre")
+
+
+def test_the_doubt_is_a_warning_listed_with_its_settings():
+    assert "doubtful_lanes" in WARNING_FLAGS and "doubtful_lanes" not in REFUSING_FLAGS
+    found = settings()
+    keys = ("pitch_doubt", "lanes_doubt", "end_doubt", "apart_doubt")
+    assert (
+        tuple(found[key] for key in keys)
+        == (PITCH_DOUBT, LANES_DOUBT, END_DOUBT, APART_DOUBT)
+        == (0.3, 0.5, 1.5, 0.6)
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "row"),
+    [
+        ("PITCH_DOUBT", 0.0, "all_present"),
+        ("LANES_DOUBT", 0.0, "uneven_spacing"),
+        ("END_DOUBT", 0.0, "all_present"),
+        ("APART_DOUBT", 0.0, "blob_gap/1000"),
+    ],
+)
+def test_each_doubt_setting_takes_part(monkeypatch, name, value, row):
+    assert doubts(_detected(row)) == ""  # cached before the setting changes
+    monkeypatch.setattr(rowdetect, name, value)
+    assert settings()[name.lower()] == value
+    assert doubts(detect(_case(row))) != ""
