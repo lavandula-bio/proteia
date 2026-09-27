@@ -277,7 +277,9 @@ def test_a_path_longer_than_windows_allows_is_read_through_its_long_form(tmp_pat
     with open("\\\\?\\" + str(folder / "blot α.tif"), "wb") as out:
         out.write(b"pixels")
     path = folder / "blot α.tif"
-    assert len(str(path)) > 300 and not path.exists()  # too long to reach plainly
+    # Too long to reach plainly unless the system has long paths enabled (as
+    # CI runners do): read through the long form either way.
+    assert len(str(path)) > 300
     (file,) = cli.parse([str(path)]).files
     assert (file.name, file.size, file.path) == ("blot α.tif", 6, path)
     assert str(file.location).startswith("\\\\?\\")
