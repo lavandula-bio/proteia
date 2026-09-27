@@ -6,6 +6,6 @@ statistics, the plot spec) is style-free, so publication polish in a later phase
 changes only this package.
 """
 
-from proteia.viz.render import render_figure, save_figure
+from proteia.viz.render import render_figure, render_svg, save_figure
 
-__all__ = ["render_figure", "save_figure"]
+__all__ = ["render_figure", "render_svg", "save_figure"]

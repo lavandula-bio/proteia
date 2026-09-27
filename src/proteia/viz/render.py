@@ -4,12 +4,26 @@
 A functional, legible draft — bars (mean), error bars, individual lane points,
 and significance brackets. Publication styling (fonts, palettes, layout) is a
 later phase and lives here when it comes; nothing upstream depends on it.
+
+The drawn marks carry ids that name what they show, so a drawing can be read
+back against its spec: ``bar-i`` is ``spec.bars[i]``, ``point-i-j`` is
+``spec.bars[i].points[j]`` and ``bracket-k`` is ``spec.comparisons[k]``. Only an
+SVG shows them (:func:`render_svg`).
+
+A name is drawn as typed: matplotlib's math syntax (``$...$``) is not read, so a
+``$`` or ``\\`` in a name is drawn and no name can fail to draw, and a character
+XML cannot hold is drawn as U+FFFD (:func:`_shown`).
 """
 
 from __future__ import annotations
 
+import io
+import re
+import threading
 from collections.abc import Callable
+from typing import Final
 
+import matplotlib
 from matplotlib.backends.backend_agg import RendererAgg
 from matplotlib.figure import Figure
 
@@ -19,6 +33,28 @@ _BAR_FACE = "#cbd5e1"
 _BAR_EDGE = "#334155"
 _POINT = "#0f172a"
 _TITLE_MARGIN_PT = 4.0  # the gap a title line keeps from the figure's edges
+# Any character outside XML 1.0's Char production.
+_NOT_XML: Final = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+# An SVG the same bytes for the same spec: ids from a fixed salt, not at random,
+# and glyphs drawn as paths, so the drawing needs no font of the viewer's.
+_SVG_SETTINGS: Final = {"svg.hashsalt": "proteia-chart", "svg.fonttype": "path"}
+# No metadata block: no date, and none of the URLs matplotlib's metadata names.
+_SVG_METADATA: Final = {"Date": None, "Creator": None, "Type": None, "Format": None}
+# rc_context changes matplotlib's global settings for as long as it lasts, so
+# drawings made at once would see each other's. One at a time: drawing is
+# CPU-bound under the GIL, so threads would not draw faster anyway.
+_svg_lock = threading.Lock()
+
+
+def _shown(text: str) -> str:
+    """``text`` as a chart shows it: each character XML cannot hold (a control
+    character other than tab, newline and carriage return, an unpaired surrogate,
+    U+FFFE or U+FFFF) as the replacement character U+FFFD. A typed name may hold
+    U+FFFE or U+FFFF, matplotlib writes every text into an SVG as it is (in a
+    comment beside its glyphs), and a browser shows no SVG that is not well-formed
+    XML."""
+    return _NOT_XML.sub("\ufffd", text)
 
 
 def _point_xs(center: float, n: int, spread: float = 0.18) -> list[float]:
@@ -48,7 +84,7 @@ def render_figure(spec: PlotSpec) -> Figure:
     means = [b.mean for b in spec.bars]
     errs = [b.error for b in spec.bars]
 
-    ax.bar(
+    bars = ax.bar(
         xs,
         means,
         yerr=errs,
@@ -59,13 +95,15 @@ def render_figure(spec: PlotSpec) -> Figure:
         linewidth=1.0,
         zorder=1,
     )
-    for x, bar in zip(xs, spec.bars, strict=True):
-        for px, val in zip(_point_xs(x, len(bar.points)), bar.points, strict=True):
-            ax.plot(px, val, "o", color=_POINT, markersize=4, zorder=3)
+    for i, patch in enumerate(bars.patches):
+        patch.set_gid(f"bar-{i}")
+    for i, (x, bar) in enumerate(zip(xs, spec.bars, strict=True)):
+        for j, (px, val) in enumerate(zip(_point_xs(x, len(bar.points)), bar.points, strict=True)):
+            ax.plot(px, val, "o", color=_POINT, markersize=4, zorder=3, gid=f"point-{i}-{j}")
 
     ax.set_xticks(xs)
-    ax.set_xticklabels([f"{b.label}\n(n={b.n})" for b in spec.bars])
-    ax.set_ylabel(spec.y_label)
+    ax.set_xticklabels([f"{_shown(b.label)}\n(n={b.n})" for b in spec.bars], parse_math=False)
+    ax.set_ylabel(_shown(spec.y_label), parse_math=False)
     lines = [spec.title or "Quantification"]
     if spec.subtitle:
         lines.append(spec.subtitle)
@@ -73,7 +111,8 @@ def render_figure(spec: PlotSpec) -> Figure:
         lines.append(f"{spec.test_name}: p = {spec.test_p:.3g}")
     if spec.test_note:
         lines.append(spec.test_note)
-    ax.set_title("\n".join(lines))
+    lines = [_shown(line) for line in lines]
+    ax.set_title("\n".join(lines), parse_math=False)
     ax.spines[["top", "right"]].set_visible(False)
 
     _draw_significance(ax, spec)
@@ -108,7 +147,7 @@ def _fit_title(fig: Figure, ax, lines: list[str]) -> None:
         if fitted == shown:
             return
         shown = fitted
-        ax.set_title("\n".join(shown))
+        ax.set_title("\n".join(shown))  # the same title text: math syntax still not read
         fig.tight_layout()
 
 
@@ -143,15 +182,38 @@ def _draw_significance(ax, spec: PlotSpec) -> None:
     gap = ceiling * 0.08 or 0.08
 
     level = 1
-    for comp in spec.comparisons:
+    for k, comp in enumerate(spec.comparisons):
         if comp.group_a not in label_to_x or comp.group_b not in label_to_x:
             continue
         x1, x2 = sorted((label_to_x[comp.group_a], label_to_x[comp.group_b]))
         y = ceiling + gap * level
-        ax.plot([x1, x1, x2, x2], [y - gap * 0.3, y, y, y - gap * 0.3], color=_BAR_EDGE, lw=1.0)
-        ax.text((x1 + x2) / 2, y, comp.stars, ha="center", va="bottom", fontsize=10)
+        ax.plot(
+            [x1, x1, x2, x2],
+            [y - gap * 0.3, y, y, y - gap * 0.3],
+            color=_BAR_EDGE,
+            lw=1.0,
+            gid=f"bracket-{k}",
+        )
+        ax.text(
+            (x1 + x2) / 2, y, comp.stars, ha="center", va="bottom", fontsize=10, parse_math=False
+        )
         level += 1
     ax.set_ylim(top=ceiling + gap * (level + 0.5))
+
+
+def render_svg(spec: PlotSpec) -> bytes:
+    """The spec's figure (:func:`render_figure`) as SVG: the same bytes for the
+    same spec, with the drawn marks' ids (see the module docstring).
+
+    Nothing in it runs or loads anything: matplotlib writes no script, no event
+    handler and no link, every reference (a clip path, a glyph) points into the
+    SVG itself, and there is no metadata. The glyphs are paths, so there is no
+    text element and no font to load.
+    """
+    with _svg_lock, matplotlib.rc_context(_SVG_SETTINGS):
+        buffer = io.BytesIO()
+        render_figure(spec).savefig(buffer, format="svg", metadata=_SVG_METADATA)
+    return buffer.getvalue()
 
 
 def save_figure(spec: PlotSpec, path: str, *, dpi: int = 150) -> None:
