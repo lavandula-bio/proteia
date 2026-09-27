@@ -141,12 +141,12 @@ def iscc_candidates(env: Mapping[str, str]) -> list[Path]:
     if which:
         found.append(Path(which))
     for variable, below in (
-        ("ProgramFiles(x86)", "Inno Setup 7"),
-        ("ProgramFiles", "Inno Setup 7"),
-        ("LOCALAPPDATA", r"Programs\Inno Setup 7"),
+        ("ProgramFiles(x86)", ("Inno Setup 7",)),
+        ("ProgramFiles", ("Inno Setup 7",)),
+        ("LOCALAPPDATA", ("Programs", "Inno Setup 7")),
     ):
         if env.get(variable):
-            found.append(Path(env[variable]) / below / "ISCC.exe")
+            found.append(Path(env[variable]).joinpath(*below, "ISCC.exe"))
     return found
 
 
