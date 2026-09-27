@@ -172,6 +172,7 @@ from proteia.core.quantify import (
     is_clipped,
     is_possibly_clipped,
     net_signal,
+    saturation_level,
 )
 from proteia.core.results import Results
 from proteia.core.session import (
@@ -2523,7 +2524,8 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     replaced in place or removed, the records written and dropped (in full),
     the lanes left without one because their slot rests on one band alone, the
     size after, the fitted pitch and noise, the detector's warnings and
-    notes, whether the lanes were read right to left, and its settings
+    notes, whether the lanes were read right to left, the saturation level
+    it was given (``saturated_at``, #121), and its settings
     (:func:`~proteia.core.rowdetect.settings`: dev builds share a version
     string, so the entry names the constants that placed the boxes). The
     answer also says which other proteins' nets on the image the row changed
@@ -2558,8 +2560,19 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         raise misnumbered
     array = session.pixels(image.id)
     right_to_left = runs is True or last is True
+    # Pixels saturated as the over-exposure checks count them: a hollow band
+    # is reported as over-exposed, not as two bands (#121). None for an image
+    # of unknown bit depth: no band is then hollow.
+    saturated_at = saturation_level(
+        clipping_depth(image.bit_depth, image.import_warnings),
+        possible_clipping_depth(image.bit_depth, image.import_warnings),
+        dark_on_light=image.polarity.dark_on_light,
+    )
     try:
-        # The settings the export record reports (record.settings): the defaults.
+        # rowdetect's settings and size rule are the defaults, which the export
+        # record reports (record.settings) with how saturated_at is chosen; the
+        # rest comes from the image and its lanes, and the log keeps the
+        # direction and the saturation level.
         found = rowdetect.detect_row(
             array,
             given,
@@ -2567,6 +2580,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             background=image.background,
             dark_on_light=image.polarity.dark_on_light,
             right_to_left=right_to_left,
+            saturated_at=saturated_at,
         )
     except rowdetect.RowDetectError as exc:
         ids = (image.id,) if exc.code == "invalid_image" else ()
@@ -2767,6 +2781,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             "flags": list(warnings),
             "notes": list(notes),
             "right_to_left": right_to_left,
+            "saturated_at": saturated_at,
             "settings": rowdetect.settings(),
         }
 

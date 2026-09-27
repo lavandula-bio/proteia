@@ -87,6 +87,7 @@ from proteia.core.quantify import (
     is_possibly_clipped,
     net_signal,
     quantify_nets,
+    saturation_level,
 )
 from proteia.core.record import history_issues
 from proteia.core.results import Level, NoticeCode
@@ -95,6 +96,7 @@ from proteia.core.session import save_to_folder
 from proteia.core.storage import canonical_json, content_hash, load_project
 from proteia.web.state import project_state
 from rowcases import (
+    MEMBRANE,
     RowCase,
     adversarial,
     adversarial_row,
@@ -4274,6 +4276,11 @@ def detected(s: ProjectSession, protein_id: str, row) -> RowDetection:
         len(batch.lanes),
         background=image.background,
         dark_on_light=image.polarity.dark_on_light,
+        saturated_at=saturation_level(
+            clipping_depth(image.bit_depth, image.import_warnings),
+            possible_clipping_depth(image.bit_depth, image.import_warnings),
+            dark_on_light=image.polarity.dark_on_light,
+        ),
     )
 
 
@@ -4922,6 +4929,28 @@ def test_warnings_are_reported_and_logged(tmp_path):
     assert (params["flags"], params["notes"]) == (["size_outlier"], list(found.notes))
 
 
+@pytest.mark.parametrize(("stored", "hollow"), [("uint16", True), ("jpeg", True), ("float", False)])
+def test_a_hollow_band_is_over_exposed_where_the_image_s_limit_is_known(tmp_path, stored, hollow):
+    # #121: lane 2's band clipped flat at 0 around a lighter centre. Its
+    # saturated pixels are counted as the over-exposure checks count them: at
+    # the limit of a 16-bit TIFF, within 2 levels of it on an 8-bit JPEG
+    # export. A float image has no known limit: one band, nothing more.
+    case = adversarial("hollow_band", 1000)
+    s = session_on(tmp_path)
+    if stored == "jpeg":
+        gray8 = np.clip(np.round(case.image * 200.0 / MEMBRANE), 0.0, 255.0).astype(np.uint8)
+        image = import_jpeg(s, gray8, 75)
+    else:
+        image = import_blot(s, case.image.astype(np.uint16 if stored == "uint16" else np.float64))
+    ops.set_lanes(s, _lane_inputs(case.n_lanes, ()))
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.flags == (("hollow_band",) if hollow else ())
+    assert any(note.startswith("lane 2: a hollow band") for note in placement.notes) is hollow
+    assert s.project.log[-1].params["flags"] == list(placement.flags)
+    assert len([b for b in protein_of(s, protein).bands if b.lane_index == 1]) == 1
+
+
 def test_the_row_commit_logs_every_lane(tmp_path):
     case = ROWS["missing_middle"]  # lane 2 is empty
     s, _, protein = row_session(tmp_path, case)
@@ -4970,6 +4999,8 @@ def test_the_row_commit_logs_every_lane(tmp_path):
             "flags": [],
             "notes": [],
             "right_to_left": False,
+            # A 16-bit TIFF: saturated at the exact limit (#121).
+            "saturated_at": 0.0,
             # Dev builds share a version string: the constants that placed the
             # boxes go with each commit.
             "settings": rowdetect.settings(),
@@ -4999,7 +5030,14 @@ def test_record_settings_are_what_the_row_commit_uses(tmp_path, monkeypatch):
         image.background,
         True,
     )
-    assert record.settings()["detect_row"] == rowdetect.settings()
+    # A 16-bit TIFF: saturated at the exact limit, 0 on a dark-on-light image (#121).
+    assert bound.arguments["saturated_at"] == 0.0
+    # The record gives detect_row's settings, and how the commit chose the
+    # saturation level for each image; the log gives the level it used.
+    reported = record.settings()["detect_row"]
+    assert {k: v for k, v in reported.items() if k != "saturated_at"} == rowdetect.settings()
+    assert "saturation_level" in reported["saturated_at"]
+    assert s.project.log[-1].params["saturated_at"] == 0.0
 
 
 # --- #111: a first row read with no lanes on the image to check it ---

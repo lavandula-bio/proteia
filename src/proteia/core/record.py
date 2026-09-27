@@ -63,6 +63,14 @@ _RESTORING_ACTIONS: Final = frozenset({"undo", "redo"})
 # The libraries core computes or decodes pixels with, by distribution name.
 _DISTRIBUTIONS: Final = ("numpy", "scipy", "scikit-image", "pillow", "tifffile")
 _TIMESTAMP = TypeAdapter(Timestamp)
+# How detect_row_boxes chooses detect_row's saturated_at for an image (#121).
+_SATURATED_AT: Final = (
+    "quantify.saturation_level: the detector limit where the exact over-exposure"
+    " check runs (clipped_pixels_threshold), else that limit moved in by"
+    " possibly_clipped's near_limit_levels (a lossy, colour or CMYK-converted"
+    " image); none for an image of unknown bit depth (float), and then no band"
+    " is called hollow (hollow_band)"
+)
 
 
 def software_versions() -> dict[str, str | None]:
@@ -110,8 +118,11 @@ def settings() -> dict[str, JsonValue]:
         # The number the lane table gives the lane of stored index 0 (0 before #53).
         "lane_table_first_lane": lane_number(0),
         "chart_png_dpi": export.CHART_PNG_DPI,
-        # What detect_row_boxes runs (rowdetect.detect_row with its defaults).
-        "detect_row": rowdetect.settings(),
+        # What detect_row_boxes runs: rowdetect.detect_row with these settings
+        # and its default size rule; the image gives the rest (its background,
+        # polarity, the lanes' direction) and the saturation level, chosen as
+        # "saturated_at" says. Each commit's log entry keeps the level it used.
+        "detect_row": {**rowdetect.settings(), "saturated_at": _SATURATED_AT},
         # How the charts' tests compute: every test is two-sided.
         "statistics": {
             "alpha": analyze.ALPHA,
