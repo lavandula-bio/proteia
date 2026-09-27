@@ -884,3 +884,14 @@ def test_the_padding_fields_send_only_what_changed_and_wait_for_a_box():
     assert "Math.max(Math.floor(protein.fitted_size[dimension] / 2), stored)" in render
     assert "const none = !protein.bands.length;" in render
     assert "renderPadding(" in _method(panel, "renderEditor(")
+
+
+def test_a_box_at_the_image_edge_shows_no_fitted_outline():
+    # A padding may shift a box at the image's edge inward, off its fit's
+    # centre: an outline inset from the drawn box would lie off the fit, so
+    # such a box shows none.
+    script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    block = script[script.index("const { across, along } = protein.box_padding;") :]
+    block = block[: block.index("color,")]
+    assert "x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height" in block
+    assert "inset && !atEdge ?" in block

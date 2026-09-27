@@ -1111,15 +1111,18 @@ function renderView(project) {
   const marks = [];
   for (const protein of project.proteins.filter((p) => p.image_id === image.id)) {
     const color = colorOf(project, protein.id);
-    // The chosen protein's padded boxes show their fitted size inside.
+    // The chosen protein's padded boxes show their fitted size inside. Not a
+    // box at the image's edge: the padding may have shifted it inward, off
+    // the fit's centre, and the outline would be drawn off the fit.
     const { across, along } = protein.box_padding;
     const inset = protein.id === state.proteinId && (across > 0 || along > 0);
     for (const band of protein.bands) {
       const [x0, y0, x1, y1] = band.rect;
+      const atEdge = x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height;
       boxes.push({
         id: band.id,
         rect: band.rect,
-        fitted: inset ? [x0 + across, y0 + along, x1 - across, y1 - along] : null,
+        fitted: inset && !atEdge ? [x0 + across, y0 + along, x1 - across, y1 - along] : null,
         color,
         clipped: band.clipped === true,
         label: `${band.lane_index + 1}${band.clipped === true ? " over-exposed" : ""}`,
