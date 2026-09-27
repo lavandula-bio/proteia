@@ -51,7 +51,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -402,8 +402,15 @@ def _tolerant_console() -> None:
             stream.reconfigure(errors="backslashreplace")
 
 
-def main() -> int:
-    """The ``proteia`` console command."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """The ``proteia`` console command (arguments: ``sys.argv[1:]`` when ``argv``
+    is None). ``proteia --self-test`` checks the installation instead
+    (:mod:`proteia.selftest`); any other arguments are ignored."""
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args[:1] == ["--self-test"]:
+        from proteia import selftest
+
+        return selftest.main(args[1:])
     _tolerant_console()
     folder = state_dir()
     hidden = {folder: "<state>", projects.projects_root(): "<projects>"}
