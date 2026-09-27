@@ -1165,6 +1165,47 @@ def test_the_reference_switches_the_series_to_fold_change_and_back(client, tmp_p
     assert answer["project"]["reference_condition"] == "10 µM"
 
 
+def test_renaming_every_lane_of_the_reference_keeps_it_as_the_reference(client, tmp_path):
+    # The lane table renames the reference condition in every lane of it, and
+    # sends the new name as the reference in the same change.
+    _, _, before = live(client, tmp_path, DOSES, reference="vehicle")
+    renamed = {"lanes": [{"condition": c} for c in ["DMSO", "DMSO", *DOSES[2:]]]}
+    answer = client.ok("PUT", "/api/lanes", {**renamed, "reference_condition": "DMSO"})
+    assert answer["reference_cleared"] is False
+    assert answer["project"]["reference_condition"] == "DMSO"
+    assert answer["results"]["reference_condition"] == "DMSO"
+    series = only_series(answer)
+    assert (answer["results"]["sets"][0]["tier"], series["value_kind"]) == (
+        "fold_change",
+        "fold_change",
+    )
+    assert bar(series, "DMSO")["mean"] == pytest.approx(1.0)
+    assert series["fold_change"] == only_series(before)["fold_change"]  # the same lanes
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1  # one change
+    assert logged(client)[-1] == "set_lanes"
+
+    # Left out, the reference names no lane after the rename: cleared, and said so.
+    client.ok("POST", "/api/undo")
+    answer = client.ok("PUT", "/api/lanes", renamed)
+    assert answer["reference_cleared"] is True
+    assert answer["project"]["reference_condition"] is None
+    assert answer["results"]["sets"][0]["tier"] == "normalized"
+
+
+def test_labels_swapped_between_lanes_keep_the_reference_with_its_label(client, tmp_path):
+    # The lane table leaves reference_condition out when the old reference
+    # still names a lane after the edit: the server keeps it, on those lanes.
+    _, _, before = live(client, tmp_path, DOSES, reference="vehicle")
+    swapped = ["10 µM", "10 µM", "vehicle", "vehicle", "vehicle"]
+    answer = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": c} for c in swapped]})
+    assert answer["reference_cleared"] is False
+    assert answer["project"]["reference_condition"] == "vehicle"
+    series = only_series(answer)
+    assert series["value_kind"] == "fold_change"
+    assert bar(series, "vehicle")["mean"] == pytest.approx(1.0)  # lanes 3-5 now
+    assert series["fold_change"] != only_series(before)["fold_change"]
+
+
 @pytest.mark.parametrize(
     ("body", "code"),
     [
