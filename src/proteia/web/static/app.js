@@ -23,6 +23,13 @@ import { ImageView, MISSING_COLOR } from "/static/view.js";
 const TOKEN_KEY = "proteia-token";
 const NEEDS_LAUNCH =
   "This page needs the link Proteia opens when it starts. Start Proteia again to open it.";
+// Every request names the opening of the project the page shows (its open id)
+// in this header. The server refuses one about another opening with this code,
+// before it does anything: another tab opened a project since, or Proteia read
+// the open one's project.json again. So no page edits or reads a project it
+// does not show (projectChanged).
+const OPENING_HEADER = "Proteia-Opening";
+const PROJECT_CHANGED = "project_changed";
 
 // The launcher puts the token in the URL fragment, which the browser never sends
 // to a server. Keep it for this tab only and remove it from the address bar.
@@ -52,11 +59,39 @@ class ApiError extends Error {
   }
 }
 
-// Every request names the token in a header; nothing relies on cookies. An
-// aborted `signal` cancels it; `priority` orders it among those waiting for a
-// connection (the browser's fetch priority).
-async function request(method, path, { json, body, contentType, signal, priority } = {}) {
+// An edit never sent: it was made while the page showed a project it no longer
+// shows (ordered). The page says why it shows another one (followOpening).
+class NotSent extends Error {
+  constructor() {
+    super("Not sent: another project is shown now.");
+  }
+}
+
+// Every request names the token in a header; nothing relies on cookies. It
+// names the opening of the project shown too (OPENING_HEADER), as it is when
+// the request is sent, unless `anyProject`: a read of the project open now,
+// whichever it is, or a create or open, whose answer is of the opening it
+// makes. An edit that waits for others is sent only while the page shows the
+// project it was made in (ordered, and the panel's queue once showOpened drops
+// its edits), so that is the opening shown when it was made. With `answer`, it
+// gives the JSON answer (null for none) in place of the response; but not an
+// answer about an opening newer than the one the request named: that is taken
+// as a project_changed refusal (projectChanged, which shows the project open
+// now), never shown as a newer state of the project shown, as applyAnswer
+// would show it (keeping what showOpened drops: previews, typed values, queued
+// edits). The server answers each request within the opening it names; the
+// page does not rely on it. An aborted `signal` cancels it; `priority` orders
+// it among those waiting for a connection (the browser's fetch priority).
+async function request(
+  method,
+  path,
+  { json, body, contentType, signal, priority, anyProject = false, answer = false } = {},
+) {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
+  const named = anyProject ? null : shownOpening();
+  if (named) {
+    headers.set(OPENING_HEADER, String(named));
+  }
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(json);
@@ -82,17 +117,33 @@ async function request(method, path, { json, body, contentType, signal, priority
     } catch (error) {
       // not JSON: keep the status
     }
-    throw new ApiError(response.status, detail);
+    const error = new ApiError(response.status, detail);
+    if (error.code === PROJECT_CHANGED) {
+      projectChanged(error, method, path);
+    }
+    throw error;
   }
-  return response;
+  if (!answer) {
+    return response;
+  }
+  const answered = response.status === 204 ? null : await response.json();
+  const now = answered && answered.project ? answered.project.open_id : null;
+  if (named && now > named) {
+    const error = new ApiError(response.status, {
+      code: PROJECT_CHANGED,
+      message: `The answer is about opening ${now}, not ${named}, which this page named.`,
+      detail: { open: answered.project.name, open_id: now },
+    });
+    projectChanged(error, method, path, { answered: true });
+    throw error;
+  }
+  return answered;
 }
 
-async function call(method, path, json) {
-  return dock.track(
-    request(method, path, { json }).then((response) =>
-      response.status === 204 ? null : response.json(),
-    ),
-  );
+// Gives the answer (request()'s `answer`); `options`: request()'s, such as
+// `anyProject`.
+async function call(method, path, json, options = {}) {
+  return dock.track(request(method, path, { ...options, json, answer: true }));
 }
 
 // --- Page state ---
@@ -213,8 +264,19 @@ function renderStatusUndo(history) {
   }
 }
 
+// A refusal the page says nothing about where it was asked for: 401 (the page
+// says it needs the launch link) and project_changed (the page shows the
+// project open now and says why, or it was about a project this page has
+// since switched from itself); and an edit not sent for that same reason.
+function saidElsewhere(error) {
+  return (
+    error instanceof NotSent ||
+    (error instanceof ApiError && (error.status === 401 || error.code === PROJECT_CHANGED))
+  );
+}
+
 function report(error) {
-  if (error instanceof ApiError && error.status === 401) {
+  if (saidElsewhere(error)) {
     return;
   }
   showStatus(error.message);
@@ -290,9 +352,18 @@ const inFlight = new Set();
 // Make an edit outside the panel's queue: `sendIt()` sends it once the queue as
 // it stands has run, so an undo, redo or clear asked for before it reaches the
 // server first and never takes back or clears this edit (a band clicked while
-// undos queue up). Gives its answer.
+// undos queue up). Not once the page shows another project than when it was
+// made (one opened in another tab, shown while the queue ran): sent then, it
+// would name that project's opening and be made there. Gives its answer;
+// rejects with NotSent if not sent.
 function ordered(sendIt) {
-  const promise = proteinPanel.queue.then(sendIt);
+  const made = shownOpening();
+  const promise = proteinPanel.queue.then(() => {
+    if (shownOpening() !== made) {
+      throw new NotSent();
+    }
+    return sendIt();
+  });
   inFlight.add(promise);
   const done = () => inFlight.delete(promise);
   promise.then(done, done);
@@ -418,16 +489,40 @@ function setOpening(name) {
   line.hidden = name === null;
 }
 
+// Show the project `answer` is about in place of the one shown: one this page
+// created or opened (switchTo), or one opened in another tab (followOpening).
+// Image ids repeat across projects (img-1 in each): drop everything shown.
+// The edits still queued were made in the project shown before (an undo
+// queued behind a refusal answered late): none runs now, since each would name
+// the opening of this one and be made here (ordered checks its own).
+function showOpened(answer) {
+  proteinPanel.invalidateEdits();
+  view.setImage(null, 0, 0);
+  view.setOverlay([], [], null);
+  state.shownImageId = null;
+  for (const id of [...state.bitmaps.keys()]) {
+    forgetBitmap(id);
+  }
+  state.originalColours.clear();
+  proteinPanel.forgetTyped();
+  laneTable.forgetTyped();
+  charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
+  $("lane-picker").hidden = true; // its retry places a box in the project it asked about
+  applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
+  lastBoxStep = null; // log numbers repeat across projects
+}
+
 // Create or open a project: POST `json` (no body if undefined) to `path`,
-// then show the project answered in place of the one shown. `name` is what
-// "Opening …" says meanwhile. Gives the answer once the project is shown, or
-// null.
-async function openProject(path, name, json) {
+// then show the project answered in place of the one shown (showOpened).
+// `name` is what "Opening …" says meanwhile. Gives the answer once the
+// project is shown; null if a create or open is already running here, or if
+// the answer is older than the project shown by then. Rejects with the
+// server's refusal, the project shown unchanged.
+async function switchTo(path, name, json) {
   if (opening !== null) {
     return null;
   }
   setOpening(name);
-  $("projects-error").textContent = "";
   try {
     // Every edit made before, in the panel's queue (its edits, the undos,
     // redos and clears) or outside it (boxes and images, which wait for that
@@ -438,35 +533,172 @@ async function openProject(path, name, json) {
     // change of that project.
     await Promise.all([proteinPanel.settled(), pending()]);
     proteinPanel.invalidateEdits();
-    const answer = await call("POST", path, json);
+    // It names no opening: its answer is of the one it makes.
+    const answer = await call("POST", path, json, { anyProject: true });
     if (!isCurrent(answer.project)) {
+      return null;
+    }
+    showOpened(answer);
+    return answer;
+  } finally {
+    setOpening(null);
+  }
+}
+
+// Create or open a project from the Projects dialog (switchTo), which closes
+// once the project is shown; what went wrong is said in the dialog. Gives the
+// answer once the project is shown, or null.
+async function openProject(path, name, json) {
+  if (opening !== null) {
+    return null;
+  }
+  $("projects-error").textContent = "";
+  try {
+    const answer = await switchTo(path, name, json);
+    if (answer === null) {
       $("projects-error").textContent = "Another project was opened meanwhile.";
       return null;
     }
-    // Image ids repeat across projects (img-1 in each): drop everything shown.
-    view.setImage(null, 0, 0);
-    view.setOverlay([], [], null);
-    state.shownImageId = null;
-    for (const id of [...state.bitmaps.keys()]) {
-      forgetBitmap(id);
-    }
-    state.originalColours.clear();
-    proteinPanel.forgetTyped();
-    laneTable.forgetTyped();
-    charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
-    $("lane-picker").hidden = true; // its retry places a box in the project it asked about
-    applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
-    lastBoxStep = null; // log numbers repeat across projects
     $("projects-dialog").close();
     showStatus("");
     return answer;
   } catch (error) {
     $("projects-error").textContent = error.message;
     return null;
-  } finally {
-    setOpening(null);
   }
 }
+
+// --- A project opened in another tab ---
+
+// A request refused because it named an opening no longer open (`error`,
+// project_changed, whose detail names the open one). Unless this page is
+// creating or opening a project itself (the reads it sent before, such as
+// previews and charts, come back refused, and it shows the project it
+// opened), or the refusal names an opening no newer than the one shown (a
+// request sent before the page showed it, answered after: a read sent before
+// this page's own switch, say), the page follows: it shows the project open
+// now. The edits queued meanwhile are dropped, and with them what they would
+// say: each would be refused. `method` and `path`: the request's, which says
+// what was not done (NOT_DONE): nothing for a read, or a reveal (a folder not
+// shown); otherwise by its path (REFUSED_AS), or a change. Nothing either if
+// `answered`: the request was answered, about an opening newer than the one
+// it named (request()), so it was not refused.
+function projectChanged(error, method, path, { answered = false } = {}) {
+  const now = error.detail && error.detail.open_id;
+  const shown = shownOpening();
+  if (opening !== null || !shown || !(now > shown)) {
+    return;
+  }
+  proteinPanel.invalidateEdits();
+  const refused =
+    answered || method === "GET" || path === "/api/project/reveal"
+      ? null
+      : REFUSED_AS[path] || "change";
+  followOpening({ refused });
+}
+
+// What a request refused as project_changed did not do, in the status line.
+// An undo or redo lost no change: the one it would take back or make again was
+// made, and is saved with the project.
+const NOT_DONE = {
+  change: "Your last change was not made.",
+  undo: "Nothing was undone.",
+  redo: "Nothing was redone.",
+  export: "Nothing was exported.",
+};
+
+// The requests other than a change, by path: what their refusal did not do (a
+// key of NOT_DONE).
+const REFUSED_AS = {
+  "/api/undo": "undo",
+  "/api/redo": "redo",
+  "/api/export": "export",
+};
+
+let following = null; // the follow under way: {refused, done}, or null
+
+// Show the project open now in place of the one shown, which is no longer
+// open, and say why in the status line, and what the refused requests did not
+// do (`refused`: a key of NOT_DONE, or null). First every edit made before has
+// its answer (each is refused: none is made in the project open now); then
+// the project is read, whichever it is, and shown with nothing kept of the one
+// before (showOpened), unless this page has meanwhile started its own create
+// or open (it shows that one) or the answer is no newer than what it shows. A
+// call while one runs joins it. Settles once done, and never rejects.
+function followOpening({ refused = null } = {}) {
+  if (following) {
+    if (refused) {
+      following.refused.add(refused);
+    }
+    return following.done;
+  }
+  const follow = { refused: new Set(refused ? [refused] : []), done: null };
+  following = follow;
+  follow.done = (async () => {
+    try {
+      const before = state.project;
+      await Promise.all([proteinPanel.settled(), pending()]);
+      proteinPanel.invalidateEdits();
+      const answer = await call("GET", "/api/project", undefined, { anyProject: true });
+      const shown = shownOpening();
+      if (opening !== null || !shown || !(answer.project.open_id > shown)) {
+        return;
+      }
+      showOpened(answer);
+      showStatus(followedText(before, answer.project, follow.refused));
+    } catch (error) {
+      report(error);
+    } finally {
+      following = null;
+    }
+  })();
+  return follow.done;
+}
+
+// Why the page now shows `project` in place of `before`, and what the
+// requests `refused` did not do (keys of NOT_DONE).
+function followedText(before, project, refused) {
+  const now = isolate(project.name);
+  const why =
+    project.name === before.name
+      ? `${now} was opened again, in another tab or after a change outside Proteia;` +
+        " it is shown as it is now."
+      : `Proteia now shows ${now}, opened in another tab; ${isolate(before.name)} is saved.`;
+  return [why, ...[...refused].map((kind) => NOT_DONE[kind])].join(" ");
+}
+
+let checking = null; // the check under way (checkOpening), or null
+
+// A page shown again (its tab chosen, its window focused) checks which project
+// is open, and follows another opening (followOpening), so the user sees the
+// project open now before editing. The header is what guarantees it: an edit
+// sent before this answer is refused, not made in another project. One check
+// at a time; none while this page creates or opens a project itself.
+function checkOpening() {
+  if (checking || quitting || opening !== null || !shownOpening()) {
+    return;
+  }
+  checking = request("GET", "/api/workspace")
+    .then((response) => response.json())
+    .then((workspace) => {
+      const shown = shownOpening();
+      if (opening === null && shown && workspace.open_id > shown) {
+        return followOpening();
+      }
+      return null;
+    })
+    .catch(() => {}) // Proteia stopped, say: the next action says so
+    .finally(() => {
+      checking = null;
+    });
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    checkOpening();
+  }
+});
+window.addEventListener("focus", () => checkOpening());
 
 // "Open sample project": a new project on the synthetic sample blot, with its
 // lanes and proteins set up and each protein's row left to drag
@@ -939,7 +1171,11 @@ function renderView(project) {
       }
     })
     .catch((error) => {
-      if (colours !== "original" || generation !== renderGeneration) {
+      if (
+        colours !== "original" ||
+        generation !== renderGeneration ||
+        (error instanceof ApiError && error.code === PROJECT_CHANGED)
+      ) {
         report(error);
         return;
       }
@@ -1051,10 +1287,13 @@ function lanesPhrase(indices) {
 // Why a row left a lane with neither a box nor an n.d. mark, by the
 // detector's reason for the empty lane (LaneReason in core/rowdetect.py). A
 // lane where no band reaches the detection limit (no_band) gets an n.d. mark,
-// unless its place lies outside the row box.
+// unless its place lies outside the row box, or rests on the one band the row
+// found (the answer's unlocated_lanes, worded apart).
 const NOT_MEASURED = {
   artefact: "a stain or streak",
+  line: "a line or strip across the lanes",
   edge_signal: "only signal at the row box's top or bottom edge",
+  side_signal: "only signal at the row box's left or right edge",
   unassigned: "signal that fits no lane",
   no_band: "outside the row box",
 };
@@ -1164,13 +1403,20 @@ function rowReport(answer, name, before) {
     const boxes = yours.length === 1 ? "box" : "boxes";
     parts.push(`kept your ${boxes} in ${lanesPhrase(yours)} (no band found)`);
   }
+  const unlocated = new Set(answer.unlocated_lanes);
   const unmeasured = new Map(); // reason -> lanes
-  for (const lane of answer.unmeasured_lanes) {
+  for (const lane of answer.unmeasured_lanes.filter((index) => !unlocated.has(index))) {
     const reason = empty.has(lane) ? empty.get(lane).reason : "";
     unmeasured.set(reason, [...(unmeasured.get(reason) || []), lane]);
   }
   for (const [reason, lanes] of unmeasured) {
     parts.push(`${lanesPhrase(lanes)} not measured: ${NOT_MEASURED[reason] || reason}`);
+  }
+  if (unlocated.size) {
+    parts.push(
+      `${lanesPhrase([...unlocated])} not recorded: one band cannot show where the other` +
+        " lanes lie",
+    );
   }
   if (answer.removed_band_ids.length) {
     const was = answer.removed_band_ids.map((id) => (before ? findBox(before, id) : null));
@@ -1252,7 +1498,7 @@ function lastBoxStepNamed(error) {
 // row read its lanes just after a box was placed or changed, an Undo of that
 // change.
 function showRowRefusal(error, name) {
-  if (error instanceof ApiError && error.status === 401) {
+  if (saidElsewhere(error)) {
     return;
   }
   const sentences = [`Row box of ${name} not placed: ${sentence(error.message)}`];
@@ -1378,12 +1624,10 @@ $("import-file").addEventListener("change", async (event) => {
   showStatus(`Importing ${isolate(file.name)}…`);
   try {
     const answer = await ordered(() =>
-      dock.track(
-        request("POST", `/api/images?${query}`, {
-          body: file,
-          contentType: "application/octet-stream",
-        }).then((response) => response.json()),
-      ),
+      call("POST", `/api/images?${query}`, undefined, {
+        body: file,
+        contentType: "application/octet-stream",
+      }),
     );
     applyAnswer(answer, { choose: { imageId: answer.image_id, boxId: null } });
     const image = answer.project.images.find((i) => i.id === answer.image_id);
@@ -1526,7 +1770,7 @@ function showRequantified(answer, before) {
 // A refusal changes nothing: the server's reason, with the images it names by
 // their file names (a missing or changed image file).
 function reportRequantify(error) {
-  if (error instanceof ApiError && error.status === 401) {
+  if (saidElsewhere(error)) {
     return;
   }
   const names = imageNames(error.ids || []);
@@ -1575,27 +1819,19 @@ function exportResults() {
   const after = Promise.allSettled([pending(), proteinPanel.adding]);
   const asked = proteinPanel.queueEdit(
     async (current) => {
-      const opened = shownOpening();
       showStatus("Exporting…"); // again: the answer of an edit before it empties the line
+      // Its answer is about the opening shown (request()). Refused as
+      // project_changed, or answered about a newer opening, it starts the
+      // follow instead (projectChanged), which turns current() false.
       try {
-        const answer = await request("POST", "/api/export").then((response) => response.json());
+        const answer = await request("POST", "/api/export", { answer: true });
         applyAnswer(answer);
-        if (current() && sameOpening(answer)) {
+        if (current()) {
           showExported(answer);
-        } else if (current()) {
-          // The project was read again from its folder while it exported (an
-          // outside change): the files are of the version before, and written.
-          const files = counted(answer.files.length, "file", "files");
-          showStatus(
-            `Exported ${files} to ${answer.folder}, from the project as it was before` +
-              " it was read again from its folder.",
-          );
         }
       } catch (error) {
-        if (current() && opened === shownOpening()) {
+        if (current()) {
           await reportExport(error);
-        } else if (current()) {
-          showStatus("Not exported: the project was read again from its folder meanwhile. Export again.");
         }
       }
       return null;
@@ -1670,7 +1906,7 @@ async function revealExport(folder) {
 // images a missing or changed file belongs to, by their file names. Settles
 // once said (and, with no lanes, once the project is shown as it is now).
 async function reportExport(error) {
-  if (error instanceof ApiError && error.status === 401) {
+  if (saidElsewhere(error)) {
     return;
   }
   let why = sentence(error.message);
@@ -1941,7 +2177,7 @@ document.addEventListener("keydown", (event) => {
     event.ctrlKey ||
     event.metaKey ||
     event.altKey || // browser shortcuts stay the browser's
-    $("projects-dialog").open ||
+    document.querySelector("dialog[open]") ||
     target instanceof HTMLInputElement ||
     target instanceof HTMLSelectElement ||
     target instanceof HTMLTextAreaElement ||
