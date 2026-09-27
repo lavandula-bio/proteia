@@ -18,15 +18,18 @@ the empty ones included, plus a margin.
   generator and the recipes the tests use (neighbouring rows, doublets,
   streaks, stains, dust between lanes, bubbles), plus rows of the tests' own
   (a row large enough for the fits' subsample, guards that bind).
+* :func:`jpeg`: a row as an 8-bit JPEG export, read back (block artefacts).
 * :func:`fuzz_row`: seeded random geometry for the invariant checks.
 """
 
 import dataclasses
+import io
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image
 
 from proteia.core.model import Rect
 
@@ -371,16 +374,22 @@ def adversarial_row(
 
 
 def blob(
-    lane: int, r: float, depth: float, *, ry: float | None = None, dy: float = 0.0
+    lane: int,
+    r: float,
+    depth: float,
+    *,
+    ry: float | None = None,
+    dy: float = 0.0,
+    dx: float = 0.0,
 ) -> Artefact:
     """A round dark blob (dust, a stain) of radius ``r`` on ``lane``'s band centre
-    (``dy`` px below it); a negative depth is a light spot. ``ry`` makes it an
-    ellipse, ``r`` px across and ``ry`` px high."""
+    (``dy`` px below it, ``dx`` px right of it); a negative depth is a light
+    spot. ``ry`` makes it an ellipse, ``r`` px across and ``ry`` px high."""
     ry = r if ry is None else ry
 
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
-        cy = lcy[lane] + dy
-        return depth * np.exp(-0.5 * (((X - lcx[lane]) / r) ** 2 + ((Y - cy) / ry) ** 2))
+        cx, cy = lcx[lane] + dx, lcy[lane] + dy
+        return depth * np.exp(-0.5 * (((X - cx) / r) ** 2 + ((Y - cy) / ry) ** 2))
 
     return f
 
@@ -614,12 +623,49 @@ ADVERSARIAL: dict[str, dict] = {
         "margin_right": 240,
         "box_adjust": (0, 0, 190, 0),
     },
+    # #121: lane 1's band pale across its middle, its two ends about 1.7x as
+    # dark (a dumbbell); the same band over-exposed, clipped flat at 0 around
+    # its lighter centre (a hollow band).
+    "dumbbell_band": {"depths": {1: 24000.0}, "artefacts": [blob(1, 6.0, -11000.0, ry=12.0)]},
+    "hollow_band": {
+        "depths": {1: 1.5 * MEMBRANE},
+        "artefacts": [blob(1, 6.0, -45000.0, ry=12.0)],
+    },
+    # #121: lane 1's band 2.5x as deep as the membrane, clipped at 0 all around
+    # a lighter centre, back to 40000 there (a ring: burnt out in its middle);
+    # the band of hollow_band with dark spots at its two ends, 6 px above its
+    # middle (a notch in its top edge, as a band whose ends curve up shows).
+    "hollow_ring": {
+        "depths": {1: 2.5 * MEMBRANE},
+        "artefacts": [blob(1, 7.0, -2.3 * MEMBRANE, ry=2.0)],
+        "my": 10,
+    },
+    "notched_band": {
+        "depths": {1: 1.5 * MEMBRANE},
+        "artefacts": [blob(1, 4.0, 60000.0, dx=x, dy=-6.0) for x in (-13.0, 13.0)],
+        "my": 10,
+    },
 }
 
 
 def adversarial(key: str, seed: int) -> RowCase:
     """The recipe ``key`` of :data:`ADVERSARIAL` at ``seed``."""
     return adversarial_row(key, seed, **ADVERSARIAL[key])
+
+
+def jpeg(case: RowCase, quality: int = 75, membrane: float = 200.0) -> RowCase:
+    """A dark-on-light ``case`` as an 8-bit JPEG export of that quality, read
+    back: the membrane at ``membrane`` grey levels and the bands scaled with it
+    (about 70 to 120 levels deep), rounded, then compressed. On a smooth
+    membrane the compression leaves 8x8 block artefacts a few levels deep, as
+    a JPEG blot shows them (#121)."""
+    scaled = np.clip(np.round(case.image * membrane / MEMBRANE), 0.0, 255.0).astype(np.uint8)
+    encoded = io.BytesIO()
+    Image.fromarray(scaled).save(encoded, format="JPEG", quality=quality)
+    encoded.seek(0)
+    with Image.open(encoded) as decoded:
+        image = np.asarray(decoded, dtype=np.float64)
+    return dataclasses.replace(case, image=image)
 
 
 def fuzz_row(seed: int) -> RowCase:
