@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // The results dock under the image: its header (the results' tier, and
-// "Updating…" while an answer is awaited), the splitter that resizes or hides
-// it, and, in a narrow window, the tabs between the lane table and the charts.
-// It shows the results the app hands it and edits nothing.
+// "Updating…" while an answer or a chart's drawing is awaited), the splitter
+// that resizes or hides it, and, in a narrow window, the tabs between the lane
+// table and the charts. It shows the results the app hands it and edits nothing.
 import { $ } from "/static/dom.js";
 
 const NARROW = "(max-width: 1100px)"; // the lane table and the charts share one place: tabs
@@ -37,7 +37,8 @@ export class Dock {
     this.share = SHARE; // the share the dock takes: the wanted one, within its limits
     this.collapsed = false;
     this.tab = "lanes-panel"; // the panel shown while the dock has tabs
-    this.waiting = 0; // answers awaited
+    this.awaited = { answers: 0, charts: 0 }; // answers awaited, chart drawings being fetched
+    this.late = false; // one has been awaited longer than UPDATING_DELAY
     this.timer = null;
     this.narrow = window.matchMedia(NARROW);
     this.bindSplitter();
@@ -60,29 +61,39 @@ export class Dock {
     }
   }
 
-  // Count `promise` as an answer awaited until it settles; "Updating…" shows
-  // once one has taken longer than UPDATING_DELAY, and the values it may
-  // change are dimmed until none is awaited. Gives `promise`.
-  track(promise) {
-    this.waiting += 1;
-    if (this.waiting === 1) {
-      this.timer = setTimeout(() => this.showUpdating(true), UPDATING_DELAY);
-    }
+  // Count `promise` as awaited until it settles: an answer, or a chart's
+  // drawing being fetched (`chart`). "Updating…" shows once one has taken
+  // longer than UPDATING_DELAY, until none is awaited; meanwhile the values
+  // and charts an answer may change are dimmed while one is awaited (a chart
+  // being fetched dims only the image it replaces, charts.js). Gives `promise`.
+  track(promise, { chart = false } = {}) {
+    const kind = chart ? "charts" : "answers";
+    this.awaited[kind] += 1;
+    this.showUpdating();
     const done = () => {
-      this.waiting -= 1;
-      if (!this.waiting) {
-        clearTimeout(this.timer);
-        this.showUpdating(false);
-      }
+      this.awaited[kind] -= 1;
+      this.showUpdating();
     };
     promise.then(done, done);
     return promise;
   }
 
-  showUpdating(on) {
-    $("updating").hidden = !on;
-    $("dock").classList.toggle("waiting", on);
-    $("dock-body").setAttribute("aria-busy", String(on));
+  showUpdating() {
+    const { answers, charts } = this.awaited;
+    if (!answers && !charts) {
+      clearTimeout(this.timer);
+      this.timer = null;
+      this.late = false;
+    } else if (this.timer === null && !this.late) {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.late = true;
+        this.showUpdating();
+      }, UPDATING_DELAY);
+    }
+    $("updating").hidden = !this.late;
+    $("dock").classList.toggle("waiting", this.late && answers > 0);
+    $("dock-body").setAttribute("aria-busy", String(this.late));
   }
 
   // --- Size and collapse ---

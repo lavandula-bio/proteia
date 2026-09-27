@@ -598,12 +598,18 @@ button:disabled {
   font-weight: 600;
 }
 
-/* The charts column holds only its placeholder until the chart cards come
-   (a later change): the lane table takes the room. */
+/* The lane table and the charts side by side. The charts take the widest
+   card (--cards-width, charts.js: one card seen whole, its two sets side by
+   side), within 20rem and 45% of the dock; the table as much of the rest as
+   it is wide, so its values show; the charts whatever is left. Each scrolls
+   sideways within its share, and Enlarge shows a card large. */
 .dock-body {
   display: grid;
   flex: 1;
-  grid-template-columns: minmax(0, 1fr) 11rem;
+  grid-template-columns:
+    minmax(0, max-content)
+    minmax(clamp(20rem, var(--cards-width, 0px) + 1.5rem + 1px, 45%), 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
 }
 
@@ -640,6 +646,275 @@ button:disabled {
   text-align: center;
 }
 
+/* --- The chart cards --- */
+
+/* Its cards scroll inside it. Each chart is as tall as the dock allows
+   (--chart-height, from the height of the cards' strip, charts.js), which
+   sets its width, and so the width of the widest card (.dock-body). */
+.charts-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dock:not(.tabbed) .charts-panel {
+  min-width: 20rem;
+}
+
+.charts-panel .panel-title,
+.charts-empty {
+  flex: none;
+}
+
+.chart-cards {
+  /* The room a chart leaves in the strip for the card's heading, a set's
+     label and two caption lines (the rest of its caption scrolls into view);
+     charts stay within limits. */
+  --chart-height: clamp(10rem, var(--strip-height, 26rem) - 6rem, 32rem);
+  display: flex;
+  flex: 1 1 auto;
+  align-items: flex-start;
+  gap: 0.75rem;
+  min-height: 0;
+  margin: 0;
+  padding: 0 0 0.3rem;
+  overflow: auto;
+  list-style: none;
+}
+
+/* Beside the table (a wide window, dock.js), a chart of three bars still fits
+   the charts' largest share (45% of the dock, beside the 20rem panel). */
+@media (min-width: 1101px) {
+  .chart-cards {
+    --chart-height: clamp(10rem, min(var(--strip-height, 26rem) - 6rem, 37.5vw - 10rem), 32rem);
+  }
+}
+
+.chart-card {
+  flex: none;
+  padding: 0.3rem 0.5rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+/* A card's heading: the series, its warnings counted, and Enlarge. As wide
+   as the charts under it: a long name wraps, and in a narrow card the count
+   and Enlarge go under it. */
+.chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.1rem 0.4rem;
+  width: 0;
+  min-width: 100%;
+  margin: 0 0 0.3rem;
+}
+
+.chart-title {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.chart-flag {
+  color: var(--warn);
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chart-enlarge {
+  margin-left: auto;
+  padding: 0 0.45rem;
+  font-size: 0.75rem;
+}
+
+.chart-card .chart-image {
+  cursor: zoom-in;
+}
+
+.chart-sets {
+  display: flex;
+  gap: 0.75rem;
+}
+
+/* A narrow window: the two sets of a card stack (in a wider one they stay
+   side by side, to be compared, and the cards scroll sideways). */
+@media (max-width: 820px) {
+  .chart-sets {
+    flex-direction: column;
+  }
+}
+
+.chart-set {
+  display: flex;
+  flex-direction: column;
+  width: min-content; /* the chart's width: the caption wraps under it */
+  margin: 0;
+}
+
+.chart-set-label {
+  margin: 0 0 0.2rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.chart-frame {
+  transition: opacity 0.2s;
+}
+
+/* While an answer is awaited, or the chart's new drawing loads, the chart
+   shown is dimmed: it is kept until the new one has loaded. */
+.dock.waiting .chart-frame,
+:root:has(.dock.waiting) .chart-dialog .chart-frame,
+.chart-frame.stale {
+  opacity: 0.5;
+}
+
+/* A chart is paper: white with a border in either theme, as it is exported. */
+.chart-image {
+  display: block;
+  width: auto;
+  max-width: none;
+  height: var(--chart-height);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #ffffff;
+}
+
+.chart-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: calc(var(--chart-height) * 1.1);
+  height: var(--chart-height);
+  margin: 0;
+  padding: 0.75rem;
+  overflow: auto;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.chart-placeholder.loading {
+  border-style: solid;
+}
+
+.chart-caption {
+  font-size: 0.8rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.chart-caption p {
+  margin: 0.2rem 0 0;
+}
+
+.chart-bars {
+  color: var(--muted);
+}
+
+.chart-notices {
+  margin: 0.2rem 0 0;
+  padding-left: 1rem;
+}
+
+.chart-notices .warning::marker {
+  color: var(--warn);
+}
+
+.chart-notices .info {
+  color: var(--muted);
+}
+
+/* Its table scrolls sideways rather than widen the chart's column. */
+.chart-values {
+  margin-top: 0.2rem;
+  contain: inline-size;
+}
+
+.chart-values summary {
+  cursor: pointer;
+}
+
+.chart-table-scroll {
+  overflow-x: auto;
+}
+
+.chart-table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-table th,
+.chart-table td {
+  padding: 0.05rem 0.35rem;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.chart-table .label {
+  text-align: left;
+}
+
+.chart-table .samples {
+  white-space: normal;
+  min-width: 8rem;
+}
+
+/* A card enlarged: each chart at its own size, where the text drawn in it
+   reads, or as large as the window allows below its whole caption; two sets
+   side by side, stacked in a narrow window. The dialog scrolls if it must. */
+.chart-dialog {
+  --chart-height: min(30rem, 100dvh - 16rem); /* a missing chart's place */
+  max-width: 96vw;
+  max-height: 96dvh;
+  padding: 0.75rem 1rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.chart-dialog-head {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.chart-dialog-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+
+.chart-dialog .chart-image {
+  height: auto;
+  max-width: calc(96vw - 4rem);
+  max-height: calc(100dvh - 16rem);
+}
+
+.chart-dialog .chart-sets.paired .chart-image {
+  max-width: calc((96vw - 5rem) / 2);
+}
+
+@media (max-width: 820px) {
+  .chart-dialog .chart-sets.paired .chart-image {
+    max-width: calc(96vw - 4rem);
+  }
+}
+
+.chart-dialog .chart-caption {
+  font-size: 0.9rem;
+}
+
 /* The lane table: its toolbar and notes stay put, the table scrolls. */
 .lanes-panel {
   display: flex;
@@ -647,12 +922,15 @@ button:disabled {
   overflow: hidden;
 }
 
+/* The toolbar and the error line wrap to the panel's width: only the table
+   sets how wide the panel would be (.dock-body). */
 .lane-tools {
   display: flex;
   flex: none;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.4rem 0.8rem;
+  contain: inline-size;
 }
 
 .inline {
@@ -698,6 +976,7 @@ button:disabled {
 .lanes-panel .error {
   flex: none;
   margin: 0 0 0.3rem;
+  contain: inline-size;
 }
 
 .table-scroll {
