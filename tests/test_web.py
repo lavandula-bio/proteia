@@ -416,11 +416,21 @@ def test_a_server_error_carries_the_security_headers():
 
 
 @pytest.mark.parametrize(
-    "path", ["/api/status", "/api/quit", "/api/workspace", "/api/nothing", "/docs"]
+    ("method", "path"),
+    [
+        ("GET", "/api/status"),
+        ("POST", "/api/quit"),
+        ("GET", "/api/workspace"),
+        ("GET", "/api/nothing"),
+        ("GET", "/docs"),
+        ("POST", "/api/incoming?name=a.tif"),
+        ("POST", "/api/handoffs"),
+        ("POST", "/api/handoffs/0/accept"),
+        ("POST", "/api/handoffs/0/discard"),
+    ],
 )
 @pytest.mark.parametrize("token", [None, "z" * 43, "wrong"])
-def test_a_request_without_the_right_token_is_refused(running, path, token):
-    method = "POST" if path == "/api/quit" else "GET"
+def test_a_request_without_the_right_token_is_refused(running, method, path, token):
     status, headers, _ = send(running.port, method, path, token=token)
     assert status == 401
     assert headers["www-authenticate"] == "Bearer"
@@ -436,7 +446,7 @@ def test_two_authorization_headers_are_refused(running):
 def test_the_right_token_and_host_are_admitted(running):
     status, headers, body = send(running.port, "GET", "/api/status", token=running.token)
     assert status == 200
-    assert json.loads(body) == {"app": "proteia", "version": proteia.__version__}
+    assert json.loads(body) == {"app": "proteia", "version": proteia.__version__, "handoff": 1}
     assert headers["cache-control"] == "no-store"
 
 

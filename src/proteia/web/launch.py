@@ -20,6 +20,11 @@ writes it to files only the current user can read, in the same folder:
   the URL, and the token rides in the URL fragment, which the browser never sends
   to a server. The page keeps it for its tab and sends it in a request header.
 
+Images a launch hands to the running instance are staged in ``incoming/`` in
+the same folder (:mod:`proteia.web.handoff`), under names the server makes; the
+instance deletes them when it stops, and a new one deletes what a crash left
+there once it holds the lock.
+
 Both files are removed when the server stops (Quit on the page, Ctrl+C, or a
 termination signal), before the lock is released. (A launch that opens the
 running instance just as it stops can write the redirect page again; its token
@@ -62,6 +67,7 @@ import proteia
 from proteia.core.storage import write_atomic
 from proteia.web import logs, projects
 from proteia.web.api import UnsavedChangesError, Workspace
+from proteia.web.handoff import INCOMING_DIR
 from proteia.web.server import APP_ID, HOST, TOKEN_PATTERN, create_app
 
 if os.name == "nt":
@@ -297,6 +303,8 @@ class Instance:
         self.redirect_path = folder / REDIRECT_FILE
         app = create_app(token=token, port=self.port, on_quit=self.stop, workspace=workspace)
         self.workspace: Workspace = app.app.state.workspace
+        if self.workspace.inbox.folder is None:  # held by this lock: no other instance uses it
+            self.workspace.inbox.place(folder / INCOMING_DIR)
         self.server = _server(app)
 
     def serve(self) -> None:
