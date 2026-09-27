@@ -19,9 +19,11 @@ draws at any zoom lands on the same pixels the server quantifies.
 Each protein's ``box_size`` is the size of every one of its boxes, the one
 quantified and drawn, and ``fitted_size`` the size its clicks, rows or typing
 asked for, which the boxes extend beyond by the protein's padding on each side
-(:attr:`~proteia.core.model.Protein.fitted_size`), both as ``{width, height}``.
-The page's size fields show the fitted size, which ``PUT
-/api/proteins/{id}/box-size`` takes.
+(:attr:`~proteia.core.model.Protein.fitted_size`), both as ``{width, height}``;
+``box_padding`` is that padding, as ``{across, along}``: whole pixels left and
+right, and above and below. The page's size fields show the fitted size, which
+``PUT /api/proteins/{id}/box-size`` takes, and its padding fields the padding,
+which ``PUT /api/proteins/{id}/box-padding`` takes.
 
 ``background_method`` names how the stored nets' backgrounds were measured
 (``ring_median_v1``, or ``global_median`` for a project quantified before #83,
@@ -122,7 +124,7 @@ def project_state(
     anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
-        size, fitted = protein.box_size, protein.fitted_size
+        size, fitted, padding = protein.box_size, protein.fitted_size, protein.box_padding
         proteins.append(
             {
                 "id": protein.id,
@@ -133,6 +135,7 @@ def project_state(
                 "expected_mw": protein.expected_mw,
                 "box_size": {"width": size.width, "height": size.height},
                 "fitted_size": {"width": fitted.width, "height": fitted.height},
+                "box_padding": {"across": padding.across, "along": padding.along},
                 "bands": [
                     {
                         "id": band.id,

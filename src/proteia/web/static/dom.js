@@ -16,6 +16,12 @@ export function inWords(items) {
     : items.join(" and ");
 }
 
+// Stored lane indices in words, numbered from 1: "lane 8", "lanes 4 and 8".
+export function lanesPhrase(indices) {
+  const numbers = indices.map((index) => String(index + 1));
+  return `${numbers.length === 1 ? "lane" : "lanes"} ${inWords(numbers)}`;
+}
+
 // A server message as a sentence: capitalized, with a full stop.
 export function sentence(text) {
   const capital = text.charAt(0).toUpperCase() + text.slice(1);
