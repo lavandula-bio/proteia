@@ -80,20 +80,33 @@ export class Dock {
 
   showUpdating() {
     const { answers, charts } = this.awaited;
-    if (!answers && !charts) {
-      clearTimeout(this.timer);
-      this.timer = null;
-      this.late = false;
-    } else if (this.timer === null && !this.late) {
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        this.late = true;
+    // Two clocks: "Updating…" once anything has been awaited too long; the
+    // values dimmed only once answers have been, so a slow chart does not dim
+    // the table at every quick edit.
+    this.late = this.clock("any", answers + charts > 0);
+    const answersLate = this.clock("answers", answers > 0);
+    $("updating").hidden = !this.late;
+    $("dock").classList.toggle("waiting", answersLate);
+    $("dock-body").setAttribute("aria-busy", String(this.late));
+  }
+
+  // Whether `name`'s awaiting (`awaiting`) has lasted UPDATING_DELAY: its timer
+  // starts when awaiting begins and stops, with the answer false, when it ends.
+  clock(name, awaiting) {
+    this.clocks ??= {};
+    const clock = (this.clocks[name] ??= { timer: null, late: false });
+    if (!awaiting) {
+      clearTimeout(clock.timer);
+      clock.timer = null;
+      clock.late = false;
+    } else if (clock.timer === null && !clock.late) {
+      clock.timer = setTimeout(() => {
+        clock.timer = null;
+        clock.late = true;
         this.showUpdating();
       }, UPDATING_DELAY);
     }
-    $("updating").hidden = !this.late;
-    $("dock").classList.toggle("waiting", this.late && answers > 0);
-    $("dock-body").setAttribute("aria-busy", String(this.late));
+    return clock.late;
   }
 
   // --- Size and collapse ---

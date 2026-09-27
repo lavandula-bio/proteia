@@ -69,6 +69,12 @@ def _point_xs(center: float, n: int, spread: float = 0.18) -> list[float]:
     return [center - spread + i * step for i in range(n)]
 
 
+def _p_text(p: float) -> str:
+    """A p-value as the page's captions write it: below 0.0001 as a bound,
+    otherwise to 3 significant digits."""
+    return "p < 0.0001" if p < 0.0001 else f"p = {p:.3g}"
+
+
 def render_figure(spec: PlotSpec) -> Figure:
     """Render the spec to a matplotlib :class:`Figure` (no global pyplot state).
 
@@ -112,7 +118,7 @@ def render_figure(spec: PlotSpec) -> Figure:
         lines.append(spec.subtitle)
     if spec.test_name and spec.test_p is not None:
         name = _TEST_NAMES.get(spec.test_name, spec.test_name.replace("_", " "))
-        lines.append(f"{name}: p = {spec.test_p:.3g}")
+        lines.append(f"{name}: {_p_text(spec.test_p)}")
     if spec.test_note:
         lines.append(spec.test_note)
     lines = [_shown(line) for line in lines]

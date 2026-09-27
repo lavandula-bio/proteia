@@ -361,7 +361,7 @@ def test_subtitle_is_passed_through():
 def test_render_draws_the_subtitle_as_the_second_title_line():
     plain = _spec()
     without = render_figure(plain).axes[0].get_title()
-    assert without == f"test\nOne-way ANOVA: p = {plain.test_p:.3g}"
+    assert without == f"test\nOne-way ANOVA: {_p(plain.test_p)}"
     labelled = plain.model_copy(update={"subtitle": "Excluding lanes 3, 7"})
     title = render_figure(labelled).axes[0].get_title()
     assert title.split("\n") == ["test", "Excluding lanes 3, 7", without.split("\n")[1]]
@@ -375,7 +375,7 @@ def test_render_draws_the_test_and_then_the_groups_it_leaves_out(subtitle):
     assert title.split("\n") == [
         "test",
         *([subtitle] if subtitle else []),
-        f"Welch t-test: p = {spec.test_p:.3g}",
+        f"Welch t-test: {_p(spec.test_p)}",
         "'50 µM' (n = 1) is not in the test",
     ]
 
@@ -395,15 +395,27 @@ def test_render_names_the_test_as_a_reader_names_it(groups, test_name, name):
     # the screen and in a saved file.
     spec = _fold_change(groups, title="test")
     assert spec.test_name == test_name
-    line = f"{name}: p = {spec.test_p:.3g}"
+    line = f"{name}: {_p(spec.test_p)}"
     assert render_figure(spec).axes[0].get_title().split("\n")[1] == line
     svg = render_svg(spec).decode()
     assert line in svg and test_name not in svg
 
 
+def _p(p):
+    """A p-value as the page's captions write it (charts.js pText)."""
+    return "p < 0.0001" if p < 0.0001 else f"p = {p:.3g}"
+
+
+def test_a_p_value_below_0_0001_is_drawn_as_a_bound():
+    spec = _fold_change({"ctl": [1.0, 1.01, 0.99], "A": [5.0, 5.01, 4.99]}, title="test")
+    assert spec.test_p is not None and spec.test_p < 0.0001
+    title = render_figure(spec).axes[0].get_title()
+    assert ": p < 0.0001" in title and "e-" not in title
+
+
 def _test_lines(spec):
     """The title lines a chart gives its test: the test that ran, then its note."""
-    ran = [f"{_TEST_NAMES[spec.test_name]}: p = {spec.test_p:.3g}"] if spec.test_name else []
+    ran = [f"{_TEST_NAMES[spec.test_name]}: {_p(spec.test_p)}"] if spec.test_name else []
     return ran + ([spec.test_note] if spec.test_note else [])
 
 
