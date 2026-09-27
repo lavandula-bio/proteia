@@ -157,8 +157,13 @@ function report(error) {
 
 // Answers can arrive out of order: one is shown only if it is not older than
 // the one shown, by (open_id, revision). The open id counts the server's
-// creates and opens, so an answer about an earlier opening is older whatever
-// its revision, and the answer of the latest open is newer than all before it.
+// openings (creates, opens of another project, and rereads of the open one's
+// project.json after it changed outside Proteia), so an answer about an
+// earlier opening is older whatever its revision, and the answer of the latest
+// open is newer than all before it. Opening the project already open otherwise
+// answers its own open id, at its latest revision: openProject asks only once
+// every edit has its answer, so that answer is not older than the one shown,
+// and is shown.
 function isCurrent(project) {
   const shown = state.answered;
   return (

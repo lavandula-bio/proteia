@@ -4,7 +4,9 @@
 The state is built from one snapshot of the committed project, the one its
 results were computed from (:func:`~proteia.core.operations.compute_view`), and
 carries ``open_id`` and ``revision``: which opening of a project it belongs to
-(the workspace counts every create and open) and the ``seq`` of the project's
+(the workspace counts every create, and every open of a project not already
+open: reopening the open one answers its own, unless it reads a
+``project.json`` changed outside Proteia again) and the ``seq`` of the project's
 last log entry (0 with an empty log). Every commit appends one entry, so within
 one opening the revision names one state, and a client can keep the newest
 answer by the pair and drop an older one that arrives late. The revision alone

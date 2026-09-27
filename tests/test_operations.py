@@ -18,6 +18,7 @@ import inspect
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -545,6 +546,73 @@ def test_explicit_save_raises_and_records_the_error(tmp_path, replace_lock):
     assert ops.save(s) == s.folder / storage.PROJECT_FILE
     assert not s.dirty and s.save_error is None
     assert load_project(s.folder) == s.project
+
+
+def test_reload_reads_project_json_again_only_once_changed_outside_proteia(tmp_path):
+    s, image, protein = boxed(tmp_path, save_to_folder)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    s.pixels(image)
+    project = s.project
+    assert not s.reload()  # the file holds what the session saved
+    assert s.project is project and s.undo_step is not None and image in s._pixels
+
+    # A copy of the folder (another machine, a restore) changes the project.
+    other = tmp_path / "copy α"
+    shutil.copytree(s.folder, other)
+    remote = ops.open_project(other, clock=FakeClock())
+    ops.remove_protein(remote, protein)
+    newer = import_blot(remote, blot(), "remote β.tif")
+    shutil.copytree(other, s.folder, dirs_exist_ok=True)
+
+    assert s.reload()
+    assert s.project == remote.project
+    assert (s.undo_step, s.redo_step, s._pixels, s.dirty, s.last_action) == (
+        None,
+        None,
+        {},
+        False,
+        None,
+    )
+    assert not s.reload()
+    ops.set_polarity(s, newer, LIGHT)  # the next change saves the file's project
+    assert load_project(s.folder) == s.project
+    assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
+    ops.undo(s)  # the history begins at the project read again
+    assert s.project.batch.find_image(newer).polarity == DARK
+    with pytest.raises(OperationError) as info:
+        ops.undo(s)
+    assert info.value.code is ErrorCode.NOTHING_TO_UNDO
+
+
+def test_reload_keeps_unsaved_changes_and_a_session_it_cannot_read(tmp_path, replace_lock):
+    s, _, protein = boxed(tmp_path, save_to_folder)
+    replace_lock.locked = True
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    project, steps = s.project, s.history_steps
+    assert s.dirty
+    assert not s.reload()  # project.json is older than the session: not read
+    assert (s.project, s.history_steps, s.dirty) == (project, steps, True)
+
+    replace_lock.locked = False
+    ops.save(s)
+    for broken in (b"{not json", b"{}"):
+        (s.folder / storage.PROJECT_FILE).write_bytes(broken)
+        with pytest.raises(storage.ProjectError):
+            s.reload()
+        assert (s.project, s.history_steps, s.dirty) == (project, steps, False)
+
+
+def test_reload_migrates_and_saves_a_file_of_an_older_schema(tmp_path):
+    folder = v1_folder(tmp_path)
+    v1 = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved
+    ops.set_reference_condition(s, None)
+    (folder / storage.PROJECT_FILE).write_bytes(v1)  # an old copy restored
+
+    assert s.reload()
+    assert [entry.action for entry in s.project.log] == ["new_project", "migrate"]
+    assert (s.dirty, s.last_action, s.undo_step) == (False, "migrate", None)
+    assert load_project(folder) == s.project
 
 
 # --- refused operations change nothing ---
