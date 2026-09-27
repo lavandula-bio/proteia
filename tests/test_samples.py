@@ -340,6 +340,42 @@ def test_the_full_flow_gives_the_true_fold_changes(tmp_path, sample_folder):
     )
 
 
+def test_padding_both_proteins_recovers_the_tails(tmp_path, sample_folder):
+    # The rows' boxes end where each band falls to 30 % of its peak (fitted 88x15
+    # and 89x18): 5 px above and below both takes in the tails. Padding the
+    # target alone would make the fold changes worse (measured 2.40 %).
+    s = ops.new_project(tmp_path / FOLDER, autosave=None, clock=FakeClock())
+    blot, _ = import_samples(s, sample_folder)
+    ops.set_lanes(
+        s,
+        [
+            LaneInput(c, sample)
+            for c, sample in zip(samples.CONDITIONS, samples.SAMPLES, strict=True)
+        ],
+        reference_condition=samples.REFERENCE,
+    )
+    loading = ops.add_protein(s, samples.LOADING_CONTROL, Role.LOADING_CONTROL, blot)
+    target = ops.add_protein(s, samples.TARGET, Role.TARGET, blot, loading_control_ids=[loading])
+    for protein, row in ((target, samples.TARGET_ROW), (loading, samples.LOADING_ROW)):
+        ops.detect_row_boxes(s, protein, row_box(row))
+        change = ops.set_box_padding(s, protein, along=5)
+        # measured: β-catenin +8.6 to +11.5 %, α-tubulin +6.0 to +9.7 %
+        assert 0.05 <= change.net_change[0] and change.net_change[1] <= 0.13, row.protein
+
+    res = ops.compute(s)
+    assert res.notices == []
+    rows = truth(sample_folder)
+    for column in res.proteins:
+        true = [float(r[f"{column.name} true signal"]) for r in rows]
+        share = [net / t for net, t in zip(column.nets, true, strict=True)]
+        # measured: β-catenin 0.942-0.966, α-tubulin 0.942-0.966 (unpadded 0.855-0.904)
+        assert 0.93 <= min(share) and max(share) <= 0.98, column.name
+    [series] = res.series
+    true_fold = [float(r["fold change vs vehicle"]) for r in rows]
+    errors = [f / t - 1 for f, t in zip(series.fold_change, true_fold, strict=True)]
+    assert max(map(abs, errors)) <= 0.005  # measured 0.39 % (unpadded 1.48 %)
+
+
 # --- The command ---
 
 

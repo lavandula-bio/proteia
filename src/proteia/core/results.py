@@ -124,6 +124,9 @@ class NoticeCode(StrEnum):
     BACKGROUND_UNEVEN = "background_uneven"
     # Nets above the whole-image median, as quantified before #83: requantify.
     LEGACY_BACKGROUND = "legacy_background"
+    # Per image: nets measured on a reading of its file this version no longer
+    # makes (#131: CMYK taken for RGB, a colour space now refused): import it again.
+    OUTDATED_READING = "outdated_reading"
     # Per series: a test ran, but some plotted conditions are left out of it.
     CONDITIONS_NOT_TESTED = "conditions_not_tested"
     # Per series: a choice of the statistics setting could not apply, so no test ran.
@@ -181,6 +184,7 @@ _FALLBACK_MODES = frozenset({"asymmetric", "image"})
 # import, so that loading results does not load the image readers.
 _UNCHECKED_WARNINGS = {
     "lossy_format": "lossy (JPEG-type) compression",
+    "cmyk_converted": "CMYK converted to RGB",
     "color_channels_differ": "color channels averaged into gray",
 }
 
@@ -398,8 +402,9 @@ def _clipping_not_checked(
     (``bands``, joined to the lanes) in the included lanes: those with no
     clipping flag. It names why the check could not run on the protein's image,
     as :func:`~proteia.core.imaging.clipping_depth` decides it: lossy
-    compression, color averaged into gray, an unknown bit depth. The operations
-    check every other image, so a flag missing there gets no reason."""
+    compression, CMYK converted to RGB, color averaged into gray, an unknown
+    bit depth. The operations check every other image, so a flag missing there
+    gets no reason."""
     unchecked = tuple(
         i
         for i, band in enumerate(bands)
@@ -539,6 +544,7 @@ def compute_results(
     error_type: ErrorType | str = ErrorType.SD,
     method: ReduceMethod | str = ReduceMethod.MEAN,
     statistics: StatisticsSetting | Mapping[str, str] | None = None,
+    outdated: Mapping[str, str] | None = None,
 ) -> Results:
     """Everything the results view shows, from the stored batch alone.
 
@@ -560,6 +566,12 @@ def compute_results(
     ``statistics`` chooses every chart's test (None: all ``auto``); both sets use
     it, and :attr:`Results.statistics` echoes it.
 
+    ``outdated`` gives, by image id, why the image's stored nets were measured on
+    a reading of its file this version no longer makes, as the session tells it
+    (:meth:`~proteia.core.session.ProjectSession.outdated_reading`); the
+    proteins with bands on each such image get an ``outdated_reading`` warning
+    with that message. The batch alone cannot tell: its file must be read.
+
     ``error_type``, ``method`` and ``statistics`` may be their raw values
     (``"SEM"``, ``"mean"``, ``{"family": "welch"}``): they become their enums
     here, before anything compares them by identity. An unknown value raises
@@ -571,6 +583,7 @@ def compute_results(
         error_type=ErrorType(error_type),
         method=ReduceMethod(method),
         statistics=statistics_setting(statistics),
+        outdated=outdated or {},
     )
     per_protein = lane_nets(batch).values()
     removed = [  # the excluded lanes that hold a value: what the exclusion changes
@@ -600,6 +613,7 @@ def _compute(
     error_type: ErrorType,
     method: ReduceMethod,
     statistics: StatisticsSetting,
+    outdated: Mapping[str, str],
     set_label: str | None,
 ) -> Results:
     """One result set, over the lane table's included lanes.
@@ -608,8 +622,10 @@ def _compute(
     is resolved against the lane labels (:func:`~proteia.core.names.resolve_label`),
     and one that matches no lane is reported and ignored. ``method`` reduces
     technical repeats; ``error_type`` picks the charts' error bars and
-    ``statistics`` their tests. ``set_label`` names the set
-    (:attr:`Results.label`) and is every chart's subtitle.
+    ``statistics`` their tests. ``outdated`` names the images whose nets were
+    measured on a reading no longer made (:func:`compute_results`).
+    ``set_label`` names the set (:attr:`Results.label`) and is every chart's
+    subtitle.
 
     Series come from :func:`~proteia.core.analyze.normalize_batch`. Each is reduced
     once over the lane table's included lanes. With a reference condition and a
@@ -670,6 +686,10 @@ def _compute(
             " around its box",
             protein_ids=legacy,
         )
+    for image_id, why in outdated.items():  # an image with no band has no nets to warn about
+        measured = tuple(p.id for p in batch.proteins if p.image_id == image_id and p.bands)
+        if measured:
+            note(NoticeCode.OUTDATED_READING, why, protein_ids=measured)
     targets = [p for p in batch.proteins if p.role is Role.TARGET]
     loading_controls = [p for p in batch.proteins if p.role is Role.LOADING_CONTROL]
     if not targets:

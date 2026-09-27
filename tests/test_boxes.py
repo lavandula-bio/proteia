@@ -16,10 +16,13 @@ from proteia.core.boxes import (
     initial_box_size,
     normalize_corners,
     overlaps_any,
+    padding_words,
     place_in_row,
     resize_all,
+    resize_checked,
+    size_words,
 )
-from proteia.core.model import BoxSize, overlaps
+from proteia.core.model import BoxPadding, BoxSize, overlaps
 
 SIZE = BoxSize(width=10, height=4)
 
@@ -254,6 +257,117 @@ def test_grow_to_fit_all_refuses_new_boxes_on_existing_ones():
     error = info.value
     assert (error.code, error.size, error.hits) == ("overlap", SIZE, (1, 2))  # input order
     assert str(error) == "a new box would overlap another box of this protein"
+
+
+# --- A protein's padding (#57): every fit keeps it ---
+
+PAD = BoxPadding(across=2, along=3)
+
+
+def test_grow_to_fit_all_pad_adds_twice_the_pad_to_need():
+    # The first box: the band's own extent, 11x7, plus the padding on each side,
+    # centred on the band's integer centre (45, 23): the band's box grown evenly.
+    size, _, [rect] = grow_to_fit_all([], SIZE, [(40, 20, 51, 27)], width=W, height=H, pad=PAD)
+    assert (size, rect) == (BoxSize(width=15, height=13), (38, 17, 53, 30))
+    assert grow_to_fit([], SIZE, (40, 20, 51, 27), width=W, height=H, pad=PAD) == (size, [], rect)
+    # A size fitted elsewhere (a row's detector) is padded the same way.
+    need = BoxSize(width=12, height=6)
+    size, _, placed = grow_to_fit_all(
+        [], SIZE, [(60, 10, 72, 16)], need=need, width=W, height=H, pad=PAD
+    )
+    assert (size, placed) == (BoxSize(width=16, height=12), [(58, 7, 74, 19)])
+    # The 2 px floor applies to the band, before the padding.
+    size, _, _ = grow_to_fit_all([], SIZE, [(50, 30, 51, 31)], width=W, height=H, pad=PAD)
+    assert size == BoxSize(width=6, height=8)
+    # No padding: as before.
+    assert grow_to_fit_all([], SIZE, [(40, 20, 51, 27)], width=W, height=H) == (
+        BoxSize(width=11, height=7),
+        [],
+        [(40, 20, 51, 27)],
+    )
+
+
+def test_grow_to_fit_all_pad_only_grows_the_fitted_size():
+    # The existing boxes are 14x10 under the padding: fitted 10x4.
+    padded = BoxSize(width=14, height=10)
+    rects = [(8, 7, 22, 17), (28, 37, 42, 47)]  # centres (15, 12) and (35, 42)
+    # A band smaller than the fitted size keeps the size and moves nothing.
+    size, resized, [rect] = grow_to_fit_all(
+        rects, padded, [(70, 30, 72, 33)], width=W, height=H, pad=PAD
+    )
+    assert (size, resized, rect) == (padded, rects, (64, 26, 78, 36))
+    # A taller band (8 px) grows the fitted height to it, and the padding stays:
+    # max(fitted, need) + 2 * pad.
+    size, resized, _ = grow_to_fit_all(rects, padded, [(60, 9, 64, 17)], width=W, height=H, pad=PAD)
+    assert size == BoxSize(width=14, height=14)
+    assert resized == [(8, 5, 22, 19), (28, 35, 42, 49)]  # same centres
+
+
+def test_grow_to_fit_all_pad_clamps_to_the_image():
+    # A 30 px band under 6 px above and below on a 40 px image: the box takes the
+    # image's full height, and the fitted size it leaves is 28, less than the band.
+    pad = BoxPadding(along=6)
+    size, _, [rect] = grow_to_fit_all([], SIZE, [(10, 5, 20, 35)], width=W, height=40, pad=pad)
+    assert size == BoxSize(width=10, height=40)
+    assert size.height - 2 * pad.along == 28
+    assert rect == (10, 0, 20, 40)
+
+
+def test_padded_new_boxes_that_overlap_are_refused_without_hits():
+    # Two 8 px bands 12 px apart fit unpadded, but not 3 px wider on each side.
+    grown = [(10, 10, 18, 14), (22, 10, 30, 14)]
+    assert grow_to_fit_all([], SIZE, grown, width=W, height=H)[2] == grown
+    with pytest.raises(BoxRuleError) as info:
+        grow_to_fit_all([], SIZE, grown, width=W, height=H, pad=BoxPadding(across=3))
+    error = info.value
+    assert (error.code, error.size, error.hits) == (
+        "size_would_overlap",
+        BoxSize(width=14, height=4),
+        (),
+    )
+    assert str(error) == (
+        "the box size 14x4 (fitted 8x4 plus 3 px left and right) would make the new boxes"
+        " overlap each other"
+    )
+
+
+def test_padded_refusals_name_the_padding():
+    rects = [(0, 0, 14, 10), (15, 0, 29, 10)]  # 1 px apart, fitted 10x4 under PAD
+    padded = BoxSize(width=14, height=10)
+    with pytest.raises(BoxRuleError) as info:
+        grow_to_fit(rects, padded, (60, 30, 72, 34), width=W, height=H, pad=PAD)
+    assert str(info.value) == (
+        "growing the box size to 16x10 (fitted 12x4 plus 2 px left and right and 3 px above"
+        " and below) would make boxes overlap"
+    )
+    with pytest.raises(BoxRuleError) as info:
+        grow_to_fit(rects[:1], padded, (2, 2, 8, 6), width=W, height=H, pad=PAD)
+    assert (info.value.code, str(info.value)) == (
+        "overlap",
+        "the new box would overlap another box of this protein (boxes are padded 2 px left"
+        " and right and 3 px above and below)",
+    )
+
+
+def test_size_and_padding_words():
+    assert padding_words(BoxPadding()) == ""
+    assert padding_words(BoxPadding(along=5)) == "5 px above and below"
+    assert padding_words(BoxPadding(across=6)) == "6 px left and right"
+    size = BoxSize(width=98, height=25)
+    assert size_words(size) == size_words(size, BoxPadding()) == "98x25"
+    assert size_words(size, BoxPadding(along=5)) == "98x25 (fitted 98x15 plus 5 px above and below)"
+
+
+def test_resize_checked_names_the_boxes_that_would_overlap():
+    rects = [(0, 0, 10, 4), (15, 0, 25, 4), (60, 30, 70, 34)]
+    bigger = BoxSize(width=20, height=4)
+    resized, hits = resize_checked(rects, bigger, width=W, height=H)
+    assert (resized, hits) == (
+        [(0, 0, 20, 4), (10, 0, 30, 4), (55, 30, 75, 34)],  # the first shifted inside
+        (0, 1),
+    )
+    assert resize_all(rects, bigger, width=W, height=H) is None
+    assert resize_checked(rects, SIZE, width=W, height=H) == (rects, ())
 
 
 # --- One row of same-size boxes (row-box detection) ---

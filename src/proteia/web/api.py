@@ -25,6 +25,12 @@ box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
 
+``PUT /api/proteins/{protein_id}/box-size`` takes a protein's fitted size, as the
+state shows it (``fitted_size``), not its box size: every box becomes that size
+plus the protein's padding on each side
+(:func:`~proteia.core.operations.set_box_size`), so the size shown, sent back
+as it is, changes nothing.
+
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
 ``?colour=original``, its stored file in its own colours, for display only.
@@ -484,10 +490,10 @@ class Workspace:
         """The image's preview PNG: of its gray analysis array, or, with
         ``original``, of its stored file in its own colours
         (:func:`~proteia.web.state.original_png`) if the file has colour to
-        show (:func:`~proteia.web.state.has_colour`); otherwise it answers the
-        gray one: a gray file's original colours are its gray levels, and the
-        colours of a CMYK file, say, are not converted. The last few previews
-        shown are kept, gray and colour alike."""
+        show (:func:`~proteia.web.state.has_colour`; a CMYK file's are its
+        colours converted to red, green and blue); otherwise it answers the
+        gray one: a gray file's original colours are its gray levels. The last
+        few previews shown are kept, gray and colour alike."""
         image = session.project.batch.find_image(image_id)
         original = original and has_colour(session, image)
         key = (image_id, image.sha256, original)

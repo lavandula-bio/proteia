@@ -13,6 +13,7 @@ path, from an imported file to the chart, to the golden numbers of
 import codecs
 import csv
 import dataclasses
+import functools
 import hashlib
 import inspect
 import io
@@ -52,6 +53,7 @@ from proteia.core.imaging import clipping_depth
 from proteia.core.model import (
     Band,
     Box,
+    BoxPadding,
     BoxSize,
     ImageKind,
     Polarity,
@@ -709,6 +711,12 @@ REFUSALS = [
     ),
     pytest.param(
         None,
+        lambda s, ids: ops.set_box_padding(s, ids["target"], along=3),  # the fitted height is 5
+        ErrorCode.INVALID_INPUT,
+        id="padding-above-half",
+    ),
+    pytest.param(
+        None,
         lambda s, ids: ops.place_box(s, ids["target"], *BACKGROUND_POINT, lane_index=2, grow=True),
         ErrorCode.NO_BAND_FOUND,
         id="click-on-background",
@@ -772,6 +780,7 @@ def test_no_op_logs_nothing(tmp_path):
     ops.set_lanes(s, [LaneInput(lane.label, lane.sample, lane.included) for lane in lanes])
     ops.move_box(s, ids["a"], before.batch.find_band(ids["a"])[1].box.rect(target.box_size))
     ops.set_box_size(s, ids["target"], target.box_size)
+    ops.set_box_padding(s, ids["target"], across=0, along=0)
     ops.set_polarity(s, ids["image"], DARK)
     ops.edit_protein(s, ids["target"], name=" β-catenin ")  # the stored name, once cleaned
     ops.set_reference_condition(s, None)  # no reference is set
@@ -1203,6 +1212,165 @@ def test_a_palette_tiff_is_analysed_as_its_indices_and_shown_through_its_map(tmp
     assert s.file_colours(s.project.batch.find_image(image_id)) == "palette"
 
 
+def _cmyk_tiff(gray: np.ndarray) -> io.BytesIO:
+    """A 16-bit gray blot as a CMYK TIFF, in black ink alone."""
+    data = io.BytesIO()
+    inks = np.zeros((*gray.shape, 4), dtype=np.uint16)
+    inks[..., 3] = 65535 - gray
+    tifffile.imwrite(data, inks, photometric="separated")
+    data.seek(0)
+    return data
+
+
+def test_a_cmyk_image_is_measured_on_its_converted_gray(tmp_path):
+    # #131: the gray of a CMYK file is that of its inks converted to RGB, so
+    # its nets are those of the same blot stored as gray.
+    s = session_on(tmp_path)
+    gray = blot()
+    cmyk = ops.import_image(s, _cmyk_tiff(gray), "cmyk µ.tif", kind=CHEMI, polarity=DARK)
+    plain = import_blot(s, gray)
+    image = s.project.batch.find_image(cmyk)
+    assert [w.code for w in image.import_warnings] == ["cmyk_converted"]
+    assert image.background == s.project.batch.find_image(plain).background
+    np.testing.assert_array_equal(s.pixels(cmyk), s.pixels(plain))
+    assert s.file_colours(image) == "rgb"  # converted: its channels are red, green and blue
+
+
+def test_a_cmyk_image_imported_before_conversion_is_refused_until_imported_again(tmp_path):
+    # An image imported before #131 read its CMYK file as C, M and Y taken for
+    # R, G and B: its record has no cmyk_converted warning, and its background
+    # and nets came from that reading. Measured now on the converted gray, its
+    # boxes would mix the two readings, so its pixels are refused.
+    s = session_on(tmp_path)
+    image_id = ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
+
+    def imported_before(draft: Project) -> None:
+        draft.batch.find_image(image_id).import_warnings = []
+
+    project, _ = apply_change(s.project, imported_before)
+    s._commit(project, action="plant", params={}, evict=[image_id])
+    before = s.project
+    place = functools.partial(ops.place_box, s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    for read in (lambda: s.pixels(image_id), place):
+        with pytest.raises(OperationError) as info:
+            read()
+        assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image_id,))
+        assert str(info.value) == (
+            "'old cmyk.tif' is a CMYK file imported before Proteia converted CMYK colours:"
+            " its stored background and nets were measured with its cyan, magenta and yellow"
+            " read as red, green and blue; remove the image and import the file again to"
+            " measure it converted"
+        )
+    assert s.project is before
+    assert s._pixels == {}
+    assert s.colour_pixels(image_id).shape == (H, W, 3)  # display only: its converted colours
+
+
+OLD_CMYK = (
+    "'old cmyk.tif' is a CMYK file imported before Proteia converted CMYK colours:"
+    " its stored background and nets were measured with its cyan, magenta and yellow"
+    " read as red, green and blue; remove the image and import the file again to"
+    " measure it converted"
+)
+OLD_LAB = (
+    "'lab blot µ.tif': its pixels are stored in the CIELAB colour space, which Proteia"
+    " does not convert to gray; it was imported before Proteia refused such files, so"
+    " its stored background and nets come from a reading Proteia no longer makes:"
+    " remove the image, save the file as a gray or RGB TIFF and import it again"
+)
+
+
+def _imported_before_cmyk(s: ProjectSession) -> tuple[str, str]:
+    """An image imported before #131 converted CMYK, with a box in lane 1: its
+    record has no cmyk_converted warning. Its image and protein ids."""
+    image_id = ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK)
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+
+    def imported_before(draft: Project) -> None:
+        draft.batch.find_image(image_id).import_warnings = []
+
+    project, _ = apply_change(s.project, imported_before)
+    s._commit(project, action="plant", params={}, evict=[image_id])
+    return image_id, protein
+
+
+def _imported_before_lab(s: ProjectSession) -> tuple[str, str]:
+    """An image imported before #131 refused CIELAB, with a box in lane 1: its
+    stored file is a CIELAB TIFF, whose L*, a* and b* were read as red, green and
+    blue. Its image and protein ids."""
+    lab = np.dstack([(blot() >> 8).astype(np.uint8)] * 3)
+    image_id = import_blot(s, lab, "lab blot µ.tif")
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    path = storage.image_path(s.folder, s.project.batch.find_image(image_id))
+    tifffile.imwrite(path, lab, photometric="cielab")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def imported_before(draft: Project) -> None:
+        draft.batch.find_image(image_id).sha256 = digest
+
+    project, _ = apply_change(s.project, imported_before)
+    s._commit(project, action="plant", params={}, evict=[image_id])
+    return image_id, protein
+
+
+def test_an_image_in_a_colour_space_now_refused_names_its_file_and_what_to_do(tmp_path):
+    # Refused on import since #131, a CIELAB file imported before is refused
+    # when read: by the name it was imported under, not its stored file's, and
+    # with what its stored numbers are and how to measure it again.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    image_id, protein = _imported_before_lab(s)
+    before = s.project
+    place = functools.partial(ops.place_box, s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    for read in (lambda: s.pixels(image_id), lambda: s.colour_pixels(image_id), place):
+        with pytest.raises(OperationError) as info:
+            read()
+        assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image_id,))
+        assert str(info.value) == OLD_LAB
+    assert s.project is before
+
+
+@pytest.mark.parametrize(
+    ("imported_before", "why"),
+    [(_imported_before_cmyk, OLD_CMYK), (_imported_before_lab, OLD_LAB)],
+    ids=["cmyk", "cielab"],
+)
+def test_nets_measured_on_a_reading_no_longer_made_are_named_and_not_exported(
+    tmp_path, imported_before, why
+):
+    # An image read differently since its import keeps its stored nets until
+    # it is removed: the results warn about them, and no export carries them.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    image_id, protein = imported_before(s)
+    plain = import_blot(s, blot())  # an image read as it was imported: no notice
+    control = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, plain)
+    ops.place_box(s, control, NARROW_X, ROW, lane_index=0, grow=True)
+    outdated = [n for n in ops.compute(s).notices if n.code is NoticeCode.OUTDATED_READING]
+    assert outdated == [
+        results.Notice(
+            code=NoticeCode.OUTDATED_READING,
+            level=Level.WARNING,
+            message=why,
+            protein_ids=(protein,),
+        )
+    ]
+    exports = (
+        functools.partial(ops.export_bundle, s, formats=["svg"]),
+        functools.partial(ops.export_lane_table, s),
+    )
+    for export in exports:
+        with pytest.raises(OperationError) as info:
+            export()
+        assert (info.value.code, info.value.ids) == (ErrorCode.UNREADABLE_IMAGE, (image_id,))
+        assert str(info.value) == why  # the page says it was not exported
+    assert list((s.folder / storage.EXPORTS_DIR).iterdir()) == []
+
+
 def test_file_colours_read_the_header_once_per_image_without_the_lock(tmp_path, monkeypatch):
     s = session_on(tmp_path)
     gray = blot()
@@ -1551,6 +1719,7 @@ def test_set_box_size_recentres_and_requantifies(tmp_path):
     )
     assert [band.box.rect(size) for band in resized.bands] == expected
     assert [band.net for band in resized.bands] != [band.net for band in old.bands]
+    assert not any(band.manually_edited for band in resized.bands)  # a protein-level setting
     assert_nets_current(s)
 
     before = s.project
@@ -1750,6 +1919,7 @@ def test_every_box_writer_requantifies_the_whole_image(tmp_path):
         ("place_box", lambda: ops.place_box(s, b, 80, ROW, lane_index=0, grow=False)),
         ("move_box", lambda: ops.move_box(s, guard, (54, 26, 64, 34))),
         ("set_box_size", lambda: ops.set_box_size(s, b, BoxSize(width=12, height=10))),
+        ("set_box_padding", lambda: ops.set_box_padding(s, b, across=1, along=1)),
         ("remove_box", lambda: ops.remove_box(s, guard)),
         ("clear_boxes", lambda: ops.clear_boxes(s, b)),
     ]
@@ -2877,7 +3047,20 @@ LOGGED_STEPS = [
     (
         lambda s: ops.set_box_size(s, "prot-4", BoxSize(width=12, height=6)),
         "set_box_size",
-        lambda s: {"protein_id": "prot-4", "box_size": {"width": 12, "height": 6}},
+        lambda s: {
+            "protein_id": "prot-4",
+            "box_size": {"width": 12, "height": 6},
+            "fitted_size": {"width": 12, "height": 6},  # no padding yet: the same size
+        },
+    ),
+    (
+        lambda s: ops.set_box_padding(s, "prot-4", across=2, along=3),
+        "set_box_padding",
+        lambda s: {
+            "protein_id": "prot-4",
+            "box_padding": {"across": 2, "along": 3},
+            "box_size": {"width": 16, "height": 12},  # the fitted 12x6 plus the padding
+        },
     ),
     (
         lambda s: ops.set_polarity(s, "img-1", LIGHT),
@@ -3038,6 +3221,7 @@ def test_each_operation_logs_its_params(tmp_path):
         "remove_box",
         "set_box_lane",
         "set_box_size",
+        "set_box_padding",
         "remove_undetected",
         "clear_boxes",
         "requantify",
@@ -5263,6 +5447,31 @@ def test_clicks_grown_wider_than_the_lane_pitch_are_not_among_the_lanes_numbered
     assert at_true_lanes(s, protein, case) == {lane: lane for lane in range(case.n_lanes)}
 
 
+@pytest.mark.parametrize("mirrored", [False, True], ids=["clicked-ltr", "clicked-rtl"])
+def test_clicks_padded_wider_than_the_lane_pitch_count_among_the_lanes_numbered(
+    tmp_path, monkeypatch, mirrored
+):
+    # Another protein's boxes clicked in true lanes 0, 2 and 4, each grown over
+    # its own band (41 px, under the pitch of 70), then padded 16 px left and
+    # right (#57): 73 px wide, but centred on their lanes as before. What grew
+    # from the click is the fitted size, so they number their lanes, the other
+    # way from a third protein's boxes in the other lanes.
+    case = ROWS["all_present"]
+    n = case.n_lanes
+    s, image, protein = row_session(tmp_path, case)
+    actin = ops.add_protein(s, "actin", Role.TARGET, image)
+    for true in (0, 2, 4):
+        lane = n - 1 - true if mirrored else true
+        ops.place_box(s, actin, *at_lane(case, true), lane_index=lane, grow=True)
+    ops.set_box_padding(s, actin, across=16)
+    grown = protein_of(s, actin)
+    assert grown.fitted_size.width < 69 and grown.box_size.width > 71
+    gapdh = other_protein_in_lanes(s, image, case, (1, 3, 5), mirrored=not mirrored)
+    names = ("'GAPDH'", "'actin'") if mirrored else ("'actin'", "'GAPDH'")
+    ids = numbering_refused(s, protein, case.row, both_ways(*names), monkeypatch)
+    assert ids == ((gapdh, actin) if mirrored else (actin, gapdh))
+
+
 def test_a_mirrored_image_numbered_one_way_is_read_right_to_left(tmp_path):
     # Two proteins' boxes and the protein's own clicked ones all number the
     # lanes right to left.
@@ -6101,3 +6310,791 @@ def test_boxes_on_another_image_are_not_in_the_way(tmp_path):
     other = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, other_image)
     placement = ops.detect_row_boxes(s, other, ABOVE_ROW)
     assert None not in placement.band_ids
+
+
+# --- #57: a protein's box padding ---
+
+PAD_CASE = ROWS["all_present"]  # six lanes 67 to 72 px apart on a 533x120 image
+
+
+def padded_row(tmp_path: Path, hook=None) -> tuple[ProjectSession, str, str]:
+    """:func:`row_session` with β-catenin's row detected: six boxes of the fitted
+    size 44x12, no padding yet."""
+    s, image, protein = row_session(tmp_path, PAD_CASE, hook=hook)
+    ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    assert protein_of(s, protein).box_size == BoxSize(width=44, height=12)
+    return s, image, protein
+
+
+def rects_of(s: ProjectSession, protein_id: str) -> list[tuple[int, int, int, int]]:
+    """The protein's boxes, as stored (by lane, then band index)."""
+    protein = protein_of(s, protein_id)
+    return [band.box.rect(protein.box_size) for band in protein.bands]
+
+
+def grown_by(rect: Sequence[int], across: int, along: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = rect
+    return (x0 - across, y0 - along, x1 + across, y1 + along)
+
+
+def test_set_box_padding_grows_each_box_by_the_padding_around_its_centre(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    before = protein_of(s, protein)
+    old = rects_of(s, protein)
+
+    change = ops.set_box_padding(s, protein, across=3, along=5)
+    after = protein_of(s, protein)
+    assert after.box_padding == BoxPadding(across=3, along=5)
+    assert after.fitted_size == before.box_size == BoxSize(width=44, height=12)  # kept
+    assert after.box_size == BoxSize(width=50, height=22)
+    # Every box grew by the padding on each side: its centre, and so each
+    # lane's place in the row, is where it was.
+    assert rects_of(s, protein) == [grown_by(rect, 3, 5) for rect in old]
+    for was, now in zip(before.bands, after.bands, strict=True):
+        assert (now.id, now.lane_index, now.source) == (was.id, was.lane_index, was.source)
+        assert not now.manually_edited  # a protein-level setting, as a size change is
+        assert now.net > was.net  # the band's tails come in
+    changes = [now.net / was.net - 1 for was, now in zip(before.bands, after.bands, strict=True)]
+    assert change == ops.PaddingChange(
+        box_size=BoxSize(width=50, height=22),
+        fitted_size=BoxSize(width=44, height=12),
+        padding=BoxPadding(across=3, along=5),
+        net_change=(min(changes), max(changes)),
+        edge_shifted=(),
+        overlapping=(),
+    )
+    assert_nets_current(s)
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "set_box_padding",
+        {
+            "protein_id": protein,
+            "box_padding": {"across": 3, "along": 5},
+            "box_size": {"width": 50, "height": 22},
+        },
+    )
+    assert entry.content_hash == content_hash(s.project)
+
+    # Lowered to nothing, every box and every net is what it was.
+    ops.set_box_padding(s, protein, across=0, along=0)
+    assert protein_of(s, protein) == before
+
+
+def test_set_box_padding_same_is_a_noop(tmp_path):
+    recorder = Recorder()
+    s, _, protein = padded_row(tmp_path, recorder)
+    ops.set_box_padding(s, protein, along=2)
+    committed, length = s.project, len(s.project.log)
+    recorder.actions.clear()
+    for kwargs in ({}, {"along": 2}, {"across": 0}, {"across": 0, "along": 2}):
+        assert ops.set_box_padding(s, protein, **kwargs) == ops.PaddingChange(
+            box_size=BoxSize(width=44, height=16),
+            fitted_size=BoxSize(width=44, height=12),
+            padding=BoxPadding(across=0, along=2),
+            net_change=None,
+            edge_shifted=(),
+            overlapping=(),
+        )
+        assert s.project is committed, kwargs
+    assert len(s.project.log) == length
+    assert recorder.actions == []
+    # Without a box, the padding kept by a clear is sent again: a no-op, not a refusal.
+    ops.clear_boxes(s, protein)
+    committed = s.project
+    assert ops.set_box_padding(s, protein, along=2).padding == BoxPadding(along=2)
+    assert s.project is committed
+    with pytest.raises(OperationError, match="place a box of 'β-catenin' first"):
+        ops.set_box_padding(s, protein, along=1)  # lowering needs a box too
+
+
+def test_set_box_padding_keeps_a_field_left_out(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    ops.set_box_padding(s, protein, across=2, along=3)
+    ops.set_box_padding(s, protein, along=1)  # as a form that sends one direction
+    assert protein_of(s, protein).box_padding == BoxPadding(across=2, along=1)
+    # The log names both directions as they took effect, the kept one too.
+    assert s.project.log[-1].params["box_padding"] == {"across": 2, "along": 1}
+    ops.set_box_padding(s, protein, across=0)
+    assert protein_of(s, protein).box_padding == BoxPadding(across=0, along=1)
+    assert protein_of(s, protein).box_size == BoxSize(width=44, height=14)
+
+
+def _padding_scene(tmp_path: Path) -> tuple[ProjectSession, Recorder, dict[str, str]]:
+    """:func:`padded_row`, saved and reopened with an empty pixel cache and a
+    recording hook, with GAPDH's one fixed 40x80 box in lane 1, touching the
+    left side of β-catenin's there (over it, two proteins' boxes would measure
+    one band, #114), and p53, which has no box."""
+    s, image, beta = padded_row(tmp_path, save_to_folder)
+    gapdh = ops.add_protein(
+        s, "GAPDH", Role.LOADING_CONTROL, image, box_size=BoxSize(width=40, height=80)
+    )
+    x, y = at_lane(PAD_CASE, 0)
+    ops.place_box(s, gapdh, x - 42, y, lane_index=0, grow=False)
+    p53 = ops.add_protein(s, "p53", Role.TARGET, image)
+    recorder = Recorder()
+    reopened = ops.open_project(s.folder, autosave=recorder, clock=FakeClock())
+    return reopened, recorder, {"image": image, "beta": beta, "gapdh": gapdh, "p53": p53}
+
+
+def _spoil_image(s: ProjectSession, ids: dict[str, str]) -> None:
+    (s.folder / storage.IMAGES_DIR / f"{ids['image']}.tif").write_bytes(b"not the image")
+
+
+def _stack_a_second_band(s: ProjectSession, ids: dict[str, str]) -> None:
+    """A box of β-catenin's second expected band 1 px below its lane-1 box."""
+
+    def change(draft: Project) -> None:
+        beta = draft.batch.find_protein(ids["beta"])
+        beta.expected_band_count = 2
+        [first] = [band for band in beta.bands if band.lane_index == 0]
+        beta.bands.append(
+            Band(
+                id=draft.new_id("band"),
+                lane_index=0,
+                band_index=1,
+                box=Box(x=first.box.x, y=first.box.y + 13),
+                source=ProposalSource.MANUAL,
+                **ops._UNQUANTIFIED,
+            )
+        )
+
+    plant(s, change)
+
+
+def _beta_boxes(*keys: tuple[int, int]):
+    """The ids of β-catenin's boxes at these (lane, band index), as a refusal names them."""
+
+    def named(s: ProjectSession, ids: dict[str, str]) -> tuple[str, ...]:
+        found = {(b.lane_index, b.band_index): b.id for b in protein_of(s, ids["beta"]).bands}
+        return tuple(found[key] for key in keys)
+
+    return named
+
+
+PADDING_REFUSALS = [
+    pytest.param(
+        None,
+        "beta",
+        {"across": True},
+        ErrorCode.INVALID_INPUT,
+        "padding left and right must be an integer, not True",
+        None,
+        id="a-bool",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"along": 2.0},
+        ErrorCode.INVALID_INPUT,
+        "padding above and below must be an integer, not 2.0",
+        None,
+        id="a-float",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"along": "2"},
+        ErrorCode.INVALID_INPUT,
+        "padding above and below must be an integer, not '2'",
+        None,
+        id="text",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"along": -1},
+        ErrorCode.INVALID_INPUT,
+        "padding above and below must be 0 or more, not -1",
+        None,
+        id="negative",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"across": -1, "along": True},  # every type first
+        ErrorCode.INVALID_INPUT,
+        "padding above and below must be an integer, not True",
+        None,
+        id="types-before-signs",
+    ),
+    pytest.param(
+        None,
+        "p53",
+        {"along": 1},
+        ErrorCode.INVALID_INPUT,
+        "place a box of 'p53' first: its padding follows the fitted size the bands set",
+        None,
+        id="no-box-yet",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"along": 7},
+        ErrorCode.INVALID_INPUT,
+        "padding above and below can be raised to at most 6 px for 'β-catenin' (half its"
+        " fitted height, 12 px), not 7",
+        None,
+        id="above-half",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"across": 23},  # the half comes before the overlap
+        ErrorCode.INVALID_INPUT,
+        "padding left and right can be raised to at most 22 px for 'β-catenin' (half its"
+        " fitted width, 44 px), not 23",
+        None,
+        id="above-half-across",
+    ),
+    pytest.param(
+        None,
+        "gapdh",
+        {"along": 21},
+        ErrorCode.SIZE_OUT_OF_BOUNDS,
+        "box size 40x122 (fitted 40x80 plus 21 px above and below) exceeds the 533x120 image img-1",
+        None,
+        id="beyond-the-image",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"across": 12},
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "12 px of padding left and right would make the boxes of 'β-catenin' in lanes 1, 2"
+        " overlap; at most 11 px fits",
+        _beta_boxes((0, 0), (1, 0)),
+        id="overlap",
+    ),
+    pytest.param(
+        None,
+        "beta",
+        {"across": 12, "along": 2},
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "12 px of padding left and right, with 2 px above and below, would make the boxes of"
+        " 'β-catenin' in lanes 1, 2 overlap; at most 11 px fits",
+        _beta_boxes((0, 0), (1, 0)),
+        id="overlap-with-both",
+    ),
+    pytest.param(
+        _stack_a_second_band,
+        "beta",
+        {"along": 1},
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "1 px of padding above and below would make the boxes of 'β-catenin' in lane 1"
+        " overlap; at most 0 px fits",
+        _beta_boxes((0, 0), (0, 1)),
+        id="stacked-boxes",
+    ),
+    pytest.param(
+        _stack_a_second_band,
+        "beta",
+        {"across": 2, "along": 1},  # 2 px left and right alone fits: above and below is named
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "1 px of padding above and below, with 2 px left and right, would make the boxes of"
+        " 'β-catenin' in lane 1 overlap; at most 0 px fits",
+        _beta_boxes((0, 0), (0, 1)),
+        id="overlap-named-by-the-direction-that-makes-it",
+    ),
+    pytest.param(
+        _stack_a_second_band,
+        "beta",
+        {"across": 12, "along": 1},  # none of left and right fits under 1 px above and below
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "12 px of padding left and right, with 1 px above and below, would make the boxes of"
+        " 'β-catenin' in lanes 1, 2 overlap",
+        _beta_boxes((0, 0), (0, 1), (1, 0)),
+        id="overlap-where-none-fits",
+    ),
+    pytest.param(
+        _spoil_image,
+        "beta",
+        {"along": 1},
+        ErrorCode.IMAGE_FILE_CHANGED,
+        None,
+        lambda s, ids: (ids["image"],),
+        id="image-file-changed",
+    ),
+    pytest.param(None, "prot-99", {"along": 1}, None, None, None, id="unknown-id"),
+]
+
+
+@pytest.mark.parametrize(
+    ("setup", "protein", "kwargs", "code", "message", "named"), PADDING_REFUSALS
+)
+def test_set_box_padding_refusals(tmp_path, setup, protein, kwargs, code, message, named):
+    s, recorder, ids = _padding_scene(tmp_path)
+    if setup is not None:
+        setup(s, ids)
+    recorder.actions.clear()
+    before = s.project
+    cache = dict(s._pixels)
+    with pytest.raises(UnknownIdError if code is None else OperationError) as info:
+        ops.set_box_padding(s, ids.get(protein, protein), **kwargs)
+    if code is not None:
+        assert info.value.code is code
+        if message is not None:
+            assert str(info.value) == message
+        assert info.value.ids == (() if named is None else named(s, ids))
+    assert s.project is before  # nothing changed, and no log entry
+    assert recorder.actions == []
+    assert s._pixels.keys() == cache.keys()
+
+
+def test_a_row_keeps_a_padding_above_half(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    # A padding set on a taller fitted size (20 px) ...
+    ops.set_box_size(s, protein, BoxSize(width=44, height=20))
+    ops.set_box_padding(s, protein, along=10)
+    # ... is kept by the next row, which fits 12 px afresh: 10 px is now more
+    # than half of it, and nothing is refused or rewritten.
+    ops.clear_boxes(s, protein)
+    ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    beta = protein_of(s, protein)
+    assert (beta.fitted_size, beta.box_padding) == (
+        BoxSize(width=44, height=12),
+        BoxPadding(along=10),
+    )
+    assert beta.box_size == BoxSize(width=44, height=32)
+    assert_nets_current(s)
+    committed = s.project
+    ops.set_box_padding(s, protein, along=10)  # sent again: a no-op, not a refusal
+    assert s.project is committed
+    with pytest.raises(OperationError) as info:
+        ops.set_box_padding(s, protein, along=11)  # raised: refused
+    assert "at most 6 px" in str(info.value)
+    assert s.project is committed
+    # A larger fitted size, though still under twice the padding, is not refused.
+    ops.set_box_size(s, protein, BoxSize(width=44, height=14))
+    ops.set_box_padding(s, protein, along=8)  # lowered, though still above half: accepted
+    beta = protein_of(s, protein)
+    assert (beta.fitted_size, beta.box_padding) == (
+        BoxSize(width=44, height=14),
+        BoxPadding(along=8),
+    )
+    assert_nets_current(s)
+
+
+def test_set_box_size_refuses_a_shrink_under_twice_the_padding(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    ops.set_box_size(s, protein, BoxSize(width=44, height=14))
+    ops.set_box_padding(s, protein, along=7)
+    committed = s.project
+    with pytest.raises(OperationError) as info:
+        ops.set_box_size(s, protein, BoxSize(width=44, height=6))
+    assert (info.value.code, str(info.value)) == (
+        ErrorCode.INVALID_INPUT,
+        "a fitted height of 6 px would leave the 7 px of padding above and below more than"
+        " half of it; lower that padding to 3 px or less first, or type a height of at least"
+        " 14",
+    )
+    with pytest.raises(OperationError) as info:
+        ops.set_box_size(s, protein, BoxSize(width=44, height=1))
+    assert "remove that padding first, or type a height of at least 14" in str(info.value)
+    for refused in [(44, 14), None]:  # not a BoxSize: refused, not an AttributeError
+        with pytest.raises(OperationError) as info:
+            ops.set_box_size(s, protein, refused)
+        assert info.value.code is ErrorCode.INVALID_INPUT
+    assert s.project is committed
+    # Twice the padding, or larger than the fitted size, is accepted.
+    ops.set_box_size(s, protein, BoxSize(width=40, height=14))  # the same height
+    ops.set_box_size(s, protein, BoxSize(width=40, height=20))
+    ops.set_box_padding(s, protein, across=5)
+    with pytest.raises(OperationError) as info:
+        ops.set_box_size(s, protein, BoxSize(width=9, height=20))
+    assert str(info.value) == (
+        "a fitted width of 9 px would leave the 5 px of padding left and right more than half"
+        " of it; lower that padding to 4 px or less first, or type a width of at least 10"
+    )
+    ops.set_box_size(s, protein, BoxSize(width=10, height=14))
+    assert protein_of(s, protein).box_size == BoxSize(width=20, height=28)
+
+
+def test_set_box_size_without_a_box_asks_only_for_a_larger_size(tmp_path):
+    # With no box, lowering the padding is refused (a box comes first), so the
+    # refusal of a shrink under twice the padding does not offer it.
+    s, _, protein = padded_row(tmp_path)
+    ops.set_box_padding(s, protein, along=6)
+    ops.clear_boxes(s, protein)
+    committed = s.project
+    for height, message in [
+        (
+            8,
+            "a fitted height of 8 px would leave the 6 px of padding above and below more than"
+            " half of it; type a height of at least 12",
+        ),
+        (
+            1,
+            "a fitted height of 1 px would leave the 6 px of padding above and below more than"
+            " half of it; type a height of at least 12",
+        ),
+    ]:
+        with pytest.raises(OperationError) as info:
+            ops.set_box_size(s, protein, BoxSize(width=44, height=height))
+        assert (info.value.code, str(info.value)) == (ErrorCode.INVALID_INPUT, message)
+        assert s.project is committed
+    with pytest.raises(OperationError, match="place a box of 'β-catenin' first"):
+        ops.set_box_padding(s, protein, along=4)
+    # What the refusal asks for is accepted.
+    ops.set_box_size(s, protein, BoxSize(width=44, height=14))
+    beta = protein_of(s, protein)
+    assert (beta.fitted_size, beta.box_padding) == (
+        BoxSize(width=44, height=14),
+        BoxPadding(along=6),
+    )
+
+
+def test_a_typed_fitted_size_lasts_until_a_seed_click_on_no_box(tmp_path):
+    # A fixed click keeps a typed fitted size, and so does a seed click whose
+    # band needs less while a box survives; a seed click on the protein with
+    # no box sets it afresh, even smaller than the size typed. The padding stays.
+    s, _, protein = boxed(tmp_path)
+    typed = BoxSize(width=30, height=20)
+    ops.set_box_size(s, protein, typed)  # before any box
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
+    assert protein_of(s, protein).fitted_size == typed
+    ops.set_box_padding(s, protein, along=2)
+    ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)  # needs 19x5
+    assert protein_of(s, protein).fitted_size == typed
+    ops.clear_boxes(s, protein)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)  # needs 9x5
+    beta = protein_of(s, protein)
+    assert (beta.fitted_size, beta.box_padding) == (BoxSize(width=9, height=5), BoxPadding(along=2))
+    assert_nets_current(s)
+
+
+def test_set_box_size_sets_the_fitted_size_under_padding(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    ops.set_box_padding(s, protein, across=2, along=5)
+    old = rects_of(s, protein)
+    ops.set_box_size(s, protein, BoxSize(width=40, height=14))
+    beta = protein_of(s, protein)
+    assert (beta.fitted_size, beta.box_padding, beta.box_size) == (
+        BoxSize(width=40, height=14),
+        BoxPadding(across=2, along=5),
+        BoxSize(width=44, height=24),  # the typed size plus the padding
+    )
+    assert rects_of(s, protein) == [grown_by(rect, -2, 1) for rect in old]
+    assert_nets_current(s)
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "set_box_size",
+        {
+            "protein_id": protein,
+            "box_size": {"width": 44, "height": 24},  # the size used
+            "fitted_size": {"width": 40, "height": 14},  # the size typed
+        },
+    )
+    committed = s.project
+    ops.set_box_size(s, protein, BoxSize(width=40, height=14))  # the fitted size: a no-op
+    assert s.project is committed
+    # The refusals name the fitted size and the padding.
+    for refused, code, message in [
+        (
+            BoxSize(width=40, height=115),
+            ErrorCode.SIZE_OUT_OF_BOUNDS,
+            "box size 44x125 (fitted 40x115 plus 2 px left and right and 5 px above and below)"
+            " exceeds the 533x120 image img-1",
+        ),
+        (
+            BoxSize(width=66, height=14),
+            ErrorCode.SIZE_WOULD_OVERLAP,
+            "box size 70x24 (fitted 66x14 plus 2 px left and right and 5 px above and below)"
+            " would make boxes of 'β-catenin' overlap",
+        ),
+    ]:
+        with pytest.raises(OperationError) as info:
+            ops.set_box_size(s, protein, refused)
+        assert (info.value.code, str(info.value), info.value.ids) == (code, message, ())
+        assert s.project is committed
+
+
+def test_set_box_padding_reports_net_change_edge_and_overlap(tmp_path):
+    # β-catenin's grown box in lane 1 and a fixed one the image's right edge
+    # stops; GAPDH's box touching the first one's right side.
+    s, image, beta = boxed(tmp_path)
+    ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
+    edge = ops.place_box(s, beta, W - 2, ROW, lane_index=2, grow=False)
+    size = protein_of(s, beta).box_size
+    assert size == BoxSize(width=9, height=5)
+    assert band_of(s, edge).box.rect(size) == (W - 9, 28, W, 33)
+    small = BoxSize(width=6, height=5)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image, box_size=small)
+    beside = ops.place_box(s, gapdh, 48, ROW, lane_index=0, grow=False)
+    ops.place_box(s, gapdh, WIDE_X, ROW, lane_index=1, grow=False)  # far from β-catenin's
+    before = s.project.batch
+    old = rects_of(s, beta)
+    assert not boxes.overlaps_any(band_of(s, beside).box.rect(small), old)
+
+    change = ops.set_box_padding(s, beta, across=2, along=1)
+    grown, stopped = rects_of(s, beta)
+    assert grown == grown_by(old[0], 2, 1)
+    # The edge box could not grow evenly: shifted inside the image, it still
+    # holds its fitted region, and extends 4 px further on its left.
+    assert stopped == (W - 13, 27, W, 34) != grown_by(old[1], 2, 1)
+    assert change.edge_shifted == (edge,)
+    assert change.overlapping == (beside,)  # other proteins' boxes may overlap: reported
+    # Its nets: the edge box's, on the background, is 0 before and left out.
+    [band] = [b for b in before.find_protein(beta).bands if b.net > 0]
+    ratio = band_of(s, band.id).net / band.net - 1
+    assert change.net_change == (ratio, ratio)
+    # GAPDH's ring leaves out the grown box: its net moved, reported as a row reports it.
+    assert [band_id for band_id, _, _ in change.remeasured] == [beside]
+    [(_, net_before, net_after)] = change.remeasured
+    assert net_after == band_of(s, beside).net != net_before
+    assert change.largest_change == (beside, abs(net_after - net_before) / net_before)
+    assert_nets_current(s)
+
+
+def test_set_box_padding_reports_only_the_boxes_it_newly_overlaps(tmp_path):
+    # GAPDH's box in lane 1 overlaps β-catenin's before the padding; its box in
+    # lane 2 touches β-catenin's right side. The padding makes only the second
+    # overlap, so only that box is reported. (The first overlaps its bottom
+    # row alone, and two rows once padded: at most half of GAPDH's box, which
+    # more would refuse, #114.)
+    s, image, beta = boxed(tmp_path)
+    ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
+    small = BoxSize(width=6, height=5)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image, box_size=small)
+    over = ops.place_box(s, gapdh, NARROW_X - 2, ROW + 4, lane_index=0, grow=False)
+    beside = ops.place_box(s, gapdh, 48, ROW, lane_index=1, grow=False)
+    old = rects_of(s, beta)
+    assert boxes.overlaps_any(band_of(s, over).box.rect(small), old)
+    assert not boxes.overlaps_any(band_of(s, beside).box.rect(small), old)
+
+    change = ops.set_box_padding(s, beta, across=2, along=1)
+    grown = rects_of(s, beta)
+    for band_id in (over, beside):
+        assert boxes.overlaps_any(band_of(s, band_id).box.rect(small), grown)
+    assert change.overlapping == (beside,)
+    assert_nets_current(s)
+
+
+def test_set_box_padding_over_half_of_another_proteins_box_is_refused(tmp_path):
+    # GAPDH's 6x5 box touches the right side of β-catenin's 9x5 box. Padded 3
+    # px left and right, β-catenin's box overlaps half of it: accepted and
+    # reported. Padded 4 px, two thirds of it: refused, as a box size is (#114),
+    # naming GAPDH's box, and nothing changes.
+    s, image, beta = boxed(tmp_path)
+    ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
+    small = BoxSize(width=6, height=5)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image, box_size=small)
+    beside = ops.place_box(s, gapdh, 48, ROW, lane_index=1, grow=False)
+    assert band_of(s, beside).box.rect(small) == (45, 28, 51, 33)
+    assert rects_of(s, beta) == [(36, 28, 45, 33)]
+
+    committed = s.project
+    with pytest.raises(OperationError) as info:
+        ops.set_box_padding(s, beta, across=4)
+    assert (info.value.code, str(info.value), info.value.ids) == (
+        ErrorCode.OVERLAP,
+        "at the box size 17x5 (fitted 9x5 plus 4 px left and right), boxes of 'β-catenin'"
+        " would overlap the box of 'GAPDH' in lane 2 by more than 50% of the smaller box's"
+        " area: two proteins' boxes would measure the same band",
+        (beside,),
+    )
+    assert info.value.detail == {
+        "cause": "other_protein",
+        "covered": [
+            {"band_id": beside, "protein_id": gapdh, "lane_index": 1, "share": round(2 / 3, 3)}
+        ],
+    }
+    assert s.project is committed
+
+    change = ops.set_box_padding(s, beta, across=3)  # half of GAPDH's box: accepted
+    assert rects_of(s, beta) == [(33, 28, 48, 33)]
+    assert change.overlapping == (beside,)
+    assert_nets_current(s)
+
+    # Lowered too: a smaller box may lie more inside another. GAPDH's 31x31 box
+    # over the lower right of β-catenin's box padded 4 px left and right and 2
+    # above and below holds under half of it, and over half of it unpadded.
+    ops.remove_box(s, beside)
+    ops.set_box_padding(s, beta, across=4, along=2)
+    assert rects_of(s, beta) == [(32, 26, 49, 35)]
+    ops.set_box_size(s, gapdh, BoxSize(width=31, height=31))
+    corner = ops.place_box(s, gapdh, 54, 44, lane_index=1, grow=False)
+    assert band_of(s, corner).box.rect(BoxSize(width=31, height=31)) == (39, 29, 70, 60)
+    committed = s.project
+    with pytest.raises(OperationError) as info:
+        ops.set_box_padding(s, beta, across=0, along=0)
+    assert (info.value.code, info.value.ids) == (ErrorCode.OVERLAP, (corner,))
+    assert info.value.detail["covered"][0]["share"] == round(24 / 45, 3)
+    assert s.project is committed
+
+
+def test_padding_survives_the_same_row_again(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    ops.set_box_padding(s, protein, across=3, along=4)
+    committed = s.project
+    again = ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    assert s.project is committed  # a no-op: the padding counts in the size it needs
+    assert again.box_size == BoxSize(width=50, height=20)
+
+
+def test_padding_survives_clear_then_row(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    ops.set_box_padding(s, protein, across=3, along=4)
+    padded = rects_of(s, protein)
+    ops.clear_boxes(s, protein)
+    assert protein_of(s, protein).box_padding == BoxPadding(across=3, along=4)  # kept
+    placement = ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    assert placement.box_size == BoxSize(width=50, height=20)
+    assert rects_of(s, protein) == padded  # the same boxes, under new ids
+    assert s.project.log[-1].params["box_size"] == {"width": 50, "height": 20}
+    assert_nets_current(s)
+
+
+def test_row_with_padding_places_detector_boxes_grown_by_it(tmp_path):
+    s, _, protein = padded_row(tmp_path)
+    found = detected(s, protein, PAD_CASE.row)
+    ops.set_box_padding(s, protein, across=2, along=5)
+    ops.clear_boxes(s, protein)
+    ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    assert protein_of(s, protein).fitted_size == found.size  # the detector's size
+    assert rects_by_lane(s, protein) == {
+        lane.lane: grown_by(lane.rect, 2, 5) for lane in found.lanes
+    }
+
+
+def test_click_grow_keeps_the_padding(tmp_path):
+    s, image, protein = boxed(tmp_path)
+    background = s.project.batch.find_image(image).background
+    narrow = grow_box(s.pixels(image), (NARROW_X, ROW), background)
+    wide = grow_box(s.pixels(image), (WIDE_X, ROW), background)
+    first = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    ops.set_box_padding(s, protein, across=1, along=2)
+    assert band_of(s, first).box.rect(protein_of(s, protein).box_size) == grown_by(narrow, 1, 2)
+
+    # A wider band grows the fitted size to its own, and the padding stays.
+    second = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    beta = protein_of(s, protein)
+    fitted = BoxSize(width=wide[2] - wide[0], height=wide[3] - wide[1])
+    assert fitted.width > narrow[2] - narrow[0]
+    assert (beta.fitted_size, beta.box_padding) == (fitted, BoxPadding(across=1, along=2))
+    assert band_of(s, second).box.rect(beta.box_size) == grown_by(wide, 1, 2)
+    assert not band_of(s, first).manually_edited
+    assert_nets_current(s)
+
+    # The first box after a clear sets the fitted size afresh, padded.
+    ops.clear_boxes(s, protein)
+    third = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    beta = protein_of(s, protein)
+    assert beta.fitted_size == BoxSize(width=narrow[2] - narrow[0], height=narrow[3] - narrow[1])
+    assert band_of(s, third).box.rect(beta.box_size) == grown_by(narrow, 1, 2)
+
+
+def test_a_fixed_box_takes_the_padded_size(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    ops.set_box_padding(s, protein, along=2)
+    size = protein_of(s, protein).box_size
+    band_id = ops.place_box(s, protein, 70, ROW, lane_index=1, grow=False)
+    assert band_of(s, band_id).box.rect(size) == boxes.centered_rect(70, ROW, size, W, H)
+    assert protein_of(s, protein).box_size == size == BoxSize(width=9, height=9)
+    assert_nets_current(s)
+
+
+def test_row_refusal_names_the_padding_not_kept_boxes(tmp_path):
+    # One box, grown where the row finds a band (so it gives way to the row:
+    # nothing survives), padded 12 px left and right: the row's boxes, 44 + 24
+    # px wide, would overlap each other in lanes 67 px apart.
+    s, _, protein = row_session(tmp_path, PAD_CASE)
+    ops.place_box(s, protein, *at_lane(PAD_CASE, 2), lane_index=2, grow=True)
+    ops.set_box_size(s, protein, BoxSize(width=44, height=12))
+    ops.set_box_padding(s, protein, across=12)
+    committed = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    assert (info.value.code, str(info.value)) == (
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "the row's boxes would overlap each other at the box size 68x12 (fitted 44x12 plus"
+        " 12 px left and right); lower the padding left and right",
+    )
+    assert s.project is committed
+    # Lowered to what fits, the row places its boxes, padded.
+    ops.set_box_padding(s, protein, across=11)
+    ops.detect_row_boxes(s, protein, PAD_CASE.row)
+    assert protein_of(s, protein).box_size == BoxSize(width=66, height=12)
+    assert len(protein_of(s, protein).bands) == PAD_CASE.n_lanes
+
+
+def _padded_kept_pair(s: ProjectSession, ids: dict[str, str]) -> None:
+    """The box :func:`_row_scene` clicked, edited by hand, and a box of a second
+    band (#58) about 49 px to its left, in the lane before: a row keeps both.
+    Padded 4 px left and right: the detected width fits between their centres,
+    and fits with 2 px of padding, not with 4."""
+    ops.set_box_size(s, ids["protein"], BoxSize(width=10, height=8))
+    x, y = at_lane(SCENE, 1)
+    near = ops.place_box(s, ids["protein"], x - 48, y, lane_index=0, grow=False)
+
+    def second_band(draft: Project) -> None:
+        protein, band = draft.batch.find_band(near)
+        protein.expected_band_count = 2
+        band.band_index = 1
+
+    plant(s, second_band)
+    edit_by_hand(s, ids["band"])
+    ops.set_box_padding(s, ids["protein"], across=4)
+
+
+def test_a_row_refused_for_its_kept_boxes_names_the_padding(tmp_path):
+    s, recorder, ids = _row_scene(tmp_path, _padded_kept_pair)
+    committed = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, ids["protein"], SCENE.row)
+    assert (info.value.code, str(info.value)) == (
+        ErrorCode.SIZE_WOULD_OVERLAP,
+        "box size 52x12 (fitted 44x12 plus 4 px left and right) would make the boxes of"
+        " 'β-catenin' that the row keeps overlap; lower the padding left and right",
+    )
+    assert s.project is committed
+    assert recorder.actions == []
+    # Lowered as it asks, the row keeps both boxes and places the others, padded.
+    kept = [band.id for band in protein_of(s, ids["protein"]).bands]
+    ops.set_box_padding(s, ids["protein"], across=2)
+    ops.detect_row_boxes(s, ids["protein"], SCENE.row)
+    beta = protein_of(s, ids["protein"])
+    assert beta.box_size == BoxSize(width=48, height=12)
+    assert set(kept) < {band.id for band in beta.bands}
+    assert_nets_current(s)
+
+
+def _step_pad(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    """A padding of 0 to 3 px each way on a protein with boxes."""
+    protein = _pick(rng, [p.id for p in s.project.batch.proteins if p.bands])
+    across, along = (int(v) for v in rng.integers(0, 4, size=2))
+    ops.set_box_padding(s, protein, across=across, along=along)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_random_edits_keep_the_padding_and_the_nets(tmp_path, seed):
+    """Property: with padding changes among the edits of
+    :func:`test_random_edits_keep_every_stored_value_what_the_pixels_give`,
+    refused or not, undone or redone, only a padding change or a restore
+    changes a protein's padding (fits, resizes and clears keep it), and every
+    stored value stays what the pixels give."""
+    s, image, target = row_session(tmp_path, PAD_CASE)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    ops.detect_row_boxes(s, target, PAD_CASE.row)
+    for lane in (1, 3):  # below the target's bands: two proteins' boxes on one band are refused
+        x, y = at_lane(PAD_CASE, lane)
+        ops.place_box(s, other, x, y + 12, lane_index=lane, grow=False)
+    steps = {**PROPERTY_STEPS, "set_box_padding": _step_pad}
+    rng = np.random.default_rng(seed)
+    names = sorted(steps)
+    schedule = [*names * 3, *(names[int(i)] for i in rng.integers(len(names), size=24))]
+    rng.shuffle(schedule)
+    for name in schedule:
+        before = s.project
+        paddings = {p.id: p.box_padding for p in before.batch.proteins}
+        try:
+            steps[name](s, rng, PAD_CASE)
+        except (OperationError, UnknownIdError):
+            assert s.project is before, name  # a refusal changes nothing
+        if name not in {"set_box_padding", "undo", "redo"}:
+            for protein in s.project.batch.proteins:
+                assert protein.box_padding == paddings.get(protein.id, BoxPadding()), name
+        assert s.project.log[-1].content_hash == content_hash(s.project), name
+        assert_nets_current(s)
+    padded = [e for e in s.project.log if e.action == "set_box_padding"]
+    assert any(e.params["box_padding"] != {"across": 0, "along": 0} for e in padded)
