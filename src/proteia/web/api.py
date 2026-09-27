@@ -6,16 +6,19 @@ whole project state (:func:`~proteia.web.state.project_state`) and its results
 (:func:`~proteia.web.results_view.results_payload`), both from one snapshot
 (:func:`~proteia.core.operations.compute_view`), so the browser redraws the
 image, the table and the charts from what the server stored. Creating, opening
-and reading the project answer the same way. One project is open at a time. A
-removal of a protein or an image also answers what it took with it: every field
-of :class:`~proteia.core.operations.Cascade`, as lists of ids. Undo and redo
-answer the change they took back or made again (``action``, ``seq``) and the
-ids and not-detected record keys that went or came back
-(:class:`~proteia.core.operations.Restored`); clearing a protein's boxes answers
-the band ids removed and the (lane index, band index) of each record dropped;
-requantifying answers the images re-quantified. Any box edit may change every
-net on its image (each band's background ring leaves out every box there), and
-every answer carries every protein's numbers, so the browser redraws them all.
+and reading the project answer the same way. Each chart in the results is
+answered as a URL named by its content (:mod:`proteia.web.charts`), and
+``GET /api/charts/{key}.svg`` serves it as SVG, drawn when first fetched. One
+project is open at a time. A removal of a protein or an image also answers what
+it took with it: every field of :class:`~proteia.core.operations.Cascade`, as
+lists of ids. Undo and redo answer the change they took back or made again
+(``action``, ``seq``) and the ids and not-detected record keys that went or came
+back (:class:`~proteia.core.operations.Restored`); clearing a protein's boxes
+answers the band ids removed and the (lane index, band index) of each record
+dropped; requantifying answers the images re-quantified. Any box edit may change
+every net on its image (each band's background ring leaves out every box
+there), and every answer carries every protein's numbers, so the browser
+redraws them all.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -54,11 +57,12 @@ from pydantic import (
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import BoxSize, UnknownIdError
-from proteia.core.plotspec import ErrorType
+from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
 from proteia.web import projects
+from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
 from proteia.web.state import preview_png, project_state, revision
 
@@ -111,7 +115,8 @@ class Workspace:
     about different openings never compare equal, even at the same revision.
     The results of the open project's latest revision computed so far are kept
     (with the open id, the revision and the settings they belong to), since
-    reading them again is common and computing them is not cheap.
+    reading them again is common and computing them is not cheap. So are the
+    charts of the answers about the latest opening (:class:`ChartStore`).
     """
 
     def __init__(
@@ -121,7 +126,8 @@ class Workspace:
         self.reveal = reveal
         self.clock = clock
         # Guards the open session, the open ids, the settings, the previews and the
-        # results; never held while computing.
+        # results; never held while computing. Taken before the chart store's own
+        # lock, never while holding it.
         self._lock = threading.Lock()
         self._switching = threading.Lock()  # one switch at a time; never held by readers
         self._session: ProjectSession | None = None
@@ -131,6 +137,7 @@ class Workspace:
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
         self._previews: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        self._charts = ChartStore()
 
     def current(self) -> ProjectSession:
         with self._lock:
@@ -183,6 +190,7 @@ class Workspace:
                 self._open_ids[session] = self._open_id
                 self._previews.clear()
                 self._results = None
+                self._charts.reset(self._open_id)
             if old is not None:
                 old.close(remove_files=not _same_folder(old.folder, session.folder))
             return session
@@ -230,6 +238,16 @@ class Workspace:
             return False
         open_id, kept_revision, settings = self._results[0]
         return (open_id, settings) == (key[0], key[2]) and kept_revision > key[1]
+
+    def register_chart(self, spec: PlotSpec, *, open_id: int) -> str:
+        """The URL of the chart drawn from ``spec``, in an answer about the
+        opening ``open_id``; kept to be served only while that is the open one."""
+        return self._charts.register(spec, open_id=open_id)
+
+    def chart(self, key: str) -> bytes:
+        """The chart ``key`` names, as SVG; :class:`UnknownIdError` for a key not
+        given in the open project's answers, or no longer kept."""
+        return self._charts.svg(key)
 
     def preview(self, session: ProjectSession, image_id: str) -> bytes:
         """The image's preview PNG, kept for the last few images shown."""
@@ -355,12 +373,19 @@ WorkspaceDep = Annotated[Workspace, Depends(_workspace)]
 
 def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
     """A route's answer: ``extra``, then the project state and its results, both
-    from one snapshot of ``session``."""
+    from one snapshot of ``session``. Every answer registers its charts, kept
+    results too, so a read of the project brings back a chart the store forgot."""
     open_id, view = workspace.view(session)
+
+    def register(spec: PlotSpec) -> str:
+        return workspace.register_chart(spec, open_id=open_id)
+
     return {
         **extra,
         "project": project_state(session.folder.name, session, view.project, open_id=open_id),
-        "results": results_payload(view.results, open_id=open_id, revision=revision(view.project)),
+        "results": results_payload(
+            view.results, open_id=open_id, revision=revision(view.project), charts=register
+        ),
     }
 
 
@@ -469,6 +494,13 @@ def set_polarity(image_id: str, body: PolarityBody, workspace: WorkspaceDep) -> 
 def image_preview(image_id: str, workspace: WorkspaceDep) -> Response:
     session = workspace.current()
     return Response(workspace.preview(session, image_id), media_type="image/png")
+
+
+@router.get("/charts/{key}.svg")
+def chart(key: str, workspace: WorkspaceDep) -> Response:
+    """A chart of an answer, at its ``chart_url``; 404 ``unknown_id`` for a key
+    not given in the open project's answers, or no longer kept."""
+    return Response(workspace.chart(key), media_type="image/svg+xml")
 
 
 @router.put("/lanes")
