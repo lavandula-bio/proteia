@@ -18,6 +18,7 @@ import inspect
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -69,7 +70,7 @@ from proteia.core.operations import (
     ProjectSession,
 )
 from proteia.core.plotspec import ErrorType
-from proteia.core.project import lane_anchors, lane_positions
+from proteia.core.project import lane_anchor_ids, lane_anchors, lane_positions
 from proteia.core.quantify import (
     RING_CLAMP,
     BandBackground,
@@ -545,6 +546,73 @@ def test_explicit_save_raises_and_records_the_error(tmp_path, replace_lock):
     assert ops.save(s) == s.folder / storage.PROJECT_FILE
     assert not s.dirty and s.save_error is None
     assert load_project(s.folder) == s.project
+
+
+def test_reload_reads_project_json_again_only_once_changed_outside_proteia(tmp_path):
+    s, image, protein = boxed(tmp_path, save_to_folder)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    s.pixels(image)
+    project = s.project
+    assert not s.reload()  # the file holds what the session saved
+    assert s.project is project and s.undo_step is not None and image in s._pixels
+
+    # A copy of the folder (another machine, a restore) changes the project.
+    other = tmp_path / "copy α"
+    shutil.copytree(s.folder, other)
+    remote = ops.open_project(other, clock=FakeClock())
+    ops.remove_protein(remote, protein)
+    newer = import_blot(remote, blot(), "remote β.tif")
+    shutil.copytree(other, s.folder, dirs_exist_ok=True)
+
+    assert s.reload()
+    assert s.project == remote.project
+    assert (s.undo_step, s.redo_step, s._pixels, s.dirty, s.last_action) == (
+        None,
+        None,
+        {},
+        False,
+        None,
+    )
+    assert not s.reload()
+    ops.set_polarity(s, newer, LIGHT)  # the next change saves the file's project
+    assert load_project(s.folder) == s.project
+    assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
+    ops.undo(s)  # the history begins at the project read again
+    assert s.project.batch.find_image(newer).polarity == DARK
+    with pytest.raises(OperationError) as info:
+        ops.undo(s)
+    assert info.value.code is ErrorCode.NOTHING_TO_UNDO
+
+
+def test_reload_keeps_unsaved_changes_and_a_session_it_cannot_read(tmp_path, replace_lock):
+    s, _, protein = boxed(tmp_path, save_to_folder)
+    replace_lock.locked = True
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    project, steps = s.project, s.history_steps
+    assert s.dirty
+    assert not s.reload()  # project.json is older than the session: not read
+    assert (s.project, s.history_steps, s.dirty) == (project, steps, True)
+
+    replace_lock.locked = False
+    ops.save(s)
+    for broken in (b"{not json", b"{}"):
+        (s.folder / storage.PROJECT_FILE).write_bytes(broken)
+        with pytest.raises(storage.ProjectError):
+            s.reload()
+        assert (s.project, s.history_steps, s.dirty) == (project, steps, False)
+
+
+def test_reload_migrates_and_saves_a_file_of_an_older_schema(tmp_path):
+    folder = v1_folder(tmp_path)
+    v1 = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved
+    ops.set_reference_condition(s, None)
+    (folder / storage.PROJECT_FILE).write_bytes(v1)  # an old copy restored
+
+    assert s.reload()
+    assert [entry.action for entry in s.project.log] == ["new_project", "migrate"]
+    assert (s.dirty, s.last_action, s.undo_step) == (False, "migrate", None)
+    assert load_project(folder) == s.project
 
 
 # --- refused operations change nothing ---
@@ -4476,6 +4544,7 @@ def test_a_row_that_leaves_out_an_empty_end_lane_is_refused(tmp_path, row, flag)
         "the row box does not show which lane each band is in; draw it over every"
         " declared lane, empty end lanes included, or place the boxes by clicking"
     )
+    assert info.value.ids == ()  # the row box alone is at fault
 
 
 # --- #51: a row checked against the lanes already placed on its image ---
@@ -4561,6 +4630,27 @@ def test_a_row_read_a_lane_off_the_lanes_on_its_image_is_refused(tmp_path, name,
     assert all(true == read + (1 if dx > 0 else -1) for read, true in reading(case, found).items())
     other_protein_in_lanes(s, image, case, lanes)
     refused_as(s, protein, row, OFF_LANES)
+
+
+def test_a_row_off_the_lanes_on_its_image_names_the_boxes_that_placed_them(tmp_path):
+    # One of them may be in the wrong lane (a click given the wrong lane), so a
+    # client can offer to take back the change that placed it. This protein's
+    # boxes a detector placed give way to the row and are not named; its box
+    # clicked in lane 4, which shows where the user put that lane, is.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    ops.detect_row_boxes(s, protein, case.row)
+    ops.remove_box(s, lane_bands(s, protein)[4].id)
+    clicked = ops.place_box(s, protein, *at_lane(case, 4), lane_index=4, grow=False)
+    other = other_protein_in_lanes(s, image, case, (3, 4))
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein, shifted(case, 70))
+    assert (info.value.code, str(info.value)) == (ErrorCode.ROW_LANES_UNCLEAR, OFF_LANES)
+    others = tuple(b.id for b in protein_of(s, other).bands)
+    assert len(others) == 2
+    assert info.value.ids == (clicked, *others)  # proteins in order, then their boxes
+    assert s.project is before
 
 
 def test_one_lane_on_the_image_does_not_show_the_lanes(tmp_path):
@@ -4771,6 +4861,12 @@ def test_lane_anchors_of_some_bands_only(tmp_path):
     assert sorted(lane for _, lane in others) == [2, 3]
     assert sorted(mine + others) == sorted(lane_anchors(batch, ref))
     assert lane_anchors(batch, ref, without=own, only=own) == []
+    # The ids of the same anchors, in the same order.
+    lanes = {b.id: b.lane_index for p in batch.proteins for b in p.bands}
+    for kwargs in ({}, {"only": own}, {"without": own}):
+        ids = lane_anchor_ids(batch, ref, **kwargs)
+        assert [lanes[i] for i in ids] == [lane for _, lane in lane_anchors(batch, ref, **kwargs)]
+    assert set(lane_anchor_ids(batch, ref, only=own)) == own
 
 
 def clicked_lanes(tmp_path: Path, mirrored: bool) -> tuple[ProjectSession, str, str, list[str]]:

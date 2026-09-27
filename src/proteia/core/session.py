@@ -27,8 +27,9 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   state whole, never replaying a change, and commit it as a logged change of
   their own (``undo``, ``redo``), so the log only grows. The history is per
   session: :func:`open_project` starts with none, and it is lost at
-  :meth:`ProjectSession.close`, a project switch or a restart; the log, which
-  keeps params and hashes but not states, cannot rebuild it.
+  :meth:`ProjectSession.close`, a project switch, a restart, or a
+  :meth:`ProjectSession.reload` of a ``project.json`` changed outside Proteia;
+  the log, which keeps params and hashes but not states, cannot rebuild it.
 * Files in ``images/`` that no project references (an image removed, an import
   that was never saved, a temp file left by a crash) are deleted after a
   successful save and before an import, but only if the ``project.json`` on
@@ -38,7 +39,7 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   removed or undone image's file stays while the history can bring it back, and
   goes at the first save or import after no state references it: once the undo
   limit drops the last such state, a new change clears the redo that held it,
-  or the session is closed; or else at the next session's first save.
+  or the session is closed or reloads; or else at the next session's first save.
 
 Refusals raise :class:`OperationError`, whose :class:`ErrorCode` is stable for
 clients (e.g. to map onto HTTP statuses).
@@ -557,6 +558,37 @@ class ProjectSession:
                 expect_hash=target.hash,
             )
             return params
+
+    def reload(self) -> bool:
+        """Read ``project.json`` again if it is not what saving the committed
+        project writes, as when it was replaced outside Proteia (a synced or
+        restored copy); return whether it did. The session then holds what
+        :func:`open_project` reads from the folder (a file of an older schema
+        is migrated and saved, as there), with no cached pixels and no undo
+        history, whose states led to a project the file no longer holds; the
+        files only that history kept go at the next save or import.
+
+        With unsaved changes (``dirty``) the file is not read: it is older than
+        the committed project, not changed outside Proteia. ``OSError`` (a
+        missing file too) and the :class:`~proteia.core.storage.ProjectError`
+        family propagate, with the session as it was.
+        """
+        with self.lock:
+            if self.dirty:
+                return False
+            saved = (self._folder / storage.PROJECT_FILE).read_bytes()
+            if saved == storage.project_to_json(self._project):
+                return False
+            project, migrated = storage.read_project(self._folder, clock=self.clock)
+            self._project = project
+            self._saved_files = _referenced_files(project)
+            self._pixels = {}
+            self._states, self._cursor = [], -1
+            self._steps = (None, None)
+            self.last_action = None
+            if migrated:
+                self._changed("migrate")
+            return True
 
     def close(self, *, remove_files: bool = True) -> None:
         """Forget the undo history, then delete the files only it kept (best

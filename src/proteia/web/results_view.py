@@ -19,8 +19,9 @@ as JSON. A translation only; every number comes from the compute step.
   the proteins' per-lane columns and the settings are the same in both sets and
   appear once, with the lane table's own include flags. Element i of every
   per-lane list belongs to ``lanes[i]``, excluded lanes included.
-* Each series has a ``chart_url``: the chart store's URL for its chart, or
-  ``null`` without a store or a chart.
+* Each series has a ``chart_url``: the URL ``charts`` registers its chart at
+  (:class:`~proteia.web.charts.ChartStore`), or ``null`` without ``charts`` or a
+  chart.
 """
 
 from __future__ import annotations
@@ -34,11 +35,11 @@ from pydantic import JsonValue
 from proteia.core.plotspec import PlotSpec
 from proteia.core.results import Results, SeriesResult
 
-ChartStore = Callable[[PlotSpec], str]  # registers a chart; gives the URL it is drawn at
+RegisterChart = Callable[[PlotSpec], str]  # registers a chart; gives the URL it is drawn at
 
 
 def results_payload(
-    results: Results, *, open_id: int, revision: int, charts: ChartStore | None = None
+    results: Results, *, open_id: int, revision: int, charts: RegisterChart | None = None
 ) -> dict[str, JsonValue]:
     """``results`` as the web UI reads them, stamped with the ``open_id`` and
     ``revision`` of the project they were computed from."""
@@ -62,7 +63,7 @@ def results_payload(
 
 
 def _result_set(
-    set_id: str, results: Results, data: dict[str, Any], charts: ChartStore | None
+    set_id: str, results: Results, data: dict[str, Any], charts: RegisterChart | None
 ) -> dict[str, JsonValue]:
     return {
         "id": set_id,
@@ -78,7 +79,7 @@ def _result_set(
 
 
 def _series(
-    series: SeriesResult, data: dict[str, Any], charts: ChartStore | None
+    series: SeriesResult, data: dict[str, Any], charts: RegisterChart | None
 ) -> dict[str, JsonValue]:
     """One series; its model gives the order of the condition keys and the stars."""
     chart = data["chart"]

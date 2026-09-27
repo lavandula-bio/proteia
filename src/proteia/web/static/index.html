@@ -150,20 +150,88 @@
     </section>
   </aside>
 
-  <section class="stage">
-    <canvas id="view" class="view"></canvas>
-    <p id="view-hint" class="view-hint" hidden></p>
-    <div class="view-tools">
-      <button id="zoom-in" type="button" title="Zoom in (+)">+</button>
-      <button id="zoom-out" type="button" title="Zoom out (−)">−</button>
-      <button id="zoom-fit" type="button" title="Fit to window (F)">Fit</button>
-    </div>
-    <div id="lane-picker" class="lane-picker" hidden>
-      <p>Which lane is this box in?</p>
-      <div id="lane-picker-buttons"></div>
-      <button id="lane-picker-cancel" type="button">Cancel</button>
-    </div>
-  </section>
+  <div id="work-area" class="work-area">
+    <section class="stage">
+      <canvas id="view" class="view"></canvas>
+      <p id="view-hint" class="view-hint" hidden></p>
+      <div class="view-tools">
+        <button id="zoom-in" type="button" title="Zoom in (+)">+</button>
+        <button id="zoom-out" type="button" title="Zoom out (−)">−</button>
+        <button id="zoom-fit" type="button" title="Fit to window (F)">Fit</button>
+      </div>
+      <div id="lane-picker" class="lane-picker" hidden>
+        <p>Which lane is this box in?</p>
+        <div id="lane-picker-buttons"></div>
+        <button id="lane-picker-cancel" type="button">Cancel</button>
+      </div>
+    </section>
+
+    <!-- Drag to resize the results; Enter or a double click hides or shows them. -->
+    <div id="dock-splitter" class="splitter" role="separator" tabindex="0"
+      aria-orientation="horizontal" aria-controls="dock" aria-label="Results height"
+      title="Drag to resize the results (arrow keys); double-click or Enter hides or shows them"></div>
+
+    <section id="dock" class="dock" aria-labelledby="dock-title">
+      <div class="dock-head">
+        <h2 id="dock-title">Results</h2>
+        <span id="tier" class="tier" hidden></span>
+        <!-- While the nets use the legacy background (app.js renderRequantify);
+          the Checks say why. Before "Updating…", so its coming never moves the button. -->
+        <span id="requantify-offer" class="requantify-offer" hidden>
+          <button id="requantify" type="button" aria-describedby="requantify-note"
+            title="The nets use the whole-image median background, as measured before the local background.">Requantify
+            with local background</button>
+          <span id="requantify-note" class="hint requantify-note"
+            title="Nets move to the local ring background; Undo takes it back.">Nets move to the local
+            ring background; Undo takes it back.</span>
+        </span>
+        <span id="updating" class="updating" hidden>Updating…</span>
+        <span class="spacer"></span>
+        <div id="dock-tabs" class="dock-tabs" role="tablist" aria-label="Results" hidden>
+          <button id="tab-lanes" type="button" role="tab" aria-controls="lanes-panel">Lanes &amp; values</button>
+          <button id="tab-charts" type="button" role="tab" aria-controls="charts-panel">Charts</button>
+        </div>
+        <button id="dock-toggle" type="button" aria-controls="dock-body" aria-expanded="true"
+          title="Hide the results">Hide</button>
+      </div>
+      <div id="dock-body" class="dock-body">
+        <section id="lanes-panel" class="dock-panel lanes-panel" aria-labelledby="lanes-title">
+          <div class="lane-tools">
+            <h3 id="lanes-title" class="panel-title">Lanes &amp; values</h3>
+            <label class="inline">Reference
+              <select id="reference"></select>
+            </label>
+            <button id="add-lane" type="button">+ Lane</button>
+            <button id="remove-lane" type="button">− Last lane</button>
+            <form id="bulk-lanes" class="bulk-lanes">
+              <label class="inline">Conditions (comma-separated)
+                <input id="bulk-conditions" type="text" autocomplete="off" spellcheck="false"
+                  placeholder="vehicle, vehicle, 10 µM, 10 µM">
+              </label>
+              <button type="submit">Set lanes</button>
+            </form>
+            <!-- In the toolbar: beside the buttons when there is room, not a line of its own. -->
+            <p class="hint lanes-help">Same condition + same sample = technical repeats, averaged
+              (≈). A blank sample: the lane is its own sample.</p>
+          </div>
+          <p id="lanes-error" class="error" role="alert" hidden></p>
+          <div class="table-scroll">
+            <table id="lane-table" class="lane-table">
+              <caption class="sr-only">Lanes and values, one row per lane</caption>
+              <thead id="lane-head"></thead>
+              <tbody id="lane-rows"></tbody>
+            </table>
+          </div>
+        </section>
+        <section id="charts-panel" class="dock-panel charts-panel" aria-labelledby="charts-title">
+          <h3 id="charts-title" class="panel-title">Charts</h3>
+          <p id="charts-empty" class="charts-empty" hidden></p>
+          <!-- One card per target and loading control; charts.js fills it. -->
+          <ul id="chart-cards" class="chart-cards"></ul>
+        </section>
+      </div>
+    </section>
+  </div>
 </main>
 
 <dialog id="projects-dialog" class="projects-dialog">
@@ -179,6 +247,15 @@
   <p id="projects-state" class="hint" role="status" hidden></p>
   <p id="projects-error" class="error" role="alert"></p>
   <button id="projects-close" type="button">Close</button>
+</dialog>
+
+<!-- A chart card enlarged (Enlarge on a card); charts.js fills it. -->
+<dialog id="chart-dialog" class="chart-dialog" aria-labelledby="chart-dialog-title">
+  <div class="chart-dialog-head">
+    <h2 id="chart-dialog-title"></h2>
+    <button id="chart-dialog-close" type="button" autofocus>Close</button>
+  </div>
+  <div id="chart-dialog-body"></div>
 </dialog>
 </body>
 </html>

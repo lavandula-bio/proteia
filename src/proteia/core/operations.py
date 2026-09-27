@@ -137,6 +137,7 @@ from proteia.core.names import (
 )
 from proteia.core.plotspec import ErrorType
 from proteia.core.project import (
+    lane_anchor_ids,
     lane_anchors,
     lane_pitch,
     lane_positions,
@@ -1807,7 +1808,9 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     (:func:`~proteia.core.project.lane_positions`: the step of two close
     lanes, repeated over many, drifts). A band found whose extent's centre
     lies more than half the local pitch from its lane's expected x
-    (:func:`_off_lanes`) refuses the row (``ROW_LANES_UNCLEAR``). So a row read
+    (:func:`_off_lanes`) refuses the row (``ROW_LANES_UNCLEAR``; ``ids``: the
+    boxes that placed those lanes, :func:`~proteia.core.project.lane_anchor_ids`,
+    since one of them may be in the wrong lane). So a row read
     a lane or more off is refused wherever its bands lie; one squeezed into
     more lanes than the box covers (its pitch too small), only where its bands
     lie between the anchored lanes, since past them the row's pitch follows
@@ -1819,7 +1822,8 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     (``OUT_OF_IMAGE``) or too small for its lanes (``ROW_TOO_SMALL``);
     non-finite pixels in the row (``UNREADABLE_IMAGE``, with the image: the
     image is at fault, not the row); bands that do not show which lane each
-    is in (``ROW_LANES_UNCLEAR``); no band in any lane (``NO_BAND_FOUND``:
+    is in (``ROW_LANES_UNCLEAR``, with no ids: the row box alone is at fault,
+    whatever boxes the image holds); no band in any lane (``NO_BAND_FOUND``:
     with no band located, the lane slots would rest only on an even split of
     the box, so no record is written either). The checks run in that order,
     the lanes on the image checking the reading next, then the size
@@ -1910,6 +1914,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             ErrorCode.ROW_LANES_UNCLEAR,
             "the bands in the row box do not line up with the lanes already placed on this"
             " image; draw the box over every declared lane, empty end lanes included",
+            ids=lane_anchor_ids(batch, image, without=detectors),
         )
     # The boxes that survive the commit: those kept, and those of another band
     # index.

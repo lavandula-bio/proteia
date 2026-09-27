@@ -22,7 +22,7 @@ from typing import Final
 from proteia.core import storage
 from proteia.core.model import format_timestamp
 from proteia.core.names import TextError, clean_text, name_key
-from proteia.core.session import Clock, ProjectSession, new_project, open_project, utc_now
+from proteia.core.session import Clock, ProjectSession, new_project, utc_now
 
 ROOT_NAME: Final = "Proteia"
 MAX_NAME: Final = 100  # characters; well inside every file system's limit
@@ -156,12 +156,15 @@ def create_project(root: Path, name: object, *, clock: Clock = utc_now) -> Proje
     return new_project(root / text, clock=clock)
 
 
-def open_named(root: Path, name: object, *, clock: Clock = utc_now) -> ProjectSession:
-    """Open the project ``name`` in ``root``; storage errors propagate."""
+def project_folder(root: Path, name: object) -> Path:
+    """The folder of the project ``name`` in ``root``, to open: named exactly
+    ``name`` as stored (:func:`project_name`), else ignoring case and look-alike
+    spellings (:func:`_existing`); :class:`ProjectNotFoundError` if it holds no
+    project."""
     folder = _existing(root, project_name(name))
     if folder is None or not (folder / storage.PROJECT_FILE).is_file():
         raise ProjectNotFoundError(f"no project named {name!r}")
-    return open_project(folder, clock=clock)
+    return folder
 
 
 def reveal(folder: Path) -> None:

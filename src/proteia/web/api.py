@@ -6,16 +6,22 @@ whole project state (:func:`~proteia.web.state.project_state`) and its results
 (:func:`~proteia.web.results_view.results_payload`), both from one snapshot
 (:func:`~proteia.core.operations.compute_view`), so the browser redraws the
 image, the table and the charts from what the server stored. Creating, opening
-and reading the project answer the same way. One project is open at a time. A
-removal of a protein or an image also answers what it took with it: every field
-of :class:`~proteia.core.operations.Cascade`, as lists of ids. Undo and redo
-answer the change they took back or made again (``action``, ``seq``) and the
-ids and not-detected record keys that went or came back
-(:class:`~proteia.core.operations.Restored`); clearing a protein's boxes answers
-the band ids removed and the (lane index, band index) of each record dropped;
-requantifying answers the images re-quantified. Any box edit may change every
-net on its image (each band's background ring leaves out every box there), and
-every answer carries every protein's numbers, so the browser redraws them all.
+and reading the project answer the same way. Each chart in the results is
+answered as a URL named by its content (:mod:`proteia.web.charts`), and
+``GET /api/charts/{key}.svg`` serves it as SVG, drawn when first fetched. One
+project is open at a time. A removal of a protein or an image also answers what
+it took with it: every field of :class:`~proteia.core.operations.Cascade`, as
+lists of ids. Undo and redo answer the change they took back or made again
+(``action``, ``seq``) and the ids and not-detected record keys that went or came
+back (:class:`~proteia.core.operations.Restored`); clearing a protein's boxes
+answers the band ids removed and the (lane index, band index) of each record
+dropped; a row box answers what it did in each lane: every field of
+:class:`~proteia.core.operations.RowPlacement`, each empty lane as
+``{lane_index, reason, snr, expected_x}``; requantifying answers the images
+re-quantified. Lane indices in requests and answers are 0-based, as stored. Any
+box edit may change every net on its image (each band's background ring leaves
+out every box there), and every answer carries every protein's numbers, so the
+browser redraws them all.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -54,17 +60,21 @@ from pydantic import (
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import BoxSize, UnknownIdError
-from proteia.core.plotspec import ErrorType
+from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
 from proteia.web import projects
+from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
 from proteia.web.state import preview_png, project_state, revision
 
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
+# How long a reopen waits for an operation running on the open session before
+# answering it without reading its project.json again.
+REOPEN_WAIT_S: Final = 5.0
 
 
 class NoProjectError(RuntimeError):
@@ -93,13 +103,14 @@ class ResultSettings:
 _ResultsKey = tuple[int, int, ResultSettings]  # open id, revision, settings
 
 
-def _same_folder(a: Path, b: Path) -> bool:
-    """Whether ``a`` and ``b`` are one folder (however the paths are spelled);
-    True when that cannot be told."""
+def _same_folder(a: Path, b: Path, *, unknown: bool) -> bool:
+    """Whether ``a`` and ``b`` are one folder, however the paths are spelled
+    (case, Unicode normalization, links); ``unknown`` when that cannot be told
+    (one of them is gone or cannot be read)."""
     try:
         return os.path.samefile(a, b)
     except OSError:
-        return True
+        return unknown
 
 
 class Workspace:
@@ -107,11 +118,16 @@ class Workspace:
 
     A request keeps the session it started with: a project switch while it runs
     does not redirect it (one user, one tab, so this only matters in a race).
-    Every create or open gives the new session the next open id, so answers
-    about different openings never compare equal, even at the same revision.
+    Every create, and every open of another project, gives the new session the
+    next open id, so answers about different openings never compare equal, even
+    at the same revision. Opening the project already open answers its session
+    (:meth:`open`), so no two sessions write one folder (#93); that session
+    takes the next open id too if it reads a ``project.json`` changed outside
+    Proteia again.
     The results of the open project's latest revision computed so far are kept
     (with the open id, the revision and the settings they belong to), since
-    reading them again is common and computing them is not cheap.
+    reading them again is common and computing them is not cheap. So are the
+    charts of the answers about the latest opening (:class:`ChartStore`).
     """
 
     def __init__(
@@ -121,7 +137,8 @@ class Workspace:
         self.reveal = reveal
         self.clock = clock
         # Guards the open session, the open ids, the settings, the previews and the
-        # results; never held while computing.
+        # results; never held while computing. Taken before the chart store's own
+        # lock, never while holding it.
         self._lock = threading.Lock()
         self._switching = threading.Lock()  # one switch at a time; never held by readers
         self._session: ProjectSession | None = None
@@ -131,6 +148,7 @@ class Workspace:
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
         self._previews: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        self._charts = ChartStore()
 
     def current(self) -> ProjectSession:
         with self._lock:
@@ -166,26 +184,29 @@ class Workspace:
         and stays open, with its undo history, if ``make`` fails or its unsaved
         changes cannot be saved. Once replaced, the old one is closed
         (:meth:`~proteia.core.session.ProjectSession.close`): its history is
-        gone, and so are the image files only that history kept, unless the
-        same project was opened again. Then the close deletes nothing, since
-        the new session may already be storing files the old one does not know
-        (the close waits for any request still running on the old one), and
-        the new session's first save or import deletes those files. Saving,
-        opening and closing run outside the lock readers take."""
-        with self._switching:
-            old = self._peek()
-            if old is not None and old.dirty:
-                self._save(old)
-            session = make()
-            with self._lock:
-                self._session = session
-                self._open_id += 1
-                self._open_ids[session] = self._open_id
-                self._previews.clear()
-                self._results = None
-            if old is not None:
-                old.close(remove_files=not _same_folder(old.folder, session.folder))
-            return session
+        gone, and so are the image files only that history kept, unless the new
+        session's folder is, or may be, the old one's. Then the close deletes
+        nothing, since the new session may already be storing files the old one
+        does not know (the close waits for any request still running on the old
+        one), and the new session's first save or import deletes those files.
+        Opening the open project never switches (:meth:`open`), but a project
+        created where the open one's folder was removed outside Proteia does.
+        Saving, opening and closing run outside the lock readers take. Called
+        with the switch lock held."""
+        old = self._peek()
+        if old is not None and old.dirty:
+            self._save(old)
+        session = make()
+        with self._lock:
+            self._session = session
+            self._open_id += 1
+            self._open_ids[session] = self._open_id
+            self._previews.clear()
+            self._results = None
+            self._charts.reset(self._open_id)
+        if old is not None:
+            old.close(remove_files=not _same_folder(old.folder, session.folder, unknown=True))
+        return session
 
     def close(self) -> None:
         """Close the open project: its undo history is gone, and so are the image
@@ -197,10 +218,53 @@ class Workspace:
                 session.close()
 
     def create(self, name: object) -> ProjectSession:
-        return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
+        with self._switching:
+            return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
 
     def open(self, name: object) -> ProjectSession:
-        return self._switch(lambda: projects.open_named(self.root, name, clock=self.clock))
+        """Open the project ``name`` (:func:`~proteia.web.projects.project_folder`)
+        in place of the open one; or, if its folder is the open project's,
+        however the name is spelled, answer the open session. A second session
+        on that folder would let an edit still running on the first save over
+        the second's ``project.json``, and the cleanup after that save delete
+        image files only the second knows (#93).
+
+        The open session reads its ``project.json`` again if that was changed
+        outside Proteia (:meth:`~proteia.core.session.ProjectSession.reload`), as
+        opening a project reads it: then it takes the next open id (its revision
+        may go back) and has no undo history or kept results. Otherwise it is
+        answered as it is, with its open id: the same opening, whose revisions
+        still order its answers (this one is of its latest revision, so a client
+        that waited for its edits' answers finds it no older than what it
+        shows); and with its undo history and kept results. Its unsaved changes
+        (a failed autosave) are neither saved first, as a switch saves them, nor
+        replaced by the older file: the next change or quitting saves them. An
+        operation running on the session (an edit, or a read such as a preview)
+        is waited for, up to :data:`REOPEN_WAIT_S`, before the file is checked:
+        after an edit, which saved over it, there is nothing to read; after a
+        read, a changed file is read. One that runs longer leaves the file
+        unread, and the session is answered as it is; opening it again reads
+        it. When it cannot be told whether the two folders are one (the open
+        one is gone), the open is a switch, whose close deletes nothing."""
+        with self._switching:
+            folder = projects.project_folder(self.root, name)
+            session = self._peek()
+            if session is None or not _same_folder(session.folder, folder, unknown=False):
+                return self._switch(lambda: ops.open_project(folder, clock=self.clock))
+            if session.lock.acquire(timeout=REOPEN_WAIT_S):
+                try:
+                    # The new open id under the session's lock: no commit falls
+                    # between the reload and it.
+                    if session.reload():
+                        with self._lock:
+                            self._open_id += 1
+                            self._open_ids[session] = self._open_id
+                            self._previews.clear()
+                            self._results = None
+                            self._charts.reset(self._open_id)
+                finally:
+                    session.lock.release()
+            return session
 
     def view(self, session: ProjectSession) -> tuple[int, ops.ComputedView]:
         """``session``'s open id, and its committed project with the results of
@@ -230,6 +294,16 @@ class Workspace:
             return False
         open_id, kept_revision, settings = self._results[0]
         return (open_id, settings) == (key[0], key[2]) and kept_revision > key[1]
+
+    def register_chart(self, spec: PlotSpec, *, open_id: int) -> str:
+        """The URL of the chart drawn from ``spec``, in an answer about the
+        opening ``open_id``; kept to be served only while that is the open one."""
+        return self._charts.register(spec, open_id=open_id)
+
+    def chart(self, key: str) -> bytes:
+        """The chart ``key`` names, as SVG; :class:`UnknownIdError` for a key not
+        given in the open project's answers, or no longer kept."""
+        return self._charts.svg(key)
 
     def preview(self, session: ProjectSession, image_id: str) -> bytes:
         """The image's preview PNG, kept for the last few images shown."""
@@ -339,6 +413,18 @@ class MoveBody(_Body):
     rect: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
 
 
+# A row box corner in image pixels, held to 32 bits: the row is clipped to the
+# image, but logged as given, and the project file's reader refuses a number of
+# more than 4300 characters, which JSON requests may carry.
+RowCoordinate = Annotated[StrictInt, Field(ge=-(2**31), lt=2**31)]
+
+
+class RowBody(_Body):
+    protein_id: str
+    # x0, y0, x1, y1, end-exclusive
+    rect: tuple[RowCoordinate, RowCoordinate, RowCoordinate, RowCoordinate]
+
+
 class LaneIndexBody(_Body):
     lane_index: StrictInt
 
@@ -355,18 +441,49 @@ WorkspaceDep = Annotated[Workspace, Depends(_workspace)]
 
 def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict[str, Any]:
     """A route's answer: ``extra``, then the project state and its results, both
-    from one snapshot of ``session``."""
+    from one snapshot of ``session``. Every answer registers its charts, kept
+    results too, so a read of the project brings back a chart the store forgot."""
     open_id, view = workspace.view(session)
+
+    def register(spec: PlotSpec) -> str:
+        return workspace.register_chart(spec, open_id=open_id)
+
     return {
         **extra,
         "project": project_state(session.folder.name, session, view.project, open_id=open_id),
-        "results": results_payload(view.results, open_id=open_id, revision=revision(view.project)),
+        "results": results_payload(
+            view.results, open_id=open_id, revision=revision(view.project), charts=register
+        ),
     }
 
 
 def _cascade(cascade: ops.Cascade) -> dict[str, list[str]]:
     """Every field of what a removal took with it, as lists of ids."""
     return {field.name: list(getattr(cascade, field.name)) for field in dataclasses.fields(cascade)}
+
+
+def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
+    """Every field of what a row box did
+    (:class:`~proteia.core.operations.RowPlacement`), with lists for tuples, the
+    box size as ``{width, height}`` and each empty lane as ``{lane_index,
+    reason, snr, expected_x}``."""
+    size = placement.box_size
+    return {
+        "band_ids": list(placement.band_ids),
+        "box_size": {"width": size.width, "height": size.height},
+        "kept_lanes": list(placement.kept_lanes),
+        "replaced_band_ids": list(placement.replaced_band_ids),
+        "removed_band_ids": list(placement.removed_band_ids),
+        "undetected_lanes": list(placement.undetected_lanes),
+        "unmeasured_lanes": list(placement.unmeasured_lanes),
+        "empty": [
+            {"lane_index": lane, "reason": reason, "snr": snr, "expected_x": expected_x}
+            for lane, reason, snr, expected_x in placement.empty
+        ],
+        "flags": list(placement.flags),
+        "notes": list(placement.notes),
+        "right_to_left": placement.right_to_left,
+    }
 
 
 router = APIRouter(prefix="/api")
@@ -471,6 +588,13 @@ def image_preview(image_id: str, workspace: WorkspaceDep) -> Response:
     return Response(workspace.preview(session, image_id), media_type="image/png")
 
 
+@router.get("/charts/{key}.svg")
+def chart(key: str, workspace: WorkspaceDep) -> Response:
+    """A chart of an answer, at its ``chart_url``; 404 ``unknown_id`` for a key
+    not given in the open project's answers, or no longer kept."""
+    return Response(workspace.chart(key), media_type="image/svg+xml")
+
+
 @router.put("/lanes")
 def set_lanes(body: LanesBody, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
@@ -552,6 +676,17 @@ def place_box(body: PlaceBody, workspace: WorkspaceDep) -> dict[str, Any]:
         session, body.protein_id, body.x, body.y, lane_index=body.lane_index, grow=body.grow
     )
     return _answer(workspace, session, band_id=band_id)
+
+
+@router.post("/boxes/row", status_code=201)
+def detect_row_boxes(body: RowBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Box the protein's first band in every declared lane from the row box
+    dragged over its row (:func:`~proteia.core.operations.detect_row_boxes`),
+    in image pixels. Answers what the row did in each lane
+    (:func:`_row_placement`); the same drag again changes nothing."""
+    session = workspace.current()
+    placement = ops.detect_row_boxes(session, body.protein_id, body.rect)
+    return _answer(workspace, session, **_row_placement(placement))
 
 
 @router.put("/boxes/{band_id}")
