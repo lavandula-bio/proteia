@@ -949,6 +949,56 @@ def bar(series: dict, condition: str) -> dict:
     return next(b for b in series["chart"]["bars"] if b["label"] == condition)
 
 
+def test_a_jpeg_project_says_its_bands_were_not_checked_for_over_exposure(client, tmp_path):
+    # #112: the over-exposure check does not run on a JPEG, and the results say so
+    # per protein. The Checks list shows every notice of a set, and a chart card
+    # those about its series' proteins, whatever their code.
+    spots = [(x, row, 5.0, 3.0, 25000.0) for row in (TARGET_ROW, LOADING_ROW) for x in LANE_X]
+    blot = (synthetic_blot((TWO_ROW_H, W), spots) // 257).astype(np.uint8)
+    jpeg = io.BytesIO()
+    Image.fromarray(blot).save(jpeg, format="JPEG", quality=95)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, jpeg.getvalue(), name="blot β.jpg")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert [w["code"] for w in image["warnings"]] == ["lossy_format"]
+    assert "over-exposure cannot be checked" in image["warnings"][0]["message"]
+    lanes = [{"condition": condition} for condition in DOSES]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes, "reference_condition": "vehicle"})
+    ids = []
+    for name, role in (("α-tubulin", "loading control"), ("β-catenin", "target")):
+        body = {"name": name, "role": role, "image_id": image_id, "box_size": SIZE}
+        ids.append(client.ok("POST", "/api/proteins", body)["protein_id"])
+    loading_id, target_id = ids
+    for protein, row, lanes_boxed in (
+        (loading_id, LOADING_ROW, (0, 1, 2, 3)),
+        (target_id, TARGET_ROW, (0, 2, 4)),
+    ):
+        for lane in lanes_boxed:
+            body = {"protein_id": protein, "x": LANE_X[lane], "y": row, "lane_index": lane}
+            answer = client.ok("POST", "/api/boxes", body)
+    assert {band["clipped"] for band in bands(answer).values()} == {None}
+
+    (result_set,) = answer["results"]["sets"]
+    unchecked = [n for n in result_set["notices"] if n["code"] == "clipping_not_checked"]
+    assert [(n["protein_ids"], n["lane_indices"], n["level"]) for n in unchecked] == [
+        ([loading_id], [0, 1, 2, 3], "warning"),
+        ([target_id], [0, 2, 4], "warning"),
+    ]
+    loading, target = (n["message"] for n in unchecked)
+    assert loading.startswith(
+        "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4: its image has"
+        " lossy (JPEG-type) compression"
+    )
+    assert loading.endswith("which biases every value normalized to it")
+    assert target.startswith("'β-catenin' was not checked for over-exposure in lanes 1, 3, 5:")
+    # The series' chart card shows both: each is about one of its proteins.
+    series = only_series(answer)
+    assert series["chart"] is not None
+    assert {n["protein_ids"][0] for n in unchecked} == {series["target_id"], series["loading_id"]}
+
+
 def test_box_edits_answer_with_the_changed_net_and_chart(client, tmp_path):
     target, _, before = live(client, tmp_path, DOSES, boxed=(0, 1, 2, 3))
     assert column(before, target)["nets"][4] is None
@@ -2445,6 +2495,9 @@ def test_a_row_box_boxes_every_lane_and_answers_the_nets_and_the_chart(client, t
         "flags": [],
         "notes": [],
         "right_to_left": False,
+        # The loading control's row lies beyond every ring the new boxes change.
+        "remeasured": [],
+        "largest_change": None,
     }
 
     # The nets of the new boxes and the chart they make, in the same answer.
@@ -2593,6 +2646,73 @@ def test_a_row_box_answers_the_detectors_warnings_and_notes(client, tmp_path):
     assert answer["notes"] == params["notes"] != []
 
 
+def test_a_row_box_answers_a_band_it_cuts_through(client, tmp_path):
+    # The box's top edge 2 px above the target's band centres (#115).
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    answer = drag(client, target, [15, TARGET_ROW - 2, W - 35, TARGET_ROW + 12])
+    assert None not in answer["band_ids"]
+    params = storage.load_project(client.root / "Blot").log[-1].params
+    assert answer["flags"] == params["flags"] == ["cut_by_row_box"]
+    [note] = answer["notes"]
+    assert note.startswith("lanes 1, 2, 3, 4, 5: the row box's top or bottom edge cuts through")
+
+
+def test_a_refused_row_box_answers_what_the_detector_saw(client, tmp_path):
+    # The box's top edge through the target's band centres: every band peaks
+    # on the box's top row, so none is kept, and the refusal says the box cuts
+    # them (#117) with the detector's raw reason.
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    body = {"protein_id": target, "rect": [15, TARGET_ROW, W - 35, TARGET_ROW + 12]}
+    status, payload = client.call("POST", "/api/boxes/row", body)
+    assert (status, payload["code"], payload["ids"]) == (422, "no_band_found", [])
+    assert payload["message"] == (
+        "the only signal in the row box lies at its top or bottom edge: the box cuts through"
+        " the bands or reaches into a neighbouring row; include the whole band height"
+    )
+    detail = payload["detail"]
+    assert set(detail) == {"cause", "flags", "notes", "margin", "membrane_shift", "lanes"}
+    assert (detail["cause"], detail["margin"]) == ("edge_signal", None)
+    assert [lane["lane_index"] for lane in detail["lanes"]] == list(range(len(LANE_X)))
+    assert {lane["reason"] for lane in detail["lanes"]} == {"edge_signal"}
+    # The detector names the bands it saw cut, though none was kept (#115).
+    assert detail["flags"] == ["cut_by_row_box"]
+    assert all(lane["cut"] for lane in detail["lanes"])
+    # A refusal that carries no detail answers the three keys only.
+    body = {"protein_id": target, "rect": [W + 10, 0, W + 50, 20]}
+    status, payload = client.call("POST", "/api/boxes/row", body)
+    assert (status, set(payload)) == (422, {"code", "message", "ids"})
+
+
+def test_a_row_box_answers_the_other_proteins_nets_it_changed(client, tmp_path):
+    # The loading control boxed just above two of the target's bands: every
+    # ring on the image leaves out the row's boxes, so its nets change with the
+    # row (#124).
+    target, loading, _ = live(client, tmp_path, DOSES, boxed=())
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
+    for lane in (1, 2):
+        y = TARGET_ROW - 12
+        body = {"protein_id": loading, "x": LANE_X[lane], "y": y, "lane_index": lane}
+        before = client.ok("POST", "/api/boxes", body)
+
+    def nets(answer: dict) -> dict[str, float]:
+        lanes = column(answer, loading)
+        return {b: net for b, net in zip(lanes["band_ids"], lanes["nets"], strict=True) if b}
+
+    answer = drag(client, target)
+    old, new = nets(before), nets(answer)
+    changed = [
+        {"band_id": band_id, "net_before": old[band_id], "net_after": new[band_id]}
+        for band_id in old
+        if new[band_id] != old[band_id]
+    ]
+    assert changed and answer["remeasured"] == changed
+    shares = {
+        c["band_id"]: abs(c["net_after"] - c["net_before"]) / c["net_before"] for c in changed
+    }
+    largest = max(shares, key=shares.__getitem__)
+    assert answer["largest_change"] == {"band_id": largest, "change": shares[largest]}
+
+
 def test_a_row_box_reads_the_lanes_the_way_the_image_numbers_them(client, tmp_path):
     target, loading, _ = live(client, tmp_path, DOSES, boxed=())
     client.ok("DELETE", f"/api/proteins/{loading}/boxes")
@@ -2659,8 +2779,11 @@ def _kept_box_on_lane_2(client: Client, target: str, loading: str) -> list[str]:
 
 def _loading_lanes(client: Client, target: str, loading: str) -> list[str]:
     """Nothing to set up: the loading control's boxes place the lanes the row
-    is checked against, and a row that does not line up with them names them."""
-    return column(client.ok("GET", "/api/project"), loading)["band_ids"]
+    is checked against, and a row that does not line up with them names those
+    its bands' lanes are read from. Leaving out lane 0, the row reads its four
+    bands a lane off, as lanes 0 to 3: the boxes of those lanes, and lane 4's,
+    whose x lane 3's band is measured against."""
+    return column(client.ok("GET", "/api/project"), loading)["band_ids"][:5]
 
 
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:

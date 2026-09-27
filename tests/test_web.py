@@ -22,10 +22,12 @@ import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
 import proteia
+from proteia.core import rowdetect
 from proteia.web import launch, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
 
@@ -596,3 +598,18 @@ def test_the_original_colours_switch_is_a_toggle_button_the_keyboard_reaches():
     assert fields.get("tabindex") != "-1"
     assert "grey analysis image" in fields["title"]  # what the nets are measured on
     assert parser.by_id["view-colours-state"]["role"] == "status"
+
+
+def _object_keys(script: str, name: str) -> set[str]:
+    """The keys of the object literal ``const <name> = {...};`` in a script."""
+    body = script[script.index(f"const {name} = {{") :].split("\n};", 1)[0]
+    return set(re.findall(r"^  (\w+): ", body, re.MULTILINE))
+
+
+def test_the_page_words_every_row_warning_and_empty_lane_reason():
+    # Each warning the detector gives a row it placed, and each reason it
+    # leaves a lane empty, has the page's own words; one without would reach
+    # the user only through the log.
+    script = (server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert _object_keys(script, "ROW_WARNINGS") == set(rowdetect.WARNING_FLAGS)
+    assert _object_keys(script, "NOT_MEASURED") == set(get_args(rowdetect.LaneReason)) - {"band"}

@@ -69,7 +69,12 @@ Flags (:attr:`RowDetection.flags`):
   other extents was left out of the shared size (``"max_guarded"``);
 * ``multiple_components``: a lane holds a second, separate component (see
   ``components``); its box is grown from the lane's strongest pixel, as a
-  click there would be (quantifying doublets is #58's).
+  click there would be (quantifying doublets is #58's);
+* ``cut_by_row_box``: the row box cuts through a band (see ``cut``): the
+  band's extent reaches the box's top or bottom edge and that edge row, across
+  the extent, still holds :data:`CUT_LEVEL` of the band's peak, so its box and
+  net miss what lies beyond the edge; or, in an empty lane, the band peaks on
+  that edge row itself and was left out (``edge_signal``).
 
 Every setting is a module constant, reported by :func:`settings`.
 """
@@ -107,6 +112,7 @@ DETECT_K: Final = 6.0  # a band's peak reaches this many smoothed-noise sigmas
 EXTENT_LEVEL: Final = REL_THRESHOLD  # sized extent: this fraction of the band's own peak (click)
 SIZE_RULE: Final = "max_guarded"  # the shared size: the largest extent, outliers left out
 SIZE_GUARD: Final = 2.0  # an extent above this times the others' median does not set the size
+CUT_LEVEL: Final = EXTENT_LEVEL  # cut_by_row_box: the box's edge row holds this of a band's peak
 
 # --- Technical settings ---
 
@@ -154,13 +160,19 @@ FIT_MAX_PIXELS: Final = 20000  # fits and noise estimates use a fixed-stride sub
 NOISE_FLOOR_FRAC: Final = 1e-3  # sigma floor: this fraction of the crop's range
 EMPTY_WINDOW: Final = 0.3  # an empty lane's SNR is read within +/- this pitch of its centre
 BG_WARN_K: Final = 3.0  # background_mismatch beyond this many pixel sigmas
+MEMBRANE_SHIFT_K: Final = DETECT_K  # membrane_shift from which a box holds too little membrane
 MIN_BOX: Final = 2  # smallest box side, as boxes.grow_to_fit
 
 # --- Vocabularies ---
 
 SIZE_RULES: Final = ("max", "max_guarded")
 REFUSING_FLAGS: Final = ("lanes_outside_row", "ambiguous_lanes")
-WARNING_FLAGS: Final = ("background_mismatch", "size_outlier", "multiple_components")
+WARNING_FLAGS: Final = (
+    "background_mismatch",
+    "size_outlier",
+    "multiple_components",
+    "cut_by_row_box",
+)
 
 RowDetectErrorCode = Literal["invalid_row", "invalid_image", "row_outside_image", "row_too_small"]
 LaneReason = Literal["band", "no_band", "artefact", "edge_signal", "unassigned"]
@@ -195,13 +207,16 @@ class LaneDetection:
 
     * ``rect``: the proposed box, of the shared size; None for an empty lane.
     * ``reason``: ``band``, or why the lane is empty: ``no_band`` (nothing
-      reaches ``DETECT_K``; ``snr`` says how close it came), ``artefact`` (a
-      rejected streak or stain covers it), ``edge_signal`` (only the rows left
-      out as a neighbouring row reach ``DETECT_K``), ``unassigned`` (signal in
-      the row's rows reaches ``DETECT_K`` but is in no assigned piece: a piece
+      but dust reaches ``DETECT_K``; ``snr`` says how close it came),
+      ``artefact`` (a rejected streak or stain covers it), ``edge_signal``
+      (only signal at the box's edge reaches ``DETECT_K``: in the rows left out
+      as a neighbouring row, or peaking on the box's top or bottom row, as a
+      band the box cuts through does), ``unassigned`` (a kept candidate in the
+      row's rows reaches ``DETECT_K`` but is in no assigned piece: a piece
       dropped for want of lanes, or too weak beside the bands around it).
     * ``snr``: the strongest smoothed signal in the lane (the growth seed; for an
-      empty lane, within ``EMPTY_WINDOW`` pitch of its centre) over the noise.
+      empty lane, within ``EMPTY_WINDOW`` pitch of its centre, leaving out the
+      candidates the detector rejected, dust among them) over the noise.
     * ``extent``: the grown extent before sizing, None for an empty lane.
     * ``expected_x``: the lane's expected centre, also for an empty lane: between
       the present lanes by index, past them by the pitch, or an even split of
@@ -222,6 +237,12 @@ class LaneDetection:
       box, over the row's rows (a neighbouring row left out). None for a lane
       that holds a band, and for an empty lane whose slot lies outside the row
       box (not measured: its ``snr`` is 0).
+    * ``cut``: the row box cuts through the lane's band (``cut_by_row_box``):
+      its extent reaches the box's top or bottom edge, and that edge row, across
+      the extent, holds at least ``CUT_LEVEL`` of the band's peak; or the lane
+      is empty (``edge_signal``) because its band peaks on that edge row, where
+      a candidate at least the dust floor wide and not flat across the rows (a
+      band's hump, not a streak) reaches ``DETECT_K`` in the lane's slot.
     """
 
     lane: int
@@ -233,6 +254,7 @@ class LaneDetection:
     bg_offset: float | None
     components: int
     window: Rect | None
+    cut: bool
 
 
 @dataclass(frozen=True)
@@ -249,6 +271,17 @@ class RowDetection:
     user does (index fields stay 0-based). ``cost`` is the cost of the chosen
     lane reading and ``margin`` how much more the best different reading costs
     (``inf`` when there is none); both None when there was nothing to assign.
+    ``membrane_shift`` says how far detection's membrane level lies inside
+    the bands, by the box's own top and bottom rows: the smaller of how far
+    each of those rows lies to the membrane side of that level (the detection
+    surface's mean over the box, with the membrane's level in the signal) and
+    of the box's deepest row (row means of the box-smoothed crop), in pixel
+    sigmas from neighbour differences (which bands do not inflate). From
+    ``MEMBRANE_SHIFT_K`` on, the box's edge rows are membrane around a band
+    that detection took for its membrane: the box holds too little membrane to
+    measure the bands against (a snug box around thick bands). The stored
+    background plays no part, so a membrane darker than it is not taken for a
+    band.
     """
 
     lanes: tuple[LaneDetection, ...]
@@ -260,6 +293,7 @@ class RowDetection:
     notes: tuple[str, ...]
     cost: float | None
     margin: float | None
+    membrane_shift: float
 
     @property
     def slots(self) -> tuple[Rect | None, ...]:
@@ -546,6 +580,9 @@ Region = tuple[slice, slice]
 @dataclass(frozen=True)
 class _Candidates:
     kept: np.ndarray  # mask of the kept components
+    dropped: np.ndarray  # mask of the candidates rejected by any rule (not kept)
+    dust: np.ndarray  # mask of the candidates the dust floor rejected
+    cut: np.ndarray  # mask of the band-like candidates peaking on the box's edge row
     rows: tuple[int, int]  # rows of the row (edge humps left out)
     rejected: list[tuple[str, Region]]  # (reason, region) of rejected structures
     pieces: list[_Piece]
@@ -588,8 +625,27 @@ def _min_width(wc: int, n: int) -> float:
     return min(max(MIN_WIDTH_PX, MIN_WIDTH_PITCH * wc / n), wc)
 
 
+def _dust(comp: np.ndarray, ds: np.ndarray, peak: float, thr: float, min_w: float) -> bool:
+    """Whether a candidate component is dust, judged on the despeckled signal
+    ``ds`` of its region (``comp`` its mask there, ``peak`` its smoothed
+    peak): gone under the running median, or its 30%-core there narrower than
+    ``min_w``. A band keeps its plateau."""
+    dloc = np.where(comp, ds, 0.0)
+    dpk = float(dloc.max())
+    if dpk < max(REL_THRESHOLD * peak, thr):
+        return True  # gone under the running median: a speck
+    dy, dx = divmod(int(np.argmax(dloc)), dloc.shape[1])
+    dcore = grow_region(dloc, (dx, dy), max(REL_THRESHOLD * dpk, thr))
+    return dcore is None or dcore[2] - dcore[0] < min_w  # below the width floor: noise, dust
+
+
 def _candidates(sig: _Signal, n: int) -> _Candidates:
-    """The kept components and the pieces of their column profile."""
+    """The kept components and the pieces of their column profile.
+
+    A candidate peaking on the box's top or bottom row is rejected
+    (``edge_signal``) whatever it is; of those, dust counts as dust, and one
+    that holds a band's hump (not flat across the rows, as a streak is) is a
+    band the box cuts through (``cut``)."""
     s_all = sig.s_sm
     hc, wc = s_all.shape
     lo, hi = _row_rows(s_all, sig.sigma_sm)
@@ -606,11 +662,16 @@ def _candidates(sig: _Signal, n: int) -> _Candidates:
     min_w = _min_width(wc, n)
     lab, count = label(s > thr)
     kept = np.zeros(s.shape, bool)
+    dust = np.zeros(s.shape, bool)
+    cut = np.zeros(s.shape, bool)
+    candidates = np.zeros(s.shape, bool)
     if count:
         regions = find_objects(lab)
         # Only components holding a pixel at the detection level (hysteresis).
         strong = np.unique(lab[s >= DETECT_K * sig.sigma_sm])
-        for k in strong[strong > 0] - 1:
+        strong = strong[strong > 0]
+        candidates = np.isin(lab, strong)
+        for k in strong - 1:
             sl = regions[k]
             comp = lab[sl] == k + 1
             local = np.where(comp, s[sl], 0.0)
@@ -622,22 +683,22 @@ def _candidates(sig: _Signal, n: int) -> _Candidates:
                 continue
             cx0, cy0, cx1, cy1 = core
             cy0, cy1 = cy0 + sl[0].start, cy1 + sl[0].start
+            c0, c1 = sl[1].start + cx0, sl[1].start + cx1
             if py == 0 or py == hc - 1:
                 rejected.append(("edge_signal", sl))
+                if _dust(comp, ds[sl], peak, thr, min_w):
+                    dust[sl] |= comp
+                elif not _flat(s, lo, hi, c0, c1):
+                    cut[sl] |= comp  # a band the box's edge runs through
                 continue
-            if cy0 <= lo and cy1 >= hi and _flat(s, lo, hi, sl[1].start + cx0, sl[1].start + cx1):
+            if cy0 <= lo and cy1 >= hi and _flat(s, lo, hi, c0, c1):
                 rejected.append(("artefact", sl))
                 continue
             # Width on the despeckled signal: dust and specks vanish under the
             # running median; a band keeps its plateau.
-            dloc = np.where(comp, ds[sl], 0.0)
-            dpk = float(dloc.max())
-            if dpk < max(REL_THRESHOLD * peak, thr):
-                continue  # gone under the running median: a speck
-            dy, dx = divmod(int(np.argmax(dloc)), dloc.shape[1])
-            dcore = grow_region(dloc, (dx, dy), max(REL_THRESHOLD * dpk, thr))
-            if dcore is None or dcore[2] - dcore[0] < min_w:
-                continue  # below the width floor: noise, dust
+            if _dust(comp, ds[sl], peak, thr, min_w):
+                dust[sl] |= comp
+                continue
             kept[sl] |= comp
     prof = np.where(kept, ds, 0.0).max(axis=0)
     half = max(ENVELOPE_MIN, int(round(ENVELOPE_HALF * wc / n)))
@@ -665,7 +726,7 @@ def _candidates(sig: _Signal, n: int) -> _Candidates:
                 kept[:, a + j0 : a + j1 + 1] = False
                 continue
             pieces.append(_Piece(a + j0, a + j1 + 1, float(seg[i]), float(seg[j0 : j1 + 1].sum())))
-    return _Candidates(kept, (lo, hi), rejected, pieces)
+    return _Candidates(kept, candidates & ~kept, dust, cut, (lo, hi), rejected, pieces)
 
 
 def _reduce(pieces: list[_Piece], n: int, x_offset: int, notes: list[str]) -> list[_Piece]:
@@ -857,10 +918,12 @@ class _Lane:
     rect: Rect | None = None  # measured extent
     centre: float = math.nan  # expected centre: set for every lane by _fill_centres
     reason: LaneReason = "no_band"
+    peak: float = 0.0  # the growth seed's smoothed signal
     snr: float = 0.0
     span: tuple[int, int] | None = None  # the x-range between the walls: components counted
     components: int = 0
     window: Rect | None = None  # an empty lane's measured slot (crop coordinates)
+    cut: bool = False  # an empty lane's band peaks on the box's edge row (_empty_lanes)
 
 
 def _lanes_from(assign: _Assignment, pieces: list[_Piece], n: int) -> list[_Lane]:
@@ -1049,6 +1112,7 @@ def _measure(lanes: list[_Lane], s: np.ndarray, kept: np.ndarray, sigma_sm: floa
             x0 = int(math.floor(c0))
             rect = (x0, rect[1], max(x0 + 1, int(math.floor(c1))), rect[3])
         ln.rect = rect
+        ln.peak = v
         ln.snr = v / sigma_sm
         ln.reason = "band"
         ln.span = (max(ga, int(math.floor(c0))), min(gb, int(math.ceil(c1))))
@@ -1170,7 +1234,16 @@ def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
 
 
 def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
-    """Expected centre, window SNR and reason of every empty lane."""
+    """Expected centre, window SNR and reason of every empty lane.
+
+    The SNR leaves out the candidates the detector rejected (dust, a peak on
+    the box's edge rows, a streak or stain), so only a kept candidate reaches
+    ``DETECT_K`` there (``unassigned``); signal short of a candidate stays, so
+    the SNR tells how close a faint band came. Signal at the box's edge (in
+    the rows left out, or a candidate peaking on an edge row) makes a lane
+    ``edge_signal``; dust counts nowhere. An ``edge_signal`` lane is ``cut``
+    when a band the box's edge runs through (``_Candidates.cut``) reaches
+    ``DETECT_K`` in its slot."""
     sig, cand, lanes = res.sig, res.cand, res.lanes
     if res.assign is None or not any(ln.present for ln in lanes):
         for i, ln in enumerate(lanes):
@@ -1180,6 +1253,9 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
     lo, hi = cand.rows
     s_row = np.zeros_like(sig.s_sm)
     s_row[lo:hi] = sig.s_sm[lo:hi]
+    s_row[cand.dropped] = 0.0
+    s_all = np.where(cand.dust, 0.0, sig.s_sm)
+    s_cut = np.where(cand.cut, sig.s_sm, 0.0)
     for ln in lanes:
         if ln.present:
             continue
@@ -1189,7 +1265,7 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
             continue  # the slot lies outside the row box: not measured
         ln.window = (a, lo, b, hi)
         ln.snr = float(s_row[:, a:b].max()) / sig.sigma_sm
-        full = float(sig.s_sm[:, a:b].max()) / sig.sigma_sm
+        full = float(s_all[:, a:b].max()) / sig.sigma_sm
         if any(
             reason == "artefact" and region[1].start < b and a < region[1].stop
             for reason, region in cand.rejected
@@ -1199,6 +1275,7 @@ def _empty_lanes(res: _Pass, n: int, wc: int, pitch: float) -> None:
             ln.reason = "unassigned"
         elif full >= DETECT_K:
             ln.reason = "edge_signal"
+            ln.cut = float(s_cut[:, a:b].max()) / sig.sigma_sm >= DETECT_K
         else:
             ln.reason = "no_band"  # the snr tells how close it came
 
@@ -1333,6 +1410,19 @@ def detect_row(
         if margin < AMBIGUITY_MARGIN:
             flags.append("ambiguous_lanes")
 
+    # A band the row box cuts through: its extent reaches the box's top or
+    # bottom edge, and that edge row still holds CUT_LEVEL of its peak there;
+    # or, in an empty lane, it peaks on that edge row (_empty_lanes).
+    cut = {
+        i
+        for i, (ex0, ey0, ex1, ey1) in extents.items()
+        if any(
+            float(sig.s_sm[y, ex0:ex1].mean()) >= CUT_LEVEL * lanes[i].peak
+            for y, touches in ((0, ey0 <= 0), (hc - 1, ey1 >= hc))
+            if touches
+        )
+    } | {i for i, ln in enumerate(lanes) if ln.cut and i not in extents}
+
     # One shared size; bounded isotonic placement inside the row.
     size = None
     out: dict[int, Rect] = {}
@@ -1393,6 +1483,7 @@ def detect_row(
                 bg_offset=bg_offset,
                 components=ln.components if rect is not None else 0,
                 window=window,
+                cut=i in cut,
             )
         )
     if right_to_left:
@@ -1412,6 +1503,22 @@ def detect_row(
             f"{lanes_phrase(multiple)}: a second separate component reaches the "
             "detection level; the box covers the one with the lane's strongest pixel"
         )
+    if cut:
+        flags.append("cut_by_row_box")
+        notes.append(
+            f"{lanes_phrase(numbered(cut))}: the row box's top or bottom edge cuts through"
+            f" the band (the box's edge row holds at least {CUT_LEVEL:.0%} of its peak)"
+        )
+    # How far detection's membrane lies inside the bands, by the box's top and
+    # bottom rows (membrane_shift): the box-smoothed rows' means about the
+    # detection surface's mean level (a surface tilted by a light margin in the
+    # box would lie inside the membrane at one end), over the stage-1 pixel
+    # noise (neighbour differences, which a band taken into the stage-2 noise
+    # estimate does not inflate).
+    ky, kx = min(SMOOTH[0], hc), min(SMOOTH[1], wc)
+    smoothed = uniform_filter(crop, size=(ky, kx), mode="nearest").mean(axis=1)
+    rows = sign * (float(sig.plane.mean()) - smoothed) - sig.offset
+    ends = max(float(rows[0]), float(rows[-1]))
     return RowDetection(
         lanes=tuple(result),
         size=size,
@@ -1422,6 +1529,7 @@ def detect_row(
         notes=tuple(notes),
         cost=None if assign is None else float(assign.cost),
         margin=margin,
+        membrane_shift=min(-ends, float(rows.max()) - ends) / sigma_px,
     )
 
 
@@ -1435,6 +1543,7 @@ def settings() -> dict[str, JsonValue]:
         "extent_level": EXTENT_LEVEL,
         "size_rule": SIZE_RULE,
         "size_guard": SIZE_GUARD,
+        "cut_level": CUT_LEVEL,
         "smooth": list(SMOOTH),
         "min_width_px": MIN_WIDTH_PX,
         "min_width_pitch": MIN_WIDTH_PITCH,
@@ -1479,5 +1588,6 @@ def settings() -> dict[str, JsonValue]:
         "noise_floor_frac": NOISE_FLOOR_FRAC,
         "empty_window": EMPTY_WINDOW,
         "bg_warn_k": BG_WARN_K,
+        "membrane_shift_k": MEMBRANE_SHIFT_K,
         "min_box": MIN_BOX,
     }

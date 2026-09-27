@@ -248,6 +248,12 @@ def _translated(series: SeriesResult) -> dict:
     }
 
 
+# The sample's bands not checked for over-exposure (#112), one notice per
+# protein: those on its JPEG, and the flags the fixture leaves out on its 16-bit
+# images. With every lane included, only the JPEG's lanes change (lane 4 too).
+UNCHECKED = ["clipping_not_checked"] * 3
+
+
 @pytest.mark.parametrize(
     ("labels", "conditions", "tiers", "notices"),
     [
@@ -256,14 +262,14 @@ def _translated(series: SeriesResult) -> dict:
             ["vehicle", "vehicle", "10 µM", "10 µM"],
             (["vehicle"], ["vehicle", "10 µM"]),
             ("fold_change", "fold_change"),
-            ([], []),
+            (UNCHECKED, UNCHECKED[:1]),
         ),
         # The excluded lane is the reference condition's only lane.
         (
             ["10 µM", "10 µM", "50 µM", "vehicle"],
             (["10 µM"], ["10 µM", "vehicle"]),
             ("normalized", "fold_change"),
-            (["reference_all_excluded"], []),
+            ([*UNCHECKED, "reference_all_excluded"], UNCHECKED[:1]),
         ),
     ],
     ids=["only value of a condition", "only lane of the reference"],

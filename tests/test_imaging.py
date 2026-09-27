@@ -12,6 +12,7 @@ from skimage import io
 from proteia.core.imaging import (
     _Declared,
     _read_tiff_with_pillow,
+    clipping_depth,
     display_rgb,
     file_colours,
     from_pixels,
@@ -217,6 +218,39 @@ def test_pixels_in_memory_follow_the_same_rules():
     assert loaded.bit_depth is None
     assert _codes(loaded) == ["unknown_bit_depth"]
     assert _codes(from_pixels(_gray(np.uint8, 255), lossy=True)) == ["lossy_format"]
+
+
+def test_every_warning_that_turns_the_clipping_check_off_says_so(tmp_path):
+    # #112: the over-exposure check does not run on these images
+    # (clipping_depth), and each warning tells the user so.
+    rgb = np.zeros((4, 5, 3), dtype=np.uint8)
+    rgb[..., 0] = 200
+    loaded = [
+        from_pixels(_gray(np.uint8, 255), lossy=True),
+        from_pixels(rgb),
+        from_pixels(np.full((4, 6), 20.0)),
+    ]
+    warnings = [warning for image in loaded for warning in image.warnings]
+    assert [w.code for w in warnings] == [
+        "lossy_format",
+        "color_channels_differ",
+        "unknown_bit_depth",
+    ]
+    for image in loaded:
+        assert clipping_depth(image.bit_depth, image.warnings) is None
+    for warning in warnings:
+        assert "over-exposure cannot be checked" in warning.message, warning.code
+    path = tmp_path / "blot β.jpg"
+    io.imsave(path, _gray(np.uint8, 255), check_contrast=False)
+    (warning,) = load_image(path).warnings
+    assert warning.message == (
+        "JPEG-type compression can change pixel values, so over-exposure cannot be"
+        " checked; quantify an uncompressed or losslessly compressed original if you have it."
+    )
+    assert warnings[1].message == (
+        "The red, green and blue channels differ; they were averaged into one gray"
+        " channel, so over-exposure cannot be checked."
+    )
 
 
 def test_jpeg_compressed_tiff_records_a_lossy_format_warning(tmp_path):

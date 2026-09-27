@@ -48,6 +48,7 @@ class ApiError extends Error {
     this.status = status;
     this.code = body && body.code;
     this.ids = (body && body.ids) || [];
+    this.detail = (body && body.detail) || null; // why, when the refusal says (a row box's)
   }
 }
 
@@ -1046,7 +1047,7 @@ function lanesPhrase(indices) {
 // unless its place lies outside the row box.
 const NOT_MEASURED = {
   artefact: "a stain or streak",
-  edge_signal: "only a neighbouring row's signal",
+  edge_signal: "only signal at the row box's top or bottom edge",
   unassigned: "signal that fits no lane",
   no_band: "outside the row box",
 };
@@ -1068,6 +1069,16 @@ const ROW_WARNINGS = {
     note: "second separate component",
     words: (lanes) => `two bands in ${lanes || "a lane"}: the box covers the stronger one`,
   },
+  cut_by_row_box: {
+    note: "cuts through the band",
+    words: (lanes) => {
+      if (!lanes) {
+        return "the row box cuts through a band; include the whole band";
+      }
+      const bands = lanes.startsWith("lanes") ? "bands" : "band";
+      return `the row box cuts through the ${bands} in ${lanes}; include the whole ${bands}`;
+    },
+  },
 };
 
 function warningText(flag, notes) {
@@ -1080,10 +1091,35 @@ function warningText(flag, notes) {
   return warning.words(match ? match[1] : null);
 }
 
+// The other proteins on the image whose nets a row changed, in words, or
+// null: every ring leaves out every box on its image, so a new row moves the
+// local background, and the net, of the boxes already there.
+function remeasuredText(answer) {
+  const found = answer.remeasured
+    .map((entry) => findBox(answer.project, entry.band_id))
+    .filter(Boolean);
+  if (!found.length) {
+    return null;
+  }
+  const names = [...new Set(found.map((box) => box.protein.name))];
+  const who =
+    names.length === 1 ? `${names[0]} on this image was` : "other proteins on this image were";
+  const largest = answer.largest_change;
+  const where = largest && findBox(answer.project, largest.band_id);
+  if (!where) {
+    return `${who} re-measured`;
+  }
+  const percent = largest.change * 100;
+  const size = percent < 1 ? "under 1%" : `${Math.round(percent)}%`;
+  const whose = names.length === 1 ? "" : ` (${where.protein.name})`;
+  return `${who} re-measured; largest change ${size} in lane ${where.band.lane_index + 1}${whose}`;
+}
+
 // What a row did, lane by lane, from its answer (lanes numbered from 1): the
 // boxes placed, the lanes with no band (n.d.), those kept as they were, those
-// not measured and why, the boxes an earlier row placed that went, and the
-// detector's warnings. `before`: the state shown before, where those boxes are.
+// not measured and why, the boxes an earlier row placed that went, the
+// detector's warnings and the other proteins it re-measured. `before`: the
+// state shown before, where those boxes are.
 // Gives {text, check, unchanged}: `unchanged` when the row changed nothing (the
 // same drag again), `check` when it changed the project and left signal that
 // fits no lane, the mark of a row box over part of the row (its bands then
@@ -1148,6 +1184,10 @@ function rowReport(answer, name, before) {
   if (answer.right_to_left) {
     parts.push("lanes read right to left, as the boxes on this image run");
   }
+  const remeasured = remeasuredText(answer);
+  if (remeasured) {
+    parts.push(remeasured);
+  }
   const check = !unchanged && unmeasured.has("unassigned");
   if (check) {
     const all = answer.band_ids.length;
@@ -1161,7 +1201,9 @@ function rowReport(answer, name, before) {
   return { text: parts.join(" · "), check, unchanged };
 }
 
-// What to do about a refused row, by the refusal's code.
+// What to do about a refused row, by the refusal's code. A row the detector
+// saw bands in (a refusal whose detail names another cause than no_band)
+// already says what to do.
 const ROW_HINTS = {
   row_too_small: "Drag across the whole row, over every lane.",
   no_band_found: "Drag over a row of bands, or click a band to box one lane.",
@@ -1230,7 +1272,7 @@ function showRowRefusal(error, name) {
         run: () => takeStep("undo", { seq: step.seq }),
       };
     }
-  } else if (ROW_HINTS[error.code]) {
+  } else if (ROW_HINTS[error.code] && !(error.detail && error.detail.cause !== "no_band")) {
     sentences.push(ROW_HINTS[error.code]);
   }
   showStatus(sentences.join(" "), action);
