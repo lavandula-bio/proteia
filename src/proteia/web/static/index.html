@@ -27,6 +27,9 @@
     aria-keyshortcuts="Control+Shift+Z Control+Y Meta+Shift+Z">Redo</button>
   <span id="save-state" class="save-state" role="status"></span>
   <span class="spacer"></span>
+  <!-- A zip file to attach to a bug report (diagnostics.js); Proteia sends nothing. -->
+  <button id="diagnostics" type="button" hidden aria-haspopup="dialog"
+    title="Write a file to attach to a bug report: the session log, the versions and the open project's records. Proteia sends nothing.">Diagnostics…</button>
   <button id="quit" type="button" hidden>Quit Proteia</button>
 </header>
 
@@ -299,7 +302,47 @@
   </div>
   <p id="projects-state" class="hint" role="status" hidden></p>
   <p id="projects-error" class="error" role="alert"></p>
-  <button id="projects-close" type="button">Close</button>
+  <div class="projects-foot">
+    <!-- The header's Diagnostics… cannot be reached while this dialog is open. -->
+    <button id="projects-diagnostics" type="button" aria-haspopup="dialog"
+      title="Write a file to attach to a bug report: the session log, the versions and the open project's records. Proteia sends nothing.">Diagnostics…</button>
+    <span class="spacer"></span>
+    <button id="projects-close" type="button">Close</button>
+  </div>
+</dialog>
+
+<!-- The diagnostic file for a bug report (#138): diagnostics.js fills it. Before
+  the file is written it lists what the file will hold; the images only when
+  ticked. -->
+<dialog id="diagnostics-dialog" class="diagnostics-dialog" aria-labelledby="diagnostics-title">
+  <h2 id="diagnostics-title">Diagnostic file for a bug report</h2>
+  <p>Proteia writes one zip file for you to attach to your bug report, so the problem can be
+    traced. Proteia sends nothing anywhere: you attach the file yourself.</p>
+  <div id="diagnostics-content">
+    <p id="diagnostics-state" class="hint" role="status"></p>
+    <p class="subhead">The file will hold</p>
+    <ul id="diagnostics-summary" class="diagnostics-summary"></ul>
+    <label class="check"><input id="diagnostics-images" type="checkbox">
+      <span id="diagnostics-images-label">Include the project's images</span></label>
+    <div class="diagnostics-files">
+      <table class="diagnostics-table">
+        <caption class="sr-only">Every file the diagnostic file will hold, with its size</caption>
+        <thead><tr><th scope="col">File</th><th scope="col" class="size">Size</th></tr></thead>
+        <tbody id="diagnostics-files"></tbody>
+      </table>
+    </div>
+    <p id="diagnostics-total"></p>
+    <p id="diagnostics-left-out" class="hint"></p>
+  </div>
+  <div id="diagnostics-result" hidden>
+    <p id="diagnostics-written" role="status"></p>
+    <button id="diagnostics-reveal" type="button">Show in folder</button>
+  </div>
+  <p id="diagnostics-error" class="error" role="alert"></p>
+  <div class="actions diagnostics-actions">
+    <button id="diagnostics-write" type="button" disabled>Write file</button>
+    <button id="diagnostics-close" type="button">Cancel</button>
+  </div>
 </dialog>
 
 <!-- A chart card enlarged (Enlarge on a card); charts.js fills it. -->

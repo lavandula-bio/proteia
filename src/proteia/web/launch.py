@@ -37,7 +37,9 @@ Every launch writes its session log (:mod:`proteia.web.logs`) to the ``logs``
 folder there: when it started and stopped, and whether it served or opened the
 running instance. The token is concealed from it as soon as the launch makes or
 reads one, so neither the log nor the console ever shows it, nor the redirect
-page's address.
+page's address. The diagnostic files the page writes for bug reports, which
+take the newest session log files, go in the ``diagnostics`` folder there
+(:mod:`proteia.web.diagnostics`).
 """
 
 from __future__ import annotations
@@ -305,6 +307,8 @@ class Instance:
         self.workspace: Workspace = app.app.state.workspace
         if self.workspace.inbox.folder is None:  # held by this lock: no other instance uses it
             self.workspace.inbox.place(folder / INCOMING_DIR)
+        if self.workspace.state is None:  # the session log's, and the diagnostic files'
+            self.workspace.state = folder
         self.server = _server(app)
 
     def serve(self) -> None:

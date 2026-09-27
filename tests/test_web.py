@@ -563,6 +563,7 @@ def test_every_module_the_page_imports_is_served(running):
     assert seen == {
         "/static/app.js",
         "/static/charts.js",
+        "/static/diagnostics.js",
         "/static/dock.js",
         "/static/dom.js",
         "/static/lanes.js",
@@ -868,10 +869,16 @@ def test_a_refused_undo_or_redo_is_not_called_a_change():
         "undo": "Nothing was undone.",
         "redo": "Nothing was redone.",
         "export": "Nothing was exported.",
+        "diagnostics": "No diagnostic file was written.",
     }
     body = script[script.index("const REFUSED_AS = {") :].split("};", 1)[0]
     refused_as = dict(re.findall(r'"([^"]+)": "(\w+)"', body))
-    assert refused_as == {"/api/undo": "undo", "/api/redo": "redo", "/api/export": "export"}
+    assert refused_as == {
+        "/api/undo": "undo",
+        "/api/redo": "redo",
+        "/api/export": "export",
+        "/api/diagnostics": "diagnostics",
+    }
     posts = {route.path for route in api.router.routes if "POST" in route.methods}
     assert set(refused_as) <= posts
     assert "REFUSED_AS[path]" in _function(script, "function projectChanged(")[1]

@@ -56,6 +56,22 @@ results are shown with, and answers the folder, relative to the project folder
 with ``{"folder": "exports/<name>"}`` as the export answered it, that export
 folder.
 
+``GET /api/diagnostics`` lists what a diagnostic file for a bug report would
+hold now (:mod:`proteia.web.diagnostics`): the open project's name and open id
+(null when none is open), whether its changes are saved, the files it takes
+(``files``), the project's image files, taken only when asked for (``images``),
+each as ``{name, size}``, the files left out (``left_out``, each ``{name,
+size, reason}``), and ``digest``, of the project's files it lists. ``POST
+/api/diagnostics`` writes it, with ``{"images", "open_id", "digest"}``:
+whether to take the images, and the open id (null: none was open) and digest
+the list answered, so neither a project opened since nor a project file made
+since is ever written unlisted: another opening is refused as
+``project_changed``, or ``no_project``, and other files as ``files_changed``
+(the page lists again). It answers the
+file's ``name``, ``path`` and ``size``, how many files it holds and how many
+were left out. ``POST /api/diagnostics/reveal`` shows the folder it is written
+in. These read the open project if one is open, and work with none.
+
 Every route that reads or edits the open project takes an optional
 ``Proteia-Opening`` header (:data:`OPENING_HEADER`): the open id of the project
 the page shows, as its answers carry it. A request that names another opening
@@ -70,10 +86,14 @@ in, and no answer is about, an opening the request did not name. An upload
 (``POST /api/images``) is checked before any of its body is read, and again
 once the body is stored: only its import and answer run within the opening,
 so a file that takes minutes to arrive holds up no reopen, and an upload
-whose opening ended meanwhile is refused, with nothing imported. ``GET
+whose opening ended meanwhile is refused, with nothing imported. A diagnostic
+file (``POST /api/diagnostics``) is checked, and planned, within the opening,
+then written once the session is released: one that takes minutes (with the
+images) holds up no reopen either. ``GET
 /api/workspace`` answers which project is open, and its open id, without
 reading it: for a page to find out. The routes that list, create or open
-projects, and the status and quit routes, need no opening.
+projects, the status and quit routes, and the one that shows the diagnostics
+folder, need no opening.
 
 Images handed to the running app by a launch wait in the workspace's inbox
 (:mod:`proteia.web.handoff`) until the page imports or discards them. ``POST
@@ -101,7 +121,10 @@ Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
 refusal carries one (a row box's: what the detector saw); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
-``no_project`` 409 before a project is open; ``project_changed`` 409 for a
+``no_project`` 409 before a project is open; ``no_state_folder`` 409 for a
+diagnostic file when Proteia was served without its state folder, and
+``files_changed`` 409 for one whose project files are not those listed;
+``project_changed`` 409 for a
 request that names an opening no longer open, with ``detail`` ``{open,
 open_id}``: the open project's name and open id; ``invalid_input`` 422 for a
 request the routes cannot read, a ``Proteia-Opening`` not in plain digits too.
@@ -163,7 +186,7 @@ from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import handoff, logs, projects, sample_project
+from proteia.web import diagnostics, handoff, logs, projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.handoff import HandoffView, Inbox, Refusal
 from proteia.web.results_view import results_payload
@@ -188,12 +211,14 @@ class NoProjectError(RuntimeError):
 
 
 class ProjectChangedError(RuntimeError):
-    """A request names an opening of a project that is no longer the open one:
-    ``open`` (the open project's name) and ``open_id`` say which is."""
+    """A request names an opening of a project that is no longer the open one
+    (``named``; None: it names none, as a diagnostic file listed with no project
+    open does): ``open`` (the open project's name) and ``open_id`` say which is."""
 
-    def __init__(self, named: int, name: str, open_id: int) -> None:
+    def __init__(self, named: int | None, name: str, open_id: int) -> None:
+        which = "no opening" if named is None else f"opening {named}"
         super().__init__(
-            f"the request names opening {named}, but {name!r} is open now (opening {open_id}):"
+            f"the request names {which}, but {name!r} is open now (opening {open_id}):"
             " read the project again"
         )
         self.open = name
@@ -289,6 +314,17 @@ class FolderNotFoundError(LookupError):
     """No export folder of the open project has this name."""
 
 
+class NoStateFolderError(RuntimeError):
+    """Proteia was served without its per-user state folder (a launch gives it
+    one), so it has no session log to read and no diagnostics folder."""
+
+
+class FilesChangedError(RuntimeError):
+    """A diagnostic file would hold other project files than the page listed
+    (:meth:`proteia.web.diagnostics.Plan.digest`): made or removed since, in
+    the same opening."""
+
+
 @dataclass(frozen=True)
 class ResultSettings:
     """How the results are computed: the keyword arguments of
@@ -357,12 +393,16 @@ class Workspace:
         reveal: Callable[[Path], None],
         clock: Clock = utc_now,
         inbox: Inbox | None = None,
+        state: Path | None = None,
     ) -> None:
         self.root = root
         self.reveal = reveal
         self.clock = clock
         # Images handed to the app; a launch gives it its staging folder.
         self.inbox = Inbox() if inbox is None else inbox
+        # The per-user state folder, which holds the session log and the
+        # diagnostics folder; a launch gives it (proteia.web.launch).
+        self.state = state
         # Guards the open session, the open ids, the sessions in use, the reopen
         # under way, the settings, the previews and the results; never held while
         # computing. Taken before the chart store's own lock, never while holding it.
@@ -400,6 +440,19 @@ class Workspace:
             raise ProjectChangedError(opening, self._session.folder.name, self._open_id)
         return self._session
 
+    def current_any(self, opening: int | None = None) -> ProjectSession | None:
+        """:meth:`current`, for a request that reads the open project if there is
+        one: None when none is open and ``opening`` is None, as
+        :meth:`using_any` gives it; checked and answered under one lock."""
+        with self._lock:
+            return self._checked_any(opening)
+
+    def _checked_any(self, opening: int | None) -> ProjectSession | None:
+        """:meth:`current_any`'s answer. Called with the lock held."""
+        if self._session is None and opening is None:
+            return None
+        return self._checked(opening)
+
     @contextlib.contextmanager
     def using(self, opening: int | None = None) -> Iterator[ProjectSession]:
         """The open project's session, as :meth:`current` gives it, for a request
@@ -418,6 +471,40 @@ class Workspace:
             yield session
         finally:
             self._done(session)
+
+    @contextlib.contextmanager
+    def using_any(self, opening: int | None = None) -> Iterator[ProjectSession | None]:
+        """:meth:`using`, for a request that reads the open project if there is
+        one: None, and nothing in use, when none is open and the request names
+        no opening; checked and taken under one lock, as :meth:`using` does."""
+        with self._lock:
+            self._changed.wait_for(lambda: self._reopening is None)
+            session = self._checked_any(opening)
+            if session is not None:
+                self._in_use[session] = self._in_use.get(session, 0) + 1
+        try:
+            yield session
+        finally:
+            if session is not None:
+                self._done(session)
+
+    def opening_of(self, session: ProjectSession | None) -> int | None:
+        """The open id of ``session``, a session a request holds (:meth:`using`),
+        or None for none."""
+        if session is None:
+            return None
+        with self._lock:
+            return self._open_ids[session]
+
+    def state_folder(self) -> Path:
+        """The per-user state folder (:attr:`state`), or
+        :class:`NoStateFolderError` without one."""
+        if self.state is None:
+            raise NoStateFolderError(
+                "Proteia was started without its state folder: it has no session log and"
+                " nowhere to write a diagnostic file"
+            )
+        return self.state
 
     @contextlib.contextmanager
     def answering(self, session: ProjectSession) -> Iterator[None]:
@@ -976,6 +1063,15 @@ class RevealBody(_Body):
     folder: str  # an export folder as POST /api/export answered it: "exports/<name>"
 
 
+class DiagnosticsBody(_Body):
+    images: StrictBool = False  # take the project's image files too
+    # The open id GET /api/diagnostics answered, whose files the page listed;
+    # required, null when no project was open.
+    open_id: StrictInt | None
+    # The digest of the project's files it listed, as it answered it (a SHA-256).
+    digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
 class RefusedBody(_Body):
     """An argument a launch refused: its base name, a code and a message, taken
     as sent and bounded by the inbox (:meth:`~proteia.web.handoff.Refusal.bounded`)."""
@@ -1064,6 +1160,27 @@ def _checked_session(request: Request) -> ProjectSession:
 
 
 CheckedSession = Annotated[ProjectSession, Depends(_checked_session)]
+
+
+def _any_session(request: Request) -> Iterator[ProjectSession | None]:
+    """:func:`_open_session`, for a route that reads the open project if one is
+    open and works with none (the diagnostic file's): None when none is open
+    and the request names no opening (:meth:`Workspace.using_any`)."""
+    with _workspace(request).using_any(_opening(request)) as session:
+        yield session
+
+
+AnySession = Annotated[ProjectSession | None, Depends(_any_session, scope="function")]
+
+
+def _checked_any_session(request: Request) -> ProjectSession | None:
+    """:func:`_checked_session`, for a route that works with no project open
+    (:func:`write_diagnostics`): None when none is open and the request names
+    no opening, as :func:`_any_session` gives it. Checked as early, but not
+    taken in use: the route takes it in use itself, only while it needs it
+    (:meth:`Workspace.using_any`), checked again. A sync function, so it runs
+    in the thread pool and never blocks the event loop."""
+    return _workspace(request).current_any(_opening(request))
 
 
 def _no_other_opening(request: Request) -> int | None:
@@ -1710,6 +1827,98 @@ def export_bundle(
     )
 
 
+def _listed(items: Sequence[diagnostics.Item]) -> list[dict[str, Any]]:
+    return [{"name": item.name, "size": item.size} for item in items]
+
+
+@router.get("/diagnostics")
+def list_diagnostics(session: AnySession, workspace: WorkspaceDep) -> dict[str, Any]:
+    """What a diagnostic file written now would hold
+    (:func:`~proteia.web.diagnostics.plan`), for which opening, and the digest
+    of its project files: the page shows it before the file is written, and
+    names the opening and the digest when it asks."""
+    plan = diagnostics.plan(workspace.state_folder(), session)
+    return {
+        "project": plan.project,
+        "open_id": workspace.opening_of(session),
+        "saved": plan.saved,
+        "files": _listed(plan.items),
+        "images": _listed(plan.images),
+        "left_out": [
+            {"name": item.name, "size": item.size, "reason": item.reason} for item in plan.left_out
+        ],
+        "digest": plan.digest(),
+        "added": [diagnostics.README_FILE, diagnostics.MANIFEST_FILE],
+        "kept": diagnostics.KEPT,
+    }
+
+
+@router.post("/diagnostics", status_code=201, dependencies=[Depends(_checked_any_session)])
+def write_diagnostics(
+    request: Request, body: DiagnosticsBody, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Write a diagnostic file (:func:`~proteia.web.diagnostics.write`) in the
+    diagnostics folder of the state folder, with the project's image files if
+    ``images``; only for the opening the page listed (``open_id``), and only
+    while the project's files are those it listed (``digest``), so the file
+    holds no project, and no project file, the page did not show.
+
+    The opening the request names is checked as early as every other route's
+    (:func:`_checked_any_session`), but the session is in use only while the
+    file is planned (:meth:`Workspace.using_any`): the opening and the files
+    are checked then, and ``project.json`` read, within one opening. The plan
+    holds what the write needs (``project.json``'s bytes, the other files'
+    paths), so the file is written once the session is released, which with
+    the images may take minutes: a reopen meanwhile does not wait for it
+    (:meth:`Workspace.open`). A file the plan names that is removed meanwhile
+    is left out, and the manifest says why."""
+    opening = _opening(request)  # as _checked_any_session read it
+    with workspace.using_any(opening) as session:
+        open_id = workspace.opening_of(session)
+        if body.open_id != open_id:
+            if session is None or open_id is None:
+                raise NoProjectError("the page listed a project, but none is open now")
+            raise ProjectChangedError(body.open_id, session.folder.name, open_id)
+        state = workspace.state_folder()
+        plan = diagnostics.plan(state, session)
+        if plan.digest() != body.digest:
+            raise FilesChangedError(
+                "the project's files are not those listed (an export made or an image imported"
+                " or removed since): list them again"
+            )
+    written = diagnostics.write(
+        plan, state / diagnostics.DIAGNOSTICS_DIR, images=body.images, moment=workspace.clock()
+    )
+    project = "no project" if plan.project is None else repr(plan.project)
+    _log.info(
+        "wrote the diagnostic file %r: %d files, %d bytes, %d left out; %s%s",
+        written.path.name,
+        written.files,
+        written.size,
+        written.left_out,
+        project,
+        ", with its images" if body.images and plan.project is not None else "",
+    )
+    return {
+        "name": written.path.name,
+        "path": str(written.path),
+        "size": written.size,
+        "files": written.files,
+        "left_out": written.left_out,
+    }
+
+
+@router.post("/diagnostics/reveal", status_code=204)
+def reveal_diagnostics(workspace: WorkspaceDep) -> Response:
+    """Show the folder diagnostic files are written in, in the system file
+    manager (made if need be)."""
+    folder = workspace.state_folder() / diagnostics.DIAGNOSTICS_DIR
+    diagnostics.make_folder(folder)
+    workspace.reveal(folder)
+    _log.info("showed the diagnostics folder in the file manager")
+    return Response(status_code=204)
+
+
 @router.post("/undo")
 def undo(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, session, **_restored(ops.undo(session)))
@@ -1746,6 +1955,8 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         UnknownIdError: lambda e: _error(404, "unknown_id", str(e)),
         FolderNotFoundError: lambda e: _error(404, "folder_not_found", str(e)),
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
+        NoStateFolderError: lambda e: _error(409, "no_state_folder", str(e)),
+        FilesChangedError: lambda e: _error(409, "files_changed", str(e)),
         ProjectChangedError: lambda e: _error(
             409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
         ),
