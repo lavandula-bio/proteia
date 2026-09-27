@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for reading image files and rendering previews; files are generated here."""
 
+import dataclasses
+import functools
 import hashlib
 import itertools
 import os
@@ -12,15 +14,20 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, ImageDraw
 from skimage import io
 
+from conftest import synthetic_blot
+from proteia import samples
+from proteia.core import imaging
 from proteia.core.imaging import (
     UNTRUSTED_WARNINGS,
     WARNINGS,
+    LoadedImage,
     UnsupportedColourSpaceError,
     _Declared,
     _read_tiff_with_pillow,
+    assess_processed,
     clipping_depth,
     converts_cmyk,
     display_rgb,
@@ -31,9 +38,11 @@ from proteia.core.imaging import (
     preview,
     read_colours,
     read_pixels,
+    reads_as_palette,
     to_analysis_array,
 )
 from proteia.core.model import ImageKind, ImageRef, ImageWarning, Polarity, Project
+from proteia.core.quantify import estimate_background, near_limit_tolerance
 from proteia.core.storage import load_project, save_project, store_image
 
 
@@ -934,3 +943,370 @@ def test_a_jpeg_compressed_cmyk_tiff_is_lossy_and_converted(tmp_path):
     loaded = load_image(path)
     assert _codes(loaded) == ["lossy_format", "cmyk_converted", "color_channels_differ"]
     assert np.abs(loaded.array - rgb.mean(axis=-1)).max() <= 3
+
+
+# --- Processed figures (#127) ---
+
+
+@functools.cache
+def _sample_blot() -> np.ndarray:
+    """The 16-bit sample blot of proteia.samples: a raw-like scan."""
+    return samples.render_blot().pixels
+
+
+def _blot8() -> np.ndarray:
+    return np.round(_sample_blot() / 257).astype(np.uint8)
+
+
+def _over_exposed() -> np.ndarray:
+    """The sample blot exposed three times as long: its band cores cut at 0."""
+    over = 3.0 * _sample_blot() - 2.0 * samples.MEMBRANE
+    return np.round(np.clip(over, 0, 65535)).astype(np.uint16)
+
+
+def _white_clipped() -> np.ndarray:
+    """The 8-bit sample blot with its levels set for a figure: the white point
+    below most of the membrane, so its background is pure white."""
+    blot = _blot8().astype(float)
+    white = np.percentile(blot, 30)
+    return np.clip(np.round((blot - 20) / (white - 20) * 255), 0, 255).astype(np.uint8)
+
+
+def _figure(canvas: int = 255) -> Image.Image:
+    """An annotated figure (8-bit gray): a blot panel and a strip below it on a
+    canvas, with black frames, a rule and labels."""
+    blot = Image.fromarray(_blot8())
+    image = Image.new("L", (700, 720), canvas)
+    image.paste(blot.crop((130, 40, 1150, 360)).resize((520, 380)), (130, 170))
+    image.paste(blot.crop((130, 300, 1150, 380)).resize((400, 60)), (130, 600))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((129, 169, 650, 550), outline=0, width=2)
+    draw.rectangle((129, 599, 530, 660), outline=0, width=3)
+    draw.line((140, 55, 640, 55), fill=0, width=3)
+    for i, label in enumerate(("(A)", "control", "a", "b", "kDa", "250", "(B)", "WB")):
+        draw.text((10 + 80 * i, 20 + 60 * (i % 2)), label, fill=0)
+    return image
+
+
+def _screenshot() -> np.ndarray:
+    """A screenshot of a viewer showing the blot (RGB): a title bar, a toolbar, a
+    side panel listing files, a status bar, and white around the blot."""
+    image = Image.new("RGB", (1280, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 1280, 32), fill=(32, 96, 200))
+    draw.rectangle((0, 32, 1280, 72), fill=(240, 240, 240))
+    draw.rectangle((0, 72, 220, 800), fill=(248, 248, 248))
+    for i in range(20):
+        draw.text((12, 90 + 30 * i), f"blot {i}.tif  1200 x 500", fill=(0, 0, 0))
+    image.paste(Image.fromarray(_blot8()).resize((960, 400)).convert("RGB"), (240, 90))
+    draw.rectangle((0, 776, 1280, 800), fill=(230, 230, 230))
+    return np.asarray(image)
+
+
+def _signals(loaded) -> list[str]:
+    """The signals a looks_processed warning names; empty without one."""
+    found = [w.message for w in loaded.warnings if w.code == "looks_processed"]
+    if not found:
+        return []
+    (message,) = found
+    prefix = "This looks like a processed figure rather than a raw scan: "
+    assert message.startswith(prefix)
+    return message[len(prefix) : message.index(". Its background")].split("; ")
+
+
+def _levels(counts: dict[int, int], dtype=np.uint8) -> np.ndarray:
+    """A one-row image holding each level as many times as its count says."""
+    return np.repeat(np.array(list(counts), dtype=dtype), list(counts.values()))[None, :]
+
+
+_SIGNAL_WORDS = {
+    "median": "its median level, the image-wide background, is",
+    "share": "of its pixels are",
+    "palette": "it is a palette image",
+}
+
+
+def _kinds(signals: list[str]) -> set[str]:
+    return {kind for kind, words in _SIGNAL_WORDS.items() if any(words in s for s in signals)}
+
+
+_TEST_BANDS = [(x, 30, 5.0, 3.0, 30000.0) for x in (50, 120, 190, 260, 330)]
+
+
+DARK, LIGHT = Polarity.DARK_ON_LIGHT, Polarity.LIGHT_ON_DARK
+
+
+def _imported(loaded: LoadedImage, polarity: Polarity = DARK) -> LoadedImage:
+    """``loaded`` with the warnings an import with ``polarity`` records: its own,
+    and looks_processed assessed against the median the import stores."""
+    warnings = assess_processed(
+        loaded.warnings,
+        loaded.array,
+        loaded.bit_depth,
+        dark_on_light=polarity.dark_on_light,
+        background=estimate_background(loaded.array),
+        palette=loaded.palette,
+    )
+    return dataclasses.replace(loaded, warnings=warnings)
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "options", "polarity"),
+    [
+        ("sample blot 16-bit.tif", _sample_blot, {}, DARK),
+        ("sample marker 8-bit.tif", samples.render_marker, {}, DARK),
+        ("sample blot 16-bit.png", _sample_blot, {}, DARK),
+        ("sample blot 8-bit.png", _blot8, {}, DARK),
+        ("sample blot 8-bit.jpg", _blot8, {"quality": 75}, DARK),
+        ("sample blot rgb.jpg", lambda: np.dstack([_blot8()] * 3), {"quality": 90}, DARK),
+        ("light on dark 16-bit.tif", lambda: 65535 - _sample_blot(), {}, LIGHT),
+        ("light on dark 8-bit.jpg", lambda: 255 - _blot8(), {"quality": 90}, LIGHT),
+        # Saturation lies at the other end of the range from the background.
+        ("over-exposed 16-bit.tif", _over_exposed, {}, DARK),
+        ("over-exposed light on dark.tif", lambda: 65535 - _over_exposed(), {}, LIGHT),
+        (
+            "over-exposed 8-bit.jpg",
+            lambda: np.round(_over_exposed() / 257).astype(np.uint8),
+            {},
+            DARK,
+        ),
+        ("test blot 16-bit.tif", lambda: synthetic_blot((60, 400), _TEST_BANDS), {}, DARK),
+        (
+            "test blot 8-bit.tif",
+            lambda: (synthetic_blot((60, 400), _TEST_BANDS) // 257).astype(np.uint8),
+            {},
+            DARK,
+        ),
+        # Raw 8-bit data as a palette: a palette PNG, and an ImageJ lookup table.
+        ("sample blot palette.png", lambda: Image.fromarray(_blot8()).convert("P"), {}, DARK),
+        (
+            "sample blot lut.tif",
+            _blot8,
+            {"photometric": "palette", "colormap": _palette_map()},
+            DARK,
+        ),
+        (
+            "sample marker lut.tif",
+            samples.render_marker,
+            {"photometric": "palette", "colormap": _palette_map()},
+            DARK,
+        ),
+        # Noise-free, its bands' flanks leave levels empty, as a reduced palette does.
+        (
+            "test blot lut.tif",
+            lambda: (synthetic_blot((60, 400), _TEST_BANDS) // 257).astype(np.uint8),
+            {"photometric": "palette", "colormap": _palette_map()},
+            DARK,
+        ),
+    ],
+)
+def test_a_raw_like_scan_does_not_look_processed(tmp_path, name, make, options, polarity):
+    path = _write(tmp_path / f"µ {name}", make(), **options)
+    assert "looks_processed" not in _codes(_imported(load_image(path), polarity))
+
+
+@pytest.mark.parametrize(
+    ("name", "make", "options", "polarity", "kinds"),
+    [
+        ("white clipped.png", _white_clipped, {}, DARK, {"median", "share"}),
+        (
+            "white clipped 16-bit.tif",
+            lambda: _white_clipped().astype(np.uint16) * 257,
+            {},
+            DARK,
+            {"median", "share"},
+        ),
+        ("white clipped.jpg", _white_clipped, {"quality": 90}, DARK, {"median", "share"}),
+        (
+            "white clipped rgb.jpg",
+            lambda: np.dstack([_white_clipped()] * 3),
+            {"quality": 75},
+            DARK,
+            {"median", "share"},
+        ),
+        # Levelled the other way round: a light-on-dark figure's black background.
+        ("black clipped.png", lambda: 255 - _white_clipped(), {}, LIGHT, {"median", "share"}),
+        ("figure.png", lambda: _figure().quantize(128), {}, DARK, {"median", "share", "palette"}),
+        ("figure on grey.png", lambda: _figure(230).quantize(128), {}, DARK, {"palette"}),
+        (
+            "figure.jpg",
+            lambda: _figure().convert("RGB"),
+            {"quality": 85},
+            DARK,
+            {"median", "share"},
+        ),
+        ("screenshot.png", _screenshot, {}, DARK, {"share"}),
+        ("screenshot.jpg", _screenshot, {"quality": 90}, DARK, {"share"}),
+    ],
+)
+def test_a_processed_figure_looks_processed(tmp_path, name, make, options, polarity, kinds):
+    path = _write(tmp_path / f"µ {name}", make(), **options)
+    loaded = _imported(load_image(path), polarity)
+    assert "looks_processed" in _codes(loaded)
+    assert _kinds(_signals(loaded)) == kinds
+
+
+def test_the_warning_names_the_signals_that_fired():
+    loaded = _imported(from_pixels(_levels({200: 400, 255: 600}), palette=True))
+    assert _codes(loaded) == ["looks_processed"]
+    assert loaded.warnings[0].message == (
+        "This looks like a processed figure rather than a raw scan: its median level, the"
+        " image-wide background, is pure white; 60% of its pixels are pure white; it is a"
+        " palette image using only 2 of the 56 grey levels in its range. Its background may"
+        " then not be the membrane, and over-exposure may be hidden; quantify the original"
+        " scan if you have it."
+    )
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_a_tenth_of_the_pixels_at_the_limit_looks_processed(dtype):
+    top = np.iinfo(dtype).max
+    membrane = top * 3 // 4
+    assert _signals(_imported(from_pixels(_levels({membrane: 900, top: 100}, dtype)))) == [
+        "10% of its pixels are pure white"
+    ]
+    assert _codes(_imported(from_pixels(_levels({membrane: 901, top: 99}, dtype)))) == []
+    # A light-on-dark image's background is at the other end.
+    dark = _levels({top // 4: 900, 0: 100}, dtype)
+    assert _signals(_imported(from_pixels(dark), LIGHT)) == ["10% of its pixels are pure black"]
+    assert _codes(_imported(from_pixels(_levels({top // 4: 901, 0: 99}, dtype)), LIGHT)) == []
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_saturated_bands_at_the_other_end_never_count_whichever_half_the_median_is_in(dtype):
+    # The limit is the background's end of the range, from the polarity: an
+    # over-exposed band sits at the other end, and its pixels never count, even
+    # where the median falls in the bands' half of the range (a 16-bit membrane
+    # below mid-range, a crop the bands fill).
+    top = np.iinfo(dtype).max
+    for membrane, share in ((top * 3 // 4, 400), (top // 4, 400), (top * 3 // 4, 650)):
+        dark_on_light = _levels({membrane: 1000 - share, 0: share}, dtype)
+        assert _codes(_imported(from_pixels(dark_on_light), DARK)) == []
+        light_on_dark = _levels({top - membrane: 1000 - share, top: share}, dtype)
+        assert _codes(_imported(from_pixels(light_on_dark), LIGHT)) == []
+    # Under the wrong polarity they do: a polarity change assesses it again.
+    wrong = _imported(from_pixels(_levels({top // 4: 600, 0: 400}, dtype)), LIGHT)
+    assert _signals(wrong) == ["40% of its pixels are pure black"]
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_a_median_at_the_limit_is_named(dtype):
+    # It never decides alone: half the pixels at the limit, which the share counts.
+    top = np.iinfo(dtype).max
+    at = _imported(from_pixels(_levels({top - 1: 499, top: 501}, dtype)))
+    assert _signals(at) == [
+        "its median level, the image-wide background, is pure white",
+        "50% of its pixels are pure white",
+    ]
+    below = from_pixels(_levels({top - 1: 501, top: 499}, dtype))  # its median is top - 1
+    assert _kinds(_signals(_imported(below))) == {"share"}
+    dark = _imported(from_pixels(_levels({1: 499, 0: 501}, dtype)), LIGHT)
+    assert _signals(dark)[0] == "its median level, the image-wide background, is pure black"
+
+
+@pytest.mark.parametrize(("dtype", "depth"), [(np.uint8, 8), (np.uint16, 16)])
+def test_where_the_exact_check_is_off_near_the_limit_counts(dtype, depth):
+    # Compression, colour averaged into gray and CMYK conversion move values off
+    # the limit: there it takes the possible over-exposure check's tolerance.
+    top = np.iinfo(dtype).max
+    near = round(near_limit_tolerance(depth))  # 2 at 8 bits, 514 at 16
+    membrane = top * 3 // 4
+    close = _levels({membrane: 900, top - near: 100}, dtype)
+    assert _codes(_imported(from_pixels(close))) == []  # the exact check runs: not at the limit
+    lossy = _imported(from_pixels(close, lossy=True))
+    assert _codes(lossy) == ["lossy_format", "looks_processed"]
+    assert _signals(lossy) == ["10% of its pixels are at or near pure white"]
+    farther = _levels({membrane: 900, top - near - 1: 100}, dtype)
+    assert _codes(_imported(from_pixels(farther, lossy=True))) == ["lossy_format"]
+    # Colour: white with less blue averages to near white.
+    rgb = np.repeat(close[..., None], 3, axis=-1)
+    rgb[0, -100:] = (top, top, top - 3 * near)
+    assert _codes(_imported(from_pixels(rgb))) == ["color_channels_differ", "looks_processed"]
+
+
+def test_an_unknown_bit_depth_has_no_limit_to_be_at():
+    assert _codes(_imported(from_pixels(np.full((10, 10), 1.0)))) == ["unknown_bit_depth"]
+
+
+def test_assessing_again_replaces_the_warning_and_keeps_the_others_first():
+    pixels = _levels({200: 400, 255: 600})
+    loaded = _imported(from_pixels(pixels, lossy=True))
+    assert _codes(loaded) == ["lossy_format", "looks_processed"]
+    white = loaded.warnings[1]
+    unmoved = dataclasses.replace(loaded, warnings=[white, loaded.warnings[0]])
+    assert _imported(unmoved).warnings == [loaded.warnings[0], white]  # one, and last
+    assert _codes(_imported(loaded, LIGHT)) == ["lossy_format"]  # nothing at 0: dropped
+
+
+def test_a_palette_using_fewer_than_three_in_four_levels_of_its_range_looks_processed():
+    def image(used: int) -> np.ndarray:  # levels 0 to 99, each used one 40 times
+        levels = np.round(np.linspace(0, 99, used)).astype(int)
+        assert len(set(levels)) == used
+        return _levels(dict.fromkeys(levels.tolist(), 40))
+
+    assert _codes(_imported(from_pixels(image(75), palette=True))) == []  # 75 of 100: 3 in 4
+    assert _signals(_imported(from_pixels(image(74), palette=True))) == [
+        "it is a palette image using only 74 of the 100 grey levels in its range"
+    ]
+    assert _codes(_imported(from_pixels(image(74)))) == []  # few levels alone: not a palette
+
+
+def test_a_palettes_range_leaves_out_its_darkest_and_lightest_specks(tmp_path):
+    # A raw 8-bit scan saved as a palette with a black and a white speck: its
+    # range is the membrane's and the bands', where it uses every level.
+    blot = _blot8().copy()
+    blot[0, :2] = (0, 255)
+    path = _write(tmp_path / "specks.png", Image.fromarray(blot).convert("P"))
+    assert _codes(_imported(load_image(path))) == []
+
+
+def test_only_a_palette_read_as_its_colours_is_assessed_as_one(tmp_path):
+    # Every other gray level: a palette PNG reads as those levels, its colours.
+    even = _levels(dict.fromkeys(range(0, 255, 2), 20))
+    png = _write(tmp_path / "even levels.png", Image.fromarray(even).convert("P"))
+    assert load_image(png).palette and reads_as_palette(png)
+    assert _signals(_imported(load_image(png))) == [
+        "it is a palette image using only 128 of the 255 grey levels in its range"
+    ]
+    gray = _write(tmp_path / "even levels gray.png", even)
+    assert not reads_as_palette(gray)
+    assert _codes(_imported(load_image(gray))) == []
+    # A palette TIFF reads as its indices, a scan's own values when ImageJ
+    # saves one with a lookup table: not assessed.
+    options = {"photometric": "palette", "colormap": _palette_map(gray=True)}
+    tiff = _write(tmp_path / "even levels.tif", even, **options)
+    assert not load_image(tiff).palette and not reads_as_palette(tiff)
+    assert _codes(_imported(load_image(tiff))) == []
+    damaged = tmp_path / "damaged µ.png"
+    damaged.write_bytes(png.read_bytes()[:40])
+    with pytest.raises((ValueError, OSError)):
+        reads_as_palette(damaged)
+
+
+def test_looking_processed_changes_no_analysis():
+    # A warning only: the over-exposure check stays exact on the pixels the
+    # file holds, and the analysis array is the file's.
+    pixels = _white_clipped()
+    loaded = _imported(from_pixels(pixels))
+    assert _codes(loaded) == ["looks_processed"]
+    assert "looks_processed" not in UNTRUSTED_WARNINGS
+    assert clipping_depth(loaded.bit_depth, loaded.warnings) == 8
+    assert possible_clipping_depth(loaded.bit_depth, loaded.warnings) is None
+    np.testing.assert_array_equal(loaded.array, pixels.astype(np.float64))
+
+
+def test_reading_an_image_does_not_assess_whether_it_looks_processed(tmp_path, monkeypatch):
+    # Only an import and a polarity change assess it, with the image's polarity
+    # and the median the import stores; every other read (a reopened project's
+    # pixels, a re-quantification, a preview) keeps only the array, so it takes
+    # no median and counts nothing.
+    def refused(*args, **kwargs):
+        raise AssertionError("assessed on a read")
+
+    monkeypatch.setattr(imaging, "processed_signals", refused)
+    monkeypatch.setattr(np, "median", refused)
+    figure = Image.fromarray(_white_clipped()).convert("P")
+    loaded = load_image(_write(tmp_path / "figure µ.png", figure))
+    assert _codes(loaded) == []
+    assert loaded.palette  # for the import to assess
+    assert not load_image(_write(tmp_path / "figure µ.tif", _white_clipped())).palette

@@ -20,7 +20,11 @@ YCbCr, ...) is refused with the colour space's name rather than read wrong.
 sets the detector limit for the over-exposure check. Other pixel types (float,
 32-bit) have no fixed limit, so their depth is ``None`` and the import records a
 warning. Problems found on import become :class:`~proteia.core.model.ImageWarning`
-records, which the project keeps with the image.
+records, which the project keeps with the image. One of them, ``looks_processed``
+(#127), says that the image looks like a figure prepared for display rather than
+a raw scan, and why; it is a warning only, and changes no analysis. It depends on
+the image's polarity, so reading a file does not assess it: the import does
+(:func:`assess_processed`), and a polarity change assesses it again.
 
 For display only, :func:`read_colours` reads a file in its own colours, and
 :func:`file_colours` says from the header whether it has colour to show.
@@ -34,13 +38,13 @@ import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import numpy as np
 import tifffile
 
 from proteia.core.model import ImageWarning
-from proteia.core.quantify import to_grayscale
+from proteia.core.quantify import near_limit_tolerance, to_grayscale
 
 TIFF_SUFFIXES = (".tif", ".tiff")
 LOSSY_SUFFIXES = (".jpg", ".jpeg", ".jpe", ".jfif")
@@ -74,9 +78,11 @@ _COLOUR_SPACES = {
 # The TIFF tags that say which inks a separated image holds (defaults: CMYK, 4).
 _INK_SET, _NUMBER_OF_INKS, _INK_SET_CMYK = 332, 334, 1
 
-# Warning codes and messages recorded on import. Each turns the over-exposure
-# check off (clipping_depth), and its message says so. The cmyk_converted
-# message names how the colours were converted: one of CMYK_CONVERSIONS.
+# Warning codes and messages recorded on import. Each but looks_processed turns
+# the over-exposure check off (clipping_depth), and its message says so. The
+# cmyk_converted message names how the colours were converted: one of
+# CMYK_CONVERSIONS; the looks_processed message names the signals that fired
+# (processed_signals), joined by semicolons.
 WARNINGS = {
     "lossy_format": (
         "JPEG-type compression can change pixel values, so over-exposure cannot be"
@@ -93,6 +99,11 @@ WARNINGS = {
         "The file's colours are CMYK: they were converted to red, green and blue {how},"
         " then to gray. Values from a converted file are approximate, so over-exposure"
         " cannot be checked."
+    ),
+    "looks_processed": (
+        "This looks like a processed figure rather than a raw scan: {signals}. Its"
+        " background may then not be the membrane, and over-exposure may be hidden;"
+        " quantify the original scan if you have it."
     ),
 }
 # How a CMYK file's colours were converted, as its cmyk_converted warning says.
@@ -115,6 +126,15 @@ _CMYK_CHANNELS_DIFFER = (
 # possible_clipping_depth assess it). results names each in its
 # clipping_not_checked and possibly_clipped notices (_UNCHECKED_WARNINGS, kept
 # in step by a test), so a code added here needs a reason there.
+# looks_processed is not one of them (#127). Levelling a figure's background to
+# white moves the background onto a limit, not the bands, and on a lossless file
+# the exact check still counts the band pixels the file holds at the limit (a
+# lossy, colour or CMYK file is distrusted by its own warning already). The
+# warning is a heuristic that also fires on some raw images (a dark background
+# the imager cut at zero, a marker photo's white membrane), whose exact check it
+# would weaken. A known limit: a palette reduced to few colours can move a
+# saturated core a level or two off the limit, which the exact check then
+# misses; the warning says that over-exposure may be hidden.
 UNTRUSTED_WARNINGS = frozenset({"lossy_format", "color_channels_differ", "cmyk_converted"})
 
 
@@ -131,6 +151,9 @@ class LoadedImage:
     pixels: np.ndarray
     bit_depth: int | None  # container depth of unsigned integer data; None otherwise
     warnings: list[ImageWarning] = field(default_factory=list)
+    # Whether the pixels are a palette's colours (a palette PNG), whose levels
+    # the import assesses (assess_processed).
+    palette: bool = False
 
     @property
     def height(self) -> int:
@@ -364,26 +387,33 @@ def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
     return _read(Path(path))[0]
 
 
-def _read(path: Path) -> tuple[np.ndarray, bool, str | None]:
-    """Read a file: its pixels, whether it is lossy, and how its CMYK was converted
-    (None if it is not CMYK); every failure to read it becomes a ``ValueError`` or
-    ``OSError``."""
+def _read(path: Path) -> tuple[np.ndarray, bool, str | None, bool]:
+    """Read a file: its pixels, whether it is lossy, how its CMYK was converted
+    (None if it is not CMYK), and whether its pixels are a palette's colours (a
+    palette PNG; a palette TIFF reads as its indices); every failure to read it
+    becomes a ``ValueError`` or ``OSError``."""
     try:
         if path.suffix.lower() in TIFF_SUFFIXES:
             pixels, lossy, cmyk = _read_tiff(path)
+            palette = False
         else:
-            pixels, cmyk = _read_other(path)
+            pixels, cmyk, palette = _read_other(path)
             lossy = path.suffix.lower() in LOSSY_SUFFIXES
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, SyntaxError from Pillow, ...
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     _check_layout(pixels, path.name)
-    return pixels, lossy, cmyk
+    return pixels, lossy, cmyk, palette
 
 
-def _read_other(path: Path) -> tuple[np.ndarray, str | None]:
-    """The pixels of a file that is not a TIFF, and how its CMYK was converted.
+# Pillow's modes of a palette image, which reads as its palette's colours.
+_PALETTE_MODES = frozenset({"P", "PA"})
+
+
+def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
+    """The pixels of a file that is not a TIFF, how its CMYK was converted, and
+    whether it is a palette image (its pixels are the palette's colours).
 
     A CMYK JPEG is decoded by Pillow, which reads an Adobe JPEG's inverted inks
     the right way up, and converted with the ICC profile it embeds, if any;
@@ -395,6 +425,7 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None]:
         # Local files the user chose: Pillow's size guard is for untrusted input.
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
         with Image.open(path) as image:
+            palette = image.mode in _PALETTE_MODES
             if image.mode == "CMYK":
                 inks, profile = np.asarray(image), image.info.get("icc_profile")
             else:
@@ -402,8 +433,9 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None]:
     if inks is None:
         from skimage import io
 
-        return io.imread(path), None
-    return _cmyk_to_rgb(inks, profile)
+        return io.imread(path), None, palette
+    rgb, how = _cmyk_to_rgb(inks, profile)
+    return rgb, how, False
 
 
 def converts_cmyk(path: str | os.PathLike[str]) -> bool:
@@ -421,6 +453,22 @@ def converts_cmyk(path: str | os.PathLike[str]) -> bool:
                     raise ValueError(f"{path.name}: holds no image")
                 return _holds_cmyk(tif.series[0].keyframe, path.name)
         return _pillow_mode(path) == "CMYK"
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+
+
+def reads_as_palette(path: str | os.PathLike[str]) -> bool:
+    """Whether reading the file gives a palette's colours
+    (:attr:`LoadedImage.palette`), from its header alone: a palette PNG, or any
+    other file Pillow opens as a palette; a TIFF's palette reads as its indices.
+    A file it cannot read raises ``ValueError`` or ``OSError``."""
+    path = Path(path)
+    if path.suffix.lower() in TIFF_SUFFIXES:
+        return False
+    try:
+        return _pillow_mode(path) in _PALETTE_MODES
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
@@ -477,10 +525,146 @@ def bit_depth_of(pixels: np.ndarray) -> int | None:
     return _BIT_DEPTHS.get(pixels.dtype)
 
 
-def from_pixels(pixels: np.ndarray, *, lossy: bool = False, cmyk: str | None = None) -> LoadedImage:
+# The looks_processed warning (#127): signals that an image was prepared for
+# display (levels, labels, a palette reduced to fewer colours) rather than
+# exported raw by the imager. The thresholds lie between synthetic raw-like
+# scans and processed figures, as measured for #127. A raw scan keeps its
+# background off the limit: no pixel is at the background's limit in the
+# samples' blot and marker, the test blots, their JPEG and light-on-dark
+# versions, or a scan over-exposed three times over (its saturation lies at the
+# other end, which the polarity tells apart), and 3 % in a light-on-dark scan
+# whose background the imager cut at zero. Figures levelled to a white
+# background, annotated figures and screenshots put 17-96 % of their pixels
+# there. A raw 8-bit scan saved as a palette PNG uses every grey level in its
+# range; a figure's palette reduced to 128 colours uses about half of them.
+PROCESSED_SHARE: Final = 0.10  # of the pixels, at the background's limit
+PROCESSED_LEVELS: Final = 0.75  # of the grey levels in a palette image's range
+# The darkest and the lightest share of a palette image's pixels left out of its
+# range, so that a speck of dust or a label does not stretch it.
+_RANGE_TRIM: Final = 0.005
+
+
+def processed_signals(
+    array: np.ndarray,
+    bit_depth: int | None,
+    *,
+    dark_on_light: bool,
+    background: float,
+    near: float = 0.0,
+    palette: bool = False,
+) -> list[str]:
+    """What makes an image look like a processed figure rather than a raw scan
+    (#127), each as the ``looks_processed`` warning words it; empty if nothing.
+
+    * Its image-wide background, the median ``background`` the import stores
+      (:func:`~proteia.core.quantify.estimate_background`), is at the limit. It
+      never decides alone: a median at the limit puts half the pixels there,
+      which the next signal counts; it says that the stored background is the
+      limit rather than the membrane.
+    * :data:`PROCESSED_SHARE` or more of its pixels are at the limit.
+    * It is a palette image whose pixels are the palette's colours
+      (``palette``: a palette PNG) that uses fewer than :data:`PROCESSED_LEVELS`
+      of the grey levels (rounded) in its range, which leaves out its darkest and
+      its lightest :data:`_RANGE_TRIM` of pixels: a palette reduced to fewer
+      colours leaves gaps between its levels, where a raw scan's noise fills
+      every one. A count alone could not tell them apart: a raw 8-bit scan may
+      span fewer levels than a figure's palette holds. A palette TIFF is not
+      assessed: it reads as its indices, the scan's own values when ImageJ
+      saves a scan with a lookup table. A scan with no noise to fill its levels
+      leaves gaps in its bands' sparse flanks too, so a noise-free synthetic
+      blot saved as a palette PNG is flagged (a known limit).
+
+    The limit is the background's end of the value range, from the polarity:
+    the top (white) for dark bands on a light background (``dark_on_light``),
+    else 0 (black). A saturated band lies at the other end, so it never counts,
+    whichever half of the range the median falls in (a 16-bit membrane below
+    mid-range, a crop that a saturated band fills); under the wrong polarity it
+    does, and a polarity change assesses the image again. A value within
+    ``near`` of the limit counts as at it: 0 where the exact over-exposure check
+    runs, and :func:`~proteia.core.quantify.near_limit_tolerance` where
+    compression, colour or a CMYK conversion moved values off it, as the
+    possible check counts them. With an unknown bit depth there is no limit:
+    only a palette is assessed. It takes no median: one count over the pixels,
+    and a palette image's levels.
+    """
+    signals = []
+    if bit_depth is not None and array.size:
+        top = 2**bit_depth - 1
+        at = "pure white" if dark_on_light else "pure black"
+        if near:
+            at = f"at or near {at}"
+        if (background >= top - near) if dark_on_light else (background <= near):
+            signals.append(f"its median level, the image-wide background, is {at}")
+        count = np.count_nonzero((array >= top - near) if dark_on_light else (array <= near))
+        if count >= PROCESSED_SHARE * array.size:
+            signals.append(f"{_percent(count / array.size)} of its pixels are {at}")
+    if palette and array.size:
+        used, spanned = _levels_in_range(array)
+        if used < PROCESSED_LEVELS * spanned:
+            levels = f"{used} of the {spanned} grey levels in its range"
+            signals.append(f"it is a palette image using only {levels}")
+    return signals
+
+
+def assess_processed(
+    warnings: Iterable[ImageWarning],
+    array: np.ndarray,
+    bit_depth: int | None,
+    *,
+    dark_on_light: bool,
+    background: float,
+    palette: bool = False,
+) -> list[ImageWarning]:
+    """An image's import ``warnings`` with its ``looks_processed`` warning
+    assessed for the polarity ``dark_on_light`` (:func:`processed_signals`):
+    added, replaced or dropped, and last of them. ``array``, ``bit_depth`` and
+    ``palette`` are the image's reading (:class:`LoadedImage`), ``background``
+    its stored median. The import assesses it, and a polarity change again; no
+    other reading of the file does, so a read keeping only the array pays nothing
+    for it."""
+    kept = [warning for warning in warnings if warning.code != "looks_processed"]
+    near_depth = possible_clipping_depth(bit_depth, kept)  # set where the exact check is off
+    near = 0.0 if near_depth is None else near_limit_tolerance(near_depth)
+    signals = processed_signals(
+        array,
+        bit_depth,
+        dark_on_light=dark_on_light,
+        background=background,
+        near=near,
+        palette=palette,
+    )
+    if signals:
+        kept.append(_warning("looks_processed", signals="; ".join(signals)))
+    return kept
+
+
+def _percent(share: float) -> str:
+    """A share as a whole percentage; 100 % only for all."""
+    return f"{min(round(share * 100), 99) if share < 1 else 100}%"
+
+
+def _levels_in_range(array: np.ndarray) -> tuple[int, int]:
+    """How many grey levels (rounded) an image uses in its range, and how many
+    the range spans: from the level that holds its darkest :data:`_RANGE_TRIM`
+    of pixels to the one that holds its lightest."""
+    levels = np.rint(array).astype(np.int64).ravel()
+    lowest = int(levels.min())
+    counts = np.bincount(levels - lowest)
+    at_or_below = np.cumsum(counts)
+    trim = _RANGE_TRIM * levels.size
+    lo = int(np.searchsorted(at_or_below, trim, side="right"))
+    hi = int(np.searchsorted(at_or_below, levels.size - trim, side="left"))
+    return int(np.count_nonzero(counts[lo : hi + 1])), hi - lo + 1
+
+
+def from_pixels(
+    pixels: np.ndarray, *, lossy: bool = False, cmyk: str | None = None, palette: bool = False
+) -> LoadedImage:
     """A :class:`LoadedImage` from pixels already in memory (e.g. generated);
     ``cmyk`` says how a CMYK file's colours were converted into them (a
-    :data:`CMYK_CONVERSIONS` key), for pixels read from one."""
+    :data:`CMYK_CONVERSIONS` key), for pixels read from one, and ``palette``
+    that they are a palette image's colours, as a palette PNG reads. Whether
+    they look processed is not assessed here (:func:`assess_processed`)."""
     array, warnings = to_analysis_array(pixels, cmyk=cmyk is not None)
     depth = bit_depth_of(pixels)
     if depth is None:
@@ -489,7 +673,9 @@ def from_pixels(pixels: np.ndarray, *, lossy: bool = False, cmyk: str | None = N
         warnings.insert(0, _warning("cmyk_converted", how=CMYK_CONVERSIONS[cmyk]))
     if lossy:
         warnings.insert(0, _warning("lossy_format"))
-    return LoadedImage(array=array, pixels=pixels, bit_depth=depth, warnings=warnings)
+    return LoadedImage(
+        array=array, pixels=pixels, bit_depth=depth, warnings=warnings, palette=palette
+    )
 
 
 def clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> int | None:
@@ -534,10 +720,11 @@ def load_image(path: str | os.PathLike[str]) -> LoadedImage:
 
     ``lossy_format`` is recorded for JPEG files and for TIFF files that use JPEG
     compression; ``cmyk_converted`` for a CMYK file, naming how its colours were
-    converted to red, green and blue.
+    converted to red, green and blue. ``looks_processed`` depends on the
+    polarity, so the import adds it (:func:`assess_processed`).
     """
-    pixels, lossy, cmyk = _read(Path(path))
-    return from_pixels(pixels, lossy=lossy, cmyk=cmyk)
+    pixels, lossy, cmyk, palette = _read(Path(path))
+    return from_pixels(pixels, lossy=lossy, cmyk=cmyk, palette=palette)
 
 
 def preview(pixels: np.ndarray) -> np.ndarray:
