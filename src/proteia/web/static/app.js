@@ -126,9 +126,10 @@ function keepsFocus(button) {
 let statusUndo = null; // the change the status line's Undo takes back: {seq}, or null
 
 // Show `text` in the status line ("" empties it), with an optional action after
-// it: {label, name (its accessible name), seq, run}. The action takes back the
-// change logged as `seq`, and goes once the history has moved past it. Gives
-// the action's button, or null.
+// it: {label, name (its accessible name), seq, run}. With `seq`, the action
+// takes back the change logged as `seq`, and goes once the history has moved
+// past it. Without, it does what changes nothing (Show folder after an export)
+// and goes with the message. Gives the action's button, or null.
 function showStatus(text, action = null) {
   const line = $("status");
   line.textContent = text;
@@ -140,17 +141,29 @@ function showStatus(text, action = null) {
     button.textContent = action.label;
     button.setAttribute("aria-label", action.name);
     keepsFocus(button);
-    // Taken once: a second press before the answer (a double click) would find
-    // the change no longer the last, and say so over what the first one did.
+    const undoes = action.seq !== undefined;
+    // An Undo is taken once: a second press before the answer (a double click)
+    // would find the change no longer the last, and say so over what the first
+    // one did. Another action may be taken again once its answer is in (`run`
+    // gives a Promise that settles then): one press, one request.
     button.addEventListener("click", () => {
-      action.run();
+      const running = action.run();
       button.disabled = true;
+      if (!undoes) {
+        const again = () => {
+          button.disabled = false;
+          if (button.isConnected && focusLost()) {
+            button.focus(); // the keyboard stays on it
+          }
+        };
+        Promise.resolve(running).then(again, again);
+      }
     });
     const part = document.createElement("span");
     part.className = "status-action";
     part.append(" — ", button);
     line.append(part);
-    statusUndo = { seq: action.seq };
+    statusUndo = undoes ? { seq: action.seq } : null;
   }
   placeStatus();
   return button;
@@ -335,24 +348,27 @@ const laneTable = new LaneTable({
   status: showStatus,
 });
 
+// Read the project again and show it: only if the answer is about the opening
+// shown, and not while another project is being opened (openProject shows
+// that one).
+async function reread() {
+  const answer = await call("GET", "/api/project");
+  if (opening === null && sameOpening(answer)) {
+    applyAnswer(answer);
+  }
+}
+
 // Each chart's drawing is fetched with the token ("Updating…" counts it until
 // it arrives or no card awaits it), at a low priority: an edit waiting for a
 // connection goes before the drawings waiting with it. One the server no
-// longer keeps is asked for again after the project is read again; that
-// answer is shown only if it is about the opening shown, and not while
-// another project is being opened (openProject shows that one).
+// longer keeps is asked for again after the project is read again (reread).
 const charts = new ChartCards({
   fetch: (path, signal) =>
     dock.track(
       request("GET", path, { signal, priority: "low" }).then((response) => response.blob()),
       { chart: true },
     ),
-  reread: async () => {
-    const answer = await call("GET", "/api/project");
-    if (opening === null && sameOpening(answer)) {
-      applyAnswer(answer);
-    }
-  },
+  reread,
 });
 
 // --- Projects ---
@@ -483,12 +499,23 @@ function laneName(project, index) {
   return `Lane ${index + 1}${label}`;
 }
 
+// The file names of the images `ids` names (a refusal's), set apart for
+// bidirectional text; one not in the project shown (an image an undo would
+// bring back) is left out.
+function imageNames(ids) {
+  return ids
+    .map((id) => state.project.images.find((image) => image.id === id))
+    .filter(Boolean)
+    .map((image) => isolate(image.original_name));
+}
+
 function render() {
   $("lane-picker").hidden = true; // its question was about the state before
   const project = state.project;
   $("workspace").hidden = !project;
   $("switch-project").hidden = false;
   $("reveal").hidden = !project;
+  $("export").hidden = !project;
   $("undo").hidden = !project;
   $("redo").hidden = !project;
   placeStatus();
@@ -514,6 +541,7 @@ function render() {
   charts.render(state.results);
   dock.render(state.results);
   renderRequantify(project);
+  renderExport(project);
 }
 
 function renderImages(project, image) {
@@ -1333,14 +1361,167 @@ function reportRequantify(error) {
   if (error instanceof ApiError && error.status === 401) {
     return;
   }
-  const names = (error.ids || [])
-    .map((id) => state.project.images.find((image) => image.id === id))
-    .filter(Boolean)
-    .map((image) => isolate(image.original_name));
+  const names = imageNames(error.ids || []);
   const which = names.length ? ` (${inWords(names)})` : "";
   showStatus(
     `Not requantified: ${sentence(`${error.message}${which}`)} The nets are as they were.`,
   );
+}
+
+// --- Exporting the results ---
+
+const EXPORT_TITLE =
+  "Write the charts, the lane tables and a record of how they were made into a new folder" +
+  " under exports in the project folder";
+const NO_LANES_TITLE = "Nothing to export yet: declare the lanes in Lanes & values";
+
+let exporting = false; // a press has no answer yet
+
+// The header's Export: disabled while an export runs, while no lanes are
+// declared (its tooltip says so), and once Quit is pressed (renderQuit).
+function renderExport(project) {
+  const button = $("export");
+  const lanes = project.lanes.length > 0;
+  button.disabled = exporting || quitting || !lanes;
+  button.title = exporting ? "Exporting…" : lanes ? EXPORT_TITLE : NO_LANES_TITLE;
+}
+
+// Write the results, as the page shows them, into a new folder under exports:
+// each set's lane table and charts (in the server's default formats: none are
+// asked for), a README and the record. Like a requantify, it runs in the
+// panel's queue once the edits made before it have their answers (a lane just
+// typed, a box being placed), so the export has them, and the edits made after
+// it, and an open, wait for it. Not a change: nothing is logged, so no Undo;
+// and no value changes, so it is not awaited as an edit is ("Updating…"): the
+// status line says "Exporting…". Pressed twice (a double click), it is sent
+// once: the button stays disabled until the answer. Quit waits for it too
+// (renderQuit).
+function exportResults() {
+  if (exporting || quitting || !state.project || $("workspace").hidden) {
+    return;
+  }
+  exporting = true;
+  renderExport(state.project);
+  renderQuit();
+  showStatus("Exporting…");
+  const after = Promise.allSettled([pending(), proteinPanel.adding]);
+  const asked = proteinPanel.queueEdit(
+    async (current) => {
+      const opened = shownOpening();
+      showStatus("Exporting…"); // again: the answer of an edit before it empties the line
+      try {
+        const answer = await request("POST", "/api/export").then((response) => response.json());
+        applyAnswer(answer);
+        if (current() && sameOpening(answer)) {
+          showExported(answer);
+        }
+      } catch (error) {
+        if (current() && opened === shownOpening()) {
+          await reportExport(error);
+        }
+      }
+      return null;
+    },
+    { after },
+  );
+  const done = () => {
+    exporting = false;
+    renderQuit();
+    if (state.project) {
+      renderExport(state.project);
+    }
+    const button = $("export");
+    if (!button.disabled && !button.hidden) {
+      // Refused: the keyboard stays on Export, which may have lost it while disabled.
+      if (focusLost()) {
+        button.focus();
+      }
+    } else {
+      // Disabled for good: the lanes are gone (a no_lanes refusal shows the
+      // project read again before this). The keyboard goes on to Undo or Redo,
+      // as from Requantify once its offer has gone.
+      keepFocus(button, "undo", null);
+    }
+  };
+  asked.then(done, done);
+}
+
+$("export").addEventListener("click", exportResults);
+
+// What the export wrote, with Show folder, which opens that folder in the
+// system file manager. The keyboard goes on to it: Export again would make
+// another folder.
+function showExported(answer) {
+  const folder = answer.folder;
+  const button = showStatus(
+    `Exported ${counted(answer.files.length, "file", "files")} to ${folder}`,
+    { label: "Show folder", name: `Show the folder ${folder}`, run: () => revealExport(folder) },
+  );
+  if (button && (focusLost() || document.activeElement === $("export"))) {
+    button.focus();
+  }
+}
+
+// Show an export folder, as the export answered it, in the system file
+// manager. One moved or deleted since is said, which takes the status line's
+// Show folder away: the keyboard then goes back to Export. Settles once
+// answered, and never rejects.
+async function revealExport(folder) {
+  const opened = shownOpening();
+  try {
+    await call("POST", "/api/project/reveal", { folder });
+  } catch (error) {
+    if (opened !== shownOpening()) {
+      return;
+    }
+    if (error.code === "folder_not_found") {
+      showStatus(
+        `${folder} is not in the project folder any more: it was moved or deleted outside Proteia.`,
+      );
+    } else {
+      report(error);
+    }
+    const button = $("export");
+    if (focusLost() && !button.disabled && !button.hidden) {
+      button.focus();
+    }
+  }
+}
+
+// A refused export writes nothing: what to do, by the refusal's code; the
+// images a missing or changed file belongs to, by their file names. Settles
+// once said (and, with no lanes, once the project is shown as it is now).
+async function reportExport(error) {
+  if (error instanceof ApiError && error.status === 401) {
+    return;
+  }
+  let why = sentence(error.message);
+  if (error.code === "no_lanes") {
+    why = "No lanes are declared. Declare the lanes in Lanes & values, then export.";
+  } else if (error.code === "image_file_changed") {
+    const names = imageNames(error.ids);
+    const one = names.length <= 1;
+    const which = names.length
+      ? `The ${one ? "file" : "files"} of ${inWords(names)} ${one ? "is" : "are"}`
+      : "An image file is";
+    why =
+      `${which} missing from the project's images folder or ${one ? "was" : "were"} changed` +
+      ` outside Proteia. Put the original ${one ? "file" : "files"} back, then export.`;
+  } else if (error.code === "path_too_long") {
+    // Projects live only in the projects folder (Projects… names it), so the
+    // way out is a shorter name: the project's folder's, renamed while Proteia
+    // is not running (it has no rename).
+    why =
+      "The project folder's path is too long for the file names an export writes. Give the" +
+      " project a shorter name: quit Proteia, rename the project's folder (Projects… shows" +
+      " where projects are saved), then start Proteia again and export.";
+  }
+  showStatus(`Not exported: ${why}`);
+  if (error.code === "no_lanes") {
+    // The page showed lanes (Export is disabled without): another tab removed
+    // them since. Show the project as it is now.
+    await reread().catch(() => {});
+  }
 }
 
 // --- Undo and redo ---
@@ -1428,10 +1609,7 @@ function reportStep(direction, error) {
   } else if (error.code === "image_file_changed") {
     // The image is often not in the project shown (undoing a removal), so its
     // name may be unknown here; and the file may be missing or changed.
-    const names = error.ids
-      .map((id) => state.project.images.find((image) => image.id === id))
-      .filter(Boolean)
-      .map((image) => isolate(image.original_name));
+    const names = imageNames(error.ids);
     const which = names.length ? `the file of ${inWords(names)} is` : "an image file it needs is";
     showStatus(
       `Cannot ${direction}: ${which} missing from the project's images folder` +
@@ -1611,21 +1789,45 @@ document.addEventListener("keydown", (event) => {
 
 // --- Quit ---
 
+let quitting = false; // pressed: its answer is awaited, or Proteia has stopped
+
+// Quit waits for an export: stopping the server under it would cut it off, and
+// its answer would come after "Proteia has stopped" (the page shown again, or
+// "Not exported" for a folder written in full). Disabled while one runs, its
+// tooltip says why; once pressed, no export starts (renderExport).
+function renderQuit() {
+  const button = $("quit");
+  button.disabled = quitting || exporting;
+  button.title = exporting ? "Quit once the export is written" : "";
+}
+
 $("quit").addEventListener("click", async () => {
-  $("quit").disabled = true;
+  if (quitting || exporting) {
+    return;
+  }
+  quitting = true;
+  renderQuit();
+  if (state.project) {
+    renderExport(state.project);
+  }
   try {
     await request("POST", "/api/quit");
     showStatus("Proteia has stopped. You can close this tab.");
     $("workspace").hidden = true;
     $("quit").hidden = true;
+    $("export").hidden = true;
     $("undo").hidden = true;
     $("redo").hidden = true;
   } catch (error) {
+    quitting = false;
     if (error instanceof ApiError && error.status === 401) {
       $("quit").hidden = true; // this tab cannot reach the running Proteia
     } else {
       showStatus(error.message || "Proteia did not stop. Try Quit again.");
-      $("quit").disabled = false;
+    }
+    renderQuit();
+    if (state.project) {
+      renderExport(state.project);
     }
   }
 });
