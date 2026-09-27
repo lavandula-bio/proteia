@@ -3112,6 +3112,22 @@ def test_a_row_box_answers_the_detectors_warnings_and_notes(client, tmp_path):
     assert answer["notes"] == params["notes"] != []
 
 
+def test_a_first_row_box_read_off_answers_its_lanes_doubtful(client, tmp_path):
+    # #111: a row box that also covers a neighbouring panel beside the row,
+    # with no lanes on the image to check it, is read two lanes off. It is
+    # placed, and the answer carries the warning and its note (the page asks
+    # to check the lane numbers, with an Undo of the row).
+    case, target = adversarial_project(client, tmp_path, "panel_beside")
+    answer = drag(client, target, list(case.row))
+    assert None not in answer["band_ids"]
+    params = storage.load_project(client.root / "Blot").log[-1].params
+    assert answer["flags"] == params["flags"] == ["doubtful_lanes"]
+    [note] = answer["notes"]
+    assert note == params["notes"][0]
+    assert note.startswith("lane numbers doubtful: the fitted pitch")
+    assert answer["project"]["history"]["undo"]["action"] == "detect_row_boxes"
+
+
 def test_a_row_box_answers_a_band_it_cuts_through(client, tmp_path):
     # The box's top edge 2 px above the target's band centres (#115).
     target, _, _ = live(client, tmp_path, DOSES, boxed=())

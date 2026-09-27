@@ -100,6 +100,7 @@ from rowcases import (
     adversarial_row,
     band_between,
     bench_cases,
+    beside,
     bottom_strip,
     hstripe,
     synthetic_row,
@@ -4999,6 +5000,95 @@ def test_record_settings_are_what_the_row_commit_uses(tmp_path, monkeypatch):
         True,
     )
     assert record.settings()["detect_row"] == rowdetect.settings()
+
+
+# --- #111: a first row read with no lanes on the image to check it ---
+
+# Two lane steps of bare membrane past the last of six bands: the reading is
+# right, but the box has room for more lanes than it reads.
+WIDE = adversarial_row("wide", 1000, margin_right=200, box_adjust=(0, 0, 150, 0))
+
+
+def test_a_first_row_over_a_neighbouring_panel_is_placed_with_its_lanes_doubtful(tmp_path):
+    # The row box also covers an arrow and a neighbouring panel's band beside
+    # the row: read with no lanes on the image, the bands are numbered two
+    # lanes early. The row is placed with the warning and its note, logged,
+    # and one undo takes it back.
+    case = adversarial("panel_beside", 1000)
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, case.row)
+    placement = ops.detect_row_boxes(s, protein, case.row)
+    assert placement.flags == ("doubtful_lanes",)
+    assert placement.notes == found.notes and found.doubt_note in placement.notes
+    assert sum(band is not None for band in placement.band_ids) == 5
+    params = s.project.log[-1].params
+    assert (params["flags"], params["notes"]) == (["doubtful_lanes"], list(found.notes))
+    ops.undo(s)
+    assert protein_of(s, protein).bands == []
+
+
+def test_lanes_on_the_image_that_check_the_reading_drop_the_doubt(tmp_path):
+    s, image, protein = row_session(tmp_path, WIDE)
+    assert detected(s, protein, WIDE.row).doubt_note is not None
+    other_protein_in_lanes(s, image, WIDE, [0, 5])  # they check the reading: it lines up
+    placement = ops.detect_row_boxes(s, protein, WIDE.row)
+    assert (placement.flags, placement.notes) == ((), ())
+    params = s.project.log[-1].params
+    assert (params["flags"], params["notes"]) == ([], [])
+
+
+def test_one_lane_on_the_image_checks_nothing_and_the_doubt_stays(tmp_path):
+    s, image, protein = row_session(tmp_path, WIDE)
+    other_protein_in_lanes(s, image, WIDE, [0])
+    placement = ops.detect_row_boxes(s, protein, WIDE.row)
+    assert placement.flags == ("doubtful_lanes",)
+    assert detected(s, protein, WIDE.row).doubt_note in placement.notes
+
+
+# Eight lanes and a ladder's band 1.8 lane steps past the last: the bands of
+# lanes 3 and 4 are merged into lane 3, and the ladder's band read as lane 7.
+LADDER = adversarial_row(
+    "ladder8",
+    1001,
+    n=8,
+    artefacts=[beside(1.8, 26, 12, 14000)],
+    margin_right=200,
+    box_adjust=(0, 0, 150, 0),
+)
+
+
+@pytest.mark.parametrize("lanes", [[0, 1], [0, 1, 2]])
+def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes):
+    # They check the reading between them only: past them the expected x
+    # steps by the row's own pitch, so the lanes squeezed a lane early there
+    # are not refused. The row is placed, its lane numbers still doubtful.
+    s, image, protein = row_session(tmp_path, LADDER)
+    found = detected(s, protein, LADDER.row)
+    other_protein_in_lanes(s, image, LADDER, lanes)
+    placement = ops.detect_row_boxes(s, protein, LADDER.row)
+    step = float(np.median(np.diff(LADDER.lane_cx)))
+    off = [
+        lane
+        for lane, rect in rects_by_lane(s, protein).items()
+        if abs((rect[0] + rect[2]) / 2 - LADDER.lane_cx[lane]) > step / 2
+    ]
+    assert off == [4, 5, 6, 7]  # what the doubt is there for
+    assert "doubtful_lanes" in placement.flags
+    assert found.doubt_note is not None and found.doubt_note in placement.notes
+    params = s.project.log[-1].params
+    assert (params["flags"], params["notes"]) == (list(placement.flags), list(found.notes))
+
+
+def test_lanes_on_the_image_refuse_a_row_read_off_whatever_its_doubt(tmp_path):
+    # The row over the neighbouring panel again, now with another protein's
+    # boxes in the lanes that hold bands: it is refused, not placed doubtful.
+    case = adversarial("panel_beside", 1000)
+    s, image, protein = row_session(tmp_path, case)
+    other_protein_in_lanes(s, image, case, [2, 3, 4])
+    with pytest.raises(OperationError) as refused:
+        ops.detect_row_boxes(s, protein, case.row)
+    assert refused.value.code is ErrorCode.ROW_LANES_UNCLEAR
+    assert refused.value.detail["cause"] == "off_lanes"
 
 
 def _row_scene(tmp_path: Path, setup) -> tuple[ProjectSession, Recorder, dict[str, str]]:

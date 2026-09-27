@@ -1337,6 +1337,10 @@ const NOT_MEASURED = {
 // core/rowdetect.py), in words. `note`: words of the detector's note on it,
 // which names its lanes first ("lane 5: …", "lanes 3, 7: …").
 const ROW_WARNINGS = {
+  doubtful_lanes: {
+    note: null,
+    words: () => "the bands' spacing does not fit the lanes read",
+  },
   background_mismatch: {
     note: null,
     words: () => "uneven background under some boxes: check their nets",
@@ -1404,7 +1408,10 @@ function remeasuredText(answer) {
 // Gives {text, check, unchanged}: `unchanged` when the row changed nothing (the
 // same drag again), `check` when it changed the project and left signal that
 // fits no lane, the mark of a row box over part of the row (its bands then
-// read as several lanes each): the text asks to check the lane numbers.
+// read as several lanes each), or read lanes that do not fit the bands'
+// spacing (doubtful_lanes, #111: a first row box that also covers a ladder,
+// labels or another panel reads its lanes off by one or more): the text asks
+// to check the lane numbers.
 function rowReport(answer, name, before) {
   const empty = new Map(answer.empty.map((lane) => [lane.lane_index, lane]));
   const kept = new Set(answer.kept_lanes);
@@ -1476,12 +1483,16 @@ function rowReport(answer, name, before) {
   if (remeasured) {
     parts.push(remeasured);
   }
-  const check = !unchanged && unmeasured.has("unassigned");
+  const partRow = unmeasured.has("unassigned");
+  const check = !unchanged && (partRow || answer.flags.includes("doubtful_lanes"));
   if (check) {
     const all = answer.band_ids.length;
     parts.push(
-      "check the boxes' lane numbers: a row box over part of the row misreads the lanes" +
-        ` (Undo, then drag across all ${all})`,
+      partRow
+        ? "check the boxes' lane numbers: a row box over part of the row misreads the lanes" +
+            ` (Undo, then drag across all ${all})`
+        : "check the boxes' lane numbers: a row box that also covers a ladder, labels or" +
+            ` another panel misreads the lanes (Undo, then drag over the ${all} lanes only)`,
     );
   } else if (unmeasured.size) {
     parts.push("click a dashed placeholder to box a lane by hand");

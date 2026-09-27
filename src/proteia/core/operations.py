@@ -302,6 +302,11 @@ class RowPlacement:
     (``replaced_band_ids``) or kept (``kept_lanes``); None in a lane left
     without one.
 
+    ``flags`` are the detector's warnings and ``notes`` its diagnostics; of
+    them, ``doubtful_lanes`` and its note (the row's lane numbers to be
+    checked) only while lanes on the image have not checked the lane of every
+    band found (:func:`detect_row_boxes`).
+
     ``kept_lanes`` are the lanes whose box was kept as it was: one edited by
     hand, or one the user placed (source ``click`` or ``manual``) in a lane
     where no band was found.
@@ -2480,6 +2485,18 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     lie between the anchored lanes, since past them the row's pitch follows
     its own reading.
 
+    With fewer than two such lanes nothing checks the reading: a first row
+    box that also covers a ladder, labels or a neighbouring panel can be read
+    a lane or more off (#111). A reading that does not fit the bands' own
+    spacing is placed with the warning ``doubtful_lanes`` (see
+    :mod:`~proteia.core.rowdetect`): the user checks its lane numbers, and
+    Undo takes the row back. Once lanes on the image have checked the lane of
+    every band found, each lying between the outermost anchored lanes (or on
+    one), the warning and its note are dropped: its lane numbers line up with
+    theirs. A band's lane past them keeps the warning, since there the
+    expected x steps by the row's own pitch, which a reading squeezed into the
+    wrong lanes fits.
+
     Also refused, changing nothing: ``row`` not four ints, or empty or
     inverted (``INVALID_INPUT``); no lanes (``NO_LANES``); lanes on the image
     numbered inconsistently, as above; a row outside the image
@@ -2658,6 +2675,14 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     replaced = [yielding[lane] for lane in rects if lane in yielding]
     removed = [yielding[lane] for lane in sorted(yielding) if lane not in rects]
     warnings = [flag for flag in found.flags if flag in rowdetect.WARNING_FLAGS]
+    notes = found.notes
+    # The lanes on the image checked the lane numbers of the bands between
+    # them; past them, the row's own pitch stepped the expected x, which a
+    # squeezed reading fits.
+    checked = anchoring_lanes(anchors, range(n))  # the kept lanes
+    if checked and all(min(checked) <= lane <= max(checked) for lane in centres):
+        warnings = [flag for flag in warnings if flag != "doubtful_lanes"]
+        notes = tuple(note for note in notes if note != found.doubt_note)
 
     def change(
         draft: Project,
@@ -2740,7 +2765,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             "pitch": found.pitch,
             "noise": found.noise,
             "flags": list(warnings),
-            "notes": list(found.notes),
+            "notes": list(notes),
             "right_to_left": right_to_left,
             "settings": rowdetect.settings(),
         }
@@ -2767,7 +2792,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         ),
         empty=empty,
         flags=tuple(warnings),
-        notes=found.notes,
+        notes=notes,
         right_to_left=right_to_left,
         remeasured=remeasured,
         largest_change=largest,

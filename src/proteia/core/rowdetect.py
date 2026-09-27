@@ -64,6 +64,8 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    placement (:func:`~proteia.core.boxes.place_in_row`).
 9. The row's line through the boxes' centres (:func:`_row_line`): a box off
    it is off the row.
+10. The lane reading against the bands' own spacing (:func:`_doubts`): a
+    reading that does not fit it is placed, its lane numbers doubtful.
 
 Flags (:attr:`RowDetection.flags`):
 
@@ -78,6 +80,16 @@ Flags (:attr:`RowDetection.flags`):
   than :data:`ROW_SMILE` box heights apart: the row box covers more than one
   row (a neighbouring row's band is stronger in some lanes), or a lane's band
   lies above or below the others (a montage's panel, a mark beside the row);
+* ``doubtful_lanes``: the lane reading does not fit the bands' own spacing,
+  so the lanes may be numbered wrong (:func:`_doubts`): the fitted pitch lies
+  more than :data:`PITCH_DOUBT` of that spacing off it, the resolved bands or
+  a touching run's cells span more than :data:`LANES_DOUBT` lanes off the
+  lanes read, the box reaches more than :data:`END_DOUBT` spacings past an
+  end lane's centre, or pieces at least :data:`APART_DOUBT` lanes apart were
+  merged, or one between the others dropped, to fit the declared lanes: as a
+  row box that also covers a ladder, labels or a neighbouring panel reads
+  (#111). The note begins ``lane numbers doubtful:``
+  (:attr:`RowDetection.doubt_note`);
 * ``background_mismatch``: the membrane under a box differs from the stored
   background by more than :data:`BG_WARN_K` pixel sigmas;
 * ``size_outlier``: an extent above :data:`SIZE_GUARD` times the median of the
@@ -99,7 +111,7 @@ from __future__ import annotations
 import itertools
 import math
 import numbers
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Final, Literal
 
@@ -125,7 +137,7 @@ from skimage.segmentation import watershed
 
 from proteia.core.boxes import place_in_row
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_region, mad_sigma
-from proteia.core.model import BoxSize, Rect, lanes_phrase
+from proteia.core.model import BoxSize, Rect, lane_number, lanes_phrase
 
 # --- Domain settings (maintainer decisions on #51) ---
 
@@ -143,6 +155,17 @@ ROW_SMILE: Final = 2.0
 ROW_LINE_MIN: Final = 4
 ROW_LINE_TOL: Final = 0.25
 ROW_LINE_TOL_PX: Final = 3.0
+# Doubtful lane numbers (#111), at the bands' own spacing (_doubts): the fitted
+# pitch off it by more than PITCH_DOUBT of it (twice SPACING_TOL); a stretch of
+# the reading (its resolved bands end to end, a touching run's cells) off by
+# more than LANES_DOUBT lanes (the rounding to another count); the box reaching
+# more than END_DOUBT spacings past an end lane's centre (END_HI and half a
+# lane: room for another lane); or pieces merged, or one between the others
+# dropped, to fit the declared lanes at least APART_DOUBT lanes apart.
+PITCH_DOUBT: Final = 0.3
+LANES_DOUBT: Final = 0.5
+END_DOUBT: Final = 1.5
+APART_DOUBT: Final = 0.6
 
 # --- Technical settings ---
 
@@ -201,6 +224,7 @@ MIN_BOX: Final = 2  # smallest box side, as boxes.grow_to_fit
 SIZE_RULES: Final = ("max", "max_guarded")
 REFUSING_FLAGS: Final = ("lanes_outside_row", "ambiguous_lanes", "off_row_line")
 WARNING_FLAGS: Final = (
+    "doubtful_lanes",
     "background_mismatch",
     "size_outlier",
     "multiple_components",
@@ -212,6 +236,7 @@ LaneReason = Literal[
     "band", "no_band", "artefact", "line", "edge_signal", "side_signal", "unassigned"
 ]
 
+_DOUBT_NOTE: Final = "lane numbers doubtful: "  # the doubtful_lanes note begins so
 _TAIL_Z: Final = float(ndtri(0.5 + TAIL_Q / 200.0))  # Gaussian |z| at the TAIL_Q percentile
 _P_SIGMA: Final = 68.27  # the percentile of |deviation| at one Gaussian sigma
 _CROSS: Final = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)  # 4-connectivity, as label()
@@ -351,6 +376,12 @@ class RowDetection:
     def refused(self) -> bool:
         """True when a refusing flag is set: the caller proposes nothing."""
         return any(flag in REFUSING_FLAGS for flag in self.flags)
+
+    @property
+    def doubt_note(self) -> str | None:
+        """The note of the ``doubtful_lanes`` flag, None without it: a caller
+        that checks the lanes another way drops both."""
+        return next((note for note in self.notes if note.startswith(_DOUBT_NOTE)), None)
 
 
 # --- Robust statistics, background and noise ---
@@ -1012,10 +1043,26 @@ def _candidates(sig: _Signal, n: int, image_rows: tuple[bool, bool]) -> _Candida
     return _Candidates(kept, candidates & ~kept, dust, cut, lines, side, (lo, hi), rejected, pieces)
 
 
-def _reduce(pieces: list[_Piece], n: int, x_offset: int, notes: list[str]) -> list[_Piece]:
+@dataclass(frozen=True)
+class _Joined:
+    """A pair of pieces :func:`_reduce` merged, or dropped the weaker of: its
+    crop x ``[l, r)`` (the pair's, or the dropped piece's) and the distance
+    between the pair's centres, px."""
+
+    l: float  # noqa: E741
+    r: float
+    apart: float
+    dropped: bool
+
+
+def _reduce(
+    pieces: list[_Piece], n: int, x_offset: int, notes: list[str]
+) -> tuple[list[_Piece], list[_Joined]]:
     """More pieces than lanes: drop the weaker of the closest pair if its mass is
-    below ``REDUCE_MASS`` of the other's, otherwise merge the pair."""
+    below ``REDUCE_MASS`` of the other's, otherwise merge the pair. Returns the
+    pieces left and each pair joined so (:class:`_Joined`)."""
     pieces = list(pieces)
+    joined: list[_Joined] = []
     while len(pieces) > n:
         gaps = [pieces[i + 1].c - pieces[i].c for i in range(len(pieces) - 1)]
         i = int(np.argmin(gaps))
@@ -1024,11 +1071,13 @@ def _reduce(pieces: list[_Piece], n: int, x_offset: int, notes: list[str]) -> li
             drop = i if a.mass < b.mass else i + 1
             p = pieces.pop(drop)
             notes.append(f"dropped a weak piece at x={x_offset + p.l:.0f}..{x_offset + p.r:.0f}")
+            joined.append(_Joined(p.l, p.r, b.c - a.c, True))
         else:
             notes.append(f"merged pieces at x={x_offset + a.l:.0f}..{x_offset + b.r:.0f}")
             merged = _Piece(a.l, b.r, max(a.peak, b.peak), a.mass + b.mass, a.side and b.side)
             pieces[i : i + 2] = [merged]
-    return pieces
+            joined.append(_Joined(a.l, b.r, b.c - a.c, False))
+    return pieces, joined
 
 
 # --- Lane assignment: an ordered dynamic programme keeping the two best costs ---
@@ -1470,6 +1519,8 @@ class _Pass:
     alt: float
     lanes: list[_Lane]
     notes: list[str]
+    pieces: list[_Piece]  # the pieces the reading assigns (_reduce's), in order
+    joined: list[_Joined]  # the pairs _reduce merged or dropped one of
 
 
 def _run_pass(sig: _Signal, n: int, x_offset: int, image_rows: tuple[bool, bool]) -> _Pass:
@@ -1478,13 +1529,13 @@ def _run_pass(sig: _Signal, n: int, x_offset: int, image_rows: tuple[bool, bool]
     wc = sig.s_sm.shape[1]
     notes: list[str] = []
     cand = _candidates(sig, n, image_rows)
-    pieces = _reduce(cand.pieces, n, x_offset, notes)
+    pieces, joined = _reduce(cand.pieces, n, x_offset, notes)
     assign, alt = (None, math.inf) if not pieces else _assign(pieces, n, float(wc))
     if assign is None:
-        return _Pass(sig, cand, None, math.inf, [_Lane() for _ in range(n)], notes)
+        return _Pass(sig, cand, None, math.inf, [_Lane() for _ in range(n)], notes, pieces, joined)
     lanes = _lanes_from(assign, pieces, n)
     _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm)
-    return _Pass(sig, cand, assign, alt, lanes, notes)
+    return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined)
 
 
 def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
@@ -1780,6 +1831,129 @@ def _row_line(
     return (y - fit @ powers) / h
 
 
+def _doubts(res: _Pass, n: int, wc: int, x_offset: int, number: Callable[[int], int]) -> list[str]:
+    """How the lane reading of ``res`` does not fit the bands' own spacing, in
+    words for the ``doubtful_lanes`` note; empty when it fits. ``n`` lanes
+    over a box ``wc`` px wide; ``number(k)`` is the number the caller knows
+    lane ``k`` (crop order) by; x is given in the image (``x_offset``).
+
+    The bands' own spacing is the repeated median of the slopes between the
+    resolved bands, their pieces' centres over their lanes (each band's median
+    slope to the others, then the median of those: a band off the others, as
+    a neighbouring panel's read as the last lane, moves it little, where the
+    median of every pair's slope follows it among four bands). A resolved band
+    is a piece the reading gives one lane, not rising into the box's side.
+    From two of them on, the reading does not fit that spacing when:
+
+    * the fitted pitch lies more than ``PITCH_DOUBT`` of it off it;
+    * the first and last resolved bands lie more than ``LANES_DOUBT`` lanes
+      off the lanes read between them;
+    * a touching run cut into cells spans more than ``LANES_DOUBT`` lanes more
+      than its cells (its width over the spacing, as if its bands filled
+      their lanes), or fewer (its width less the narrowest resolved band's
+      over the spacing, plus one, as if its bands were that narrow);
+    * the box reaches more than ``END_DOUBT`` spacings past an end lane's
+      centre, stepped from the resolved bands: room for another lane there.
+
+    And over that spacing, or the fitted pitch with fewer than two resolved
+    bands, when ``_reduce`` merged a pair of pieces, or dropped the weaker
+    between the pieces read, to fit the declared lanes, their centres
+    ``APART_DOUBT`` lanes apart or more: two bands, not one band's halves or
+    dust beside a band. A piece dropped past the pieces read shifts none of
+    their lanes (the reading is theirs without it, which the tests above
+    judge): dust in a loose box's margin, 0.7 to 0.9 lanes past the end band,
+    is no doubt.
+
+    A row box that also covers a ladder, labels or a neighbouring panel, read
+    with no lanes on the image to check it, holds more objects than lanes, or
+    room for more, and the pitch fitted to the box and its ends misses the
+    bands' spacing (#111). Measured on the bench, the accuracy judge's rows,
+    the recipes and the fuzz rows (611 rows read right) and on real drags, the
+    honest rows stay within: the pitch 19% off the spacing (a loose box,
+    margins of a pitch each side; 19% on a real row), the resolved bands 0.31
+    lanes off (+/-35% spacing; real 0.24), runs 0.33 lanes more than their
+    cells (bands twice as wide as the others; real ones none) and 0.24 fewer,
+    the box 1.35 spacings past an end lane (real 1.09), and merged or dropped
+    pieces 0.51 lanes apart (a band's halves split by a bubble, 0.33 to 0.40;
+    dust midway between lanes, 0.45 to 0.51). The real drags read a lane or
+    more off: a box over a side panel, the pitch 65% off and the box 2.1
+    spacings past lane 1; over a ladder, the bands 0.9 lanes off and a run
+    0.59 more; past a montage panel's frame on both sides, runs 0.61 and 0.77
+    more and the box 1.9 spacings past lane 1. Rows declared with fewer lanes
+    than bands merge pieces 0.64 lanes apart or more, or drop a weak one
+    between the others. Not caught: a box over an arrow just past the last
+    band, read as the last lane at the bands' own spacing (the reading fits
+    it); a box over part of a row of touching bands, which leaves no resolved
+    band to measure; and a weak band past the end one, dropped, the declared
+    lanes read in order from the other end (2 of 93 fuzz rows declared with
+    fewer lanes than bands: a sliver of a band the box's side cuts)."""
+    assign = res.assign
+    if assign is None:
+        return []
+
+    def lanes(a: int, b: int) -> str:
+        lo, hi = sorted((number(a), number(b)))
+        return f"lanes {lo} to {hi}"
+
+    resolved = [
+        (k, p) for p, (k, q) in zip(res.pieces, assign.lanes, strict=True) if q == 1 and not p.side
+    ]
+    spacing = None
+    if len(resolved) >= 2:  # each band's median slope to the others, and their median
+        spacing = float(
+            np.median(
+                [
+                    np.median([(pb.c - pa.c) / (kb - ka) for kb, pb in resolved if kb != ka])
+                    for ka, pa in resolved
+                ]
+            )
+        )
+    words: list[str] = []
+    if spacing is not None:  # the pieces run in lane order: it is positive
+        own = f"the bands' own spacing ({spacing:.1f} px)"
+        at_own: list[str] = []
+        off = assign.pitch / spacing - 1.0
+        if abs(off) > PITCH_DOUBT:
+            words.append(f"the fitted pitch ({assign.pitch:.1f} px) is {abs(off):.0%} off {own}")
+        (k0, p0), (k1, p1) = resolved[0], resolved[-1]
+        span = (p1.c - p0.c) / spacing
+        if abs(span - (k1 - k0)) > LANES_DOUBT:
+            at_own.append(f"the bands read as {lanes(k0, k1)} lie {span:.1f} lanes apart")
+        narrowest = min(p.w for _, p in resolved)
+        for p, (k, q) in zip(res.pieces, assign.lanes, strict=True):
+            if q == 1 or p.side:
+                continue
+            # At most as many lanes as its cells' spacing gives, at least as
+            # many as bands as narrow as the narrowest resolved one leave room for.
+            most, least = p.w / spacing, (p.w - narrowest) / spacing + 1.0
+            if most - q > LANES_DOUBT or q - least > LANES_DOUBT:
+                cells = most if most - q > LANES_DOUBT else least
+                at_own.append(
+                    f"the touching bands read as {lanes(k, k + q - 1)} span {cells:.1f} lanes"
+                )
+        for end, room in ((0, p0.c / spacing - k0), (n - 1, (wc - p1.c) / spacing - (n - 1 - k1))):
+            if room > END_DOUBT:
+                at_own.append(
+                    f"the row box reaches {room:.1f} lanes past lane {number(end)}'s centre"
+                )
+        if at_own:
+            at_own[0] = ("at that spacing " if words else f"at {own}, ") + at_own[0]
+            words.extend(at_own)
+    step = assign.pitch if spacing is None else spacing
+    first, last = res.pieces[0].l, res.pieces[-1].r  # the pieces read (an assignment has some)
+    for joined in res.joined:
+        if joined.dropped and (joined.r <= first or joined.l >= last):
+            continue  # dropped past them: their lanes are read as without it
+        apart = joined.apart / step
+        if apart >= APART_DOUBT:
+            done = "one dropped" if joined.dropped else "merged"
+            words.append(
+                f"two pieces {apart:.1f} lanes apart, {done} at"
+                f" x={x_offset + joined.l:.0f}..{x_offset + joined.r:.0f} to fit the declared lanes"
+            )
+    return words
+
+
 def detect_row(
     gray: np.ndarray,
     row: Sequence[int],
@@ -1942,6 +2116,13 @@ def detect_row(
                     " other boxes"
                 )
 
+    # The reading against the bands' own spacing: placed, its lane numbers to
+    # be checked (#111).
+    doubts = _doubts(res, n, wc, x0, lambda k: lane_number(numbered([k])[0]))
+    if doubts:
+        flags.append("doubtful_lanes")
+        notes.append(_DOUBT_NOTE + "; ".join(doubts))
+
     result: list[LaneDetection] = []
     for i, ln in enumerate(lanes):
         rect = out.get(i)
@@ -2036,6 +2217,10 @@ def settings() -> dict[str, JsonValue]:
         "row_line_min": ROW_LINE_MIN,
         "row_line_tol": ROW_LINE_TOL,
         "row_line_tol_px": ROW_LINE_TOL_PX,
+        "pitch_doubt": PITCH_DOUBT,
+        "lanes_doubt": LANES_DOUBT,
+        "end_doubt": END_DOUBT,
+        "apart_doubt": APART_DOUBT,
         "smooth": list(SMOOTH),
         "min_width_px": MIN_WIDTH_PX,
         "min_width_pitch": MIN_WIDTH_PITCH,
