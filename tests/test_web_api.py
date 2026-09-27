@@ -320,6 +320,33 @@ def test_an_import_answers_the_warnings_found_in_the_file(client, tmp_path):
     assert client.ok("GET", "/api/project")["project"]["images"][1] == image  # and it stays
 
 
+def test_an_import_warns_of_an_image_that_looks_like_a_processed_figure(client):
+    # #127: a background levelled to pure white, as a figure's is. A warning
+    # only: the page lists it with the others, and the image imports as usual.
+    pixels = np.full((H, W), 255, dtype=np.uint8)
+    pixels[ROW - 6 : ROW + 6] = 90  # a dark row across it: a fifth of the image
+    figure = io.BytesIO()
+    Image.fromarray(pixels).save(figure, format="PNG")
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, figure.getvalue(), name="figure β.png")
+    assert status == 201, answer
+    (image,) = answer["project"]["images"]
+    (warning,) = image["warnings"]
+    assert warning["code"] == "looks_processed"
+    assert warning["message"].startswith(
+        "This looks like a processed figure rather than a raw scan: its median level,"
+        " the image-wide background, is pure white; 80% of its pixels are pure white."
+    )
+    assert image["bit_depth"] == 8
+    # Its background's end of the range comes from the polarity: light on dark,
+    # nothing is at 0, and the page gets the warning dropped.
+    path = f"/api/images/{image['id']}/polarity"
+    answer = client.ok("PUT", path, {"polarity": "light_on_dark"})
+    assert answer["project"]["images"][0]["warnings"] == []
+    answer = client.ok("PUT", path, {"polarity": "dark_on_light"})
+    assert answer["project"]["images"][0]["warnings"] == [warning]
+
+
 def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
     image_id, _ = ready(client, tmp_path)
     answer = client.ok("PUT", f"/api/images/{image_id}/polarity", {"polarity": "light_on_dark"})
