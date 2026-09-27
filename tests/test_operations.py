@@ -119,7 +119,7 @@ from test_regression_baseline import (
     _assert_close,
     _blot,
 )
-from test_results import _chart_stats, _golden_chart_stats
+from test_results import _chart_stats
 
 FOLDER = "專案 µ α β"
 MICRO, MU = "\N{MICRO SIGN}", "\N{GREEK SMALL LETTER MU}"  # look-alikes
@@ -2114,7 +2114,7 @@ def test_operations_reproduce_the_regression_baseline(tmp_path, method):
             ops.compute(s, plot_conditions=plot, error_type=error_type, method=method)
             for error_type in (ErrorType.SD, ErrorType.SEM)
         ]
-        _assert_close(_chart_stats(*charts), _golden_chart_stats(reduced[case]), rel, abs_, case)
+        _assert_close(_chart_stats(*charts), reduced[case], rel, abs_, case)
 
 
 def test_set_polarity_reproduces_the_light_on_dark_baseline(tmp_path):
@@ -2164,7 +2164,7 @@ def test_table_and_chart_use_the_same_loading_control(tmp_path):
     ]
     assert series.chart is not None
     assert series.chart.title == "β-catenin fold-change vs vehicle  (/GAPDH)"
-    assert {bar.label: bar.points for bar in series.chart.bars} == series.groups
+    assert {bar.label: bar.points for bar in series.chart.bars if bar.n} == series.groups
     assert series.groups == {"vehicle": [v / series.baseline for v in series.normalized[:2]]}
     assert all(x.loading_id != "prot-8" for x in res.series)
     assert load_project(s.folder) == s.project  # saved as well

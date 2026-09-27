@@ -4,6 +4,9 @@
 Runs the chain the app uses today, from pixels to statistics, on a deterministic
 synthetic blot with fixed boxes, and compares every output with the golden
 values in ``data/regression_baseline.json`` (tolerance recorded in that file).
+The statistics are the charts' (:func:`~proteia.core.results.chart_test`, with the
+value kind and reference the app gives them), plus one entry per registered test
+(:data:`~proteia.core.analyze.TESTS`) chosen explicitly.
 Box placement is not covered: the boxes are fixed inputs. The nets are the
 local background's (ring_median v1, #83), all sixteen boxes quantified
 together as the operations quantify an image; the golden file also keeps each
@@ -28,18 +31,21 @@ import pytest
 
 from proteia.core import quantify
 from proteia.core.analyze import (
+    TESTS,
     Batch,
     ProteinNets,
     ReduceMethod,
     Role,
-    compare,
+    StatisticsSetting,
     describe,
     fold_change_lane,
     normalize_batch,
     reduce_samples,
 )
 from proteia.core.model import Box, BoxSize
+from proteia.core.plotspec import ValueKind
 from proteia.core.quantify import band_backgrounds, estimate_background, quantify_nets
+from proteia.core.results import chart_test
 
 GOLDEN = Path(__file__).parent / "data" / "regression_baseline.json"
 
@@ -95,8 +101,30 @@ def _quantified(image: np.ndarray, *, dark_on_light: bool) -> tuple[dict, dict, 
     return out
 
 
-def _stats(groups: dict[str, list[float]]) -> dict:
-    result = compare(groups)
+# Each registered test, chosen explicitly: (family, comparisons, the groups it takes).
+EXPLICIT = {
+    "student_t": ("pooled", "all_pairs", "two"),
+    "welch_t": ("welch", "all_pairs", "two"),
+    "mann_whitney": ("rank", "all_pairs", "two"),
+    "anova_tukey": ("pooled", "all_pairs", "all"),
+    "welch_anova_games_howell": ("welch", "all_pairs", "all"),
+    "kruskal_dunn_holm": ("rank", "all_pairs", "all"),
+    "dunnett": ("pooled", "vs_reference", "all"),
+    "welch_t_holm": ("welch", "vs_reference", "all"),
+    "dunn_holm": ("rank", "vs_reference", "all"),
+}
+
+
+def _stats(
+    groups: dict[str, list[float]],
+    kind: ValueKind,
+    reference: str | None,
+    setting: StatisticsSetting | None = None,
+) -> dict:
+    """The describe and the test of ``groups``, as a chart of ``kind`` gets them."""
+    result = chart_test(
+        groups, setting=setting or StatisticsSetting(), kind=kind, reference=reference
+    )
     return {
         "describe": [dataclasses.asdict(g) for g in describe(groups)],
         "compare": {
@@ -156,12 +184,31 @@ def _compute() -> dict:
                 lane_values, CONDITIONS, SAMPLES, included=INCLUDED, method=method
             )
             groups = reduction.groups
+            two = {k: groups[k] for k in (REFERENCE, LOW)}
+            # As the app charts them: normalized values when there is no reference,
+            # fold changes vs the reference.
+            value_kind, reference = (
+                (ValueKind.FOLD_CHANGE, REFERENCE)
+                if kind == "fold_change"
+                else (ValueKind.LOADING_NORMALIZED, None)
+            )
             out["reduced"][f"{kind}/{method}"] = {
                 "groups": groups,
                 "averaged": reduction.averaged,
-                "all": _stats(groups),  # 3 groups: one-way ANOVA + Tukey HSD
-                "two": _stats({k: groups[k] for k in (REFERENCE, LOW)}),  # Welch's t
+                "all": _stats(groups, value_kind, reference),  # Dunnett, or ANOVA + Tukey
+                "two": _stats(two, value_kind, reference),  # Student's t
             }
+    fold = out["reduced"][f"fold_change/{ReduceMethod.MEAN}"]["groups"]
+    cases = {"all": fold, "two": {k: fold[k] for k in (REFERENCE, LOW)}}
+    out["tests"] = {
+        test_id: _stats(
+            cases[case],
+            ValueKind.FOLD_CHANGE,
+            REFERENCE,
+            StatisticsSetting(family=family, comparisons=comparisons),
+        )
+        for test_id, (family, comparisons, case) in EXPLICIT.items()
+    }
     # Round-trip through JSON so tuples, enums and floats compare like the file.
     return json.loads(json.dumps(out))
 
@@ -214,8 +261,13 @@ def test_baseline_fixture_exercises_repeats_exclusion_and_the_reference():
         assert reduced["averaged"] == [[REFERENCE, "v1"]]
         assert [len(v) for v in reduced["groups"].values()] == [2, 2, 2]  # a3 excluded
         assert np.mean(reduced["groups"][REFERENCE]) == pytest.approx(1.0)
-        assert reduced["all"]["compare"]["test"] == "anova_oneway"
-        assert reduced["two"]["compare"]["test"] == "welch_t"
+        # The automatic rule on these equal n: Dunnett's test vs the reference,
+        # ANOVA + Tukey-Kramer without one, and Student's t for two conditions.
+        assert reduced["all"]["compare"]["test"] == "dunnett"
+        assert reduced["two"]["compare"]["test"] == "student_t"
+        normalized = _compute()["reduced"][f"normalized/{method}"]
+        assert normalized["all"]["compare"]["test"] == "anova_tukey"
+        assert normalized["two"]["compare"]["test"] == "student_t"
 
 
 def test_baseline_fixture_exercises_the_local_background(monkeypatch):
@@ -241,3 +293,11 @@ def test_baseline_fixture_exercises_the_local_background(monkeypatch):
     assert lifts[TARGET][:2] == [pytest.approx(0.39, abs=0.01), pytest.approx(0.15, abs=0.01)]
     assert lifts[TARGET][2:] == [0.0] * 6
     assert lifts[LOADING] == [0.0] * 8
+
+
+def test_the_baseline_runs_every_registered_test():
+    tests = _compute()["tests"]
+    assert set(tests) == set(EXPLICIT) == set(TESTS)
+    for test_id, stats in tests.items():
+        assert stats["compare"]["test"] == test_id
+        assert stats["compare"]["pairwise"]  # every comparison, significant or not

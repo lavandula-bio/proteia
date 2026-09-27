@@ -50,7 +50,8 @@ background, so it reads 85-90 % of the true signal: the band's tails lie outside
 the box, a share that varies a little with each band's width and height against
 its row's one box size. The share mostly cancels in the ratios: the per-lane
 fold changes come within 1.5 % of the truth and the treatment mean within 0.5 %
-(Welch's t-test p = 0.003). ``tests/test_samples.py`` checks these with a margin.
+(Student's t-test on log values, p = 0.0007). ``tests/test_samples.py`` checks
+these with a margin.
 
 The image. The membrane is 52000 counts with a mild linear gradient (+/-800
 across, +/-300 down: within what row detection takes without a

@@ -11,6 +11,7 @@ from proteia.core.analyze import (
     ProteinNets,
     ReduceMethod,
     Role,
+    StatisticsSetting,
     Tier,
     assess,
     compare,
@@ -281,7 +282,7 @@ def test_reduce_prevents_pseudoreplication_in_stats():
         ["a1", "a1", "a1", "b1", "b1", "b1"],
     )
     assert [len(v) for v in r.groups.values()] == [1, 1]  # n=1 each
-    res = compare(r.groups)
+    res = compare(r.groups, StatisticsSetting(), ratio=False, reference=None)
     assert res.test == "none"  # cannot test n=1 groups -> no fake significance
 
 
@@ -306,21 +307,23 @@ def test_describe_singleton_has_zero_error():
 
 
 def test_compare_two_groups_uses_welch_t():
-    res = compare({"a": [1, 2, 3], "b": [10, 11, 12]})
+    groups = {"a": [1, 2, 3], "b": [10, 11, 12]}
+    res = compare(groups, {"family": "welch"}, ratio=False, reference=None)
     assert res.test == "welch_t"
     assert res.p_value is not None and res.p_value < 0.05
     assert len(res.pairwise) == 1
 
 
 def test_compare_three_groups_uses_anova_with_posthoc():
-    res = compare({"a": [1, 2, 3], "b": [10, 11, 12], "c": [20, 21, 22]})
-    assert res.test == "anova_oneway"
+    groups = {"a": [1, 2, 3], "b": [10, 11, 12], "c": [20, 21, 22]}
+    res = compare(groups, StatisticsSetting(), ratio=False, reference=None)
+    assert res.test == "anova_tukey"
     assert res.p_value is not None and res.p_value < 0.05
     assert len(res.pairwise) == 3  # all pairs
 
 
 def test_compare_too_few_replicates_returns_no_test():
-    res = compare({"a": [1], "b": [2]})
+    res = compare({"a": [1], "b": [2]}, StatisticsSetting(), ratio=False, reference=None)
     assert res.test == "none"
     assert res.p_value is None
     assert res.note
@@ -337,8 +340,8 @@ def test_full_chain_normalize_group_compare():
     groups = reduce_samples(norm, batch.conditions).groups  # no sample names: one per lane
     assert set(groups) == {"ctl", "A", "B"}
     assert [len(v) for v in groups.values()] == [3, 3, 2]
-    res = compare(groups)
-    assert res.test == "anova_oneway"
+    res = compare(groups, StatisticsSetting(), ratio=True, reference=None)
+    assert res.test == "welch_anova_games_howell"  # n of 3, 3 and 2: Welch's
     assert res.p_value < 0.05  # ctl~1, A~2, B~0.55 are clearly different
 
 

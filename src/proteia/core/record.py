@@ -21,7 +21,10 @@ numbers came from and how:
 * ``files``: the SHA-256 and size of each exported file (an export bundle's
   record lists every other file of its folder, see
   :func:`~proteia.core.operations.export_bundle`);
-* ``results``: the compute settings of the results the export used, or None.
+* ``results``: the compute settings of the results the export used, or None,
+  with what each chart's test resolved to (:func:`results_statistics`): the
+  automatic rule may change in a later version, and the record keeps what this
+  one chose.
 
 Nothing is sent anywhere, and no platform, host name, user or path is recorded.
 A record serializes canonically (sorted keys, no NaN), so a later signature can
@@ -50,7 +53,7 @@ from typing import Any, Final
 from pydantic import JsonValue, TypeAdapter
 
 import proteia
-from proteia.core import export, grow, quantify, rowdetect, storage
+from proteia.core import analyze, export, grow, quantify, rowdetect, storage
 from proteia.core.model import LogEntry, Project, Timestamp, lane_number
 from proteia.core.results import Results
 
@@ -101,19 +104,100 @@ def settings() -> dict[str, JsonValue]:
         "chart_png_dpi": export.CHART_PNG_DPI,
         # What detect_row_boxes runs (rowdetect.detect_row with its defaults).
         "detect_row": rowdetect.settings(),
+        # How the charts' tests compute: every test is two-sided.
+        "statistics": {
+            "alpha": analyze.ALPHA,
+            "dunnett_rng_seed": analyze.DUNNETT_SEED,
+            # Each chart's record names the method its test used ("method").
+            "mann_whitney": (
+                "exact; with tied values, the exact permutation distribution up to"
+                " mann_whitney_tied_permutations arrangements, else the normal"
+                " approximation with the tie correction"
+            ),
+            "mann_whitney_tied_permutations": analyze.MANN_WHITNEY_PERMUTATIONS,
+            "kruskal_wallis_p": "chi-square approximation",
+            "dunn_adjustment": "holm",
+            "log_base": "e",
+            "auto_rule": analyze.AUTO_RULE_VERSION,
+            "tests": sorted(analyze.TESTS),
+        },
     }
 
 
 def results_settings(results: Results) -> dict[str, JsonValue]:
     """The compute arguments behind ``results``: they are not project state, so
-    each export records the ones its numbers came from."""
+    each export records the ones its numbers came from, with what each chart's
+    test resolved to (:func:`results_statistics`)."""
     plotted = results.plot_conditions
     return {
         "method": results.method.value,
         "error_type": results.error_type.value,
         "plot_conditions": None if plotted is None else list(plotted),  # resolved labels
         "excluded_lanes": list(results.excluded_lanes),
+        "statistics": results_statistics(results),
     }
+
+
+def results_statistics(results: Results) -> dict[str, JsonValue]:
+    """The statistics setting of ``results`` and, for each chart of it and of its
+    all-lanes set, what the setting resolved to: the test (None when the chart
+    shows none, and ``note`` says why), its family, comparisons, scale and
+    reference, the conditions it covers and those it leaves out, with why, and
+    which fields the user chose and which the automatic rule did (``chosen``,
+    ``reasons``). This pins what ``auto`` gave even when a later version changes
+    the rule. The test's p-values are here unrounded, as the chart's legend
+    gives them rounded: ``p_value`` and ``statistic`` (the omnibus test's or the
+    single comparison's; None for comparisons with the reference among 3
+    conditions or more), every comparison in ``pairwise`` with its adjusted p
+    and estimate, and ``method``, how a Mann-Whitney U test's p was computed."""
+    setting = results.statistics
+    chosen = {
+        name: "auto" if value == "auto" else "user"
+        for name, value in setting.model_dump(mode="json").items()
+    }
+    sets = [results] if results.all_lanes is None else [results, results.all_lanes]
+    charts: list[JsonValue] = []
+    for one in sets:
+        for series in one.series:
+            chart = series.chart
+            if chart is None:
+                continue
+            test = chart.test
+            charts.append(
+                {
+                    "result_set": one.label,
+                    "target_id": series.target_id,
+                    "loading_id": series.loading_id,
+                    "test": None if test is None else test.id,
+                    "family": None if test is None else test.family,
+                    "comparisons": None if test is None else test.comparisons,
+                    "scale": None if test is None else test.scale,
+                    "reference": None if test is None else test.reference,
+                    "design": None if test is None else test.design,
+                    "covered": [] if test is None else list(test.covered),
+                    "not_tested": [
+                        {
+                            "condition": c.label,
+                            "n": c.n,
+                            "replicates": c.replicates,
+                            "not_detected": c.not_detected,
+                            "reason": c.left_out,
+                        }
+                        for c in chart.coverage
+                        if c.left_out is not None
+                    ],
+                    "chosen": chosen if test is None else dict(test.chosen),
+                    "reasons": [] if test is None else list(test.reasons),
+                    "note": None if test is not None else chart.test_note,
+                    "p_value": None if test is None else test.p_value,
+                    "statistic": None if test is None else test.statistic,
+                    "pairwise": []
+                    if test is None
+                    else [pair.model_dump(mode="json") for pair in test.pairwise],
+                    "method": None if test is None else test.method,
+                }
+            )
+    return {"setting": setting.model_dump(mode="json"), "charts": charts}
 
 
 def _undo_mismatch(log: tuple[LogEntry, ...]) -> bool:
