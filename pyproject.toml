@@ -30,6 +30,13 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
 ]
+# The Windows installer's build tools (ADR 0003), pinned; only
+# packaging/windows/build.py installs them, in an environment of its own. The
+# default `uv sync` (dev only) and the CI test jobs never do.
+build = [
+    "pyinstaller==6.22.3",
+    "pyinstaller-hooks-contrib==2026.7",
+]
 
 [build-system]
 requires = ["hatchling"]
