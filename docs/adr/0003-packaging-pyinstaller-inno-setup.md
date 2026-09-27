@@ -229,8 +229,15 @@ used, for the reasons below.
 
 - A per-user install by default, with a per-machine option for administrators; a
   fixed application ID; a Start Menu shortcut and an optional desktop shortcut.
-- Uninstalling removes the program files and the launcher state in
-  `%LOCALAPPDATA%\Proteia`, and never touches `Documents\Proteia`.
+- Uninstalling removes the program files and the launcher's own instance
+  files in the uninstalling user's `%LOCALAPPDATA%\Proteia` (`instance.lock`,
+  `instance.json`, `open-proteia.html`). It keeps the rest of that folder, where
+  the session logs are written (#137), so a reinstall made to work around a
+  problem does not delete the logs a bug report needs. It never touches
+  `Documents\Proteia`.
+- A per-machine uninstall runs as the administrator, so it reaches only that
+  account's `%LOCALAPPDATA%`; other users' state folders stay. They hold no
+  project data, and a later install reuses them.
 - Before it replaces files, the installer stops a running Proteia, for example by
   sending Quit to the running instance (`POST /api/quit` with the token from
   `instance.json`; Proteia saves first and answers 409 if it cannot), and stops with
