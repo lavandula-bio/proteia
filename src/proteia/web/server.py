@@ -37,6 +37,10 @@ from proteia.web import api, projects
 
 HOST: Final = "127.0.0.1"
 APP_ID: Final = "proteia"  # what /api/status reports, so a launcher knows it found Proteia
+# What /api/status reports as ``handoff``: the version of the routes that take
+# files from a launch (proteia.web.handoff), so a launcher knows, before it
+# sends any, that this Proteia can take them.
+HANDOFF: Final = 1
 STATIC_DIR: Final = Path(__file__).parent / "static"
 # secrets.token_urlsafe output: URL-safe base64 without padding.
 TOKEN_PATTERN: Final = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
@@ -158,8 +162,8 @@ def create_app(
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/api/status")
-    def status() -> dict[str, str]:
-        return {"app": APP_ID, "version": proteia.__version__}
+    def status() -> dict[str, str | int]:
+        return {"app": APP_ID, "version": proteia.__version__, "handoff": HANDOFF}
 
     @app.post("/api/quit", status_code=202)
     def quit_app(request: Request) -> dict[str, str]:

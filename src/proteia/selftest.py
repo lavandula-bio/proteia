@@ -440,7 +440,9 @@ def _web_checks(client: _Client, report: Report) -> None:
     from proteia.web.launch import InstanceInfo, probe
 
     status = client.json("GET", "/api/status")
-    check(status == {"app": "proteia", "version": proteia.__version__}, f"status {status}")
+    # The fields that name the app; the status may carry others (``handoff``).
+    named = {key: status.get(key) for key in ("app", "version")}
+    check(named == {"app": "proteia", "version": proteia.__version__}, f"status {status}")
     client.request("GET", "/api/status", token=False, expect=401)
     check(probe(InstanceInfo(0, client.port, client.token)), "the launcher's probe failed")
     shell, kind = client.request("GET", "/", token=False)
