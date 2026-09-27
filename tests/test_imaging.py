@@ -12,10 +12,13 @@ from skimage import io
 from proteia.core.imaging import (
     _Declared,
     _read_tiff_with_pillow,
+    clipping_depth,
     display_rgb,
+    file_colours,
     from_pixels,
     load_image,
     preview,
+    read_colours,
     read_pixels,
     to_analysis_array,
 )
@@ -217,6 +220,39 @@ def test_pixels_in_memory_follow_the_same_rules():
     assert _codes(from_pixels(_gray(np.uint8, 255), lossy=True)) == ["lossy_format"]
 
 
+def test_every_warning_that_turns_the_clipping_check_off_says_so(tmp_path):
+    # #112: the over-exposure check does not run on these images
+    # (clipping_depth), and each warning tells the user so.
+    rgb = np.zeros((4, 5, 3), dtype=np.uint8)
+    rgb[..., 0] = 200
+    loaded = [
+        from_pixels(_gray(np.uint8, 255), lossy=True),
+        from_pixels(rgb),
+        from_pixels(np.full((4, 6), 20.0)),
+    ]
+    warnings = [warning for image in loaded for warning in image.warnings]
+    assert [w.code for w in warnings] == [
+        "lossy_format",
+        "color_channels_differ",
+        "unknown_bit_depth",
+    ]
+    for image in loaded:
+        assert clipping_depth(image.bit_depth, image.warnings) is None
+    for warning in warnings:
+        assert "over-exposure cannot be checked" in warning.message, warning.code
+    path = tmp_path / "blot β.jpg"
+    io.imsave(path, _gray(np.uint8, 255), check_contrast=False)
+    (warning,) = load_image(path).warnings
+    assert warning.message == (
+        "JPEG-type compression can change pixel values, so over-exposure cannot be"
+        " checked; quantify an uncompressed or losslessly compressed original if you have it."
+    )
+    assert warnings[1].message == (
+        "The red, green and blue channels differ; they were averaged into one gray"
+        " channel, so over-exposure cannot be checked."
+    )
+
+
 def test_jpeg_compressed_tiff_records_a_lossy_format_warning(tmp_path):
     path = tmp_path / "jpeg inside.tif"
     Image.fromarray(_gray(np.uint8, 255)).save(path, compression="jpeg")
@@ -311,3 +347,95 @@ def test_display_rgb_views():
     rgba = np.zeros((1, 1, 4), dtype=np.uint8)
     rgba[..., :3], rgba[..., 3] = [1, 2, 3], 255
     assert display_rgb(rgba).tolist() == [[[1, 2, 3]]]
+
+
+# --- A file's own colours, for display only (#57) ---
+
+
+def _palette_map(gray: bool = False) -> np.ndarray:
+    """A 16-bit TIFF colour map (3 x 256): a gray ramp, or a red-to-yellow one."""
+    level = np.arange(256, dtype=np.uint16)
+    if gray:
+        return np.stack([level * 257] * 3)
+    return np.stack([level * 257, level * 128, (255 - level) * 64])
+
+
+def _write(path, pixels, **options):
+    if path.suffix == ".tif":
+        tifffile.imwrite(path, pixels, **options)
+    else:
+        (pixels if isinstance(pixels, Image.Image) else Image.fromarray(pixels)).save(
+            path, **options
+        )
+    return path
+
+
+def _palette_png() -> Image.Image:
+    image = Image.fromarray(_gray(np.uint8, 2), mode="L").convert("P")
+    image.putpalette([200, 30, 40, 250, 220, 225, 120, 10, 20] + [0] * (253 * 3))
+    return image
+
+
+@pytest.mark.parametrize(
+    ("name", "pixels", "options", "expected"),
+    [
+        ("rgb.tif", _rgb8(), {}, "rgb"),
+        ("rgb lzw.tif", Image.fromarray(_rgb8()), {"compression": "tiff_lzw"}, "rgb"),
+        ("rgba.tif", np.dstack([_rgb8(), _gray(np.uint8, 255)]), {}, "rgb"),
+        (
+            "palette.tif",
+            _gray(np.uint8, 255),
+            {"photometric": "palette", "colormap": _palette_map()},
+            "palette",
+        ),
+        (
+            "gray map.tif",
+            _gray(np.uint8, 255),
+            {"photometric": "palette", "colormap": _palette_map(gray=True)},
+            None,
+        ),
+        ("gray.tif", _gray(np.uint16, 65535), {}, None),
+        # Three gray planes are not red, green and blue.
+        ("planes.tif", _rgb8(), {"photometric": "minisblack", "planarconfig": "contig"}, None),
+        ("rgb.png", _rgb8(), {}, "rgb"),
+        ("palette.png", _palette_png(), {}, "rgb"),
+        ("gray.png", _gray(np.uint8, 255), {}, None),
+        ("rgb.jpg", _rgb8(), {"quality": 95}, "rgb"),
+        # CMYK is not converted, so its colours cannot be shown as the file's own.
+        ("cmyk.jpg", Image.fromarray(_rgb8()).convert("CMYK"), {"quality": 95}, None),
+        ("cmyk.tif", Image.fromarray(_rgb8()).convert("CMYK"), {}, None),
+    ],
+)
+def test_file_colours_say_from_the_header_how_a_file_holds_colour(
+    tmp_path, name, pixels, options, expected
+):
+    path = tmp_path / f"µ {name}"
+    if isinstance(pixels, Image.Image) and path.suffix == ".tif":
+        pixels.save(path, **options)  # LZW, or CMYK as a separated TIFF
+    else:
+        _write(path, pixels, **options)
+    assert file_colours(path) == expected
+
+
+def test_file_colours_of_a_damaged_file_is_a_value_error(tmp_path):
+    for name in ("damaged.tif", "damaged.png"):
+        path = tmp_path / name
+        path.write_bytes(b"not an image")
+        with pytest.raises((ValueError, OSError)):
+            file_colours(path)
+
+
+def test_read_colours_looks_a_palette_tiff_up_in_its_colour_map(tmp_path):
+    indices = _gray(np.uint8, 255)
+    colormap = _palette_map()
+    path = _write(tmp_path / "fire.tif", indices, photometric="palette", colormap=colormap)
+    np.testing.assert_array_equal(read_pixels(path), indices)  # what analysis reads
+    shown = read_colours(path)
+    assert (shown.shape, shown.dtype) == ((6, 8, 3), np.uint8)
+    np.testing.assert_array_equal(shown[..., 0], indices)  # the high byte of level * 257
+    np.testing.assert_array_equal(shown[..., 1], indices // 2)
+    np.testing.assert_array_equal(shown[..., 2], (255 - indices) // 4)
+    # Anything else reads as it is stored.
+    for name, pixels in (("rgb.tif", _rgb8()), ("gray.png", _gray(np.uint8, 255))):
+        other = _write(tmp_path / name, pixels)
+        np.testing.assert_array_equal(read_colours(other), pixels)

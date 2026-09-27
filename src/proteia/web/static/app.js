@@ -48,6 +48,7 @@ class ApiError extends Error {
     this.status = status;
     this.code = body && body.code;
     this.ids = (body && body.ids) || [];
+    this.detail = (body && body.detail) || null; // why, when the refusal says (a row box's)
   }
 }
 
@@ -103,14 +104,19 @@ const state = {
   imageId: null,
   proteinId: null, // the protein a click on the image places a box of
   boxId: null,
-  bitmaps: new Map(), // image id -> Promise of its preview's ImageBitmap
+  // image id -> {grey, original}: Promises of its previews' ImageBitmaps, each
+  // fetched when first shown
+  bitmaps: new Map(),
   shownImageId: null, // the image the view shows (null while a preview loads)
+  // The images shown in their original colours ("Original colours" on): kept
+  // for this page only, never in the project.
+  originalColours: new Set(),
 };
 
 function forgetBitmap(imageId) {
-  const pending = state.bitmaps.get(imageId);
+  const previews = state.bitmaps.get(imageId);
   state.bitmaps.delete(imageId);
-  if (pending) {
+  for (const pending of Object.values(previews || {})) {
     pending.then((bitmap) => bitmap.close()).catch(() => {});
   }
 }
@@ -126,9 +132,10 @@ function keepsFocus(button) {
 let statusUndo = null; // the change the status line's Undo takes back: {seq}, or null
 
 // Show `text` in the status line ("" empties it), with an optional action after
-// it: {label, name (its accessible name), seq, run}. The action takes back the
-// change logged as `seq`, and goes once the history has moved past it. Gives
-// the action's button, or null.
+// it: {label, name (its accessible name), seq, run}. With `seq`, the action
+// takes back the change logged as `seq`, and goes once the history has moved
+// past it. Without, it does what changes nothing (Show folder after an export)
+// and goes with the message. Gives the action's button, or null.
 function showStatus(text, action = null) {
   const line = $("status");
   line.textContent = text;
@@ -140,17 +147,29 @@ function showStatus(text, action = null) {
     button.textContent = action.label;
     button.setAttribute("aria-label", action.name);
     keepsFocus(button);
-    // Taken once: a second press before the answer (a double click) would find
-    // the change no longer the last, and say so over what the first one did.
+    const undoes = action.seq !== undefined;
+    // An Undo is taken once: a second press before the answer (a double click)
+    // would find the change no longer the last, and say so over what the first
+    // one did. Another action may be taken again once its answer is in (`run`
+    // gives a Promise that settles then): one press, one request.
     button.addEventListener("click", () => {
-      action.run();
+      const running = action.run();
       button.disabled = true;
+      if (!undoes) {
+        const again = () => {
+          button.disabled = false;
+          if (button.isConnected && focusLost()) {
+            button.focus(); // the keyboard stays on it
+          }
+        };
+        Promise.resolve(running).then(again, again);
+      }
     });
     const part = document.createElement("span");
     part.className = "status-action";
     part.append(" — ", button);
     line.append(part);
-    statusUndo = { seq: action.seq };
+    statusUndo = undoes ? { seq: action.seq } : null;
   }
   placeStatus();
   return button;
@@ -335,24 +354,27 @@ const laneTable = new LaneTable({
   status: showStatus,
 });
 
+// Read the project again and show it: only if the answer is about the opening
+// shown, and not while another project is being opened (openProject shows
+// that one).
+async function reread() {
+  const answer = await call("GET", "/api/project");
+  if (opening === null && sameOpening(answer)) {
+    applyAnswer(answer);
+  }
+}
+
 // Each chart's drawing is fetched with the token ("Updating…" counts it until
 // it arrives or no card awaits it), at a low priority: an edit waiting for a
 // connection goes before the drawings waiting with it. One the server no
-// longer keeps is asked for again after the project is read again; that
-// answer is shown only if it is about the opening shown, and not while
-// another project is being opened (openProject shows that one).
+// longer keeps is asked for again after the project is read again (reread).
 const charts = new ChartCards({
   fetch: (path, signal) =>
     dock.track(
       request("GET", path, { signal, priority: "low" }).then((response) => response.blob()),
       { chart: true },
     ),
-  reread: async () => {
-    const answer = await call("GET", "/api/project");
-    if (opening === null && sameOpening(answer)) {
-      applyAnswer(answer);
-    }
-  },
+  reread,
 });
 
 // --- Projects ---
@@ -362,13 +384,16 @@ async function showProjects() {
   $("projects-error").textContent = "";
   const listing = await call("GET", "/api/projects");
   $("projects-root").textContent = `Projects are saved in ${listing.root}`;
+  $("projects-empty").hidden = listing.projects.length > 0;
   const list = $("project-list");
   list.replaceChildren();
   for (const entry of listing.projects) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = entry.name;
-    button.addEventListener("click", () => openProject("/api/projects/open", entry.name));
+    button.addEventListener("click", () =>
+      openProject("/api/projects/open", entry.name, { name: entry.name }),
+    );
     const item = document.createElement("li");
     item.append(button);
     list.append(item);
@@ -382,7 +407,7 @@ async function showProjects() {
 // One create or open at a time: while it runs the dialog stays open and takes
 // no other choice, so no two opens race and no edit is made from the page
 // until the server's newly open project is shown.
-let opening = null; // the name being opened, or null
+let opening = null; // what is being opened ("Opening …" names it), or null
 
 function setOpening(name) {
   opening = name;
@@ -393,9 +418,13 @@ function setOpening(name) {
   line.hidden = name === null;
 }
 
-async function openProject(path, name) {
+// Create or open a project: POST `json` (no body if undefined) to `path`,
+// then show the project answered in place of the one shown. `name` is what
+// "Opening …" says meanwhile. Gives the answer once the project is shown, or
+// null.
+async function openProject(path, name, json) {
   if (opening !== null) {
-    return;
+    return null;
   }
   setOpening(name);
   $("projects-error").textContent = "";
@@ -409,10 +438,10 @@ async function openProject(path, name) {
     // change of that project.
     await Promise.all([proteinPanel.settled(), pending()]);
     proteinPanel.invalidateEdits();
-    const answer = await call("POST", path, { name });
+    const answer = await call("POST", path, json);
     if (!isCurrent(answer.project)) {
       $("projects-error").textContent = "Another project was opened meanwhile.";
-      return;
+      return null;
     }
     // Image ids repeat across projects (img-1 in each): drop everything shown.
     view.setImage(null, 0, 0);
@@ -421,6 +450,7 @@ async function openProject(path, name) {
     for (const id of [...state.bitmaps.keys()]) {
       forgetBitmap(id);
     }
+    state.originalColours.clear();
     proteinPanel.forgetTyped();
     laneTable.forgetTyped();
     charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
@@ -429,17 +459,41 @@ async function openProject(path, name) {
     lastBoxStep = null; // log numbers repeat across projects
     $("projects-dialog").close();
     showStatus("");
+    return answer;
   } catch (error) {
     $("projects-error").textContent = error.message;
+    return null;
   } finally {
     setOpening(null);
   }
 }
 
+// "Open sample project": a new project on the synthetic sample blot, with its
+// lanes and proteins set up and each protein's row left to drag
+// (sample_project.py on the server). The status line says what to do next.
+// The first-use tour will start here: the answer's sample.rows gives each
+// protein's row, top to bottom, as a drag over it, for the tour to point at.
+async function openSample() {
+  const answer = await openProject("/api/projects/sample", "the sample project");
+  if (answer === null || !sameOpening(answer)) {
+    return;
+  }
+  const names = answer.sample.rows
+    .map((row) => answer.project.proteins.find((p) => p.id === row.protein_id))
+    .filter(Boolean)
+    .map((protein) => protein.name);
+  showStatus(
+    "For each protein, choose it on the left and drag across its row to box its bands" +
+      ` (rows from the top: ${names.join(", ")}); the table and charts fill in.`,
+  );
+}
+
 $("new-project").addEventListener("submit", (event) => {
   event.preventDefault();
-  openProject("/api/projects", $("new-project-name").value);
+  const name = $("new-project-name").value;
+  openProject("/api/projects", name, { name });
 });
+$("open-sample").addEventListener("click", () => openSample());
 $("projects-close").addEventListener("click", () => {
   if (opening === null) {
     $("projects-dialog").close();
@@ -483,12 +537,23 @@ function laneName(project, index) {
   return `Lane ${index + 1}${label}`;
 }
 
+// The file names of the images `ids` names (a refusal's), set apart for
+// bidirectional text; one not in the project shown (an image an undo would
+// bring back) is left out.
+function imageNames(ids) {
+  return ids
+    .map((id) => state.project.images.find((image) => image.id === id))
+    .filter(Boolean)
+    .map((image) => isolate(image.original_name));
+}
+
 function render() {
   $("lane-picker").hidden = true; // its question was about the state before
   const project = state.project;
   $("workspace").hidden = !project;
   $("switch-project").hidden = false;
   $("reveal").hidden = !project;
+  $("export").hidden = !project;
   $("undo").hidden = !project;
   $("redo").hidden = !project;
   placeStatus();
@@ -509,11 +574,13 @@ function render() {
   renderBox(project);
   renderNotices(project);
   renderHint(project, image);
+  renderColours(image);
   renderView(project);
   laneTable.render(project, state.results);
   charts.render(state.results);
   dock.render(state.results);
   renderRequantify(project);
+  renderExport(project);
 }
 
 function renderImages(project, image) {
@@ -724,20 +791,70 @@ function renderHint(project, image) {
   }
 }
 
+// The preview of each colours: the grey analysis image, or the stored file's
+// original colours (the server answers the grey one for a file without colour).
+const PREVIEW_QUERY = { grey: "", original: "?colour=original" };
+
 // One fetch per preview, shared by every render that waits for it.
-function bitmapOf(imageId) {
+function bitmapOf(imageId, colours) {
   if (!state.bitmaps.has(imageId)) {
-    const pending = request("GET", `/api/images/${imageId}/preview`)
+    state.bitmaps.set(imageId, {});
+  }
+  const previews = state.bitmaps.get(imageId);
+  if (!previews[colours]) {
+    const pending = request("GET", `/api/images/${imageId}/preview${PREVIEW_QUERY[colours]}`)
       .then((response) => response.blob())
       .then((blob) => createImageBitmap(blob));
     pending.catch(() => {
-      if (state.bitmaps.get(imageId) === pending) {
-        state.bitmaps.delete(imageId); // the next render tries again
+      if (previews[colours] === pending) {
+        delete previews[colours]; // the next render tries again
       }
     });
-    state.bitmaps.set(imageId, pending);
+    previews[colours] = pending;
   }
-  return state.bitmaps.get(imageId);
+  return previews[colours];
+}
+
+// The colours the view shows `image` in: "original" while its "Original
+// colours" is on (offered only for a file with colour), else "grey".
+function coloursOf(image) {
+  return image.colour && state.originalColours.has(image.id) ? "original" : "grey";
+}
+
+function renderColours(image) {
+  const button = $("original-colours");
+  button.hidden = !image || !image.colour;
+  button.setAttribute("aria-pressed", String(Boolean(image) && coloursOf(image) === "original"));
+}
+
+// The image whose colours were just switched: the view says which it shows
+// once it shows them (for a screen reader: the switch may be the C key).
+let switchedColours = null;
+
+// "Original colours" (the button, or C): the chosen image in the stored file's
+// own colours, or back to the grey analysis image. The view keeps its zoom.
+function toggleColours() {
+  const project = state.project;
+  const image = project && project.images.find((i) => i.id === state.imageId);
+  if (!image || !image.colour || $("workspace").hidden) {
+    return;
+  }
+  if (!state.originalColours.delete(image.id)) {
+    state.originalColours.add(image.id);
+  }
+  switchedColours = image.id;
+  renderColours(image);
+  renderView(project);
+}
+
+$("original-colours").addEventListener("click", () => toggleColours());
+
+function sayColours(image, colours) {
+  const name = isolate(image.original_name);
+  $("view-colours-state").textContent =
+    colours === "original"
+      ? `${name} in its original colours, for display only`
+      : `${name} as the grey analysis image, which the nets are measured on`;
 }
 
 let renderGeneration = 0;
@@ -796,16 +913,47 @@ function renderView(project) {
       });
     }
   }
-  bitmapOf(image.id)
+  const colours = coloursOf(image);
+  if (state.shownImageId === image.id) {
+    // Shown already: its boxes are drawn now, over the bitmap shown, not once the
+    // preview in these colours has loaded (both cover the same pixels), so the
+    // view never shows, nor takes a click on, a box the server no longer has.
+    view.setOverlay(boxes, ghosts, state.boxId, marks);
+  }
+  bitmapOf(image.id, colours)
     .then((bitmap) => {
       if (generation !== renderGeneration) {
         return; // a later render owns the view
       }
-      view.setImage(bitmap, image.width, image.height);
-      state.shownImageId = image.id;
-      view.setOverlay(boxes, ghosts, state.boxId, marks);
+      if (state.shownImageId === image.id) {
+        view.setBitmap(bitmap); // this image, maybe in other colours: the zoom stays
+      } else {
+        view.setImage(bitmap, image.width, image.height);
+        view.setOverlay(boxes, ghosts, state.boxId, marks);
+        state.shownImageId = image.id;
+      }
+      const switched = switchedColours === image.id;
+      switchedColours = null;
+      if (switched) {
+        sayColours(image, colours);
+      }
     })
-    .catch(report);
+    .catch((error) => {
+      if (colours !== "original" || generation !== renderGeneration) {
+        report(error);
+        return;
+      }
+      // Not shown in its colours (its file changed outside Proteia, say): the
+      // switch goes back off, and the grey analysis image is shown.
+      state.originalColours.delete(image.id);
+      switchedColours = null;
+      renderColours(image);
+      renderView(state.project);
+      if (!(error instanceof ApiError && error.status === 401)) {
+        const name = isolate(image.original_name);
+        showStatus(`${name} not shown in its original colours: ${sentence(error.message)}`);
+      }
+    });
 }
 
 // --- Edits ---
@@ -906,7 +1054,7 @@ function lanesPhrase(indices) {
 // unless its place lies outside the row box.
 const NOT_MEASURED = {
   artefact: "a stain or streak",
-  edge_signal: "only a neighbouring row's signal",
+  edge_signal: "only signal at the row box's top or bottom edge",
   unassigned: "signal that fits no lane",
   no_band: "outside the row box",
 };
@@ -928,6 +1076,16 @@ const ROW_WARNINGS = {
     note: "second separate component",
     words: (lanes) => `two bands in ${lanes || "a lane"}: the box covers the stronger one`,
   },
+  cut_by_row_box: {
+    note: "cuts through the band",
+    words: (lanes) => {
+      if (!lanes) {
+        return "the row box cuts through a band; include the whole band";
+      }
+      const bands = lanes.startsWith("lanes") ? "bands" : "band";
+      return `the row box cuts through the ${bands} in ${lanes}; include the whole ${bands}`;
+    },
+  },
 };
 
 function warningText(flag, notes) {
@@ -940,10 +1098,35 @@ function warningText(flag, notes) {
   return warning.words(match ? match[1] : null);
 }
 
+// The other proteins on the image whose nets a row changed, in words, or
+// null: every ring leaves out every box on its image, so a new row moves the
+// local background, and the net, of the boxes already there.
+function remeasuredText(answer) {
+  const found = answer.remeasured
+    .map((entry) => findBox(answer.project, entry.band_id))
+    .filter(Boolean);
+  if (!found.length) {
+    return null;
+  }
+  const names = [...new Set(found.map((box) => box.protein.name))];
+  const who =
+    names.length === 1 ? `${names[0]} on this image was` : "other proteins on this image were";
+  const largest = answer.largest_change;
+  const where = largest && findBox(answer.project, largest.band_id);
+  if (!where) {
+    return `${who} re-measured`;
+  }
+  const percent = largest.change * 100;
+  const size = percent < 1 ? "under 1%" : `${Math.round(percent)}%`;
+  const whose = names.length === 1 ? "" : ` (${where.protein.name})`;
+  return `${who} re-measured; largest change ${size} in lane ${where.band.lane_index + 1}${whose}`;
+}
+
 // What a row did, lane by lane, from its answer (lanes numbered from 1): the
 // boxes placed, the lanes with no band (n.d.), those kept as they were, those
-// not measured and why, the boxes an earlier row placed that went, and the
-// detector's warnings. `before`: the state shown before, where those boxes are.
+// not measured and why, the boxes an earlier row placed that went, the
+// detector's warnings and the other proteins it re-measured. `before`: the
+// state shown before, where those boxes are.
 // Gives {text, check, unchanged}: `unchanged` when the row changed nothing (the
 // same drag again), `check` when it changed the project and left signal that
 // fits no lane, the mark of a row box over part of the row (its bands then
@@ -1008,6 +1191,10 @@ function rowReport(answer, name, before) {
   if (answer.right_to_left) {
     parts.push("lanes read right to left, as the boxes on this image run");
   }
+  const remeasured = remeasuredText(answer);
+  if (remeasured) {
+    parts.push(remeasured);
+  }
   const check = !unchanged && unmeasured.has("unassigned");
   if (check) {
     const all = answer.band_ids.length;
@@ -1021,7 +1208,9 @@ function rowReport(answer, name, before) {
   return { text: parts.join(" · "), check, unchanged };
 }
 
-// What to do about a refused row, by the refusal's code.
+// What to do about a refused row, by the refusal's code. A row the detector
+// saw bands in (a refusal whose detail names another cause than no_band)
+// already says what to do.
 const ROW_HINTS = {
   row_too_small: "Drag across the whole row, over every lane.",
   no_band_found: "Drag over a row of bands, or click a band to box one lane.",
@@ -1090,7 +1279,7 @@ function showRowRefusal(error, name) {
         run: () => takeStep("undo", { seq: step.seq }),
       };
     }
-  } else if (ROW_HINTS[error.code]) {
+  } else if (ROW_HINTS[error.code] && !(error.detail && error.detail.cause !== "no_band")) {
     sentences.push(ROW_HINTS[error.code]);
   }
   showStatus(sentences.join(" "), action);
@@ -1340,14 +1529,177 @@ function reportRequantify(error) {
   if (error instanceof ApiError && error.status === 401) {
     return;
   }
-  const names = (error.ids || [])
-    .map((id) => state.project.images.find((image) => image.id === id))
-    .filter(Boolean)
-    .map((image) => isolate(image.original_name));
+  const names = imageNames(error.ids || []);
   const which = names.length ? ` (${inWords(names)})` : "";
   showStatus(
     `Not requantified: ${sentence(`${error.message}${which}`)} The nets are as they were.`,
   );
+}
+
+// --- Exporting the results ---
+
+const EXPORT_TITLE =
+  "Write the charts, the lane tables and a record of how they were made into a new folder" +
+  " under exports in the project folder";
+const NO_LANES_TITLE = "Nothing to export yet: declare the lanes in Lanes & values";
+
+let exporting = false; // a press has no answer yet
+
+// The header's Export: disabled while an export runs, while no lanes are
+// declared (its tooltip says so), and once Quit is pressed (renderQuit).
+function renderExport(project) {
+  const button = $("export");
+  const lanes = project.lanes.length > 0;
+  button.disabled = exporting || quitting || !lanes;
+  button.title = exporting ? "Exporting…" : lanes ? EXPORT_TITLE : NO_LANES_TITLE;
+}
+
+// Write the results, as the page shows them, into a new folder under exports:
+// each set's lane table and charts (in the server's default formats: none are
+// asked for), a README and the record. Like a requantify, it runs in the
+// panel's queue once the edits made before it have their answers (a lane just
+// typed, a box being placed), so the export has them, and the edits made after
+// it, and an open, wait for it. Not a change: nothing is logged, so no Undo;
+// and no value changes, so it is not awaited as an edit is ("Updating…"): the
+// status line says "Exporting…". Pressed twice (a double click), it is sent
+// once: the button stays disabled until the answer. Quit waits for it too
+// (renderQuit).
+function exportResults() {
+  if (exporting || quitting || !state.project || $("workspace").hidden) {
+    return;
+  }
+  exporting = true;
+  renderExport(state.project);
+  renderQuit();
+  showStatus("Exporting…");
+  const after = Promise.allSettled([pending(), proteinPanel.adding]);
+  const asked = proteinPanel.queueEdit(
+    async (current) => {
+      const opened = shownOpening();
+      showStatus("Exporting…"); // again: the answer of an edit before it empties the line
+      try {
+        const answer = await request("POST", "/api/export").then((response) => response.json());
+        applyAnswer(answer);
+        if (current() && sameOpening(answer)) {
+          showExported(answer);
+        } else if (current()) {
+          // The project was read again from its folder while it exported (an
+          // outside change): the files are of the version before, and written.
+          const files = counted(answer.files.length, "file", "files");
+          showStatus(
+            `Exported ${files} to ${answer.folder}, from the project as it was before` +
+              " it was read again from its folder.",
+          );
+        }
+      } catch (error) {
+        if (current() && opened === shownOpening()) {
+          await reportExport(error);
+        } else if (current()) {
+          showStatus("Not exported: the project was read again from its folder meanwhile. Export again.");
+        }
+      }
+      return null;
+    },
+    { after },
+  );
+  const done = () => {
+    exporting = false;
+    renderQuit();
+    if (state.project) {
+      renderExport(state.project);
+    }
+    const button = $("export");
+    if (!button.disabled && !button.hidden) {
+      // Refused: the keyboard stays on Export, which may have lost it while disabled.
+      if (focusLost()) {
+        button.focus();
+      }
+    } else {
+      // Disabled for good: the lanes are gone (a no_lanes refusal shows the
+      // project read again before this). The keyboard goes on to Undo or Redo,
+      // as from Requantify once its offer has gone.
+      keepFocus(button, "undo", null);
+    }
+  };
+  asked.then(done, done);
+}
+
+$("export").addEventListener("click", exportResults);
+
+// What the export wrote, with Show folder, which opens that folder in the
+// system file manager. The keyboard goes on to it: Export again would make
+// another folder.
+function showExported(answer) {
+  const folder = answer.folder;
+  const button = showStatus(
+    `Exported ${counted(answer.files.length, "file", "files")} to ${folder}`,
+    { label: "Show folder", name: `Show the folder ${folder}`, run: () => revealExport(folder) },
+  );
+  if (button && (focusLost() || document.activeElement === $("export"))) {
+    button.focus();
+  }
+}
+
+// Show an export folder, as the export answered it, in the system file
+// manager. One moved or deleted since is said, which takes the status line's
+// Show folder away: the keyboard then goes back to Export. Settles once
+// answered, and never rejects.
+async function revealExport(folder) {
+  const opened = shownOpening();
+  try {
+    await call("POST", "/api/project/reveal", { folder });
+  } catch (error) {
+    if (opened !== shownOpening()) {
+      return;
+    }
+    if (error.code === "folder_not_found") {
+      showStatus(
+        `${folder} is not in the project folder any more: it was moved or deleted outside Proteia.`,
+      );
+    } else {
+      report(error);
+    }
+    const button = $("export");
+    if (focusLost() && !button.disabled && !button.hidden) {
+      button.focus();
+    }
+  }
+}
+
+// A refused export writes nothing: what to do, by the refusal's code; the
+// images a missing or changed file belongs to, by their file names. Settles
+// once said (and, with no lanes, once the project is shown as it is now).
+async function reportExport(error) {
+  if (error instanceof ApiError && error.status === 401) {
+    return;
+  }
+  let why = sentence(error.message);
+  if (error.code === "no_lanes") {
+    why = "No lanes are declared. Declare the lanes in Lanes & values, then export.";
+  } else if (error.code === "image_file_changed") {
+    const names = imageNames(error.ids);
+    const one = names.length <= 1;
+    const which = names.length
+      ? `The ${one ? "file" : "files"} of ${inWords(names)} ${one ? "is" : "are"}`
+      : "An image file is";
+    why =
+      `${which} missing from the project's images folder or ${one ? "was" : "were"} changed` +
+      ` outside Proteia. Put the original ${one ? "file" : "files"} back, then export.`;
+  } else if (error.code === "path_too_long") {
+    // Projects live only in the projects folder (Projects… names it), so the
+    // way out is a shorter name: the project's folder's, renamed while Proteia
+    // is not running (it has no rename).
+    why =
+      "The project folder's path is too long for the file names an export writes. Give the" +
+      " project a shorter name: quit Proteia, rename the project's folder (Projects… shows" +
+      " where projects are saved), then start Proteia again and export.";
+  }
+  showStatus(`Not exported: ${why}`);
+  if (error.code === "no_lanes") {
+    // The page showed lanes (Export is disabled without): another tab removed
+    // them since. Show the project as it is now.
+    await reread().catch(() => {});
+  }
 }
 
 // --- Undo and redo ---
@@ -1435,10 +1787,7 @@ function reportStep(direction, error) {
   } else if (error.code === "image_file_changed") {
     // The image is often not in the project shown (undoing a removal), so its
     // name may be unknown here; and the file may be missing or changed.
-    const names = error.ids
-      .map((id) => state.project.images.find((image) => image.id === id))
-      .filter(Boolean)
-      .map((image) => isolate(image.original_name));
+    const names = imageNames(error.ids);
     const which = names.length ? `the file of ${inWords(names)} is` : "an image file it needs is";
     showStatus(
       `Cannot ${direction}: ${which} missing from the project's images folder` +
@@ -1613,26 +1962,52 @@ document.addEventListener("keydown", (event) => {
     view.zoomCentre(1.25);
   } else if (event.key === "-") {
     view.zoomCentre(0.8);
+  } else if (event.key === "c" || event.key === "C") {
+    toggleColours();
   }
 });
 
 // --- Quit ---
 
+let quitting = false; // pressed: its answer is awaited, or Proteia has stopped
+
+// Quit waits for an export: stopping the server under it would cut it off, and
+// its answer would come after "Proteia has stopped" (the page shown again, or
+// "Not exported" for a folder written in full). Disabled while one runs, its
+// tooltip says why; once pressed, no export starts (renderExport).
+function renderQuit() {
+  const button = $("quit");
+  button.disabled = quitting || exporting;
+  button.title = exporting ? "Quit once the export is written" : "";
+}
+
 $("quit").addEventListener("click", async () => {
-  $("quit").disabled = true;
+  if (quitting || exporting) {
+    return;
+  }
+  quitting = true;
+  renderQuit();
+  if (state.project) {
+    renderExport(state.project);
+  }
   try {
     await request("POST", "/api/quit");
     showStatus("Proteia has stopped. You can close this tab.");
     $("workspace").hidden = true;
     $("quit").hidden = true;
+    $("export").hidden = true;
     $("undo").hidden = true;
     $("redo").hidden = true;
   } catch (error) {
+    quitting = false;
     if (error instanceof ApiError && error.status === 401) {
       $("quit").hidden = true; // this tab cannot reach the running Proteia
     } else {
       showStatus(error.message || "Proteia did not stop. Try Quit again.");
-      $("quit").disabled = false;
+    }
+    renderQuit();
+    if (state.project) {
+      renderExport(state.project);
     }
   }
 });

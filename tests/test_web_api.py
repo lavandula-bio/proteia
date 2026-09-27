@@ -8,20 +8,24 @@ JSON."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import http.client
 import io
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
 
 import numpy as np
 import pytest
+import tifffile
 from PIL import Image
 
 from conftest import (
@@ -34,6 +38,8 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
+from proteia import samples
+from proteia.core import session as session_module
 from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
@@ -47,7 +53,7 @@ from proteia.core.model import (
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import compute_results
 from proteia.viz import render_svg
-from proteia.web import api, charts, launch, server
+from proteia.web import api, charts, launch, sample_project, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 from rowcases import RowCase, adversarial
@@ -315,6 +321,265 @@ def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
     assert image_id in answer["removed"]
     assert [image["id"] for image in answer["project"]["images"]] == [second["image_id"]]
     assert client.refused("GET", f"/api/images/{image_id}/preview")[:2] == (404, "unknown_id")
+
+
+# --- Original colours (#57) ---
+
+PONCEAU = "Ponceau S α.png"  # alpha
+
+
+def ponceau(dtype: type = np.uint8) -> np.ndarray:
+    """A blot as a Ponceau S stain shows it: red bands on a pale pink membrane,
+    so its red, green and blue differ; 8-bit RGB, or 16-bit at 257 times."""
+    gray = synthetic_blot((H, W), [(x, ROW, 5.0, 3.0, 30000.0) for x in LANE_X], dtype=float)
+    depth = 1 - gray / MEMBRANE_LEVEL  # 0 on the membrane, 0.6 at a band's centre
+    rgb = np.stack([245 - 40 * depth, 225 - 330 * depth, 228 - 300 * depth], axis=-1)
+    rgb = np.clip(np.round(rgb), 0, 255)
+    return (rgb * 257).astype(np.uint16) if dtype is np.uint16 else rgb.astype(np.uint8)
+
+
+def png_bytes(pixels: np.ndarray | Image.Image) -> bytes:
+    """A PNG of pixels (gray, gray with alpha, RGB or RGBA by their channels) or of an image."""
+    image = pixels if isinstance(pixels, Image.Image) else Image.fromarray(pixels)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def preview_of(client: Client, image_id: str, query: str = "") -> bytes:
+    status, (kind, png) = client.call("GET", f"/api/images/{image_id}/preview{query}")
+    assert (status, kind) == (200, "image/png")
+    return png
+
+
+def decoded(png: bytes) -> tuple[str, np.ndarray]:
+    with Image.open(io.BytesIO(png)) as image:
+        return image.mode, np.asarray(image)
+
+
+def test_a_colour_image_is_previewed_in_its_original_colours_on_request(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    stain = ponceau()
+    status, answer = upload(client, png_bytes(stain), name=PONCEAU, kind="visible_marker")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert image["colour"] is True
+    assert [w["code"] for w in image["warnings"]] == ["color_channels_differ"]
+
+    # The default stays the gray analysis image: the mean the nets are measured on.
+    mode, gray = decoded(preview_of(client, image_id))
+    assert (mode, gray.shape) == ("L", (H, W))
+    # The original colours, on the same pixel grid: 8-bit colour is shown as stored.
+    mode, colour = decoded(preview_of(client, image_id, "?colour=original"))
+    assert (mode, colour.shape) == ("RGB", (H, W, 3))
+    assert np.array_equal(colour, stain)
+    band, membrane = colour[ROW, LANE_X[0]].astype(int), colour[5, LANE_X[0]].astype(int)
+    assert band[0] > band[1] + 100 and band[0] > band[2] + 100  # a red band
+    assert (membrane < 250).all() and membrane[0] > membrane[1]  # on a pink membrane
+    # Nothing about the colours reaches the project: it is a view, not an edit.
+    assert client.ok("GET", "/api/project")["project"]["revision"] == answer["project"]["revision"]
+
+
+def test_a_gray_image_answers_its_gray_preview_for_its_original_colours(client, tmp_path):
+    # A gray file's original colours are its gray levels: the same PNG as the
+    # gray preview, so a page asking with a switch left on still draws the image.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, blot_bytes(tmp_path))  # 16-bit gray
+    level = np.linspace(40, 220, W).round().astype(np.uint8)
+    gray = np.tile(level, (H, 1))
+    alpha = np.full_like(gray, 200)
+    ids = {
+        "16-bit gray": answer["image_id"],
+        # Three equal channels: gray stored as RGB, as many scanners save it.
+        "gray as RGB": upload(client, png_bytes(np.dstack([gray] * 3)), name="rgb.png")[1],
+        "gray with alpha": upload(client, png_bytes(np.dstack([gray, alpha])), name="la.png")[1],
+    }
+    ids = {what: got if isinstance(got, str) else got["image_id"] for what, got in ids.items()}
+    images = {i["id"]: i for i in client.ok("GET", "/api/project")["project"]["images"]}
+    for what, image_id in ids.items():
+        assert images[image_id]["colour"] is False, what
+        plain = preview_of(client, image_id)
+        assert preview_of(client, image_id, "?colour=original") == plain, what
+        assert decoded(plain)[0] == "L", what
+
+
+@pytest.mark.parametrize("query", ["?colour=grey", "?colour=ORIGINAL", "?colour="])
+def test_an_unknown_colours_choice_is_refused(client, tmp_path, query):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, png_bytes(ponceau()), name=PONCEAU)
+    path = f"/api/images/{answer['image_id']}/preview{query}"
+    assert client.refused("GET", path)[:2] == (422, "invalid_input")
+
+
+def test_original_colours_need_the_token_and_a_known_image(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, png_bytes(ponceau()), name=PONCEAU)
+    path = f"/api/images/{answer['image_id']}/preview?colour=original"
+    status, headers, body = fetch(client, path, token=False)
+    assert (status, headers["www-authenticate"]) == (401, "Bearer")
+    assert not body.startswith(b"\x89PNG")
+    assert fetch(client, path)[0] == 200
+    assert not_found(client, "/api/images/img-99/preview?colour=original") == "unknown_id"
+
+
+def test_original_colours_are_read_only_from_the_unchanged_stored_file(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    _, answer = upload(client, png_bytes(ponceau()), name=PONCEAU)
+    image_id = answer["image_id"]
+    stored = client.root / "Blot" / storage.IMAGES_DIR / f"{image_id}.png"
+    # Other bytes of the same size and layout, written outside Proteia.
+    stored.write_bytes(png_bytes(ponceau()[:, ::-1].copy()))
+    path = f"/api/images/{image_id}/preview?colour=original"
+    assert client.refused("GET", path) == (422, "image_file_changed", [image_id])
+    stored.unlink()
+    assert client.refused("GET", path) == (422, "image_file_changed", [image_id])
+
+
+def test_original_colours_are_kept_with_the_last_previews_shown(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A")
+    with io.BytesIO(png_bytes(ponceau())) as stream:
+        image_id = api.ops.import_image(
+            session, stream, "a.png", kind="visible_marker", polarity="dark_on_light"
+        )
+    session._pixels.clear()  # as if the image had not been worked on in this session
+    reads: list[str] = []
+    colour_pixels = type(session).colour_pixels
+
+    def counting(self, image_id: str) -> np.ndarray:
+        reads.append(image_id)
+        return colour_pixels(self, image_id)
+
+    monkeypatch.setattr(type(session), "colour_pixels", counting)
+    colour = workspace.preview(session, image_id, original=True)
+    assert workspace.preview(session, image_id, original=True) == colour
+    assert reads == [image_id]  # read once, then kept
+
+    monkeypatch.setattr(api, "_PREVIEWS_KEPT", 1)
+    # The gray one is another preview: kept in place of the colour one, the last shown.
+    assert workspace.preview(session, image_id) != colour
+    assert image_id not in session._pixels  # neither holds the image in memory
+    assert workspace.preview(session, image_id, original=True) == colour
+    assert reads == [image_id, image_id]
+
+
+def test_original_colours_of_other_colour_files(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    stain = ponceau()
+    # A palette PNG, read as its palette's colours.
+    indices = (np.arange(H * W).reshape(H, W) % 3).astype(np.uint8)
+    table = [200, 30, 40, 250, 220, 225, 120, 10, 20] + [0] * (253 * 3)
+    palette = Image.frombytes("P", (W, H), indices.tobytes())
+    palette.putpalette(table)
+    # RGBA: the alpha channel is dropped, as the analysis ignores it.
+    rgba = np.dstack([stain, np.full((H, W), 90, dtype=np.uint8)])
+    # 16-bit RGB: stretched to 8 bits over the three channels at once.
+    ids = {
+        "palette": upload(client, png_bytes(palette), name="palette.png")[1]["image_id"],
+        "rgba": upload(client, png_bytes(rgba), name="rgba.png")[1]["image_id"],
+        "16-bit": upload(
+            client, write_tiff(tmp_path / "rgb16.tif", ponceau(np.uint16)).read_bytes()
+        )[1]["image_id"],
+    }
+    images = {i["id"]: i for i in client.ok("GET", "/api/project")["project"]["images"]}
+    assert all(images[image_id]["colour"] for image_id in ids.values())
+    shown = {what: decoded(preview_of(client, i, "?colour=original")) for what, i in ids.items()}
+    assert all(mode == "RGB" and pixels.shape == (H, W, 3) for mode, pixels in shown.values())
+    expected = np.array(table[:9], dtype=np.uint8).reshape(3, 3)[indices]
+    assert np.array_equal(shown["palette"][1], expected)
+    assert np.array_equal(shown["rgba"][1], stain)
+    sixteen = shown["16-bit"][1].astype(int)
+    assert (sixteen.min(), sixteen.max()) == (0, 255)
+    stretched = (stain.astype(float) - stain.min()) * 255 / (int(stain.max()) - int(stain.min()))
+    assert np.abs(sixteen - stretched).max() <= 1  # one stretch: the hues keep their balance
+
+
+def palette_tiff(colormap: np.ndarray) -> tuple[bytes, np.ndarray]:
+    """An 8-bit TIFF whose pixels index ``colormap`` (3 x 256, 16-bit), as ImageJ
+    saves one with a lookup table, and its indices: a dark band under each lane."""
+    gray = synthetic_blot((H, W), [(x, ROW, 5.0, 3.0, 30000.0) for x in LANE_X], dtype=float)
+    indices = np.clip(np.round(gray / 257), 0, 255).astype(np.uint8)
+    buffer = io.BytesIO()
+    tifffile.imwrite(buffer, indices, photometric="palette", colormap=colormap)
+    return buffer.getvalue(), indices
+
+
+def test_a_palette_tiff_is_shown_through_its_colour_map(client, tmp_path):
+    # The nets are measured on the indices; its own colours are the map's.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    level = np.arange(256, dtype=np.uint16)
+    fire = np.stack([level * 257, level * 128, (255 - level) * 64])
+    data, indices = palette_tiff(fire)
+    status, answer = upload(client, data, name="Fire LUT α.tif")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert (image["colour"], image["warnings"]) == (True, [])
+    mode, colour = decoded(preview_of(client, image_id, "?colour=original"))
+    assert (mode, colour.shape) == ("RGB", (H, W, 3))
+    np.testing.assert_array_equal(colour, (fire.T >> 8).astype(np.uint8)[indices])
+    assert decoded(preview_of(client, image_id))[0] == "L"
+    # A gray lookup table (inverted, say) has no colour to show.
+    gray_map = np.stack([(255 - level) * 257] * 3)
+    other = upload(client, palette_tiff(gray_map)[0], name="inverted.tif")[1]["image_id"]
+    images = {i["id"]: i for i in client.ok("GET", "/api/project")["project"]["images"]}
+    assert images[other]["colour"] is False
+    assert preview_of(client, other, "?colour=original") == preview_of(client, other)
+
+
+@pytest.mark.parametrize("fmt", ["TIFF", "JPEG"])
+def test_a_cmyk_file_is_not_offered_in_colours_it_does_not_hold(client, tmp_path, fmt):
+    # Its cyan, magenta and yellow would be drawn as red, green and blue: the
+    # page offers no original colours, and asking answers the gray preview.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    buffer = io.BytesIO()
+    Image.fromarray(ponceau()).convert("CMYK").save(buffer, format=fmt)
+    suffix = ".tif" if fmt == "TIFF" else ".jpg"
+    status, answer = upload(client, buffer.getvalue(), name=f"cmyk{suffix}", kind="visible_marker")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert "color_channels_differ" in [w["code"] for w in image["warnings"]]
+    assert image["colour"] is False
+    plain = preview_of(client, image_id)
+    assert preview_of(client, image_id, "?colour=original") == plain
+    assert decoded(plain)[0] == "L"
+
+
+def test_the_state_reads_a_file_header_once_and_only_where_colour_can_hide(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A")
+    level = np.linspace(40, 220, W).round().astype(np.uint8)
+    files = {
+        "gray.png": png_bytes(np.tile(level, (H, 1))),
+        "stain.png": png_bytes(ponceau()),
+        "gray.tif": blot_bytes(tmp_path),
+    }
+    ids = {}
+    for name, data in files.items():
+        with io.BytesIO(data) as stream:
+            ids[name] = api.ops.import_image(
+                session, stream, name, kind="visible_marker", polarity="dark_on_light"
+            )
+    reads: list[str] = []
+    file_colours = session_module.file_colours
+
+    def counting(path: Path) -> str | None:
+        reads.append(Path(path).stem)  # the stored file: the image id
+        return file_colours(path)
+
+    monkeypatch.setattr(session_module, "file_colours", counting)
+    session._file_colours.clear()
+    for _ in range(3):
+        state = project_state("A", session, session.project, open_id=1)
+        assert {i["id"]: i["colour"] for i in state["images"]} == {
+            ids["gray.png"]: False,
+            ids["stain.png"]: True,
+            ids["gray.tif"]: False,  # a TIFF: read, as a palette would show only there
+        }
+    # A gray PNG is never read; the colour PNG and the TIFF once each.
+    assert sorted(reads) == sorted([ids["stain.png"], ids["gray.tif"]])
 
 
 # --- Boxes ---
@@ -684,6 +949,56 @@ def bar(series: dict, condition: str) -> dict:
     return next(b for b in series["chart"]["bars"] if b["label"] == condition)
 
 
+def test_a_jpeg_project_says_its_bands_were_not_checked_for_over_exposure(client, tmp_path):
+    # #112: the over-exposure check does not run on a JPEG, and the results say so
+    # per protein. The Checks list shows every notice of a set, and a chart card
+    # those about its series' proteins, whatever their code.
+    spots = [(x, row, 5.0, 3.0, 25000.0) for row in (TARGET_ROW, LOADING_ROW) for x in LANE_X]
+    blot = (synthetic_blot((TWO_ROW_H, W), spots) // 257).astype(np.uint8)
+    jpeg = io.BytesIO()
+    Image.fromarray(blot).save(jpeg, format="JPEG", quality=95)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, jpeg.getvalue(), name="blot β.jpg")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert [w["code"] for w in image["warnings"]] == ["lossy_format"]
+    assert "over-exposure cannot be checked" in image["warnings"][0]["message"]
+    lanes = [{"condition": condition} for condition in DOSES]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes, "reference_condition": "vehicle"})
+    ids = []
+    for name, role in (("α-tubulin", "loading control"), ("β-catenin", "target")):
+        body = {"name": name, "role": role, "image_id": image_id, "box_size": SIZE}
+        ids.append(client.ok("POST", "/api/proteins", body)["protein_id"])
+    loading_id, target_id = ids
+    for protein, row, lanes_boxed in (
+        (loading_id, LOADING_ROW, (0, 1, 2, 3)),
+        (target_id, TARGET_ROW, (0, 2, 4)),
+    ):
+        for lane in lanes_boxed:
+            body = {"protein_id": protein, "x": LANE_X[lane], "y": row, "lane_index": lane}
+            answer = client.ok("POST", "/api/boxes", body)
+    assert {band["clipped"] for band in bands(answer).values()} == {None}
+
+    (result_set,) = answer["results"]["sets"]
+    unchecked = [n for n in result_set["notices"] if n["code"] == "clipping_not_checked"]
+    assert [(n["protein_ids"], n["lane_indices"], n["level"]) for n in unchecked] == [
+        ([loading_id], [0, 1, 2, 3], "warning"),
+        ([target_id], [0, 2, 4], "warning"),
+    ]
+    loading, target = (n["message"] for n in unchecked)
+    assert loading.startswith(
+        "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4: its image has"
+        " lossy (JPEG-type) compression"
+    )
+    assert loading.endswith("which biases every value normalized to it")
+    assert target.startswith("'β-catenin' was not checked for over-exposure in lanes 1, 3, 5:")
+    # The series' chart card shows both: each is about one of its proteins.
+    series = only_series(answer)
+    assert series["chart"] is not None
+    assert {n["protein_ids"][0] for n in unchecked} == {series["target_id"], series["loading_id"]}
+
+
 def test_box_edits_answer_with_the_changed_net_and_chart(client, tmp_path):
     target, _, before = live(client, tmp_path, DOSES, boxed=(0, 1, 2, 3))
     assert column(before, target)["nets"][4] is None
@@ -897,8 +1212,11 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["POST /api/requantify"] = client.ok("POST", "/api/requantify")  # a no-op here
     answers["POST /api/export"] = client.ok("POST", "/api/export", {"formats": ["svg"]})
     answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+    # Another project, so another opening, whose revisions start again.
+    answers["POST /api/projects/sample"] = client.ok("POST", "/api/projects/sample")
 
     revisions = []
+    blot = answers["POST /api/projects"]["project"]["open_id"]
     for route, answer in answers.items():
         project, results = answer["project"], answer["results"]
         assert (results["open_id"], results["revision"]) == (
@@ -906,7 +1224,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
             project["revision"],
         ), route
         assert {"lanes", "proteins", "sets", "settings"} <= set(results), route
-        revisions.append(project["revision"])
+        if project["open_id"] == blot:
+            revisions.append(project["revision"])
+    assert len(revisions) == len(answers) - 1
     assert revisions == sorted(revisions)
     # Every route that answers with the project is exercised above.
     others = {
@@ -2175,6 +2495,9 @@ def test_a_row_box_boxes_every_lane_and_answers_the_nets_and_the_chart(client, t
         "flags": [],
         "notes": [],
         "right_to_left": False,
+        # The loading control's row lies beyond every ring the new boxes change.
+        "remeasured": [],
+        "largest_change": None,
     }
 
     # The nets of the new boxes and the chart they make, in the same answer.
@@ -2323,6 +2646,73 @@ def test_a_row_box_answers_the_detectors_warnings_and_notes(client, tmp_path):
     assert answer["notes"] == params["notes"] != []
 
 
+def test_a_row_box_answers_a_band_it_cuts_through(client, tmp_path):
+    # The box's top edge 2 px above the target's band centres (#115).
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    answer = drag(client, target, [15, TARGET_ROW - 2, W - 35, TARGET_ROW + 12])
+    assert None not in answer["band_ids"]
+    params = storage.load_project(client.root / "Blot").log[-1].params
+    assert answer["flags"] == params["flags"] == ["cut_by_row_box"]
+    [note] = answer["notes"]
+    assert note.startswith("lanes 1, 2, 3, 4, 5: the row box's top or bottom edge cuts through")
+
+
+def test_a_refused_row_box_answers_what_the_detector_saw(client, tmp_path):
+    # The box's top edge through the target's band centres: every band peaks
+    # on the box's top row, so none is kept, and the refusal says the box cuts
+    # them (#117) with the detector's raw reason.
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    body = {"protein_id": target, "rect": [15, TARGET_ROW, W - 35, TARGET_ROW + 12]}
+    status, payload = client.call("POST", "/api/boxes/row", body)
+    assert (status, payload["code"], payload["ids"]) == (422, "no_band_found", [])
+    assert payload["message"] == (
+        "the only signal in the row box lies at its top or bottom edge: the box cuts through"
+        " the bands or reaches into a neighbouring row; include the whole band height"
+    )
+    detail = payload["detail"]
+    assert set(detail) == {"cause", "flags", "notes", "margin", "membrane_shift", "lanes"}
+    assert (detail["cause"], detail["margin"]) == ("edge_signal", None)
+    assert [lane["lane_index"] for lane in detail["lanes"]] == list(range(len(LANE_X)))
+    assert {lane["reason"] for lane in detail["lanes"]} == {"edge_signal"}
+    # The detector names the bands it saw cut, though none was kept (#115).
+    assert detail["flags"] == ["cut_by_row_box"]
+    assert all(lane["cut"] for lane in detail["lanes"])
+    # A refusal that carries no detail answers the three keys only.
+    body = {"protein_id": target, "rect": [W + 10, 0, W + 50, 20]}
+    status, payload = client.call("POST", "/api/boxes/row", body)
+    assert (status, set(payload)) == (422, {"code", "message", "ids"})
+
+
+def test_a_row_box_answers_the_other_proteins_nets_it_changed(client, tmp_path):
+    # The loading control boxed just above two of the target's bands: every
+    # ring on the image leaves out the row's boxes, so its nets change with the
+    # row (#124).
+    target, loading, _ = live(client, tmp_path, DOSES, boxed=())
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
+    for lane in (1, 2):
+        y = TARGET_ROW - 12
+        body = {"protein_id": loading, "x": LANE_X[lane], "y": y, "lane_index": lane}
+        before = client.ok("POST", "/api/boxes", body)
+
+    def nets(answer: dict) -> dict[str, float]:
+        lanes = column(answer, loading)
+        return {b: net for b, net in zip(lanes["band_ids"], lanes["nets"], strict=True) if b}
+
+    answer = drag(client, target)
+    old, new = nets(before), nets(answer)
+    changed = [
+        {"band_id": band_id, "net_before": old[band_id], "net_after": new[band_id]}
+        for band_id in old
+        if new[band_id] != old[band_id]
+    ]
+    assert changed and answer["remeasured"] == changed
+    shares = {
+        c["band_id"]: abs(c["net_after"] - c["net_before"]) / c["net_before"] for c in changed
+    }
+    largest = max(shares, key=shares.__getitem__)
+    assert answer["largest_change"] == {"band_id": largest, "change": shares[largest]}
+
+
 def test_a_row_box_reads_the_lanes_the_way_the_image_numbers_them(client, tmp_path):
     target, loading, _ = live(client, tmp_path, DOSES, boxed=())
     client.ok("DELETE", f"/api/proteins/{loading}/boxes")
@@ -2389,8 +2779,11 @@ def _kept_box_on_lane_2(client: Client, target: str, loading: str) -> list[str]:
 
 def _loading_lanes(client: Client, target: str, loading: str) -> list[str]:
     """Nothing to set up: the loading control's boxes place the lanes the row
-    is checked against, and a row that does not line up with them names them."""
-    return column(client.ok("GET", "/api/project"), loading)["band_ids"]
+    is checked against, and a row that does not line up with them names those
+    its bands' lanes are read from. Leaving out lane 0, the row reads its four
+    bands a lane off, as lanes 0 to 3: the boxes of those lanes, and lane 4's,
+    whose x lane 3's band is measured against."""
+    return column(client.ok("GET", "/api/project"), loading)["band_ids"][:5]
 
 
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:
@@ -2681,3 +3074,253 @@ def test_an_export_under_too_long_a_path_is_refused(client, monkeypatch):
     monkeypatch.setattr(storage, "PATH_LIMIT", len(project) + 60)
     assert client.refused("POST", "/api/export", {})[:2] == (422, "path_too_long")
     assert export_folders(client) == []
+
+
+# --- The sample project (#55) ---
+
+SAMPLE_BLOT = "Sample blot"
+SAMPLE_LOG = [
+    "new_project",
+    "import_image",
+    "import_image",
+    "set_lanes",
+    "add_protein",
+    "add_protein",
+]
+
+
+def open_sample_blot(client: Client) -> dict:
+    """The answer to "Open sample project": 201, as a create."""
+    status, answer = client.call("POST", "/api/projects/sample")
+    assert status == 201, (status, answer)
+    return answer
+
+
+def setup_of(project: dict) -> dict:
+    """What the sample project's setup made, without the revision or history."""
+    return {key: project[key] for key in ("lanes", "reference_condition", "images", "proteins")}
+
+
+def test_the_sample_project_is_set_up_up_to_the_row_boxes(client):
+    answer = open_sample_blot(client)
+    project = answer["project"]
+    assert project["name"] == sample_project.SAMPLE_NAME == SAMPLE_BLOT
+    assert project["saved"] and client.ok("GET", "/api/projects")["open"] == SAMPLE_BLOT
+
+    # The blot and its marker image, on one membrane; the bytes proteia.samples writes.
+    blot, marker = project["images"]
+    fields = ("original_name", "kind", "polarity", "width", "height", "bit_depth", "warnings")
+    assert [[image[field] for field in fields] for image in (blot, marker)] == [
+        ["sample-blot.tif", "chemiluminescence", "dark_on_light", 1200, 500, 16, []],
+        ["sample-marker.tif", "visible_marker", "dark_on_light", 1200, 500, 8, []],
+    ]
+    assert marker["membrane_id"] == blot["membrane_id"]
+    files = samples.sample_files()
+    batch = client.workspace.current().project.batch
+    for image in (blot, marker):
+        data = files[image["original_name"]]
+        assert batch.find_image(image["id"]).sha256 == hashlib.sha256(data).hexdigest()
+
+    # The design, written out here rather than read back from the module.
+    assert [(lane["condition"], lane["sample"], lane["included"]) for lane in project["lanes"]] == [
+        ("vehicle", "V1", True),
+        ("vehicle", "V2", True),
+        ("vehicle", "V3", True),
+        ("vehicle", "V4", True),
+        ("treatment", "T1", True),
+        ("treatment", "T2", True),
+        ("treatment", "T3", True),
+        ("treatment", "T4", True),
+    ]
+    assert project["reference_condition"] == "vehicle"
+    loading, target = project["proteins"]
+    assert [
+        (p["name"], p["role"], p["image_id"], p["loading_control_ids"], p["bands"], p["undetected"])
+        for p in (loading, target)
+    ] == [
+        ("α-tubulin", "loading control", blot["id"], [], [], []),
+        ("β-catenin", "target", blot["id"], [loading["id"]], [], []),
+    ]
+    assert column(answer, target["id"])["nets"] == [None] * 8
+
+    # Each step an ordinary logged operation, saved.
+    folder = client.root / SAMPLE_BLOT
+    assert [entry.action for entry in storage.load_project(folder).log] == SAMPLE_LOG
+    assert project["history"]["undo"]["action"] == "add_protein"
+
+    # The truth table next to project.json, never among the exports.
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "exports",
+        "images",
+        "project.json",
+        "sample-truth.csv",
+    ]
+    assert list((folder / storage.EXPORTS_DIR).iterdir()) == []
+    assert (folder / "sample-truth.csv").read_bytes() == files[samples.TRUTH_FILE]
+
+    # Each protein's row, top to bottom: a drag that spans every lane's band.
+    sample = answer["sample"]
+    assert sample["truth_file"] == "sample-truth.csv"
+    assert [row["protein_id"] for row in sample["rows"]] == [target["id"], loading["id"]]
+    (_, _, _, top_y1), (_, low_y0, _, _) = (row["rect"] for row in sample["rows"])
+    assert top_y1 <= low_y0  # the rows do not overlap
+    half = samples.BAND_WIDTH / 2
+    for row, kda in zip(sample["rows"], (92.0, 50.0), strict=True):
+        x0, y0, x1, y1 = row["rect"]
+        assert x0 < samples.LANE_X[0] - half and samples.LANE_X[-1] + half < x1 <= 1200
+        for x in samples.LANE_X:
+            assert y0 + 10 < samples.band_y(kda, x) < y1 - 10, (kda, x)
+
+
+def test_undo_takes_the_sample_setup_back_step_by_step(client):
+    made = setup_of(open_sample_blot(client)["project"])
+    steps = []
+    for _ in SAMPLE_LOG[1:]:
+        undone = client.ok("POST", "/api/undo")
+        steps.append(undone["action"])
+    assert steps == SAMPLE_LOG[:0:-1]  # every step, the last first
+    assert setup_of(undone["project"]) == {
+        "lanes": [],
+        "reference_condition": None,
+        "images": [],
+        "proteins": [],
+    }
+    assert undone["project"]["history"]["undo"] is None  # the empty project it was created as
+    # The truth table is not part of the project: undo leaves it.
+    assert (client.root / SAMPLE_BLOT / "sample-truth.csv").is_file()
+
+    for _ in SAMPLE_LOG[1:]:
+        redone = client.ok("POST", "/api/redo")
+    assert setup_of(redone["project"]) == made
+
+
+def test_each_sample_project_takes_the_next_free_name(client):
+    first = open_sample_blot(client)
+    second = open_sample_blot(client)
+    assert (first["project"]["name"], second["project"]["name"]) == (
+        SAMPLE_BLOT,
+        "Sample blot (2)",
+    )
+    assert second["project"]["open_id"] > first["project"]["open_id"]
+    # Taken ignoring case and look-alikes, as project names are, by any folder.
+    (client.root / "SAMPLE BLOT （3）").mkdir()  # fullwidth parentheses
+    third = open_sample_blot(client)
+    assert third["project"]["name"] == "Sample blot (4)"
+    listing = client.ok("GET", "/api/projects")
+    assert listing["open"] == "Sample blot (4)"
+    names = [SAMPLE_BLOT, "Sample blot (2)", "Sample blot (4)"]
+    assert sorted(p["name"] for p in listing["projects"]) == names
+    for name in names:  # each a whole sample project of its own
+        assert [e.action for e in storage.load_project(client.root / name).log] == SAMPLE_LOG
+    assert setup_of(third["project"]) == setup_of(first["project"])
+
+
+def test_the_sample_rows_box_every_lane_and_give_the_documented_fold_change(client):
+    answer = open_sample_blot(client)
+    for row in answer["sample"]["rows"]:
+        answer = drag(client, row["protein_id"], row["rect"])
+        assert len(answer["band_ids"]) == 8 and None not in answer["band_ids"]
+        assert (answer["flags"], answer["empty"], answer["notes"]) == ([], [], [])
+    assert [len(protein["bands"]) for protein in answer["project"]["proteins"]] == [8, 8]
+    [result_set] = answer["results"]["sets"]
+    assert result_set["tier"] == "fold_change"
+    series = only_series(answer)
+    vehicle, treatment = bar(series, "vehicle"), bar(series, "treatment")
+    assert (vehicle["n"], treatment["n"]) == (4, 4)
+    assert vehicle["mean"] == pytest.approx(1.0)  # the baseline is the vehicle mean
+    # The truth: a treatment mean of 2.00 (proteia.samples). measured 2.0088
+    assert treatment["mean"] == pytest.approx(2.0, rel=0.03)
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        (OSError(28, "No space left on device"), 500, "file_error"),
+        (api.ops.OperationError(api.ops.ErrorCode.INVALID_INPUT, "refused"), 422, "invalid_input"),
+    ],
+)
+def test_a_sample_project_that_fails_midway_leaves_no_folder(
+    client, monkeypatch, error, status, code
+):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    # After the images are stored: their files go with the folder.
+    monkeypatch.setattr(sample_project.ops, "set_lanes", fail)
+    assert client.refused("POST", "/api/projects/sample")[:2] == (status, code)
+    assert sorted(path.name for path in client.root.iterdir()) == ["Blot"]
+    assert client.ok("GET", "/api/projects")["open"] == "Blot"  # still open
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (OSError(28, "No space left on device"), "[Errno 28] No space left on device"),
+        (api.ops.OperationError(api.ops.ErrorCode.INVALID_INPUT, "refused"), "refused"),
+    ],
+)
+def test_a_sample_folder_that_cannot_be_removed_is_named_in_the_error(
+    client, monkeypatch, error, text
+):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    def rmtree_but_images(path: Path, ignore_errors: bool = False) -> None:
+        # What shutil.rmtree removes while another program holds the stored images open.
+        for item in sorted(Path(path).rglob("*"), reverse=True):  # children first
+            if item.is_dir() and not any(item.iterdir()):
+                item.rmdir()
+            elif item.is_file() and item.parent.name != "images":
+                item.unlink()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sample_project.ops, "set_lanes", fail)
+        patch.setattr(sample_project, "shutil", SimpleNamespace(rmtree=rmtree_but_images))
+        status, answer = client.call("POST", "/api/projects/sample")
+    # A file error whatever failed: the folder left needs deleting by hand.
+    assert (status, answer["code"]) == (500, "file_error")
+    assert answer["message"] == (
+        f"the sample project could not be set up ({text}), and its unfinished folder"
+        f" '{SAMPLE_BLOT}' could not be removed: delete it from the projects folder"
+    )
+    folder = client.root / SAMPLE_BLOT
+    assert {path.relative_to(folder).parts[0] for path in folder.rglob("*")} == {"images"}
+    listing = client.ok("GET", "/api/projects")
+    assert (listing["open"], [entry["name"] for entry in listing["projects"]]) == ("Blot", ["Blot"])
+    # Its name stays taken until it is deleted: the next sample is numbered.
+    assert open_sample_blot(client)["project"]["name"] == f"{SAMPLE_BLOT} (2)"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows refuses to delete a file held open")
+def test_a_sample_image_held_open_leaves_its_folder_named_in_the_error(client, monkeypatch):
+    held: list[io.BufferedReader] = []
+
+    def hold_and_fail(session: Any, *args: Any, **kwargs: Any) -> None:
+        held.append(next((session.folder / "images").iterdir()).open("rb"))
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sample_project.ops, "set_lanes", hold_and_fail)
+    try:
+        status, answer = client.call("POST", "/api/projects/sample")
+    finally:
+        for handle in held:
+            handle.close()
+    assert (status, answer["code"]) == (500, "file_error")
+    assert f"unfinished folder '{SAMPLE_BLOT}' could not be removed" in answer["message"]
+    folder = client.root / SAMPLE_BLOT
+    assert sorted(path.relative_to(folder).as_posix() for path in folder.rglob("*")) == [
+        "images",
+        f"images/{Path(held[0].name).name}",
+    ]
+    assert client.ok("GET", "/api/projects")["projects"] == []
+
+
+def test_a_sample_project_in_a_projects_root_that_cannot_be_written_answers_json(client):
+    client.root.parent.mkdir(parents=True, exist_ok=True)
+    client.root.write_text("a file where the projects folder should be", encoding="utf-8")
+    assert client.refused("POST", "/api/projects/sample")[:2] == (500, "file_error")
+    assert client.refused("GET", "/api/project")[:2] == (409, "no_project")

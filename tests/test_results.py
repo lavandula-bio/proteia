@@ -15,7 +15,7 @@ from collections.abc import Callable
 import pytest
 
 from conftest import as_legacy, assert_strict_json, make_project
-from proteia.core import model, results
+from proteia.core import imaging, model, results
 from proteia.core.analyze import ReduceMethod, StatisticsSetting, Tier, compare
 from proteia.core.model import (
     Band,
@@ -141,7 +141,9 @@ def test_columns_carry_the_joined_nets_and_band_ids():
     assert beta.band_ids == ["band-10", "band-11", None, "band-12"]
     assert [lane.condition for lane in res.lanes] == ["vehicle", "vehicle", "10 µM", "10 µM"]
     assert [lane.included for lane in res.lanes] == [True, True, True, False]
-    assert res.notices == []  # the sample project is clean
+    # The sample project is clean but for its unchecked bands (#112): its JPEG
+    # loading control, and flags its 16-bit images leave out.
+    assert {notice.code for notice in res.notices} == {NoticeCode.CLIPPING_NOT_CHECKED}
 
 
 # --- which loading control a series uses ---
@@ -666,7 +668,26 @@ def test_compute_matches_the_regression_baseline(method, reference, kind, golden
     batch = _baseline_batch(reference)
 
     res = compute_results(batch, method=method)
+    unchecked = (
+        "was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 7, 8: its image has an"
+        " unknown bit depth, so saturated pixels cannot be counted; if it is over-exposed"
+        " there, its net is an under-estimate"
+    )
     assert res.notices == [
+        # The baseline blot is a float image: no detector limit to check against (#112).
+        *(
+            results.Notice(
+                code=NoticeCode.CLIPPING_NOT_CHECKED,
+                level=Level.WARNING,
+                message=f"{name!r} {unchecked}{effect}",
+                protein_ids=(protein_id,),
+                lane_indices=(0, 1, 2, 3, 4, 6, 7),
+            )
+            for name, protein_id, effect in (
+                (TARGET, "prot-3", ""),
+                (LOADING, "prot-4", ", which biases every value normalized to it"),
+            )
+        ),
         # The blot's ±2-level texture moves target lanes 1 and 7 by more than 5 %
         # of their nets from side to side (lane 6, as bad, is excluded).
         results.Notice(
@@ -1476,3 +1497,161 @@ def test_a_replicate_the_loading_control_misses_has_no_value_but_counts():
     assert chart.bars[0].label == "vehicle" and chart.bars[0].not_detected_lanes == []
     assert (chart.coverage[0].n, chart.coverage[0].replicates) == (1, 2)
     assert chart.coverage[0].left_out == "fewer_than_2"
+
+
+# --- #112: bands the over-exposure check could not run on ---
+
+# Import warnings as an image holds them; the notice reads their codes only.
+LOSSY = {"code": "lossy_format", "message": "JPEG-type compression can change pixel values."}
+COLOR = {"code": "color_channels_differ", "message": "The channels were averaged."}
+UNKNOWN = {"code": "unknown_bit_depth", "message": "The pixel type has no fixed range."}
+# The sample's bands by protein: β-catenin in lanes 0, 1 and 3 (excluded),
+# α-tubulin in lanes 0-3, GAPDH in lanes 0 and 1.
+BETA_BANDS = ("band-10", "band-11", "band-12")
+EVERY_BAND = (*BETA_BANDS, "band-13", "band-14", "band-15", "band-16", "band-17", "band-18")
+UNDER = "if it is over-exposed there, its net is an under-estimate"
+
+
+def _image(image_id: str, bit_depth: int | None, *warnings: dict) -> Callable[[Project], None]:
+    def edit(draft: Project) -> None:
+        image = draft.batch.find_image(image_id)
+        image.bit_depth = bit_depth
+        image.import_warnings = [model.ImageWarning(**warning) for warning in warnings]
+
+    return edit
+
+
+def _checked(flag: bool | None, *band_ids: str) -> Callable[[Project], None]:
+    def edit(draft: Project) -> None:
+        for band_id in band_ids:
+            draft.batch.find_band(band_id)[1].clipped = flag
+
+    return edit
+
+
+def _unchecked(res: results.Results) -> list[results.Notice]:
+    return _all(res, NoticeCode.CLIPPING_NOT_CHECKED)
+
+
+@pytest.mark.parametrize(
+    ("bit_depth", "warnings", "because"),
+    [
+        (8, [LOSSY], "lossy (JPEG-type) compression"),
+        (16, [COLOR], "color channels averaged into gray"),
+        (None, [UNKNOWN], "an unknown bit depth"),
+        (None, [], "an unknown bit depth"),  # not recorded: no limit to check against
+        (8, [LOSSY, COLOR], "lossy (JPEG-type) compression and color channels averaged into gray"),
+        (None, [LOSSY], "lossy (JPEG-type) compression and an unknown bit depth"),
+    ],
+)
+def test_a_band_not_checked_for_over_exposure_is_reported_with_the_reason(
+    bit_depth, warnings, because
+):
+    # Every band checked but β-catenin's in lanes 0 and 3 (excluded), on an
+    # image the check cannot trust.
+    res = compute_results(
+        _batch(
+            _checked(False, *EVERY_BAND),
+            _checked(None, "band-10", "band-12"),
+            _image("img-2", bit_depth, *warnings),
+        )
+    )
+    assert _unchecked(res) == [
+        results.Notice(
+            code=NoticeCode.CLIPPING_NOT_CHECKED,
+            level=Level.WARNING,
+            message=(
+                f"'β-catenin' was not checked for over-exposure in lane 1: its image has"
+                f" {because}, so saturated pixels cannot be counted; {UNDER}"
+            ),
+            protein_ids=("prot-7",),
+            lane_indices=(0,),
+        )
+    ]
+    # The excluded lane is reported with every lane included.
+    [every] = _unchecked(res.all_lanes)
+    assert (every.protein_ids, every.lane_indices) == (("prot-7",), (0, 3))
+    assert "in lanes 1, 4:" in every.message
+
+
+def test_a_loading_control_not_checked_names_the_values_it_biases():
+    res = compute_results(
+        _batch(_checked(False, *BETA_BANDS, "band-17", "band-18"), _image("img-6", 8, LOSSY))
+    )
+    [notice] = _unchecked(res)
+    assert (notice.protein_ids, notice.lane_indices) == (("prot-8",), (0, 1, 2))
+    assert notice.message == (
+        "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3: its image has lossy"
+        f" (JPEG-type) compression, so saturated pixels cannot be counted; {UNDER}, which"
+        " biases every value normalized to it"
+    )
+
+
+def test_only_the_unchecked_bands_of_included_lanes_are_reported():
+    # β-catenin: lane 0 not checked, lane 1 checked, lane 2 without a box, lane 3
+    # excluded; each protein gets its own notice, in model order.
+    res = compute_results(
+        _batch(
+            _checked(False, "band-11", "band-12", "band-15"),
+            _checked(True, "band-14"),
+            _image("img-2", 16, COLOR),
+            _image("img-6", 8, LOSSY),
+            _image("img-4", None, UNKNOWN),
+        )
+    )
+    assert [(n.protein_ids, n.lane_indices, n.level) for n in _unchecked(res)] == [
+        (("prot-7",), (0,), Level.WARNING),
+        (("prot-8",), (0,), Level.WARNING),
+        (("prot-9",), (0, 1), Level.WARNING),
+    ]
+    # A band checked and over-exposed has its own notice, not this one.
+    assert _one(res, NoticeCode.CLIPPED).lane_indices == (1,)
+    assert [n.lane_indices for n in _unchecked(res.all_lanes)] == [(0, 3)]  # α-tubulin's
+
+
+def test_no_notice_when_every_band_is_checked():
+    for flag in (False, True):
+        res = compute_results(_batch(_checked(flag, *EVERY_BAND)))
+        assert _unchecked(res) == [] and _unchecked(res.all_lanes) == []
+    # The stored flag decides, not the image: a flag checked on a JPEG (a model
+    # the operations never write) is not reported as unchecked.
+    res = compute_results(_batch(_checked(False, *EVERY_BAND), _image("img-2", 8, LOSSY)))
+    assert _unchecked(res) == []
+
+
+def test_an_unchecked_band_without_a_reason_is_still_reported():
+    # A 16-bit image without warnings has a limit the check trusts, so the
+    # operations always check its bands; a flag missing anyway is reported, with
+    # no reason made up.
+    res = compute_results(_batch(_checked(False, *EVERY_BAND), _checked(None, "band-11")))
+    assert _unchecked(res) == [
+        results.Notice(
+            code=NoticeCode.CLIPPING_NOT_CHECKED,
+            level=Level.WARNING,
+            message=f"'β-catenin' was not checked for over-exposure in lane 2; {UNDER}",
+            protein_ids=("prot-7",),
+            lane_indices=(1,),
+        )
+    ]
+
+
+def test_every_warning_that_turns_the_clipping_check_off_has_a_reason():
+    # results names the reason from the warning codes without importing
+    # imaging, so a code that clipping_depth starts distrusting must be named
+    # here too; otherwise its notice silently loses the reason.
+    distrusted = {
+        code
+        for code, message in imaging.WARNINGS.items()
+        if imaging.clipping_depth(8, [model.ImageWarning(code=code, message=message)]) is None
+    }
+    assert distrusted == imaging.UNTRUSTED_WARNINGS
+    assert results._UNCHECKED_WARNINGS.keys() == imaging.UNTRUSTED_WARNINGS
+
+
+def test_the_sample_projects_jpeg_loading_control_is_reported():
+    # α-tubulin is on a JPEG with no recorded bit depth; nothing else in the
+    # sample is unchecked once β-catenin's and GAPDH's bands are checked.
+    res = compute_results(_batch(_checked(False, *BETA_BANDS, "band-17", "band-18")))
+    assert _codes(res) == [NoticeCode.CLIPPING_NOT_CHECKED]
+    assert _codes(res.all_lanes) == [NoticeCode.CLIPPING_NOT_CHECKED]
+    assert "lossy (JPEG-type) compression and an unknown bit depth" in res.notices[0].message

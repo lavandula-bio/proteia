@@ -26,6 +26,7 @@ from proteia.core.session import Clock, ProjectSession, new_project, utc_now
 
 ROOT_NAME: Final = "Proteia"
 MAX_NAME: Final = 100  # characters; well inside every file system's limit
+MAX_NUMBERED: Final = 1000  # names free_name tries: the plain one, then numbered
 # Characters Windows refuses in a file name.
 _FORBIDDEN: Final = frozenset('<>:"/\\|?*')
 # Device names Windows reserves, with or without an extension: COM and LPT with
@@ -145,6 +146,19 @@ def _existing(root: Path, name: str) -> Path | None:
         if name_key(child.name) == key:
             return child
     return None
+
+
+def free_name(root: Path, name: object) -> str:
+    """``name`` as stored (:func:`project_name`), or ``name (2)``, ``name (3)``
+    and so on: the first that no file or folder in ``root`` has, ignoring case
+    and look-alike spellings (:func:`_existing`), as export folders are
+    numbered. :class:`ProjectExistsError` once :data:`MAX_NUMBERED` are taken."""
+    text = project_name(name)
+    for number in range(1, MAX_NUMBERED + 1):
+        candidate = text if number == 1 else project_name(f"{text} ({number})")
+        if _existing(root, candidate) is None:
+            return candidate
+    raise ProjectExistsError(f"no free project name for {text!r}: {MAX_NUMBERED} are taken")
 
 
 def create_project(root: Path, name: object, *, clock: Clock = utc_now) -> ProjectSession:

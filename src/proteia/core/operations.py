@@ -146,6 +146,7 @@ from proteia.core.names import (
 )
 from proteia.core.plotspec import ErrorType
 from proteia.core.project import (
+    anchoring_lanes,
     lane_anchor_ids,
     lane_anchors,
     lane_pitch,
@@ -283,6 +284,13 @@ class RowPlacement:
     ``kept_lanes`` are the lanes whose box was kept as it was: one edited by
     hand, or one the user placed (source ``click`` or ``manual``) in a lane
     where no band was found.
+
+    ``remeasured`` lists the bands of the other proteins on the image whose net
+    the row changed (every ring on the image leaves out the row's boxes), as
+    ``(band id, net before, net after)``, protein by protein and band by band
+    as stored; ``largest_change`` is the band among them whose net changed by
+    the largest share of its net before, ``(band id, |after - before| /
+    before)``, None when none had a net before.
     """
 
     band_ids: tuple[str | None, ...]  # per declared lane: its first-band box after, or None
@@ -297,6 +305,8 @@ class RowPlacement:
     flags: tuple[str, ...]  # the detector's warnings (rowdetect.WARNING_FLAGS)
     notes: tuple[str, ...]  # the detector's diagnostics, lanes counted from 1
     right_to_left: bool  # lanes read from the box's right end, as those on the image run
+    remeasured: tuple[tuple[str, float, float], ...] = ()  # other proteins' nets it changed
+    largest_change: tuple[str, float] | None = None  # (band id, share of its net before)
 
 
 @dataclass(frozen=True)
@@ -1631,6 +1641,15 @@ def _off_lanes(centres: Mapping[int, float], expected: Mapping[int, float]) -> l
     return off
 
 
+def _named_lanes(anchors: Sequence[tuple[float, int]], off: Iterable[int]) -> set[int]:
+    """The kept lanes whose boxes decided that ``off`` lanes are off
+    (:func:`_off_lanes`): those each off lane's expected x, and its neighbours'
+    (the half-pitch yardstick), are read from
+    (:func:`~proteia.core.project.anchoring_lanes`). A box in the wrong lane
+    beside an off lane can be the cause, so it is named too."""
+    return anchoring_lanes(anchors, {lane + d for lane in off for d in (-1, 0, 1)})
+
+
 def _in_words(items: Sequence[str]) -> str:
     """``a``, ``a and b``, ``a, b and c``."""
     return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
@@ -1722,6 +1741,91 @@ def _misnumbered_lanes(
         f" (half the lane pitch) apart; {fix}",
         ids=[band_id for _, _, band_id in boxes_in],
     )
+
+
+def _row_refusal(found: rowdetect.RowDetection) -> OperationError:
+    """The refusal of a row whose detection :func:`detect_row_boxes` cannot
+    commit, worded by what the detector saw.
+
+    Refused by a refusing flag (``ROW_LANES_UNCLEAR``): a box that cuts through
+    the bands says so first (cause ``cut_by_row_box``: a lane ``cut``, whether
+    its band's extent reaches the box's edge or the band peaks on the edge row
+    and was left out), since drawn over every lane it can still misread them;
+    otherwise the first refusing flag. No band sized (``NO_BAND_FOUND``), by the
+    empty lanes' reasons: bands kept but in no lane (``unassigned``), signal
+    only at the box's top or bottom edge (``edge_signal``: a box through the
+    bands, or over a neighbouring row), only a streak or stain filling its
+    height (``artefact``), a box with too little membrane to measure the bands
+    against (``too_little_membrane``:
+    :attr:`~proteia.core.rowdetect.RowDetection.membrane_shift` at least
+    :data:`~proteia.core.rowdetect.MEMBRANE_SHIFT_K`: detection took a band for
+    its membrane), else no band (``no_band``).
+
+    ``detail`` holds the raw reason: the ``cause`` the words follow, the
+    detector's ``flags`` and ``notes``, the reading's ``margin`` (None with no
+    reading or no other one), the box's ``membrane_shift`` and each lane's
+    ``lane_index``, ``reason``, ``snr`` and ``cut``. The message names no lane:
+    a reading the row box does not settle numbers them unreliably.
+    """
+    reasons = {lane.reason for lane in found.lanes}
+    if found.refused:
+        code = ErrorCode.ROW_LANES_UNCLEAR
+        if any(lane.cut for lane in found.lanes):
+            cause = "cut_by_row_box"
+            message = (
+                "the row box cuts through the bands, so it does not show which lane each band"
+                " is in; draw it over the whole band height and every declared lane, empty end"
+                " lanes included"
+            )
+        else:
+            cause = next(flag for flag in found.flags if flag in rowdetect.REFUSING_FLAGS)
+            message = (
+                "the row box does not show which lane each band is in; draw it over every"
+                " declared lane, empty end lanes included, or place the boxes by clicking"
+            )
+    else:
+        code = ErrorCode.NO_BAND_FOUND
+        if "unassigned" in reasons:
+            cause = "unassigned"
+            message = (
+                "bands were found in the row box but do not fit the lanes; draw it over every"
+                " declared lane, empty end lanes included, or place the boxes by clicking"
+            )
+        elif "edge_signal" in reasons:
+            cause = "edge_signal"
+            message = (
+                "the only signal in the row box lies at its top or bottom edge: the box cuts"
+                " through the bands or reaches into a neighbouring row; include the whole band"
+                " height"
+            )
+        elif "artefact" in reasons:
+            cause = "artefact"
+            message = (
+                "the only signal in the row box runs through its whole height: a streak or"
+                " stain, or bands the box cuts through; include the whole band height"
+            )
+        elif found.membrane_shift >= rowdetect.MEMBRANE_SHIFT_K:
+            cause = "too_little_membrane"
+            message = (
+                "the row box holds too little membrane to measure the bands against; include"
+                " some membrane above and below the bands"
+            )
+        else:
+            cause = "no_band"
+            message = "no band found in the row box"
+    margin = found.margin
+    detail: dict[str, JsonValue] = {
+        "cause": cause,
+        "flags": list(found.flags),
+        "notes": list(found.notes),
+        "margin": margin if margin is not None and math.isfinite(margin) else None,
+        "membrane_shift": found.membrane_shift,
+        "lanes": [
+            {"lane_index": lane.lane, "reason": lane.reason, "snr": lane.snr, "cut": lane.cut}
+            for lane in found.lanes
+        ],
+    }
+    return OperationError(code, message, detail=detail)
 
 
 def _row(row: object) -> Rect:
@@ -1831,8 +1935,11 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     lanes, repeated over many, drifts). A band found whose extent's centre
     lies more than half the local pitch from its lane's expected x
     (:func:`_off_lanes`) refuses the row (``ROW_LANES_UNCLEAR``; ``ids``: the
-    boxes that placed those lanes, :func:`~proteia.core.project.lane_anchor_ids`,
-    since one of them may be in the wrong lane). So a row read
+    boxes of the lanes those bands' expected x, and their neighbours', are
+    read from (:func:`_named_lanes`), in the order of
+    :func:`~proteia.core.project.lane_anchor_ids`, since one of them may be in
+    the wrong lane; ``detail``: ``{"cause": "off_lanes", "off_lanes": [...]}``,
+    the lanes off as read). So a row read
     a lane or more off is refused wherever its bands lie; one squeezed into
     more lanes than the box covers (its pitch too small), only where its bands
     lie between the anchored lanes, since past them the row's pitch follows
@@ -1847,7 +1954,9 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     is in (``ROW_LANES_UNCLEAR``, with no ids: the row box alone is at fault,
     whatever boxes the image holds); no band in any lane (``NO_BAND_FOUND``:
     with no band located, the lane slots would rest only on an even split of
-    the box, so no record is written either). The checks run in that order,
+    the box, so no record is written either). Those two are worded by what
+    the detector saw, with its raw reason as the refusal's ``detail``
+    (:func:`_row_refusal`). The checks run in that order,
     the lanes on the image checking the reading next, then the size
     (:func:`~proteia.core.boxes.grow_to_fit_all`).
 
@@ -1859,7 +1968,10 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     the size after, the fitted pitch and noise, the detector's warnings and
     notes, whether the lanes were read right to left, and its settings
     (:func:`~proteia.core.rowdetect.settings`: dev builds share a version
-    string, so the entry names the constants that placed the boxes).
+    string, so the entry names the constants that placed the boxes). The
+    answer also says which other proteins' nets on the image the row changed
+    (``remeasured``, ``largest_change``); the log need not, since every net is
+    stored whole.
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
@@ -1902,14 +2014,8 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     except rowdetect.RowDetectError as exc:
         ids = (image.id,) if exc.code == "invalid_image" else ()
         raise OperationError(_ROW_ERRORS[exc.code], str(exc), ids=ids) from exc
-    if found.refused:
-        raise OperationError(
-            ErrorCode.ROW_LANES_UNCLEAR,
-            "the row box does not show which lane each band is in; draw it over every"
-            " declared lane, empty end lanes included, or place the boxes by clicking",
-        )
-    if found.size is None:
-        raise OperationError(ErrorCode.NO_BAND_FOUND, "no band found in the row box")
+    if found.refused or found.size is None:
+        raise _row_refusal(found)
 
     # Band index 0, per lane: a box edited by hand stays, and so does one the
     # user placed where no band was found; any other gives way.
@@ -1931,12 +2037,20 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         for lane in found.lanes
         if lane.extent is not None
     }
-    if expected and _off_lanes(centres, expected):
+    off = _off_lanes(centres, expected) if expected else []
+    if off:
+        named = _named_lanes(anchors, off)
+        placed_ids = lane_anchor_ids(batch, image, without=detectors)
         raise OperationError(
             ErrorCode.ROW_LANES_UNCLEAR,
             "the bands in the row box do not line up with the lanes already placed on this"
             " image; draw the box over every declared lane, empty end lanes included",
-            ids=lane_anchor_ids(batch, image, without=detectors),
+            ids=[
+                band_id
+                for band_id, (_, lane) in zip(placed_ids, anchors, strict=True)
+                if lane in named
+            ],
+            detail={"cause": "off_lanes", "off_lanes": list(off)},
         )
     # The boxes that survive the commit: those kept, and those of another band
     # index.
@@ -2071,6 +2185,23 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         }
 
     band_ids, _, _, _ = _apply(session, "detect_row_boxes", change, params)
+    # The other proteins' nets on the image the row changed (their rings leave
+    # out its boxes); the same drag again, a no-op, changes none.
+    after = {
+        band.id: band.net
+        for other in session.project.batch.proteins
+        if other.image_id == image.id and other.id != protein_id
+        for band in other.bands
+    }
+    remeasured = tuple(
+        (band.id, band.net, after[band.id])
+        for other in batch.proteins
+        if other.image_id == image.id and other.id != protein_id
+        for band in other.bands
+        if after[band.id] != band.net
+    )
+    shares = [(abs(new - old) / old, band_id) for band_id, old, new in remeasured if old > 0]
+    largest = max(shares, key=lambda share: share[0], default=None)
     empty = tuple(
         (lane.lane, lane.reason, lane.snr, lane.expected_x)
         for lane in found.lanes
@@ -2091,6 +2222,8 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         flags=tuple(warnings),
         notes=found.notes,
         right_to_left=right_to_left,
+        remeasured=remeasured,
+        largest_change=None if largest is None else (largest[1], largest[0]),
     )
 
 

@@ -459,6 +459,14 @@ button:disabled {
   gap: 0.3rem;
 }
 
+/* "Original colours" while on: filled, outlined and bold, not told by a hue alone. */
+.view-tools button[aria-pressed="true"] {
+  border-color: Highlight;
+  background: var(--chosen);
+  color: CanvasText;
+  font-weight: 600;
+}
+
 .lane-picker {
   position: absolute;
   max-width: 22rem;
@@ -502,6 +510,20 @@ button:disabled {
 
 .new-project .field {
   flex: 1;
+}
+
+.sample-project {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.6rem;
+  margin-top: 0.8rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--line);
+}
+
+.sample-project .hint {
+  flex: 1 1 12rem;
 }
 
 .error {

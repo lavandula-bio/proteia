@@ -110,6 +110,16 @@ export class ImageView {
     this.draw();
   }
 
+  // The image shown drawn from another bitmap of it (its original colours, or
+  // its grey analysis image again): the zoom, the pan and a drag under way stay,
+  // and so do the boxes, since both cover the same image pixels.
+  setBitmap(bitmap) {
+    if (bitmap !== this.bitmap) {
+      this.bitmap = bitmap;
+      this.draw();
+    }
+  }
+
   setOverlay(boxes, ghosts, selectedId, marks = []) {
     this.boxes = boxes;
     this.ghosts = ghosts;
@@ -190,7 +200,8 @@ export class ImageView {
     const s = this.scale * ratio;
     ctx.setTransform(s, 0, 0, s, -this.offsetX * s, -this.offsetY * s);
     ctx.imageSmoothingEnabled = this.scale < 2; // show pixels when zoomed in
-    ctx.drawImage(this.bitmap, 0, 0);
+    // Over the image's own pixels, whatever the bitmap's size, so boxes stay on them.
+    ctx.drawImage(this.bitmap, 0, 0, this.width, this.height);
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0); // overlays in screen pixels
     for (const ghost of this.ghosts) {
       this.drawRect(ghost.rect, ghost.color, { dashed: true, label: ghost.label });

@@ -359,12 +359,17 @@ def adversarial_row(
     )
 
 
-def blob(lane: int, r: float, depth: float) -> Artefact:
-    """A round dark blob (dust, a stain) of radius ``r`` on ``lane``'s band centre;
-    a negative depth is a light spot."""
+def blob(
+    lane: int, r: float, depth: float, *, ry: float | None = None, dy: float = 0.0
+) -> Artefact:
+    """A round dark blob (dust, a stain) of radius ``r`` on ``lane``'s band centre
+    (``dy`` px below it); a negative depth is a light spot. ``ry`` makes it an
+    ellipse, ``r`` px across and ``ry`` px high."""
+    ry = r if ry is None else ry
 
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
-        return depth * np.exp(-0.5 * (((X - lcx[lane]) / r) ** 2 + ((Y - lcy[lane]) / r) ** 2))
+        cy = lcy[lane] + dy
+        return depth * np.exp(-0.5 * (((X - lcx[lane]) / r) ** 2 + ((Y - cy) / ry) ** 2))
 
     return f
 
@@ -380,13 +385,14 @@ def blob_between(left: int, r: float, depth: float) -> Artefact:
     return f
 
 
-def band_between(left: int, w: float, h: float, depth: float) -> Artefact:
+def band_between(left: int, w: float, h: float, depth: float, dy: float = 0.0) -> Artefact:
     """An extra flat-topped band, ``w`` x ``h`` px at 20%, midway between lanes
-    ``left`` and ``left + 1``, at the band height of ``left``."""
+    ``left`` and ``left + 1``, at the band height of ``left`` (``dy`` px below
+    it)."""
 
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
         cx = 0.5 * (lcx[left] + lcx[left + 1])
-        return _band(X[0], Y[:, 0], cx, lcy[left], w, h, depth, "super")
+        return _band(X[0], Y[:, 0], cx, lcy[left] + dy, w, h, depth, "super")
 
     return f
 
@@ -396,6 +402,16 @@ def vstreak(lane: int, half_w: float, depth: float) -> Artefact:
 
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
         return depth * np.exp(-0.5 * np.abs((X - lcx[lane]) / half_w) ** 4) + 0 * Y
+
+    return f
+
+
+def hstripe(half_h: float, depth: float) -> Artefact:
+    """A darker stretch of membrane: a flat stripe across the whole image width,
+    ``2 * half_h`` px high about the row's mean band height."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        return depth * (np.abs(Y - float(np.mean(lcy))) < half_h) + 0 * X
 
     return f
 
@@ -444,6 +460,13 @@ ADVERSARIAL: dict[str, dict] = {
     # Touching bands, the first a quarter as deep as the rest: its end of the
     # run is trimmed against its neighbour's peak once the envelope reaches it.
     "touching_weak_end": {"pitch": 48.0, "w": 60.0, "depths": {0: 6000.0}},
+    # Lane 2 spread to 1.4 pitches over empty lane 3 (the judge's
+    # wide_band_next_empty): the piece is lane 2's, and the kept signal it
+    # spills into lane 3 fits no lane.
+    "wide_next_empty": {"widths": {2: 100.0}, "missing": [3]},
+    # A tilted row (lane 1 highest) whose box's top edge runs 3 px above the
+    # highest band's centre: it cuts the bands of lanes 1 and 2 only.
+    "tilt_cut": {"tilt": 10.0, "box_adjust": (0, 9, 0, 0)},
 }
 
 

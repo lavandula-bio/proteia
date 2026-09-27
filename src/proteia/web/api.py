@@ -17,11 +17,22 @@ back (:class:`~proteia.core.operations.Restored`); clearing a protein's boxes
 answers the band ids removed and the (lane index, band index) of each record
 dropped; a row box answers what it did in each lane: every field of
 :class:`~proteia.core.operations.RowPlacement`, each empty lane as
-``{lane_index, reason, snr, expected_x}``; requantifying answers the images
+``{lane_index, reason, snr, expected_x}``, each other protein's band it
+re-measured as ``{band_id, net_before, net_after}`` and the largest change as
+``{band_id, change}`` (or null); requantifying answers the images
 re-quantified. Lane indices in requests and answers are 0-based, as stored. Any
 box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
+
+``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
+gray analysis array, which the nets are measured on, or, with
+``?colour=original``, its stored file in its own colours, for display only.
+
+``POST /api/projects/sample`` creates the sample project, set up on the
+synthetic sample blot up to the row boxes (:mod:`proteia.web.sample_project`),
+and answers as a create does, with ``sample``: the truth table's name in the
+project folder and each protein's row, as a drag over it.
 
 ``POST /api/export`` writes the results into a new export folder
 (:func:`~proteia.core.operations.export_bundle`), computed with the settings the
@@ -32,7 +43,8 @@ with ``{"folder": "exports/<name>"}`` as the export answered it, that export
 folder.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
-with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404, and
+with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
+refusal carries one (a row box's: what the detector saw); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
 ``no_project`` 409 before a project is open; ``invalid_input`` 422 for a request
 the routes cannot read.
@@ -49,7 +61,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -75,10 +87,10 @@ from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import projects
+from proteia.web import projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.results_view import results_payload
-from proteia.web.state import preview_png, project_state, revision
+from proteia.web.state import has_colour, original_png, preview_png, project_state, revision
 
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
@@ -162,7 +174,8 @@ class Workspace:
         self._open_ids: weakref.WeakKeyDictionary[ProjectSession, int] = weakref.WeakKeyDictionary()
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
-        self._previews: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        # (image id, SHA-256, original colours) -> preview PNG, least recently shown first.
+        self._previews: OrderedDict[tuple[str, str, bool], bytes] = OrderedDict()
         self._charts = ChartStore()
 
     def current(self) -> ProjectSession:
@@ -241,6 +254,15 @@ class Workspace:
     def create(self, name: object) -> ProjectSession:
         with self._switching:
             return self._switch(lambda: projects.create_project(self.root, name, clock=self.clock))
+
+    def create_sample(self) -> ProjectSession:
+        """Create the sample project
+        (:func:`~proteia.web.sample_project.create_sample_project`) and open it,
+        as :meth:`create` does."""
+        with self._switching:
+            return self._switch(
+                lambda: sample_project.create_sample_project(self.root, clock=self.clock)
+            )
 
     def open(self, name: object) -> ProjectSession:
         """Open the project ``name`` (:func:`~proteia.web.projects.project_folder`)
@@ -326,15 +348,25 @@ class Workspace:
         given in the open project's answers, or no longer kept."""
         return self._charts.svg(key)
 
-    def preview(self, session: ProjectSession, image_id: str) -> bytes:
-        """The image's preview PNG, kept for the last few images shown."""
+    def preview(self, session: ProjectSession, image_id: str, *, original: bool = False) -> bytes:
+        """The image's preview PNG: of its gray analysis array, or, with
+        ``original``, of its stored file in its own colours
+        (:func:`~proteia.web.state.original_png`) if the file has colour to
+        show (:func:`~proteia.web.state.has_colour`); otherwise it answers the
+        gray one: a gray file's original colours are its gray levels, and the
+        colours of a CMYK file, say, are not converted. The last few previews
+        shown are kept, gray and colour alike."""
         image = session.project.batch.find_image(image_id)
-        key = (image_id, image.sha256)
+        original = original and has_colour(session, image)
+        key = (image_id, image.sha256, original)
         with self._lock:
             if key in self._previews:
                 self._previews.move_to_end(key)
                 return self._previews[key]
-        data = preview_png(session.pixels(image_id, keep=False))
+        if original:
+            data = original_png(session.colour_pixels(image_id))
+        else:
+            data = preview_png(session.pixels(image_id, keep=False))
         with self._lock:
             self._previews[key] = data
             while len(self._previews) > _PREVIEWS_KEPT:
@@ -495,9 +527,10 @@ def _cascade(cascade: ops.Cascade) -> dict[str, list[str]]:
 def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
     """Every field of what a row box did
     (:class:`~proteia.core.operations.RowPlacement`), with lists for tuples, the
-    box size as ``{width, height}`` and each empty lane as ``{lane_index,
-    reason, snr, expected_x}``."""
-    size = placement.box_size
+    box size as ``{width, height}``, each empty lane as ``{lane_index,
+    reason, snr, expected_x}``, each band re-measured as ``{band_id, net_before,
+    net_after}`` and the largest change as ``{band_id, change}`` (or None)."""
+    size, largest = placement.box_size, placement.largest_change
     return {
         "band_ids": list(placement.band_ids),
         "box_size": {"width": size.width, "height": size.height},
@@ -513,6 +546,13 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
         "flags": list(placement.flags),
         "notes": list(placement.notes),
         "right_to_left": placement.right_to_left,
+        "remeasured": [
+            {"band_id": band_id, "net_before": before, "net_after": after}
+            for band_id, before, after in placement.remeasured
+        ],
+        "largest_change": None
+        if largest is None
+        else {"band_id": largest[0], "change": largest[1]},
     }
 
 
@@ -534,6 +574,16 @@ def list_projects(workspace: WorkspaceDep) -> dict[str, Any]:
 @router.post("/projects", status_code=201)
 def create_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, workspace.create(body.name))
+
+
+@router.post("/projects/sample", status_code=201)
+def create_sample_project(workspace: WorkspaceDep) -> dict[str, Any]:
+    """Create the sample project (:mod:`proteia.web.sample_project`), named
+    ``Sample blot`` or the next free ``Sample blot (n)``, and open it. Answers as
+    a create does, with ``sample`` (:func:`~proteia.web.sample_project.sample_payload`):
+    the truth table's name in the project folder and each protein's row."""
+    session = workspace.create_sample()
+    return _answer(workspace, session, sample=sample_project.sample_payload(session.project))
 
 
 @router.post("/projects/open")
@@ -642,9 +692,18 @@ def set_polarity(image_id: str, body: PolarityBody, workspace: WorkspaceDep) -> 
 
 
 @router.get("/images/{image_id}/preview")
-def image_preview(image_id: str, workspace: WorkspaceDep) -> Response:
+def image_preview(
+    image_id: str, workspace: WorkspaceDep, colour: Literal["original"] | None = None
+) -> Response:
+    """The image as the view draws it, a PNG of the image's own size: its gray
+    analysis array, which the nets are measured on, or with ``colour=original``
+    its stored file in the file's own colours, for display only (the gray one
+    for a file without colour to show: ``colour`` in the project state says
+    which have it). Either is read after the stored file's SHA-256 is checked:
+    ``image_file_changed`` or ``unreadable_image`` (422) otherwise."""
     session = workspace.current()
-    return Response(workspace.preview(session, image_id), media_type="image/png")
+    data = workspace.preview(session, image_id, original=colour == "original")
+    return Response(data, media_type="image/png")
 
 
 @router.get("/charts/{key}.svg")
@@ -842,8 +901,18 @@ def redo(workspace: WorkspaceDep) -> dict[str, Any]:
 # --- Errors ---
 
 
-def _error(status: int, code: str, message: str, ids: tuple[str, ...] = ()) -> JSONResponse:
-    return JSONResponse({"code": code, "message": message, "ids": list(ids)}, status_code=status)
+def _error(
+    status: int,
+    code: str,
+    message: str,
+    ids: tuple[str, ...] = (),
+    detail: dict[str, Any] | None = None,
+) -> JSONResponse:
+    """An error answer: ``{code, message, ids}``, and ``detail`` when given."""
+    body: dict[str, Any] = {"code": code, "message": message, "ids": list(ids)}
+    if detail is not None:
+        body["detail"] = detail
+    return JSONResponse(body, status_code=status)
 
 
 def install(app: FastAPI, workspace: Workspace) -> None:
@@ -851,7 +920,7 @@ def install(app: FastAPI, workspace: Workspace) -> None:
     app.state.workspace = workspace
     app.include_router(router)
     answers: dict[type[Exception], Callable[[Exception], JSONResponse]] = {
-        OperationError: lambda e: _error(422, e.code.value, str(e), e.ids),
+        OperationError: lambda e: _error(422, e.code.value, str(e), e.ids, e.detail),
         UnknownIdError: lambda e: _error(404, "unknown_id", str(e)),
         FolderNotFoundError: lambda e: _error(404, "folder_not_found", str(e)),
         NoProjectError: lambda e: _error(409, "no_project", str(e)),

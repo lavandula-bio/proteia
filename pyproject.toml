@@ -14,7 +14,7 @@ dependencies = [
     "pillow>=12",
     "pydantic>=2.13.4",
     "scikit-image>=0.25",
-    "scipy>=1.14",
+    "scipy>=1.16",
     "tifffile>=2024.8",
     "uvicorn>=0.54.0",
 ]
