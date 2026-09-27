@@ -777,3 +777,20 @@ def test_an_answer_about_a_newer_opening_than_its_request_named_is_never_applied
     assert "anyProject: true" in _function(script, "function followOpening(")[1]
     # Answered, the request was not refused: nothing is said to be not done.
     assert "answered ||" in _function(script, "function projectChanged(")[1]
+
+
+# --- The box size fields (#57) ---
+
+
+def test_the_box_size_fields_show_and_send_the_fitted_size():
+    # PUT /api/proteins/{id}/box-size takes the fitted size, which the boxes
+    # extend beyond by the protein's padding. The fields show the fitted size
+    # and Apply sends what they hold: filled with the box size, each Apply
+    # would add the padding again. The boxes, and the placeholders of the
+    # lanes with none, are drawn at the box size.
+    panel = _code("proteins.js")
+    editor = _method(panel, "renderEditor(")
+    for field, dimension in (("box-width", "width"), ("box-height", "height")):
+        assert f'this.fill("{field}", protein.fitted_size.{dimension},' in editor
+    assert "box_size" not in panel
+    assert "const { width, height } = protein.box_size;" in _code("app.js")

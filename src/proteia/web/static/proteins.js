@@ -270,8 +270,10 @@ export class ProteinPanel {
     const image = this.project.images.find((i) => i.id === protein.image_id);
     $("box-width").max = String(image.width);
     $("box-height").max = String(image.height);
-    this.fill("box-width", protein.box_size.width, force("box-width"));
-    this.fill("box-height", protein.box_size.height, force("box-height"));
+    // The fitted size, which Apply sends: the boxes extend beyond it by the
+    // protein's padding, which the server adds (the box size would get it twice).
+    this.fill("box-width", protein.fitted_size.width, force("box-width"));
+    this.fill("box-height", protein.fitted_size.height, force("box-height"));
     this.renderUndetected(protein);
     this.renderClear();
   }

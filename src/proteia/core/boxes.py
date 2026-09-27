@@ -4,8 +4,8 @@ keep equal area, and forbid overlap.
 
 These are pure functions over rectangles so the rules can be unit-tested
 without a GUI. :func:`resize_all` enforces the shared size when it changes and
-refuses a size that would force an overlap; :func:`normalize_corners` reads
-napari shape vertices.
+refuses a size that would force an overlap (:func:`resize_checked` names the
+boxes instead); :func:`normalize_corners` reads napari shape vertices.
 
 The placement rules of the napari app's box handlers are lifted here so the
 project operations (:mod:`proteia.core.operations`) apply them too:
@@ -14,7 +14,8 @@ the image; :func:`center_snap` reads an edited rect by its centre (napari's
 ``_center_snap``); :func:`initial_box_size` is a new protein's default size
 (``_initial_size``); and :func:`grow_to_fit` fits the shared size to a
 seed-grown band (``_seed_grow``), :func:`grow_to_fit_all` to several bands at
-once (a detected row). Only one protein's own boxes must not overlap
+once (a detected row), each keeping the protein's padding (#57; its sizes in
+words: :func:`size_words`). Only one protein's own boxes must not overlap
 (:func:`overlaps_any`); boxes of different proteins may. :func:`place_in_row`
 places one row of same-size boxes left to right without overlap (row-box
 detection, :mod:`proteia.core.rowdetect`).
@@ -28,11 +29,12 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Iterable, Sequence
-from typing import Literal
+from typing import Final, Literal
 
-from proteia.core.model import BoxSize, Rect, overlaps
+from proteia.core.model import BoxPadding, BoxSize, Rect, overlaps
 
 BoxRuleCode = Literal["overlap", "size_would_overlap"]
+NO_PADDING: Final = BoxPadding()
 
 
 class BoxRuleError(ValueError):
@@ -95,6 +97,38 @@ def resize_all(
     """
     resized = _recentred(rects, size, width, height)
     return None if _clashing(resized) else resized
+
+
+def resize_checked(
+    rects: Sequence[Rect], size: BoxSize, *, width: int, height: int
+) -> tuple[list[Rect], tuple[int, ...]]:
+    """:func:`resize_all` inside a ``width`` x ``height`` image, reporting instead
+    of refusing: the re-sized boxes, and the indices of those that would overlap
+    another (empty when none), for a refusal that names them."""
+    resized = _recentred(rects, size, width, height)
+    return resized, _clashing(resized)
+
+
+def padding_words(pad: BoxPadding) -> str:
+    """A padding in words, the direction left out while 0: ``5 px above and
+    below``, ``6 px left and right and 5 px above and below``; empty for none."""
+    parts = []
+    if pad.across:
+        parts.append(f"{pad.across} px left and right")
+    if pad.along:
+        parts.append(f"{pad.along} px above and below")
+    return " and ".join(parts)
+
+
+def size_words(size: BoxSize, pad: BoxPadding = NO_PADDING) -> str:
+    """A protein's box size in words: ``88x15``, or under a padding the fitted
+    size it is made of, ``98x25 (fitted 88x15 plus 5 px above and below)``, so
+    a refusal names what the user set."""
+    words = f"{size.width}x{size.height}"
+    if pad == NO_PADDING:
+        return words
+    fitted = f"{size.width - 2 * pad.across}x{size.height - 2 * pad.along}"
+    return f"{words} (fitted {fitted} plus {padding_words(pad)})"
 
 
 def _recentred(
@@ -176,22 +210,31 @@ def place_in_row(targets: Sequence[int], width: int, lo: int, hi: int) -> list[i
 
 
 def grow_to_fit(
-    rects: Sequence[Rect], size: BoxSize, grown: Rect, *, width: int, height: int
+    rects: Sequence[Rect],
+    size: BoxSize,
+    grown: Rect,
+    *,
+    width: int,
+    height: int,
+    pad: BoxPadding = NO_PADDING,
 ) -> tuple[BoxSize, list[Rect], Rect]:
     """Fit a protein's shared box size to a newly grown band and place its box:
     :func:`grow_to_fit_all` of the one band.
 
     ``rects`` are the protein's existing boxes, all of ``size``; ``grown`` is the
     band's fitted rect (e.g. from :func:`proteia.core.grow.grow_box`). The first
-    box sets the size (at least 2 px, clamped to the image); later boxes only grow
-    it, so every box of the protein keeps one area. Existing boxes are re-centred
-    to the new size (:func:`resize_all`) and the new box is centred on the band.
+    box sets the size (at least 2 px, plus the padding ``pad``, clamped to the
+    image); later boxes only grow it, so every box of the protein keeps one
+    area. Existing boxes are re-centred to the new size (:func:`resize_all`) and
+    the new box is centred on the band.
 
     Returns ``(size, resized, rect)`` with ``resized`` in input order. Raises
     :class:`BoxRuleError` with ``size_would_overlap`` if the new size would make
     existing boxes overlap, or ``overlap`` if the new box overlaps one of them.
     """
-    new, resized, [rect] = grow_to_fit_all(rects, size, [grown], width=width, height=height)
+    new, resized, [rect] = grow_to_fit_all(
+        rects, size, [grown], width=width, height=height, pad=pad
+    )
     return new, resized, rect
 
 
@@ -203,6 +246,7 @@ def grow_to_fit_all(
     width: int,
     height: int,
     need: BoxSize | None = None,
+    pad: BoxPadding = NO_PADDING,
 ) -> tuple[BoxSize, list[Rect], list[Rect]]:
     """Fit a protein's shared box size to newly grown bands and place a box on
     each: :func:`grow_to_fit` for several bands at once (a detected row).
@@ -211,11 +255,16 @@ def grow_to_fit_all(
     the bands' fitted rects. ``need`` is the size the bands need: by default the
     largest extent among ``grown`` in each dimension, each at least 2 px and
     clamped to the image. A caller whose bands share a size fitted elsewhere (a
-    row's detector) passes it, and it counts even with no band to place. With
-    no existing box, ``need`` is the size; otherwise it only grows the size, so
-    every box of the protein keeps one area. Existing boxes are re-centred to
-    the new size (:func:`resize_all`) and each new box is centred on its band's
-    integer centre, shifted inside the image.
+    row's detector) passes it, and it counts even with no band to place.
+    ``pad`` is the protein's padding: it is added on each side of ``need``,
+    clamped to the image, so every fit keeps it (``max(size, need + 2 * pad)
+    = max(fitted, need) + 2 * pad`` while the image does not clamp; where it
+    does, the box takes the image's full size and the fitted size it leaves,
+    the size less the padding, is less than the bands'). With no existing box,
+    the padded ``need`` is the size; otherwise it only grows the size, so every
+    box of the protein keeps one area. Existing boxes are re-centred to the new
+    size (:func:`resize_all`) and each new box is centred on its band's integer
+    centre, shifted inside the image.
 
     Returns ``(size, resized, placed)``, both lists in input order. Raises
     :class:`BoxRuleError`, with the new ``size``: ``size_would_overlap`` if the
@@ -231,6 +280,10 @@ def grow_to_fit_all(
             width=max(min(width, max(2, x1 - x0)) for x0, _, x1, _ in grown),
             height=max(min(height, max(2, y1 - y0)) for _, y0, _, y1 in grown),
         )
+    need = BoxSize(
+        width=min(width, need.width + 2 * pad.across),
+        height=min(height, need.height + 2 * pad.along),
+    )
     if rects:
         new = BoxSize(width=max(size.width, need.width), height=max(size.height, need.height))
     else:
@@ -240,7 +293,7 @@ def grow_to_fit_all(
     if clashing:
         raise BoxRuleError(
             "size_would_overlap",
-            f"growing the box size to {new.width}x{new.height} would make boxes overlap",
+            f"growing the box size to {size_words(new, pad)} would make boxes overlap",
             size=new,
             hits=clashing,
         )
@@ -251,13 +304,17 @@ def grow_to_fit_all(
     if _clashing(placed):
         raise BoxRuleError(
             "size_would_overlap",
-            f"the box size {new.width}x{new.height} would make the new boxes overlap each other",
+            f"the box size {size_words(new, pad)} would make the new boxes overlap each other",
             size=new,
         )
     hits = tuple(i for i, rect in enumerate(resized) if overlaps_any(rect, placed))
     if hits:
         which = "the new box" if len(placed) == 1 else "a new box"
+        padded = f" (boxes are padded {padding_words(pad)})" if pad != NO_PADDING else ""
         raise BoxRuleError(
-            "overlap", f"{which} would overlap another box of this protein", size=new, hits=hits
+            "overlap",
+            f"{which} would overlap another box of this protein{padded}",
+            size=new,
+            hits=hits,
         )
     return new, resized, placed

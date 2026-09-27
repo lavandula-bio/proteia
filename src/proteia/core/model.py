@@ -63,9 +63,10 @@ from pydantic import (
     model_validator,
 )
 
-# Bumped, with a registered migration, by every change to the saved form (see
-# proteia.core.storage). 2 (#83): the band background fields and the project's
-# background method.
+# Before v0.1, an additive change (a new optional field left out while empty, or
+# a new enum value) does not bump; from v0.1 on, every saved-form change bumps and
+# registers a migration (see proteia.core.storage). 2 (#83): the band background
+# fields and the project's background method.
 SCHEMA_VERSION: Final = 2
 # Stored image suffixes: what the import dialog accepts today (#45 may change it).
 IMAGE_SUFFIXES: Final = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
@@ -225,6 +226,14 @@ class BoxSize(_Model):
     @property
     def area(self) -> int:
         return self.width * self.height
+
+
+class BoxPadding(_Model):
+    """Whole pixels every box of one protein extends beyond its fitted size (the
+    size its clicks, rows or typing asked for), on each side (#57)."""
+
+    across: int = Field(default=0, ge=0)  # left and right
+    along: int = Field(default=0, ge=0)  # above and below
 
 
 class Lane(_Model):
@@ -466,10 +475,12 @@ class UndetectedBand(_Model):
 class Protein(_Model):
     """One protein quantified on one image (the successor of ``Analysis``).
 
-    Every band shares ``box_size``, the effective size that was quantified. A
-    target normalizes against ``loading_control_ids``; an empty list means the
-    batch's single loading control. Each (lane, band index) holds a band, a
-    not-detected record, or neither; a record only ever concerns an expected band.
+    Every band shares ``box_size``, the effective size that was quantified: the
+    fitted size (what clicks, rows or typing asked for) plus ``box_padding`` on
+    each side (:attr:`fitted_size`). A target normalizes against
+    ``loading_control_ids``; an empty list means the batch's single loading
+    control. Each (lane, band index) holds a band, a not-detected record, or
+    neither; a record only ever concerns an expected band.
     """
 
     id: ProteinId
@@ -480,11 +491,43 @@ class Protein(_Model):
     expected_mw: Kda | None = None
     expected_band_count: int = Field(default=1, ge=1)
     mw_tolerance: Annotated[Finite, Field(gt=0, lt=1)] = 0.10  # relative: 0.10 = ±10%
-    box_size: BoxSize
+    box_size: BoxSize  # quantified: the fitted size plus box_padding on each side
+    # Left out of the saved form while (0, 0), so a project without padding keeps its
+    # bytes and hash (see "Canonical form" in storage).
+    box_padding: BoxPadding = Field(
+        default_factory=BoxPadding, exclude_if=lambda v: v == BoxPadding()
+    )
     bands: list[Band] = Field(default_factory=list)
     # Left out of the saved form when empty, so a project without records keeps its
     # bytes and hash. Do not "normalize" this: see "Canonical form" in storage.
     undetected: list[UndetectedBand] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+    @property
+    def fitted_size(self) -> BoxSize:
+        """The size the bands asked for: ``box_size`` less ``box_padding`` on each side."""
+        padding = self.box_padding
+        return BoxSize(
+            width=self.box_size.width - 2 * padding.across,
+            height=self.box_size.height - 2 * padding.along,
+        )
+
+    @model_validator(mode="after")
+    def _check_box_padding(self) -> Protein:
+        # The range (at most half the fitted size) is a rule of the operations
+        # that set a padding, not of the model: a later fit keeps the padding
+        # whatever size it fits, and must never make a file unloadable.
+        size, padding = self.box_size, self.box_padding
+        under = []
+        if size.width <= 2 * padding.across:
+            under.append(f"{padding.across} px of padding left and right")
+        if size.height <= 2 * padding.along:
+            under.append(f"{padding.along} px of padding above and below")
+        if under:
+            raise ValueError(
+                f"protein {self.id}: box size {size.width}x{size.height} leaves no fitted"
+                f" size under {' and '.join(under)}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_bands_and_loading_controls(self) -> Protein:
