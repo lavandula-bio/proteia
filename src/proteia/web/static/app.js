@@ -11,6 +11,7 @@ import {
   focusLost,
   inWords,
   isolate,
+  lanesPhrase,
   netText,
   rebuild,
   sentence,
@@ -376,14 +377,14 @@ function pending() {
 }
 
 // Send an edit and show a refusal in the status line (unless another project
-// is shown by then).
-async function edit(method, path, json) {
+// is shown by then): the server's reason, or as `refused(error)` shows it.
+async function edit(method, path, json, { refused = report } = {}) {
   const opened = shownOpening();
   try {
     return await ordered(() => send(method, path, json));
   } catch (error) {
     if (opened === shownOpening()) {
-      report(error);
+      refused(error);
     }
     throw error;
   }
@@ -394,7 +395,12 @@ const view = new ImageView($("view"), {
     placeBox(x, y, options, options.laneIndex, options.proteinId || state.proteinId),
   row: (rect, proteinId) => placeRow(rect, proteinId),
   move: (boxId, rect) =>
-    edit("PUT", `/api/boxes/${boxId}`, { rect })
+    edit(
+      "PUT",
+      `/api/boxes/${boxId}`,
+      { rect },
+      { refused: (error) => showBoxRefusal(error, "Box not moved", "move it again") },
+    )
       .then((answer) => noteBoxStep(answer, "move_box", [boxId]))
       .catch(() => {}),
   select: (boxId) => {
@@ -414,6 +420,7 @@ const proteinPanel = new ProteinPanel({
   undo: (seq) => takeStep("undo", { seq }),
   pending,
   laneName: (index) => laneName(state.project, index),
+  remeasured: (answer) => remeasuredText(answer),
 });
 
 // Its edits run in the panel's queue: in order with the protein edits, the
@@ -802,7 +809,7 @@ function render() {
       : "Saving…";
   const image = project.images.find((i) => i.id === state.imageId) || null;
   renderImages(project, image);
-  proteinPanel.render(project, image, state.proteinId);
+  proteinPanel.render(project, image, state.proteinId, state.results);
   renderBox(project);
   renderNotices(project);
   renderHint(project, image);
@@ -914,6 +921,35 @@ function boxNetText(protein, band) {
   return net === null ? "—" : netText(net);
 }
 
+// A box's over-exposure: the check at the detector limit, or on an image it
+// cannot trust (lossy, colour or converted), how near the limit its pixels come
+// (#112).
+function overExposureText(band) {
+  if (band.clipped !== null) {
+    return band.clipped
+      ? "Yes: pixels at the detector limit, so the net is an under-estimate"
+      : "No";
+  }
+  if (band.possibly_clipped === true) {
+    return "Possibly: pixels near the detector limit, which this image cannot confirm; check the original capture";
+  }
+  if (band.possibly_clipped === false) {
+    // Not "No": a colour channel saturated alone may never bring the grey mean
+    // near the limit, so the heuristic seeing nothing does not clear the band.
+    return "Not checked; no sign of it in the grey analysis image";
+  }
+  return "Not checked";
+}
+
+// What a box's label adds about its over-exposure; a question mark where it
+// cannot be confirmed (#112).
+function overExposureLabel(band) {
+  if (band.clipped === true) {
+    return " over-exposed";
+  }
+  return band.possibly_clipped === true ? " over-exposed?" : "";
+}
+
 function renderBox(project) {
   const found = state.boxId ? findBox(project, state.boxId) : null;
   $("box-panel").hidden = !found;
@@ -922,12 +958,7 @@ function renderBox(project) {
   }
   const { protein, band } = found;
   $("box-summary").textContent = `${protein.name}, ${laneName(project, band.lane_index)}`;
-  $("box-clipped").textContent =
-    band.clipped === true
-      ? "Yes: pixels at the detector limit, so the net is an under-estimate"
-      : band.clipped === null
-        ? "Not checked"
-        : "No";
+  $("box-clipped").textContent = overExposureText(band);
   $("box-net").textContent = boxNetText(protein, band);
   const edited = band.manually_edited ? "; moved or re-laned by hand since" : "";
   $("box-source").textContent = `${PLACED_BY[band.source] || band.source}${edited}`;
@@ -1109,13 +1140,21 @@ function renderView(project) {
   const marks = [];
   for (const protein of project.proteins.filter((p) => p.image_id === image.id)) {
     const color = colorOf(project, protein.id);
+    // The chosen protein's padded boxes show their fitted size inside. Not a
+    // box at the image's edge: the padding may have shifted it inward, off
+    // the fit's centre, and the outline would be drawn off the fit.
+    const { across, along } = protein.box_padding;
+    const inset = protein.id === state.proteinId && (across > 0 || along > 0);
     for (const band of protein.bands) {
+      const [x0, y0, x1, y1] = band.rect;
+      const atEdge = x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height;
       boxes.push({
         id: band.id,
         rect: band.rect,
+        fitted: inset && !atEdge ? [x0 + across, y0 + along, x1 - across, y1 - along] : null,
         color,
         clipped: band.clipped === true,
-        label: `${band.lane_index + 1}${band.clipped === true ? " over-exposed" : ""}`,
+        label: `${band.lane_index + 1}${overExposureLabel(band)}`,
       });
     }
     const { width, height } = protein.box_size;
@@ -1237,6 +1276,8 @@ async function placeBox(x, y, options, laneIndex, proteinId) {
         "No band found where you clicked. Click on a band, or Shift+click to place a box" +
           " of the protein's box size.",
       );
+    } else if (error.code === "overlap") {
+      showBoxRefusal(error, "Box not placed", "click again");
     } else {
       report(error);
     }
@@ -1277,12 +1318,6 @@ $("lane-picker-cancel").addEventListener("click", () => {
 });
 
 // --- A row of boxes from a row box ---
-
-// Stored lane indices in words, numbered from 1: "lane 8", "lanes 4 and 8".
-function lanesPhrase(indices) {
-  const numbers = indices.map((index) => String(index + 1));
-  return `${numbers.length === 1 ? "lane" : "lanes"} ${inWords(numbers)}`;
-}
 
 // Why a row left a lane with neither a box nor an n.d. mark, by the
 // detector's reason for the empty lane (LaneReason in core/rowdetect.py). A
@@ -1493,23 +1528,106 @@ function lastBoxStepNamed(error) {
   });
 }
 
+// The boxes a refusal names (an overlap's: those in the way) in words, protein
+// by protein as the project holds them: "the box of GAPDH in lane 2", "the
+// boxes of GAPDH in lanes 1, 2 and 3"; null when it names none shown.
+function namedBoxes(error) {
+  const lanes = new Map(); // protein -> the lane indices of its boxes named
+  for (const id of error.ids) {
+    const found = findBox(state.project, id);
+    if (found) {
+      lanes.set(found.protein, [...(lanes.get(found.protein) || []), found.band.lane_index]);
+    }
+  }
+  const parts = [...lanes].map(([protein, indices]) => {
+    const boxes = indices.length === 1 ? "box" : "boxes";
+    return `the ${boxes} of ${protein.name} in ${lanesPhrase(indices.sort((a, b) => a - b))}`;
+  });
+  return parts.length ? inWords(parts) : null;
+}
+
+// Show a box on its image, selected: the user moves or deletes it from there.
+function selectBox(boxId) {
+  const found = state.project && findBox(state.project, boxId);
+  if (!found) {
+    return; // gone meanwhile (an undo)
+  }
+  state.imageId = found.protein.image_id;
+  state.boxId = boxId;
+  select();
+  render();
+}
+
+// What to do about the boxes in the way of a box or a row (an overlap refusal,
+// which names them: another box of the protein, or another protein's boxes it
+// would overlap by more than half): move or delete them, then `again`. With an
+// Undo of the last box change when it made one of them (it may be the
+// mistake), else a Select of the first of them. Gives {text, action}; no text
+// when it names none shown.
+function boxesInTheWay(error, again) {
+  const which = namedBoxes(error);
+  if (!which) {
+    return { text: null, action: null };
+  }
+  const text = `Move or delete ${which}, then ${again}.`;
+  const step = state.project.history.undo;
+  if (lastBoxStepNamed(error)) {
+    const words = actionWords(step.action);
+    return {
+      text: `${text} If the last change (${words}) was the mistake, Undo takes it back.`,
+      action: {
+        label: "Undo",
+        name: `Undo ${words}`,
+        seq: step.seq,
+        run: () => takeStep("undo", { seq: step.seq }),
+      },
+    };
+  }
+  const first = error.ids.map((id) => findBox(state.project, id)).find(Boolean);
+  return {
+    text,
+    action: {
+      label: "Select",
+      name: `Select the box of ${first.protein.name} in lane ${first.band.lane_index + 1}`,
+      run: () => selectBox(first.band.id),
+    },
+  };
+}
+
+// A box placed or moved refused in the status line: `head` (what was not
+// done), the server's reason, and for boxes in its way what to do, with an
+// Undo or Select of them (boxesInTheWay).
+function showBoxRefusal(error, head, again) {
+  if (saidElsewhere(error)) {
+    return;
+  }
+  const sentences = [`${head}: ${sentence(error.message)}`];
+  let action = null;
+  if (error.code === "overlap") {
+    const offer = boxesInTheWay(error, again);
+    if (offer.text) {
+      sentences.push(offer.text);
+      action = offer.action;
+    }
+  }
+  showStatus(sentences.join(" "), action);
+}
+
 // A refused row in the status line: the server's reason with the protein
 // named, what to do, and, when the boxes already on the image did not let the
 // row read its lanes just after a box was placed or changed, an Undo of that
-// change.
+// change; for boxes in its way, an Undo or Select of them (showBoxRefusal).
 function showRowRefusal(error, name) {
   if (saidElsewhere(error)) {
     return;
   }
+  if (error.code === "overlap") {
+    showBoxRefusal(error, `Row box of ${name} not placed`, "drag again");
+    return;
+  }
   const sentences = [`Row box of ${name} not placed: ${sentence(error.message)}`];
   let action = null;
-  if (error.code === "overlap") {
-    const lanes = error.ids.map((id) => findBox(state.project, id)).filter(Boolean);
-    const which = lanes.length
-      ? `the box in ${lanesPhrase(lanes.map((found) => found.band.lane_index))}`
-      : "that box";
-    sentences.push(`Move or delete ${which}, then drag again.`);
-  } else if (error.code === "row_lanes_unclear") {
+  if (error.code === "row_lanes_unclear") {
     // Named: the boxes on the image the row disagrees with, or their proteins
     // (none when the row box alone does not show the lanes).
     const step = state.project.history.undo;
@@ -1655,11 +1773,31 @@ $("import-polarity").addEventListener("change", (event) => {
   $("import-button").classList.toggle("disabled", !event.target.value);
 });
 
-// --- Requantifying with the local background ---
+// --- Requantifying: the local background, and looking for over-exposure ---
 
 // The background method of a project quantified before the local background:
 // each net above its image's median. It stays until the project is requantified.
 const LEGACY_BACKGROUND = "global_median";
+
+// What the offer says for each reason to requantify (requantifyReason): the
+// legacy background, which moves every net, or boxes on a lossy, colour or
+// CMYK image measured before Proteia looked for pixels near the detector limit
+// there (#112). The note is its own tooltip too, whole where it is cut short.
+const REQUANTIFY_OFFERS = {
+  background: {
+    label: "Requantify with local background",
+    title:
+      "The nets use the whole-image median background, as measured before the local background.",
+    note: "Nets move to the local ring background; Undo takes it back.",
+  },
+  overExposure: {
+    label: "Requantify",
+    title:
+      "Boxes on a lossy, colour or CMYK image were measured before Proteia looked for pixels" +
+      " near the detector limit there.",
+    note: "Looks for pixels near the detector limit; Undo takes it back.",
+  },
+};
 
 let requantifying = false; // a press has no answer yet
 
@@ -1668,19 +1806,39 @@ function hasBoxes(project) {
   return project.proteins.some((protein) => protein.bands.length);
 }
 
-// The offer in the results' header, while the nets use the legacy background
-// and there are boxes to measure again (the Checks say why); it goes once the
-// project is on the local background. In view whatever the side panel shows,
-// next to the numbers it changes.
+// Why the project is offered a requantify (a REQUANTIFY_OFFERS key), or null:
+// the legacy background while there are boxes to measure again (that
+// requantify measures every box, so it looks near the limit too), else images
+// whose boxes were never looked at near the limit (the server's
+// unassessed_images, which a requantify assesses).
+function requantifyReason(project) {
+  if (project.background_method === LEGACY_BACKGROUND && hasBoxes(project)) {
+    return "background";
+  }
+  return project.unassessed_images.length ? "overExposure" : null;
+}
+
+// The offer in the results' header, worded for its reason (the Checks say
+// why); it goes once there is nothing left to requantify. In view whatever the
+// side panel shows, next to the numbers it changes.
 function renderRequantify(project) {
-  $("requantify-offer").hidden = !(
-    project.background_method === LEGACY_BACKGROUND && hasBoxes(project)
-  );
+  const reason = requantifyReason(project);
+  $("requantify-offer").hidden = reason === null;
+  if (reason !== null) {
+    const offer = REQUANTIFY_OFFERS[reason];
+    const button = $("requantify");
+    button.textContent = offer.label;
+    button.title = offer.title;
+    const note = $("requantify-note");
+    note.textContent = offer.note;
+    note.title = offer.note;
+  }
   $("requantify").disabled = requantifying;
 }
 
-// Measure every box again against the local background, in one change the
-// status line offers to Undo. Like an undo or a clear, it runs in the panel's
+// Measure boxes again: every box against the local background, or those not
+// yet looked at near the detector limit, in one change the status line offers
+// to Undo. Like an undo or a clear, it runs in the panel's
 // queue once the edits made before it have their answers (a box being placed
 // is measured again too), so it never reaches a project opened after it was
 // asked for, and the edits made after it wait for it. Pressed twice (a double
@@ -1731,30 +1889,40 @@ function requantify() {
 $("requantify").addEventListener("click", requantify);
 
 // What the requantify did, with an Undo of it that goes once the history moves
-// on. It did nothing if the project was on the local background already: the
-// revision shown did not move, or, once another tab requantified since this
-// page showed the project, no image was measured again although it has boxes
-// (a requantify measures every image with boxes). Then the last change is not
+// on, worded for the offer the page showed. It did nothing if nothing was left
+// to do: the revision shown did not move, or, once another tab requantified
+// since this page showed the project, no image was measured again although it
+// has boxes (a requantify of a legacy project measures every image with boxes,
+// which leaves none to look at near the limit). Then the last change is not
 // this one: no Undo.
 function showRequantified(answer, before) {
   const project = answer.project;
   const count = answer.images.length;
+  const background = before.background_method === LEGACY_BACKGROUND;
   if (
     (before.open_id === project.open_id && before.revision === project.revision) ||
     (!count && hasBoxes(project))
   ) {
-    showStatus("The nets already use the local background."); // nothing logged
+    // Nothing logged.
+    showStatus(
+      background
+        ? "The nets already use the local background."
+        : "Every box has been looked at near the detector limit already.",
+    );
     return;
   }
-  const text = count
-    ? `Requantified ${counted(count, "image", "images")} with the local background`
-    : "Switched to the local background (no boxes to requantify)";
+  const images = counted(count, "image", "images");
+  const text = !background
+    ? `Requantified ${images}: looked for pixels near the detector limit`
+    : count
+      ? `Requantified ${images} with the local background`
+      : "Switched to the local background (no boxes to requantify)";
   const step = project.history.undo;
   const undo =
     step && step.action === "requantify"
       ? {
           label: "Undo",
-          name: "Undo requantifying with the local background",
+          name: background ? "Undo requantifying with the local background" : "Undo requantifying",
           seq: step.seq,
           run: () => takeStep("undo", { seq: step.seq, back: () => $("requantify") }),
         }
@@ -1956,10 +2124,11 @@ const ACTION_WORDS = {
   remove_box: "delete box",
   set_box_lane: "change box lane",
   set_box_size: "change box size",
+  set_box_padding: "change box padding",
   clear_boxes: "clear boxes",
   detect_row_boxes: "detect row boxes",
   remove_undetected: "remove n.d. mark",
-  requantify: "requantify with local background",
+  requantify: "requantify",
   undo: "undo",
   redo: "redo",
 };

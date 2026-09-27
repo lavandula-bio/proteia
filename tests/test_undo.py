@@ -25,6 +25,7 @@ from proteia.core import storage
 from proteia.core.grow import grow_box
 from proteia.core.model import (
     Batch,
+    BoxPadding,
     BoxSize,
     LogEntry,
     Project,
@@ -261,6 +262,27 @@ def test_undo_of_a_placement_removes_the_box_and_a_size_change_lists_nothing(tmp
     }
     assert ops.redo(s) == Restored(placed, "place_box", (), (band,), (), ())
     assert s.project.log[-1].params["returns_to_seq"] == placed
+
+
+def test_undo_of_a_padding_restores_size_boxes_and_nets(tmp_path):
+    s, _, protein = boxed(tmp_path)
+    for x, lane in ((NARROW_X, 0), (WIDE_X, 1)):
+        ops.place_box(s, protein, x, ROW, lane_index=lane, grow=True)
+    before = s.project
+    ops.set_box_padding(s, protein, across=1, along=2)
+    padded = s.project
+    seq = padded.log[-1].seq
+    assert protein_of(s, protein).box_padding == BoxPadding(across=1, along=2)
+
+    # Boxes that moved and changed their nets, and a padding: in no list.
+    assert ops.undo(s) == Restored(seq, "set_box_padding", (), (), (), ())
+    assert s.project.batch == before.batch
+    assert protein_of(s, protein).box_padding == BoxPadding()
+    assert_nets_current(s)
+    assert ops.redo(s) == Restored(seq, "set_box_padding", (), (), (), ())
+    assert s.project.batch == padded.batch
+    assert s.project.log[-1].content_hash == padded.log[-1].content_hash
+    assert_nets_current(s)
 
 
 # --- 3. the linear model ---
@@ -667,7 +689,7 @@ def test_clear_boxes_of_records_only_of_nothing_or_of_an_unknown_protein(tmp_pat
     assert s.project is committed and recorder.actions == []
 
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
-    kept = ops.place_box(s, other, WIDE_X, ROW, lane_index=0, grow=False)
+    kept = ops.place_box(s, other, WIDE_X, ROW + 12, lane_index=0, grow=False)  # below the band
     plant_records(s, other, _record(2))
     first = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
     second = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=False)

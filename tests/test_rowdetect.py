@@ -27,7 +27,7 @@ from skimage.morphology import reconstruction
 from proteia.core import rowdetect
 from proteia.core.evaluate import hit_rate, iou
 from proteia.core.grow import NOISE_K, grow_box
-from proteia.core.model import BoxSize, overlaps
+from proteia.core.model import BoxSize, lanes_phrase, overlaps
 from proteia.core.quantify import estimate_background
 from proteia.core.rowdetect import (
     AMBIGUITY_MARGIN,
@@ -40,6 +40,11 @@ from proteia.core.rowdetect import (
     FIT_MAX_PIXELS,
     MEMBRANE_SHIFT_K,
     REFUSING_FLAGS,
+    ROW_LINE_K,
+    ROW_LINE_MIN,
+    ROW_LINE_TOL,
+    ROW_LINE_TOL_PX,
+    ROW_SMILE,
     SIZE_GUARD,
     SMOOTH,
     WARNING_FLAGS,
@@ -505,7 +510,8 @@ def test_lanes_outside_row_refuses():
     # Its slot is clipped to the row box: only the part inside was measured.
     assert found.lanes[0].window[0] == case.row[0]
     assert found.refused
-    assert found.flags[: len(REFUSING_FLAGS)] == REFUSING_FLAGS  # refusing flags first
+    # Refusing flags first, in their order.
+    assert found.flags[:2] == ("lanes_outside_row", "ambiguous_lanes") == REFUSING_FLAGS[:2]
 
 
 @pytest.mark.parametrize(("lane", "adjust"), [(0, (40, 0, 0, 0)), (5, (0, 0, -40, 0))])
@@ -944,9 +950,14 @@ def test_doublet_boxes_the_strongest_component_and_flags_the_lane():
 def test_a_weaker_second_component_is_flagged_and_counted_once(dy, frac):
     # Lane 2's second band is dy px below the first and a fifth to 0.3 as deep:
     # under the extent level of the box, yet tens of sigmas above its saddle.
+    # The pair is centred on the row, so the box on the first lies dy / 2 px
+    # above the other boxes' line: 10 px apart, more than ROW_LINE_K of the
+    # 12 px box's height (#114).
     case = adversarial_row("doublet", 1000, doublet={2: (dy, frac)}, my=12)
     found = detect(case)
-    assert found.flags == ("multiple_components",)
+    off = ("off_row_line",) if dy / 2 > ROW_LINE_K * found.size.height else ()
+    assert found.flags == (*off, "multiple_components")
+    assert bool(off) is (dy == 20)
     assert components(found) == [1, 1, 2, 1, 1, 1]
 
 
@@ -1979,6 +1990,278 @@ def test_settings_are_a_fresh_copy():
     found = settings()
     found["smooth"].append(99)
     assert settings()["smooth"] == [3, 5]
+
+
+# --- #114: the boxes of a row lie on one line ---
+
+
+def two_rows(seed: int, above: dict[int, float], rel: float = 1.0, **kwargs) -> RowCase:
+    """A row with another row 40 px above it, the row box dragged over both:
+    the row above ``above[lane]`` (else ``rel``) times as deep as the row's own
+    band, so a lane where it is deeper holds its strongest band there;
+    ``kwargs`` go to :func:`adversarial_row`."""
+    return adversarial_row(
+        "two rows",
+        seed,
+        neighbour_dy=-40.0,
+        neighbour_rel=rel,
+        neighbour_rels=above,
+        box_adjust=(0, -40, 0, 0),
+        img_h=200,
+        **kwargs,
+    )
+
+
+def off_line(found: RowDetection) -> list[int]:
+    """The lanes whose box lies more than ROW_LINE_K box heights off the row's line."""
+    return [
+        lane.lane
+        for lane in found.lanes
+        if lane.line_offset is not None and abs(lane.line_offset) > ROW_LINE_K
+    ]
+
+
+def in_row_above(found: RowDetection, case: RowCase) -> list[int]:
+    """The lanes whose box lies on the row 40 px above the case's."""
+    return [
+        lane.lane
+        for lane in found.lanes
+        if lane.rect is not None
+        and (lane.rect[1] + lane.rect[3]) / 2 < case.lane_cy[lane.lane] - 20
+    ]
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_row_box_over_two_rows_is_refused(seed):
+    # The strongest band of lanes 0-2 lies in the row above, of lanes 3-5 in
+    # the row's own: the boxes lie on two rows, a row's height apart, as a
+    # loading control's row box dragged over its target's row too put them.
+    case = two_rows(seed, {0: 2.0, 1: 2.0, 2: 2.0}, rel=0.5)
+    found = detect(case)
+    assert in_row_above(found, case) == [0, 1, 2]
+    assert found.refused and "off_row_line" in found.flags
+    # The lanes named are one of the two rows' (three and three: either).
+    off = off_line(found)
+    assert off in ([0, 1, 2], [3, 4, 5])
+    assert found.flags[0] == "off_row_line"  # a refusing flag: first
+    [note] = [note for note in found.notes if "row's line" in note]
+    assert note.startswith(f"{lanes_phrase(off)}: box centre more than {ROW_LINE_K:g} box height")
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_row_box_over_two_rows_names_the_lanes_on_the_other_row(seed):
+    # Lanes 4 and 5 hold their strongest band in the row above: those two
+    # boxes lie off the line of the other four.
+    case = two_rows(seed, {4: 2.0, 5: 2.0}, rel=0.5)
+    found = detect(case)
+    assert in_row_above(found, case) == off_line(found) == [4, 5]
+    assert found.refused
+    assert all(found.lanes[lane].line_offset < -3 for lane in (4, 5))  # above: negative
+
+
+@pytest.mark.parametrize(
+    ("lane", "shift"),
+    [(2, -14.0), (2, 14.0), (3, -14.0), (0, -18.0), (5, 18.0)],
+)
+def test_a_lane_whose_band_lies_off_the_row_is_refused(lane, shift):
+    # A montage's panel (or a mark beside the row) puts one lane's band
+    # 14-18 px (1.2-1.5 box heights) above or below the others'.
+    case = adversarial_row("montage", 1000, shifts={lane: shift})
+    found = detect(case)
+    assert found.size.height == 12
+    assert found.refused and found.flags == ("off_row_line",)
+    assert off_line(found) == [lane]
+    assert np.sign(found.lanes[lane].line_offset) == np.sign(shift)
+    assert found.notes == (
+        f"lane {lane + 1}: box centre more than {ROW_LINE_K:g} box height (9 px) off the"
+        " row's line through the other boxes",
+    )
+    # The others lie on the line through them.
+    assert all(abs(ld.line_offset) < 0.1 for ld in found.lanes if ld.lane != lane)
+
+
+def test_a_lane_half_a_box_height_off_the_row_is_placed():
+    case = adversarial_row("montage", 1000, shifts={2: -6.0})
+    found = detect(case)
+    assert not found.refused and found.flags == ()
+    assert 0.3 < -found.lanes[2].line_offset < ROW_LINE_K
+
+
+def test_the_lanes_off_the_line_are_numbered_as_the_caller_numbers_them():
+    # Read right to left, lane 1 (from the left) is lane 4 (index 4) of six.
+    case = adversarial_row("montage", 1000, shifts={1: -14.0})
+    found = detect(case, right_to_left=True)
+    assert off_line(found) == [4]
+    assert found.notes[0].startswith("lane 5: box centre")
+    ltr = detect(case)
+    assert found.lanes[4].line_offset == ltr.lanes[1].line_offset
+
+
+SMILES_AND_TILTS = {
+    "bench smile (8 px)": BENCH["smile"],
+    **{f"smile_tall_tight/{seed}": _adversarial("smile_tall_tight", seed) for seed in (1000, 1002)},
+    **{f"tilt_cut/{seed}": _adversarial("tilt_cut", seed) for seed in (1000, 1001)},
+    # The accuracy judge's strongest smile: 20 px (1.8 box heights) across, of
+    # which four boxes show it.
+    **{
+        f"strong smile/{seed}": adversarial_row("strong smile", seed, smile=20.0, missing=[1, 4])
+        for seed in (1000, 1001, 1002)
+    },
+    "frown (20 px)": adversarial_row("frown", 1000, smile=-20.0),
+    "tilt (14 px)": adversarial_row("tilted", 1000, tilt=14.0, my=8),
+    "steep tilt (40 px)": adversarial_row("steep tilt", 1000, tilt=40.0, my=25),
+}
+
+
+@pytest.mark.parametrize("name", SMILES_AND_TILTS)
+def test_smiles_and_tilts_lie_on_the_row_line(name):
+    # The row's line bends with a smile and tilts with the row: no box of
+    # these lies near ROW_LINE_K off it (the bench's largest: 0.19).
+    case = SMILES_AND_TILTS[name]
+    found = detect(case)
+    assert "off_row_line" not in found.flags and not found.refused
+    offsets = [abs(lane.line_offset) for lane in found.lanes if lane.line_offset is not None]
+    assert len(offsets) >= ROW_LINE_MIN
+    assert max(offsets) < ROW_LINE_K / 3
+
+
+@pytest.mark.parametrize("seed", range(0, 300, 6))
+def test_fuzz_rows_lie_on_their_row_line(seed):
+    # Random geometry (smiles up to 12 px, a tall band, tight edges, a lane
+    # count off by one): the bands lie on one row, and no box off it.
+    found = detect(fuzz_row(seed))
+    assert "off_row_line" not in found.flags
+
+
+def test_three_boxes_are_not_checked():
+    # Three centres lie on some smile: a row of three boxes shows no line.
+    case = adversarial_row("montage", 1000, shifts={2: -14.0}, missing=[1, 4, 5])
+    found = detect(case)
+    assert [lane.lane for lane in found.lanes if lane.rect is not None] == [0, 2, 3]
+    assert "off_row_line" not in found.flags
+    assert all(lane.line_offset is None for lane in found.lanes)
+
+
+def test_an_empty_lane_has_no_line_offset():
+    found = detect(adversarial_row("montage", 1000, shifts={2: -14.0}, missing=[4]))
+    assert found.lanes[4].rect is None and found.lanes[4].line_offset is None
+    assert off_line(found) == [2]
+
+
+def test_the_row_line_fits_through_the_other_boxes():
+    # Straight or bent by a smile, the line runs through the boxes; one box
+    # off it does not drag it there, nor two of seven.
+    xs = [70.0 * i for i in range(7)]
+    tilted = [(x, 50.0 + 0.1 * x) for x in xs]
+    assert np.allclose(rowdetect._row_line(tilted, 12), 0.0)
+    smiled = [(x, 50.0 + 24.0 * ((x - 210.0) / 420.0) ** 2) for x in xs]  # 6 px of sag
+    assert np.allclose(rowdetect._row_line(smiled, 12), 0.0, atol=1e-9)
+    off = [(x, y + (15.0 if i == 3 else 0.0)) for i, (x, y) in enumerate(tilted)]
+    assert np.allclose(rowdetect._row_line(off, 12), [0, 0, 0, 1.25, 0, 0, 0])
+    two = [(x, y - (40.0 if i in (5, 6) else 0.0)) for i, (x, y) in enumerate(smiled)]
+    offsets = rowdetect._row_line(two, 12)
+    assert np.allclose(offsets[:5], 0.0, atol=1e-9) and np.allclose(offsets[5:], -40 / 12)
+    assert rowdetect._row_line(tilted[:3], 12) is None  # fewer than ROW_LINE_MIN
+    # Over two rows (heights more than a smile apart), the smaller group lies
+    # off whole, the line through the larger: 45 px (6.4 box heights) apart.
+    rows = [(70.0 * i, 75.5 if i < 2 else 30.5) for i in range(5)]
+    assert np.allclose(rowdetect._row_line(rows, 7), [45 / 7, 45 / 7, 0, 0, 0])
+
+
+# Honest flat rows of thin bands and few lanes, a pixel of jitter (the review
+# of #114): the half of the boxes nearest a fit alone let four boxes a pixel
+# apart pick a smile that fits them exactly and passes the others by box
+# heights. Main placed every one of these rows with no flag.
+THIN = {"pitch": 50.0, "w": 32.0}
+
+
+@pytest.mark.parametrize(
+    ("seed", "n", "h", "jitter"),
+    [(7, 5, 4.0, 1.0), (9, 6, 4.0, 1.0), (11, 6, 6.0, 1.5), (81, 7, 5.0, 1.0), (17, 8, 5.0, 1.0)],
+)
+def test_a_flat_row_of_thin_bands_lies_on_its_line(seed, n, h, jitter):
+    found = detect(adversarial_row("flat", seed, n=n, h=h, y_jitter=jitter, **THIN))
+    assert found.size.height <= 8  # a pixel is an eighth of a box height or more
+    assert not found.refused and "off_row_line" not in found.flags
+    assert max(abs(lane.line_offset) for lane in found.lanes) < 0.4
+
+
+@pytest.mark.parametrize(("n", "h", "jitter"), [(5, 4.0, 1.0), (5, 6.0, 1.5), (6, 6.0, 1.5)])
+def test_flat_rows_of_thin_bands_are_placed(n, h, jitter):
+    for seed in range(20):
+        found = detect(adversarial_row("flat", seed, n=n, h=h, y_jitter=jitter, **THIN))
+        assert "off_row_line" not in found.flags, seed
+
+
+def test_the_row_line_is_level_through_boxes_a_pixel_apart():
+    # Seven 5 px boxes whose centres lie within 2 px of each other: the last
+    # four lie exactly on a smile of nearly two box heights, which passes the
+    # first three by up to 2.2 box heights. The line is the level one that
+    # every box lies near.
+    ys = [8.5, 9.5, 8.5, 10.5, 9.5, 9.5, 10.5]
+    offsets = rowdetect._row_line([(50.0 * i, y) for i, y in enumerate(ys)], 5)
+    assert np.max(np.abs(offsets)) < 0.3
+
+
+@pytest.mark.parametrize(("n", "above"), [(2, 0), (3, 0), (3, 1), (4, 0), (4, 3)])
+def test_a_row_box_over_two_rows_with_few_boxes_is_refused(n, above):
+    # Two to four lanes, one lane's strongest band in the row 40 px (3.3 box
+    # heights) above: no line through so few boxes shows it (any three lie on
+    # some smile, and four bend to one), but no smile or tilt steps a row that
+    # far from one lane to the next. Of two boxes, neither is the row's.
+    case = two_rows(1000, {above: 2.0}, rel=0.5, n=n)
+    found = detect(case)
+    assert in_row_above(found, case) == [above]
+    assert found.refused and found.flags[0] == "off_row_line"
+    assert off_line(found) == ([0, 1] if n == 2 else [above])
+    if n == 2:
+        assert found.notes[0] == (
+            "lanes 1, 2: box centres more than 2 box heights (24 px) apart, on two rows"
+        )
+
+
+@pytest.mark.parametrize("missing", [[1, 2, 3, 4, 5, 6], [1, 2, 4, 5, 6], [1, 2, 4, 5]])
+def test_a_sparse_tilted_row_of_few_thin_boxes_is_placed(missing):
+    # Two to four of eight lanes, thin bands on a row tilted by 30 px across
+    # (5 degrees): boxes more than two box heights apart, but none of them in
+    # neighbouring lanes, on one line.
+    case = adversarial_row("sparse tilt", 1000, n=8, h=5.0, tilt=30.0, missing=missing, **THIN)
+    found = detect(case)
+    assert not found.refused and "off_row_line" not in found.flags
+    ys = [(lane.rect[1] + lane.rect[3]) / 2 for lane in found.lanes if lane.rect is not None]
+    assert max(ys) - min(ys) > ROW_SMILE * found.size.height
+
+
+def test_the_row_line_is_flagged_as_refusing_with_its_settings():
+    assert "off_row_line" in REFUSING_FLAGS
+    found = settings()
+    keys = ("row_line_k", "row_smile", "row_line_min", "row_line_tol", "row_line_tol_px")
+    assert (
+        tuple(found[key] for key in keys)
+        == (ROW_LINE_K, ROW_SMILE, ROW_LINE_MIN, ROW_LINE_TOL, ROW_LINE_TOL_PX)
+        == (0.75, 2.0, 4, 0.25, 3.0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "case"),
+    [
+        ("ROW_LINE_K", 1.5, adversarial_row("montage", 1000, shifts={2: -14.0})),
+        ("ROW_SMILE", 0.5, adversarial_row("strong smile", 1000, smile=20.0, missing=[1, 4])),
+        ("ROW_LINE_MIN", 7, adversarial_row("montage", 1000, shifts={2: -14.0})),
+        # An end lane 13 px (1.1 box heights) off: a tolerance of a box height
+        # lets the line bend to it.
+        ("ROW_LINE_TOL", 1.0, adversarial_row("montage", 1000, shifts={0: -13.0})),
+        # Five 4 px boxes a pixel apart: without the pixels, four of them pick
+        # a smile again.
+        ("ROW_LINE_TOL_PX", 0.0, adversarial_row("flat", 7, n=5, h=4.0, **THIN)),
+    ],
+)
+def test_each_row_line_setting_takes_part(monkeypatch, name, value, case):
+    found = detect(case)
+    monkeypatch.setattr(rowdetect, name, value)
+    assert settings()[name.lower()] == value
+    assert detect(case) != found
 
 
 def test_box_size_is_the_model_type():

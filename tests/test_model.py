@@ -6,6 +6,7 @@ caller could, and check that re-validation accepts or rejects the result.
 """
 
 import hashlib
+import json
 import math
 from datetime import UTC, datetime, timedelta, timezone
 from typing import get_args
@@ -21,6 +22,7 @@ from proteia.core.model import (
     Band,
     Batch,
     Box,
+    BoxPadding,
     BoxSize,
     CalibrationPoint,
     FitMethod,
@@ -158,6 +160,7 @@ def test_field_defaults():
 
     band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), source="click", **MEASURED)
     assert (band.band_index, band.clipped, band.apparent_mw) == (0, None, None)
+    assert band.possibly_clipped is None
     assert band.manually_edited is False
     for field in MEASURED:  # what quantifying gave: no default
         with pytest.raises(ValidationError, match=field):
@@ -185,6 +188,27 @@ def test_field_defaults():
     calibration = Membrane(id="mem-1").calibration
     assert (calibration.ladder, calibration.points, calibration.fit_quality) == (None, [], None)
     assert calibration.fit_method is FitMethod.LOG_LINEAR
+
+
+def test_a_possible_flag_is_left_out_while_unset_and_never_beside_the_exact_one():
+    # #112: possibly_clipped stands in for clipped where it cannot be checked.
+    band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), source="click", **MEASURED)
+    for mode in ("python", "json"):
+        assert "possibly_clipped" not in band.model_dump(mode=mode)
+        for flag in (True, False):
+            assessed = band.model_copy(update={"possibly_clipped": flag})
+            assert assessed.model_dump(mode=mode)["possibly_clipped"] is flag
+    for clipped in (True, False):
+        with pytest.raises(ValidationError, match="only one of the checks runs"):
+            Band(
+                id="band-1",
+                lane_index=0,
+                box=Box(x=0, y=0),
+                source="click",
+                clipped=clipped,
+                possibly_clipped=False,
+                **MEASURED,
+            )
 
 
 def test_polarity_gives_the_dark_on_light_flag():
@@ -946,3 +970,87 @@ def test_dumps_leave_out_an_empty_record_list():
             "source": "row_box",
         }
     ]
+
+
+# --- Box padding (#57) ---
+
+
+def _with_padding(across: int = 0, along: int = 0, *, protein: str = "prot-8") -> dict:
+    """The sample project as project.json holds it, with a padding on one
+    protein (α-tubulin: 20x10 boxes on img-6, 200x100)."""
+    doc = make_project().model_dump(mode="json")
+    [held] = [p for p in doc["batch"]["proteins"] if p["id"] == protein]
+    held["box_padding"] = {"across": across, "along": along}
+    return doc
+
+
+def test_box_padding_is_left_out_while_zero():
+    protein = Protein(
+        id="prot-1",
+        name="p53",
+        role=Role.TARGET,
+        image_id="img-2",
+        box_size=BoxSize(width=4, height=4),
+    )
+    assert protein.box_padding == BoxPadding(across=0, along=0)
+    for mode in ("python", "json"):
+        assert "box_padding" not in protein.model_dump(mode=mode)
+        proteins = make_project().model_dump(mode=mode)["batch"]["proteins"]
+        assert ["box_padding" in p for p in proteins] == [False, False, False]
+        # An explicit zero padding (a hand-edited file) loads, and is dumped without it.
+        explicit = Project.model_validate(_with_padding())
+        assert explicit == make_project()
+        assert "box_padding" not in explicit.model_dump(mode=mode)["batch"]["proteins"][1]
+        # Any other padding is dumped, both directions.
+        padded = Project.model_validate(_with_padding(along=2))
+        dumped = padded.model_dump(mode=mode)["batch"]["proteins"]
+        assert [p.get("box_padding") for p in dumped] == [None, {"across": 0, "along": 2}, None]
+
+
+def test_box_padding_must_leave_a_fitted_size():
+    def protein(across: int, along: int) -> Protein:
+        return Protein(
+            id="prot-4",
+            name="p53",
+            role=Role.TARGET,
+            image_id="img-2",
+            box_size=BoxSize(width=20, height=10),
+            box_padding=BoxPadding(across=across, along=along),
+        )
+
+    assert protein(0, 4).fitted_size == BoxSize(width=20, height=2)
+    with pytest.raises(ValidationError, match="fitted") as info:
+        protein(0, 5)
+    assert (
+        "protein prot-4: box size 20x10 leaves no fitted size under 5 px of padding above and below"
+    ) in str(info.value)
+    with pytest.raises(ValidationError, match="10 px of padding left and right and 6 px"):
+        protein(10, 6)
+    assert protein(9, 0).fitted_size == BoxSize(width=2, height=10)
+    # The same rule on a whole project, re-validated.
+    Project.model_validate(_with_padding(across=9, along=4))
+    with pytest.raises(ValidationError, match="prot-8: box size 20x10 leaves no fitted size"):
+        Project.model_validate(_with_padding(along=5))
+
+
+@pytest.mark.parametrize(
+    "padding",
+    [{"across": -1, "along": 0}, {"across": 0, "along": -1}, {"along": 1.5}, {"across": "x"}],
+)
+def test_box_padding_is_not_negative(padding):
+    doc = make_project().model_dump(mode="json")
+    doc["batch"]["proteins"][1]["box_padding"] = padding
+    with pytest.raises(ValidationError, match="box_padding"):
+        Project.model_validate(doc)
+    with pytest.raises(ValidationError, match="box_padding"):
+        Project.model_validate_json(json.dumps(doc), strict=True)  # as a file is loaded
+
+
+def test_fitted_size_is_box_size_less_padding():
+    project = Project.model_validate(_with_padding(across=3, along=2))
+    tubulin = project.batch.find_protein("prot-8")
+    assert tubulin.box_size == BoxSize(width=20, height=10)  # the size quantified and stored
+    assert tubulin.fitted_size == BoxSize(width=14, height=6)
+    # Without a padding the two are the same size.
+    beta = project.batch.find_protein("prot-7")
+    assert beta.fitted_size == beta.box_size == BoxSize(width=24, height=14)

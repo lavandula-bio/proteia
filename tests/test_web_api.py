@@ -1039,6 +1039,104 @@ def test_a_jpeg_project_says_its_bands_were_not_checked_for_over_exposure(client
     assert {n["protein_ids"][0] for n in unchecked} == {series["target_id"], series["loading_id"]}
 
 
+def test_a_jpeg_project_flags_bands_possibly_over_exposed(client, tmp_path):
+    # #112: on a JPEG, a box with 5 or more pixels within 2 levels of the limit
+    # is flagged, per band in the state and per lane in the results, and each
+    # protein gets a warning naming its lanes.
+    deep = {("target", 1), ("target", 3), ("loading", 0)}  # saturated at 0
+    spots = [
+        (x, row, 5.0, 3.0, 70000.0 if (name, lane) in deep else 25000.0)
+        for name, row in (("target", TARGET_ROW), ("loading", LOADING_ROW))
+        for lane, x in enumerate(LANE_X)
+    ]
+    blot = np.round(synthetic_blot((TWO_ROW_H, W), spots) / 257).astype(np.uint8)
+    jpeg = io.BytesIO()
+    Image.fromarray(blot).save(jpeg, format="JPEG", quality=85)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, jpeg.getvalue(), name="blot β.jpg")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    lanes = [{"condition": condition} for condition in DOSES]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes, "reference_condition": "vehicle"})
+    ids = []
+    for name, role in (("α-tubulin", "loading control"), ("β-catenin", "target")):
+        body = {"name": name, "role": role, "image_id": image_id, "box_size": SIZE}
+        ids.append(client.ok("POST", "/api/proteins", body)["protein_id"])
+    loading_id, target_id = ids
+    for protein, row in ((loading_id, LOADING_ROW), (target_id, TARGET_ROW)):
+        for lane, x in enumerate(LANE_X):
+            body = {"protein_id": protein, "x": x, "y": row, "lane_index": lane}
+            answer = client.ok("POST", "/api/boxes", body)
+
+    # The state: each band's flags (the exact check did not run).
+    flagged = {
+        (protein["id"], band["lane_index"]): (band["clipped"], band["possibly_clipped"])
+        for protein in answer["project"]["proteins"]
+        for band in protein["bands"]
+    }
+    assert flagged == {
+        (protein, lane): (None, (name, lane) in deep)
+        for name, protein in (("target", target_id), ("loading", loading_id))
+        for lane in range(len(LANE_X))
+    }
+    # The results: the columns, and one warning per protein, loading control first.
+    assert column(answer, target_id)["possibly_clipped"] == [False, True, False, True, False]
+    assert column(answer, loading_id)["possibly_clipped"] == [True, False, False, False, False]
+    (result_set,) = answer["results"]["sets"]
+    possibly = [n for n in result_set["notices"] if n["code"] == "possibly_clipped"]
+    assert [(n["protein_ids"], n["lane_indices"], n["level"]) for n in possibly] == [
+        ([loading_id], [0], "warning"),
+        ([target_id], [1, 3], "warning"),
+    ]
+    loading, target = (n["message"] for n in possibly)
+    assert loading.startswith(
+        "'α-tubulin' is possibly over-exposed in lane 1: its box holds 5 or more pixels"
+        " within 2 grey levels of the detector limit, and its image has lossy (JPEG-type)"
+        " compression, so saturation cannot be confirmed;"
+    )
+    assert "which biases every value normalized to it" in loading
+    assert target.startswith("'β-catenin' is possibly over-exposed in lanes 2, 4:")
+    # Both reach the series' chart card: each is about one of its proteins.
+    series = only_series(answer)
+    assert {n["protein_ids"][0] for n in possibly} == {series["target_id"], series["loading_id"]}
+    assert answer["project"]["unassessed_images"] == []
+
+    # The same boxes as a project saved before #112: neither flag on them. The
+    # state names the image, each not-checked notice says to requantify, and a
+    # requantify assesses its bands.
+    session = client.workspace.current()
+
+    def forget(draft: Project) -> None:
+        for protein in draft.batch.proteins:
+            for band in protein.bands:
+                band.possibly_clipped = None
+
+    with session.transaction():
+        project, _ = apply_change(session.project, forget)
+        session._commit(project, action="plant", params={})
+    before = client.ok("GET", "/api/project")
+    assert before["project"]["unassessed_images"] == [image_id]
+    (result_set,) = before["results"]["sets"]
+    assert "possibly_clipped" not in notice_codes(before)
+    unchecked = [n["message"] for n in result_set["notices"] if n["code"] == "clipping_not_checked"]
+    assert len(unchecked) == 2
+    assert all(message.endswith(": requantify to look for them") for message in unchecked)
+
+    requantified = client.ok("POST", "/api/requantify")
+    assert requantified["images"] == [image_id]
+    assert requantified["project"]["unassessed_images"] == []
+    assert {
+        (protein["id"], band["lane_index"]): (band["clipped"], band["possibly_clipped"])
+        for protein in requantified["project"]["proteins"]
+        for band in protein["bands"]
+    } == flagged
+    assert "possibly_clipped" in notice_codes(requantified)
+    assert history(requantified)["undo"] == {
+        "seq": requantified["project"]["revision"],
+        "action": "requantify",
+    }
+
+
 def test_box_edits_answer_with_the_changed_net_and_chart(client, tmp_path):
     target, _, before = live(client, tmp_path, DOSES, boxed=(0, 1, 2, 3))
     assert column(before, target)["nets"][4] is None
@@ -1215,7 +1313,10 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     body = {"protein_id": protein, "x": LANE_X[0], "y": ROW, "lane_index": 0}
     answers["POST /api/boxes"] = client.ok("POST", "/api/boxes", body)
     band = answers["POST /api/boxes"]["band_id"]
-    x0, y0, x1, y1 = bands(answers["POST /api/boxes"])[band]["rect"]
+    answers["PUT /api/proteins/{protein_id}/box-padding"] = client.ok(
+        "PUT", f"/api/proteins/{protein}/box-padding", {"along": 1}
+    )
+    x0, y0, x1, y1 = bands(answers["PUT /api/proteins/{protein_id}/box-padding"])[band]["rect"]
     answers["PUT /api/boxes/{band_id}"] = client.ok(
         "PUT", f"/api/boxes/{band}", {"rect": [x0 + 2, y0, x1 + 2, y1]}
     )
@@ -1482,6 +1583,224 @@ def test_a_malformed_box_size_is_refused(client, tmp_path, body):
     _, protein = ready(client, tmp_path)
     path = f"/api/proteins/{protein}/box-size"
     assert unchanged_refusal(client, "PUT", path, body) == ("invalid_input", [])
+
+
+def test_the_box_size_route_takes_the_fitted_size_the_state_shows(client, tmp_path):
+    # A padding (#57) makes every box the fitted size plus the padding on each
+    # side. The state carries both sizes, and the route takes the fitted one:
+    # the size the page shows, sent back as it is, changes nothing (it is not
+    # padded again), and a new one is padded once.
+    target, _, _ = live(client, tmp_path, DOSES)
+    api.ops.set_box_padding(client.workspace.current(), target, across=3, along=2)
+    before = client.ok("GET", "/api/project")
+    state = protein_of(before, target)
+    assert state["fitted_size"] == {"width": 14, "height": 10}  # SIZE
+    assert state["box_size"] == {"width": 14 + 2 * 3, "height": 10 + 2 * 2}
+    path = f"/api/proteins/{target}/box-size"
+
+    same = client.ok("PUT", path, state["fitted_size"])  # a no-op: no log entry
+    assert same == client.ok("GET", "/api/project")
+    assert same["project"]["revision"] == before["project"]["revision"]
+    assert protein_of(same, target) == state
+    assert "set_box_size" not in logged(client)
+
+    answer = client.ok("PUT", path, {"width": 16, "height": 12})
+    state = protein_of(answer, target)
+    assert state["fitted_size"] == {"width": 16, "height": 12}
+    assert state["box_size"] == {"width": 16 + 2 * 3, "height": 12 + 2 * 2}
+    for band in state["bands"]:
+        x0, y0, x1, y1 = band["rect"]
+        assert (x1 - x0, y1 - y0) == (22, 16)
+
+
+# --- Box padding (#57) ---
+
+# What a padding change answers besides the project and its results: every
+# field of PaddingChange, its padding as box_padding (the state's name).
+PADDING_FIELDS = {
+    "box_padding" if field.name == "padding" else field.name
+    for field in dataclasses.fields(api.ops.PaddingChange)
+}
+
+
+def padding_path(protein_id: str) -> str:
+    return f"/api/proteins/{protein_id}/box-padding"
+
+
+def lane_nets(answer: dict, protein_id: str) -> dict[str, float]:
+    """A protein's nets in the answer's results, by band id."""
+    lanes = column(answer, protein_id)
+    return {b: net for b, net in zip(lanes["band_ids"], lanes["nets"], strict=True) if b}
+
+
+def test_a_box_padding_change_answers_sizes_and_net_change(client, tmp_path):
+    # Every box of the protein grows by the padding on each side around its own
+    # centre; the fitted size is kept, and the nets take in more of the bands'
+    # tails. The answer says how the protein's nets moved, and the state
+    # carries every protein's padding.
+    target, loading, before = live(client, tmp_path, DOSES)
+    assert protein_of(before, target)["box_padding"] == {"across": 0, "along": 0}
+    old = {band["id"]: band["rect"] for band in protein_of(before, target)["bands"]}
+    answer = client.ok("PUT", padding_path(target), {"along": 2})
+    assert set(answer) - {"project", "results"} == PADDING_FIELDS
+    state = protein_of(answer, target)
+    assert state["box_padding"] == answer["box_padding"] == {"across": 0, "along": 2}
+    assert state["fitted_size"] == answer["fitted_size"] == {"width": 14, "height": 10}  # SIZE
+    assert state["box_size"] == answer["box_size"] == {"width": 14, "height": 10 + 2 * 2}
+    for band in state["bands"]:
+        x0, y0, x1, y1 = old[band["id"]]
+        assert band["rect"] == [x0, y0 - 2, x1, y1 + 2]
+    assert protein_of(answer, loading)["box_padding"] == {"across": 0, "along": 0}
+    new, was = lane_nets(answer, target), lane_nets(before, target)
+    changes = [new[band] / was[band] - 1 for band in was]
+    assert min(changes) > 0
+    assert answer["net_change"] == pytest.approx([min(changes), max(changes)])
+    assert (answer["edge_shifted"], answer["overlapping"]) == ([], [])
+    new, was = lane_nets(answer, loading), lane_nets(before, loading)
+    changed = [
+        {"band_id": band, "net_before": was[band], "net_after": new[band]}
+        for band in was
+        if new[band] != was[band]
+    ]
+    assert answer["remeasured"] == changed
+    assert answer["project"]["revision"] == before["project"]["revision"] + 1
+    assert logged(client)[-1] == "set_box_padding"
+
+    for body in ({"along": 2}, {"across": 0, "along": 2}, {}):  # the same: a no-op
+        same = client.ok("PUT", padding_path(target), body)
+        assert same["project"] == client.ok("GET", "/api/project")["project"]
+        assert same["project"]["revision"] == answer["project"]["revision"]
+        assert (same["box_padding"], same["net_change"]) == ({"across": 0, "along": 2}, None)
+    assert logged(client).count("set_box_padding") == 1
+
+
+def test_a_box_padding_field_left_out_keeps_its_value(client, tmp_path):
+    # A page sends only the direction it changed: a tab that still shows the
+    # padding before another tab set the other direction does not reset it.
+    target, _, _ = live(client, tmp_path, DOSES)
+    client.ok("PUT", padding_path(target), {"across": 1, "along": 2})
+    answer = client.ok("PUT", padding_path(target), {"across": 0})
+    assert protein_of(answer, target)["box_padding"] == {"across": 0, "along": 2}
+    answer = client.ok("PUT", padding_path(target), {"along": 3})
+    assert protein_of(answer, target)["box_padding"] == {"across": 0, "along": 3}
+    assert protein_of(answer, target)["box_size"] == {"width": 14, "height": 10 + 2 * 3}
+
+
+def test_a_box_padding_reports_boxes_the_edge_shifts_and_boxes_it_overlaps(client, tmp_path):
+    # A fitted height of 60 puts the target's boxes against the image's top
+    # edge (their centre, y 30, is 30 px down), so 6 px more above and below
+    # shifts them down, onto 2 of the 10 rows of the loading control's boxes
+    # (y 70 to 80): each box then counts part of the other's band, which is
+    # allowed and said (more than half of the smaller box is refused, #114).
+    target, loading, _ = live(client, tmp_path, DOSES)
+    client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 14, "height": 60})
+    answer = client.ok("PUT", padding_path(target), {"along": 6})
+    state = protein_of(answer, target)
+    assert all(band["rect"][1::2] == [0, 72] for band in state["bands"])
+    assert answer["edge_shifted"] == [band["id"] for band in state["bands"]]
+    assert answer["overlapping"] == [band["id"] for band in protein_of(answer, loading)["bands"]]
+
+
+def test_a_box_padding_answers_the_other_proteins_nets_it_changed(client, tmp_path):
+    # The loading control boxed just above two of the target's bands: every
+    # ring on the image leaves out the target's boxes, so padding them left
+    # and right changes those two nets, which the answer names as a row box
+    # does (#124), with the largest change.
+    target, loading, _ = live(client, tmp_path, DOSES)
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
+    for lane in (1, 2):
+        y = TARGET_ROW - 12
+        body = {"protein_id": loading, "x": LANE_X[lane], "y": y, "lane_index": lane}
+        before = client.ok("POST", "/api/boxes", body)
+    answer = client.ok("PUT", padding_path(target), {"across": 7})  # half of 14
+    old, new = lane_nets(before, loading), lane_nets(answer, loading)
+    assert len(old) == 2
+    changed = [
+        {"band_id": band_id, "net_before": old[band_id], "net_after": new[band_id]}
+        for band_id in old
+        if new[band_id] != old[band_id]
+    ]
+    assert changed and answer["remeasured"] == changed
+    shares = {
+        c["band_id"]: abs(c["net_after"] - c["net_before"]) / c["net_before"] for c in changed
+    }
+    largest = max(shares, key=shares.__getitem__)
+    assert answer["largest_change"] == {"band_id": largest, "change": shares[largest]}
+
+
+def _no_box_yet(client: Client, tmp_path: Path) -> str:
+    return ready(client, tmp_path)[1]
+
+
+def _live_target(client: Client, tmp_path: Path) -> str:
+    return live(client, tmp_path, DOSES)[0]
+
+
+def _wide_target(client: Client, tmp_path: Path) -> str:
+    """The target's boxes 60 px wide, and 60 px tall, on lanes 70 px apart."""
+    target = live(client, tmp_path, DOSES)[0]
+    client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 60, "height": 60})
+    return target
+
+
+@pytest.mark.parametrize(
+    ("setup", "body", "code", "words"),
+    [
+        (_no_box_yet, {"along": 2}, "invalid_input", "place a box of 'β-actin' first"),
+        (_live_target, {"along": 6}, "invalid_input", "at most 5 px"),  # half of 10
+        (_live_target, {"across": 8}, "invalid_input", "at most 7 px"),  # half of 14
+        (_wide_target, {"across": 6}, "size_would_overlap", "at most 5 px fits"),
+        (_wide_target, {"along": 21}, "size_out_of_bounds", "exceed"),  # 102 on 100
+    ],
+)
+def test_a_box_padding_that_does_not_fit_changes_nothing(
+    client, tmp_path, setup, body, code, words
+):
+    protein = setup(client, tmp_path)
+    before = client.ok("GET", "/api/project")
+    status, payload = client.call("PUT", padding_path(protein), body)
+    assert (status, payload["code"]) == (422, code)
+    assert words in payload["message"]
+    assert client.ok("GET", "/api/project") == before
+    boxes = [band["id"] for band in protein_of(before, protein)["bands"]]
+    assert payload["ids"] == (boxes if code == "size_would_overlap" else [])
+    assert unchanged_refusal(client, "PUT", padding_path("prot-99"), body) == ("unknown_id", [])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"along": -1},
+        {"across": -1, "along": 2},
+        {"along": 2.0},
+        {"along": "2"},  # a number as text
+        {"along": True},
+        {"along": None},  # left out is how a direction is kept
+        {"along": 2, "depth": 1},  # an unknown field
+        [0, 2],
+    ],
+)
+def test_a_malformed_box_padding_is_refused(client, tmp_path, body):
+    target, _, _ = live(client, tmp_path, DOSES)  # it has boxes: a read body would be applied
+    assert unchanged_refusal(client, "PUT", padding_path(target), body) == ("invalid_input", [])
+
+
+def test_a_box_padding_from_a_page_showing_another_opening_changes_nothing(client, tmp_path):
+    # #134: the page names the opening it shows; a padding asked for from a
+    # page still showing Other is refused before anything is done in Blot.
+    answer, shown = opened_elsewhere(client, tmp_path)
+    project = answer["project"]
+    target = next(p["id"] for p in project["proteins"] if p["role"] == "target")
+    status, payload = client.call(
+        "PUT", padding_path(target), {"along": 2}, headers={OPENING: str(shown)}
+    )
+    assert (status, payload["code"]) == (409, "project_changed")
+    now = client.ok("GET", "/api/project")
+    assert now["project"]["revision"] == project["revision"]
+    assert protein_of(now, target)["box_padding"] == {"across": 0, "along": 0}
+    named = {OPENING: str(project["open_id"])}
+    done = client.ok("PUT", padding_path(target), {"along": 2}, headers=named)
+    assert protein_of(done, target)["box_padding"] == {"across": 0, "along": 2}
 
 
 def test_a_seed_click_grows_a_box_over_the_band_and_answers_its_net(client, tmp_path):
@@ -2497,6 +2816,7 @@ def test_a_read_from_the_kept_results_registers_their_charts_again(client, tmp_p
 
 ROW_FIELDS = [field.name for field in dataclasses.fields(api.ops.RowPlacement)]
 TARGET_ROW_BOX = [15, TARGET_ROW - 12, W - 35, TARGET_ROW + 12]  # every lane of the target row
+BOTH_ROWS_BOX = [15, TARGET_ROW - 12, W - 35, LOADING_ROW + 12]  # the target's row and the LC's
 
 
 def drag(client: Client, protein_id: str, rect: list[int] = TARGET_ROW_BOX) -> dict:
@@ -2634,8 +2954,10 @@ def test_one_band_on_an_image_without_lanes_placed_answers_the_lanes_it_cannot_l
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
 def test_a_second_row_box_corrects_the_first_and_removes_a_box_its_lane_lost(client, tmp_path):
     depths = (20000.0, 22000.0, 0.0, 33000.0, 36000.0)  # lane 2 of the target row: no band
-    target, _, _ = live(client, tmp_path, DOSES, target=depths, boxed=())
-    # Dragged over the loading control's row first, by mistake: a box in every lane.
+    target, loading, _ = live(client, tmp_path, DOSES, target=depths, boxed=())
+    # Dragged over the loading control's row first, by mistake, before that row
+    # was boxed (over its boxes the row is refused, #114): a box in every lane.
+    client.ok("DELETE", f"/api/proteins/{loading}/boxes")
     first = drag(client, target, [15, LOADING_ROW - 12, W - 35, LOADING_ROW + 12])
     ids = first["band_ids"]
     assert None not in ids
@@ -2656,6 +2978,77 @@ def test_a_second_row_box_corrects_the_first_and_removes_a_box_its_lane_lost(cli
     assert all(band["rect"][1] < TARGET_ROW < band["rect"][3] for band in state["bands"])
     assert [record["lane_index"] for record in state["undetected"]] == [2]
     assert column(answer, target)["detected"] == [True, True, False, True, True]
+
+
+def test_a_row_box_over_two_rows_answers_the_lanes_off_its_line(client, tmp_path):
+    # The target's bands are deeper than the loading control's in lanes 2-4,
+    # shallower in lanes 0 and 1: there the row's boxes would lie on the
+    # loading control's row (#114).
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    status, payload = client.call(
+        "POST", "/api/boxes/row", {"protein_id": target, "rect": BOTH_ROWS_BOX}
+    )
+    assert (status, payload["code"], payload["ids"]) == (422, "row_off_line", [])
+    assert payload["message"] == (
+        "the bands found in lanes 1, 2 lie above or below the row's line through the other"
+        " bands, by more than 0.75 of a box's height: the row box covers more than one row,"
+        " or those bands lie off the row; draw it over one row only, or box those lanes by"
+        " clicking their bands"
+    )
+    detail = payload["detail"]
+    assert detail["cause"] == "off_row_line" and detail["flags"][0] == "off_row_line"
+    offsets = [lane["line_offset"] for lane in detail["lanes"]]
+    assert [lane for lane, v in enumerate(offsets) if abs(v) > 0.75] == [0, 1]
+    assert all(v > 0 for v in offsets[:2])  # below the target's row
+
+
+def test_a_box_over_another_proteins_box_is_refused_naming_it(client, tmp_path):
+    # Clicked, shift+clicked or moved onto the loading control's box in lane 1
+    # (#114): refused, naming that box for the page to offer it.
+    target, loading, answer = live(client, tmp_path, DOSES, boxed=(0,))
+    in_the_way = column(answer, loading)["band_ids"][1]
+    moved = column(answer, target)["band_ids"][0]
+    click = {"protein_id": target, "x": LANE_X[1], "y": LOADING_ROW, "lane_index": 1}
+    over = [LANE_X[1] - 7, LOADING_ROW - 5, LANE_X[1] + 7, LOADING_ROW + 5]
+    for method, path, body in (
+        ("POST", "/api/boxes", {**click, "grow": True}),
+        ("POST", "/api/boxes", {**click, "grow": False}),
+        ("PUT", f"/api/boxes/{moved}", {"rect": over}),
+    ):
+        assert unchanged_refusal(client, method, path, body) == ("overlap", [in_the_way])
+        _, payload = client.call(method, path, body)
+        assert payload["message"] == (
+            "the box would overlap the box of 'α-tubulin' in lane 2 by more than 50% of the"
+            " smaller box's area: two proteins' boxes would measure the same band"
+        )
+        [covered] = payload["detail"]["covered"]
+        assert payload["detail"]["cause"] == "other_protein"
+        assert (covered["band_id"], covered["protein_id"], covered["lane_index"]) == (
+            in_the_way,
+            loading,
+            1,
+        )
+        assert 0.5 < covered["share"] <= 1.0
+    assert "move_box" not in logged(client)
+
+
+def test_a_box_size_over_another_proteins_boxes_is_refused_naming_them(client, tmp_path):
+    # The loading control's boxes made 90 px high reach up over the target's,
+    # 45 px above (#114): refused, naming the target's boxes.
+    target, loading, answer = live(client, tmp_path, DOSES)
+    covered = column(answer, target)["band_ids"]
+    path = f"/api/proteins/{loading}/box-size"
+    body = {"width": 14, "height": 90}
+    assert unchanged_refusal(client, "PUT", path, body) == ("overlap", covered)
+    _, payload = client.call("PUT", path, body)
+    assert payload["message"] == (
+        "at the box size 14x90, boxes of 'α-tubulin' would overlap the boxes of 'β-catenin' in"
+        " lanes 1, 2, 3, 4, 5 by more than 50% of the smaller box's area: two proteins' boxes"
+        " would measure the same band"
+    )
+    assert payload["detail"]["cause"] == "other_protein"
+    assert [c["band_id"] for c in payload["detail"]["covered"]] == covered
+    assert "set_box_size" not in logged(client)
 
 
 def adversarial_project(client: Client, tmp_path: Path, key: str) -> tuple[RowCase, str]:
@@ -2852,6 +3245,12 @@ def _loading_lanes(client: Client, target: str, loading: str) -> list[str]:
     return column(client.ok("GET", "/api/project"), loading)["band_ids"][:5]
 
 
+def _loading_boxes(client: Client, target: str, loading: str) -> list[str]:
+    """Nothing to set up: the loading control's boxes, which a row over its
+    row would cover (#114)."""
+    return column(client.ok("GET", "/api/project"), loading)["band_ids"]
+
+
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:
     """A non-finite pixel in the row, as a damaged file would read."""
     session = client.workspace.current()
@@ -2881,6 +3280,16 @@ ROW_BOX_REFUSALS = [
     pytest.param(None, [15, 45, W - 35, 60], "no_band_found", id="no-band"),
     pytest.param(_wide_kept_box, TARGET_ROW_BOX, "size_would_overlap", id="size-would-overlap"),
     pytest.param(_kept_box_on_lane_2, TARGET_ROW_BOX, "overlap", id="onto-a-kept-box"),
+    # Over both rows: the target's bands in lanes 2-4, the loading control's
+    # (deeper there) in lanes 0 and 1, so the boxes would lie on two rows (#114).
+    pytest.param(None, BOTH_ROWS_BOX, "row_off_line", id="over-two-rows"),
+    # Over the loading control's row: its boxes are in the way (#114).
+    pytest.param(
+        _loading_boxes,
+        [15, LOADING_ROW - 12, W - 35, LOADING_ROW + 12],
+        "overlap",
+        id="onto-another-proteins-row",
+    ),
 ]
 
 

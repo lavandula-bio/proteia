@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // The "Proteins on this image" panel: the list with each protein's colour and
 // role, the form that adds a protein, and the editor of the chosen one (name,
-// role, loading controls, box size, not-detected marks, clearing its boxes,
-// removal). It stores nothing itself: each change goes to the server through
-// the app, and the panel is drawn again from the state the server answers.
-import { $, counted, focusLost, inWords, isolate, rebuild, span, swatch } from "/static/dom.js";
+// role, loading controls, fitted size and padding, not-detected marks, clearing
+// its boxes, removal). It stores nothing itself: each change goes to the server
+// through the app, and the panel is drawn again from the state the server
+// answers.
+import {
+  $,
+  counted,
+  focusLost,
+  inWords,
+  isolate,
+  lanesPhrase,
+  rebuild,
+  span,
+  swatch,
+} from "/static/dom.js";
 
 const PROTEIN_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#17becf", "#bcbd22"];
 const LOADING_CONTROL = "loading control";
@@ -37,6 +48,48 @@ function names(proteins) {
   return proteins.map((p) => p.name).join(", ");
 }
 
+// A protein's padding directions as the editor shows them, above and below
+// first: its key in box_padding, its field, and the fitted size's dimension it
+// pads.
+const PADDING = [
+  { key: "along", field: "pad-along", dimension: "height", words: "above and below" },
+  { key: "across", field: "pad-across", dimension: "width", words: "left and right" },
+];
+
+// "5 px above and below and 2 px left and right"; "" for no padding.
+function paddingWords(padding) {
+  const sides = PADDING.filter(({ key }) => padding[key]);
+  return inWords(sides.map(({ key, words }) => `${padding[key]} px ${words}`));
+}
+
+// The size of a protein's boxes, the one quantified and drawn: its fitted size
+// plus its padding on each side.
+function paddedSize({ fitted_size: fitted, box_padding: padding }) {
+  return {
+    width: fitted.width + 2 * padding.across,
+    height: fitted.height + 2 * padding.along,
+  };
+}
+
+// How a protein's nets moved, from the smallest and largest share of change:
+// "rose 8.6–11.5%", "fell 1.2%", "changed −1.2 to +0.4%".
+function netChangeWords([low, high]) {
+  const percent = (value) => Math.abs(value * 100).toFixed(1);
+  const range = (a, b) =>
+    percent(a) === percent(b) ? `${percent(a)}%` : `${percent(a)}–${percent(b)}%`;
+  if (percent(low) === "0.0" && percent(high) === "0.0") {
+    return "did not change";
+  }
+  if (low >= 0) {
+    return `rose ${range(low, high)}`;
+  }
+  if (high <= 0) {
+    return `fell ${range(high, low)}`;
+  }
+  const signed = (value) => `${value < 0 ? "−" : "+"}${percent(value)}`;
+  return `changed ${signed(low)} to ${signed(high)}%`;
+}
+
 export class ProteinPanel {
   // handlers: send(method, path, json) gives a Promise of the server's answer
   // once the app has applied it (null if the answer is about a project opened
@@ -46,10 +99,13 @@ export class ProteinPanel {
   // button ({label, name, seq, run}) after it, and gives that button (or
   // null); undo(seq) takes back the change logged as `seq` if it is still the
   // last; pending() gives a Promise that settles once the edits the app made
-  // outside the queue have their answers; laneName(index) names a lane.
+  // outside the queue have their answers; laneName(index) names a lane;
+  // remeasured(answer) says which other proteins' nets an edit re-measured, or
+  // gives null.
   constructor(handlers) {
     this.handlers = handlers;
     this.project = null;
+    this.results = null; // the results of that same project state
     this.image = null;
     this.protein = null;
     this.filled = new Map(); // input id -> the value the panel last put in it
@@ -89,8 +145,9 @@ export class ProteinPanel {
     this.closeAdd(false);
   }
 
-  render(project, image, proteinId) {
+  render(project, image, proteinId, results = null) {
     this.project = project;
+    this.results = results;
     this.image = image;
     const proteins = image ? project.proteins.filter((p) => p.image_id === image.id) : [];
     this.protein = proteins.find((p) => p.id === proteinId) || null;
@@ -126,6 +183,23 @@ export class ProteinPanel {
         fields: ["box-width", "box-height"],
         near: $("box-size"),
       });
+    });
+    $("box-padding").addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.applyPadding();
+    });
+    $("box-padding").addEventListener("input", () => this.renderPaddingNotes());
+    for (const { field } of PADDING) {
+      $(field).title = $(field).labels[0].title; // the tooltip on the field too
+    }
+    $("box-padding").addEventListener("keydown", (event) => {
+      const direction = PADDING.find(({ field }) => field === event.target.id);
+      if (event.key === "Escape" && direction && this.protein) {
+        // The stored padding back: always within the field's range.
+        event.preventDefault();
+        this.fill(direction.field, this.protein.box_padding[direction.key], true);
+        this.renderPaddingNotes();
+      }
     });
     $("clear-boxes").addEventListener("click", () => this.clear());
     $("remove-protein").addEventListener("click", () => this.remove());
@@ -270,10 +344,97 @@ export class ProteinPanel {
     const image = this.project.images.find((i) => i.id === protein.image_id);
     $("box-width").max = String(image.width);
     $("box-height").max = String(image.height);
-    this.fill("box-width", protein.box_size.width, force("box-width"));
-    this.fill("box-height", protein.box_size.height, force("box-height"));
+    // The fitted size, which Apply sends: the boxes extend beyond it by the
+    // protein's padding, which the server adds (the box size would get it twice).
+    this.fill("box-width", protein.fitted_size.width, force("box-width"));
+    this.fill("box-height", protein.fitted_size.height, force("box-height"));
+    this.renderPadding(protein, force);
     this.renderUndetected(protein);
     this.renderClear();
+  }
+
+  // The padding form: whole pixels per side, each at most half the fitted size
+  // (so a box at most doubles), or the stored value when a fit has left it
+  // above that since: the stored value is always valid, and can be lowered.
+  // Disabled until the protein has a box: before that, its fitted size is a
+  // placeholder no band set (after Clear boxes, the kept padding shows).
+  renderPadding(protein, force) {
+    const none = !protein.bands.length;
+    for (const { key, field, dimension } of PADDING) {
+      const stored = protein.box_padding[key];
+      $(field).max = String(Math.max(Math.floor(protein.fitted_size[dimension] / 2), stored));
+      $(field).disabled = none;
+      this.fill(field, protein.box_padding[key], force(field));
+    }
+    $("pad-apply").disabled = none;
+    $("pad-none").hidden = !none;
+    this.renderPaddingNotes();
+    const { width, height } = paddedSize(protein);
+    $("box-boxes").textContent = `Boxes ${width} × ${height} px`;
+    this.renderPartners(protein);
+  }
+
+  // Beside each padding field: its share of the fitted size as typed, and a
+  // note when the stored padding is more than half of it (a fit has set a
+  // smaller fitted size since) or the value typed is more than the field takes.
+  renderPaddingNotes() {
+    const protein = this.protein;
+    if (!protein) {
+      return;
+    }
+    for (const { key, field, dimension } of PADDING) {
+      const typed = $(field).value === "" ? NaN : Number($(field).value);
+      const fitted = protein.fitted_size[dimension];
+      const half = Math.floor(fitted / 2);
+      const stored = protein.box_padding[key];
+      const share = $(`${field}-share`);
+      const shown = Number.isInteger(typed) && typed >= 0;
+      share.textContent = shown ? `${Math.round((100 * typed) / fitted)}%` : "";
+      share.title = shown ? `of the fitted ${dimension}, ${fitted} px` : "";
+      let text = "";
+      if (stored > half) {
+        text =
+          `More than half the fitted ${dimension}: lower it to ${half} px or less to keep` +
+          " boxes within twice the fitted size.";
+      } else if (typed > half) {
+        text = `At most ${half} px: half the fitted ${dimension}, ${fitted} px.`;
+      }
+      const note = $(`${field}-note`);
+      note.textContent = text;
+      note.hidden = !text;
+    }
+  }
+
+  // The chosen protein's partners as the applied results pair them (a target's
+  // loading controls, a loading control's targets), each with its padding:
+  // fold changes lose least when both are padded alike.
+  renderPartners(protein) {
+    const sets = this.results ? this.results.sets : [];
+    const ids = [];
+    for (const series of sets.length ? sets[0].series : []) {
+      let other = null;
+      if (series.target_id === protein.id) {
+        other = series.loading_id;
+      } else if (series.loading_id === protein.id) {
+        other = series.target_id;
+      }
+      if (other !== null && !ids.includes(other)) {
+        ids.push(other);
+      }
+    }
+    const partners = ids
+      .map((id) => this.project.proteins.find((p) => p.id === id))
+      .filter(Boolean);
+    const line = $("pad-partners");
+    line.hidden = !partners.length;
+    if (!partners.length) {
+      line.textContent = "";
+      return;
+    }
+    const plural = partners.length === 1 ? "" : "s";
+    const kind = protein.role === LOADING_CONTROL ? "target" : "loading control";
+    const each = partners.map((p) => `${p.name}: ${paddingWords(p.box_padding) || "not padded"}`);
+    line.textContent = `Its ${kind}${plural} ${each.join("; ")}.`;
   }
 
   // Clear boxes: disabled when the chosen protein has nothing to clear, and
@@ -487,6 +648,99 @@ export class ProteinPanel {
       }
     }
     return error.message;
+  }
+
+  // Apply the padding typed. The values are read now; once the edits before it
+  // have their answers, only the directions whose value differs from the
+  // padding the last answer stored are sent (editChosen), so a direction
+  // another tab changed since stays as it set it, and an Apply pressed before
+  // the one before it was answered is compared with what that one set. With
+  // none, the body is empty: the server answers it as a no-op ("No change"),
+  // and the fields show the stored padding ("05" reads 5 again). Said in the
+  // status line once done.
+  async applyPadding() {
+    const shown = this.protein;
+    if (!shown) {
+      return;
+    }
+    const typed = PADDING.map(({ key, field }) => [key, Number($(field).value)]);
+    let before = null;
+    const answer = await this.editChosen(
+      "PUT",
+      (protein) => {
+        before = this.project;
+        const body = {};
+        for (const [key, value] of typed) {
+          if (value !== protein.box_padding[key]) {
+            body[key] = value;
+          }
+        }
+        return [`/api/proteins/${protein.id}/box-padding`, body];
+      },
+      { proteinId: shown.id, fields: PADDING.map(({ field }) => field), near: $("box-padding") },
+    );
+    if (answer) {
+      this.handlers.status(this.paddingText(answer, shown.id, before));
+    }
+  }
+
+  // What a padding change did, from its answer: the boxes' size, how the
+  // protein's nets moved, the other proteins it re-measured, its boxes the
+  // image edge kept from growing evenly, and the boxes they now overlap.
+  // `before`: the state shown when it was sent.
+  paddingText(answer, proteinId, before) {
+    const project = answer.project;
+    const protein = project.proteins.find((p) => p.id === proteinId);
+    const name = protein ? protein.name : proteinId;
+    const { width, height } = paddedSize(answer);
+    const fitted = answer.fitted_size;
+    const padding = paddingWords(answer.box_padding);
+    const boxes = `boxes ${width} × ${height} px`;
+    const size = padding
+      ? `${boxes} (fitted ${fitted.width} × ${fitted.height}, plus ${padding})`
+      : `${boxes}, not padded`;
+    const unchanged =
+      before !== null &&
+      before.open_id === project.open_id &&
+      before.revision === project.revision;
+    const parts = [unchanged ? `No change: ${name} has ${size}` : `${name}: ${size}`];
+    if (answer.net_change) {
+      parts.push(`its nets ${netChangeWords(answer.net_change)}`);
+    }
+    const remeasured = this.handlers.remeasured(answer);
+    if (remeasured) {
+      parts.push(remeasured);
+    }
+    const bands = new Map(
+      project.proteins.flatMap((p) => p.bands.map((band) => [band.id, { protein: p, band }])),
+    );
+    const lanes = (ids) =>
+      ids
+        .map((id) => bands.get(id))
+        .filter(Boolean)
+        .map(({ band }) => band.lane_index)
+        .sort((a, b) => a - b);
+    if (answer.edge_shifted.length) {
+      const those = answer.edge_shifted.length === 1 ? "that box extends" : "those boxes extend";
+      parts.push(
+        `the image edge stops the padding of ${lanesPhrase(lanes(answer.edge_shifted))}:` +
+          ` ${those} further on the other side`,
+      );
+    }
+    const overlapped = new Map(); // another protein -> its band ids the boxes now overlap
+    for (const id of answer.overlapping) {
+      const found = bands.get(id);
+      if (found) {
+        overlapped.set(found.protein, [...(overlapped.get(found.protein) || []), id]);
+      }
+    }
+    for (const [other, ids] of overlapped) {
+      parts.push(
+        `the boxes now overlap ${other.name}'s in ${lanesPhrase(lanes(ids))}:` +
+          " each counts part of the other's band",
+      );
+    }
+    return parts.join(" · ");
   }
 
   rename() {

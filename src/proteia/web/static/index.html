@@ -111,13 +111,44 @@
           <div id="loading-choices"></div>
           <p id="loading-hint" class="note"></p>
         </fieldset>
+        <!-- The size the bands asked for: clicks and row boxes fit it; the boxes
+          extend beyond it by the padding. -->
         <form id="box-size" class="box-size">
-          <span class="box-size-label">Box size (pixels)</span>
-          <label>W <input id="box-width" type="number" min="1" step="1" required></label>
+          <span id="box-size-label" class="box-size-label">Fitted size (pixels)</span>
+          <label>W <input id="box-width" type="number" min="1" step="1" required
+            aria-describedby="box-size-label"></label>
           <span aria-hidden="true">×</span>
-          <label>H <input id="box-height" type="number" min="1" step="1" required></label>
+          <label>H <input id="box-height" type="number" min="1" step="1" required
+            aria-describedby="box-size-label"></label>
           <button type="submit">Apply</button>
         </form>
+        <!-- Whole pixels on each side of the fitted size, above and below first;
+          until the protein has a box, disabled (proteins.js renderPadding). -->
+        <form id="box-padding" class="box-padding">
+          <span class="box-size-label">Padding per side (pixels)</span>
+          <p id="pad-none" class="note" hidden>Place a box first: the padding follows the size the
+            bands set.</p>
+          <label for="pad-along"
+            title="Pixels added above and below every box of this protein. Nets rise as the band's tails come in, then level off; more adds noise and can take in a nearby band.">Above
+            and below</label>
+          <input id="pad-along" type="number" min="0" step="1" required
+            aria-describedby="pad-along-share pad-along-note">
+          <span id="pad-along-share" class="hint pad-share"></span>
+          <p id="pad-along-note" class="note warning pad-note" hidden></p>
+          <label for="pad-across"
+            title="Pixels added beside every box. One protein's boxes cannot overlap, so the lane spacing limits it. It changes fold changes little when both proteins are padded alike.">Left
+            and right</label>
+          <input id="pad-across" type="number" min="0" step="1" required
+            aria-describedby="pad-across-share pad-across-note">
+          <span id="pad-across-share" class="hint pad-share"></span>
+          <p id="pad-across-note" class="note warning pad-note" hidden></p>
+          <button id="pad-apply" type="submit">Apply</button>
+        </form>
+        <p id="box-boxes" class="note"></p>
+        <p id="pad-partners" class="note" hidden></p>
+        <p class="hint note">Clicks and row boxes end where the band falls to 30% of its peak,
+          leaving its tails outside. Padding above and below takes them in. Pad a target and its
+          loading control alike: padding only one of them can make fold changes worse.</p>
         <div id="undetected" hidden>
           <p class="subhead">Not detected (n.d.)</p>
           <ul id="undetected-list" class="undetected-list"></ul>
@@ -185,8 +216,10 @@
       <div class="dock-head">
         <h2 id="dock-title">Results</h2>
         <span id="tier" class="tier" hidden></span>
-        <!-- While the nets use the legacy background (app.js renderRequantify);
-          the Checks say why. Before "Updating…", so its coming never moves the button. -->
+        <!-- While there is something to requantify (app.js renderRequantify, which
+          words it for why): the legacy background, or boxes not yet looked at near the
+          detector limit; the Checks say why. Before "Updating…", so its coming never moves
+          the button. -->
         <span id="requantify-offer" class="requantify-offer" hidden>
           <button id="requantify" type="button" aria-describedby="requantify-note"
             title="The nets use the whole-image median background, as measured before the local background.">Requantify

@@ -25,6 +25,20 @@ box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
 
+``PUT /api/proteins/{protein_id}/box-size`` takes a protein's fitted size, as the
+state shows it (``fitted_size``), not its box size: every box becomes that size
+plus the protein's padding on each side
+(:func:`~proteia.core.operations.set_box_size`), so the size shown, sent back
+as it is, changes nothing. ``PUT /api/proteins/{protein_id}/box-padding`` sets
+that padding, ``{across, along}`` in whole pixels on each side; a direction left
+out keeps its value, so a page that sends only the one it changed never resets
+the other (:func:`~proteia.core.operations.set_box_padding`). It answers every
+field of :class:`~proteia.core.operations.PaddingChange`: ``box_size`` and
+``fitted_size`` as ``{width, height}``, the padding as ``box_padding {across,
+along}``, ``net_change`` as ``[smallest, largest]`` (or null), the band ids in
+``edge_shifted`` and ``overlapping``, and the other proteins' bands it
+re-measured and the largest change as a row box answers them.
+
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
 ``?colour=original``, its stored file in its own colours, for display only.
@@ -510,6 +524,7 @@ class Workspace:
 
 
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
+NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 
 
 def _url_index(value: object) -> object:
@@ -584,6 +599,16 @@ class ProteinEditBody(_Body):
 class BoxSizeBody(_Body):
     width: PositiveInt
     height: PositiveInt
+
+
+class BoxPaddingBody(_Body):
+    """A protein's padding, whole pixels on each side: ``across`` left and right,
+    ``along`` above and below. A field left out keeps its value: only the fields
+    the request set are passed on, so these defaults are never used, and null is
+    no value."""
+
+    across: NonNegativeInt = 0
+    along: NonNegativeInt = 0
 
 
 class PlaceBody(_Body):
@@ -704,16 +729,36 @@ def _cascade(cascade: ops.Cascade) -> dict[str, list[str]]:
     return {field.name: list(getattr(cascade, field.name)) for field in dataclasses.fields(cascade)}
 
 
+def _size(size: BoxSize) -> dict[str, int]:
+    return {"width": size.width, "height": size.height}
+
+
+def _remeasured(
+    remeasured: tuple[tuple[str, float, float], ...], largest: tuple[str, float] | None
+) -> dict[str, Any]:
+    """The other proteins' bands an edit re-measured, each as ``{band_id,
+    net_before, net_after}``, and the largest change as ``{band_id, change}``
+    (or None)."""
+    return {
+        "remeasured": [
+            {"band_id": band_id, "net_before": before, "net_after": after}
+            for band_id, before, after in remeasured
+        ],
+        "largest_change": None
+        if largest is None
+        else {"band_id": largest[0], "change": largest[1]},
+    }
+
+
 def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
     """Every field of what a row box did
     (:class:`~proteia.core.operations.RowPlacement`), with lists for tuples, the
     box size as ``{width, height}``, each empty lane as ``{lane_index,
-    reason, snr, expected_x}``, each band re-measured as ``{band_id, net_before,
-    net_after}`` and the largest change as ``{band_id, change}`` (or None)."""
-    size, largest = placement.box_size, placement.largest_change
+    reason, snr, expected_x}``, and the bands re-measured as
+    :func:`_remeasured` gives them."""
     return {
         "band_ids": list(placement.band_ids),
-        "box_size": {"width": size.width, "height": size.height},
+        "box_size": _size(placement.box_size),
         "kept_lanes": list(placement.kept_lanes),
         "replaced_band_ids": list(placement.replaced_band_ids),
         "removed_band_ids": list(placement.removed_band_ids),
@@ -726,14 +771,26 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
         "flags": list(placement.flags),
         "notes": list(placement.notes),
         "right_to_left": placement.right_to_left,
-        "remeasured": [
-            {"band_id": band_id, "net_before": before, "net_after": after}
-            for band_id, before, after in placement.remeasured
-        ],
-        "largest_change": None
-        if largest is None
-        else {"band_id": largest[0], "change": largest[1]},
+        **_remeasured(placement.remeasured, placement.largest_change),
         "unlocated_lanes": list(placement.unlocated_lanes),
+    }
+
+
+def _padding_change(change: ops.PaddingChange) -> dict[str, Any]:
+    """Every field of what a padding change did
+    (:class:`~proteia.core.operations.PaddingChange`): the sizes as ``{width,
+    height}``, the padding as ``box_padding {across, along}``, the net change as
+    ``[smallest, largest]`` (or None), lists for tuples, and the bands
+    re-measured as :func:`_remeasured` gives them."""
+    padding, net_change = change.padding, change.net_change
+    return {
+        "box_size": _size(change.box_size),
+        "fitted_size": _size(change.fitted_size),
+        "box_padding": {"across": padding.across, "along": padding.along},
+        "net_change": None if net_change is None else list(net_change),
+        "edge_shifted": list(change.edge_shifted),
+        "overlapping": list(change.overlapping),
+        **_remeasured(change.remeasured, change.largest_change),
     }
 
 
@@ -987,8 +1044,23 @@ def remove_protein(
 def set_box_size(
     protein_id: str, body: BoxSizeBody, session: OpenSession, workspace: WorkspaceDep
 ) -> dict[str, Any]:
+    """Set the protein's fitted size: every box becomes it plus the protein's
+    padding on each side (:func:`~proteia.core.operations.set_box_size`)."""
     ops.set_box_size(session, protein_id, BoxSize(width=body.width, height=body.height))
     return _answer(workspace, session)
+
+
+@router.put("/proteins/{protein_id}/box-padding")
+def set_box_padding(
+    protein_id: str, body: BoxPaddingBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Set how far every box of the protein extends beyond its fitted size, on
+    each side (:func:`~proteia.core.operations.set_box_padding`); answers what
+    it did (:func:`_padding_change`). The same padding, or an empty body, is a
+    no-op."""
+    # Only the fields the request set: the operation keeps the others (KEEP).
+    change = ops.set_box_padding(session, protein_id, **body.model_dump(exclude_unset=True))
+    return _answer(workspace, session, **_padding_change(change))
 
 
 @router.delete("/proteins/{protein_id}/undetected/{lane_index}")
@@ -1075,9 +1147,11 @@ def _restored(restored: ops.Restored) -> dict[str, Any]:
 
 @router.post("/requantify")
 def requantify(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
-    """Switch the project to the local background and re-quantify every band;
-    answers the images re-quantified (``images``; empty for a project already
-    on the local background, a no-op)."""
+    """Switch the project to the local background and re-quantify every band,
+    or, on the local background already, re-quantify the images whose bands
+    were never assessed for over-exposure (the state's ``unassessed_images``;
+    :func:`~proteia.core.operations.requantify`); answers the images
+    re-quantified (``images``; empty for a no-op: nothing to do)."""
     images = ops.requantify(session)
     return _answer(workspace, session, images=list(images))
 

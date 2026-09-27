@@ -342,6 +342,31 @@ button:disabled {
   width: 4.5rem;
 }
 
+/* A row per direction (its label, its field, its share of the fitted size),
+   each note under its row, Apply last. */
+.box-padding {
+  display: grid;
+  grid-template-columns: max-content 4.5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.3rem 0.35rem;
+  margin: 0.4rem 0;
+}
+
+.box-padding input {
+  width: 100%;
+}
+
+.box-padding > .box-size-label,
+.box-padding > .note {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.box-padding > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
 .subhead {
   margin: 0.5rem 0 0.2rem;
 }
@@ -610,7 +635,7 @@ button:disabled {
   font-size: 0.85rem;
 }
 
-/* In the header while the nets use the legacy background (app.js
+/* In the header while there is something to requantify (app.js
    renderRequantify): the control that requantifies and, on the same line, what
    it changes, so it takes none of the lane table's height and stays when the
    results are hidden. Only its note gives way, cut short ("…"; its tooltip has

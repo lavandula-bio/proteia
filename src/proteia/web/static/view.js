@@ -79,7 +79,7 @@ export class ImageView {
     this.scale = 1;
     this.offsetX = 0; // the image point at the canvas's top-left corner
     this.offsetY = 0;
-    this.boxes = []; // {id, rect, color, label, clipped}
+    this.boxes = []; // {id, rect, color, label, clipped, fitted (a rect inside, or null)}
     this.ghosts = []; // {rect, color, label, proteinId, laneIndex}: lanes without a box
     this.marks = []; // {rect, color, label, proteinId, laneIndex}: not-detected records
     this.selectedId = null;
@@ -211,15 +211,20 @@ export class ImageView {
     }
     const moving = this.gesture && this.gesture.kind === "move" ? this.gesture : null;
     for (const box of this.boxes) {
-      let rect = box.rect;
-      if (moving && moving.boxId === box.id) {
-        rect = [rect[0] + moving.dx, rect[1] + moving.dy, rect[2] + moving.dx, rect[3] + moving.dy];
-      }
-      this.drawRect(rect, box.clipped ? CLIPPED_COLOR : box.color, {
+      const moved = moving && moving.boxId === box.id;
+      const shift = (rect) =>
+        moved
+          ? [rect[0] + moving.dx, rect[1] + moving.dy, rect[2] + moving.dx, rect[3] + moving.dy]
+          : rect;
+      const color = box.clipped ? CLIPPED_COLOR : box.color;
+      this.drawRect(shift(box.rect), color, {
         selected: box.id === this.selectedId,
         label: box.label,
         clipped: box.clipped,
       });
+      if (box.fitted) {
+        this.drawRect(shift(box.fitted), color, { faint: true }); // its fitted size, inside
+      }
     }
     const g = this.gesture;
     if (g && g.kind === "row") {
@@ -237,7 +242,14 @@ export class ImageView {
   drawRect(
     rect,
     color,
-    { dashed = false, dotted = false, selected = false, label = "", clipped = false },
+    {
+      dashed = false,
+      dotted = false,
+      selected = false,
+      label = "",
+      clipped = false,
+      faint = false,
+    },
   ) {
     const ctx = this.context;
     const [x0, y0] = this.toScreen(rect[0], rect[1]);
@@ -248,8 +260,13 @@ export class ImageView {
       ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
       ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
     }
-    ctx.lineWidth = selected ? 3 : 2;
+    ctx.lineWidth = selected ? 3 : faint ? 1 : 2;
     ctx.strokeStyle = color;
+    if (faint) {
+      // A padded box's fitted size: a thin line, at low alpha. Not dashed (a
+      // lane's placeholder, a row box) nor dotted (an n.d. mark).
+      ctx.globalAlpha = 0.55;
+    }
     ctx.setLineDash(dashed ? [5, 4] : dotted ? [2, 3] : []);
     ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
     if (dotted) {

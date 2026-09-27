@@ -16,11 +16,25 @@ Coordinates are image pixels: a box is ``[x0, y0, x1, y1]`` with the end
 exclusive, as :meth:`~proteia.core.model.Box.rect` gives it, so a box the browser
 draws at any zoom lands on the same pixels the server quantifies.
 
+Each protein's ``box_size`` is the size of every one of its boxes, the one
+quantified and drawn, and ``fitted_size`` the size its clicks, rows or typing
+asked for, which the boxes extend beyond by the protein's padding on each side
+(:attr:`~proteia.core.model.Protein.fitted_size`), both as ``{width, height}``;
+``box_padding`` is that padding, as ``{across, along}``: whole pixels left and
+right, and above and below. The page's size fields show the fitted size, which
+``PUT /api/proteins/{id}/box-size`` takes, and its padding fields the padding,
+which ``PUT /api/proteins/{id}/box-padding`` takes.
+
 ``background_method`` names how the stored nets' backgrounds were measured
 (``ring_median_v1``, or ``global_median`` for a project quantified before #83,
 until it is requantified), and each band's ``background_mode`` how its own was:
 ``symmetric``, ``asymmetric`` or ``image`` (a ring cut short), or
-``global_median``.
+``global_median``. Each band's ``clipped`` says whether it is over-exposed
+(null: not checked), and ``possibly_clipped`` whether it looks so on an image
+that check cannot trust (null: not assessed; #112). ``unassessed_images`` lists
+the images whose bands were measured before Proteia looked for pixels near the
+detector limit, which ``POST /api/requantify`` assesses
+(:func:`~proteia.core.operations.unassessed_images`).
 
 Each protein's ``undetected`` lists its not-detected records
 (:class:`~proteia.core.model.UndetectedBand`), in lane order, for the view to
@@ -47,6 +61,7 @@ from pydantic import JsonValue
 
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
 from proteia.core.model import Batch, ImageRef, Project, Protein
+from proteia.core.operations import unassessed_images
 from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import HistoryStep, ProjectSession
 
@@ -115,7 +130,7 @@ def project_state(
     anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
-        size = protein.box_size
+        size, fitted, padding = protein.box_size, protein.fitted_size, protein.box_padding
         proteins.append(
             {
                 "id": protein.id,
@@ -125,6 +140,8 @@ def project_state(
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
                 "box_size": {"width": size.width, "height": size.height},
+                "fitted_size": {"width": fitted.width, "height": fitted.height},
+                "box_padding": {"across": padding.across, "along": padding.along},
                 "bands": [
                     {
                         "id": band.id,
@@ -132,6 +149,7 @@ def project_state(
                         "band_index": band.band_index,
                         "rect": list(band.box.rect(size)),
                         "clipped": band.clipped,
+                        "possibly_clipped": band.possibly_clipped,
                         "background_mode": band.background_mode,
                         "source": band.source.value,
                         "manually_edited": band.manually_edited,
@@ -159,6 +177,7 @@ def project_state(
         "revision": revision(project),
         "history": {"undo": _step(undo), "redo": _step(redo)},
         "background_method": project.background_method,
+        "unassessed_images": unassessed_images(batch),
         "lanes": [
             {
                 "index": lane.index,

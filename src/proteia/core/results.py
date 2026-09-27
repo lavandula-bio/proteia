@@ -90,7 +90,12 @@ from proteia.core.plotspec import (
     not_in_the_test,
 )
 from proteia.core.project import spine_axes
-from proteia.core.quantify import BACKGROUND_UNEVEN_LIMIT
+from proteia.core.quantify import (
+    BACKGROUND_UNEVEN_LIMIT,
+    NEAR_LIMIT_LEVELS,
+    POSSIBLY_CLIPPED_PIXELS,
+    near_limit_tolerance,
+)
 
 
 class NoticeCode(StrEnum):
@@ -115,7 +120,12 @@ class NoticeCode(StrEnum):
     # Bands with no clipping flag: their image has no limit the check trusts
     # (imaging.clipping_depth). A warning, as CLIPPED is: the bias it may hide is
     # the same, and a loading control's biases every value normalized to it.
+    # Says to requantify where they were measured before #112 looked near the
+    # limit.
     CLIPPING_NOT_CHECKED = "clipping_not_checked"
+    # Bands on such an image with several pixels near the limit (#112,
+    # quantify.is_possibly_clipped): likely over-exposed, still included.
+    POSSIBLY_CLIPPED = "possibly_clipped"
     BELOW_DETECTION = "below_detection"  # not-detected records in included lanes: no value
     # Bands whose ring is cut short (by the image edge or other boxes): their
     # level is a robust plane or the image median (quantify.band_backgrounds).
@@ -179,9 +189,10 @@ SERIES_NOTICE_CODES = frozenset(
 # The background modes of a ring cut short (quantify.band_backgrounds).
 _FALLBACK_MODES = frozenset({"asymmetric", "image"})
 # What makes imaging.clipping_depth distrust an image, besides an unknown bit
-# depth: its import warnings, as a clipping_not_checked notice names them. The
-# keys are imaging.UNTRUSTED_WARNINGS, kept in step by a test rather than an
-# import, so that loading results does not load the image readers.
+# depth: its import warnings, as the clipping_not_checked and possibly_clipped
+# notices name them. The keys are imaging.UNTRUSTED_WARNINGS, kept in step by a
+# test rather than an import, so that loading results does not load the image
+# readers.
 _UNCHECKED_WARNINGS = {
     "lossy_format": "lossy (JPEG-type) compression",
     "cmyk_converted": "CMYK converted to RGB",
@@ -219,6 +230,9 @@ class ProteinColumn(BaseModel, frozen=True):
     nets: list[float | None]  # joined on the stored lane_index; None = no box
     band_ids: list[str | None]
     clipped: list[bool | None]  # per lane: over-exposed; None = no box, or not checked
+    # Per lane, where clipped could not be checked: likely over-exposed (#112);
+    # None = no box, or not assessed.
+    possibly_clipped: list[bool | None]
     # Per lane: True = a box; False = not detected (below the detection limit, no
     # value); None = not measured.
     detected: list[bool | None]
@@ -404,7 +418,9 @@ def _clipping_not_checked(
     as :func:`~proteia.core.imaging.clipping_depth` decides it: lossy
     compression, CMYK converted to RGB, color averaged into gray, an unknown
     bit depth. The operations check every other image, so a flag missing there
-    gets no reason."""
+    gets no reason. Where such a band was not assessed for pixels near the limit
+    either, although its image's range is known (:func:`_unassessed`: measured
+    before #112), it says to requantify."""
     unchecked = tuple(
         i
         for i, band in enumerate(bands)
@@ -412,23 +428,101 @@ def _clipping_not_checked(
     )
     if not unchecked:
         return
+    reasons = _unchecked_reasons(image)
+    because = ""
+    if reasons:
+        because = f": its image has {reasons}, so saturated pixels cannot be counted"
+    requantify = ""
+    if any(_unassessed(image, bands[i]) for i in unchecked):
+        requantify = (
+            "; its boxes were measured before Proteia looked for pixels near the detector"
+            " limit: requantify to look for them"
+        )
+    note(
+        NoticeCode.CLIPPING_NOT_CHECKED,
+        f"{protein.name!r} was not checked for over-exposure in {lanes_phrase(unchecked)}"
+        f"{because}; {_clipping_effect(protein)}{requantify}",
+        protein_ids=(protein.id,),
+        lane_indices=unchecked,
+    )
+
+
+def _unassessed(image: model.ImageRef, band: model.Band | None) -> bool:
+    """Whether a band holds neither over-exposure flag on an image whose range
+    is known but whose limit the exact check distrusts: the image
+    :func:`~proteia.core.imaging.possible_clipping_depth` assesses, as
+    :func:`~proteia.core.operations.unassessed_images` names it (a project
+    saved before #112). Its warnings are read as :data:`_UNCHECKED_WARNINGS`
+    names them."""
+    return (
+        band is not None
+        and band.clipped is None
+        and band.possibly_clipped is None
+        and image.bit_depth is not None
+        and any(warning.code in _UNCHECKED_WARNINGS for warning in image.import_warnings)
+    )
+
+
+def _unchecked_reasons(image: model.ImageRef) -> str:
+    """Why the clipping check cannot run on an image, as
+    :func:`~proteia.core.imaging.clipping_depth` decides it: its import warnings
+    and an unknown bit depth, joined by "and"; empty with none."""
     codes = {warning.code for warning in image.import_warnings}
     reasons = [text for code, text in _UNCHECKED_WARNINGS.items() if code in codes]
     if image.bit_depth is None:
         reasons.append("an unknown bit depth")
-    because = ""
-    if reasons:
-        listed = " and ".join(reasons)
-        because = f": its image has {listed}, so saturated pixels cannot be counted"
+    return " and ".join(reasons)
+
+
+def _clipping_effect(protein: model.Protein) -> str:
+    """What over-exposure would do to a protein's values."""
     effect = "if it is over-exposed there, its net is an under-estimate"
     if protein.role is Role.LOADING_CONTROL:
         effect += ", which biases every value normalized to it"
+    return effect
+
+
+def _near_limit(bit_depth: int | None) -> str:
+    """How near the detector limit the possibly-clipped pixels lie, in the
+    image's own levels (and on an 8-bit scale, for another depth)."""
+    if bit_depth is None or bit_depth == 8:
+        return f"{NEAR_LIMIT_LEVELS} grey levels"
+    return (
+        f"{near_limit_tolerance(bit_depth):g} grey levels ({NEAR_LIMIT_LEVELS} on an 8-bit scale)"
+    )
+
+
+def _possibly_clipped(
+    protein: model.Protein,
+    image: model.ImageRef,
+    bands: list[model.Band | None],
+    included: list[bool],
+    note: Callable[..., None],
+) -> None:
+    """The ``possibly_clipped`` notice of one protein's first bands (``bands``,
+    joined to the lanes) in the included lanes: those whose image the clipping
+    check cannot trust, with :data:`~proteia.core.quantify.POSSIBLY_CLIPPED_PIXELS`
+    or more pixels near the limit (#112). It names the lanes, the rule, why the
+    image cannot confirm it (as ``clipping_not_checked`` does), and what the
+    bias reaches."""
+    flagged = tuple(
+        i
+        for i, band in enumerate(bands)
+        if band is not None and band.possibly_clipped and included[i]
+    )
+    if not flagged:
+        return
+    boxes = "its box holds" if len(flagged) == 1 else "each of those boxes holds"
+    reasons = _unchecked_reasons(image)
+    because = f", and its image has {reasons}, so saturation cannot be confirmed" if reasons else ""
     note(
-        NoticeCode.CLIPPING_NOT_CHECKED,
-        f"{protein.name!r} was not checked for over-exposure in {lanes_phrase(unchecked)}"
-        f"{because}; {effect}",
+        NoticeCode.POSSIBLY_CLIPPED,
+        f"{protein.name!r} is possibly over-exposed in {lanes_phrase(flagged)}: {boxes}"
+        f" {POSSIBLY_CLIPPED_PIXELS} or more pixels within {_near_limit(image.bit_depth)} of"
+        f" the detector limit{because}; {_clipping_effect(protein)}; check the imager's"
+        " original capture",
         protein_ids=(protein.id,),
-        lane_indices=unchecked,
+        lane_indices=flagged,
     )
 
 
@@ -660,6 +754,7 @@ def _compute(
             nets=nets[p.id],
             band_ids=_field(joined[p.id], "id"),
             clipped=_field(joined[p.id], "clipped"),
+            possibly_clipped=_field(joined[p.id], "possibly_clipped"),
             detected=detected[p.id],
         )
         for p in batch.proteins
@@ -735,6 +830,9 @@ def _compute(
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
+    for protein in batch.proteins:  # bands likely over-exposed, where that cannot be checked
+        image = batch.find_image(protein.image_id)
+        _possibly_clipped(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # bands not checked for that, in lanes this set includes
         image = batch.find_image(protein.image_id)
         _clipping_not_checked(protein, image, joined[protein.id], included, note)
