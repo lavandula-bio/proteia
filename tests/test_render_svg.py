@@ -14,7 +14,7 @@ import pytest
 
 from proteia.core.analyze import compare, describe
 from proteia.core.plotspec import PlotSpec, ValueKind, build_plotspec
-from proteia.viz import render, render_svg
+from proteia.viz import render, render_pdf, render_png, render_svg
 
 _SVG_NS = "http://www.w3.org/2000/svg"
 _XLINK_NS = "http://www.w3.org/1999/xlink"
@@ -84,9 +84,27 @@ def test_charts_drawn_at_once_are_the_bytes_drawn_one_at_a_time():
     assert drawn == alone
 
 
-def test_a_drawing_waits_until_the_one_before_it_is_saved(monkeypatch):
-    # The lock spans a whole drawing, from the figure to the saved bytes, as the
-    # settings it draws with are matplotlib's global ones.
+def _png(spec: PlotSpec) -> bytes:
+    return render_png(spec, dpi=72)
+
+
+@pytest.mark.parametrize(
+    ("draw_first", "draw_second"),
+    [
+        (render_svg, render_svg),
+        (render_svg, render_pdf),
+        (render_pdf, render_svg),
+        (render_pdf, render_pdf),
+        (render_svg, _png),
+        (_png, render_svg),
+    ],
+    ids=["svg-svg", "svg-pdf", "pdf-svg", "pdf-pdf", "svg-png", "png-svg"],
+)
+def test_a_drawing_waits_until_the_one_before_it_is_saved(monkeypatch, draw_first, draw_second):
+    # The lock spans a whole drawing, from the figure to the saved bytes, in
+    # every format, as the settings a drawing uses are matplotlib's global ones:
+    # an SVG and a PDF (an export's, drawn while the screen draws its SVGs)
+    # would each undo the other's.
     figure = render.render_figure
     begun: list[str | None] = []
     saving, release = threading.Event(), threading.Event()
@@ -106,8 +124,8 @@ def test_a_drawing_waits_until_the_one_before_it_is_saved(monkeypatch):
         return drawn
 
     monkeypatch.setattr(render, "render_figure", held_while_saved)
-    first = threading.Thread(target=render_svg, args=(_spec(TESTED, subtitle="first"),))
-    second = threading.Thread(target=render_svg, args=(_spec(TESTED, subtitle="second"),))
+    first = threading.Thread(target=draw_first, args=(_spec(TESTED, subtitle="first"),))
+    second = threading.Thread(target=draw_second, args=(_spec(TESTED, subtitle="second"),))
     first.start()
     try:
         assert saving.wait(10)
@@ -123,8 +141,10 @@ def test_a_drawing_waits_until_the_one_before_it_is_saved(monkeypatch):
 
 
 def test_drawing_leaves_the_global_settings_alone():
-    before = {key: matplotlib.rcParams[key] for key in ("svg.hashsalt", "svg.fonttype")}
+    keys = ("svg.hashsalt", "svg.fonttype", "pdf.fonttype")
+    before = {key: matplotlib.rcParams[key] for key in keys}
     render_svg(_spec(TESTED))
+    render_pdf(_spec(TESTED))
     assert {key: matplotlib.rcParams[key] for key in before} == before
 
 

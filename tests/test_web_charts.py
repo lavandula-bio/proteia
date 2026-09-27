@@ -46,7 +46,8 @@ def key_of(url: str) -> str:
 
 def test_the_key_is_a_hash_of_the_spec():
     chart = spec()
-    expected = hashlib.sha256(b"render-v3\n" + chart.model_dump_json().encode()).hexdigest()
+    # v4: every chart states its error bars (#53).
+    expected = hashlib.sha256(b"render-v4\n" + chart.model_dump_json().encode()).hexdigest()
     assert charts.chart_key(chart) == expected[:32]
     assert charts.chart_url(chart) == f"/api/charts/{expected[:32]}.svg"
     assert charts.chart_key(spec()) == charts.chart_key(chart)  # an equal spec, the same key

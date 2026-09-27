@@ -116,6 +116,9 @@ class ErrorCode(StrEnum):
     INVALID_IMAGE = "invalid_image"  # an empty stream, or a name store_image refuses
     UNREADABLE_IMAGE = "unreadable_image"  # the loader cannot decode it
     IMAGE_FILE_CHANGED = "image_file_changed"  # stored file missing, other bytes, other shape
+    # The project folder's path leaves an export's files too little room within
+    # the file system's path limit (Windows' 259 characters, long paths off).
+    PATH_TOO_LONG = "path_too_long"
     FOLDER_NOT_EMPTY = "folder_not_empty"
     LEFTOVER_FILE = "leftover_file"  # an orphan holding the next image id could not be deleted
     NOTHING_TO_UNDO = "nothing_to_undo"

@@ -810,6 +810,61 @@ def test_save_while_reader_holds_file(tmp_path, no_delay):
     assert path.read_bytes() == before
 
 
+def _folder_of_length(tmp_path: Path, length: int) -> Path:
+    base = os.path.abspath(tmp_path)
+    return Path(base) / ("d" * (length - len(base) - 1))
+
+
+def test_a_name_fits_within_the_name_limit_in_bytes(tmp_path, monkeypatch):
+    # write_atomic's temp file, ".<name>.<8 random characters>.tmp", is 14
+    # characters longer than the name.
+    monkeypatch.setattr(storage, "PATH_LIMIT", None)
+    assert storage.NAME_LIMIT_BYTES == 255
+    assert storage.name_fits(tmp_path, "x" * 241)
+    assert not storage.name_fits(tmp_path, "x" * 242)
+    assert storage.name_fits(tmp_path, "β" * 120)  # two bytes each
+    assert not storage.name_fits(tmp_path, "β" * 121)
+
+
+def test_a_name_fits_within_the_path_limit_in_utf16_code_units(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "PATH_LIMIT", 259)
+    folder = _folder_of_length(tmp_path, 200)  # it need not exist
+    room = 259 - 200 - len(os.sep) - len("..12345678.tmp")
+    assert storage.name_fits(folder, "x" * room)
+    assert not storage.name_fits(folder, "x" * (room + 1))
+    assert storage.name_fits(folder, "β" * room)  # one code unit each
+    assert storage.name_fits(folder, "\U0001d6fd" * (room // 2))  # two each: outside the BMP
+    assert not storage.name_fits(folder, "\U0001d6fd" * (room // 2 + 1))
+
+
+def _long_paths_enabled() -> bool:
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem"
+        ) as key:
+            return winreg.QueryValueEx(key, "LongPathsEnabled")[0] == 1
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _long_paths_enabled(), reason="Windows with long paths off, its default"
+)
+def test_the_path_limit_is_the_one_windows_applies(tmp_path):
+    assert storage.PATH_LIMIT == 259
+    folder = _folder_of_length(tmp_path, 200)
+    folder.mkdir()
+    room = 259 - 200 - 1 - len("..12345678.tmp")
+    storage.write_atomic(folder / ("x" * room), b"fits")
+    assert storage.name_fits(folder, "y" * room)
+    assert not storage.name_fits(folder, "y" * (room + 1))
+    with pytest.raises(OSError):
+        storage.write_atomic(folder / ("y" * (room + 1)), b"one character too long")
+    assert [path.name for path in folder.iterdir()] == ["x" * room]
+
+
 def test_store_image_copies_under_generated_name(tmp_path):
     pixels = random.Random(2).randbytes(3_000_000)
     stored = store_image(tmp_path, "img-2", "β-actin 10 µM.TIF", io.BytesIO(pixels))

@@ -5,7 +5,12 @@ import csv
 
 import pytest
 
-from proteia.core.export import LANE_TABLE_DECIMALS, lane_table_bytes, write_lane_table
+from proteia.core.export import (
+    LANE_TABLE_DECIMALS,
+    LANE_TABLE_RATIO_DECIMALS,
+    lane_table_bytes,
+    write_lane_table,
+)
 
 BOM = b"\xef\xbb\xbf"
 
@@ -29,9 +34,9 @@ def test_lane_table_round_trips_non_ascii_names(tmp_path):
     assert path.read_bytes().startswith(BOM)  # Excel detects UTF-8 from the BOM
     assert _read_rows(path) == [
         ["lane", "condition", "sample", "include", "β-actin", "α-tubulin"],
-        ["0", "vehicle", "α1", "yes", "1.0", "0.5"],
-        ["1", "10 µM", "β2", "yes", "2.5", ""],
-        ["2", "10 µM", "", "no", "", "3.25"],
+        ["1", "vehicle", "α1", "yes", "1.0", "0.5"],  # lanes numbered from 1, as the app does
+        ["2", "10 µM", "β2", "yes", "2.5", ""],
+        ["3", "10 µM", "", "no", "", "3.25"],
     ]
 
 
@@ -101,8 +106,8 @@ def test_lane_table_bytes_match_the_written_file(tmp_path):
     assert LANE_TABLE_DECIMALS == 3
     rows = (
         "lane,condition,sample,include,β-actin,β-actin clipped\r\n"
-        "0,vehicle,α1,yes,1.235,no\r\n"  # rounded to LANE_TABLE_DECIMALS
-        "1,10 µM,,no,,\r\n"
+        "1,vehicle,α1,yes,1.235,no\r\n"  # rounded to LANE_TABLE_DECIMALS
+        "2,10 µM,,no,,\r\n"
     )
     assert data == BOM + rows.encode()
 
@@ -117,3 +122,38 @@ def test_lane_table_bytes_match_the_written_file(tmp_path):
             clipped={"p": [True]},
         )
     assert not collision.exists()  # checked before the file is opened
+
+
+def test_lane_table_series_columns_follow_the_proteins():
+    data = lane_table_bytes(
+        ["vehicle", "10 µM", "10 µM"],
+        ["α1", "β2", None],
+        [True, True, False],
+        [("β-actin", [1.0, 2.0, None])],
+        clipped={"β-actin": [False, None, None]},
+        series=[
+            ("β-actin ÷ GAPDH normalized", [0.123456789, None, 2.0]),
+            ("β-actin ÷ GAPDH fold change vs vehicle", [1.0, float("nan"), float("inf")]),
+        ],
+    )
+    assert LANE_TABLE_RATIO_DECIMALS == 6
+    rows = (
+        "lane,condition,sample,include,β-actin,β-actin clipped,"
+        "β-actin ÷ GAPDH normalized,β-actin ÷ GAPDH fold change vs vehicle\r\n"
+        "1,vehicle,α1,yes,1.0,no,0.123457,1.0\r\n"  # rounded to LANE_TABLE_RATIO_DECIMALS
+        "2,10 µM,β2,yes,2.0,,,\r\n"  # no value, or none that is finite: an empty cell
+        "3,10 µM,,no,,,2.0,\r\n"
+    )
+    assert data == BOM + rows.encode()
+    with pytest.raises(ValueError, match="2 values but there are 3 lanes"):
+        lane_table_bytes(["a"] * 3, [None] * 3, [True] * 3, [], series=[("r", [1.0, 2.0])])
+    with pytest.raises(ValueError, match="share a name"):
+        lane_table_bytes(["a"], [None], [True], [("r", [1.0])], series=[("r", [1.0])])
+
+
+def test_lane_table_cells_are_written_as_typed():
+    # Provisional (#53): a cell that a spreadsheet reads as a formula is not
+    # changed; whether to guard such cells is the maintainer's decision.
+    data = lane_table_bytes(["-DOX", "+LPS", "=1+1", "@x"], [None] * 4, [True] * 4, [])
+    rows = data.decode("utf-8-sig").splitlines()[1:]
+    assert [row.split(",")[1] for row in rows] == ["-DOX", "+LPS", "=1+1", "@x"]

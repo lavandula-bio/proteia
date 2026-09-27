@@ -11,6 +11,7 @@ import dataclasses
 import http.client
 import io
 import json
+import os
 import shutil
 import threading
 import time
@@ -893,6 +894,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "DELETE", f"/api/images/{second['image_id']}"
     )
     answers["POST /api/requantify"] = client.ok("POST", "/api/requantify")  # a no-op here
+    answers["POST /api/export"] = client.ok("POST", "/api/export", {"formats": ["svg"]})
     answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
 
     revisions = []
@@ -2476,3 +2478,166 @@ def test_a_malformed_row_box_is_refused(client, tmp_path, body):
     _, protein = ready(client, tmp_path)
     body = {"protein_id": protein, **body}
     assert unchanged_refusal(client, "POST", "/api/boxes/row", body) == ("invalid_input", [])
+
+
+# --- The export bundle (#53) ---
+
+SAMPLE = "Sample µ"
+SAMPLE_FILES = [
+    "lane-table (Excluding lane 4).csv",
+    "lane-table (All lanes).csv",
+    "chart β-catenin ÷ α-tubulin (Excluding lane 4).svg",
+    "chart β-catenin ÷ α-tubulin (Excluding lane 4).png",
+    "chart β-catenin ÷ α-tubulin (All lanes).svg",
+    "chart β-catenin ÷ α-tubulin (All lanes).png",
+    "README.txt",
+    "export.record.json",
+]
+
+
+def open_sample(client: Client) -> dict:
+    """The conftest sample project, saved in the projects root and opened."""
+    project = make_project()
+    folder = client.root / SAMPLE
+    write_image_files(folder, project)
+    storage.save_project(project, folder)
+    return client.ok("POST", "/api/projects/open", {"name": SAMPLE})
+
+
+def export_folders(client: Client) -> list[str]:
+    exports = client.root / SAMPLE / storage.EXPORTS_DIR
+    return sorted(path.name for path in exports.iterdir()) if exports.is_dir() else []
+
+
+def test_an_export_answers_its_folder_and_files(client):
+    before = open_sample(client)
+    project_json = (client.root / SAMPLE / storage.PROJECT_FILE).read_bytes()
+    status, answer = client.call("POST", "/api/export", {})
+    assert status == 201, answer
+    name = answer["folder"].removeprefix("exports/")
+    assert answer["folder"] == f"exports/{name}" and "/" not in name
+    assert answer["files"] == SAMPLE_FILES
+    folder = client.root / SAMPLE / storage.EXPORTS_DIR / name
+    assert sorted(path.name for path in folder.iterdir()) == sorted(SAMPLE_FILES)
+    # Not a change: the same project and results, at the same revision.
+    assert answer["project"] == before["project"]
+    assert answer["results"] == before["results"]
+    assert (client.root / SAMPLE / storage.PROJECT_FILE).read_bytes() == project_json
+
+    status, answer = client.call("POST", "/api/export")  # no body: the default formats
+    assert status == 201 and answer["files"] == SAMPLE_FILES
+    answer = client.ok("POST", "/api/export", {"formats": ["pdf"]})
+    assert [name for name in answer["files"] if name.startswith("chart ")] == [
+        "chart β-catenin ÷ α-tubulin (Excluding lane 4).pdf",
+        "chart β-catenin ÷ α-tubulin (All lanes).pdf",
+    ]
+    assert len(export_folders(client)) == 3
+
+
+def test_an_export_uses_the_workspaces_result_settings(client):
+    open_sample(client)
+    client.workspace._settings = api.ResultSettings(
+        plot_conditions=("vehicle",),
+        error_type=ErrorType.SEM,
+        method=ReduceMethod.REPRESENTATIVE,
+    )
+    answer = client.ok("POST", "/api/export", {"formats": ["svg"]})
+    folder = client.root / SAMPLE / answer["folder"]
+    doc = json.loads((folder / "export.record.json").read_bytes())
+    assert doc["results"] == {
+        "method": "representative",
+        "error_type": "SEM",
+        "plot_conditions": ["vehicle"],
+        "excluded_lanes": [3],
+    }
+    # What the screen shows, each setting of it.
+    settings = {"error_type": "SEM", "plot_conditions": ["vehicle"], "method": "representative"}
+    assert answer["results"]["settings"] == settings
+    [chart] = answer["results"]["sets"][0]["series"]
+    assert chart["chart"]["error_type"] == "SEM"
+    assert [bar["label"] for bar in chart["chart"]["bars"]] == ["vehicle"]
+    svg = (folder / "chart β-catenin ÷ α-tubulin (Excluding lane 4).svg").read_bytes()
+    assert svg == render_svg(PlotSpec.model_validate(chart["chart"]))
+
+
+def test_an_export_folder_is_revealed_on_request(client):
+    open_sample(client)
+    answer = client.ok("POST", "/api/export", {"formats": []})
+    assert answer["files"] == SAMPLE_FILES[:2] + SAMPLE_FILES[-2:]  # an empty list: no chart
+    assert client.call("POST", "/api/project/reveal", {"folder": answer["folder"]})[0] == 204
+    assert client.revealed == [client.root / SAMPLE / answer["folder"]]
+    assert client.call("POST", "/api/project/reveal")[0] == 204  # the project folder
+    assert client.revealed[-1] == client.root / SAMPLE
+
+
+@pytest.mark.parametrize(
+    "folder",
+    [
+        "",
+        "exports",
+        "exports/",
+        "images",
+        "project.json",
+        "exports/.",
+        "exports/..",
+        "exports/../images",
+        "../exports/x",
+        "exports/a/b",
+        "exports\\x",
+        "/exports/x",
+        "C:/exports/x",
+        "exports/C:x",
+        "exports/...",  # Windows drops the dots: the exports folder itself
+        "exports/ ",
+        "exports/x.",
+        "exports/a\u0007b",
+    ],
+)
+def test_only_an_export_folder_can_be_revealed(client, folder):
+    open_sample(client)
+    (client.root / SAMPLE / "exports" / "x").mkdir()  # "exports/x." would reach it on Windows
+    assert client.refused("POST", "/api/project/reveal", {"folder": folder})[:2] == (
+        422,
+        "invalid_input",
+    )
+    assert client.revealed == []
+
+
+def test_a_missing_export_folder_is_not_revealed(client):
+    open_sample(client)
+    (client.root / SAMPLE / "exports" / "a file").write_bytes(b"")
+    for folder in ("exports/2026-01-01 0000", "exports/a file"):
+        assert client.refused("POST", "/api/project/reveal", {"folder": folder})[:2] == (
+            404,
+            "folder_not_found",
+        )
+    assert client.revealed == []
+
+
+def test_an_export_is_refused_with_a_code_and_writes_nothing(client):
+    assert client.refused("POST", "/api/export", {})[:2] == (409, "no_project")
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    assert client.refused("POST", "/api/export", {})[:2] == (422, "no_lanes")
+    assert list((client.root / "Blot" / "exports").iterdir()) == []
+
+    open_sample(client)
+    for body in (
+        {"formats": ["svg", "gif"]},
+        {"formats": ["SVG"]},
+        {"formats": "svg"},
+        {"formats": [1]},
+        {"format": ["svg"]},
+    ):
+        assert client.refused("POST", "/api/export", body)[:2] == (422, "invalid_input"), body
+    (client.root / SAMPLE / "images" / "img-2.tif").write_bytes(b"other pixels")
+    assert client.refused("POST", "/api/export", {}) == (422, "image_file_changed", ["img-2"])
+    assert export_folders(client) == []
+
+
+def test_an_export_under_too_long_a_path_is_refused(client, monkeypatch):
+    open_sample(client)
+    project = os.path.abspath(client.root / SAMPLE)
+    # A path limit that leaves an export's files too little room.
+    monkeypatch.setattr(storage, "PATH_LIMIT", len(project) + 60)
+    assert client.refused("POST", "/api/export", {})[:2] == (422, "path_too_long")
+    assert export_folders(client) == []

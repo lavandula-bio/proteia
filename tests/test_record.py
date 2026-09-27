@@ -25,7 +25,7 @@ from conftest import (
 from proteia.core import operations as ops
 from proteia.core import quantify, rowdetect
 from proteia.core.analyze import ReduceMethod
-from proteia.core.export import LANE_TABLE_DECIMALS
+from proteia.core.export import CHART_PNG_DPI, LANE_TABLE_DECIMALS, LANE_TABLE_RATIO_DECIMALS
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.model import ImageKind, LogEntry, Polarity, Project, Role
 from proteia.core.plotspec import ErrorType
@@ -224,6 +224,9 @@ def test_settings_are_the_code_constants():
         },
         "clipped_pixels_threshold": CLIPPED_PIXELS_THRESHOLD,
         "lane_table_decimals": LANE_TABLE_DECIMALS,
+        "lane_table_ratio_decimals": LANE_TABLE_RATIO_DECIMALS,
+        "lane_table_first_lane": 1,  # the lane column numbers lanes as the app does
+        "chart_png_dpi": CHART_PNG_DPI,
         "detect_row": rowdetect.settings(),  # every row-box detection constant
     }
     parameters = inspect.signature(grow_box).parameters

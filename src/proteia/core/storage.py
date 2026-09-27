@@ -9,6 +9,9 @@ types). A project folder, which may have any name, holds::
     exports/                        created by save_project, for exported results:
     exports/lane-table.csv          the per-lane table
     exports/lane-table.record.json  its reproducibility record (proteia.core.record)
+    exports/2026-09-27 1532/        an export folder, one per export: lane tables,
+                                    charts, README.txt and export.record.json
+                                    (proteia.core.operations.export_bundle)
 
 Stored names come only from validated ids plus a whitelisted suffix; an image's
 ``original_name`` never becomes a path. A crash can leave orphan files (a temp
@@ -100,6 +103,13 @@ HASH_EXCLUDE: Final = frozenset({"next_id", "log"})
 # fail on Windows: retry with a doubling delay (about 0.75 s in all).
 REPLACE_ATTEMPTS = 5
 REPLACE_DELAY = 0.05  # seconds; tests set it to 0
+# The longest file name most file systems take, in UTF-8 bytes (ext4, APFS;
+# NTFS counts 255 UTF-16 code units, never more than a name's UTF-8 bytes).
+NAME_LIMIT_BYTES = 255  # tests lower it
+# The longest path Windows takes while long paths are off, its default:
+# MAX_PATH (260) less its terminating NUL, in UTF-16 code units. None where no
+# such limit applies.
+PATH_LIMIT: int | None = 259 if os.name == "nt" else None  # tests set it
 _CHUNK: Final = 1 << 20  # store_image copies 1 MiB at a time
 
 _IMAGE_ID = TypeAdapter(ImageId)
@@ -478,6 +488,25 @@ def _temp_file(directory: Path, name: str, suffix: str) -> tuple[int, Path]:
     # The same directory means the same volume, so the later replace is atomic.
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{name}.", suffix=suffix)
     return fd, Path(tmp)
+
+
+def name_fits(folder: Path, name: str) -> bool:
+    """Whether :func:`write_atomic` can write a file named ``name`` into
+    ``folder`` (which need not exist yet) within the file system's length limits.
+
+    It writes the file through a temp file with a longer name,
+    ``.<name>.<8 random characters>.tmp`` (:func:`tempfile.mkstemp`'s names),
+    whose name must hold at most :data:`NAME_LIMIT_BYTES` UTF-8 bytes and, on
+    Windows, whose absolute path must hold at most :data:`PATH_LIMIT` UTF-16
+    code units (a character outside the Basic Multilingual Plane counts two).
+    """
+    temp = f".{name}.{'x' * 8}.tmp"
+    if len(temp.encode("utf-8", "surrogatepass")) > NAME_LIMIT_BYTES:
+        return False
+    if PATH_LIMIT is None:
+        return True
+    path = os.path.join(os.path.abspath(folder), temp)
+    return len(path.encode("utf-16-le", "surrogatepass")) // 2 <= PATH_LIMIT
 
 
 def write_atomic(path: Path, data: bytes, *, private: bool = False) -> None:

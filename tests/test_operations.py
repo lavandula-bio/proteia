@@ -2098,7 +2098,7 @@ def test_export_lane_table(tmp_path, monkeypatch):
         "GAPDH clipped",
     ]
     assert rows[1] == [
-        "0",
+        "1",  # lanes numbered from 1, as the app does
         "vehicle",
         "v1",
         "yes",
@@ -2109,7 +2109,7 @@ def test_export_lane_table(tmp_path, monkeypatch):
         "5120.5",
         "",
     ]
-    assert rows[3][:6] == ["2", "10 µM", "a1", "yes", "", ""]  # no β-catenin box in lane 2
+    assert rows[3][:6] == ["3", "10 µM", "a1", "yes", "", ""]  # no β-catenin box in lane 3
     assert rows[4][3] == "no"
     assert rows[4][5] == "no"  # band-12 was checked and is not clipped
     assert len(rows) == 5

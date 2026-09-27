@@ -300,15 +300,15 @@ def test_the_full_flow_gives_the_true_fold_changes(tmp_path, sample_folder):
         # measured: β-catenin 0.855-0.886, α-tubulin 0.863-0.904
         assert 0.83 <= min(share) and max(share) <= 0.93, column.name
 
-    # The module and its --help tell users to match the lane-table export with
-    # the truth on the sample, because the export numbers lanes from 0 and the
-    # truth table from 1. Matched on the sample, every net meets its own truth.
+    # The lane-table export numbers lanes from 1, as the truth table and the app
+    # do, so the two files' rows match on the lane as well as on the sample.
+    # Matched so, every net meets its own truth.
     with ops.export_lane_table(s).open(encoding="utf-8-sig", newline="") as f:
         exported = {lane["sample"]: lane for lane in csv.DictReader(f)}
     assert sorted(exported) == sorted(r["sample"] for r in rows)
     for r in rows:
         lane = exported[r["sample"]]
-        assert int(lane["lane"]) == int(r["lane"]) - 1, r["sample"]
+        assert lane["lane"] == r["lane"], r["sample"]
         for name in (samples.TARGET, samples.LOADING_CONTROL):
             assert 0.83 <= float(lane[name]) / float(r[f"{name} true signal"]) <= 0.93
 
@@ -410,7 +410,7 @@ def test_python_m_shows_the_help():
     assert samples.DEFAULT_FOLDER in shown.stdout and "--force" in shown.stdout
     text = " ".join(shown.stdout.split())
     # How to match the results with the truth table (see the full-flow test).
-    assert "match rows on the sample" in text and "numbers them from 0" in text
+    assert "match rows on the lane or the sample" in text and "number lanes from 1" in text
 
 
 def test_git_ignores_the_default_folder():
