@@ -3,6 +3,7 @@
 // shows the open project's images, proteins, boxes and checks. Every edit, and
 // every undo and redo, goes to the server, which answers with the stored
 // project and its results; the page only draws what it is given.
+import { ChartCards } from "/static/charts.js";
 import { Dock } from "/static/dock.js";
 import {
   $,
@@ -50,8 +51,10 @@ class ApiError extends Error {
   }
 }
 
-// Every request names the token in a header; nothing relies on cookies.
-async function request(method, path, { json, body, contentType } = {}) {
+// Every request names the token in a header; nothing relies on cookies. An
+// aborted `signal` cancels it; `priority` orders it among those waiting for a
+// connection (the browser's fetch priority).
+async function request(method, path, { json, body, contentType, signal, priority } = {}) {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
@@ -59,7 +62,14 @@ async function request(method, path, { json, body, contentType } = {}) {
   } else if (contentType) {
     headers.set("Content-Type", contentType);
   }
-  const response = await fetch(path, { method, headers, body, cache: "no-store" });
+  const response = await fetch(path, {
+    method,
+    headers,
+    body,
+    cache: "no-store",
+    signal,
+    priority,
+  });
   if (response.status === 401) {
     showStatus(NEEDS_LAUNCH);
     throw new ApiError(401, null);
@@ -325,6 +335,26 @@ const laneTable = new LaneTable({
   status: showStatus,
 });
 
+// Each chart's drawing is fetched with the token ("Updating…" counts it until
+// it arrives or no card awaits it), at a low priority: an edit waiting for a
+// connection goes before the drawings waiting with it. One the server no
+// longer keeps is asked for again after the project is read again; that
+// answer is shown only if it is about the opening shown, and not while
+// another project is being opened (openProject shows that one).
+const charts = new ChartCards({
+  fetch: (path, signal) =>
+    dock.track(
+      request("GET", path, { signal, priority: "low" }).then((response) => response.blob()),
+      { chart: true },
+    ),
+  reread: async () => {
+    const answer = await call("GET", "/api/project");
+    if (opening === null && sameOpening(answer)) {
+      applyAnswer(answer);
+    }
+  },
+});
+
 // --- Projects ---
 
 async function showProjects() {
@@ -393,6 +423,7 @@ async function openProject(path, name) {
     }
     proteinPanel.forgetTyped();
     laneTable.forgetTyped();
+    charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
     $("lane-picker").hidden = true; // its retry places a box in the project it asked about
     applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
     lastBoxStep = null; // log numbers repeat across projects
@@ -480,6 +511,7 @@ function render() {
   renderHint(project, image);
   renderView(project);
   laneTable.render(project, state.results);
+  charts.render(state.results);
   dock.render(state.results);
 }
 

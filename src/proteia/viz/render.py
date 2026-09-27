@@ -33,6 +33,8 @@ _BAR_FACE = "#cbd5e1"
 _BAR_EDGE = "#334155"
 _POINT = "#0f172a"
 _TITLE_MARGIN_PT = 4.0  # the gap a title line keeps from the figure's edges
+# The core's tests as a reader names them; another is named by its id, spaced.
+_TEST_NAMES: Final = {"welch_t": "Welch t-test", "anova_oneway": "One-way ANOVA"}
 # Any character outside XML 1.0's Char production.
 _NOT_XML: Final = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
@@ -67,11 +69,18 @@ def _point_xs(center: float, n: int, spread: float = 0.18) -> list[float]:
     return [center - spread + i * step for i in range(n)]
 
 
+def _p_text(p: float) -> str:
+    """A p-value as the page's captions write it: below 0.0001 as a bound,
+    otherwise to 3 significant digits."""
+    return "p < 0.0001" if p < 0.0001 else f"p = {p:.3g}"
+
+
 def render_figure(spec: PlotSpec) -> Figure:
     """Render the spec to a matplotlib :class:`Figure` (no global pyplot state).
 
     The title's lines: the spec's title, its subtitle (the result set) when it has
-    one, the test and its p when a test ran, and the spec's note when it has one:
+    one, the test (by the name a reader knows it by) and its p when a test ran,
+    and the spec's note when it has one:
     why no test ran, or which groups the test that ran leaves out. So a chart
     never drops its test, or a group from it, without a word. A line too wide
     for the figure is broken over lines (:func:`_fit_title`), so a saved figure
@@ -108,7 +117,8 @@ def render_figure(spec: PlotSpec) -> Figure:
     if spec.subtitle:
         lines.append(spec.subtitle)
     if spec.test_name and spec.test_p is not None:
-        lines.append(f"{spec.test_name}: p = {spec.test_p:.3g}")
+        name = _TEST_NAMES.get(spec.test_name, spec.test_name.replace("_", " "))
+        lines.append(f"{name}: {_p_text(spec.test_p)}")
     if spec.test_note:
         lines.append(spec.test_note)
     lines = [_shown(line) for line in lines]

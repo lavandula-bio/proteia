@@ -34,7 +34,7 @@ DRAWINGS_KEPT: Final = 64
 KEY_PATTERN: Final = re.compile(r"[0-9a-f]{32}")
 # Part of every key: change it when the same spec is drawn differently, so a
 # browser never keeps a drawing under the key of a spec drawn anew.
-_KEY_VERSION: Final = b"render-v1\n"
+_KEY_VERSION: Final = b"render-v3\n"  # v2: tests named as readers name them; v3: p < 0.0001
 _UNKNOWN: Final = "no chart has this key; read the project again for its charts' URLs"
 
 

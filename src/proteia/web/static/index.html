@@ -215,7 +215,9 @@
         </section>
         <section id="charts-panel" class="dock-panel charts-panel" aria-labelledby="charts-title">
           <h3 id="charts-title" class="panel-title">Charts</h3>
-          <p class="charts-empty">Charts appear here.</p>
+          <p id="charts-empty" class="charts-empty" hidden></p>
+          <!-- One card per target and loading control; charts.js fills it. -->
+          <ul id="chart-cards" class="chart-cards"></ul>
         </section>
       </div>
     </section>
@@ -235,6 +237,15 @@
   <p id="projects-state" class="hint" role="status" hidden></p>
   <p id="projects-error" class="error" role="alert"></p>
   <button id="projects-close" type="button">Close</button>
+</dialog>
+
+<!-- A chart card enlarged (Enlarge on a card); charts.js fills it. -->
+<dialog id="chart-dialog" class="chart-dialog" aria-labelledby="chart-dialog-title">
+  <div class="chart-dialog-head">
+    <h2 id="chart-dialog-title"></h2>
+    <button id="chart-dialog-close" type="button" autofocus>Close</button>
+  </div>
+  <div id="chart-dialog-body"></div>
 </dialog>
 </body>
 </html>
