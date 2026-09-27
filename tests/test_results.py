@@ -14,7 +14,7 @@ from collections.abc import Callable
 
 import pytest
 
-from conftest import assert_strict_json, make_project
+from conftest import as_legacy, assert_strict_json, make_project
 from proteia.core import model, results
 from proteia.core.analyze import ReduceMethod, Tier, compare
 from proteia.core.model import (
@@ -57,6 +57,12 @@ from test_regression_baseline import (
 )
 
 MU = "μ"  # Greek mu; the fixture's labels use the micro sign µ (U+00B5)
+# The background of a band added to the sample (img-2, ring_median_v1), whole ring.
+RING = {
+    "background_level": 199.88251668003335,
+    "background_mode": "symmetric",
+    "background_spread": 0.0,
+}
 
 
 def _batch(*changes: Callable[[Project], object]) -> model.Batch:
@@ -408,6 +414,7 @@ def test_extra_bands_are_reported_and_not_quantified():
                 box=Box(x=18, y=80),
                 net=999.0,
                 source=ProposalSource.MANUAL,
+                **RING,
             )
         )
 
@@ -418,6 +425,107 @@ def test_extra_bands_are_reported_and_not_quantified():
     assert res.proteins[0].nets[0] == 4279.740326695199  # the first band's net, not 999
     assert res.proteins[0].band_ids[0] == "band-10"
     assert lane_nets(batch)["prot-7"][0] == 4279.740326695199
+
+
+# --- the background notices (#83) ---
+
+
+def _background(band_id: str, **fields) -> Callable[[Project], None]:
+    def edit(draft: Project) -> None:
+        band = draft.batch.find_band(band_id)[1]
+        for name, value in fields.items():
+            setattr(band, name, value)
+
+    return edit
+
+
+def _all(res: results.Results, code: NoticeCode) -> list[results.Notice]:
+    return [notice for notice in res.notices if notice.code is code]
+
+
+def test_a_ring_cut_short_is_reported_with_the_membrane_to_leave():
+    # β-catenin (24x14 boxes): lanes 0 and 1, and lane 3, which is excluded;
+    # α-tubulin (20x10): lane 0. A whole ring (symmetric) is never reported.
+    res = compute_results(
+        _batch(
+            _background("band-10", background_mode="asymmetric"),
+            _background("band-11", background_mode="image"),
+            _background("band-12", background_mode="image"),
+            _background("band-13", background_mode="asymmetric"),
+        )
+    )
+
+    def notice(name: str, protein_id: str, lanes: tuple[int, ...], margins: str):
+        where = "lane 1" if lanes == (0,) else "lanes 1, 2"
+        return results.Notice(
+            code=NoticeCode.BACKGROUND_FALLBACK,
+            level=Level.WARNING,
+            message=(
+                f"{name!r} has too little membrane around its box in {where}: the image edge"
+                " or other boxes cut it, so the background there is estimated less surely;"
+                f" when cropping, leave about {margins} beside them (one box height, 0.4 box"
+                " width)"
+            ),
+            protein_ids=(protein_id,),
+            lane_indices=lanes,
+        )
+
+    assert _all(res, NoticeCode.BACKGROUND_FALLBACK) == [
+        notice("β-catenin", "prot-7", (0, 1), "14 px above and below the bands and 10 px"),
+        notice("α-tubulin", "prot-8", (0,), "10 px above and below the bands and 8 px"),
+    ]
+    # The excluded lane is reported with every lane included.
+    [every] = _all(res.all_lanes, NoticeCode.BACKGROUND_FALLBACK)
+    assert (every.protein_ids, every.lane_indices) == (("prot-7",), (0, 1, 3))
+    assert _all(compute_results(make_project().batch), NoticeCode.BACKGROUND_FALLBACK) == []
+
+
+def test_a_background_uneven_around_the_box_is_reported():
+    # band-10 (β-catenin, lane 0): net 4279.74 over a 24x14 box, so its net
+    # moves by 5 % at a spread of 0.05 * 4279.74 / 336 levels.
+    limit = 0.05 * 4279.740326695199 / 336
+    res = compute_results(
+        _batch(
+            _background("band-10", background_spread=limit * 1.001),
+            _background("band-11", background_spread=limit * 0.999),  # net 4832: well under
+            _net("band-14", 0.0),  # α-tubulin lane 1: any spread on a net of 0
+            _background("band-14", background_spread=1e-9),
+            _net("band-15", 0.0),  # α-tubulin lane 2: no spread, nothing to report
+        )
+    )
+    uneven = _all(res, NoticeCode.BACKGROUND_UNEVEN)
+    assert [(n.protein_ids, n.lane_indices, n.level) for n in uneven] == [
+        (("prot-7",), (0,), Level.WARNING),
+        (("prot-8",), (1,), Level.WARNING),
+    ]
+    assert uneven[0].message == (
+        "'β-catenin' has an uneven background around its box in lane 1: it differs from"
+        " side to side by more than 5% of the net; check the membrane there"
+    )
+    just_under = _batch(_background("band-10", background_spread=limit * 0.999))
+    assert _all(compute_results(just_under), NoticeCode.BACKGROUND_UNEVEN) == []
+
+
+def test_a_legacy_project_is_told_to_requantify():
+    legacy = as_legacy(make_project())
+    res = compute_results(legacy.batch)
+    notice = _one(res, NoticeCode.LEGACY_BACKGROUND)
+    assert notice == results.Notice(
+        code=NoticeCode.LEGACY_BACKGROUND,
+        level=Level.INFO,
+        message=(
+            "nets use the whole-image median background, as measured before the local"
+            " background; requantify to measure each band's background from the membrane"
+            " around its box"
+        ),
+        protein_ids=("prot-7", "prot-8", "prot-9"),
+    )
+    # Before any lane is declared too, and not once the project measures locally.
+    no_lanes = legacy.batch.model_copy(update={"lanes": [], "reference_condition": None})
+    assert NoticeCode.LEGACY_BACKGROUND in _codes(compute_results(no_lanes))
+    assert NoticeCode.LEGACY_BACKGROUND not in _codes(compute_results(make_project().batch))
+    # The same numbers either way: the notice is about the method only.
+    assert lane_nets(legacy.batch) == lane_nets(make_project().batch)
 
 
 # --- purity ---
@@ -456,6 +564,7 @@ def _baseline_batch(reference: str | None) -> model.Batch:
     on one image with its fixed boxes, and its dark-on-light nets as the stored nets."""
     computed = _compute()
     nets = computed["nets"]["dark_on_light"]
+    background = computed["background"]
     image = ImageRef(
         id="img-2",
         file="img-2.tif",
@@ -465,7 +574,7 @@ def _baseline_batch(reference: str | None) -> model.Batch:
         width=WIDTH,
         height=HEIGHT,
         polarity=Polarity.DARK_ON_LIGHT,
-        background=computed["background"]["dark_on_light"],
+        background=background["image_median"]["dark_on_light"],
     )
     number = iter(range(5, 100))
     proteins = [
@@ -481,6 +590,9 @@ def _baseline_batch(reference: str | None) -> model.Batch:
                     lane_index=i,
                     box=_box(cx, ROW_Y[name]),
                     net=nets[name][i],
+                    background_level=background["levels"]["dark_on_light"][name][i],
+                    background_mode=background["modes"]["dark_on_light"][name][i],
+                    background_spread=background["spreads"]["dark_on_light"][name][i],
                     source=ProposalSource.MANUAL,
                 )
                 for i, cx in enumerate(LANE_X)
@@ -551,6 +663,19 @@ def test_compute_matches_the_regression_baseline(method, reference, kind, golden
 
     res = compute_results(batch, method=method)
     assert res.notices == [
+        # The blot's ±2-level texture moves target lanes 1 and 7 by more than 5 %
+        # of their nets from side to side (lane 6, as bad, is excluded).
+        results.Notice(
+            code=NoticeCode.BACKGROUND_UNEVEN,
+            level=Level.WARNING,
+            message=(
+                f"{TARGET!r} has an uneven background around its box in lanes 1, 7: it"
+                " differs from side to side by more than 5% of the net; check the membrane"
+                " there"
+            ),
+            protein_ids=("prot-3",),
+            lane_indices=(0, 6),
+        ),
         results.Notice(
             code=NoticeCode.TECHNICAL_REPEATS,
             level=Level.INFO,
@@ -559,7 +684,7 @@ def test_compute_matches_the_regression_baseline(method, reference, kind, golden
                 + " 1 sample(s) with technical repeats (repeats do not count as n)"
             ),
             conditions=(REFERENCE,),
-        )
+        ),
     ]
     [s] = res.series
     assert s.value_kind is kind
@@ -750,6 +875,7 @@ def _no_variation(draft: Project) -> None:
             box=Box(x=98, y=43),
             net=1000.0,
             source=ProposalSource.MANUAL,
+            **RING,
         )
     )
     for band in beta.bands:

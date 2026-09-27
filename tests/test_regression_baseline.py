@@ -4,7 +4,10 @@
 Runs the chain the app uses today, from pixels to statistics, on a deterministic
 synthetic blot with fixed boxes, and compares every output with the golden
 values in ``data/regression_baseline.json`` (tolerance recorded in that file).
-Box placement is not covered: the boxes are fixed inputs.
+Box placement is not covered: the boxes are fixed inputs. The nets are the
+local background's (ring_median v1, #83), all sixteen boxes quantified
+together as the operations quantify an image; the golden file also keeps each
+band's background level, mode and spread, and the image medians.
 
 A deliberate change to the numbers regenerates the file with
 
@@ -16,12 +19,14 @@ and the pull request that does so says why the numbers moved.
 import dataclasses
 import functools
 import json
+import math
 import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from proteia.core import quantify
 from proteia.core.analyze import (
     Batch,
     ProteinNets,
@@ -34,7 +39,7 @@ from proteia.core.analyze import (
     reduce_samples,
 )
 from proteia.core.model import Box, BoxSize
-from proteia.core.quantify import estimate_background, net_signal
+from proteia.core.quantify import band_backgrounds, estimate_background, quantify_nets
 
 GOLDEN = Path(__file__).parent / "data" / "regression_baseline.json"
 
@@ -71,14 +76,23 @@ def _box(cx: int, cy: int) -> Box:
     return Box(x=cx - BOX_SIZE.width // 2, y=cy - BOX_SIZE.height // 2)
 
 
-def _nets(image: np.ndarray, background: float, *, dark_on_light: bool) -> dict:
-    return {
-        name: [
-            net_signal(image, _box(cx, cy), BOX_SIZE, background, dark_on_light=dark_on_light)
-            for cx in LANE_X
-        ]
-        for name, cy in ROW_Y.items()
-    }
+def _quantified(image: np.ndarray, *, dark_on_light: bool) -> tuple[dict, dict, dict, dict]:
+    """Every box on the image quantified together, as the operations do (each
+    ring leaves out all the boxes, of both proteins): per protein, the nets
+    (:func:`~proteia.core.quantify.quantify_nets`, ring_median) and the
+    background level, mode and spread of each band."""
+    placed = [(name, _box(cx, cy)) for name, cy in ROW_Y.items() for cx in LANE_X]
+    rects = [box.rect(BOX_SIZE) for _, box in placed]
+    sizes = [(BOX_SIZE.width, BOX_SIZE.height)] * len(placed)
+    kwargs = {"dark_on_light": dark_on_light, "integral": False}  # a float image
+    nets = quantify_nets(image, rects, sizes, method="ring_median", **kwargs)
+    found = band_backgrounds(image, rects, sizes, fallback=estimate_background(image), **kwargs)
+    out: tuple[dict, dict, dict, dict] = ({}, {}, {}, {})
+    for (name, _), net, background in zip(placed, nets, found, strict=True):
+        values = (net, background.level, background.mode, background.spread)
+        for table, value in zip(out, values, strict=True):
+            table.setdefault(name, []).append(value)
+    return out
 
 
 def _stats(groups: dict[str, list[float]]) -> dict:
@@ -98,14 +112,24 @@ def _stats(groups: dict[str, list[float]]) -> dict:
 def _compute() -> dict:
     dark = _blot()
     light = 255.0 - dark  # the same blot as a light-on-dark image
-    out: dict = {"background": {}, "nets": {}}
+    background: dict = {
+        "method": "ring_median_v1",
+        "image_median": {},  # ImageRef.background: the grow seed level and the fallback
+        "levels": {},
+        "modes": {},
+        "spreads": {},
+    }
+    out: dict = {"background": background, "nets": {}}
     for polarity, image, dark_on_light in (
         ("dark_on_light", dark, True),
         ("light_on_dark", light, False),
     ):
-        background = estimate_background(image)
-        out["background"][polarity] = background
-        out["nets"][polarity] = _nets(image, background, dark_on_light=dark_on_light)
+        background["image_median"][polarity] = estimate_background(image)
+        nets, levels, modes, spreads = _quantified(image, dark_on_light=dark_on_light)
+        out["nets"][polarity] = nets
+        background["levels"][polarity] = levels
+        background["modes"][polarity] = modes
+        background["spreads"][polarity] = spreads
 
     nets = out["nets"]["dark_on_light"]
     batch = Batch(
@@ -192,3 +216,28 @@ def test_baseline_fixture_exercises_repeats_exclusion_and_the_reference():
         assert np.mean(reduced["groups"][REFERENCE]) == pytest.approx(1.0)
         assert reduced["all"]["compare"]["test"] == "anova_oneway"
         assert reduced["two"]["compare"]["test"] == "welch_t"
+
+
+def test_baseline_fixture_exercises_the_local_background(monkeypatch):
+    # Keep the fixture meaningful for the ring_median background (#83): every
+    # ring is whole, both polarities give the same nets, and the blot's
+    # periodic texture (±2 levels) lifts target lanes 0 and 1 as lane haze.
+    computed = _compute()
+    background = computed["background"]
+    for polarity in ("dark_on_light", "light_on_dark"):
+        modes = background["modes"][polarity]
+        assert {mode for row in modes.values() for mode in row} == {"symmetric"}
+    dark, light = computed["nets"]["dark_on_light"], computed["nets"]["light_on_dark"]
+    for name in (TARGET, LOADING):
+        assert light[name] == pytest.approx(dark[name], rel=1e-14)  # measured 1.7e-15
+
+    monkeypatch.setattr(quantify, "RING_HAZE_Z", math.inf)  # no lift at all
+    unlifted = _quantified(_blot(), dark_on_light=True)[1]
+    lifted = background["levels"]["dark_on_light"]
+    # A dark-on-light level is the negated signal-up level: the lift lowers it.
+    lifts = {
+        name: [u - v for u, v in zip(unlifted[name], lifted[name], strict=True)] for name in lifted
+    }
+    assert lifts[TARGET][:2] == [pytest.approx(0.39, abs=0.01), pytest.approx(0.15, abs=0.01)]
+    assert lifts[TARGET][2:] == [0.0] * 6
+    assert lifts[LOADING] == [0.0] * 8

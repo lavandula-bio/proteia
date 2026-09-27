@@ -88,11 +88,8 @@ import numpy as np
 from pydantic import JsonValue
 
 from proteia.core.grow import mad_sigma
-from proteia.core.model import Box, BoxSize, Rect
+from proteia.core.model import BackgroundMode, Box, BoxSize, Rect  # the mode: a band field
 
-# How a band's background level was measured: a ring_median mode, or the one
-# image-wide level of a band quantified before #83.
-BackgroundMode = Literal["symmetric", "asymmetric", "image", "global_median"]
 BackgroundMethod = Literal["global_median", "ring_median"]
 # "pixel": each pixel's contribution floored at 0; "total": the box total floored at 0.
 NetClamp = Literal["pixel", "total"]

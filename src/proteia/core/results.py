@@ -13,7 +13,8 @@ One call gives:
 * one :class:`SeriesResult` per (target, resolved loading control) pairing, with
   its per-lane ratios, fold-changes, reduced groups and chart;
 * typed :class:`Notice` objects, built from the model directly, never by parsing
-  warning strings.
+  warning strings: the background notices, for one, read each band's stored
+  background fields and its protein's box size, never pixels.
 
 Within a result set, each series is reduced once
 (:func:`~proteia.core.analyze.reduce_samples` with that set's include flags). The
@@ -37,7 +38,7 @@ Notice messages count lanes from 1, as the user does; every index field
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from enum import StrEnum
 from functools import partial
 
@@ -62,6 +63,7 @@ from proteia.core.model import Role, lanes_phrase
 from proteia.core.names import name_key, resolve_label
 from proteia.core.plotspec import ErrorType, PlotSpec, ValueKind, build_plotspec
 from proteia.core.project import spine_axes
+from proteia.core.quantify import BACKGROUND_UNEVEN_LIMIT
 
 
 class NoticeCode(StrEnum):
@@ -84,6 +86,13 @@ class NoticeCode(StrEnum):
     EXTRA_BANDS_IGNORED = "extra_bands_ignored"  # band_index > 0 is not quantified yet
     CLIPPED = "clipped"  # bands with pixels at the detector limit: over-exposed, still included
     BELOW_DETECTION = "below_detection"  # not-detected records in included lanes: no value
+    # Bands whose ring is cut short (by the image edge or other boxes): their
+    # level is a robust plane or the image median (quantify.band_backgrounds).
+    BACKGROUND_FALLBACK = "background_fallback"
+    # Bands whose background differs around the box by more than the QC limit.
+    BACKGROUND_UNEVEN = "background_uneven"
+    # Nets above the whole-image median, as quantified before #83: requantify.
+    LEGACY_BACKGROUND = "legacy_background"
 
 
 class Level(StrEnum):
@@ -96,8 +105,11 @@ _INFO_CODES = frozenset(
         NoticeCode.TECHNICAL_REPEATS,
         NoticeCode.REFERENCE_NOT_PLOTTED,
         NoticeCode.EXTRA_BANDS_IGNORED,
+        NoticeCode.LEGACY_BACKGROUND,
     }
 )
+# The background modes of a ring cut short (quantify.band_backgrounds).
+_FALLBACK_MODES = frozenset({"asymmetric", "image"})
 
 
 class Notice(BaseModel, frozen=True):
@@ -245,6 +257,48 @@ def _listed(values: Collection[object]) -> str:
     return ", ".join(repr(v) for v in values)
 
 
+def _background_notices(
+    protein: model.Protein,
+    bands: list[model.Band | None],
+    included: list[bool],
+    note: Callable[..., None],
+) -> None:
+    """The background notices of one protein's first bands (``bands``, joined to
+    the lanes) in the included lanes, from their stored fields and the box size:
+    a ring cut short (``background_fallback``), and a background uneven around
+    the box, its spread moving the net by more than
+    :data:`~proteia.core.quantify.BACKGROUND_UNEVEN_LIMIT` of it
+    (``background_uneven``, also for any spread under a net of 0)."""
+    size = protein.box_size
+    shown = [(i, band) for i, band in enumerate(bands) if band is not None and included[i]]
+    cut = tuple(i for i, band in shown if band.background_mode in _FALLBACK_MODES)
+    if cut:
+        note(
+            NoticeCode.BACKGROUND_FALLBACK,
+            f"{protein.name!r} has too little membrane around its box in {lanes_phrase(cut)}:"
+            " the image edge or other boxes cut it, so the background there is estimated"
+            f" less surely; when cropping, leave about {size.height} px above and below the"
+            f" bands and {round(0.4 * size.width)} px beside them (one box height, 0.4"
+            " box width)",
+            protein_ids=(protein.id,),
+            lane_indices=cut,
+        )
+    uneven = tuple(
+        i
+        for i, band in shown
+        if band.background_spread * size.area > BACKGROUND_UNEVEN_LIMIT * band.net
+    )
+    if uneven:
+        note(
+            NoticeCode.BACKGROUND_UNEVEN,
+            f"{protein.name!r} has an uneven background around its box in"
+            f" {lanes_phrase(uneven)}: it differs from side to side by more than"
+            f" {BACKGROUND_UNEVEN_LIMIT:.0%} of the net; check the membrane there",
+            protein_ids=(protein.id,),
+            lane_indices=uneven,
+        )
+
+
 def _chart(
     groups: dict[str, list[float]],
     point_lanes: dict[str, list[list[int]]],
@@ -388,6 +442,19 @@ def _compute(
             " each lane uses its first band",
             protein_ids=extra,
         )
+    # A project quantified before #83 keeps the whole-image median until it is
+    # requantified; every band then has this mode (the model keeps one method).
+    legacy = tuple(
+        p.id for p in batch.proteins if any(b.background_mode == "global_median" for b in p.bands)
+    )
+    if legacy:
+        note(
+            NoticeCode.LEGACY_BACKGROUND,
+            "nets use the whole-image median background, as measured before the local"
+            " background; requantify to measure each band's background from the membrane"
+            " around its box",
+            protein_ids=legacy,
+        )
     targets = [p for p in batch.proteins if p.role is Role.TARGET]
     loading_controls = [p for p in batch.proteins if p.role is Role.LOADING_CONTROL]
     if not targets:
@@ -432,6 +499,8 @@ def _compute(
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
+    for protein in batch.proteins:  # backgrounds to check, in lanes this set includes
+        _background_notices(protein, joined[protein.id], included, note)
     for column in columns:  # not-detected records in lanes this set includes
         below = tuple(i for i, flag in enumerate(column.detected) if flag is False and included[i])
         if not below:

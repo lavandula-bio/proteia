@@ -41,14 +41,19 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   and a hand-edited file that holds it loads, hashes as if the key were absent and
   is saved without it. Writing the empty value instead would move every existing
   project's hash, so every export would report ``content_changed_outside_log``.
-* The hash covers ``schema_version``, every id, the lane table, the image records
-  (and so the pixels, through each ``sha256``), the calibrations, and the
-  proteins with their bands (stored nets and flags) and their not-detected
-  records. It excludes ``next_id`` and the log (the history: equal content made
-  at other times must hash equal), and the file's formatting. The project never
-  stores its own hash; each log entry stores the hash of the content it left.
+* The hash covers ``schema_version``, the background method, every id, the lane
+  table, the image records (and so the pixels, through each ``sha256``), the
+  calibrations, and the proteins with their bands (stored nets, backgrounds and
+  flags) and their not-detected records. It excludes ``next_id`` and the log
+  (the history: equal content made at other times must hash equal), and the
+  file's formatting. The project never stores its own hash; each log entry
+  stores the hash of the content it left.
 * Loading a file Proteia wrote and saving it again gives the same bytes, because
-  the strict load keeps every type exactly.
+  the strict load keeps every type exactly. A file of an older schema is
+  migrated as it loads (:func:`migrate`, :data:`MIGRATIONS`), in memory, and
+  gets one ``migrate`` log entry; it is written in the new schema at its next
+  save (which :func:`~proteia.core.session.open_project` runs at once, through
+  the session's autosave hook).
 
 The canonical form follows Python's float repr, not RFC 8785 (JSON
 Canonicalization Scheme); switch, with a schema bump, before hashes must be
@@ -66,19 +71,23 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Final, NoReturn
 
 from pydantic import TypeAdapter, ValidationError
 
+import proteia
 from proteia.core.model import (
     IMAGE_SUFFIXES,
+    LEGACY_BACKGROUND_METHOD,
     SCHEMA_VERSION,
     ImageId,
     ImageRef,
     LogEntry,
     OriginalName,
     Project,
+    format_timestamp,
     revalidate,
 )
 
@@ -208,6 +217,11 @@ def project_from_content(data: bytes, *, next_id: int, log: tuple[LogEntry, ...]
     return project.model_copy(update={"log": log})
 
 
+def _utc_now() -> datetime:
+    """The time of a ``migrate`` entry when no session clock is given."""
+    return datetime.now(UTC)
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in pairs:
@@ -221,12 +235,18 @@ def _reject_constant(name: str) -> NoReturn:
     raise ValueError(f"{name} is not allowed")
 
 
-def project_from_json(data: bytes) -> Project:
+def project_from_json(data: bytes, *, clock: Callable[[], datetime] = _utc_now) -> Project:
     """Parse and validate ``project.json`` bytes, migrating an older schema.
 
     A BOM (from a Windows editor) and CRLF are tolerated; duplicate keys,
-    NaN/Infinity, wrong types and unknown keys are not.
+    NaN/Infinity, wrong types and unknown keys are not. A migrated project gets
+    one ``migrate`` log entry (:func:`_migrated`), timed by ``clock``.
     """
+    return _read_json(data, clock)[0]
+
+
+def _read_json(data: bytes, clock: Callable[[], datetime]) -> tuple[Project, bool]:
+    """:func:`project_from_json`, and whether it migrated the project."""
     try:
         raw = json.loads(
             data.decode("utf-8-sig"),
@@ -260,18 +280,113 @@ def project_from_json(data: bytes) -> Project:
     # The model knows only the latest schema; strict JSON mode keeps every type
     # exactly (no "340" for an int, no 0 for a bool), so load then save is a fixed point.
     try:
-        return Project.model_validate_json(json.dumps(raw, ensure_ascii=False), strict=True)
+        project = Project.model_validate_json(json.dumps(raw, ensure_ascii=False), strict=True)
     except ValidationError as exc:
         raise ProjectFormatError(f"project.json is not a valid project: {exc}") from exc
+    if version == SCHEMA_VERSION:
+        return project, False
+    return _migrated(project, version, clock), True
 
 
 # --- Schema versions and migrations ---
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
-# {n: a step from schema n to n + 1}. Empty while SCHEMA_VERSION is 1. From the v0.1
-# tag on, every change to the saved form bumps SCHEMA_VERSION and registers a step
-# here (an additive change registers a step that only bumps the number).
-MIGRATIONS: Mapping[int, Migration] = {}
+
+
+def _dicts(value: object) -> list[dict[str, Any]]:
+    """The objects in a JSON list, for a migration step: a part of an unvalidated
+    file that is not the shape it should be is skipped, for validation to refuse."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _v1_to_v2(doc: dict[str, Any]) -> dict[str, Any]:
+    """Schema 1 to 2 (#83): the project's background method and each band's
+    background fields.
+
+    A schema-1 net was measured above its image's median, so the project keeps
+    that method (``global_median``) and each band records its image's
+    ``background`` as its level, with mode ``global_median`` and no spread:
+    every net stays exact, and stays what the pixels give under that method.
+    Pure JSON, on the copy :func:`migrate` passes.
+    """
+    doc["schema_version"] = 2
+    doc["background_method"] = LEGACY_BACKGROUND_METHOD
+    batch = doc.get("batch")
+    if not isinstance(batch, dict):
+        return doc
+    medians = {
+        image["id"]: image.get("background")
+        for membrane in _dicts(batch.get("membranes"))
+        for image in _dicts(membrane.get("images"))
+        if isinstance(image.get("id"), str)
+    }
+    for protein in _dicts(batch.get("proteins")):
+        image_id = protein.get("image_id")
+        if not isinstance(image_id, str) or image_id not in medians:
+            continue  # an unknown image: validation refuses the protein
+        for band in _dicts(protein.get("bands")):
+            band["background_level"] = medians[image_id]
+            band["background_mode"] = LEGACY_BACKGROUND_METHOD
+            band["background_spread"] = 0.0
+    return doc
+
+
+def _v1_content(content: dict[str, Any]) -> dict[str, Any]:
+    """A schema-2 content document (:func:`content_document`) as schema 1 held
+    the same content: without the background method and the band background
+    fields. Exact for a migrated project, since the step only adds them."""
+    old = {key: value for key, value in content.items() if key != "background_method"}
+    old["schema_version"] = 1
+    old["batch"] = batch = dict(content["batch"])
+    added = {"background_level", "background_mode", "background_spread"}
+    batch["proteins"] = [
+        {
+            **protein,
+            "bands": [
+                {key: value for key, value in band.items() if key not in added}
+                for band in protein["bands"]
+            ],
+        }
+        for protein in batch["proteins"]
+    ]
+    return old
+
+
+# {n: a step from schema n to n + 1}. Every change to the saved form bumps
+# SCHEMA_VERSION and registers a step here (an additive change registers a step
+# that only bumps the number), and registers in _EARLIER_CONTENT how the content
+# of a project migrated from each older schema read in that schema.
+MIGRATIONS: Mapping[int, Migration] = {1: _v1_to_v2}
+# {n: a latest-schema content document as schema n held it}: the migrate entry's
+# from_content_hash.
+_EARLIER_CONTENT: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {1: _v1_content}
+
+
+def _migrated(project: Project, found: int, clock: Callable[[], datetime]) -> Project:
+    """``project``, migrated from schema ``found``, with a ``migrate`` log entry
+    appended. Its params name the schemas it went from and to and the hash the
+    content it started from had under schema ``found`` (``from_content_hash``:
+    the old log's last hash, unless the file was changed outside it, which
+    :func:`proteia.core.record.history_issues` reports); its ``content_hash`` is,
+    as for every entry, that of the content it left. The log is not content, so
+    appending the entry does not change that hash.
+    """
+    content = content_document(project)
+    entry = LogEntry(
+        seq=len(project.log) + 1,
+        time=format_timestamp(clock()),
+        action="migrate",
+        version=proteia.__version__,
+        params={
+            "from_schema": found,
+            "to_schema": SCHEMA_VERSION,
+            "from_content_hash": document_hash(_EARLIER_CONTENT[found](content)),
+        },
+        content_hash=document_hash(content),
+    )
+    return project.model_copy(update={"log": (*project.log, entry)})
 
 
 def migrate(
@@ -282,9 +397,10 @@ def migrate(
 ) -> dict[str, Any]:
     """Run the migration steps from ``doc``'s schema up to ``target`` on a copy.
 
-    A step that changes the hashed content must also append a ``migrate`` log
-    entry (from and to schema, the new content hash); otherwise every export
-    record of a migrated project reports ``content_changed_outside_log``.
+    The steps change content only. :func:`project_from_json` then appends one
+    ``migrate`` log entry for the whole run, with the hash of the validated
+    content it left; without it, every export record of a migrated project
+    would report ``content_changed_outside_log``.
     """
     out, version = copy.deepcopy(doc), doc["schema_version"]
     while version < target:
@@ -410,19 +526,38 @@ def save_project(project: Project, folder: str | os.PathLike[str]) -> Path:
     return path
 
 
-def load_project(folder: str | os.PathLike[str], *, require_images: bool = True) -> Project:
-    """Read and validate ``folder/project.json``.
+def load_project(
+    folder: str | os.PathLike[str],
+    *,
+    require_images: bool = True,
+    clock: Callable[[], datetime] = _utc_now,
+) -> Project:
+    """Read and validate ``folder/project.json``, migrating an older schema in
+    memory (:func:`project_from_json`, whose ``migrate`` entry ``clock`` times);
+    the file is not rewritten.
 
     ``FileNotFoundError`` propagates. With ``require_images``, a missing image file
     raises :class:`MissingImageError`. Image hashes are not re-checked here; see
     :func:`verify_images`.
     """
-    project = project_from_json((Path(folder) / PROJECT_FILE).read_bytes())
+    return read_project(folder, require_images=require_images, clock=clock)[0]
+
+
+def read_project(
+    folder: str | os.PathLike[str],
+    *,
+    require_images: bool = True,
+    clock: Callable[[], datetime] = _utc_now,
+) -> tuple[Project, bool]:
+    """:func:`load_project`, and whether the project was migrated: then
+    ``project.json``, of an older schema, does not hold it (nor its ``migrate``
+    entry) until it is saved."""
+    project, migrated = _read_json((Path(folder) / PROJECT_FILE).read_bytes(), clock)
     if require_images:
         missing = _missing_images(project, folder)
         if missing:
             raise MissingImageError(missing)
-    return project
+    return project, migrated
 
 
 def store_image(

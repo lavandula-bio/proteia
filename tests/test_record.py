@@ -14,14 +14,16 @@ from pydantic import ValidationError
 
 import proteia
 from conftest import (
+    V1_CONTENT_HASH,
     FakeClock,
     make_project,
     make_project_with_undetected,
+    sample_doc_v1,
     synthetic_blot,
     write_tiff,
 )
 from proteia.core import operations as ops
-from proteia.core import rowdetect
+from proteia.core import quantify, rowdetect
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import LANE_TABLE_DECIMALS
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
@@ -44,6 +46,7 @@ from proteia.core.storage import (
     content_hash,
     document_bytes,
     load_project,
+    project_from_json,
 )
 
 EXPORTED_AT = "2026-09-26T09:30:00.250Z"
@@ -177,7 +180,8 @@ def test_build_record_shape():
     }
     assert software["proteia"] == proteia.__version__
     assert software["python"] == platform.python_version()
-    assert record["settings"] == settings()
+    # The code's settings, and the method the stored nets used.
+    assert record["settings"] == {**settings(), "background_method": "ring_median_v1"}
     assert record["results"] is None
 
     canonical_json(record)  # sorted keys, no NaN: ready to be signed as it is
@@ -211,6 +215,7 @@ def test_record_names_the_compute_settings():
 
 def test_settings_are_the_code_constants():
     assert settings() == {
+        "background": quantify.background_settings(),  # ring_median v1 (#83)
         "grow_box": {
             "rel_threshold": REL_THRESHOLD,
             "noise_k": NOISE_K,
@@ -255,19 +260,26 @@ def test_the_content_includes_not_detected_records():
     assert record["history_issues"] == []
 
 
-def test_a_log_written_before_records_existed_has_no_history_issues():
-    # The content hash a build without not-detected records stored for the
-    # sample project (test_storage pins the same value).
-    before = "28dfdbcbca235bb7359164954bf76a6d743a2c4448e51049172f42cc00b3df6a"
-    entry = LogEntry(
-        seq=1,
-        time="2026-09-20T08:00:00.000Z",
-        action="new_project",
-        version="0.1.0.dev0",
-        content_hash=before,
-    )
-    project = make_project().model_copy(update={"log": (entry,)})
+def test_a_log_written_before_the_band_backgrounds_has_no_history_issues():
+    # A schema-1 file (before #83, and before not-detected records), its log
+    # holding the hash that build computed: the migration's entry carries it on.
+    doc = sample_doc_v1()
+    doc["log"] = [
+        {
+            "seq": 1,
+            "time": "2026-09-20T08:00:00.000Z",
+            "action": "new_project",
+            "version": "0.1.0.dev0",
+            "params": {},
+            "content_hash": V1_CONTENT_HASH,
+        }
+    ]
+    project = project_from_json(document_bytes(doc))
+    assert [entry.action for entry in project.log] == ["new_project", "migrate"]
     assert history_issues(project) == []
     record = build_record(project, exported_at=EXPORTED_AT, files={})
     assert record["history_issues"] == []
     assert all("undetected" not in p for p in record["content"]["batch"]["proteins"])
+    # The record names the legacy method its nets still use.
+    assert record["settings"]["background_method"] == "global_median"
+    assert record["content"]["background_method"] == "global_median"

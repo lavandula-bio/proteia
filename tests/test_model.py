@@ -13,7 +13,7 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from conftest import make_project, make_project_with_undetected
+from conftest import as_legacy, make_project, make_project_with_undetected
 from proteia.core import analyze, model
 from proteia.core.model import (
     DETECTING_SOURCES,
@@ -44,6 +44,14 @@ from proteia.core.model import (
     lanes_phrase,
     revalidate,
 )
+
+# A band's measured fields, as a ring_median band holds them.
+MEASURED = {
+    "net": 0.0,
+    "background_level": 200.0,
+    "background_mode": "symmetric",
+    "background_spread": 0.0,
+}
 
 
 def _get(project: Project, obj_id: str):
@@ -108,6 +116,31 @@ def test_empty_project_defaults():
     assert list(empty.iter_ids()) == []
     # The Literal must follow SCHEMA_VERSION.
     assert get_args(Project.model_fields["schema_version"].annotation) == (SCHEMA_VERSION,)
+    assert SCHEMA_VERSION == 2  # #83: band backgrounds and the background method
+    assert empty.background_method == "ring_median_v1"  # a new project measures locally
+
+
+def test_every_band_background_belongs_to_the_projects_method(project):
+    # The sample measures locally: any ring mode, never the legacy one.
+    for mode in ("symmetric", "asymmetric", "image"):
+        revalidate(_edit(project, "band-10", background_mode=mode, background_spread=0.25))
+    with pytest.raises(ValidationError, match="does not belong to the project's background"):
+        revalidate(_edit(project, "band-10", background_mode="global_median"))
+    _edit(project, "band-10", background_mode="symmetric")
+
+    # A legacy project: every band the image median's, with no spread.
+    legacy = as_legacy(project)
+    assert {b.background_mode for p in legacy.batch.proteins for b in p.bands} == {"global_median"}
+    with pytest.raises(ValidationError, match="does not belong to the project's background"):
+        revalidate(project.model_copy(update={"background_method": "global_median"}))
+    for field, value in (("background_level", 199.5), ("background_spread", 0.5)):
+        stale = _edit(legacy.model_copy(deep=True), "band-10", **{field: value})
+        with pytest.raises(ValidationError, match="its image's median, with no spread"):
+            revalidate(stale)
+    with pytest.raises(ValidationError, match="background_method"):
+        Project(background_method="ring_median_v2")
+    with pytest.raises(ValidationError, match="background_mode"):
+        revalidate(_edit(project, "band-10", background_mode="ring"))
 
 
 def test_field_defaults():
@@ -123,9 +156,18 @@ def test_field_defaults():
     assert protein.loading_control_ids == []
     assert protein.expected_mw is None
 
-    band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), net=0.0, source="click")
+    band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), source="click", **MEASURED)
     assert (band.band_index, band.clipped, band.apparent_mw) == (0, None, None)
     assert band.manually_edited is False
+    for field in MEASURED:  # what quantifying gave: no default
+        with pytest.raises(ValidationError, match=field):
+            Band(
+                id="band-1",
+                lane_index=0,
+                box=Box(x=0, y=0),
+                source="click",
+                **{key: value for key, value in MEASURED.items() if key != field},
+            )
 
     image = ImageRef(
         id="img-1",
@@ -858,7 +900,11 @@ def test_placing_a_band_where_a_record_is_needs_the_record_dropped():
     def place_in_lane_2(draft: Project) -> None:
         draft.batch.find_protein("prot-7").bands.append(
             Band(
-                id=draft.new_id("band"), lane_index=2, box=Box(x=98, y=43), net=1.0, source="manual"
+                id=draft.new_id("band"),
+                lane_index=2,
+                box=Box(x=98, y=43),
+                source="manual",
+                **{**MEASURED, "net": 1.0},
             )
         )
 

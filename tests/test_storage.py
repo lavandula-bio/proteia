@@ -14,7 +14,17 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from conftest import image_bytes, make_project, make_project_with_undetected, write_image_files
+import proteia
+from conftest import (
+    V1_CONTENT_HASH,
+    FakeClock,
+    as_legacy,
+    image_bytes,
+    make_project,
+    make_project_with_undetected,
+    sample_doc_v1,
+    write_image_files,
+)
 from proteia.core import storage
 from proteia.core.model import (
     SCHEMA_VERSION,
@@ -30,6 +40,7 @@ from proteia.core.model import (
     revalidate,
 )
 from proteia.core.project import join_to_spine
+from proteia.core.record import history_issues
 from proteia.core.storage import (
     HASH_EXCLUDE,
     MIGRATIONS,
@@ -48,6 +59,7 @@ from proteia.core.storage import (
     orphan_files,
     project_from_json,
     project_to_json,
+    read_project,
     save_project,
     store_image,
     verify_images,
@@ -137,14 +149,14 @@ def test_project_json_encoding(tmp_path):
     assert "β-catenin".encode() in data
     assert b"\xc2\xb5" in data  # µ as raw UTF-8
     assert b"\\u" not in data
-    assert b'"schema_version": 1' in data
+    assert b'"schema_version": 2' in data
 
 
 def test_empty_project_bytes_exact():
     assert project_to_json(Project()) == (
-        b'{\n "batch": {\n  "lanes": [],\n  "membranes": [],\n  "proteins": [],\n'
-        b'  "reference_condition": null\n },\n "log": [],\n "next_id": 1,\n'
-        b' "schema_version": 1\n}\n'
+        b'{\n "background_method": "ring_median_v1",\n "batch": {\n  "lanes": [],\n'
+        b'  "membranes": [],\n  "proteins": [],\n  "reference_condition": null\n },\n'
+        b' "log": [],\n "next_id": 1,\n "schema_version": 2\n}\n'
     )
 
 
@@ -156,10 +168,12 @@ def test_content_hash_is_pinned():
     change also bumps SCHEMA_VERSION and registers a migration. The constant lives
     in code, not in a committed file, because the Windows CI checkout converts text
     files to CRLF. It did not move when the action log was added: the log is not
-    content, and the hash leaves it out.
+    content, and the hash leaves it out. It moved with schema 2 (#83), which added
+    the background method and each band's background fields; schema 1 gave
+    ``conftest.V1_CONTENT_HASH``.
     """
     assert content_hash(make_project()) == (
-        "28dfdbcbca235bb7359164954bf76a6d743a2c4448e51049172f42cc00b3df6a"
+        "d667c01c0856fa2c7f8b046729995b0c50cf9f11c2481b11f817599eb206b6d6"
     )
 
 
@@ -262,6 +276,15 @@ def _band(project: Project, band_id: str) -> Band:
             id="net-one-ulp",
         ),
         pytest.param(lambda p: setattr(_band(p, "band-10"), "clipped", False), id="clipped"),
+        pytest.param(
+            lambda p: setattr(_band(p, "band-10"), "background_level", 199.5), id="background-level"
+        ),
+        pytest.param(
+            lambda p: setattr(_band(p, "band-10"), "background_mode", "image"), id="background-mode"
+        ),
+        pytest.param(
+            lambda p: setattr(_band(p, "band-10"), "background_spread", 0.5), id="background-spread"
+        ),
     ],
 )
 def test_content_hash_changes_with_content(change):
@@ -277,7 +300,8 @@ def test_content_hash_with_records_is_pinned():
     """The content hash of the sample project with not-detected records: the records
     are content. Regenerate it on the same terms as the pinned hash above."""
     assert content_hash(make_project_with_undetected()) == (
-        "805e1f12d680a4466887a9f53e52e6405dc960ebde5334ea94b0bda7719389b4"
+        # 805e1f12d680a4466887a9f53e52e6405dc960ebde5334ea94b0bda7719389b4 under schema 1
+        "dcef6f3deed6968ef3251c79f6ad1350a7771b25ac8d633dbab822fd37824529"
     )
 
 
@@ -463,10 +487,10 @@ def test_numbers_survive_round_trip_exactly(tmp_path):
 
 def test_load_rejects_newer_schema_version():
     doc = _doc(make_project())
-    doc["schema_version"] = 2
+    doc["schema_version"] = SCHEMA_VERSION + 1
     with pytest.raises(SchemaVersionError, match="newer Proteia") as info:
         project_from_json(_encode(doc))
-    assert (info.value.found, info.value.supported) == (2, SCHEMA_VERSION)
+    assert (info.value.found, info.value.supported) == (SCHEMA_VERSION + 1, SCHEMA_VERSION)
 
 
 _MISSING = object()
@@ -580,7 +604,116 @@ def test_migrate_chain():
 
 
 def test_migrations_cover_every_older_version():
-    assert set(MIGRATIONS) == set(range(1, SCHEMA_VERSION))
+    assert set(MIGRATIONS) == set(range(1, SCHEMA_VERSION)) == {1}
+
+
+# --- Schema 1 to 2 (#83): the band backgrounds ---
+
+
+def _v1_file(*, log: bool = True) -> dict:
+    """The sample project as a schema-1 build saved it, its log beginning with
+    its creation, whose hash is the one that build computed."""
+    doc = sample_doc_v1()
+    if log:
+        doc["log"] = [
+            {
+                "seq": 1,
+                "time": "2026-09-20T08:00:00.000Z",
+                "action": "new_project",
+                "version": "0.1.0.dev0",
+                "params": {},
+                "content_hash": V1_CONTENT_HASH,
+            }
+        ]
+    return doc
+
+
+def test_a_schema_1_project_migrates_with_its_nets_unchanged():
+    doc = _v1_file()
+    project = project_from_json(_encode(doc), clock=FakeClock())
+    assert (project.schema_version, project.background_method) == (2, "global_median")
+    v1_nets = {
+        band["id"]: band["net"] for protein in doc["batch"]["proteins"] for band in protein["bands"]
+    }
+    for protein in project.batch.proteins:
+        median = project.batch.find_image(protein.image_id).background
+        for band in protein.bands:
+            assert band.net == v1_nets[band.id]  # exact: the nets stay what they were
+            assert (band.background_level, band.background_mode, band.background_spread) == (
+                median,
+                "global_median",
+                0.0,
+            )
+    # Nothing else changed: the sample, with the legacy background.
+    assert project.model_copy(update={"log": ()}) == as_legacy(make_project())
+
+    created, migrated = project.log
+    assert created == LogEntry.model_validate(doc["log"][0])
+    assert (migrated.seq, migrated.action, migrated.version) == (2, "migrate", proteia.__version__)
+    assert migrated.time == "2026-09-26T08:00:00.000Z"  # from the clock given
+    # It started from the content the log vouched for (the hash schema 1 gave
+    # it, rebuilt exactly), and left the migrated content.
+    assert migrated.params == {
+        "from_schema": 1,
+        "to_schema": 2,
+        "from_content_hash": V1_CONTENT_HASH,
+    }
+    assert migrated.content_hash == content_hash(project)
+    assert history_issues(project) == []
+
+
+def test_a_migrated_project_is_saved_in_the_new_schema_once(tmp_path):
+    folder = tmp_path / "v1 µ"
+    write_image_files(folder, make_project())
+    (folder / storage.PROJECT_FILE).write_bytes(document_bytes(_v1_file()))
+    loaded, migrated = read_project(folder, clock=FakeClock())
+    assert [entry.action for entry in loaded.log] == ["new_project", "migrate"] and migrated
+    assert (folder / storage.PROJECT_FILE).read_bytes() == document_bytes(_v1_file())  # untouched
+    path = _saved(folder, loaded)
+    assert b'"schema_version": 2' in path.read_bytes()
+    again, migrated = read_project(folder)
+    assert again == loaded and not migrated  # no second migration, no second entry
+    assert load_project(folder) == again
+    assert project_to_json(again) == path.read_bytes()
+
+
+def test_a_file_changed_before_its_migration_is_reported():
+    doc = _v1_file()
+    doc["batch"]["proteins"][0]["bands"][0]["net"] += 1.0  # by hand, outside the log
+    project = project_from_json(_encode(doc))
+    migrated = project.log[-1]
+    assert migrated.params["from_content_hash"] != V1_CONTENT_HASH
+    assert migrated.content_hash == content_hash(project)  # the migration itself is logged
+    assert history_issues(project) == ["content_changed_outside_log"]
+
+
+def test_a_schema_1_project_without_a_log_gets_only_the_migration():
+    project = project_from_json(_encode(_v1_file(log=False)))
+    [migrated] = project.log
+    assert (migrated.seq, migrated.action) == (1, "migrate")
+    assert migrated.params["from_content_hash"] == V1_CONTENT_HASH
+    assert history_issues(project) == ["history_starts_late"]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(lambda d: d.update(batch=[]), id="batch-not-an-object"),
+        pytest.param(lambda d: d["batch"].update(proteins="x"), id="proteins-not-a-list"),
+        pytest.param(lambda d: d["batch"]["proteins"][0].update(image_id=["img-2"]), id="list-id"),
+        pytest.param(lambda d: d["batch"]["proteins"][0].update(image_id="img-99"), id="unknown"),
+        pytest.param(lambda d: d["batch"]["proteins"][0]["bands"].append([1]), id="band-list"),
+        pytest.param(lambda d: d["batch"]["membranes"][0]["images"][0].pop("id"), id="no-id"),
+        pytest.param(
+            lambda d: d["batch"]["membranes"][0]["images"][0].update(id=["img-2"]), id="id-list"
+        ),
+    ],
+)
+def test_a_malformed_schema_1_file_is_a_format_error(edit):
+    doc = _v1_file()
+    edit(doc)
+    with pytest.raises(ProjectFormatError):
+        project_from_json(_encode(doc))
 
 
 def test_load_reports_missing_image(tmp_path):
@@ -607,7 +740,16 @@ def test_save_revalidates_in_place_edits(tmp_path):
     before = path.read_bytes()
     # Onto band-10's box, bypassing apply_change.
     project.batch.find_protein("prot-7").bands.append(
-        Band(id="band-19", lane_index=2, box=Box(x=20, y=45), net=1.0, source="manual")
+        Band(
+            id="band-19",
+            lane_index=2,
+            box=Box(x=20, y=45),
+            net=1.0,
+            background_level=199.88251668003335,
+            background_mode="symmetric",
+            background_spread=0.0,
+            source="manual",
+        )
     )
     project.next_id = 20
     with pytest.raises(ValidationError, match="overlap"):

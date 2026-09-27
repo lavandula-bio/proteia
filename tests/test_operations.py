@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -30,9 +30,11 @@ import pytest
 
 import proteia
 from conftest import (
+    V1_CONTENT_HASH,
     FakeClock,
     make_project,
     make_project_with_undetected,
+    sample_doc_v1,
     synthetic_blot,
     write_image_files,
     write_tiff,
@@ -68,13 +70,26 @@ from proteia.core.operations import (
 )
 from proteia.core.plotspec import ErrorType
 from proteia.core.project import lane_anchors, lane_positions
-from proteia.core.quantify import estimate_background, is_clipped, net_signal
+from proteia.core.quantify import (
+    RING_CLAMP,
+    BandBackground,
+    band_backgrounds,
+    estimate_background,
+    is_clipped,
+    net_signal,
+    quantify_nets,
+)
 from proteia.core.record import history_issues
 from proteia.core.results import Level, NoticeCode
 from proteia.core.rowdetect import DETECT_K, RowDetection
 from proteia.core.session import save_to_folder
 from proteia.core.storage import canonical_json, content_hash, load_project
+from proteia.web.state import project_state
 from rowcases import RowCase, adversarial, adversarial_row, bench_cases, synthetic_row
+from test_background_truth import LANES as TRUTH_LANES
+from test_background_truth import _blot as truth_blot
+from test_background_truth import _fold_changes as truth_fold_changes
+from test_background_truth import _worst as truth_worst
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -147,24 +162,56 @@ def import_blot(
         )
 
 
-def assert_nets_current(session: ProjectSession) -> None:
-    """Every stored net and clipping flag equals its value recomputed from the
-    session's pixels."""
-    batch = session.project.batch
-    for protein in batch.proteins:
-        image = batch.find_image(protein.image_id)
+def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None = None) -> None:
+    """The operations' invariant: every stored net, background (level, mode,
+    spread) and clipping flag equals, exactly, its value recomputed from the
+    session's pixels, image by image, with every box on the image (every
+    protein's, each with its size) measured together under the project's
+    background method. ``only`` limits the check to those images.
+    """
+    project = session.project
+    batch = project.batch
+    legacy = project.background_method == "global_median"
+    for image in batch.iter_images():
+        if only is not None and image.id not in only:
+            continue
+        placed = [(p, b) for p in batch.proteins if p.image_id == image.id for b in p.bands]
+        if not placed:
+            continue
         pixels = session.pixels(image.id)
         dark = image.polarity.dark_on_light
-        for band in protein.bands:
-            expected = net_signal(
-                pixels, band.box, protein.box_size, image.background, dark_on_light=dark
+        rects = [band.box.rect(protein.box_size) for protein, band in placed]
+        sizes = [(protein.box_size.width, protein.box_size.height) for protein, _ in placed]
+        integral = image.bit_depth is not None
+        if legacy:
+            found = [BandBackground(image.background, "global_median", 0.0)] * len(placed)
+            clamp = "pixel"
+        else:
+            found = band_backgrounds(
+                pixels,
+                rects,
+                sizes,
+                dark_on_light=dark,
+                integral=integral,
+                fallback=image.background,
             )
-            assert band.net == expected, band.id
-            depth = clipping_depth(image.bit_depth, image.import_warnings)
-            clipped = is_clipped(
-                pixels, band.box, protein.box_size, bit_depth=depth, dark_on_light=dark
+            clamp = RING_CLAMP
+        depth = clipping_depth(image.bit_depth, image.import_warnings)
+        for (protein, band), background in zip(placed, found, strict=True):
+            size = protein.box_size
+            net = net_signal(
+                pixels, band.box, size, background.level, dark_on_light=dark, clamp=clamp
             )
+            stored = (band.net, band.background_level, band.background_mode, band.background_spread)
+            assert stored == (net, background.level, background.mode, background.spread), band.id
+            clipped = is_clipped(pixels, band.box, size, bit_depth=depth, dark_on_light=dark)
             assert band.clipped is clipped, band.id
+        # The product's one entry point gives the same nets.
+        method = "global_median" if legacy else "ring_median"
+        nets = quantify_nets(
+            pixels, rects, sizes, method=method, dark_on_light=dark, integral=integral
+        )
+        assert [band.net for _, band in placed] == nets, image.id
 
 
 def open_sample(
@@ -209,6 +256,24 @@ def plant(session: ProjectSession, change) -> None:
     """Commit a change no operation makes yet (e.g. an apparent MW from #58)."""
     project, _ = apply_change(session.project, change)
     session._commit(project, action="plant", params={})
+
+
+def plant_legacy(session: ProjectSession) -> None:
+    """Make the project one quantified before #83 (a migrated schema-1 project):
+    the legacy method, every band on every image quantified under it."""
+    batch = session.project.batch
+    arrays = {
+        image.id: session.pixels(image.id)
+        for image in batch.iter_images()
+        if any(p.bands for p in batch.proteins if p.image_id == image.id)
+    }
+
+    def change(draft: Project) -> None:
+        draft.background_method = "global_median"
+        for image_id, array in arrays.items():
+            ops._quantify_image(draft, image_id, array)
+
+    plant(session, change)
 
 
 class ReplaceLock:
@@ -282,6 +347,88 @@ def test_open_project_reads_no_pixels_and_changes_nothing(tmp_path):
     assert session._pixels == {}
     assert orphan.exists()
     assert (folder / "project.json").read_bytes() == before
+
+
+def v1_folder(tmp_path: Path) -> Path:
+    """The conftest sample as a schema-1 build (before #83) saved it, with its
+    stand-in image files; its log begins with its creation, whose hash is the
+    one that build computed."""
+    folder = tmp_path / FOLDER
+    write_image_files(folder, make_project())
+    created = {
+        "seq": 1,
+        "time": "2026-09-20T08:00:00.000Z",
+        "action": "new_project",
+        "version": "0.1.0.dev0",
+        "params": {},
+        "content_hash": V1_CONTENT_HASH,
+    }
+    doc = {**sample_doc_v1(), "log": [created]}
+    (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
+    return folder
+
+
+def test_opening_a_schema_1_project_saves_its_migration_at_once(tmp_path):
+    folder = v1_folder(tmp_path)
+    recorder = Recorder()
+
+    def hook(session: ProjectSession) -> None:
+        recorder(session)
+        save_to_folder(session)
+
+    s = ops.open_project(folder, autosave=hook, clock=FakeClock())
+    migrated = s.project.log[-1]
+    assert (migrated.seq, migrated.action) == (2, "migrate")
+    assert migrated.time == "2026-09-26T08:00:00.000Z"  # from the session's clock
+    # A logged change like any other: autosaved at once, entry and all.
+    assert recorder.actions == ["migrate"]
+    assert (s.dirty, s.save_error, s.last_action) == (False, None, "migrate")
+    assert load_project(folder) == s.project
+    assert project_state(folder.name, s, s.project, open_id=1)["saved"] is True
+
+    # A record exported before any edit cites the log the file holds, and the
+    # next session neither migrates again nor logs another entry.
+    ops.export_lane_table(s)
+    exported = json.loads((folder / storage.EXPORTS_DIR / ops.LANE_TABLE_RECORD_FILE).read_bytes())
+    s.close()
+    reopened = ops.open_project(folder, clock=FakeClock(datetime(2026, 11, 5, tzinfo=UTC)))
+    assert reopened.project == s.project and not reopened.dirty
+    ops.set_reference_condition(reopened, None)
+    saved = [entry.model_dump(mode="json") for entry in load_project(folder).log]
+    assert saved[: len(exported["log"])] == exported["log"]
+    assert exported["history_issues"] == [] == history_issues(load_project(folder))
+    # Its edits come after the migration in time too.
+    assert reopened.project.log[-1].time > migrated.time
+
+
+def test_a_migration_is_unsaved_until_a_save_without_autosave(tmp_path):
+    folder = v1_folder(tmp_path)
+    before = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, autosave=None, clock=FakeClock())
+    assert s.project.log[-1].action == "migrate"
+    # project.json does not hold the migrated project yet.
+    assert (s.dirty, s.save_error) == (True, None)
+    assert (folder / storage.PROJECT_FILE).read_bytes() == before
+    ops.save(s)
+    assert not s.dirty and load_project(folder) == s.project
+
+
+def test_a_failed_save_of_a_migration_keeps_it_in_memory(tmp_path, replace_lock):
+    folder = v1_folder(tmp_path)
+    before = (folder / storage.PROJECT_FILE).read_bytes()
+    replace_lock.locked = True
+    s = ops.open_project(folder, clock=FakeClock())  # opens all the same
+    assert s.dirty and isinstance(s.save_error, PermissionError)
+    assert (folder / storage.PROJECT_FILE).read_bytes() == before
+
+    replace_lock.locked = False
+    ops.set_reference_condition(s, None)  # the next change saves both
+    assert (s.dirty, s.save_error) == (False, None)
+    assert [entry.action for entry in load_project(folder).log] == [
+        "new_project",
+        "migrate",
+        "set_reference_condition",
+    ]
 
 
 def test_autosave_hook_runs_once_after_each_change(tmp_path):
@@ -885,12 +1032,10 @@ def test_set_polarity_recomputes_the_nets_on_that_image(tmp_path):
     ops.set_polarity(s, bright, LIGHT)
     image = s.project.batch.find_image(bright)
     assert image.polarity is LIGHT and image.background == background
-    protein = protein_of(s, on_bright)
-    pixels = s.pixels(bright)
-    for band in protein.bands:
-        expected = net_signal(pixels, band.box, protein.box_size, background, dark_on_light=False)
-        assert band.net == expected and band.net > 0
+    for band in protein_of(s, on_bright).bands:
+        assert band.net > 0  # bright bands now read as signal
         assert band.clipped is False  # recomputed for the new polarity (16-bit, below 65535)
+    assert_nets_current(s, only=[bright])  # every band on it, the other signal direction
     assert protein_of(s, on_dark).bands == dark_bands  # the other image is untouched
 
 
@@ -983,8 +1128,10 @@ def test_set_lanes(tmp_path):
     assert info.value.ids == ("band-12", "band-16")
     ops.set_lanes(s, [*_four("vehicle", "vehicle"), LaneInput("50 µM", "b1")])
     assert len(s.project.batch.lanes) == 5
-    ops.remove_box(s, "band-12")
-    ops.remove_box(s, "band-16")
+    # Without the boxes in lane 3 (removed with their proteins' others: removing
+    # one box re-quantifies the rest, and the sample's images are no pixels).
+    ops.clear_boxes(s, "prot-7")
+    ops.clear_boxes(s, "prot-8")
     ops.set_lanes(s, _four("vehicle", "vehicle")[:3])
     assert len(s.project.batch.lanes) == 3
 
@@ -1281,6 +1428,460 @@ def test_stored_nets_stay_current_through_a_session_and_a_reopen(tmp_path):
     assert_nets_current(reopened)
 
 
+# --- the local background (#83): every box on an image, quantified together ---
+
+
+def textured_blot(seed: int = 83) -> np.ndarray:
+    """The box tests' blot on a membrane with a gradient across it and noise, in
+    16-bit counts: every ring pixel counts, so a box placed or removed beside a
+    band moves its level."""
+    _, x = np.mgrid[0:H, 0:W].astype(float)
+    noise = np.random.default_rng(seed).normal(0.0, 300.0, (H, W))
+    image = blot().astype(float) + 20.0 * (x - W / 2) + noise
+    return np.clip(np.round(image), 0, 65535).astype(np.uint16)
+
+
+def two_proteins(tmp_path: Path, hook=None) -> tuple[ProjectSession, str, str, str]:
+    """A session with the textured blot, three lanes, and a target and a loading
+    control on it (16x8 and 10x8 boxes), neither with a box yet."""
+    s = session_on(tmp_path, hook)
+    image = import_blot(s, textured_blot())
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    a = ops.add_protein(s, "β-catenin", Role.TARGET, image, box_size=BoxSize(width=16, height=8))
+    b = ops.add_protein(
+        s, "GAPDH", Role.LOADING_CONTROL, image, box_size=BoxSize(width=10, height=8)
+    )
+    return s, image, a, b
+
+
+MEASURED = ("net", "background_level", "background_mode", "background_spread", "clipped")
+
+
+def measured(band: Band) -> list:
+    """What quantifying the band's image gave it."""
+    return [getattr(band, name) for name in MEASURED]
+
+
+def _bands_on_image(s: ProjectSession, image_id: str) -> list[str]:
+    batch = s.project.batch
+    return [b.id for p in batch.proteins if p.image_id == image_id for b in p.bands]
+
+
+def test_a_box_of_another_protein_moves_a_neighbours_net_in_the_same_change(tmp_path):
+    s, _, a, b = two_proteins(tmp_path)
+    band_a = ops.place_box(s, a, NARROW_X, ROW, lane_index=0, grow=False)
+    alone = band_of(s, band_a)
+    band_b = ops.place_box(s, b, NARROW_X + 16, ROW, lane_index=1, grow=False)  # in A's ring
+    beside = band_of(s, band_a)
+    assert (beside.net, beside.background_level) != (alone.net, alone.background_level)
+    assert s.project.log[-1].content_hash == content_hash(s.project)
+    assert_nets_current(s)
+
+    length = len(s.project.log)
+    ops.remove_box(s, band_b)
+    after = band_of(s, band_a)
+    # One change, B's removal, whose logged hash covers A's new net: A's ring
+    # is whole again.
+    assert len(s.project.log) == length + 1
+    assert s.project.log[-1].action == "remove_box"
+    assert s.project.log[-1].content_hash == content_hash(s.project)
+    assert measured(after) == measured(alone) != measured(beside)
+    assert_nets_current(s)
+
+
+def test_a_removal_reads_the_pixels_only_when_bands_stay_on_the_image(tmp_path):
+    s, image, a, b = two_proteins(tmp_path, save_to_folder)
+    band_a = ops.place_box(s, a, NARROW_X, ROW, lane_index=0, grow=False)
+    band_b = ops.place_box(s, b, WIDE_X, ROW, lane_index=1, grow=False)
+    reopened = ops.open_project(s.folder)
+    source = reopened.folder / "images" / f"{image}.tif"
+    kept = source.read_bytes()
+    source.write_bytes(b"not the imported file")
+    before = reopened.project
+    for remove in (
+        lambda: ops.remove_box(reopened, band_a),
+        lambda: ops.clear_boxes(reopened, a),
+        lambda: ops.remove_protein(reopened, a),
+    ):  # GAPDH's box stays, and its ring would change
+        with pytest.raises(OperationError) as info:
+            remove()
+        assert (info.value.code, info.value.ids) == (ErrorCode.IMAGE_FILE_CHANGED, (image,))
+        assert reopened.project is before
+        assert reopened._pixels == {}
+
+    source.write_bytes(kept)
+    ops.remove_box(s, band_b)  # saved; now only β-catenin's box is on the image
+    reopened = ops.open_project(s.folder)
+    source.write_bytes(b"not the imported file")
+    ops.remove_box(reopened, band_a)  # the last box: nothing is left to quantify
+    assert _bands_on_image(reopened, image) == []
+    assert reopened._pixels == {}
+
+
+def test_the_napari_app_shows_the_nets_the_operations_store(tmp_path):
+    # The app module imports headlessly (napari and Qt are imported inside
+    # launch); #57 retires the app, and this case with it.
+    from proteia.gui import app
+
+    s, image, a, b = two_proteins(tmp_path)
+    for protein, x, lane in ((a, NARROW_X, 0), (b, NARROW_X + 16, 1), (a, WIDE_X, 2)):
+        ops.place_box(s, protein, x, ROW, lane_index=lane, grow=False)  # GAPDH in a ring
+    proteins = [protein_of(s, a), protein_of(s, b)]
+    state = {  # the app's state, as its placement leaves it
+        "images": [
+            {
+                "array": s.pixels(image),
+                "dark": True,
+                "bit_depth": s.project.batch.find_image(image).bit_depth,
+            }
+        ],
+        "proteins": [{"image": 0, "base": p.box_size, "pad_w": 0, "pad_h": 0} for p in proteins],
+        "placed": [
+            {"pid": k, "rect": band.box.rect(p.box_size)}
+            for k, p in enumerate(proteins)
+            for band in p.bands
+        ],
+    }
+    for k, protein in enumerate(proteins):
+        stored = sorted((band.box.x, band.net) for band in protein.bands)
+        assert app._boxes_with_nets(state, k) == stored, protein.name
+
+
+def test_a_ring_cut_short_stores_its_fallback_and_is_reported(tmp_path):
+    """Both fallbacks through the operations: a box in the image's corner, whose
+    ring has too few pixels paired across it (``asymmetric``, a robust plane),
+    and a box that leaves too little ring (``image``, the image's median)."""
+    s, image, a, _ = two_proteins(tmp_path)
+    corner = ops.place_box(s, a, 8, 4, lane_index=0, grow=False)
+    whole = ops.place_box(s, a, WIDE_X, ROW, lane_index=1, grow=False)
+    other = import_blot(s, textured_blot(seed=5), "reprobe β.tif")
+    c = ops.add_protein(
+        s, "α-tubulin", Role.LOADING_CONTROL, other, box_size=BoxSize(width=150, height=56)
+    )
+    filling = ops.place_box(s, c, W // 2, H // 2, lane_index=0, grow=False)
+    assert_nets_current(s)
+
+    median = {i.id: i.background for i in s.project.batch.iter_images()}
+    cut, kept, fallback = band_of(s, corner), band_of(s, whole), band_of(s, filling)
+    assert (cut.background_mode, kept.background_mode) == ("asymmetric", "symmetric")
+    assert cut.background_level != median[image]  # a plane through its ring, not the median
+    assert (fallback.background_mode, fallback.background_level) == ("image", median[other])
+    assert fallback.net > 0.0
+    notices = ops.compute(s).notices
+    assert [
+        (n.protein_ids, n.lane_indices, n.level)
+        for n in notices
+        if n.code is NoticeCode.BACKGROUND_FALLBACK
+    ] == [((a,), (0,), Level.WARNING), ((c,), (0,), Level.WARNING)]
+
+
+def test_every_box_writer_requantifies_the_whole_image(tmp_path):
+    s, image, a, b = two_proteins(tmp_path)
+    for lane, x in ((0, NARROW_X), (1, WIDE_X)):
+        ops.place_box(s, a, x, ROW, lane_index=lane, grow=False)
+    guard = ops.place_box(s, b, 62, ROW, lane_index=2, grow=False)  # in both of A's rings
+    steps = [
+        ("place_box", lambda: ops.place_box(s, b, 80, ROW, lane_index=0, grow=False)),
+        ("move_box", lambda: ops.move_box(s, guard, (54, 26, 64, 34))),
+        ("set_box_size", lambda: ops.set_box_size(s, b, BoxSize(width=12, height=10))),
+        ("remove_box", lambda: ops.remove_box(s, guard)),
+        ("clear_boxes", lambda: ops.clear_boxes(s, b)),
+    ]
+    for action, step in steps:
+        before = [measured(band) for band in protein_of(s, a).bands]
+        step()  # an edit of GAPDH's boxes only
+        assert s.project.log[-1].action == action
+        after = [measured(band) for band in protein_of(s, a).bands]
+        assert after != before, action  # β-catenin's bands are measured again
+        assert_nets_current(s)
+    ops.place_box(s, b, 62, ROW, lane_index=2, grow=False)
+    before = [measured(band) for band in protein_of(s, a).bands]
+    ops.remove_protein(s, b)
+    assert [measured(band) for band in protein_of(s, a).bands] != before
+    assert_nets_current(s)
+    ops.set_polarity(s, image, LIGHT)
+    assert_nets_current(s)
+
+
+# The steps of the property test: each takes the session, a random generator
+# and the row case, and either commits a change or is refused.
+def _pick(rng: np.random.Generator, items: Sequence):
+    if not items:
+        raise UnknownIdError("nothing to pick")  # a refusal like any other
+    return items[int(rng.integers(len(items)))]
+
+
+def _band_ids(s: ProjectSession) -> list[str]:
+    return [band.id for protein in s.project.batch.proteins for band in protein.bands]
+
+
+def _protein_ids(s: ProjectSession) -> list[str]:
+    return [protein.id for protein in s.project.batch.proteins]
+
+
+def _step_place(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    protein, lane = _pick(rng, _protein_ids(s)), int(rng.integers(case.n_lanes))
+    x = round(case.lane_cx[lane]) + int(rng.integers(-15, 16))
+    y = round(case.lane_cy[lane]) + int(rng.integers(-25, 26))
+    ops.place_box(s, protein, x, y, lane_index=lane, grow=bool(rng.random() < 0.4))
+
+
+def _step_move(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    protein, band = s.project.batch.find_band(_pick(rng, _band_ids(s)))
+    x0, y0, x1, y1 = band.box.rect(protein.box_size)
+    dx, dy = int(rng.integers(-12, 13)), int(rng.integers(-10, 11))
+    ops.move_box(s, band.id, (x0 + dx, y0 + dy, x1 + dx, y1 + dy))
+
+
+def _step_resize(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    size = BoxSize(width=int(rng.integers(8, 60)), height=int(rng.integers(4, 24)))
+    ops.set_box_size(s, _pick(rng, _protein_ids(s)), size)
+
+
+def _step_add_protein(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    [image] = s.project.batch.iter_images()
+    size = BoxSize(width=int(rng.integers(10, 40)), height=int(rng.integers(6, 16)))
+    name = f"protein {len(s.project.log)}"
+    ops.add_protein(s, name, Role.LOADING_CONTROL, image.id, box_size=size)
+
+
+def _step_polarity(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    [image] = s.project.batch.iter_images()
+    ops.set_polarity(s, image.id, LIGHT if image.polarity is DARK else DARK)
+
+
+def _step_row(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    ops.detect_row_boxes(s, _pick(rng, _protein_ids(s)), case.row)
+
+
+def _step_lane(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
+    ops.set_box_lane(s, _pick(rng, _band_ids(s)), int(rng.integers(case.n_lanes)))
+
+
+PROPERTY_STEPS = {
+    "place_box": _step_place,
+    "move_box": _step_move,
+    "remove_box": lambda s, rng, case: ops.remove_box(s, _pick(rng, _band_ids(s))),
+    "set_box_size": _step_resize,
+    "remove_protein": lambda s, rng, case: ops.remove_protein(s, _pick(rng, _protein_ids(s))),
+    "add_protein": _step_add_protein,
+    "set_polarity": _step_polarity,
+    "detect_row_boxes": _step_row,
+    "clear_boxes": lambda s, rng, case: ops.clear_boxes(s, _pick(rng, _protein_ids(s))),
+    "set_box_lane": _step_lane,
+    "undo": lambda s, rng, case: ops.undo(s),
+    "redo": lambda s, rng, case: ops.redo(s),
+}
+# Every operation that adds, moves, resizes or removes a box, or turns the signal
+# around: each re-quantifies the whole image (remove_image takes the image along).
+BOX_WRITERS = frozenset(
+    {
+        "place_box",
+        "move_box",
+        "remove_box",
+        "set_box_size",
+        "remove_protein",
+        "set_polarity",
+        "detect_row_boxes",
+        "clear_boxes",
+    }
+)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
+def test_random_edits_keep_every_stored_value_what_the_pixels_give(tmp_path, seed):
+    """Property: after any sequence of edits, refused or not, undone or redone,
+    every band on the image holds exactly what quantifying the image from
+    scratch gives (with two proteins' boxes on it, one in the image's corner,
+    whose ring falls back to a plane)."""
+    case = ROWS["all_present"]
+    s, image, target = row_session(tmp_path, case)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    ops.detect_row_boxes(s, target, case.row)
+    for lane in (1, 3):
+        ops.place_box(s, other, *at_lane(case, lane), lane_index=lane, grow=True)
+    corner = ops.place_box(s, other, 0, 0, lane_index=5, grow=False)
+    assert band_of(s, corner).background_mode == "asymmetric"
+    assert_nets_current(s)
+    rng = np.random.default_rng(seed)
+    names = sorted(PROPERTY_STEPS)
+    # Every step three times, then random ones, in a random order.
+    schedule = [*names * 3, *(names[int(i)] for i in rng.integers(len(names), size=24))]
+    rng.shuffle(schedule)
+    for name in schedule:
+        before = s.project
+        try:
+            PROPERTY_STEPS[name](s, rng, case)
+        except (OperationError, UnknownIdError):
+            assert s.project is before, name  # a refusal changes nothing
+        assert s.project.log[-1].content_hash == content_hash(s.project), name
+        assert_nets_current(s)
+    done = {entry.action for entry in s.project.log}
+    assert BOX_WRITERS <= done, BOX_WRITERS - done
+
+
+# --- requantify: from a project quantified before #83 to the local background ---
+
+
+def legacy_scene(tmp_path: Path) -> tuple[ProjectSession, list[str], list[str]]:
+    """Two images with boxes of three proteins, and a third image without any,
+    quantified as before #83 (the legacy method, planted); autosaved. Returns the
+    session, the images with boxes and the proteins."""
+    s, image, a, b = two_proteins(tmp_path, save_to_folder)
+    other = import_blot(s, textured_blot(seed=5), "reprobe β.tif")
+    import_blot(s, textured_blot(seed=6), "empty α.tif")
+    c = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, other)
+    for protein, x, lane in ((a, NARROW_X, 0), (a, WIDE_X, 1), (b, 70, 2), (c, NARROW_X, 0)):
+        ops.place_box(s, protein, x, ROW, lane_index=lane, grow=False)
+    plant_legacy(s)
+    return s, [image, other], [a, b, c]
+
+
+def test_a_legacy_project_keeps_the_image_median_through_its_edits(tmp_path):
+    s, _, proteins = legacy_scene(tmp_path)
+    assert s.project.background_method == "global_median"
+    for protein in s.project.batch.proteins:
+        median = s.project.batch.find_image(protein.image_id).background
+        for band in protein.bands:
+            assert (band.background_level, band.background_mode) == (median, "global_median")
+    assert_nets_current(s)  # the legacy invariant: the median, each pixel floored
+    [first, *_] = protein_of(s, proteins[0]).bands
+    ops.move_box(s, first.id, (60, 20, 76, 28))
+    ops.set_box_size(s, proteins[0], BoxSize(width=18, height=8))
+    assert s.project.background_method == "global_median"  # edits never switch it
+    assert_nets_current(s)
+    notices = [n for n in ops.compute(s).notices if n.code is NoticeCode.LEGACY_BACKGROUND]
+    assert [n.protein_ids for n in notices] == [tuple(proteins)]
+
+
+def test_requantify_switches_a_legacy_project_to_the_local_background(tmp_path):
+    s, images, _ = legacy_scene(tmp_path)
+    legacy = {band.id: band.net for p in s.project.batch.proteins for band in p.bands}
+
+    assert ops.requantify(s) == tuple(images)  # the images with bands, in order
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "requantify",
+        {"from": "global_median", "to": "ring_median_v1", "images": images},
+    )
+    assert entry.content_hash == content_hash(s.project)
+    assert s.project.background_method == "ring_median_v1"
+    bands = [band for p in s.project.batch.proteins for band in p.bands]
+    assert all(band.net != legacy[band.id] for band in bands)
+    assert {band.background_mode for band in bands} <= {"symmetric", "asymmetric", "image"}
+    assert_nets_current(s)
+    assert NoticeCode.LEGACY_BACKGROUND not in [n.code for n in ops.compute(s).notices]
+    assert load_project(s.folder) == s.project  # saved with its entry
+    assert history_issues(s.project) == []
+
+    committed = s.project
+    assert ops.requantify(s) == ()  # already local: a no-op, with no entry
+    assert s.project is committed
+
+    ops.undo(s)  # the switch taken back whole: the legacy nets, not recomputed
+    assert s.project.background_method == "global_median"
+    assert {b.id: b.net for p in s.project.batch.proteins for b in p.bands} == legacy
+    assert_nets_current(s)
+
+
+def test_requantify_keeps_no_pixels_it_had_not_cached(tmp_path):
+    s, images, _ = legacy_scene(tmp_path)
+    reopened = ops.open_project(s.folder)
+    assert ops.requantify(reopened) == tuple(images)
+    assert reopened._pixels == {}  # read image by image and let go
+    ops.requantify(s)
+    assert reopened.project.batch == s.project.batch
+
+
+def test_requantify_refuses_a_changed_image_and_changes_nothing(tmp_path):
+    s, images, _ = legacy_scene(tmp_path)
+    reopened = ops.open_project(s.folder)
+    (reopened.folder / "images" / f"{images[1]}.tif").write_bytes(b"other bytes")
+    before, length = reopened.project, len(reopened.project.log)
+    with pytest.raises(OperationError) as info:
+        ops.requantify(reopened)
+    assert (info.value.code, info.value.ids) == (ErrorCode.IMAGE_FILE_CHANGED, (images[1],))
+    assert reopened.project is before and len(reopened.project.log) == length
+    assert reopened._pixels == {}
+
+
+def test_requantify_switches_a_legacy_project_without_boxes(tmp_path):
+    s = session_on(tmp_path)
+    plant(s, lambda draft: setattr(draft, "background_method", "global_median"))
+    assert ops.requantify(s) == ()
+    assert s.project.background_method == "ring_median_v1"
+    params = s.project.log[-1].params
+    assert params == {"from": "global_median", "to": "ring_median_v1", "images": []}
+
+
+def test_a_schema_1_project_opens_with_its_nets_until_requantified(tmp_path):
+    s, _, proteins = legacy_scene(tmp_path)
+    nets = {band.id: band.net for p in s.project.batch.proteins for band in p.bands}
+    # Its project.json as a schema-1 build wrote it (without a log, here).
+    path = s.folder / storage.PROJECT_FILE
+    doc = json.loads(path.read_bytes())
+    del doc["background_method"]
+    doc.update(schema_version=1, log=[])
+    for protein in doc["batch"]["proteins"]:
+        for band in protein["bands"]:
+            for name in ("background_level", "background_mode", "background_spread"):
+                del band[name]
+    path.write_bytes(storage.document_bytes(doc))
+
+    reopened = ops.open_project(s.folder, clock=FakeClock())
+    project = reopened.project
+    assert [entry.action for entry in project.log] == ["migrate"]
+    assert project.background_method == "global_median"
+    assert {b.id: b.net for p in project.batch.proteins for b in p.bands} == nets
+    assert_nets_current(reopened)  # the stored nets are what the pixels give
+    [first, *_] = protein_of(reopened, proteins[0]).bands
+    ops.move_box(reopened, first.id, (60, 20, 76, 28))  # still the median's
+    assert_nets_current(reopened)
+    ops.requantify(reopened)
+    assert reopened.project.background_method == "ring_median_v1"
+    assert_nets_current(reopened)
+
+
+# --- the local background against a known truth, through the operations ---
+
+
+@pytest.mark.parametrize(
+    ("membrane", "limit"), [("gradient", 0.03), ("hump", 0.03), ("haze", 0.10)]
+)
+def test_operations_measure_fold_changes_near_the_truth(tmp_path, membrane, limit):
+    """The #83 truth blots (test_background_truth) through the whole chain: the
+    image imported, the boxes placed, the fold-changes computed. The target's
+    fold-change of lane i is (t_i / l_i) / (t_0 / l_0), lane 0 the reference;
+    with seed 83 it is off the truth by 1.1 % (gradient), 1.2 % (hump) and
+    7.9 % (haze) at most, the whole-image median's by 42 %, 71 % and 18 %."""
+    pixels, rects, sizes, true_total, _ = truth_blot(membrane)
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels.astype(np.uint8), f"{membrane} µ.tif")
+    labels = [f"dose {lane}" for lane in range(TRUTH_LANES)]
+    ops.set_lanes(s, [LaneInput(label) for label in labels], reference_condition=labels[0])
+    proteins = [
+        ops.add_protein(s, name, role, image, box_size=BoxSize(width=w, height=h))
+        for name, role, (w, h) in (
+            ("β-catenin", Role.TARGET, sizes[0]),
+            ("α-tubulin", Role.LOADING_CONTROL, sizes[TRUTH_LANES]),
+        )
+    ]
+    for k, (x0, y0, x1, y1) in enumerate(rects):
+        x, y = x0 + (x1 - x0) // 2, y0 + (y1 - y0) // 2  # centered_rect gives x0, y0 back
+        lane = k % TRUTH_LANES
+        ops.place_box(s, proteins[k // TRUTH_LANES], x, y, lane_index=lane, grow=False)
+    assert_nets_current(s)
+
+    res = ops.compute(s)
+    [series] = res.series
+    assert truth_worst(series.fold_change[1:], truth_fold_changes(true_total)) <= limit
+    # The nets of the one entry point, on the file's pixels and these boxes.
+    nets = [net for column in res.proteins for net in column.nets]
+    assert nets == quantify_nets(
+        pixels, rects, sizes, method="ring_median", dark_on_light=True, integral=True
+    )
+
+
 # --- compute and export through the operations ---
 
 
@@ -1302,6 +1903,23 @@ def _parity_session(tmp_path: Path, pixels: np.ndarray, polarity: Polarity) -> P
     return s
 
 
+def _stored_backgrounds(s: ProjectSession) -> list[list]:
+    """Each protein's stored band backgrounds, by lane: (level, mode, spread)."""
+    return [
+        [[b.background_level, b.background_mode, b.background_spread] for b in protein.bands]
+        for protein in s.project.batch.proteins
+    ]
+
+
+def _golden_backgrounds(background: dict, polarity: str) -> list[list]:
+    """The golden file's band backgrounds in :func:`_stored_backgrounds`' shape."""
+    fields = [background[key][polarity] for key in ("levels", "modes", "spreads")]
+    return [
+        [list(band) for band in zip(*(field[name] for field in fields), strict=True)]
+        for name in (TARGET, LOADING)
+    ]
+
+
 def _golden() -> tuple[dict, float, float]:
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
     return golden["values"], golden["tolerance"]["rel"], golden["tolerance"]["abs"]
@@ -1313,7 +1931,12 @@ def test_operations_reproduce_the_regression_baseline(tmp_path, method):
     s = _parity_session(tmp_path, _blot(), DARK)
     [image] = s.project.batch.iter_images()
     assert image.bit_depth is None  # a float64 TIFF
-    _assert_close(image.background, values["background"]["dark_on_light"], rel, abs_)
+    background = values["background"]
+    assert (s.project.background_method, background["method"]) == ("ring_median_v1",) * 2
+    _assert_close(image.background, background["image_median"]["dark_on_light"], rel, abs_)
+    _assert_close(
+        _stored_backgrounds(s), _golden_backgrounds(background, "dark_on_light"), rel, abs_
+    )
 
     res = ops.compute(s, method=method)
     nets = values["nets"]["dark_on_light"]
@@ -1339,7 +1962,11 @@ def test_set_polarity_reproduces_the_light_on_dark_baseline(tmp_path):
     [image] = s.project.batch.iter_images()
     ops.set_polarity(s, image.id, LIGHT)
     [image] = s.project.batch.iter_images()
-    _assert_close(image.background, values["background"]["light_on_dark"], rel, abs_)
+    background = values["background"]
+    _assert_close(image.background, background["image_median"]["light_on_dark"], rel, abs_)
+    _assert_close(
+        _stored_backgrounds(s), _golden_backgrounds(background, "light_on_dark"), rel, abs_
+    )
     nets = values["nets"]["light_on_dark"]
     res = ops.compute(s)
     _assert_close([c.nets for c in res.proteins], [nets[TARGET], nets[LOADING]], rel, abs_)
@@ -2051,6 +2678,17 @@ LOGGED_STEPS = [
         lambda s: {"image_id": "img-1", "polarity": "light_on_dark", "dropped_undetected": []},
     ),
     (
+        # As a project quantified before #83 (a migrated one), planted.
+        lambda s: plant_legacy(s),
+        "plant",
+        lambda s: {},
+    ),
+    (
+        lambda s: ops.requantify(s),
+        "requantify",
+        lambda s: {"from": "global_median", "to": "ring_median_v1", "images": ["img-1"]},
+    ),
+    (
         lambda s: ops.remove_box(s, "band-10"),
         "remove_box",
         lambda s: {"band_id": "band-10", "protein_id": "prot-4", "lane_index": 1},
@@ -2195,7 +2833,8 @@ def test_each_operation_logs_its_params(tmp_path):
         "set_box_size",
         "remove_undetected",
         "clear_boxes",
-        "plant",  # the test's own records, as no operation writes them on this blot
+        "requantify",
+        "plant",  # the test's own records and legacy method, as no operation writes them
     }
     text = (s.folder / storage.PROJECT_FILE).read_text(encoding="utf-8")
     for leak in (str(tmp_path), json.dumps(str(tmp_path))[1:-1], FOLDER):
@@ -2349,7 +2988,7 @@ def test_export_writes_the_record(tmp_path):
     assert doc["exported_at"] == "2026-09-26T08:00:00.000Z"
     assert doc["history_issues"] == ["no_history"]  # the sample was saved without a log
     assert doc["results"] is None  # the lane table uses no compute settings
-    assert doc["settings"] == record.settings()
+    assert doc["settings"] == {**record.settings(), "background_method": "ring_median_v1"}
     text = data.decode("utf-8")
     for leak in (str(tmp_path), json.dumps(str(tmp_path))[1:-1], FOLDER):
         assert leak not in text
@@ -3267,7 +3906,15 @@ def test_a_row_leaves_the_other_proteins_on_its_image_alone(tmp_path):
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert None not in placement.band_ids
-    assert protein_of(s, other) == before
+    # Its boxes, size and records stay; only what its pixels give is measured
+    # again, since every ring on the image now leaves out the row's boxes.
+    measured = {"net", "background_level", "background_mode", "background_spread", "clipped"}
+    after = protein_of(s, other)
+    assert after.model_dump(exclude={"bands"}) == before.model_dump(exclude={"bands"})
+    assert [b.model_dump(exclude=measured) for b in after.bands] == [
+        b.model_dump(exclude=measured) for b in before.bands
+    ]
+    assert [b.net for b in after.bands] != [b.net for b in before.bands]
     assert_nets_current(s)
 
 

@@ -12,7 +12,10 @@ of :class:`~proteia.core.operations.Cascade`, as lists of ids. Undo and redo
 answer the change they took back or made again (``action``, ``seq``) and the
 ids and not-detected record keys that went or came back
 (:class:`~proteia.core.operations.Restored`); clearing a protein's boxes answers
-the band ids removed and the (lane index, band index) of each record dropped.
+the band ids removed and the (lane index, band index) of each record dropped;
+requantifying answers the images re-quantified. Any box edit may change every
+net on its image (each band's background ring leaves out every box there), and
+every answer carries every protein's numbers, so the browser redraws them all.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -597,6 +600,16 @@ def _restored(restored: ops.Restored) -> dict[str, Any]:
         "undetected_removed": [list(key) for key in restored.undetected_removed],
         "undetected_restored": [list(key) for key in restored.undetected_restored],
     }
+
+
+@router.post("/requantify")
+def requantify(workspace: WorkspaceDep) -> dict[str, Any]:
+    """Switch the project to the local background and re-quantify every band;
+    answers the images re-quantified (``images``; empty for a project already
+    on the local background, a no-op)."""
+    session = workspace.current()
+    images = ops.requantify(session)
+    return _answer(workspace, session, images=list(images))
 
 
 @router.post("/undo")
