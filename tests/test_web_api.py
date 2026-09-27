@@ -688,6 +688,56 @@ def bar(series: dict, condition: str) -> dict:
     return next(b for b in series["chart"]["bars"] if b["label"] == condition)
 
 
+def test_a_jpeg_project_says_its_bands_were_not_checked_for_over_exposure(client, tmp_path):
+    # #112: the over-exposure check does not run on a JPEG, and the results say so
+    # per protein. The Checks list shows every notice of a set, and a chart card
+    # those about its series' proteins, whatever their code.
+    spots = [(x, row, 5.0, 3.0, 25000.0) for row in (TARGET_ROW, LOADING_ROW) for x in LANE_X]
+    blot = (synthetic_blot((TWO_ROW_H, W), spots) // 257).astype(np.uint8)
+    jpeg = io.BytesIO()
+    Image.fromarray(blot).save(jpeg, format="JPEG", quality=95)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, jpeg.getvalue(), name="blot β.jpg")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    (image,) = answer["project"]["images"]
+    assert [w["code"] for w in image["warnings"]] == ["lossy_format"]
+    assert "over-exposure cannot be checked" in image["warnings"][0]["message"]
+    lanes = [{"condition": condition} for condition in DOSES]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes, "reference_condition": "vehicle"})
+    ids = []
+    for name, role in (("α-tubulin", "loading control"), ("β-catenin", "target")):
+        body = {"name": name, "role": role, "image_id": image_id, "box_size": SIZE}
+        ids.append(client.ok("POST", "/api/proteins", body)["protein_id"])
+    loading_id, target_id = ids
+    for protein, row, lanes_boxed in (
+        (loading_id, LOADING_ROW, (0, 1, 2, 3)),
+        (target_id, TARGET_ROW, (0, 2, 4)),
+    ):
+        for lane in lanes_boxed:
+            body = {"protein_id": protein, "x": LANE_X[lane], "y": row, "lane_index": lane}
+            answer = client.ok("POST", "/api/boxes", body)
+    assert {band["clipped"] for band in bands(answer).values()} == {None}
+
+    (result_set,) = answer["results"]["sets"]
+    unchecked = [n for n in result_set["notices"] if n["code"] == "clipping_not_checked"]
+    assert [(n["protein_ids"], n["lane_indices"], n["level"]) for n in unchecked] == [
+        ([loading_id], [0, 1, 2, 3], "warning"),
+        ([target_id], [0, 2, 4], "warning"),
+    ]
+    loading, target = (n["message"] for n in unchecked)
+    assert loading.startswith(
+        "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4: its image has"
+        " lossy (JPEG-type) compression"
+    )
+    assert loading.endswith("which biases every value normalized to it")
+    assert target.startswith("'β-catenin' was not checked for over-exposure in lanes 1, 3, 5:")
+    # The series' chart card shows both: each is about one of its proteins.
+    series = only_series(answer)
+    assert series["chart"] is not None
+    assert {n["protein_ids"][0] for n in unchecked} == {series["target_id"], series["loading_id"]}
+
+
 def test_box_edits_answer_with_the_changed_net_and_chart(client, tmp_path):
     target, _, before = live(client, tmp_path, DOSES, boxed=(0, 1, 2, 3))
     assert column(before, target)["nets"][4] is None
