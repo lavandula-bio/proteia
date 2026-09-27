@@ -4,6 +4,8 @@
 - **Date**: 2026-09-25
 - **Deciders**: Roger Huang
 - **Supersedes**: [ADR 0001](0001-gui-foundation-napari.md)
+- **Amended**: 2026-09-28, images handed over by a launch (see
+  [Amendments](#amendments))
 
 ## Context
 
@@ -237,3 +239,33 @@ separate ADR.
   large 16-bit scans; and reading and writing a project folder on disk depends on
   browser file-system APIs that are not available in every browser. The analysis
   would also run in a runtime that the test suite does not exercise.
+
+## Amendments
+
+**2026-09-28: images handed over by a launch**
+
+The Decision says that the browser sends each imported image to the server, and
+the Trade-offs say that an imported image arrives as file contents only. Image
+files can now also be named on the command line (`proteia PATH...`), so a launch
+may hand them to the running instance. The rule that a name from the client never
+becomes a path still holds: no HTTP client ever supplies a path.
+
+- A launch that finds Proteia already running uploads each file's bytes to it as
+  a raw request body, one file per request, as the page does, with the token from
+  the per-user file that records the running instance's port and token. The
+  original file name is sent percent-encoded, as metadata only. The server stores
+  the bytes in a private staging folder next to that file, not in a project
+  folder, under a name it generates itself, with limits on how many files and
+  bytes may wait there.
+- A launch that starts the server hands it the files named on its own command
+  line in-process, without HTTP. The server reads each of them where it is when
+  the page imports it, and makes no copy before then.
+- Nothing is imported until the page has chosen each image's kind, polarity and
+  membrane. The images then go into a new project through the ordinary import,
+  which stores them in the project folder as described above. The page sees a
+  file id, a name and a size for each image, never a path.
+- A staged file is deleted after the page imports or discards it, when no launch
+  offers it for import within 10 minutes of its upload, when the server stops,
+  and at the next start if a crash left it behind. This cleanup deletes only
+  files directly in the staging folder, under names the server generated. A file
+  handed over is never deleted from where it was.
