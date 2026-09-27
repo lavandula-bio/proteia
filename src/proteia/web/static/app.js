@@ -146,14 +146,32 @@ function showStatus(text, action = null) {
   return button;
 }
 
+let statusFloor = 0; // px: the tallest status line shown since the window was resized
+
 // While a project is shown the status line keeps its place under the header,
 // empty or not: a message coming or going (after every undo, and the next edit)
 // never moves the panel or the image under the pointer, so a second click, or
-// a click on a band, lands where it was aimed. Otherwise it shows only a message.
+// a click on a band, lands where it was aimed. It is two lines tall (app.css),
+// or as tall as the tallest message yet at this window size, so a shorter one
+// after it moves nothing back. Otherwise it shows only a message.
 function placeStatus() {
   const line = $("status");
   line.hidden = !line.textContent && $("workspace").hidden;
+  if ($("workspace").hidden) {
+    statusFloor = 0;
+    line.style.minHeight = "";
+  } else if (line.offsetHeight > statusFloor) {
+    statusFloor = line.offsetHeight;
+    line.style.minHeight = `${statusFloor}px`;
+  }
 }
+
+// Lines wrap anew at another width: the status line is as tall as its message.
+window.addEventListener("resize", () => {
+  statusFloor = 0;
+  $("status").style.minHeight = "";
+  placeStatus();
+});
 
 // Drop the status line's Undo once undo would take back another change.
 function renderStatusUndo(history) {
@@ -274,7 +292,11 @@ async function edit(method, path, json) {
 const view = new ImageView($("view"), {
   place: (x, y, options) =>
     placeBox(x, y, options, options.laneIndex, options.proteinId || state.proteinId),
-  move: (boxId, rect) => edit("PUT", `/api/boxes/${boxId}`, { rect }).catch(() => {}),
+  row: (rect, proteinId) => placeRow(rect, proteinId),
+  move: (boxId, rect) =>
+    edit("PUT", `/api/boxes/${boxId}`, { rect })
+      .then((answer) => noteBoxStep(answer, "move_box", [boxId]))
+      .catch(() => {}),
   select: (boxId) => {
     state.boxId = boxId;
     render();
@@ -373,6 +395,7 @@ async function openProject(path, name) {
     laneTable.forgetTyped();
     $("lane-picker").hidden = true; // its retry places a box in the project it asked about
     applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
+    lastBoxStep = null; // log numbers repeat across projects
     $("projects-dialog").close();
     showStatus("");
   } catch (error) {
@@ -616,6 +639,20 @@ function renderNotices(project) {
   }
 }
 
+// What a drag on the membrane boxes: a row of the chosen protein, once it is on
+// this signal image and the lanes are declared ({proteinId, color, lanes});
+// otherwise null, and the drag pans.
+function rowTool(project, image) {
+  const protein = image
+    ? project.proteins.find((p) => p.id === state.proteinId && p.image_id === image.id)
+    : null;
+  if (!protein || image.kind === "visible_marker" || !project.lanes.length) {
+    return null;
+  }
+  const color = colorOf(project, protein.id);
+  return { proteinId: protein.id, color, lanes: project.lanes.length };
+}
+
 function renderHint(project, image) {
   const hint = $("view-hint");
   hint.hidden = !image;
@@ -623,15 +660,26 @@ function renderHint(project, image) {
     return;
   }
   const protein = project.proteins.find((p) => p.id === state.proteinId);
+  const lanes = project.lanes.length;
   if (image.kind === "visible_marker") {
     hint.textContent = "A marker image: boxes are placed on signal images.";
   } else if (!protein) {
     hint.textContent = "Add a protein to place boxes on this image.";
-  } else {
+  } else if (!lanes) {
     hint.replaceChildren(
       "Boxes go to ",
       span("hint-target", protein.name),
-      " · Click a band: one box · Shift+click: fixed box · Drag: pan · Wheel: zoom",
+      " · Click a band: one box · Shift+click: fixed box · Drag: pan · Wheel: zoom" +
+        " · Declare the lanes to box a whole row at once",
+    );
+  } else {
+    // The row box is the analysis region: every declared lane, and no ladder.
+    const over = lanes === 1 ? "over the lane" : `over all ${lanes} lanes`;
+    hint.replaceChildren(
+      "Boxes go to ",
+      span("hint-target", protein.name),
+      ` · Drag across a row (${over}, not a ladder): one box per lane · Click a band: one box` +
+        " · Shift+click: fixed box · Space+drag: pan · Wheel: zoom",
     );
   }
 }
@@ -657,6 +705,7 @@ let renderGeneration = 0;
 function renderView(project) {
   const generation = ++renderGeneration;
   const image = project.images.find((i) => i.id === state.imageId);
+  view.setRowTool(rowTool(project, image));
   if (!image || state.shownImageId !== image.id) {
     // Never show one image while edits target another: blank until it loads.
     state.shownImageId = null;
@@ -748,6 +797,7 @@ async function placeBox(x, y, options, laneIndex, proteinId) {
     const answer = await ordered(() => call("POST", "/api/boxes", body));
     applyAnswer(answer, { choose: { proteinId } }); // it stays the click target
     if (sameOpening(answer)) {
+      noteBoxStep(answer, "place_box", [answer.band_id]);
       showStatus(""); // not selected, so the next click places the next box
     }
   } catch (error) {
@@ -802,6 +852,258 @@ $("lane-picker-cancel").addEventListener("click", () => {
   $("lane-picker").hidden = true;
 });
 
+// --- A row of boxes from a row box ---
+
+// Stored lane indices in words, numbered from 1: "lane 8", "lanes 4 and 8".
+function lanesPhrase(indices) {
+  const numbers = indices.map((index) => String(index + 1));
+  return `${numbers.length === 1 ? "lane" : "lanes"} ${inWords(numbers)}`;
+}
+
+// Why a row left a lane with neither a box nor an n.d. mark, by the
+// detector's reason for the empty lane (LaneReason in core/rowdetect.py). A
+// lane where no band reaches the detection limit (no_band) gets an n.d. mark,
+// unless its place lies outside the row box.
+const NOT_MEASURED = {
+  artefact: "a stain or streak",
+  edge_signal: "only a neighbouring row's signal",
+  unassigned: "signal that fits no lane",
+  no_band: "outside the row box",
+};
+
+// The detector's warnings about a row it placed (WARNING_FLAGS in
+// core/rowdetect.py), in words. `note`: words of the detector's note on it,
+// which names its lanes first ("lane 5: …", "lanes 3, 7: …").
+const ROW_WARNINGS = {
+  background_mismatch: {
+    note: null,
+    words: () => "uneven background under some boxes: check their nets",
+  },
+  size_outlier: {
+    note: "left out of the shared size",
+    words: (lanes) =>
+      `a band much larger than the others${lanes ? ` (${lanes})` : ""} did not set the box size`,
+  },
+  multiple_components: {
+    note: "second separate component",
+    words: (lanes) => `two bands in ${lanes || "a lane"}: the box covers the stronger one`,
+  },
+};
+
+function warningText(flag, notes) {
+  const warning = ROW_WARNINGS[flag];
+  if (!warning) {
+    return null; // a warning this page does not know: the log keeps it
+  }
+  const note = warning.note && notes.find((text) => text.includes(warning.note));
+  const match = note ? /^(lanes? [\d, ]+):/.exec(note) : null;
+  return warning.words(match ? match[1] : null);
+}
+
+// What a row did, lane by lane, from its answer (lanes numbered from 1): the
+// boxes placed, the lanes with no band (n.d.), those kept as they were, those
+// not measured and why, the boxes an earlier row placed that went, and the
+// detector's warnings. `before`: the state shown before, where those boxes are.
+// Gives {text, check, unchanged}: `unchanged` when the row changed nothing (the
+// same drag again), `check` when it changed the project and left signal that
+// fits no lane, the mark of a row box over part of the row (its bands then
+// read as several lanes each): the text asks to check the lane numbers.
+function rowReport(answer, name, before) {
+  const empty = new Map(answer.empty.map((lane) => [lane.lane_index, lane]));
+  const kept = new Set(answer.kept_lanes);
+  const placed = answer.band_ids.filter(
+    (id, lane) => id !== null && !empty.has(lane) && !kept.has(lane),
+  ).length;
+  const replaced = answer.replaced_band_ids.length;
+  let head = `Placed ${counted(placed, "box", "boxes")} of ${name}`;
+  const unchanged = Boolean(
+    before &&
+      before.open_id === answer.project.open_id &&
+      before.revision === answer.project.revision,
+  );
+  if (unchanged) {
+    head = `No change: the row box finds the boxes of ${name} where they are`; // nothing logged
+  } else if (replaced) {
+    head += ` (${replaced === placed ? "all" : replaced} in place of the earlier ones)`;
+  }
+  const parts = [head];
+  if (answer.undetected_lanes.length) {
+    parts.push(`no band in ${lanesPhrase(answer.undetected_lanes)} (n.d.)`);
+  }
+  const bands = new Map(answer.project.proteins.flatMap((p) => p.bands).map((b) => [b.id, b]));
+  const keptLanes = answer.kept_lanes.map((lane) => [lane, bands.get(answer.band_ids[lane])]);
+  const edited = keptLanes.filter(([, band]) => band && band.manually_edited).map(([l]) => l);
+  const yours = keptLanes.filter(([, band]) => !(band && band.manually_edited)).map(([l]) => l);
+  if (edited.length) {
+    parts.push(`kept ${lanesPhrase(edited)} (edited)`);
+  }
+  if (yours.length) {
+    const boxes = yours.length === 1 ? "box" : "boxes";
+    parts.push(`kept your ${boxes} in ${lanesPhrase(yours)} (no band found)`);
+  }
+  const unmeasured = new Map(); // reason -> lanes
+  for (const lane of answer.unmeasured_lanes) {
+    const reason = empty.has(lane) ? empty.get(lane).reason : "";
+    unmeasured.set(reason, [...(unmeasured.get(reason) || []), lane]);
+  }
+  for (const [reason, lanes] of unmeasured) {
+    parts.push(`${lanesPhrase(lanes)} not measured: ${NOT_MEASURED[reason] || reason}`);
+  }
+  if (answer.removed_band_ids.length) {
+    const was = answer.removed_band_ids.map((id) => (before ? findBox(before, id) : null));
+    parts.push(
+      was.every(Boolean)
+        ? `removed the earlier ${was.length === 1 ? "box" : "boxes"} in ${lanesPhrase(
+            was.map((found) => found.band.lane_index).sort((a, b) => a - b),
+          )}`
+        : `removed ${counted(was.length, "earlier box", "earlier boxes")}`,
+    );
+  }
+  for (const flag of answer.flags) {
+    const text = warningText(flag, answer.notes);
+    if (text) {
+      parts.push(text);
+    }
+  }
+  if (answer.right_to_left) {
+    parts.push("lanes read right to left, as the boxes on this image run");
+  }
+  const check = !unchanged && unmeasured.has("unassigned");
+  if (check) {
+    const all = answer.band_ids.length;
+    parts.push(
+      "check the boxes' lane numbers: a row box over part of the row misreads the lanes" +
+        ` (Undo, then drag across all ${all})`,
+    );
+  } else if (unmeasured.size) {
+    parts.push("click a dashed placeholder to box a lane by hand");
+  }
+  return { text: parts.join(" · "), check, unchanged };
+}
+
+// What to do about a refused row, by the refusal's code.
+const ROW_HINTS = {
+  row_too_small: "Drag across the whole row, over every lane.",
+  no_band_found: "Drag over a row of bands, or click a band to box one lane.",
+  out_of_image: "Drag over the image.",
+  no_lanes: "Declare the lanes in the lane table first.",
+  size_would_overlap: "Move apart or delete the boxes it keeps (edited by hand), then drag again.",
+};
+
+// The last box change made from this page, as logged: {seq, ids}, the boxes it
+// placed, moved or gave a lane (a row: the boxes it placed or replaced); or
+// null. A row refused over the boxes already on the image names them (or
+// their proteins): if it names one of these, the last change may have put it
+// in the wrong lane.
+let lastBoxStep = null;
+
+// Note the box change `answer` logged as `action` (another change logged
+// meanwhile leaves the last one unknown).
+function noteBoxStep(answer, action, ids) {
+  const step = answer && sameOpening(answer) ? answer.project.history.undo : null;
+  lastBoxStep = step && step.action === action ? { seq: step.seq, ids } : null;
+}
+
+// Whether the change undo would take back is the last box change, and made
+// one of the boxes (or boxes of the proteins) the refusal `error` names.
+function lastBoxStepNamed(error) {
+  const step = state.project.history.undo;
+  if (!lastBoxStep || !step || step.seq !== lastBoxStep.seq) {
+    return false;
+  }
+  const named = new Set(error.ids);
+  return lastBoxStep.ids.some((id) => {
+    const found = findBox(state.project, id);
+    return named.has(id) || (found !== null && named.has(found.protein.id));
+  });
+}
+
+// A refused row in the status line: the server's reason with the protein
+// named, what to do, and, when the boxes already on the image did not let the
+// row read its lanes just after a box was placed or changed, an Undo of that
+// change.
+function showRowRefusal(error, name) {
+  if (error instanceof ApiError && error.status === 401) {
+    return;
+  }
+  const sentences = [`Row box of ${name} not placed: ${sentence(error.message)}`];
+  let action = null;
+  if (error.code === "overlap") {
+    const lanes = error.ids.map((id) => findBox(state.project, id)).filter(Boolean);
+    const which = lanes.length
+      ? `the box in ${lanesPhrase(lanes.map((found) => found.band.lane_index))}`
+      : "that box";
+    sentences.push(`Move or delete ${which}, then drag again.`);
+  } else if (error.code === "row_lanes_unclear") {
+    // Named: the boxes on the image the row disagrees with, or their proteins
+    // (none when the row box alone does not show the lanes).
+    const step = state.project.history.undo;
+    if (lastBoxStepNamed(error)) {
+      const words = actionWords(step.action);
+      sentences.push(
+        `If the last change (${words}) put a box in the wrong lane, Undo takes it back.`,
+      );
+      action = {
+        label: "Undo",
+        name: `Undo ${words}`,
+        seq: step.seq,
+        run: () => takeStep("undo", { seq: step.seq }),
+      };
+    }
+  } else if (ROW_HINTS[error.code]) {
+    sentences.push(ROW_HINTS[error.code]);
+  }
+  showStatus(sentences.join(" "), action);
+}
+
+// Box the first band of `proteinId` in every declared lane from the row box
+// dragged over its row (image pixels, end exclusive), then say what the row
+// did. Sent in order with the other edits (ordered), so an undo or an open
+// asked for after it waits for it; its answer goes through the stale-answer
+// guard (applyAnswer). A refusal changes nothing.
+async function placeRow(rect, proteinId) {
+  const protein = state.project.proteins.find((p) => p.id === proteinId);
+  if (!protein) {
+    return;
+  }
+  const opened = shownOpening();
+  let before = null;
+  try {
+    const answer = await ordered(() => {
+      before = state.project;
+      return call("POST", "/api/boxes/row", { protein_id: proteinId, rect });
+    });
+    applyAnswer(answer, { choose: { proteinId } }); // it stays the drag's protein
+    if (sameOpening(answer)) {
+      const name = (answer.project.proteins.find((p) => p.id === proteinId) || protein).name;
+      const { text, check, unchanged } = rowReport(answer, name, before);
+      if (!unchanged) {
+        // Its boxes: those it placed or replaced, not those it kept as they were.
+        const kept = new Set(answer.kept_lanes);
+        const made = answer.band_ids.filter((id, lane) => id !== null && !kept.has(lane));
+        noteBoxStep(answer, "detect_row_boxes", made);
+      }
+      // Asked to check the lane numbers: an Undo of this row at hand. It goes
+      // once the history moves on.
+      const step = answer.project.history.undo;
+      const undo =
+        check && step && step.action === "detect_row_boxes"
+          ? {
+              label: "Undo",
+              name: `Undo the row box of ${name}`,
+              seq: step.seq,
+              run: () => takeStep("undo", { seq: step.seq }),
+            }
+          : null;
+      showStatus(text, undo);
+    }
+  } catch (error) {
+    if (opened === shownOpening()) {
+      showRowRefusal(error, protein.name);
+    }
+  }
+}
+
 async function deleteSelected() {
   if (state.boxId) {
     await edit("DELETE", `/api/boxes/${state.boxId}`).catch(() => {});
@@ -811,7 +1113,10 @@ async function deleteSelected() {
 $("delete-box").addEventListener("click", deleteSelected);
 $("box-lane").addEventListener("change", (event) => {
   const lane = Number(event.target.value);
-  edit("PUT", `/api/boxes/${state.boxId}/lane`, { lane_index: lane }).catch(() => render());
+  const boxId = state.boxId;
+  edit("PUT", `/api/boxes/${boxId}/lane`, { lane_index: lane })
+    .then((answer) => noteBoxStep(answer, "set_box_lane", [boxId]))
+    .catch(() => render());
 });
 $("polarity").addEventListener("change", (event) => {
   edit("PUT", `/api/images/${state.imageId}/polarity`, { polarity: event.target.value }).catch(

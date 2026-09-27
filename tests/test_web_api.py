@@ -2384,6 +2384,12 @@ def _kept_box_on_lane_2(client: Client, target: str, loading: str) -> list[str]:
     return [_edited_box(client, target, [60, 10], 1, [LANE_X[1], 25, LANE_X[1] + 60, 35])]
 
 
+def _loading_lanes(client: Client, target: str, loading: str) -> list[str]:
+    """Nothing to set up: the loading control's boxes place the lanes the row
+    is checked against, and a row that does not line up with them names them."""
+    return column(client.ok("GET", "/api/project"), loading)["band_ids"]
+
+
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:
     """A non-finite pixel in the row, as a damaged file would read."""
     session = client.workspace.current()
@@ -2403,7 +2409,10 @@ ROW_BOX_REFUSALS = [
     pytest.param(None, [15, 18, 24, 42], "row_too_small", id="too-narrow"),  # < 2 px a lane
     pytest.param(None, [15, 18, W - 35, 20], "row_too_small", id="too-low"),
     pytest.param(_unreadable_pixels, TARGET_ROW_BOX, "unreadable_image", id="unreadable"),
-    pytest.param(None, [85, 18, W, 42], "row_lanes_unclear", id="first-lane-left-out"),
+    # Read a lane off: the loading control's boxes show it.
+    pytest.param(_loading_lanes, [85, 18, W, 42], "row_lanes_unclear", id="first-lane-left-out"),
+    # The row box alone does not show the lanes: nothing on the image is named.
+    pytest.param(None, [15, 18, 180, 42], "row_lanes_unclear", id="part-of-the-row"),
     pytest.param(
         _lane_1_on_two_columns, TARGET_ROW_BOX, "row_lanes_unclear", id="numbered-inconsistently"
     ),

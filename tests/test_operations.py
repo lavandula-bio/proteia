@@ -70,7 +70,7 @@ from proteia.core.operations import (
     ProjectSession,
 )
 from proteia.core.plotspec import ErrorType
-from proteia.core.project import lane_anchors, lane_positions
+from proteia.core.project import lane_anchor_ids, lane_anchors, lane_positions
 from proteia.core.quantify import (
     RING_CLAMP,
     BandBackground,
@@ -4544,6 +4544,7 @@ def test_a_row_that_leaves_out_an_empty_end_lane_is_refused(tmp_path, row, flag)
         "the row box does not show which lane each band is in; draw it over every"
         " declared lane, empty end lanes included, or place the boxes by clicking"
     )
+    assert info.value.ids == ()  # the row box alone is at fault
 
 
 # --- #51: a row checked against the lanes already placed on its image ---
@@ -4629,6 +4630,27 @@ def test_a_row_read_a_lane_off_the_lanes_on_its_image_is_refused(tmp_path, name,
     assert all(true == read + (1 if dx > 0 else -1) for read, true in reading(case, found).items())
     other_protein_in_lanes(s, image, case, lanes)
     refused_as(s, protein, row, OFF_LANES)
+
+
+def test_a_row_off_the_lanes_on_its_image_names_the_boxes_that_placed_them(tmp_path):
+    # One of them may be in the wrong lane (a click given the wrong lane), so a
+    # client can offer to take back the change that placed it. This protein's
+    # boxes a detector placed give way to the row and are not named; its box
+    # clicked in lane 4, which shows where the user put that lane, is.
+    case = ROWS["all_present"]
+    s, image, protein = row_session(tmp_path, case)
+    ops.detect_row_boxes(s, protein, case.row)
+    ops.remove_box(s, lane_bands(s, protein)[4].id)
+    clicked = ops.place_box(s, protein, *at_lane(case, 4), lane_index=4, grow=False)
+    other = other_protein_in_lanes(s, image, case, (3, 4))
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        ops.detect_row_boxes(s, protein, shifted(case, 70))
+    assert (info.value.code, str(info.value)) == (ErrorCode.ROW_LANES_UNCLEAR, OFF_LANES)
+    others = tuple(b.id for b in protein_of(s, other).bands)
+    assert len(others) == 2
+    assert info.value.ids == (clicked, *others)  # proteins in order, then their boxes
+    assert s.project is before
 
 
 def test_one_lane_on_the_image_does_not_show_the_lanes(tmp_path):
@@ -4839,6 +4861,12 @@ def test_lane_anchors_of_some_bands_only(tmp_path):
     assert sorted(lane for _, lane in others) == [2, 3]
     assert sorted(mine + others) == sorted(lane_anchors(batch, ref))
     assert lane_anchors(batch, ref, without=own, only=own) == []
+    # The ids of the same anchors, in the same order.
+    lanes = {b.id: b.lane_index for p in batch.proteins for b in p.bands}
+    for kwargs in ({}, {"only": own}, {"without": own}):
+        ids = lane_anchor_ids(batch, ref, **kwargs)
+        assert [lanes[i] for i in ids] == [lane for _, lane in lane_anchors(batch, ref, **kwargs)]
+    assert set(lane_anchor_ids(batch, ref, only=own)) == own
 
 
 def clicked_lanes(tmp_path: Path, mirrored: bool) -> tuple[ProjectSession, str, str, list[str]]:
