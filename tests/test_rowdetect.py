@@ -1079,6 +1079,121 @@ def test_a_band_burnt_out_in_its_middle_is_hollow(seed, stored):
     assert unknown.slots == found.slots
 
 
+def burnt_out(depth: float, light: float, seed: int) -> RowCase:
+    """Lane 1's band ``depth`` times as deep as the membrane (clipped at 0),
+    its centre lightened by ``light`` through its whole height and more: the
+    band of hollow_band, lightened 45000 there."""
+    blobs = [blob(1, 6.0, -light, ry=12.0)]
+    return adversarial_row("burnt_out", seed, depths={1: depth * MEMBRANE}, artefacts=blobs)
+
+
+# #121: 1.5x as deep lightened by 45000 to 120000, 2x by 60000 to 120000. From
+# 60000 (1.5x) or 90000 (2x) on, the centre falls below the extent level and
+# splits the band along x. Left out: 2x lightened by 45000, its centre still
+# at the limit, and seed 1001's band 1.5x deep lightened by 90000 or more,
+# which reaches the limit at fewer than HOLLOW_PIXELS pixels (both below).
+BURNT_OUT = [
+    (depth, light, seed)
+    for depth, lights in ((1.5, range(45000, 120001, 15000)), (2.0, range(60000, 120001, 15000)))
+    for light in lights
+    for seed in (1000, 1001)
+    if not (depth == 1.5 and seed == 1001 and light >= 90000)
+]
+
+
+@pytest.mark.parametrize("light_on_dark", [False, True])
+@pytest.mark.parametrize(("depth", "light", "seed"), BURNT_OUT)
+def test_a_band_split_by_its_burnt_out_centre_is_one_hollow_band(depth, light, seed, light_on_dark):
+    # #121: lane 1's band clipped at the limit on both sides of a centre
+    # lighter through its whole height, however light: split along x where
+    # the centre falls below the extent level, its halves in the same rows,
+    # saturated on either side of the centre. One band, hollow, not two, and
+    # its extent and box over both halves: a box over one of them, as over
+    # the stronger of two bands, would measure half the band.
+    case = burnt_out(depth, light, seed)
+    limit = 0.0
+    if light_on_dark:
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    assert found.notes[-1] == f"lane 2{HOLLOW_NOTE}"
+    ref = case.reference[1]
+    for x0, _, x1, _ in (found.lanes[1].extent, found.slots[1]):
+        assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2  # both halves
+
+
+def test_a_stroke_across_a_burnt_out_band_s_rows_does_not_join_it():
+    # #121: the halves of a saturated band split by a lighter centre (rows 15
+    # to 24), and a stroke drawn through the centre from row 2 to 37, at the
+    # limit too, as a pen line on a blot. The band's other half shares its
+    # rows and joins it; the stroke shares fewer than JOIN_ROWS of the rows it
+    # and the band span, and does not. (On a real drag, strokes joined in a
+    # chain gave one band a 77 x 37 px extent.)
+    s = np.zeros((40, 60))
+    saturated = np.zeros(s.shape, bool)
+    for c0, c1 in ((5, 25), (36, 56)):
+        s[15:25, c0:c1] = 100.0
+        saturated[17:23, c0 + 3 : c1 - 3] = True
+    s[15:25, 25:36] = 10.0  # the lighter centre
+    s[2:38, 30:32] = 100.0
+    saturated[2:38, 30:32] = True
+    pieces, count = label(s > 30.0)
+    assert count == 3
+    grown = pieces == pieces[20, 10]
+    joined = rowdetect._join_burnt_out(pieces, grown, s, saturated, 6.0, (0, 60))
+    assert joined is not None and joined[20, 45]  # the other half
+    assert np.flatnonzero(joined.any(axis=1)).tolist() == list(range(15, 25))
+    assert np.flatnonzero(joined.any(axis=0)).tolist() == list(range(5, 56))
+
+
+@pytest.mark.parametrize("seed", [1000, 1001])
+def test_a_band_at_the_limit_through_its_centre_is_not_hollow(seed):
+    # 2x as deep, lightened by 45000, lane 1's centre still reaches the limit:
+    # saturated across, no lighter centre. One band, boxed whole.
+    case = burnt_out(2.0, 45000.0, seed)
+    found = detect(case, saturated_at=0.0)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+    ref = case.reference[1]
+    x0, _, x1, _ = found.slots[1]
+    assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2
+
+
+@pytest.mark.parametrize("light", [90000.0, 105000.0, 120000.0])
+def test_a_band_split_where_it_hardly_reaches_the_limit_is_two_peaks(light):
+    # Seed 1001's band, 1.5x as deep, lightened by 90000 or more, reaches the
+    # limit at fewer than HOLLOW_PIXELS pixels: not over-exposed by the
+    # quantification's count (#112), no saturated pixels to enclose a centre.
+    # Its halves are two peaks, as a band's split by a bubble.
+    case = burnt_out(1.5, light, 1001)
+    assert np.count_nonzero(case.image <= 0.0) < HOLLOW_PIXELS
+    found = detect(case, saturated_at=0.0)
+    assert found.flags == ("multiple_components",)
+    assert components(found) == [1, 2, 1, 1, 1, 1]
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize(
+    ("left", "right"), [(24000.0, 24000.0), (1.5 * MEMBRANE, 24000.0), (24000.0, 1.5 * MEMBRANE)]
+)
+def test_two_bands_side_by_side_not_both_saturated_count_as_two(seed, left, right):
+    # #121: lane 1 holds two bands side by side, 28 px apart, membrane between
+    # them: neither saturated, or one only. No centre with saturated pixels on
+    # either side of it: two bands where the saturation level is known too.
+    blobs = [blob(1, 5.0, left, ry=3.5, dx=-14.0), blob(1, 5.0, right, ry=3.5, dx=14.0)]
+    case = adversarial_row("pair", seed, depths={1: 0.0}, artefacts=blobs)
+    found = detect(case, saturated_at=0.0)
+    assert found.flags == ("multiple_components",)
+    assert components(found) == [1, 2, 1, 1, 1, 1]
+    assert not any(lane.hollow for lane in found.lanes)
+
+
 @pytest.mark.parametrize("seed", [1000, 1001, 1002])
 @pytest.mark.parametrize(("frac", "depth"), [(0.5, 1.3 * MEMBRANE), (1.0, 1.6 * MEMBRANE)])
 def test_an_over_exposed_close_doublet_is_not_a_hollow_band(seed, frac, depth):
