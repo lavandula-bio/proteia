@@ -48,6 +48,12 @@ desktop.ini
 *.log
 logs/
 
+# ─── Generated samples ────────────────────────────────────────────────────────
+# `python -m proteia.samples` writes its synthetic images here by default when
+# run in the repository root. Only this folder is ignored: sample images kept
+# on purpose elsewhere in the repository are not.
+/proteia-samples/
+
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
