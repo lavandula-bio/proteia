@@ -224,6 +224,10 @@ LANE_TABLE_RECORD_FILE: Final = "lane-table.record.json"
 _RESERVED_KEYS: Final = frozenset(name_key(column) for column in LANE_COLUMNS)
 # How many names an export tries for its new folder: the plain one, then numbered.
 _FOLDER_ATTEMPTS: Final = 1000
+# A box placed, moved or resized may overlap another protein's box on its
+# image by at most this share of the smaller box's area (#114): more, and the
+# two would measure the same band.
+COVER_SHARE: Final = 0.5
 
 
 class Keep(Enum):
@@ -737,6 +741,75 @@ def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> lis
         for band in protein.bands
         if band.id != skip and overlaps(rect, band.box.rect(protein.box_size))
     ]
+
+
+def _overlap_share(rect: Rect, box: Rect) -> float:
+    """How much of the smaller of two boxes' areas they share: 1.0 for a box
+    wholly inside the other, whichever is larger."""
+    w = min(rect[2], box[2]) - max(rect[0], box[0])
+    h = min(rect[3], box[3]) - max(rect[1], box[1])
+    smaller = min((r[2] - r[0]) * (r[3] - r[1]) for r in (rect, box))
+    return max(0, w) * max(0, h) / smaller
+
+
+def _covered(
+    batch: Batch, protein: Protein, rects: Iterable[Rect]
+) -> list[tuple[Protein, Band, float]]:
+    """The other proteins' bands on ``protein``'s image whose box one of
+    ``rects`` overlaps by more than :data:`COVER_SHARE` of the smaller box's
+    area, with the largest share (:func:`_overlap_share`); protein by protein
+    and band by band, as stored.
+
+    Against the smaller box: a box wholly inside another protein's larger box
+    shares all of it, and would measure its band as that box does; against
+    the other box alone, it passed when under half that box's area, and the
+    same pair of boxes was refused or not by which came first."""
+    rects = list(rects)
+    found = []
+    for other in batch.proteins:
+        if other.id == protein.id or other.image_id != protein.image_id:
+            continue
+        for band in other.bands:
+            box = band.box.rect(other.box_size)
+            share = max((_overlap_share(rect, box) for rect in rects), default=0.0)
+            if share > COVER_SHARE:
+                found.append((other, band, share))
+    return found
+
+
+def _cover_refusal(covered: Sequence[tuple[Protein, Band, float]], what: str) -> OperationError:
+    """``OVERLAP``: ``what`` (the new box, a row's boxes, or a protein's boxes
+    at a new size, with the verb: "the box would overlap") would overlap the
+    ``covered`` boxes of other proteins (:func:`_covered`) by more than
+    :data:`COVER_SHARE` of the smaller box's area; it names their band ids,
+    with ``detail`` ``{"cause": "other_protein", "covered": [{band_id,
+    protein_id, lane_index, share}]}``."""
+    lanes: dict[str, tuple[Protein, list[int]]] = {}
+    for other, band, _ in covered:
+        lanes.setdefault(other.id, (other, []))[1].append(band.lane_index)
+    parts = [
+        f"{'the box' if len(indices) == 1 else 'the boxes'} of {other.name!r} in"
+        f" {lanes_phrase(indices)}"
+        for other, indices in lanes.values()
+    ]
+    return OperationError(
+        ErrorCode.OVERLAP,
+        f"{what} {_in_words(parts)} by more than {COVER_SHARE:.0%} of the smaller box's area:"
+        " two proteins' boxes would measure the same band",
+        ids=[band.id for _, band, _ in covered],
+        detail={
+            "cause": "other_protein",
+            "covered": [
+                {
+                    "band_id": band.id,
+                    "protein_id": other.id,
+                    "lane_index": band.lane_index,
+                    "share": round(share, 3),
+                }
+                for other, band, share in covered
+            ],
+        },
+    )
 
 
 # --- Images ---
@@ -1322,9 +1395,13 @@ def place_box(
     protein's shared size fitted to it (the first box sets the size, later ones
     only grow it, and the other boxes are re-centred).
     ``grow=False`` drops a box of the current size centred on the point, shifted
-    inside the image. A protein's own boxes never overlap. Every band on the
-    image, of every protein, is then re-quantified: the new box leaves every
-    ring.
+    inside the image. A protein's own boxes never overlap (``OVERLAP``, with
+    the box in the way), and the new box, or a box of the protein grown to a
+    size the click grows, may overlap another protein's box on the image by
+    at most :data:`COVER_SHARE` of the smaller box's area (``OVERLAP``, naming
+    the boxes it would overlap, :func:`_cover_refusal`): two proteins' boxes
+    on one band would measure it twice. Every band on the image, of every
+    protein, is then re-quantified: the new box leaves every ring.
 
     A not-detected record in the lane is replaced by the box, with no
     confirmation: the log entry names it (``replaced_undetected``, else null).
@@ -1382,6 +1459,19 @@ def place_box(
             )
         except boxes.BoxRuleError as exc:  # overlap, or size_would_overlap
             raise OperationError(ErrorCode(exc.code), str(exc)) from exc
+        covered = _covered(batch, protein, [rect])
+        if covered:
+            raise _cover_refusal(covered, "the box would overlap")
+        # The protein's other boxes, grown to the size around their centres.
+        covered = _covered(
+            batch, protein, [r for r, o in zip(resized, rects, strict=True) if r != o]
+        )
+        if covered:
+            raise _cover_refusal(
+                covered,
+                f"at the box size {size.width}x{size.height} this band needs, boxes of"
+                f" {protein.name!r} would overlap",
+            )
         source = ProposalSource.CLICK
         if lane_index is None:
             # The grown band's own centre (the box is shifted inside the image at the
@@ -1397,6 +1487,9 @@ def place_box(
             raise OperationError(
                 ErrorCode.OVERLAP, "the box would overlap another box of this protein", ids=hits
             )
+        covered = _covered(batch, protein, [rect])
+        if covered:
+            raise _cover_refusal(covered, "the box would overlap")
         source = ProposalSource.MANUAL
     if lane_index is None:  # unreachable: every branch above checks or proposes it
         raise RuntimeError("place_box left the lane unresolved")
@@ -1443,7 +1536,10 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
     """Move a box to where the user dragged or resized it.
 
     ``rect`` is read by its centre: the box keeps the protein's size, centred
-    there and shifted inside the image. Every band on the image is
+    there and shifted inside the image. It may not overlap another box of its
+    protein, nor another protein's box by more than :data:`COVER_SHARE` of the
+    smaller box's area (``OVERLAP``, as :func:`place_box`). Every band on the
+    image is
     re-quantified, since the box leaves one ring and may cut another; its lane
     never changes. Marks the band as manually edited.
     """
@@ -1462,6 +1558,9 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         raise OperationError(
             ErrorCode.OVERLAP, "the box would overlap another box of this protein", ids=hits
         )
+    covered = _covered(batch, protein, [new])
+    if covered:
+        raise _cover_refusal(covered, "the box would overlap")
     array = session.pixels(image.id)
 
     def change(draft: Project) -> None:
@@ -1539,7 +1638,10 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
     """Change a protein's shared box size: every box is re-sized around its centre
     (shifted inside the image), and every band on the image is re-quantified
     (the other proteins' rings leave out the resized boxes). A size that would
-    make boxes overlap is refused."""
+    make boxes overlap is refused (``SIZE_WOULD_OVERLAP``), and so is one that
+    would make a box overlap another protein's by more than
+    :data:`COVER_SHARE` of the smaller box's area (``OVERLAP``, naming those
+    boxes, :func:`_cover_refusal`)."""
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     image = batch.find_image(protein.image_id)
@@ -1552,6 +1654,12 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
         raise OperationError(
             ErrorCode.SIZE_WOULD_OVERLAP,
             f"box size {size.width}x{size.height} would make boxes of {protein.name!r} overlap",
+        )
+    covered = _covered(batch, protein, [r for r, o in zip(resized, rects, strict=True) if r != o])
+    if covered:
+        raise _cover_refusal(
+            covered,
+            f"at the box size {size.width}x{size.height}, boxes of {protein.name!r} would overlap",
         )
     array = session.pixels(image.id) if protein.bands else None
 
@@ -1757,14 +1865,22 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     Refused by a refusing flag (``ROW_LANES_UNCLEAR``): a box that cuts through
     the bands says so first (cause ``cut_by_row_box``: a lane ``cut``, whether
     its band's extent reaches the box's edge or the band peaks on the edge row
-    and was left out), since drawn over every lane it can still misread them;
-    then a box whose left or right edge cuts through a band and so leaves
-    lanes out (cause ``side_signal``: ``lanes_outside_row``, and a lane of
-    signal rising into the box's side past the lanes holding bands, at an end
-    where a lane's expected centre lies outside the box); otherwise the first
-    refusing flag (signal rising into the box's side elsewhere, as a dark
-    image edge leaves, does not make the lanes unclear). No band sized
-    (``NO_BAND_FOUND``), by the empty lanes' reasons: bands kept but in no
+    and was left out), since drawn over every lane it can still misread them,
+    unless bands off the row's line are all that refuses it (then as below,
+    the cut said too: the lanes were read); then a box whose left or right
+    edge cuts through a band and so leaves lanes out (cause ``side_signal``:
+    ``lanes_outside_row``, and a lane of signal rising into the box's side
+    past the lanes holding bands, at an end where a lane's expected centre
+    lies outside the box); then bands that do not lie on one row
+    (``ROW_OFF_LINE``, cause ``off_row_line``: a box more than
+    :data:`~proteia.core.rowdetect.ROW_LINE_K` box heights off the row's
+    line, as a box over two rows, or over a lane whose band lies off the row,
+    places one; every box off it, two rows and neither the row's), naming
+    those lanes unless another refusing flag leaves the reading unsettled;
+    otherwise the first refusing flag (signal rising into
+    the box's side elsewhere, as a dark image edge leaves, does not make the
+    lanes unclear). No band sized (``NO_BAND_FOUND``), by the empty lanes'
+    reasons: bands kept but in no
     lane (``unassigned``), signal only at the box's top or bottom edge
     (``edge_signal``: a box through the bands, or over a neighbouring row),
     only signal rising into its left or right edge (``side_signal``: a band
@@ -1780,8 +1896,9 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     ``detail`` holds the raw reason: the ``cause`` the words follow, the
     detector's ``flags`` and ``notes``, the reading's ``margin`` (None with no
     reading or no other one), the box's ``membrane_shift`` and each lane's
-    ``lane_index``, ``reason``, ``snr`` and ``cut``. The message names no lane:
-    a reading the row box does not settle numbers them unreliably.
+    ``lane_index``, ``reason``, ``snr``, ``cut`` and ``line_offset``. Only the
+    ``off_row_line`` message names lanes: a reading the row box does not
+    settle numbers them unreliably.
     """
     reasons = {lane.reason for lane in found.lanes}
     if found.refused:
@@ -1800,7 +1917,17 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
                 for x in sides
             )
         )
-        if any(lane.cut for lane in found.lanes):
+        off = [
+            lane.lane
+            for lane in found.lanes
+            if lane.line_offset is not None and abs(lane.line_offset) > rowdetect.ROW_LINE_K
+        ]
+        # The lanes, where the reading settles them.
+        settled = not any(
+            flag in rowdetect.REFUSING_FLAGS and flag != "off_row_line" for flag in found.flags
+        )
+        cut = any(lane.cut for lane in found.lanes)
+        if cut and not (off and settled):
             cause = "cut_by_row_box"
             message = (
                 "the row box cuts through the bands, so it does not show which lane each band"
@@ -1814,6 +1941,36 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
                 " which lane each band is in; draw it over the whole bands of every declared"
                 " lane, empty end lanes included"
             )
+        elif off:
+            code = ErrorCode.ROW_OFF_LINE
+            cause = "off_row_line"
+            if not settled:
+                which, lie, those, fix = "some bands found", "lie", "some bands", ""
+            elif len(off) == 1:
+                which, lie, those = f"the band found in {lanes_phrase(off)}", "lies", "that band"
+                fix = ", or box that lane by clicking its band"
+            else:
+                which, lie, those = f"the bands found in {lanes_phrase(off)}", "lie", "those bands"
+                fix = ", or box those lanes by clicking their bands"
+            if settled and len(off) == sum(lane.rect is not None for lane in found.lanes):
+                # Every box off the line: two rows, neither the row's.
+                what = (
+                    f"{which} {lie} on two rows, more than {rowdetect.ROW_SMILE:g} box heights"
+                    " apart: the row box covers more than one row"
+                )
+            else:
+                what = (
+                    f"{which} {lie} above or below the row's line through the other bands, by"
+                    f" more than {rowdetect.ROW_LINE_K:g} of a box's height: the row box covers"
+                    " more than one row, or "
+                    + (f"cuts {those}" if cut else f"{those} {lie} off the row")
+                )
+            lead, whole = (
+                ("the row box cuts through the bands, and ", ", over the whole band height")
+                if cut
+                else ("", "")
+            )
+            message = f"{lead}{what}; draw it over one row only{whole}{fix}"
         else:
             cause = next(flag for flag in found.flags if flag in rowdetect.REFUSING_FLAGS)
             message = (
@@ -1871,7 +2028,13 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
         "margin": margin if margin is not None and math.isfinite(margin) else None,
         "membrane_shift": found.membrane_shift,
         "lanes": [
-            {"lane_index": lane.lane, "reason": lane.reason, "snr": lane.snr, "cut": lane.cut}
+            {
+                "lane_index": lane.lane,
+                "reason": lane.reason,
+                "snr": lane.snr,
+                "cut": lane.cut,
+                "line_offset": lane.line_offset,
+            }
             for lane in found.lanes
         ],
     }
@@ -1942,7 +2105,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     placed: the survivors are re-centred and the new boxes centred on the
     detected ones. That size making survivors overlap, or new boxes overlap
     each other, is refused (``SIZE_WOULD_OVERLAP``), and so is a new box over a
-    survivor (``OVERLAP``, with the survivor). If none survives, this detection
+    survivor (``OVERLAP``, with the survivor), or a box it places (new or in
+    place), or a survivor grown to the size, that overlaps another protein's
+    box on the image by more than :data:`COVER_SHARE` of the smaller box's
+    area (``OVERLAP``, naming those boxes, :func:`_cover_refusal`: a row
+    dragged over another protein's row, or a loading control's row over its
+    target's). If none survives, this detection
     sets the size afresh. A box may then extend beyond
     the row box, never beyond the image. Every band on the image, of every
     protein, is then re-quantified with the project's background method; the
@@ -2008,13 +2176,17 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     non-finite pixels in the row (``UNREADABLE_IMAGE``, with the image: the
     image is at fault, not the row); bands that do not show which lane each
     is in (``ROW_LANES_UNCLEAR``, with no ids: the row box alone is at fault,
-    whatever boxes the image holds); no band in any lane (``NO_BAND_FOUND``:
-    with no band located, the lane slots would rest only on an even split of
-    the box, so no record is written either). Those two are worded by what
-    the detector saw, with its raw reason as the refusal's ``detail``
-    (:func:`_row_refusal`). The checks run in that order,
+    whatever boxes the image holds); bands that do not lie on one row
+    (``ROW_OFF_LINE``, with no ids: a box more than
+    :data:`~proteia.core.rowdetect.ROW_LINE_K` box heights off the row's line
+    through the others, as when the row box covers two rows); no band in any
+    lane (``NO_BAND_FOUND``: with no band located, the lane slots would rest
+    only on an even split of the box, so no record is written either). Those
+    three are worded by what the detector saw, with its raw reason as the
+    refusal's ``detail`` (:func:`_row_refusal`). The checks run in that order,
     the lanes on the image checking the reading next, then the size
-    (:func:`~proteia.core.boxes.grow_to_fit_all`).
+    (:func:`~proteia.core.boxes.grow_to_fit_all`), then the other proteins'
+    boxes the row's would overlap (those it places, then those it keeps).
 
     The log entry holds the row as given; each lane's first-band box after the
     change, as ``band_ids`` names it (placed, replaced in place or kept: its
@@ -2147,6 +2319,16 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             )
         raise OperationError(ErrorCode.SIZE_WOULD_OVERLAP, message) from exc
     rects = {lane.lane: rect for lane, rect in zip(placed, new_rects, strict=True)}
+    covered = _covered(batch, protein, rects.values())
+    if covered:
+        raise _cover_refusal(covered, "the row's boxes would overlap")
+    covered = _covered(batch, protein, [r for r, o in zip(resized, old, strict=True) if r != o])
+    if covered:
+        raise _cover_refusal(
+            covered,
+            f"at the box size {size.width}x{size.height} the row needs, the boxes of"
+            f" {protein.name!r} it keeps would overlap",
+        )
     # A not-detected record's slot rests on the bands found, stepped by the
     # pitch past them: one band leaves the slots to a pitch the box's width
     # suggests. The lanes on the image check the band's own lane, not them.

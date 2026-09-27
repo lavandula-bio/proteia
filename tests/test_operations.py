@@ -63,6 +63,7 @@ from proteia.core.model import (
     UndetectedReason,
     UnknownIdError,
     apply_change,
+    lanes_phrase,
     revalidate,
 )
 from proteia.core.operations import (
@@ -496,9 +497,12 @@ def test_default_autosave_writes_every_change(tmp_path):
     s, image, target = boxed(tmp_path, save_to_folder)
     assert load_project(s.folder) == s.project and not s.dirty
     loading = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
-    for protein in (target, loading):
-        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-        ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    ops.place_box(s, target, NARROW_X, ROW, lane_index=0, grow=True)
+    ops.place_box(s, target, WIDE_X, ROW, lane_index=1, grow=True)
+    # The loading control's boxes lower down: two proteins' boxes may not
+    # measure one band (#114).
+    for lane, x in enumerate((NARROW_X, WIDE_X)):
+        ops.place_box(s, loading, x, ROW + 6, lane_index=lane, grow=False)
     ops.set_reference_condition(s, "vehicle")
     assert load_project(s.folder) == s.project
     assert not s.dirty and s.save_error is None
@@ -1577,7 +1581,7 @@ def test_stored_nets_stay_current_through_a_session_and_a_reopen(tmp_path):
     clicked = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     fixed = ops.place_box(s, protein, 70, ROW, lane_index=2, grow=False)
     ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)  # grows, re-centres
-    ops.place_box(s, loading, WIDE_X, ROW, lane_index=0, grow=False)
+    ops.place_box(s, loading, WIDE_X, ROW + 6, lane_index=0, grow=False)  # below the band
     ops.move_box(s, fixed, (62, 22, 70, 36))
     ops.set_box_size(s, protein, BoxSize(width=21, height=7))
     ops.set_polarity(s, image, LIGHT)
@@ -1860,8 +1864,9 @@ def test_random_edits_keep_every_stored_value_what_the_pixels_give(tmp_path, see
     s, image, target = row_session(tmp_path, case)
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
     ops.detect_row_boxes(s, target, case.row)
-    for lane in (1, 3):
-        ops.place_box(s, other, *at_lane(case, lane), lane_index=lane, grow=True)
+    for lane in (1, 3):  # below the target's bands: two proteins' boxes on one band are refused
+        x, y = at_lane(case, lane)
+        ops.place_box(s, other, x, y + 12, lane_index=lane, grow=False)
     corner = ops.place_box(s, other, 0, 0, lane_index=5, grow=False)
     assert band_of(s, corner).background_mode == "asymmetric"
     assert_nets_current(s)
@@ -2477,9 +2482,11 @@ def test_a_seed_click_at_the_edge_is_proposed_from_the_band(tmp_path):
     assert band_of(s, band).box.x + protein_of(s, protein).box_size.width == LANE_W
     assert band_of(s, band).lane_index == 5
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
-    ops.place_box(s, other, lane_x(0), LANE_ROW, lane_index=0, grow=False)
-    ops.place_box(s, other, lane_x(2), LANE_ROW, lane_index=2, grow=False)
-    fourth = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
+    # In a row of its own below: inside the target's wide boxes, two proteins'
+    # boxes would measure one band (#114).
+    ops.place_box(s, other, lane_x(0), LANE_ROW + 20, lane_index=0, grow=False)
+    ops.place_box(s, other, lane_x(2), LANE_ROW + 20, lane_index=2, grow=False)
+    fourth = ops.place_box(s, other, lane_x(4), LANE_ROW + 20, grow=False)
     assert band_of(s, fourth).lane_index == 4  # not skewed by the shifted lane-5 box
 
 
@@ -3812,19 +3819,22 @@ def other_protein_in_lanes(
     mirrored: bool = False,
     name: str = "GAPDH",
     offset: int = 0,
+    y: int = 20,
 ) -> str:
     """A second protein on the image with a small box in each of ``lanes``
     (every lane by default), at the lane's true centre moved ``dx`` px, in a row
-    of its own above the case's: lanes already placed on the image. Mirrored,
-    the lanes are numbered right to left; ``offset`` is added to each lane
-    number (a protein numbered a lane off)."""
+    of its own above the case's, centred on image row ``y``: lanes already
+    placed on the image. Mirrored, the lanes are numbered right to left;
+    ``offset`` is added to each lane number (a protein numbered a lane off).
+    Another such protein in the same lanes takes another ``y``: two proteins'
+    boxes on one band are refused (#114)."""
     other = ops.add_protein(
         s, name, Role.LOADING_CONTROL, image_id, box_size=BoxSize(width=20, height=8)
     )
     n = case.n_lanes
     for lane in range(n) if lanes is None else lanes:
         index = (n - 1 - lane if mirrored else lane) + offset
-        ops.place_box(s, other, round(case.lane_cx[lane] + dx), 20, lane_index=index, grow=False)
+        ops.place_box(s, other, round(case.lane_cx[lane] + dx), y, lane_index=index, grow=False)
     return other
 
 
@@ -4153,8 +4163,9 @@ def test_a_row_leaves_the_other_proteins_on_its_image_alone(tmp_path):
     case = ROWS["all_present"]
     s, image, protein = row_session(tmp_path, case)
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
-    for lane in (1, 2):  # over the target's bands: boxes of two proteins may overlap
-        ops.place_box(s, other, *at_lane(case, lane), lane_index=lane, grow=True)
+    for lane in (1, 2):  # over the lower part of the target's bands
+        x, y = at_lane(case, lane)
+        ops.place_box(s, other, x, y + 8, lane_index=lane, grow=False)
     plant_records(s, other, _record(0))
     before = protein_of(s, other)
 
@@ -5145,7 +5156,9 @@ def test_two_proteins_numbering_the_lanes_opposite_ways_refuse_a_row(
     case = ROWS["all_present"]
     s, image, protein = row_session(tmp_path, case)
     gapdh = other_protein_in_lanes(s, image, case, (1, 2, 3), mirrored=mirrored)
-    actin = other_protein_in_lanes(s, image, case, (3, 4), mirrored=not mirrored, name="actin")
+    actin = other_protein_in_lanes(
+        s, image, case, (3, 4), mirrored=not mirrored, name="actin", y=36
+    )
     ltr, rtl = ("'actin'", "'GAPDH'") if mirrored else ("'GAPDH'", "'actin'")
     for row in (case.row, shifted(case, 70), UNCLEAR_ROW):
         ids = numbering_refused(s, protein, row, both_ways(ltr, rtl), monkeypatch)
@@ -5257,7 +5270,7 @@ def test_a_mirrored_image_numbered_one_way_is_read_right_to_left(tmp_path):
     n = case.n_lanes
     s, image, protein, clicked = clicked_lanes(tmp_path, mirrored=True)
     other_protein_in_lanes(s, image, case, mirrored=True)
-    other_protein_in_lanes(s, image, case, (0, 2, 5), mirrored=True, name="actin")
+    other_protein_in_lanes(s, image, case, (0, 2, 5), mirrored=True, name="actin", y=36)
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert placement.right_to_left
@@ -5489,7 +5502,13 @@ def assert_raw_reason(detail: dict, found: RowDetection) -> None:
     )
     assert detail["membrane_shift"] == found.membrane_shift
     assert detail["lanes"] == [
-        {"lane_index": lane.lane, "reason": lane.reason, "snr": lane.snr, "cut": lane.cut}
+        {
+            "lane_index": lane.lane,
+            "reason": lane.reason,
+            "snr": lane.snr,
+            "cut": lane.cut,
+            "line_offset": lane.line_offset,
+        }
         for lane in found.lanes
     ]
 
@@ -5676,13 +5695,15 @@ def test_a_row_off_the_lanes_names_only_the_boxes_next_to_the_off_bands(tmp_path
 
 
 def test_a_row_reports_the_nets_it_changed_of_other_proteins_on_its_image(tmp_path):
-    # GAPDH's boxes over two of the target's bands: every ring on the image
-    # leaves out the row's boxes, so GAPDH's nets change with the row.
+    # GAPDH's boxes over the lower part of two of the target's bands: every
+    # ring on the image leaves out the row's boxes, so GAPDH's nets change with
+    # the row.
     case = ROWS["all_present"]
     s, image, protein = row_session(tmp_path, case)
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
     for lane in (1, 2):
-        ops.place_box(s, other, *at_lane(case, lane), lane_index=lane, grow=True)
+        x, y = at_lane(case, lane)
+        ops.place_box(s, other, x, y + 8, lane_index=lane, grow=False)
     before = {b.id: b.net for b in protein_of(s, other).bands}
 
     placement = ops.detect_row_boxes(s, protein, case.row)
@@ -5712,10 +5733,371 @@ def test_a_net_that_was_zero_is_remeasured_but_sets_no_largest_change(tmp_path):
     case = ROWS["all_present"]
     s, image, protein = row_session(tmp_path, case)
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
-    band_id = ops.place_box(s, other, *at_lane(case, 1), lane_index=1, grow=True)
+    x, y = at_lane(case, 1)
+    band_id = ops.place_box(s, other, x, y + 8, lane_index=1, grow=False)
     plant(s, lambda draft: setattr(draft.batch.find_band(band_id)[1], "net", 0.0))
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     net = band_of(s, band_id).net
     assert net > 0
     assert (placement.remeasured, placement.largest_change) == (((band_id, 0.0, net),), None)
+
+
+# --- #114: a row off its line, and a box over another protein's ---
+
+# Two rows 40 px apart and the row box over both: the row above (a loading
+# control's) is twice as deep as the row's own (a target's) in lanes 0-2 and
+# half as deep in lanes 3-5, so each lane's strongest band lies in the row
+# above there and in the row's own here.
+TWO_ROWS = adversarial_row(
+    "two rows",
+    1000,
+    neighbour_dy=-40.0,
+    neighbour_rel=0.5,
+    neighbour_rels={0: 2.0, 1: 2.0, 2: 2.0},
+    box_adjust=(0, -40, 0, 0),
+    img_h=200,
+)
+ABOVE_ROW = (*TWO_ROWS.row[:3], TWO_ROWS.row[3] - 40)  # over the row above alone
+OWN_ROW = (TWO_ROWS.row[0], TWO_ROWS.row[1] + 40, *TWO_ROWS.row[2:])  # over the row's own alone
+# Lanes 4 and 5 alone hold their strongest band in the row above.
+TWO_LANES_ABOVE = adversarial_row(
+    "two rows",
+    1000,
+    neighbour_dy=-40.0,
+    neighbour_rel=0.5,
+    neighbour_rels={4: 2.0, 5: 2.0},
+    box_adjust=(0, -40, 0, 0),
+    img_h=200,
+)
+# A montage: lane 2's band 14 px (1.2 box heights) above the others'.
+MONTAGE = adversarial_row("montage", 1000, shifts={2: -14.0})
+OFF_LINE = (
+    "{which} above or below the row's line through the other bands, by more than 0.75 of a"
+    " box's height: the row box covers more than one row, or {those} off the row; draw it over"
+    " one row only{fix}"
+)
+OFF_LINE_TWO = OFF_LINE.format(
+    which="the bands found in lanes 5, 6 lie",
+    those="those bands lie",
+    fix=", or box those lanes by clicking their bands",
+)
+OFF_LINE_ONE = OFF_LINE.format(
+    which="the band found in lane 3 lies",
+    those="that band lies",
+    fix=", or box that lane by clicking its band",
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "message", "off"),
+    [
+        pytest.param(TWO_LANES_ABOVE, OFF_LINE_TWO, [4, 5], id="over-two-rows"),
+        pytest.param(MONTAGE, OFF_LINE_ONE, [2], id="a-lane-off-the-row"),
+    ],
+)
+def test_a_row_whose_boxes_are_off_its_line_is_refused_naming_the_lanes(
+    tmp_path, case, message, off
+):
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, case.row)
+    assert found.flags[0] == "off_row_line"
+    error = row_refused(s, protein, case.row)
+    assert (error.code, str(error), error.ids) == (ErrorCode.ROW_OFF_LINE, message, ())
+    assert error.detail["cause"] == "off_row_line"
+    assert_raw_reason(error.detail, found)
+    offsets = [lane["line_offset"] for lane in error.detail["lanes"]]
+    assert [i for i, v in enumerate(offsets) if abs(v) > rowdetect.ROW_LINE_K] == off
+
+
+def test_a_row_off_its_line_whose_lanes_are_unclear_names_none(tmp_path, monkeypatch):
+    # With the reading unsettled too, the lanes are not named.
+    s, _, protein = row_session(tmp_path, MONTAGE)
+    found = detected(s, protein, MONTAGE.row)
+    unclear = dataclasses.replace(found, flags=("ambiguous_lanes", *found.flags))
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: unclear)
+    error = row_refused(s, protein, MONTAGE.row)
+    assert error.code is ErrorCode.ROW_OFF_LINE
+    assert str(error) == OFF_LINE.format(
+        which="some bands found lie", those="some bands lie", fix=""
+    )
+
+
+def two_rows_session(tmp_path: Path, case: RowCase = TWO_ROWS) -> tuple[ProjectSession, str, str]:
+    """``case`` (TWO_ROWS, or one of its geometry) with a loading control over
+    the row above and its target over the row's own, each placed by a row box
+    over its own row alone; (the session, the loading control, the target)."""
+    s, image, target = row_session(tmp_path, case)
+    loading = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    ops.edit_protein(s, target, loading_control_ids=[loading])
+    ops.set_reference_condition(s, "vehicle")
+    ops.detect_row_boxes(s, loading, (*case.row[:3], case.row[3] - 40))
+    ops.detect_row_boxes(s, target, (case.row[0], case.row[1] + 40, *case.row[2:]))
+    return s, loading, target
+
+
+def test_a_loading_control_dragged_again_over_both_rows_is_refused(tmp_path):
+    # As on the smoke test's blot: the loading control's row box dragged again
+    # over its row and its target's, whose boxes are placed. Committed, its
+    # boxes in lanes 3-5 would lie on the target's bands, and the target's
+    # values there would be normalized by its own bands. Refused, and nothing
+    # changes: the fold changes stay.
+    s, loading, target = two_rows_session(tmp_path)
+    before, results = s.project, ops.compute(s)
+    assert None not in results.series[0].fold_change
+    error = row_refused(s, loading, TWO_ROWS.row)
+    assert error.code is ErrorCode.ROW_OFF_LINE and error.ids == ()
+    assert s.project is before and ops.compute(s) == results
+
+
+@pytest.mark.parametrize(
+    ("dragged", "row", "other", "name"),
+    [
+        pytest.param("loading", OWN_ROW, "target", "β-catenin", id="onto-its-target"),
+        pytest.param("target", ABOVE_ROW, "loading", "GAPDH", id="onto-its-loading-control"),
+    ],
+)
+def test_a_row_dragged_over_another_proteins_row_is_refused_naming_its_boxes(
+    tmp_path, dragged, row, other, name
+):
+    s, loading, target = two_rows_session(tmp_path)
+    ids = {"loading": loading, "target": target}
+    covered = [band.id for band in protein_of(s, ids[other]).bands]
+    error = covered_refusal(s, lambda: ops.detect_row_boxes(s, ids[dragged], row))
+    assert error.ids == tuple(covered)
+    assert str(error) == (
+        f"the row's boxes would overlap the boxes of {name!r} in lanes 1, 2, 3, 4, 5, 6 by"
+        " more than 50% of the smaller box's area: two proteins' boxes would measure the same"
+        " band"
+    )
+    assert [c["band_id"] for c in error.detail["covered"]] == covered
+    assert {c["protein_id"] for c in error.detail["covered"]} == {ids[other]}
+    assert [c["lane_index"] for c in error.detail["covered"]] == list(range(6))
+    assert all(0.5 < c["share"] <= 1.0 for c in error.detail["covered"])
+
+
+def covered_refusal(s: ProjectSession, call) -> OperationError:
+    """The refusal of a box over another protein's, which changes nothing."""
+    before = s.project
+    with pytest.raises(OperationError) as info:
+        call()
+    assert s.project is before
+    assert info.value.code is ErrorCode.OVERLAP
+    assert info.value.detail["cause"] == "other_protein"
+    return info.value
+
+
+def test_a_box_clicked_or_moved_over_another_proteins_box_is_refused(tmp_path):
+    s, loading, target = two_rows_session(tmp_path)
+    x, y = at_lane(TWO_ROWS, 1)
+    lc_box = lane_bands(s, loading)[1].id
+    t_boxes = lane_bands(s, target)
+    ops.remove_box(s, t_boxes[1].id)
+    # Clicked (grown from the band) on the loading control's band in lane 1.
+    error = covered_refusal(s, lambda: ops.place_box(s, target, x, y - 40, lane_index=1, grow=True))
+    assert error.ids == (lc_box,)
+    assert str(error) == (
+        "the box would overlap the box of 'GAPDH' in lane 2 by more than 50% of the smaller"
+        " box's area: two proteins' boxes would measure the same band"
+    )
+    [covered] = error.detail["covered"]
+    assert (covered["band_id"], covered["protein_id"], covered["lane_index"]) == (
+        lc_box,
+        loading,
+        1,
+    )
+    # Shift+clicked (a box of the protein's size) there.
+    error = covered_refusal(
+        s, lambda: ops.place_box(s, target, x, y - 40, lane_index=1, grow=False)
+    )
+    assert error.ids == (lc_box,)
+    # Its lane-0 box moved there.
+    moved = t_boxes[0]
+    error = covered_refusal(s, lambda: ops.move_box(s, moved.id, rects_by_lane(s, loading)[1]))
+    assert error.ids == (lc_box,)
+    assert band_of(s, moved.id) == moved  # where it was
+
+
+def test_a_box_over_half_of_another_proteins_box_or_less_is_placed(tmp_path):
+    # A box of the loading control's size over its box in lane 1, lower by 5
+    # or 6 of its 12 px height: over 7/12 of it (refused), or half of it.
+    s, loading, target = two_rows_session(tmp_path)
+    size = BoxSize(width=44, height=12)
+    ops.set_box_size(s, loading, size)
+    for band in list(protein_of(s, target).bands):
+        ops.remove_box(s, band.id)
+    ops.set_box_size(s, target, size)
+    x0, y0, x1, y1 = rects_by_lane(s, loading)[1]
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    error = covered_refusal(
+        s, lambda: ops.place_box(s, target, cx, cy + 5, lane_index=1, grow=False)
+    )
+    assert error.detail["covered"][0]["share"] == round(7 / 12, 3)
+    band_id = ops.place_box(s, target, cx, cy + 6, lane_index=1, grow=False)
+    rect = band_of(s, band_id).box.rect(size)
+    assert (rect[0] - x0, rect[1] - y0) == (0, 6)  # over half of it: placed
+    ops.move_box(s, band_id, (rect[0], rect[1] + 1, rect[2], rect[3] + 1))
+    assert_nets_current(s)
+
+
+def test_a_box_wholly_inside_a_larger_box_of_another_protein_is_refused(tmp_path):
+    # The target's boxes enlarged to 53x22 (to hold whole bands): the loading
+    # control's row box over the target's row alone puts each of its boxes
+    # wholly inside one of them, over less than half of it. The two would
+    # still measure one band: the overlap counts against the smaller box, all
+    # of it. Refused, the fold changes as they were; and so is a box of the
+    # loading control's size dropped on one of them.
+    s, loading, target = two_rows_session(tmp_path)
+    ops.set_box_size(s, target, BoxSize(width=53, height=22))
+    targets = [band.id for band in protein_of(s, target).bands]
+    results = ops.compute(s)
+    error = covered_refusal(s, lambda: ops.detect_row_boxes(s, loading, OWN_ROW))
+    assert error.ids == tuple(targets)
+    assert [c["share"] for c in error.detail["covered"]] == [1.0] * 6
+    assert ops.compute(s) == results
+    ops.remove_box(s, lane_bands(s, loading)[1].id)
+    x, y = at_lane(TWO_ROWS, 1)
+    error = covered_refusal(s, lambda: ops.place_box(s, loading, x, y, lane_index=1, grow=False))
+    assert error.ids == (lane_bands(s, target)[1].id,)
+
+
+def test_a_box_size_over_another_proteins_boxes_is_refused(tmp_path):
+    # The loading control's boxes made 100 px high reach down over the
+    # target's, 40 px below: refused, the target's fold changes as they were.
+    # At 80 px high they cover half of each: placed.
+    s, loading, target = two_rows_session(tmp_path)
+    targets = tuple(band.id for band in protein_of(s, target).bands)
+    results = ops.compute(s)
+    error = covered_refusal(s, lambda: ops.set_box_size(s, loading, BoxSize(width=44, height=100)))
+    assert error.ids == targets
+    assert str(error) == (
+        "at the box size 44x100, boxes of 'GAPDH' would overlap the boxes of 'β-catenin' in"
+        " lanes 1, 2, 3, 4, 5, 6 by more than 50% of the smaller box's area: two proteins'"
+        " boxes would measure the same band"
+    )
+    assert ops.compute(s) == results
+    ops.set_box_size(s, loading, BoxSize(width=44, height=80))
+    assert protein_of(s, loading).box_size == BoxSize(width=44, height=80)
+
+
+def _smear(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+    """A dark smear 36 px wide in lane 0, from 130 px above the row's band down
+    into the band of the row 40 px above it."""
+    inside = (np.abs(X - lcx[0]) < 18) & (Y > lcy[0] - 130) & (Y < lcy[0] - 36)
+    return np.where(inside, 20000.0, 0.0)
+
+
+# TWO_ROWS on a taller image, with a smear above the loading control's band
+# in lane 0.
+SMEARED = adversarial_row(
+    "two rows",
+    1000,
+    neighbour_dy=-40.0,
+    neighbour_rel=0.5,
+    neighbour_rels={0: 2.0, 1: 2.0, 2: 2.0},
+    box_adjust=(0, -40, 0, 0),
+    img_h=400,
+    artefacts=[_smear],
+)
+
+
+def test_a_click_that_grows_boxes_over_another_proteins_is_refused(tmp_path):
+    # The loading control's lane-1 box removed, then the smear above its band
+    # clicked: the band grown from the click needs boxes 96 px high. The new
+    # box, over the smear, lies clear of the target's box in lane 1, but the
+    # loading control's other boxes, grown to that around their centres,
+    # would reach down over the target's. Refused.
+    s, loading, target = two_rows_session(tmp_path, SMEARED)
+    assert protein_of(s, loading).box_size == BoxSize(width=44, height=17)
+    ops.remove_box(s, lane_bands(s, loading)[0].id)
+    x, y = round(SMEARED.lane_cx[0]), round(SMEARED.lane_cy[0] - 80)
+    error = covered_refusal(s, lambda: ops.place_box(s, loading, x, y, lane_index=0, grow=True))
+    assert error.ids == tuple(band.id for band in protein_of(s, target).bands)[1:]
+    assert str(error) == (
+        "at the box size 44x96 this band needs, boxes of 'GAPDH' would overlap the boxes of"
+        " 'β-catenin' in lanes 2, 3, 4, 5, 6 by more than 50% of the smaller box's area: two"
+        " proteins' boxes would measure the same band"
+    )
+
+
+def test_a_row_that_grows_its_kept_boxes_over_another_proteins_is_refused(tmp_path, monkeypatch):
+    # The loading control's boxes all moved by hand, which a row keeps, and a
+    # row box over its row whose bands need boxes 100 px high: the kept
+    # boxes, grown to that, would reach down over the target's.
+    s, loading, target = two_rows_session(tmp_path)
+    for band in list(protein_of(s, loading).bands):
+        edit_by_hand(s, band.id)
+    found = detected(s, loading, ABOVE_ROW)
+    tall = dataclasses.replace(found, size=BoxSize(width=44, height=100))
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: tall)
+    error = covered_refusal(s, lambda: ops.detect_row_boxes(s, loading, ABOVE_ROW))
+    assert error.ids == tuple(band.id for band in protein_of(s, target).bands)
+    assert str(error) == (
+        "at the box size 44x100 the row needs, the boxes of 'GAPDH' it keeps would overlap"
+        " the boxes of 'β-catenin' in lanes 1, 2, 3, 4, 5, 6 by more than 50% of the smaller"
+        " box's area: two proteins' boxes would measure the same band"
+    )
+
+
+def test_a_row_box_over_two_rows_that_cuts_bands_names_the_lanes_off_its_line(tmp_path):
+    # The row box over both rows, its top edge through the row above's bands
+    # and its bottom edge through the row's own: the lanes are read, off the
+    # row's line is the only refusing flag. Said so, naming those lanes, with
+    # the cut: not that the box does not show which lane each band is in.
+    case = adversarial_row(
+        "two rows",
+        1000,
+        neighbour_dy=-40.0,
+        neighbour_rel=0.5,
+        neighbour_rels={0: 2.0, 1: 2.0, 2: 2.0},
+        box_adjust=(0, -32, 0, -8),
+        img_h=200,
+    )
+    s, _, protein = row_session(tmp_path, case)
+    found = detected(s, protein, case.row)
+    assert [flag for flag in found.flags if flag in rowdetect.REFUSING_FLAGS] == ["off_row_line"]
+    assert any(lane.cut for lane in found.lanes)
+    off = [lane.lane for lane in found.lanes if abs(lane.line_offset) > rowdetect.ROW_LINE_K]
+    assert off in ([0, 1, 2], [3, 4, 5])
+    error = row_refused(s, protein, case.row)
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
+    assert str(error) == (
+        f"the row box cuts through the bands, and the bands found in {lanes_phrase(off)} lie"
+        " above or below the row's line through the other bands, by more than 0.75 of a"
+        " box's height: the row box covers more than one row, or cuts those bands; draw it"
+        " over one row only, over the whole band height, or box those lanes by clicking"
+        " their bands"
+    )
+    assert_raw_reason(error.detail, found)
+
+
+def test_two_boxes_on_two_rows_are_both_named(tmp_path):
+    # Two lanes, the first one's strongest band in the row above: neither box
+    # is the row's.
+    case = adversarial_row(
+        "two rows",
+        1000,
+        n=2,
+        neighbour_dy=-40.0,
+        neighbour_rel=0.5,
+        neighbour_rels={0: 2.0},
+        box_adjust=(0, -40, 0, 0),
+        img_h=200,
+    )
+    s, _, protein = row_session(tmp_path, case)
+    error = row_refused(s, protein, case.row)
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
+    assert str(error) == (
+        "the bands found in lanes 1, 2 lie on two rows, more than 2 box heights apart: the"
+        " row box covers more than one row; draw it over one row only, or box those lanes by"
+        " clicking their bands"
+    )
+
+
+def test_boxes_on_another_image_are_not_in_the_way(tmp_path):
+    # The same pixels in a second image: its protein's boxes lie elsewhere.
+    s, loading, _ = two_rows_session(tmp_path)
+    other_image = import_blot(s, TWO_ROWS.image.astype(np.uint16), "reprobe β.tif")
+    other = ops.add_protein(s, "α-tubulin", Role.LOADING_CONTROL, other_image)
+    placement = ops.detect_row_boxes(s, other, ABOVE_ROW)
+    assert None not in placement.band_ids

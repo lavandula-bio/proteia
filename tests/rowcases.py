@@ -256,6 +256,8 @@ def adversarial_row(
     holes: Sequence[tuple[int, float, float, float]] = (),
     neighbour_dy: float | None = None,
     neighbour_rel: float = 1.0,
+    neighbour_rels: Mapping[int, float] | None = None,
+    shifts: Mapping[int, float] | None = None,
     artefacts: Sequence[Artefact] = (),
     noise: float = NOISE_SIGMA,
     light_on_dark: bool = False,
@@ -273,7 +275,10 @@ def adversarial_row(
     ``holes`` are ``(lane, dx, dy, r)``: a round hole of radius ``r`` punched into
     the bands (multiplicative, a transfer bubble) that far from the lane's centre;
     ``neighbour_dy`` adds a neighbouring row that far below (above if
-    negative), ``neighbour_rel`` as deep;
+    negative), ``neighbour_rel`` as deep (``neighbour_rels`` sets a lane's
+    own); ``shifts`` moves single lanes' bands down (up if negative) by that
+    many px, as a montage's panel or a mark beside the row lies, the row box
+    spanning them;
     ``artefacts`` add darkening maps ``f(X, Y, lane_cx, lane_cy)``; ``widths``,
     ``heights`` and ``depths`` override single bands; ``box_adjust`` moves the
     row box's edges."""
@@ -288,6 +293,8 @@ def adversarial_row(
     half = max(0.5 * (lane_cx[-1] - lane_cx[0]), 1.0)
     u = (lane_cx - xc) / half
     lane_cy = row_cy + smile * (0.5 - u**2) + tilt * u / 2 + rng.uniform(-y_jitter, y_jitter, n)
+    for k, v in (shifts or {}).items():
+        lane_cy[k] += v
     ws = w * rng.uniform(0.92, 1.08, n)
     hs = h * rng.uniform(0.9, 1.1, n)
     for k, v in (widths or {}).items():
@@ -332,7 +339,8 @@ def adversarial_row(
     if neighbour_dy is not None:
         for i in range(n):
             cy = lane_cy[i] + neighbour_dy
-            dmap += _band(xs, ys, lane_cx[i], cy, ws[i], h, dps[i] * neighbour_rel, shape)
+            rel = (neighbour_rels or {}).get(i, neighbour_rel)
+            dmap += _band(xs, ys, lane_cx[i], cy, ws[i], h, dps[i] * rel, shape)
     for f in artefacts:
         dmap += f(xs[None, :], ys[:, None], lane_cx, lane_cy)
     nz = rng.normal(0.0, 1.0, base.shape)

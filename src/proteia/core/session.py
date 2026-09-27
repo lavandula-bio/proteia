@@ -108,6 +108,11 @@ class ErrorCode(StrEnum):
     # The bands in a row box, or the lanes already placed on its image, do not
     # show which lane is which.
     ROW_LANES_UNCLEAR = "row_lanes_unclear"
+    # The bands in a row box do not lie on one row: it covers two rows, or a
+    # lane's band lies above or below the others.
+    ROW_OFF_LINE = "row_off_line"
+    # A box would overlap another box of its protein, or cover most of another
+    # protein's box (``detail``: the covered boxes).
     OVERLAP = "overlap"
     SIZE_WOULD_OVERLAP = "size_would_overlap"
     SIZE_OUT_OF_BOUNDS = "size_out_of_bounds"
