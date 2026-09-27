@@ -618,6 +618,30 @@ def test_the_page_words_every_row_warning_and_empty_lane_reason():
     assert _object_keys(script, "NOT_MEASURED") == set(get_args(rowdetect.LaneReason)) - {"band"}
 
 
+def test_the_page_offers_the_boxes_in_the_way_of_a_box_or_a_row():
+    # A box placed or moved, or a row, refused over boxes in its way (an
+    # overlap: another box of the protein, or most of another protein's box,
+    # #114) names them, protein by protein, with an Undo of the last box
+    # change when it made one of them (it may be the mistake), else a Select
+    # of the first of them, shown on its image to move or delete.
+    script = _code("app.js")
+    _, offer = _function(script, "function boxesInTheWay(")
+    assert "namedBoxes(error)" in offer
+    assert "lastBoxStepNamed(error)" in offer and 'label: "Undo"' in offer
+    assert 'label: "Select"' in offer and "selectBox(first.band.id)" in offer
+    assert "boxesInTheWay(error, again)" in _function(script, "function showBoxRefusal(")[1]
+    _, place = _function(script, "async function placeBox(")
+    assert 'showBoxRefusal(error, "Box not placed", "click again")' in place
+    move = script[script.index("  move: (boxId, rect) =>") : script.index("  select: (boxId) =>")]
+    assert 'showBoxRefusal(error, "Box not moved", "move it again")' in move
+    _, row = _function(script, "function showRowRefusal(")
+    assert 'showBoxRefusal(error, `Row box of ${name} not placed`, "drag again")' in row
+    _, select = _function(script, "function selectBox(")
+    assert "state.imageId = found.protein.image_id" in select and "state.boxId = boxId" in select
+    _, named = _function(script, "function namedBoxes(")
+    assert "found.protein" in named and "lanesPhrase(" in named
+
+
 def _logged_actions() -> set[str]:
     """Every action the operations log, found in their source: each ``_apply``
     of an operation, each entry committed with its own ``action`` (an import,

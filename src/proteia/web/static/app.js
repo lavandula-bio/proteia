@@ -377,14 +377,14 @@ function pending() {
 }
 
 // Send an edit and show a refusal in the status line (unless another project
-// is shown by then).
-async function edit(method, path, json) {
+// is shown by then): the server's reason, or as `refused(error)` shows it.
+async function edit(method, path, json, { refused = report } = {}) {
   const opened = shownOpening();
   try {
     return await ordered(() => send(method, path, json));
   } catch (error) {
     if (opened === shownOpening()) {
-      report(error);
+      refused(error);
     }
     throw error;
   }
@@ -395,7 +395,12 @@ const view = new ImageView($("view"), {
     placeBox(x, y, options, options.laneIndex, options.proteinId || state.proteinId),
   row: (rect, proteinId) => placeRow(rect, proteinId),
   move: (boxId, rect) =>
-    edit("PUT", `/api/boxes/${boxId}`, { rect })
+    edit(
+      "PUT",
+      `/api/boxes/${boxId}`,
+      { rect },
+      { refused: (error) => showBoxRefusal(error, "Box not moved", "move it again") },
+    )
       .then((answer) => noteBoxStep(answer, "move_box", [boxId]))
       .catch(() => {}),
   select: (boxId) => {
@@ -1271,6 +1276,8 @@ async function placeBox(x, y, options, laneIndex, proteinId) {
         "No band found where you clicked. Click on a band, or Shift+click to place a box" +
           " of the protein's box size.",
       );
+    } else if (error.code === "overlap") {
+      showBoxRefusal(error, "Box not placed", "click again");
     } else {
       report(error);
     }
@@ -1521,23 +1528,106 @@ function lastBoxStepNamed(error) {
   });
 }
 
+// The boxes a refusal names (an overlap's: those in the way) in words, protein
+// by protein as the project holds them: "the box of GAPDH in lane 2", "the
+// boxes of GAPDH in lanes 1, 2 and 3"; null when it names none shown.
+function namedBoxes(error) {
+  const lanes = new Map(); // protein -> the lane indices of its boxes named
+  for (const id of error.ids) {
+    const found = findBox(state.project, id);
+    if (found) {
+      lanes.set(found.protein, [...(lanes.get(found.protein) || []), found.band.lane_index]);
+    }
+  }
+  const parts = [...lanes].map(([protein, indices]) => {
+    const boxes = indices.length === 1 ? "box" : "boxes";
+    return `the ${boxes} of ${protein.name} in ${lanesPhrase(indices.sort((a, b) => a - b))}`;
+  });
+  return parts.length ? inWords(parts) : null;
+}
+
+// Show a box on its image, selected: the user moves or deletes it from there.
+function selectBox(boxId) {
+  const found = state.project && findBox(state.project, boxId);
+  if (!found) {
+    return; // gone meanwhile (an undo)
+  }
+  state.imageId = found.protein.image_id;
+  state.boxId = boxId;
+  select();
+  render();
+}
+
+// What to do about the boxes in the way of a box or a row (an overlap refusal,
+// which names them: another box of the protein, or another protein's boxes it
+// would overlap by more than half): move or delete them, then `again`. With an
+// Undo of the last box change when it made one of them (it may be the
+// mistake), else a Select of the first of them. Gives {text, action}; no text
+// when it names none shown.
+function boxesInTheWay(error, again) {
+  const which = namedBoxes(error);
+  if (!which) {
+    return { text: null, action: null };
+  }
+  const text = `Move or delete ${which}, then ${again}.`;
+  const step = state.project.history.undo;
+  if (lastBoxStepNamed(error)) {
+    const words = actionWords(step.action);
+    return {
+      text: `${text} If the last change (${words}) was the mistake, Undo takes it back.`,
+      action: {
+        label: "Undo",
+        name: `Undo ${words}`,
+        seq: step.seq,
+        run: () => takeStep("undo", { seq: step.seq }),
+      },
+    };
+  }
+  const first = error.ids.map((id) => findBox(state.project, id)).find(Boolean);
+  return {
+    text,
+    action: {
+      label: "Select",
+      name: `Select the box of ${first.protein.name} in lane ${first.band.lane_index + 1}`,
+      run: () => selectBox(first.band.id),
+    },
+  };
+}
+
+// A box placed or moved refused in the status line: `head` (what was not
+// done), the server's reason, and for boxes in its way what to do, with an
+// Undo or Select of them (boxesInTheWay).
+function showBoxRefusal(error, head, again) {
+  if (saidElsewhere(error)) {
+    return;
+  }
+  const sentences = [`${head}: ${sentence(error.message)}`];
+  let action = null;
+  if (error.code === "overlap") {
+    const offer = boxesInTheWay(error, again);
+    if (offer.text) {
+      sentences.push(offer.text);
+      action = offer.action;
+    }
+  }
+  showStatus(sentences.join(" "), action);
+}
+
 // A refused row in the status line: the server's reason with the protein
 // named, what to do, and, when the boxes already on the image did not let the
 // row read its lanes just after a box was placed or changed, an Undo of that
-// change.
+// change; for boxes in its way, an Undo or Select of them (showBoxRefusal).
 function showRowRefusal(error, name) {
   if (saidElsewhere(error)) {
     return;
   }
+  if (error.code === "overlap") {
+    showBoxRefusal(error, `Row box of ${name} not placed`, "drag again");
+    return;
+  }
   const sentences = [`Row box of ${name} not placed: ${sentence(error.message)}`];
   let action = null;
-  if (error.code === "overlap") {
-    const lanes = error.ids.map((id) => findBox(state.project, id)).filter(Boolean);
-    const which = lanes.length
-      ? `the box in ${lanesPhrase(lanes.map((found) => found.band.lane_index))}`
-      : "that box";
-    sentences.push(`Move or delete ${which}, then drag again.`);
-  } else if (error.code === "row_lanes_unclear") {
+  if (error.code === "row_lanes_unclear") {
     // Named: the boxes on the image the row disagrees with, or their proteins
     // (none when the row box alone does not show the lanes).
     const step = state.project.history.undo;

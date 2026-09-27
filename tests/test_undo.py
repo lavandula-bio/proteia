@@ -689,7 +689,7 @@ def test_clear_boxes_of_records_only_of_nothing_or_of_an_unknown_protein(tmp_pat
     assert s.project is committed and recorder.actions == []
 
     other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
-    kept = ops.place_box(s, other, WIDE_X, ROW, lane_index=0, grow=False)
+    kept = ops.place_box(s, other, WIDE_X, ROW + 12, lane_index=0, grow=False)  # below the band
     plant_records(s, other, _record(2))
     first = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
     second = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=False)
