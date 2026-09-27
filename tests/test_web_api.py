@@ -14,6 +14,7 @@ import json
 import shutil
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -41,9 +42,10 @@ from proteia.core.model import (
     UndetectedReason,
     apply_change,
 )
-from proteia.core.plotspec import ErrorType
+from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import compute_results
-from proteia.web import api, launch
+from proteia.viz import render_svg
+from proteia.web import api, charts, launch, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 
@@ -716,7 +718,9 @@ def test_the_answer_equals_the_results_of_the_saved_project(client, tmp_path):
     assert results["sets"][0]["tier"] == "fold_change"
     saved = storage.load_project(client.root / "Blot")
     open_id, revision = results["open_id"], results["revision"]
-    expected = results_payload(compute_results(saved.batch), open_id=open_id, revision=revision)
+    expected = results_payload(
+        compute_results(saved.batch), open_id=open_id, revision=revision, charts=charts.chart_url
+    )
     assert results == expected  # the one computation path (#42)
     assert revision == saved.log[-1].seq == answer["project"]["revision"]
 
@@ -895,7 +899,12 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         revisions.append(project["revision"])
     assert revisions == sorted(revisions)
     # Every route that answers with the project is exercised above.
-    others = {"GET /api/projects", "POST /api/project/reveal", "GET /api/images/{image_id}/preview"}
+    others = {
+        "GET /api/projects",
+        "POST /api/project/reveal",
+        "GET /api/images/{image_id}/preview",
+        "GET /api/charts/{key}.svg",
+    }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
 
@@ -1721,6 +1730,25 @@ def test_reopening_after_a_restore_shows_the_older_project_under_a_new_open_id(c
     assert client.ok("GET", "/api/project")["project"] == restored
 
 
+def test_charts_of_a_project_read_again_on_reopen_are_served(client, tmp_path):
+    live(client, tmp_path, DOSES)
+    project_file = client.root / "Blot" / storage.PROJECT_FILE
+    backup = project_file.read_bytes()
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": c} for c in reversed(DOSES)]})
+    # Another copy, never shown here: its charts have keys never registered.
+    outside = backup.decode("utf-8").replace(f'"{DOSES[0]}"', '"mock µ"')
+    assert outside != backup.decode("utf-8")
+    project_file.write_bytes(outside.encode("utf-8"))
+
+    # The reload takes a new opening: its charts are registered under it.
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+    assert reopened["project"]["open_id"] == 2
+    urls = [url for url in chart_urls(reopened).values() if url is not None]
+    assert urls
+    for url in urls:
+        assert fetch(client, url)[0] == 200
+
+
 def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
     tmp_path, monkeypatch
 ):
@@ -1887,3 +1915,165 @@ def test_stopping_the_server_closes_the_open_project(tmp_path):
     assert not thread.is_alive()
     assert not file.exists()  # closed after the flush
     assert storage.load_project(session.folder) == session.project
+
+
+# --- Charts drawn on the server (#52) ---
+
+
+def fetch(client: Client, path: str, *, token: bool = True) -> tuple[int, dict[str, str], bytes]:
+    """A GET with the launch's token or none: its status, headers (by lower-case
+    name) and body."""
+    headers = {"Authorization": f"Bearer {client.token}"} if token else {}
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        conn.request("GET", path, headers=headers)
+        response = conn.getresponse()
+        body = response.read()
+        got = {name.lower(): value for name, value in response.getheaders()}
+    finally:
+        conn.close()
+    return response.status, got, body
+
+
+def not_found(client: Client, path: str) -> str:
+    status, _, body = fetch(client, path)
+    assert status == 404, (status, body[:200])
+    return json.loads(body)["code"]
+
+
+def chart_urls(answer: dict) -> dict[tuple[str, str], str | None]:
+    """Each series' chart URL by (set id, target id)."""
+    return {
+        (result_set["id"], series["target_id"]): series["chart_url"]
+        for result_set in answer["results"]["sets"]
+        for series in result_set["series"]
+    }
+
+
+@pytest.fixture
+def drawn(monkeypatch) -> list[str]:
+    """The title of every chart the server draws, in order."""
+    titles: list[str] = []
+    render = charts.render_svg
+
+    def counting(spec: PlotSpec) -> bytes:
+        titles.append(spec.title)
+        return render(spec)
+
+    monkeypatch.setattr(charts, "render_svg", counting)
+    return titles
+
+
+def test_an_edit_answers_a_chart_url_that_serves_the_chart_as_svg(client, tmp_path, drawn):
+    _, _, answer = live(client, tmp_path, DOSES)  # the last answer: a box placed
+    series = only_series(answer)
+    spec = PlotSpec.model_validate(series["chart"])
+    assert series["chart_url"] == charts.chart_url(spec)  # named by the chart it answers
+    assert drawn == []  # drawn only when fetched
+
+    status, headers, body = fetch(client, series["chart_url"])
+    assert status == 200
+    assert headers["content-type"] == "image/svg+xml"
+    for name, value in server._SECURITY_HEADERS:  # the guard's, as on every answer
+        assert headers[name.decode()] == value.decode(), name
+    assert body == render_svg(spec)
+    assert fetch(client, series["chart_url"])[2] == body
+    assert len(drawn) == 1  # kept once drawn
+
+    status, headers, body = fetch(client, series["chart_url"], token=False)
+    assert (status, headers["www-authenticate"]) == (401, "Bearer")
+    assert b"<svg" not in body
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["10 µM\uffff", r"$\notacommand$"],  # a noncharacter; not math matplotlib could draw
+    ids=ascii,
+)
+def test_a_chart_of_any_name_is_served_as_well_formed_svg(client, tmp_path, condition):
+    _, _, answer = live(client, tmp_path, ["vehicle", "vehicle", condition, condition, condition])
+    series = only_series(answer)
+    assert condition in [bar["label"] for bar in series["chart"]["bars"]]  # stored as typed
+    status, headers, body = fetch(client, series["chart_url"])
+    assert (status, headers["content-type"]) == (200, "image/svg+xml")
+    assert ET.fromstring(body).tag == "{http://www.w3.org/2000/svg}svg"
+
+
+def test_moving_a_box_changes_only_the_charts_of_its_series(client, tmp_path, drawn):
+    target, _, _ = live(client, tmp_path, DOSES)
+    # The other series on a second image, with its own loading control: a box
+    # edit changes every net on its image (each band's ring leaves out every box
+    # there), so only a series off that image keeps its chart.
+    status, answer = upload(client, two_row_bytes(tmp_path, DEPTHS, (25000.0,) * 5), "reprobe.tif")
+    assert status == 201, answer
+    image_id = answer["image_id"]
+    body = {"name": "GAPDH", "role": "loading control", "image_id": image_id, "box_size": SIZE}
+    gapdh = client.ok("POST", "/api/proteins", body)["protein_id"]
+    body = {"name": "p-ERK", "role": "target", "image_id": image_id, "box_size": SIZE}
+    body["loading_control_ids"] = [gapdh]
+    other = client.ok("POST", "/api/proteins", body)["protein_id"]
+    for protein, row in ((gapdh, LOADING_ROW), (other, TARGET_ROW)):
+        for lane, x in enumerate(LANE_X):
+            body = {"protein_id": protein, "x": x, "y": row, "lane_index": lane}
+            client.ok("POST", "/api/boxes", body)
+    rows = [{"condition": condition, "included": lane != 1} for lane, condition in enumerate(DOSES)]
+    before = client.ok("PUT", "/api/lanes", {"lanes": rows})  # a lane with values left out
+    urls = chart_urls(before)
+    assert set(urls) == {(s, t) for s in ("applied", "all_lanes") for t in (target, other)}
+    assert None not in urls.values() and len(set(urls.values())) == 4  # both sets' series
+    for url in urls.values():
+        assert fetch(client, url)[0] == 200
+    assert len(drawn) == 4
+
+    band = column(before, target)["band_ids"][4]
+    x0, y0, x1, y1 = bands(before)[band]["rect"]
+    moved = client.ok("PUT", f"/api/boxes/{band}", {"rect": [x0 + 4, y0 + 3, x1 + 4, y1 + 3]})
+    after = chart_urls(moved)
+    for set_id in ("applied", "all_lanes"):
+        assert after[(set_id, target)] != urls[(set_id, target)]
+        assert after[(set_id, other)] == urls[(set_id, other)]
+    for url in after.values():
+        assert fetch(client, url)[0] == 200
+    assert drawn[4:] == ["β-catenin / α-tubulin"] * 2  # only the two changed charts
+
+
+def test_a_chart_key_is_unknown_unless_given_in_this_opening(client, tmp_path):
+    _, _, answer = live(client, tmp_path, DOSES)
+    url = only_series(answer)["chart_url"]
+    key = url.removeprefix("/api/charts/").removesuffix(".svg")
+    assert fetch(client, url)[0] == 200
+    for other in ["0" * 32, "f" * 32, key.upper(), key[:-1], key + "0", "g" * 32]:
+        assert not_found(client, f"/api/charts/{other}.svg") == "unknown_id", other
+
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    assert not_found(client, url) == "unknown_id"  # a key of the project closed
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})
+    assert only_series(reopened)["chart_url"] == url  # the same chart: the same URL
+    assert fetch(client, url)[0] == 200  # registered again by the answer
+    client.ok("POST", "/api/projects/open", {"name": "Other"})
+    assert not_found(client, url) == "unknown_id"
+
+
+def test_an_answer_about_an_earlier_opening_registers_no_chart(client, tmp_path):
+    _, _, answer = live(client, tmp_path, DOSES)
+    session = client.workspace.current()
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    late = api._answer(client.workspace, session)  # a request on Blot that finished late
+    assert late["results"]["open_id"] == answer["results"]["open_id"]
+    url = only_series(late)["chart_url"]
+    assert url == only_series(answer)["chart_url"]
+    assert not_found(client, url) == "unknown_id"  # its charts are not Other's
+
+
+def test_a_read_from_the_kept_results_registers_their_charts_again(client, tmp_path, monkeypatch):
+    _, _, answer = live(client, tmp_path, DOSES)
+    url = only_series(answer)["chart_url"]
+    calls: list = []
+    _counting(monkeypatch, calls)
+    # The store forgets the charts, as when the least recently used are evicted.
+    client.workspace._charts.reset(answer["results"]["open_id"])
+    assert not_found(client, url) == "unknown_id"
+    read = client.ok("GET", "/api/project")
+    assert calls == []  # the kept results of this revision, not computed again
+    assert only_series(read)["chart_url"] == url
+    assert fetch(client, url)[0] == 200
