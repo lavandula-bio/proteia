@@ -17,7 +17,12 @@ it fails:
    environment ``WORK/env`` gets exactly those (``--no-deps``) and then Proteia
    itself, not editable. The default ``uv sync`` never installs the ``build``
    group. ``--python`` chooses the interpreter the bundle carries (default: the
-   one running this script).
+   one running this script). Once those requirements are installed, a stamp
+   (``WORK/env/build-env.json``) records their hash and the interpreter (real
+   path and version); ``--reuse-env`` keeps ``WORK/env`` only when that stamp
+   matches the requirements just exported and the interpreter ``--python``
+   names, so an install that stopped halfway, or another interpreter, makes it
+   anew.
 3. **Bundle.** PyInstaller runs ``proteia.spec`` into ``WORK/dist/Proteia``
    (log: ``WORK/pyinstaller.log``). The bundle may hold no napari, Qt or Tcl
    file and no Universal CRT DLL, and must hold the web client and the
@@ -78,6 +83,15 @@ INNO_SETUP_VERSION = "7.1.0"  # proteia.iss refuses another
 # Excluded from the build environment with everything only it requires (#57
 # removes it from the dependencies).
 PRUNED = ("napari",)
+# In WORK/env, written once its locked requirements are installed.
+ENV_STAMP = "build-env.json"
+# Prints which interpreter runs it, or which one a virtual environment's comes
+# from: its real path (links such as uv's minor-version folders followed) and
+# full version, as JSON (ASCII, whatever the console's code page).
+_IDENTIFY = (
+    "import json, os, sys; print(json.dumps({'path': os.path.normcase(os.path.realpath("
+    "getattr(sys, '_base_executable', sys.executable))), 'version': sys.version}))"
+)
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -206,6 +220,54 @@ def bundle_problems(dist: Path) -> list[str]:
     return problems
 
 
+def identify_interpreter(python: str | Path) -> dict[str, str] | None:
+    """The interpreter ``python`` is, or the one a virtual environment's comes
+    from: ``{"path", "version"}``; None when it does not run."""
+    try:
+        done = subprocess.run(
+            [str(python), "-c", _IDENTIFY],
+            capture_output=True,
+            creationflags=_NO_WINDOW,
+            timeout=60,
+        )
+        identity = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return identity if isinstance(identity, dict) else None
+
+
+def env_stamp(requirements: bytes, interpreter: Mapping[str, str] | None) -> dict[str, Any]:
+    """The stamp of a build environment with the locked ``requirements`` (the
+    exported file's bytes) installed on ``interpreter`` (None: unknown)."""
+    return {
+        "requirements_sha256": hashlib.sha256(requirements).hexdigest(),
+        "interpreter": None if interpreter is None else dict(interpreter),
+    }
+
+
+def env_reuse_problem(stamp: Any, wanted: Mapping[str, Any]) -> str | None:
+    """Why the build environment stamped ``stamp`` (None: it has no readable
+    stamp) cannot serve a build that wants ``wanted`` (:func:`env_stamp`), or
+    None when it can."""
+    if not isinstance(stamp, Mapping):
+        return "it has no stamp (its install did not finish, or it predates stamps)"
+    if stamp.get("requirements_sha256") != wanted["requirements_sha256"]:
+        return "the locked requirements changed since it was made"
+    if wanted["interpreter"] is None:
+        return "the interpreter --python names could not be identified"
+    if stamp.get("interpreter") != wanted["interpreter"]:
+        return f"it was made on {stamp.get('interpreter')}, not {wanted['interpreter']}"
+    return None
+
+
+def read_env_stamp(path: Path) -> Any:
+    """The stamp at ``path``, or None when it is missing or unreadable."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 class Build:
     """One build: the paths, the log of each step, and the summary."""
 
@@ -250,9 +312,55 @@ class Build:
         self.summary["steps"][name] = round(time.perf_counter() - start, 1)
         return result
 
+    @property
+    def env_stamp_file(self) -> Path:
+        return self.work / "env" / ENV_STAMP
+
+    def requested_interpreter(self, python: str) -> dict[str, str] | None:
+        """The interpreter ``--python`` names, found as ``uv venv`` finds it: a
+        file is itself; any other request (``3.12``, say) is resolved among the
+        installed interpreters, not virtual environments. None when not found."""
+        if not Path(python).is_file():
+            done = subprocess.run(
+                [self.uv, "python", "find", "--system", "--no-project", python],
+                capture_output=True,
+                creationflags=_NO_WINDOW,
+            )
+            if done.returncode != 0:
+                return None
+            python = done.stdout.decode("utf-8", "replace").strip()
+        return identify_interpreter(python)
+
+    def make_environment(self, python: str, requirements: Path, reuse: bool) -> str:
+        """Make ``WORK/env`` on ``python`` with the locked ``requirements``, or with
+        ``reuse`` keep the one there when its stamp matches both. Says which."""
+        locked = requirements.read_bytes()
+        problem = "--reuse-env was not given"
+        if reuse:
+            wanted = env_stamp(locked, self.requested_interpreter(python))
+            stamp = read_env_stamp(self.env_stamp_file) if self.env_python.is_file() else None
+            problem = env_reuse_problem(stamp, wanted)
+            if problem is None:
+                return "reused"
+            print(f"   making {self.work / 'env'} anew: {problem}", flush=True)
+        # uv venv --clear removes the stamp too; this covers its failing first.
+        self.env_stamp_file.unlink(missing_ok=True)
+        self.run("uv-venv", [self.uv, "venv", "--clear", self.work / "env", "--python", python])
+        self.run(
+            "uv-install",
+            [self.uv, "pip", "install", "--python", self.env_python, "--no-deps",
+             "--require-hashes", "--requirement", requirements],
+        )  # fmt: skip
+        # Only now, with every requirement installed, can the environment be reused.
+        made_on = identify_interpreter(self.env_python)
+        if made_on is None:
+            raise BuildError(f"{self.env_python} does not run")
+        text = json.dumps(env_stamp(locked, made_on), indent=1)
+        self.env_stamp_file.write_text(text, encoding="utf-8")
+        return f"made ({problem})"
+
     def environment(self, python: str, reuse: bool) -> None:
         requirements = self.work / "requirements.txt"
-        previous = requirements.read_bytes() if requirements.exists() else None
         prune = [arg for name in PRUNED for arg in ("--prune", name)]
         self.run(
             "uv-export",
@@ -260,13 +368,7 @@ class Build:
              *prune, "--format", "requirements.txt", "--output-file", requirements],
             cwd=ROOT,
         )  # fmt: skip
-        if not (reuse and self.env_python.exists() and previous == requirements.read_bytes()):
-            self.run("uv-venv", [self.uv, "venv", "--clear", self.work / "env", "--python", python])
-            self.run(
-                "uv-install",
-                [self.uv, "pip", "install", "--python", self.env_python, "--no-deps",
-                 "--require-hashes", "--requirement", requirements],
-            )  # fmt: skip
+        self.summary["environment"] = self.make_environment(python, requirements, reuse)
         self.run(
             "uv-install-proteia",
             [self.uv, "pip", "install", "--python", self.env_python, "--no-deps",
@@ -382,7 +484,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--reuse-env",
         action="store_true",
-        help="keep WORK/env when the locked requirements have not changed",
+        help="keep WORK/env when its stamp shows the same locked requirements, fully"
+        " installed, on the interpreter --python names",
     )
     args = parser.parse_args(argv)
     if sys.platform != "win32":

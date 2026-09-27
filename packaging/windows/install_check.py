@@ -31,9 +31,14 @@ rather than the environment is real, and the report lists it: the Start Menu
 shortcut and the uninstall entry under ``HKEY_CURRENT_USER`` (both created and
 removed). ``Documents/Proteia`` and the real ``%LOCALAPPDATA%/Proteia`` are
 compared before and after. The check refuses to run when this account already
-has Proteia installed. ``FOLDER`` must be new or empty, or one an earlier run
-made (it holds the file :data:`MARKER`), which is emptied first; any other
-folder is refused, never emptied. Exit status 0 when every check passed.
+has Proteia installed. A step that raises (a Proteia that never answers, a
+timeout) is a failure that ends the run; however the run ends, the check then
+ends the Proteia processes it started and runs the scratch installation's
+uninstaller silently when it is there, so that the account is left without
+Proteia, and the report says what it cleaned up. ``FOLDER`` must be new or
+empty, or one an earlier run made (it holds the file :data:`MARKER`), which is
+emptied first; any other folder is refused, never emptied. Exit status 0 when
+every check passed.
 """
 
 from __future__ import annotations
@@ -155,6 +160,8 @@ class Check:
         self.state = self.user / "localappdata" / "Proteia"
         self.app_id = bundle.iss_app_id((HERE / "proteia.iss").read_text(encoding="utf-8"))
         self.report: dict[str, Any] = {"failures": [], "touched_outside_folder": []}
+        self.started: list[subprocess.Popen] = []  # every Proteia start_app started
+        self.shortcut: Path | None = None  # the Start Menu shortcut, once known
 
     def expect(self, condition: object, message: str) -> None:
         if not condition:
@@ -202,7 +209,8 @@ class Check:
         return result
 
     def start_app(self) -> subprocess.Popen:
-        """Start the installed app and wait for its first answer."""
+        """Start the installed app and wait for its first answer. The process is
+        remembered first, so that :meth:`clean_up` ends it if it never answers."""
         proc = subprocess.Popen(
             [str(self.app / bundle.EXE_NAME)],
             env=self.env,
@@ -211,6 +219,7 @@ class Check:
             stderr=subprocess.DEVNULL,
             creationflags=_NO_WINDOW,
         )
+        self.started.append(proc)
         smoke.wait_for_status(proc, self.state, time.perf_counter())
         return proc
 
@@ -284,10 +293,14 @@ class Check:
         return report
 
     def run(self, expect_numbers: dict[str, Any] | None) -> dict[str, Any]:
+        """Every check, in order. A step that raises is a failure that ends the
+        run; whatever happens, :meth:`clean_up` then ends the processes the check
+        started and uninstalls what it installed, so the account is left as the
+        check found it."""
         report = self.report
         real, scratch = known_folders(), known_folders(self.env)
         report["known_folders"] = {"real": real, "with_scratch_env": scratch}
-        shortcut = scratch["programs"] / f"{bundle.APP_NAME}.lnk"
+        shortcut = self.shortcut = scratch["programs"] / f"{bundle.APP_NAME}.lnk"
         desktop = scratch["desktop"] / f"{bundle.APP_NAME}.lnk"
         outside = {
             "documents": real["documents"] / bundle.APP_NAME,
@@ -296,11 +309,71 @@ class Check:
             "real_desktop": real["desktop"] / f"{bundle.APP_NAME}.lnk",
         }
         before = {name: snapshot(path) for name, path in outside.items()}
+        # Refused before anything is installed: nothing to clean up.
         if uninstall_entry(self.app_id) is not None or before["real_start_menu"]["exists"]:
             raise SystemExit("Proteia is installed for this account: uninstall it first")
         smoke.check_stand_in(self.env["BROWSER"], self.log, self.env)
 
-        # 1. Install, and what it installed.
+        steps = (
+            ("1. install", lambda: self.check_install(shortcut, desktop)),
+            ("2. launches and self-test", lambda: self.check_launches(expect_numbers)),
+            ("3. upgrade while running", self.check_upgrade),
+            ("4. refused while unreachable", self.check_refusals),
+            ("5. uninstall while running", self.check_uninstall),
+            ("6. uninstall after a crash", self.check_uninstall_after_crash),
+        )
+        try:
+            for index, (name, action) in enumerate(steps):
+                try:
+                    action()
+                except Exception as exc:  # recorded; the finally below cleans up
+                    error = f"{type(exc).__name__}: {exc}"
+                    not_run = [later for later, _ in steps[index + 1 :]]
+                    report["stopped"] = {"step": name, "error": error, "not_run": not_run}
+                    self.expect(False, f"step {name} stopped with {error}")
+                    break
+        finally:
+            report["cleanup"] = self.clean_up()
+
+        after = {name: snapshot(path) for name, path in outside.items()}
+        report["outside"] = {name: [str(outside[name]), before[name]] for name in outside}
+        self.expect(before == after, f"changed outside the scratch folder: {before} -> {after}")
+        report["ok"] = not report["failures"]
+        return report
+
+    def clean_up(self) -> dict[str, Any]:
+        """End every Proteia the check started that still runs, then run the
+        scratch installation's uninstaller silently if it is there (a run that
+        stopped midway leaves it installed for this account, with its uninstall
+        entry and Start Menu shortcut, and the next run refuses to start).
+        Returns what it did; what it could not remove is a failure. Never
+        raises, so that the report is written."""
+        done: dict[str, Any] = {"stopped": [], "uninstalled": None, "left": []}
+        for proc in self.started:
+            if proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(30)
+                done["stopped"].append(proc.pid)
+        if (self.app / "unins000.exe").is_file():
+            try:
+                done["uninstalled"] = self.uninstall("clean-up-uninstall")
+            except Exception as exc:
+                self.expect(False, f"clean-up: the uninstaller failed: {type(exc).__name__}: {exc}")
+        if uninstall_entry(self.app_id) is not None:
+            done["left"].append(f"HKEY_CURRENT_USER\\{UNINSTALL_KEY}\\{{{self.app_id}}}_is1")
+        if self.shortcut is not None and self.shortcut.exists():
+            done["left"].append(str(self.shortcut))
+        self.expect(
+            not done["left"],
+            "clean-up: still there, remove by hand before the next run: " + "; ".join(done["left"]),
+        )
+        return done
+
+    def check_install(self, shortcut: Path, desktop: Path) -> None:
+        """Step 1: install, and what it installed."""
+        report = self.report
         report["install"] = self.install("install")
         for name in (bundle.EXE_NAME, "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "unins000.exe"):
             self.expect((self.app / name).is_file(), f"no {name} in the installation")
@@ -317,7 +390,9 @@ class Check:
         if not shortcut.is_relative_to(self.folder):
             report["touched_outside_folder"].append(str(shortcut))
 
-        # 2. Launches (the first is the cold start) and the self-test.
+    def check_launches(self, expect_numbers: dict[str, Any] | None) -> None:
+        """Step 2: launches (the first is the cold start) and the self-test."""
+        report = self.report
         launches = smoke.run(self.app / bundle.EXE_NAME, self.folder / "smoke", runs=3)
         report["launches"] = [
             {key: launch.get(key) for key in ("first_status_s", "second_launch_s", "failures")}
@@ -340,53 +415,57 @@ class Check:
             report["selftest"]["numbers_as_built"] = not differences
             self.expect(not differences, f"installed numbers differ: {differences[:3]}")
 
-        # 3. The installer again while Proteia runs.
+    def check_upgrade(self) -> None:
+        """Step 3: the installer again while Proteia runs."""
         proc = self.start_app()
-        report["upgrade_while_running"] = self.install("upgrade")
-        report["upgrade_while_running"]["app_exit"] = proc.poll()
+        result = self.report["upgrade_while_running"] = self.install("upgrade")
+        result["app_exit"] = proc.poll()
         self.expect(proc.poll() == 0, f"Proteia exited {proc.poll()} when the installer ran")
         if proc.poll() is None:
             proc.kill()
         self.expect(self.state_files() == ["instance.lock"], f"state: {self.state_files()}")
 
-        # 4. The installer and the uninstaller while Quit cannot reach Proteia.
-        report["refused_while_unreachable"] = self.refusals()
+    def check_refusals(self) -> None:
+        """Step 4: the installer and the uninstaller while Quit cannot reach Proteia."""
+        self.report["refused_while_unreachable"] = self.refusals()
 
-        # 5. Uninstall while Proteia runs, with other files in the state folder.
+    def check_uninstall(self) -> None:
+        """Step 5: uninstall while Proteia runs, with other files in the state folder."""
         (self.state / "logs").mkdir(parents=True, exist_ok=True)
         (self.state / "logs" / "session µ.log").write_text("a session log\n", encoding="utf-8")
         (self.state / "notes.txt").write_text("kept\n", encoding="utf-8")
-        kept = ["logs", "logs/session µ.log", "notes.txt"]
         proc = self.start_app()
-        report["uninstall_while_running"] = self.uninstall("uninstall")
-        report["uninstall_while_running"]["app_exit"] = proc.poll()
+        result = self.report["uninstall_while_running"] = self.uninstall("uninstall")
+        result["app_exit"] = proc.poll()
         self.expect(proc.poll() == 0, f"Proteia exited {proc.poll()} when the uninstaller ran")
         if proc.poll() is None:
             proc.kill()
-        self.after_uninstall("uninstall", kept, shortcut)
+        self.after_uninstall("uninstall")
 
-        # 6. Instance files left by a Proteia that did not quit.
+    def check_uninstall_after_crash(self) -> None:
+        """Step 6: instance files left by a Proteia that did not quit."""
         self.install("reinstall")
         proc = self.start_app()
         proc.kill()
         proc.wait(30)
         left = self.state_files()
         self.expect(set(INSTANCE_FILES) <= set(left), f"after a kill the state holds {left}")
-        report["uninstall_after_crash"] = self.uninstall("uninstall-after-crash")
-        self.after_uninstall("uninstall-after-crash", kept, shortcut)
+        self.report["uninstall_after_crash"] = self.uninstall("uninstall-after-crash")
+        self.after_uninstall("uninstall-after-crash")
 
-        after = {name: snapshot(path) for name, path in outside.items()}
-        report["outside"] = {name: [str(outside[name]), before[name]] for name in outside}
-        self.expect(before == after, f"changed outside the scratch folder: {before} -> {after}")
-        report["ok"] = not report["failures"]
-        return report
-
-    def after_uninstall(self, label: str, kept: list[str], shortcut: Path) -> None:
+    def after_uninstall(self, label: str) -> None:
+        """What an uninstall must remove, and the other files of the state
+        folder (step 5 adds them) it must keep."""
+        kept = ["logs", "logs/session µ.log", "notes.txt"]
         left = self.state_files()
         self.report[f"{label}_state_left"] = left
         self.expect(left == kept, f"{label}: the state folder holds {left}, not {kept}")
         self.expect(not self.app.exists() or not any(self.app.iterdir()), f"{label}: files left")
-        self.expect(not shortcut.exists(), f"{label}: the Start Menu shortcut is still there")
+        shortcut = self.shortcut
+        self.expect(
+            shortcut is not None and not shortcut.exists(),
+            f"{label}: the Start Menu shortcut is still there",
+        )
         self.expect(uninstall_entry(self.app_id) is None, f"{label}: the uninstall entry stayed")
 
 

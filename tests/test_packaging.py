@@ -11,8 +11,11 @@ import importlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
+import types
 import webbrowser
 from pathlib import Path
 
@@ -342,6 +345,76 @@ def test_the_finished_bundle_is_checked(tmp_path):
     ]
 
 
+# --- The build environment and --reuse-env ---
+
+_PY313 = {"path": r"c:\uv\cpython-3.13.14\python.exe", "version": "3.13.14 (main) [MSC v.1944]"}
+_PY312 = {"path": r"c:\uv\cpython-3.12.13\python.exe", "version": "3.12.13 (main) [MSC v.1944]"}
+_LOCKED = b"numpy==2.4.6 \\\n    --hash=sha256:aa\n"
+
+
+def test_the_build_environment_is_reused_only_when_its_stamp_matches():
+    wanted = build.env_stamp(_LOCKED, _PY313)
+    assert build.env_reuse_problem(wanted, wanted) is None
+    # No stamp: the install never finished, or the environment predates stamps.
+    assert "no stamp" in build.env_reuse_problem(None, wanted)
+    assert "no stamp" in build.env_reuse_problem(["not", "a", "stamp"], wanted)
+    # A stale stamp: the lock changed since.
+    stale = build.env_stamp(b"numpy==2.4.5 \\\n    --hash=sha256:bb\n", _PY313)
+    assert "requirements" in build.env_reuse_problem(stale, wanted)
+    # Another interpreter: --python asks for 3.12, the environment has 3.13.
+    problem = build.env_reuse_problem(wanted, build.env_stamp(_LOCKED, _PY312))
+    assert "3.13.14" in problem and "3.12.13" in problem
+    elsewhere = build.env_stamp(_LOCKED, dict(_PY313, path=r"c:\other\python.exe"))
+    assert build.env_reuse_problem(wanted, elsewhere) is not None
+    # An interpreter that cannot be identified is never taken for the same one.
+    unknown = build.env_stamp(_LOCKED, None)
+    assert "not be identified" in build.env_reuse_problem(unknown, unknown)
+
+
+def test_an_environment_whose_install_stopped_is_made_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("UV", "uv")
+    work = tmp_path / "work"
+    maker = build.Build(work, tmp_path / "out")
+    requirements = _file(work / "requirements.txt", _LOCKED.decode())
+    py313, py312 = _file(tmp_path / "3.13" / "python.exe"), _file(tmp_path / "3.12" / "python.exe")
+    made_from: dict[str, Path] = {}
+    calls: list[str] = []
+    stop_install = [True]
+
+    def run(name, argv, **kwargs):
+        calls.append(name)
+        if name == "uv-venv":  # --clear: the folder is made anew
+            shutil.rmtree(work / "env", ignore_errors=True)
+            _file(maker.env_python)
+            made_from["python"] = Path(argv[argv.index("--python") + 1])
+        elif name == "uv-install" and stop_install:
+            stop_install.clear()
+            raise build.BuildError("uv-install failed (2)")
+        return ""
+
+    def identify(python):
+        python = Path(python)
+        base = made_from["python"] if python == maker.env_python else python
+        return {py313: _PY313, py312: _PY312}[base]
+
+    monkeypatch.setattr(maker, "run", run)
+    monkeypatch.setattr(build, "identify_interpreter", identify)
+    with pytest.raises(build.BuildError):
+        maker.make_environment(str(py313), requirements, reuse=True)
+    assert maker.env_python.is_file()  # half made, and unstamped
+    assert maker.make_environment(str(py313), requirements, reuse=True).startswith("made")
+    assert calls == ["uv-venv", "uv-install"] * 2
+    assert maker.make_environment(str(py313), requirements, reuse=True) == "reused"
+    # --python names another interpreter: the environment is made on it.
+    assert maker.make_environment(str(py312), requirements, reuse=True).startswith("made")
+    assert made_from["python"] == py312
+    assert maker.make_environment(str(py312), requirements, reuse=True) == "reused"
+    _file(requirements, "numpy==2.4.5\n")
+    assert "requirements" in maker.make_environment(str(py312), requirements, reuse=True)
+    assert maker.make_environment(str(py312), requirements, reuse=False).startswith("made")
+    assert calls.count("uv-venv") == 5
+
+
 # --- The notices ---
 
 
@@ -631,6 +704,158 @@ def test_the_install_check_empties_only_its_own_folder(install_check, tmp_path):
     empty.mkdir()
     assert module.main([str(setup), str(empty)]) == 0
     assert runs == [scratch, scratch, empty]
+
+
+# --- The install check's clean-up ---
+
+
+class _Process:
+    """A stand-in for a Proteia the check starts: it runs until it is killed."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid, self.returncode = pid, None
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = 1
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class _Windows:
+    """What the install check runs, faked: the installer and the uninstaller only
+    make and remove files and the per-user uninstall entry, the self-test passes,
+    and a started Proteia never answers."""
+
+    def __init__(self, programs: Path) -> None:
+        self.shortcut = programs / f"{bundle.APP_NAME}.lnk"
+        self.registry: dict[str, dict[str, str]] = {}
+        self.runs: list[list[str]] = []
+        self.started: list[_Process] = []
+        self.install_error: Exception | None = None
+        self.uninstall_leaves_shortcut = False
+
+    def run(self, argv, **kwargs):
+        argv = [str(arg) for arg in argv]
+        self.runs.append(argv)
+        exe = Path(argv[0])
+        if exe.name == "unins000.exe":
+            shutil.rmtree(exe.parent)
+            if not self.uninstall_leaves_shortcut:
+                self.shortcut.unlink(missing_ok=True)
+            self.registry.clear()
+        elif "--self-test" in argv:
+            report = {"ok": True, "steps": [], "numbers": {}}
+            _file(Path(argv[argv.index("--json") + 1]), json.dumps(report))
+        else:  # the installer
+            if self.install_error is not None:
+                raise self.install_error
+            app = Path(next(arg for arg in argv if arg.startswith("/DIR="))[len("/DIR=") :])
+            for name in (bundle.EXE_NAME, "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "unins000.exe"):
+                _file(app / name)
+            _file(self.shortcut)
+            self.registry["entry"] = {"DisplayName": bundle.APP_NAME, "InstallLocation": str(app)}
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    def popen(self, argv, **kwargs) -> _Process:
+        self.started.append(_Process(7000 + len(self.started)))
+        return self.started[-1]
+
+
+@pytest.fixture
+def faked_check(tmp_path, monkeypatch):
+    """install_check.py on a faked Windows (see _Windows): nothing is installed,
+    nothing runs."""
+    if os.name != "nt":
+        pytest.skip("install_check.py runs on Windows (winreg)")
+    [module] = _load("install_check")
+    windows = _Windows(tmp_path / "scratch" / "programs")
+    fake = types.SimpleNamespace(
+        run=windows.run,
+        Popen=windows.popen,
+        DEVNULL=subprocess.DEVNULL,
+        TimeoutExpired=subprocess.TimeoutExpired,
+    )
+    monkeypatch.setattr(module, "subprocess", fake)
+    monkeypatch.setattr(module, "uninstall_entry", lambda app_id: windows.registry.get("entry"))
+    monkeypatch.setattr(
+        module,
+        "known_folders",
+        lambda env=None: {
+            name: tmp_path / ("scratch" if env else "real") / name
+            for name in ("documents", "programs", "desktop")
+        },
+    )
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "real" / "localappdata"))
+
+    def no_answer(proc, state, start):
+        raise RuntimeError("no answer from /api/status in 90 s")
+
+    monkeypatch.setattr(smoke, "check_stand_in", lambda browser, log, env: None)
+    monkeypatch.setattr(smoke, "run", lambda exe, folder, runs: {"ok": True, "launches": []})
+    monkeypatch.setattr(smoke, "wait_for_status", no_answer)
+    folder = tmp_path / "check µ"
+    module.prepare_folder(folder)
+    return module, windows, module.Check(tmp_path / "Proteia-0.1.0.dev0-setup.exe", folder)
+
+
+def test_a_check_that_stops_midway_ends_what_it_started_and_uninstalls(faked_check):
+    module, windows, check = faked_check
+    report = check.run(None)  # step 3's Proteia never answers
+    assert report["ok"] is False
+    assert report["stopped"] == {
+        "step": "3. upgrade while running",
+        "error": "RuntimeError: no answer from /api/status in 90 s",
+        "not_run": [
+            "4. refused while unreachable",
+            "5. uninstall while running",
+            "6. uninstall after a crash",
+        ],
+    }
+    assert any("3. upgrade while running" in failure for failure in report["failures"])
+    [proc] = windows.started
+    assert proc.poll() is not None
+    uninstaller = windows.runs[-1]
+    assert Path(uninstaller[0]) == check.app / "unins000.exe"
+    assert set(module.SILENT) <= set(uninstaller)
+    assert report["cleanup"]["stopped"] == [proc.pid]
+    assert report["cleanup"]["uninstalled"]["exit"] == 0
+    assert report["cleanup"]["left"] == []
+    assert windows.registry == {} and not windows.shortcut.exists()
+    assert not [failure for failure in report["failures"] if failure.startswith("clean-up")]
+    json.dumps(report, default=str)  # the report is still written
+
+
+def test_the_clean_up_says_what_it_could_not_remove(faked_check):
+    module, windows, check = faked_check
+    windows.uninstall_leaves_shortcut = True
+    report = check.run(None)
+    assert report["cleanup"]["left"] == [str(windows.shortcut)]
+    assert any(
+        failure.startswith("clean-up") and str(windows.shortcut) in failure
+        for failure in report["failures"]
+    )
+
+
+def test_the_clean_up_runs_no_uninstaller_the_check_did_not_install(faked_check):
+    module, windows, check = faked_check
+    # The installer timed out having installed nothing: nothing to clean up.
+    windows.install_error = subprocess.TimeoutExpired("setup", 900)
+    report = check.run(None)
+    assert report["stopped"]["step"] == "1. install"
+    assert report["stopped"]["error"].startswith("TimeoutExpired: ")
+    assert len(report["stopped"]["not_run"]) == 5
+    assert [Path(argv[0]) for argv in windows.runs] == [check.setup]
+    assert report["cleanup"] == {"stopped": [], "uninstalled": None, "left": []}
+    # Proteia is installed for this account already: the check refuses before
+    # it installs anything, and runs no uninstaller.
+    windows.registry["entry"] = {"DisplayName": bundle.APP_NAME}
+    with pytest.raises(SystemExit, match="uninstall it first"):
+        module.Check(check.setup, check.folder).run(None)
+    assert len(windows.runs) == 1 and windows.registry
 
 
 # --- The launch check's stand-in browser ---
