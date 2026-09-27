@@ -20,9 +20,14 @@ runs the installer silently for the current user into ``FOLDER/app`` and:
    stop the installer;
 5. uninstalls while Proteia runs, with other files in the state folder: the
    uninstaller must stop Proteia, remove the program, the shortcut, the
-   uninstall entry and the launcher's instance files, and keep the other files;
+   uninstall entry and the launcher's instance files, and keep the other files:
+   the session log the app wrote there (``logs/proteia.log``, #137), a rotated
+   log from an earlier session, and a file of the user's;
 6. installs again, ends Proteia without Quit (its instance files stay behind,
    as after a crash) and uninstalls: the uninstaller removes those files.
+
+From step 3 on, the state folder also holds the session log the app writes
+there, and each step expects it.
 
 Every process runs with ``LOCALAPPDATA``, ``APPDATA``, ``USERPROFILE`` and
 ``TEMP`` in ``FOLDER`` and a stand-in browser (no browser opens, no window
@@ -30,7 +35,9 @@ shows). What Inno Setup takes from Windows' known folders and the registry
 rather than the environment is real, and the report lists it: the Start Menu
 shortcut and the uninstall entry under ``HKEY_CURRENT_USER`` (both created and
 removed). ``Documents/Proteia`` and the real ``%LOCALAPPDATA%/Proteia`` are
-compared before and after. The check refuses to run when this account already
+compared before and after: no Proteia the check starts may write there, its
+session log included (a Proteia run from source meanwhile writes its session
+log there, so quit it first). The check refuses to run when this account already
 has Proteia installed. A step that raises (a Proteia that never answers, a
 timeout) is a failure that ends the run; however the run ends, the check then
 ends the Proteia processes it started and runs the scratch installation's
@@ -64,6 +71,11 @@ HERE = Path(__file__).resolve().parent
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
 SILENT = ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
 INSTANCE_FILES = ("instance.lock", "instance.json", "open-proteia.html")
+# The session log the app writes in the state folder, as state_files lists it.
+SESSION_LOG = (smoke.LOG_DIR, f"{smoke.LOG_DIR}/{smoke.LOG_FILE}")
+# What step 5 adds to the state folder, besides the app's files: a log an
+# earlier session rotated, and a file of the user's.
+OTHER_STATE_FILES = (f"{smoke.LOG_DIR}/{smoke.LOG_FILE}.1", "notes µ.txt")
 # The file that marks FOLDER as this check's own: the next run may empty it.
 MARKER = ".install-check"
 # Setup's exit code when its Preparing step (PrepareToInstall) refused.
@@ -272,8 +284,11 @@ class Check:
                 result["static_app_js"] = smoke._request(info["port"], "/static/app.js")[0]
             self.expect(result.get("static_app_js") == 200, f"{label}: app.js is not served")
             left = self.state_files()
-            wanted = sorted(["instance.lock", "open-proteia.html"] + ["instance.json"] * wrong_port)
-            self.expect(left == wanted, f"{label}: the state folder holds {left}")
+            wanted = sorted(
+                ["instance.lock", "open-proteia.html", *SESSION_LOG]
+                + ["instance.json"] * wrong_port
+            )
+            self.expect(left == wanted, f"{label}: the state folder holds {left}, not {wanted}")
             report[label] = result
         instance.write_bytes(original)
         with contextlib.suppress(OSError):
@@ -423,7 +438,9 @@ class Check:
         self.expect(proc.poll() == 0, f"Proteia exited {proc.poll()} when the installer ran")
         if proc.poll() is None:
             proc.kill()
-        self.expect(self.state_files() == ["instance.lock"], f"state: {self.state_files()}")
+        wanted = ["instance.lock", *SESSION_LOG]
+        left = self.state_files()
+        self.expect(left == wanted, f"upgrade: the state folder holds {left}, not {wanted}")
 
     def check_refusals(self) -> None:
         """Step 4: the installer and the uninstaller while Quit cannot reach Proteia."""
@@ -431,9 +448,10 @@ class Check:
 
     def check_uninstall(self) -> None:
         """Step 5: uninstall while Proteia runs, with other files in the state folder."""
-        (self.state / "logs").mkdir(parents=True, exist_ok=True)
-        (self.state / "logs" / "session µ.log").write_text("a session log\n", encoding="utf-8")
-        (self.state / "notes.txt").write_text("kept\n", encoding="utf-8")
+        for name in OTHER_STATE_FILES:
+            path = self.state / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"{name}: kept\n".encode())
         proc = self.start_app()
         result = self.report["uninstall_while_running"] = self.uninstall("uninstall")
         result["app_exit"] = proc.poll()
@@ -454,9 +472,9 @@ class Check:
         self.after_uninstall("uninstall-after-crash")
 
     def after_uninstall(self, label: str) -> None:
-        """What an uninstall must remove, and the other files of the state
-        folder (step 5 adds them) it must keep."""
-        kept = ["logs", "logs/session µ.log", "notes.txt"]
+        """What an uninstall must remove, and what of the state folder it must
+        keep: the session log, and the other files step 5 adds."""
+        kept = sorted([*SESSION_LOG, *OTHER_STATE_FILES])
         left = self.state_files()
         self.report[f"{label}_state_left"] = left
         self.expect(left == kept, f"{label}: the state folder holds {left}, not {kept}")

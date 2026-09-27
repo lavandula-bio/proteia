@@ -15,12 +15,21 @@ No cookie is set and no CORS header is sent, so another page can neither make th
 browser send the token nor read a response. The generated API description and
 documentation pages are off. Every response carries a Content-Security-Policy
 that lets the page load and fetch only from this server.
+
+The guard logs (:mod:`proteia.web.logs`) the requests it refuses, by method and
+path (never a header, so never a token): anyone who can reach the port can send
+them, so the path is cut short (:func:`~proteia.web.logs.shorten`) and at most
+:data:`~proteia.web.logs.REFUSALS_LOGGED` a minute are logged one by one, the
+rest counted (:class:`~proteia.web.logs.Throttle`). It also logs every error no
+route answered, with its stack trace, once, in the log file only: the console
+shows uvicorn's report of it, as before.
 """
 
 from __future__ import annotations
 
 import hmac
 import json
+import logging
 import mimetypes
 import re
 from collections.abc import Callable, Iterable
@@ -33,7 +42,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import proteia
-from proteia.web import api, projects
+from proteia.web import api, logs, projects
 
 HOST: Final = "127.0.0.1"
 APP_ID: Final = "proteia"  # what /api/status reports, so a launcher knows it found Proteia
@@ -64,6 +73,8 @@ _SECURITY_HEADERS: Final = (
     (b"cache-control", b"no-store"),
 )
 _REPLACED: Final = frozenset(name for name, _ in _SECURITY_HEADERS)
+
+_log = logging.getLogger(__name__)
 
 
 def _is_shell(scope: Scope) -> bool:
@@ -106,6 +117,19 @@ class Guard:
         self.app = app
         self._host = f"{HOST}:{port}".encode("ascii")
         self._authorization = f"Bearer {token}".encode("ascii")
+        self.refusals = logs.Throttle()  # the refusals logged one by one
+
+    def _log_refusal(self, method: str, path: str, why: str) -> None:
+        admitted, left_out = self.refusals.admit()
+        if left_out:
+            _log.info(
+                "refused %d more requests on their Host header or token, not logged one by one"
+                " (more than %d a minute)",
+                left_out,
+                self.refusals.limit,
+            )
+        if admitted:
+            _log.info("refused %s %s: %s", method, logs.shorten(path), why)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":  # none are served
@@ -115,13 +139,16 @@ class Guard:
             await self.app(scope, receive, send)
             return
         headers: list[tuple[bytes, bytes]] = scope["headers"]
+        method, path = scope["method"], scope["path"]
         hosts = [value for name, value in headers if name == b"host"]
         if hosts != [self._host]:
+            self._log_refusal(method, path, "400 unexpected Host header")
             await _reject(send, 400, "unexpected Host header")
             return
         if not _is_shell(scope):
             given = [value for name, value in headers if name == b"authorization"]
             if len(given) != 1 or not hmac.compare_digest(given[0], self._authorization):
+                self._log_refusal(method, path, "401 missing or wrong access token")
                 await _reject(
                     send, 401, "missing or wrong access token", (b"www-authenticate", b"Bearer")
                 )
@@ -132,7 +159,21 @@ class Guard:
                 message = {**message, "headers": _with_security_headers(message["headers"])}
             await send(message)
 
-        await self.app(scope, receive, send_secured)
+        try:
+            await self.app(scope, receive, send_secured)
+        except Exception as exc:
+            # Answered 500 by FastAPI's last handler, then raised again for the
+            # server, which reports it on the console: the file has it once, here,
+            # with the request.
+            _log.error(
+                "unexpected error answering %s %s",
+                method,
+                logs.shorten(path),
+                exc_info=exc,
+                extra=logs.FILE_ONLY,
+            )
+            logs.mark_logged(exc)
+            raise
 
 
 def create_app(
@@ -170,6 +211,7 @@ def create_app(
         # Unsaved changes (a failed autosave) are saved first; if that fails the
         # answer is 409 unsaved_changes and Proteia keeps running.
         request.app.state.workspace.flush()
+        _log.info("quit from the page")
         on_quit()
         return {"status": "stopping"}
 

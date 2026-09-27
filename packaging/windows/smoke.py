@@ -15,7 +15,9 @@ and checks each launch:
   server;
 * every module the process loaded comes from the bundle or Windows;
 * ``POST /api/quit`` ends the process with exit code 0 and removes the instance
-  and redirect files (the lock file stays).
+  and redirect files (the lock file and the session log's folder stay);
+* the session log (``logs/proteia.log`` in the state folder, #137) records the
+  start and the end of both launches, and never the access token.
 
 It times each launch from the start of the process to the first answer of
 ``/api/status``. The process runs without a console window, with ``PATH``
@@ -45,6 +47,10 @@ from typing import Any
 STAND_IN_FLAG = "--stand-in-browser"
 START_WAIT = 90.0  # seconds from the start of the process to the first answer
 QUIT_WAIT = 30.0
+# The session log in the state folder (proteia.web.logs.LOG_DIR and LOG_FILE):
+# the app makes the folder, and uninstalling keeps it (ADR 0003).
+LOG_DIR = "logs"
+LOG_FILE = "proteia.log"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _SYSTEM_ROOT = os.environ.get("SystemRoot", r"C:\Windows")
 
@@ -137,6 +143,25 @@ def wait_for_status(proc: subprocess.Popen, state: Path, start: float) -> tuple[
     raise RuntimeError(f"no answer from /api/status in {START_WAIT:.0f} s")
 
 
+def session_log_problems(state: Path, token: str, sessions: int) -> list[str]:
+    """What is wrong with the session log in the state folder ``state`` after
+    ``sessions`` launches that each ended: it must be there, record each one's
+    start and end, and never hold the access token ``token``."""
+    path = state / LOG_DIR / LOG_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return [f"the session log cannot be read: {type(exc).__name__}: {exc}"]
+    problems = []
+    for event in ("session started", "session ended"):
+        count = text.count(f" proteia.web.launch: {event}")
+        if count != sessions:
+            problems.append(f"the session log records {event!r} {count} times, not {sessions}")
+    if token in text:
+        problems.append("the session log holds the access token")
+    return problems
+
+
 def _allowed(exe: Path) -> tuple[str, ...]:
     """Where a module the app loads may come from: the bundle, Windows, and
     Microsoft Defender's platform folder, whose modules Windows loads into
@@ -226,7 +251,9 @@ def launch_once(exe: Path, folder: Path, python: str | None = None) -> dict[str,
             result["quit_to_exit_s"] = round(time.perf_counter() - quit_start, 3)
             expect(code == 0, f"the process exited with {code} after Quit")
             left = sorted(path.name for path in state.iterdir())
-            expect(left == ["instance.lock"], f"the state folder holds {left} after Quit")
+            wanted = ["instance.lock", LOG_DIR]
+            expect(left == wanted, f"the state folder holds {left} after Quit, not {wanted}")
+            failures.extend(session_log_problems(state, token, sessions=2))
         except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
             failures.append(f"{type(exc).__name__}: {exc}")
         finally:
