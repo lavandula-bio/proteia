@@ -430,3 +430,54 @@ def test_git_ignores_the_default_folder():
         check=False,
     )
     assert (done.returncode, done.stdout.splitlines()) == (0, paths)
+
+
+def test_a_sample_held_by_another_program_stops_every_write(tmp_path, monkeypatch):
+    folder = tmp_path / "samples µ"
+    samples.generate(folder)
+    before = {name: (folder / name).read_bytes() for name in samples.FILES}
+    for name in samples.FILES:
+        (folder / name).write_bytes(b"an older version")
+    older = {name: (folder / name).read_bytes() for name in samples.FILES}
+    monkeypatch.setattr(samples, "_held", lambda path: path.name == samples.TRUTH_FILE)
+
+    with pytest.raises(samples.SampleWriteError) as caught:
+        samples.generate(folder, force=True)
+    assert (caught.value.replaced, caught.value.failed) == ((), (samples.TRUTH_FILE,))
+    assert "nothing was written" in str(caught.value)
+    assert {name: (folder / name).read_bytes() for name in samples.FILES} == older
+    assert older != before
+
+
+def test_a_write_failing_after_others_names_what_was_replaced(tmp_path, monkeypatch):
+    folder = tmp_path / "samples"
+    samples.generate(folder)
+    for name in samples.FILES:
+        (folder / name).write_bytes(b"an older version")
+    real = samples.write_atomic
+
+    def write(path, data):
+        if path.name == samples.TRUTH_FILE:
+            raise PermissionError(13, "held", str(path))
+        real(path, data)
+
+    monkeypatch.setattr(samples, "write_atomic", write)
+    with pytest.raises(samples.SampleWriteError) as caught:
+        samples.generate(folder, force=True)
+    assert caught.value.replaced == (samples.BLOT_FILE, samples.MARKER_FILE)
+    assert caught.value.failed == (samples.TRUTH_FILE,)
+    assert "two versions" in str(caught.value)
+    assert (folder / samples.TRUTH_FILE).read_bytes() == b"an older version"
+
+
+def test_held_tells_a_file_another_program_holds(tmp_path, monkeypatch):
+    path = tmp_path / "sample-truth.csv"
+    assert not samples._held(path)  # missing
+    path.write_bytes(b"x")
+    assert not samples._held(path)
+
+    def refuse(self, *args, **kwargs):
+        raise PermissionError(13, "held", str(self))
+
+    monkeypatch.setattr(Path, "open", refuse)
+    assert samples._held(path)

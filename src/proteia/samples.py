@@ -328,6 +328,27 @@ class SampleConflictError(FileExistsError):
         )
 
 
+class SampleWriteError(OSError):
+    """The sample files could not all be written. ``replaced`` names those
+    already replaced, so the folder may hold files of two versions; ``failed``
+    names the rest."""
+
+    def __init__(self, folder: Path, replaced: Sequence[str], failed: Sequence[str]) -> None:
+        self.folder = folder
+        self.replaced = tuple(replaced)
+        self.failed = tuple(failed)
+        if self.replaced:
+            state = (
+                f"replaced {', '.join(self.replaced)} but not {', '.join(self.failed)}:"
+                " the folder now holds files of two versions"
+            )
+        else:
+            state = f"{', '.join(self.failed)} is open in another program; nothing was written"
+        super().__init__(
+            f"in {folder}, {state}. Close the files in other programs and run again with --force."
+        )
+
+
 def generate(folder: str | os.PathLike[str], *, force: bool = False) -> tuple[Path, ...]:
     """Write the sample files into ``folder`` and return their paths, in
     :data:`FILES` order.
@@ -337,7 +358,11 @@ def generate(folder: str | os.PathLike[str], *, force: bool = False) -> tuple[Pa
     replaced only with ``force``; without it, :class:`SampleConflictError` names
     every such file and nothing is written. Other files in the folder are never
     touched. Each file is replaced atomically
-    (:func:`~proteia.core.storage.write_atomic`).
+    (:func:`~proteia.core.storage.write_atomic`), the truth table last. Before
+    any is replaced, those another program holds (a table open in a spreadsheet
+    on Windows) are named in :class:`SampleWriteError` and nothing is written; a
+    write failing after others were replaced raises it naming both, since the
+    images and the truth table must be of one version.
     """
     folder = Path(folder)
     files = sample_files()
@@ -347,14 +372,32 @@ def generate(folder: str | os.PathLike[str], *, force: bool = False) -> tuple[Pa
     if differ and not force:
         raise SampleConflictError(folder, differ)
     folder.mkdir(parents=True, exist_ok=True)
-    for name, data in files.items():
-        if name not in same:
-            write_atomic(paths[name], data)
+    pending = [name for name in files if name not in same]
+    held = [name for name in pending if _held(paths[name])]
+    if held:
+        raise SampleWriteError(folder, (), held)
+    for index, name in enumerate(pending):
+        try:
+            write_atomic(paths[name], files[name])
+        except OSError as exc:
+            raise SampleWriteError(folder, pending[:index], pending[index:]) from exc
     return tuple(paths.values())
 
 
 def _holds(path: Path, data: bytes) -> bool:
     return path.is_file() and path.read_bytes() == data
+
+
+def _held(path: Path) -> bool:
+    """Whether another program holds the existing file so it cannot be
+    replaced (Windows locks a file a spreadsheet has open)."""
+    try:
+        with path.open("r+b"):
+            return False
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return True
 
 
 def _tolerant_console() -> None:
