@@ -29,6 +29,7 @@ from proteia.core.analyze import (
     Batch,
     ProteinNets,
     Role,
+    StatisticsSetting,
     assess,
     compare,
     describe,
@@ -920,7 +921,8 @@ def launch(image_path: str | None = None) -> None:
                 pass
         state["plot_docks"] = []
         for i, (name, spec) in enumerate(named_specs):
-            canvas = FigureCanvasQTAgg(render_figure(spec))
+            # No caption beside it here: the chart draws its legend under itself.
+            canvas = FigureCanvasQTAgg(render_figure(spec, statement=True))
             dock = viewer.window.add_dock_widget(canvas, area="bottom", name=f"Chart: {name}")
             # Float each, cascaded, so multiple targets are visibly separate windows.
             try:
@@ -1020,10 +1022,12 @@ def launch(image_path: str | None = None) -> None:
                     provenance.setdefault(cond, []).append(i)
             reduction = reduce_samples(values, conditions, samples, included=eff_included)
             groups = reduction.groups
+            # The automatic rule until napari goes (#57): its charts are ratios.
+            test = compare(groups, StatisticsSetting(), ratio=True, reference=control)
             spec = build_plotspec(
                 groups,
                 describe(groups),
-                compare(groups),
+                test,
                 value_kind=kind,
                 error_type=error_type,
                 title=title,

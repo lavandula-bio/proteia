@@ -330,13 +330,13 @@ def test_the_full_flow_gives_the_true_fold_changes(tmp_path, sample_folder):
     )
     assert vehicle.mean == pytest.approx(1.0)  # the baseline is the vehicle mean
     assert treatment.mean == pytest.approx(2.0, rel=0.015)  # measured 2.0088
-    assert chart.test_name == "welch_t"
-    assert chart.test_p < 0.01  # measured 0.0026
+    assert chart.test_name == "student_t"  # 4 and 4 replicates: pooled variance, log values
+    assert chart.test_p < 0.001  # measured 0.00072 (0.0026 with Welch's t on linear values)
     [comparison] = chart.comparisons
     assert (comparison.group_a, comparison.group_b, comparison.stars) == (
         "vehicle",
         "treatment",
-        "**",
+        "***",
     )
 
 

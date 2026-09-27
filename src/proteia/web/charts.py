@@ -27,7 +27,7 @@ from typing import Final
 
 from proteia.core.model import UnknownIdError
 from proteia.core.plotspec import PlotSpec
-from proteia.viz import render_svg
+from proteia.viz import DEFAULT_STYLE, render_svg
 
 SPECS_KEPT: Final = 256
 DRAWINGS_KEPT: Final = 64
@@ -35,15 +35,19 @@ KEY_PATTERN: Final = re.compile(r"[0-9a-f]{32}")
 # Part of every key: change it when the same spec is drawn differently, so a
 # browser never keeps a drawing under the key of a spec drawn anew. v2: tests
 # named as readers name them; v3: p < 0.0001; v4: the caption stating the
-# error bars (#53).
-_KEY_VERSION: Final = b"render-v4\n"
+# error bars (#53); v5: the statistics as legend text (shown by the page, not
+# drawn), a key of the marks, the n.d. row and slots, the axis titles.
+_KEY_VERSION: Final = b"render-v5\n"
 _UNKNOWN: Final = "no chart has this key; read the project again for its charts' URLs"
 
 
-def chart_key(spec: PlotSpec) -> str:
-    """The key of the chart drawn from ``spec``: the first 32 hex digits of a
-    SHA-256 of the drawing's version and the spec as JSON."""
-    return hashlib.sha256(_KEY_VERSION + spec.model_dump_json().encode()).hexdigest()[:32]
+def chart_key(spec: PlotSpec, style: str = DEFAULT_STYLE) -> str:
+    """The key of the chart drawn from ``spec`` in ``style``
+    (:data:`~proteia.viz.styles.CHART_STYLES`): the first 32 hex digits of a
+    SHA-256 of the drawing's version, the style and the spec as JSON. The store
+    draws every chart in the default style."""
+    drawing = _KEY_VERSION + style.encode() + b"\n" + spec.model_dump_json().encode()
+    return hashlib.sha256(drawing).hexdigest()[:32]
 
 
 def chart_url(spec: PlotSpec) -> str:

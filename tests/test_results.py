@@ -16,7 +16,7 @@ import pytest
 
 from conftest import as_legacy, assert_strict_json, make_project
 from proteia.core import model, results
-from proteia.core.analyze import ReduceMethod, Tier, compare
+from proteia.core.analyze import ReduceMethod, StatisticsSetting, Tier, compare
 from proteia.core.model import (
     Band,
     Box,
@@ -34,8 +34,9 @@ from proteia.core.model import (
     UndetectedReason,
     apply_change,
 )
-from proteia.core.plotspec import NO_VARIATION, ErrorType, ValueKind
+from proteia.core.plotspec import NO_VARIATION, ErrorType, ValueKind, p_text
 from proteia.core.results import Level, NoticeCode, compute_results, lane_detected, lane_nets
+from proteia.viz import render_svg
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -157,7 +158,7 @@ def test_series_uses_the_loading_control_the_target_names():
     assert s.normalized != _ratio(nets["prot-7"], nets["prot-8"])
     assert s.chart is not None
     assert s.chart.title == "β-catenin fold-change vs vehicle  (/GAPDH)"
-    assert {bar.label: bar.points for bar in s.chart.bars} == s.groups
+    assert {bar.label: bar.points for bar in s.chart.bars if bar.n} == s.groups
     assert all(x.loading_id != "prot-8" for x in res.series)
 
 
@@ -168,7 +169,9 @@ def test_series_naming_the_first_loading_control_uses_it_throughout():
     assert (s.loading_id, s.loading) == ("prot-8", "α-tubulin")
     assert s.normalized == _ratio(nets["prot-7"], nets["prot-8"])
     assert s.chart is not None and s.chart.title.endswith("(/α-tubulin)")
-    assert {bar.label: bar.points for bar in s.chart.bars} == s.groups
+    assert {bar.label: bar.points for bar in s.chart.bars if bar.n} == s.groups
+    # 10 µM's one included lane has no β-catenin box: its slot, with no value.
+    assert [(bar.label, bar.n) for bar in s.chart.bars] == [("vehicle", 2), ("10 µM", 0)]
 
 
 def test_target_without_a_choice_among_two_loading_controls_has_no_series():
@@ -226,8 +229,9 @@ def test_reference_without_a_value_in_one_series_only():
     assert tubulin.groups == {"10 µM": [tubulin.normalized[3]]}
     assert gapdh.value_kind is ValueKind.FOLD_CHANGE
     assert gapdh.chart is not None
-    assert [bar.label for bar in gapdh.chart.bars] == ["vehicle"]
+    assert [bar.label for bar in gapdh.chart.bars] == ["vehicle", "10 µM"]
     assert gapdh.chart.bars[0].mean == pytest.approx(1.0)
+    assert gapdh.chart.bars[1].mean is None  # GAPDH has no box in the 10 µM lanes
 
 
 def test_non_positive_reference_mean_is_unusable():
@@ -618,30 +622,30 @@ def _baseline_batch(reference: str | None) -> model.Batch:
 
 
 def _chart_stats(res_sd: results.Results, res_sem: results.Results) -> dict:
-    """A chart's statistics in the golden file's shape (only brackets for p < 0.05)."""
+    """A chart's statistics in the golden file's shape: its bars and its test,
+    every comparison of it."""
     [sd], [sem] = res_sd.series, res_sem.series
     assert sd.chart is not None and sem.chart is not None
+    test = sd.chart.test
+    assert test is not None
     return {
         "describe": [
-            {"label": a.label, "n": a.n, "mean": a.mean, "sd": a.error, "sem": b.error}
+            {
+                "label": a.label,
+                "n": a.n,
+                "mean": a.mean,
+                "sd": a.error,
+                "sem": b.error,
+                "geometric_mean": a.geometric_mean,
+                "geometric_sd_factor": a.geometric_sd_factor,
+            }
             for a, b in zip(sd.chart.bars, sem.chart.bars, strict=True)
         ],
         "compare": {
-            "test": sd.chart.test_name,
-            "p_value": sd.chart.test_p,
-            "pairwise": [c.model_dump() for c in sd.chart.comparisons],
-        },
-    }
-
-
-def _golden_chart_stats(stats: dict) -> dict:
-    compared = stats["compare"]
-    return {
-        "describe": stats["describe"],
-        "compare": {
-            "test": compared["test"],
-            "p_value": compared["p_value"],
-            "pairwise": [pw for pw in compared["pairwise"] if pw["p_value"] < 0.05],
+            "test": test.id,
+            "p_value": test.p_value,
+            "statistic": test.statistic,
+            "pairwise": [p.model_dump() for p in test.pairwise],
         },
     }
 
@@ -703,8 +707,15 @@ def test_compute_matches_the_regression_baseline(method, reference, kind, golden
             compute_results(batch, plot_conditions=plot, error_type=error_type, method=method)
             for error_type in (ErrorType.SD, ErrorType.SEM)
         ]
-        expected = _golden_chart_stats(reduced[case])
-        _assert_close(_chart_stats(*charts), expected, rel, abs_, case)
+        _assert_close(_chart_stats(*charts), reduced[case], rel, abs_, case)
+        # The brackets: the comparisons with an adjusted p below 0.05.
+        brackets = [c.model_dump() for c in charts[0].series[0].chart.comparisons]
+        expected = [
+            {key: pw[key] for key in ("group_a", "group_b", "p_value")}
+            for pw in reduced[case]["compare"]["pairwise"]
+            if pw["p_value"] < 0.05
+        ]
+        _assert_close(brackets, expected, rel, abs_, f"{case} brackets")
 
 
 # --- review of #69: provenance, notices that must not mislead, tier ---
@@ -787,7 +798,8 @@ def test_too_few_samples_give_a_chart_without_statistics():
     assert [bar.n for bar in chart.bars] == [1, 1]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
     # The reason no test ran names the groups, where the core's note names none.
-    assert compare(series.groups).note == "need >=2 groups with >=2 replicates for a test"
+    core = compare(series.groups, StatisticsSetting(), ratio=True, reference="vehicle")
+    assert core.note == "need >=2 groups with >=2 replicates for a test"
     assert chart.test_note == "no test: 'vehicle', '10 µM' have fewer than 2 replicates"
     # The all-lanes set has vehicle n = 2, still too few groups with two samples to test.
     all_chart = res.all_lanes.series[0].chart
@@ -890,7 +902,8 @@ def test_values_that_do_not_vary_give_a_chart_with_a_note_and_no_test():
     res = compute_results(_batch(_no_variation))
     [series] = res.series
     assert series.groups == {"vehicle": [1.0, 1.0], "10 µM": [1.0, 1.0]}
-    assert math.isnan(compare(series.groups).p_value)  # what the core gives
+    core = compare(series.groups, StatisticsSetting(), ratio=True, reference="vehicle")
+    assert math.isnan(core.p_value)  # what the core gives
     chart = series.chart
     assert chart is not None and [bar.n for bar in chart.bars] == [2, 2]
     assert (chart.test_name, chart.test_p, chart.comparisons) == (None, None, [])
@@ -909,8 +922,8 @@ def test_a_group_of_one_gives_a_chart_with_a_note_and_no_brackets():
 
 def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_tests_the_other_two():
     # The baseline blot with lane 8 excluded too: 50 µM keeps only b1. The chart
-    # shows the core's Welch's t of vehicle and 10 µM, p < 0.05 where the ANOVA over
-    # all three conditions had none, and says that 50 µM is not in it.
+    # shows the core's Student's t of vehicle and 10 µM, and says that 50 µM is not
+    # in it.
     baseline = _baseline_batch(REFERENCE)
     lanes = [
         lane.model_copy(update={"included": False}) if lane.index == 7 else lane
@@ -919,12 +932,12 @@ def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_tests_the_
     res = compute_results(baseline.model_copy(update={"lanes": lanes}))
     assert res.label == "Excluding lanes 6, 8"
     [series] = res.series
-    tested = compare(series.groups)
-    assert (tested.test, tested.p_value < 0.05) == ("welch_t", True)  # what the core gives
+    tested = compare(series.groups, StatisticsSetting(), ratio=True, reference=REFERENCE)
+    assert (tested.test, tested.p_value < 0.05) == ("student_t", True)  # what the core gives
     chart = series.chart
     assert chart is not None
     assert [(bar.label, bar.n) for bar in chart.bars] == [(REFERENCE, 2), (LOW, 2), (HIGH, 1)]
-    assert (chart.test_name, chart.test_p) == ("welch_t", tested.p_value)
+    assert (chart.test_name, chart.test_p) == ("student_t", tested.p_value)
     assert [(c.group_a, c.group_b, c.p_value) for c in chart.comparisons] == [
         (REFERENCE, LOW, tested.p_value)  # the one bracket, between the tested conditions
     ]
@@ -933,7 +946,8 @@ def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_tests_the_
     assert_strict_json(res)
     all_chart = res.all_lanes.series[0].chart
     assert all_chart is not None and [bar.n for bar in all_chart.bars] == [2, 3, 2]
-    assert (all_chart.test_name, all_chart.test_note) == ("anova_oneway", None)
+    # n of 2, 3 and 2 with the reference tested: Welch's t-tests vs the reference.
+    assert (all_chart.test_name, all_chart.test_note) == ("welch_t_holm", None)
 
 
 def _clipped(*band_ids: str) -> Callable[[Project], None]:
@@ -1125,7 +1139,11 @@ def test_records_carry_no_value():
             without.tier,
         )
         for a, b in zip(with_records.series, without.series, strict=True):
-            assert a.model_copy(update={"undetected": {}}) == b
+            assert a.model_copy(update={"undetected": {}, "chart": None}) == b.model_copy(
+                update={"chart": None}
+            )
+            # The charts draw the same values; a record only says why a lane has none.
+            assert [bar.points for bar in a.chart.bars] == [bar.points for bar in b.chart.bars]
         assert [n for n in with_records.notices if n.code is not NoticeCode.BELOW_DETECTION] == (
             without.notices
         )
@@ -1167,6 +1185,31 @@ def test_a_technical_repeat_with_one_lane_not_detected_keeps_its_measured_lane()
     assert series.averaged == []  # one measured lane: nothing averaged
     assert series.undetected == {"vehicle": [1]}
     assert _one(res, NoticeCode.BELOW_DETECTION).lane_indices == (1,)
+
+
+def _repeats_of_a1(*changes: Callable[[Project], object]) -> model.Batch:
+    """The sample with lane 4 (1-based) included as a technical repeat of lane 3:
+    10 µM has one sample, a1, over lanes 3 and 4."""
+    return _batch(_lane(3, included=True, sample="a1"), *changes)
+
+
+def test_a_repeat_measured_in_one_lane_is_a_detected_replicate_on_the_chart():
+    # β-catenin not detected in lane 3 but measured in lane 4: a1 has a value.
+    chart = compute_results(_repeats_of_a1(_undetected("prot-7", 2))).series[0].chart
+    low, coverage = chart.bars[1], chart.coverage[1]
+    assert low.label == "10 µM"
+    assert (low.n, low.lane_indices, low.not_detected_lanes) == (1, [3], [])
+    assert low.mean is not None  # a bar: nothing of it was below the detection limit
+    assert (coverage.not_detected, coverage.left_out) == (0, "fewer_than_2")
+
+
+def test_a_repeat_with_no_value_and_one_lane_not_detected_is_not_detected():
+    # Neither lane of a1 has a β-catenin value; lane 3 has a not-detected record.
+    batch = _repeats_of_a1(_no_bands("prot-7", 3), _undetected("prot-7", 2))
+    chart = compute_results(batch).series[0].chart
+    low, coverage = chart.bars[1], chart.coverage[1]
+    assert (low.n, low.points, low.not_detected_lanes) == (0, [], [2])
+    assert (coverage.not_detected, coverage.left_out) == (1, "not_detected")
 
 
 def test_a_reference_the_target_was_not_detected_in_says_so():
@@ -1256,3 +1299,180 @@ def test_compute_takes_the_detection_state_from_lane_detected(monkeypatch):
     assert len(seen) == 2  # this set and the all-lanes set (lane 3 is excluded)
     assert seen[0] is batch
     assert [column.detected for column in res.proteins] == list(lane_detected(batch).values())
+
+
+# --- #52 PR 6b: the statistics setting, its notices, and replicates not detected ---
+
+
+def test_the_statistics_setting_flows_into_every_chart():
+    batch = _baseline_batch(REFERENCE)  # 2, 2 and 2 replicates here, 2, 3 and 2 in all lanes
+    auto = compute_results(batch)
+    assert auto.statistics == StatisticsSetting() == auto.all_lanes.statistics
+    assert auto.series[0].chart.test.id == "dunnett"
+    welch = compute_results(batch, statistics={"family": "welch", "scale": "linear"})
+    assert welch.statistics == StatisticsSetting(family="welch", scale="linear")
+    for one_set in (welch, welch.all_lanes):
+        test = one_set.series[0].chart.test
+        assert (test.id, test.scale) == ("welch_t_holm", "linear")
+        assert test.chosen == {"family": "user", "comparisons": "auto", "scale": "user"}
+    assert welch == compute_results(batch, statistics=welch.statistics)  # raw strings or the model
+
+
+def test_an_unknown_statistics_setting_is_a_value_error():
+    with pytest.raises(ValueError, match="invalid statistics setting"):
+        compute_results(make_project().batch, statistics={"family": "t-test"})
+
+
+def test_each_set_states_its_own_test():
+    # Excluding lane 6 leaves 10 µM two replicates of three: equal n here, unequal in all lanes.
+    res = compute_results(_baseline_batch(REFERENCE))
+    applied, every = res.series[0].chart, res.all_lanes.series[0].chart
+    assert applied.test.id == "dunnett"
+    assert every.test.id == "welch_t_holm"
+    for chart, name in ((applied, "Dunnett's test"), (every, "Welch's t-tests (Holm)")):
+        # Each comparison's p, the legend's only numbers: there is no omnibus p.
+        each = ", ".join(f"{p.group_b!r} {p_text(p.p_value)}" for p in chart.test.pairwise)
+        assert [p.group_b for p in chart.test.pairwise] == [LOW, HIGH]
+        assert chart.statement[1] == f"{name} on log values, each condition vs 'vehicle': {each}"
+
+
+def test_a_chart_is_tested_through_chart_test(monkeypatch):
+    calls = []
+    real = results.chart_test
+
+    def spy(shown, *, setting, kind, reference):
+        calls.append((set(shown), setting, kind, reference))
+        return real(shown, setting=setting, kind=kind, reference=reference)
+
+    monkeypatch.setattr(results, "chart_test", spy)
+    setting = StatisticsSetting(comparisons="all_pairs")
+    compute_results(_baseline_batch(REFERENCE), statistics=setting)
+    everything = {REFERENCE, LOW, HIGH}
+    assert calls == [(everything, setting, ValueKind.FOLD_CHANGE, REFERENCE)] * 2  # both sets
+
+
+def test_chart_test_is_the_core_test_of_the_value_kind():
+    groups = {REFERENCE: [1.0, 1.1], LOW: [2.0, 2.2], HIGH: [0.5, 0.6]}
+    ratio = results.chart_test(
+        groups, setting=StatisticsSetting(), kind=ValueKind.FOLD_CHANGE, reference=REFERENCE
+    )
+    assert (ratio.test, ratio.plan.scale) == ("dunnett", "log")
+    raw = results.chart_test(
+        groups, setting=StatisticsSetting(), kind=ValueKind.RAW, reference=None
+    )
+    assert (raw.test, raw.plan.scale) == ("anova_tukey", "linear")
+
+
+def _baseline_without(*lanes: int) -> model.Batch:
+    baseline = _baseline_batch(REFERENCE)
+    return baseline.model_copy(
+        update={
+            "lanes": [
+                lane.model_copy(update={"included": False}) if lane.index in lanes else lane
+                for lane in baseline.lanes
+            ]
+        }
+    )
+
+
+def test_conditions_left_out_of_a_test_are_a_warning():
+    res = compute_results(_baseline_without(5, 7))  # 50 µM keeps one replicate
+    notice = _one(res, NoticeCode.CONDITIONS_NOT_TESTED)
+    assert notice.level is Level.WARNING
+    assert notice.message == "'β-catenin' / 'α-tubulin': '50 µM' (n = 1) is not in the test"
+    assert (notice.protein_ids, notice.conditions) == (("prot-3", "prot-4"), (HIGH,))
+    assert NoticeCode.CONDITIONS_NOT_TESTED not in _codes(res.all_lanes)  # all tested there
+
+
+def test_each_set_keeps_the_test_notices_of_its_own_charts():
+    # 50 µM loses its lane-8 β-catenin box: one replicate in both sets, so both
+    # charts leave it out. Shared notices are kept only in the first set, but a
+    # test notice is about one set's chart: the all-lanes set keeps its own.
+    batch = _baseline_batch(REFERENCE).model_copy(deep=True)
+    beta = batch.find_protein("prot-3")
+    beta.bands = [band for band in beta.bands if band.lane_index != 7]
+    res = compute_results(batch)
+    assert res.all_lanes is not None
+    for one in (res, res.all_lanes):
+        notice = _one(one, NoticeCode.CONDITIONS_NOT_TESTED)
+        assert notice.message == "'β-catenin' / 'α-tubulin': '50 µM' (n = 1) is not in the test"
+        assert one.series[0].chart.coverage[-1].left_out == "fewer_than_2"
+
+
+def test_a_choice_that_cannot_apply_is_a_warning():
+    res = compute_results(_baseline_batch(None), statistics={"comparisons": "vs_reference"})
+    notice = _one(res, NoticeCode.TEST_NOT_APPLICABLE)
+    assert notice.level is Level.WARNING
+    assert notice.message == (
+        "'β-catenin' / 'α-tubulin': no test: comparisons with the reference were chosen,"
+        " but no reference is set"
+    )
+    assert res.series[0].chart.test is None
+
+
+def test_a_ratio_tested_on_the_linear_scale_is_told():
+    batch = _baseline_batch(REFERENCE).model_copy(deep=True)
+    batch.find_band("band-8")[1].net = 0.0  # 10 µM, lane 4: a fold-change of 0
+    res = compute_results(batch)
+    notice = _one(res, NoticeCode.LOG_SCALE_UNAVAILABLE)
+    assert notice.level is Level.INFO
+    assert notice.message == (
+        "'β-catenin' / 'α-tubulin' is tested on linear values:"
+        " '10 µM' has a value of 0 or below, which has no log"
+    )
+    assert notice.conditions == (LOW,)
+    assert res.series[0].chart.test.scale == "linear"
+    # An explicit linear scale is the user's choice, not a fallback.
+    linear = compute_results(batch, statistics={"scale": "linear"})
+    assert NoticeCode.LOG_SCALE_UNAVAILABLE not in _codes(linear)
+
+
+def test_a_rank_test_that_cannot_reach_significance_is_a_warning():
+    res = compute_results(_baseline_batch(REFERENCE), statistics={"family": "rank"})
+    notice = _one(res, NoticeCode.RANK_TEST_CANNOT_REACH_ALPHA)
+    assert notice.level is Level.WARNING
+    assert notice.message.startswith(
+        "'β-catenin' / 'α-tubulin': Dunn's test (Holm): with these n no p can be below"
+    )
+    assert res.series[0].chart.test.id == "dunn_holm"
+
+
+def test_a_condition_the_target_was_not_detected_in_keeps_its_slot():
+    # β-catenin not detected in lane 3 (10 µM, a1); lane 4 (a2) is excluded.
+    res = compute_results(_batch(_no_bands("prot-7", 2), _undetected("prot-7", 2)))
+    chart = res.series[0].chart
+    assert [bar.label for bar in chart.bars] == ["vehicle", "10 µM"]
+    low = chart.bars[1]
+    assert (low.mean, low.points, low.not_detected_lanes) == (None, [], [2])
+    assert chart.coverage[1].left_out == "not_detected"
+    assert chart.statement[1:] == [
+        "No test: fewer than 2 conditions to test; not tested: '10 µM' (1 of 1 not detected)"
+    ]
+    # In all lanes a2 was measured: 10 µM is partly detected, and still draws no bar.
+    every_series = res.all_lanes.series[0]
+    every = every_series.chart
+    assert every.bars[1].points == every_series.groups["10 µM"]
+    assert (every.bars[1].mean, every.bars[1].not_detected_lanes) == (None, [2])
+    assert every.coverage[1].replicates == 2
+    svg = render_svg(chart).decode()
+    assert 'id="nd-1-0"' in svg and 'id="slot-1"' in svg
+
+
+def test_a_condition_without_any_value_keeps_its_slot_and_is_named():
+    res = compute_results(_batch())  # 10 µM's only included lane has no β-catenin box
+    chart = res.series[0].chart
+    assert [(bar.label, bar.n) for bar in chart.bars] == [("vehicle", 2), ("10 µM", 0)]
+    assert chart.coverage[1].left_out == "no_value"
+    assert chart.test_note == (
+        "no test: fewer than 2 conditions to test; not tested: '10 µM' (no value)"
+    )
+
+
+def test_a_replicate_the_loading_control_misses_has_no_value_but_counts():
+    # α-tubulin not detected in lane 2 (vehicle, v2): β-catenin / α-tubulin has no
+    # value there, a replicate with no value, not one of the target's not detected.
+    res = compute_results(_batch(_no_bands("prot-8", 1), _undetected("prot-8", 1)))
+    chart = res.series[0].chart
+    assert chart.bars[0].label == "vehicle" and chart.bars[0].not_detected_lanes == []
+    assert (chart.coverage[0].n, chart.coverage[0].replicates) == (1, 2)
+    assert chart.coverage[0].left_out == "fewer_than_2"

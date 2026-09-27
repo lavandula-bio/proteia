@@ -22,12 +22,12 @@ from conftest import (
     synthetic_blot,
     write_tiff,
 )
+from proteia.core import analyze, quantify, rowdetect
 from proteia.core import operations as ops
-from proteia.core import quantify, rowdetect
-from proteia.core.analyze import ReduceMethod
+from proteia.core.analyze import ReduceMethod, StatisticsSetting
 from proteia.core.export import CHART_PNG_DPI, LANE_TABLE_DECIMALS, LANE_TABLE_RATIO_DECIMALS
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
-from proteia.core.model import ImageKind, LogEntry, Polarity, Project, Role
+from proteia.core.model import ImageKind, LogEntry, Polarity, Project, Role, apply_change
 from proteia.core.plotspec import ErrorType
 from proteia.core.quantify import CLIPPED_PIXELS_THRESHOLD
 from proteia.core.record import (
@@ -36,6 +36,7 @@ from proteia.core.record import (
     history_issues,
     record_bytes,
     results_settings,
+    results_statistics,
     settings,
     software_versions,
 )
@@ -205,6 +206,7 @@ def test_record_names_the_compute_settings():
         "error_type": "SEM",
         "plot_conditions": ["vehicle", "10 µM"],  # resolved, in lane order
         "excluded_lanes": [3],
+        "statistics": results_statistics(res),
     }
     assert results_settings(res) == expected
     assert build_record(project, exported_at=EXPORTED_AT, files={}, results=res)["results"] == (
@@ -228,6 +230,21 @@ def test_settings_are_the_code_constants():
         "lane_table_first_lane": 1,  # the lane column numbers lanes as the app does
         "chart_png_dpi": CHART_PNG_DPI,
         "detect_row": rowdetect.settings(),  # every row-box detection constant
+        "statistics": {
+            "alpha": 0.05,
+            "dunnett_rng_seed": 0,
+            "mann_whitney": (
+                "exact; with tied values, the exact permutation distribution up to"
+                " mann_whitney_tied_permutations arrangements, else the normal"
+                " approximation with the tie correction"
+            ),
+            "mann_whitney_tied_permutations": analyze.MANN_WHITNEY_PERMUTATIONS,
+            "kruskal_wallis_p": "chi-square approximation",
+            "dunn_adjustment": "holm",
+            "log_base": "e",
+            "auto_rule": analyze.AUTO_RULE_VERSION,
+            "tests": sorted(analyze.TESTS),
+        },
     }
     parameters = inspect.signature(grow_box).parameters
     assert parameters["rel_threshold"].default == REL_THRESHOLD == 0.3
@@ -286,3 +303,113 @@ def test_a_log_written_before_the_band_backgrounds_has_no_history_issues():
     # The record names the legacy method its nets still use.
     assert record["settings"]["background_method"] == "global_median"
     assert record["content"]["background_method"] == "global_median"
+
+
+# --- #52: the statistics each exported chart used ---
+
+
+def test_the_record_pins_what_each_charts_test_resolved_to():
+    project = make_project()
+    res = compute_results(project.batch, statistics={"family": "welch"})
+    pinned = results_statistics(res)
+    assert pinned["setting"] == {"family": "welch", "comparisons": "auto", "scale": "auto"}
+    charts = pinned["charts"]
+    # One chart per series of each set: this set, then the all-lanes set.
+    assert [(c["result_set"], c["target_id"], c["loading_id"]) for c in charts] == [
+        ("Excluding lane 4", "prot-7", "prot-8"),
+        ("All lanes", "prot-7", "prot-8"),
+    ]
+    applied, every = charts
+    # Excluding lane 4, 10 µM has no β-catenin value: no test, and why.
+    assert applied["test"] is None
+    assert applied["note"] == (
+        "no test: fewer than 2 conditions to test; not tested: '10 µM' (no value)"
+    )
+    assert applied["not_tested"] == [
+        {"condition": "10 µM", "n": 0, "replicates": 1, "not_detected": 0, "reason": "no_value"}
+    ]
+    assert applied["chosen"] == {"family": "user", "comparisons": "auto", "scale": "auto"}
+    assert every["test"] is None and every["not_tested"][0]["reason"] == "fewer_than_2"
+    json.dumps(pinned, allow_nan=False)
+
+
+def test_the_record_pins_a_test_that_ran():
+    res = compute_results(_baseline_like_batch())
+    [chart] = results_statistics(res)["charts"]
+    assert {key: chart[key] for key in ("result_set", "test", "family", "comparisons")} == {
+        "result_set": None,
+        "test": "student_t",
+        "family": "pooled",
+        "comparisons": "all_pairs",
+    }
+    assert (chart["scale"], chart["reference"], chart["covered"]) == (
+        "log",
+        None,
+        ["vehicle", "10 µM"],
+    )
+    assert chart["chosen"] == {"family": "auto", "comparisons": "auto", "scale": "auto"}
+    assert chart["reasons"] == [
+        "ratios: log scale",
+        "equal n: pooled variance",
+        "2 conditions: all pairs",
+    ]
+    assert (chart["not_tested"], chart["note"]) == ([], None)
+    # The p-values, unrounded: the legend gives them rounded.
+    test = res.series[0].chart.test
+    assert chart["p_value"] == test.p_value and chart["statistic"] == test.statistic
+    assert chart["pairwise"] == [
+        {"group_a": "vehicle", "group_b": "10 µM", "p_value": test.p_value, "estimate": est}
+        for est in [test.pairwise[0].estimate]
+    ]
+    assert chart["method"] is None  # only the Mann-Whitney U test has several
+
+
+def test_the_record_gives_each_p_value_of_a_test_vs_the_reference():
+    from test_results import _baseline_batch  # the regression baseline's blot
+
+    res = compute_results(_baseline_batch("vehicle"))
+    applied, every = results_statistics(res)["charts"]
+    for pinned, one in ((applied, res), (every, res.all_lanes)):
+        test = one.series[0].chart.test
+        assert pinned["test"] == test.id
+        assert (pinned["p_value"], pinned["statistic"]) == (None, None)  # no omnibus test
+        assert pinned["pairwise"] == [
+            {
+                "group_a": p.group_a,
+                "group_b": p.group_b,
+                "p_value": p.p_value,
+                "estimate": p.estimate,
+            }
+            for p in test.pairwise
+        ]
+        assert [p["group_a"] for p in pinned["pairwise"]] == ["vehicle", "vehicle"]
+    assert (applied["test"], every["test"]) == ("dunnett", "welch_t_holm")
+    json.dumps(results_statistics(res), allow_nan=False)
+
+
+def test_the_record_says_how_a_mann_whitney_p_was_computed():
+    res = compute_results(_baseline_like_batch(), statistics={"family": "rank"})
+    [chart] = results_statistics(res)["charts"]
+    assert (chart["test"], chart["method"]) == ("mann_whitney", "exact")
+
+
+def _baseline_like_batch():
+    """The sample project with a β-catenin box in lane 3 and lane 4 included:
+    vehicle and 10 µM, two replicates each."""
+
+    def change(draft: Project) -> None:
+        draft.batch.lanes[3].included = True
+        beta = draft.batch.find_protein("prot-7")
+        extra = beta.bands[0].model_copy(update={"id": draft.new_id("band"), "lane_index": 2})
+        extra.box = extra.box.model_copy(update={"x": 98})
+        beta.bands.append(extra)
+
+    return apply_change(make_project(), change)[0].batch
+
+
+def test_the_record_statistics_have_the_setting_even_without_charts():
+    res = compute_results(make_project().batch, statistics=StatisticsSetting(family="none"))
+    pinned = results_statistics(res)
+    assert pinned["setting"]["family"] == "none"
+    assert all(chart["test"] is None for chart in pinned["charts"])
+    assert pinned["charts"][0]["note"] == "no test: statistics are turned off"

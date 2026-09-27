@@ -9,13 +9,20 @@ as JSON. A translation only; every number comes from the compute step.
   ``[{condition, values}]``, ``undetected`` as ``[{condition, lanes}]``, in lane
   order), since a JS object puts keys that look like numbers ("5", "10") first,
   in numeric order. ``averaged`` becomes ``[{condition, sample}]``.
-* Each chart comparison carries its ``stars``.
+* Each chart comparison carries its ``stars``. Each chart carries its
+  ``statement`` (the legend text the page shows under the image, the same the
+  export's README gives), its ``coverage`` (which conditions its test covers,
+  and why the others are not tested) and its ``test`` (null with no test); a
+  condition with no bar has a null ``mean`` and ``error``.
 * The result sets become a ``sets`` list: ``applied`` (the lane table's
   include flags), then ``all_lanes`` when excluded lanes hold values
   (:attr:`~proteia.core.results.Results.all_lanes`). Each set has its ``label``,
   ``excluded_lanes`` (0-based), ``tier``, ``notices`` and ``series``. The
   ``all_lanes`` set's notices are only those the applied set does not already
-  carry, as in the core results; what applies to it is both lists. The lanes,
+  carry, as in the core results, but for the notices of its own charts' tests
+  (:data:`~proteia.core.results.TEST_NOTICE_CODES`), which each set keeps;
+  what applies to it is both lists, less the applied set's test notices and
+  its notice of excluded reference lanes. The lanes,
   the proteins' per-lane columns and the settings are the same in both sets and
   appear once, with the lane table's own include flags. Element i of every
   per-lane list belongs to ``lanes[i]``, excluded lanes included.
@@ -54,6 +61,7 @@ def results_payload(
             "error_type": data["error_type"],
             "plot_conditions": data["plot_conditions"],
             "method": data["method"],
+            "statistics": data["statistics"],
         },
         "reference_condition": data["reference_condition"],
         "lanes": data["lanes"],

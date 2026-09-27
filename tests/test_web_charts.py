@@ -10,7 +10,7 @@ import threading
 
 import pytest
 
-from proteia.core.analyze import compare, describe
+from proteia.core.analyze import StatisticsSetting, compare, describe
 from proteia.core.model import UnknownIdError
 from proteia.core.plotspec import PlotSpec, ValueKind, build_plotspec
 from proteia.viz import render_svg
@@ -20,8 +20,9 @@ GROUPS = {"vehicle": [1.0, 1.1, 0.9], "10 µM": [2.0, 2.1, 1.9]}  # 10 micro-mol
 
 
 def spec(title: str = "β-catenin / α-tubulin") -> PlotSpec:
+    test = compare(GROUPS, StatisticsSetting(), ratio=True, reference="vehicle")
     return build_plotspec(
-        GROUPS, describe(GROUPS), compare(GROUPS), value_kind=ValueKind.FOLD_CHANGE, title=title
+        GROUPS, describe(GROUPS), test, value_kind=ValueKind.FOLD_CHANGE, title=title
     )
 
 
@@ -46,14 +47,23 @@ def key_of(url: str) -> str:
 
 def test_the_key_is_a_hash_of_the_spec():
     chart = spec()
-    # v4: every chart states its error bars (#53).
-    expected = hashlib.sha256(b"render-v4\n" + chart.model_dump_json().encode()).hexdigest()
+    # v5: the statistics as legend text, a key of the marks, the n.d. row, the
+    # axis titles; and the style the chart is drawn in.
+    drawing = b"render-v5\nbar\n" + chart.model_dump_json().encode()
+    expected = hashlib.sha256(drawing).hexdigest()
     assert charts.chart_key(chart) == expected[:32]
     assert charts.chart_url(chart) == f"/api/charts/{expected[:32]}.svg"
     assert charts.chart_key(spec()) == charts.chart_key(chart)  # an equal spec, the same key
     assert charts.chart_key(chart.model_copy(update={"subtitle": "All lanes"})) != (
         charts.chart_key(chart)
     )
+
+
+def test_the_key_differs_by_style():
+    # A drawing in another style is another drawing: it never takes this one's key.
+    chart = spec()
+    assert charts.chart_key(chart, style="bar") == charts.chart_key(chart)
+    assert charts.chart_key(chart, style="log-points") != charts.chart_key(chart)
 
 
 def test_a_chart_is_drawn_when_first_fetched_and_then_kept(drawn):
