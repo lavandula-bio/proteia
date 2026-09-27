@@ -186,10 +186,12 @@ def has_colour(session: ProjectSession, image: ImageRef) -> bool:
     * a palette TIFF's colour map that is not gray: its pixels read as the
       indices (the gray levels, as an ImageJ lookup table colours them).
 
-    A file whose channels are not red, green and blue (CMYK, CIELAB) is not
-    offered: Proteia does not convert them, so its colours would be shown
-    wrong. Equal channels are gray, and so is gray with alpha. The stored
-    file's header is read for a TIFF, or a file with the warning
+    A CMYK file is read converted to red, green and blue, which its gray is
+    the mean of, so it is offered on the same terms, in those colours
+    (approximate, as its ``cmyk_converted`` warning says); files in other
+    colour spaces (CIELAB, YCbCr) are refused on import. Equal channels are
+    gray, and so is gray with alpha. The stored file's header is read for a
+    TIFF, or a file with the warning
     (:meth:`~proteia.core.session.ProjectSession.file_colours`, once each)."""
     differ = any(warning.code == "color_channels_differ" for warning in image.import_warnings)
     if not differ and not image.file.endswith(TIFF_SUFFIXES):

@@ -2389,7 +2389,8 @@ def compute_view(
     statistics: StatisticsSetting | Mapping[str, str] | None = None,
 ) -> ComputedView:
     """The committed project with every result of it
-    (:func:`~proteia.core.results.compute_results`).
+    (:func:`~proteia.core.results.compute_results`), which warn about nets
+    measured on a reading no longer made (:func:`_outdated_readings`).
 
     Reads ``session.project`` once, so a change committed meanwhile is in neither
     half of the view: no lock, no pixels, no autosave. ``error_type``,
@@ -2407,8 +2408,34 @@ def compute_view(
         error_type=error_type,
         method=method,
         statistics=setting,
+        outdated=_outdated_readings(session, project),
     )
     return ComputedView(project, computed)
+
+
+def _outdated_readings(session: ProjectSession, project: Project) -> dict[str, str]:
+    """Why each image holding bands was measured on a reading of its stored file
+    that this version no longer makes, by image id
+    (:meth:`~proteia.core.session.ProjectSession.outdated_reading`, from the
+    header, once per image)."""
+    measured = {protein.image_id for protein in project.batch.proteins if protein.bands}
+    return {
+        image.id: why
+        for image in project.batch.iter_images()
+        if image.id in measured and (why := session.outdated_reading(image)) is not None
+    }
+
+
+def _refuse_outdated_nets(session: ProjectSession, project: Project) -> None:
+    """Refuse an export of nets measured on a reading no longer made
+    (``UNREADABLE_IMAGE``, with those images; :func:`_outdated_readings`): an
+    export never carries numbers the results warn are not this reading's. The
+    message is each image's why, which says what to do."""
+    outdated = _outdated_readings(session, project)
+    if outdated:
+        raise OperationError(
+            ErrorCode.UNREADABLE_IMAGE, "; and ".join(outdated.values()), ids=tuple(outdated)
+        )
 
 
 def compute(
@@ -2441,7 +2468,9 @@ def export_lane_table(session: ProjectSession) -> Path:
     (:func:`~proteia.core.export.lane_columns`; this table has no series
     columns to give way to). An image file that is missing or changed
     since import is refused (``IMAGE_FILE_CHANGED``, with those images): a record
-    never vouches for pixels that are no longer on disk. Both files are built
+    never vouches for pixels that are no longer on disk; so are nets measured on
+    a reading this version no longer makes (``UNREADABLE_IMAGE``:
+    :func:`_refuse_outdated_nets`). Both files are built
     before either is written, and each is replaced atomically, the table first;
     ``OSError`` propagates (with Excel holding the table, both old files stay; a
     first export whose record fails removes its table).
@@ -2459,6 +2488,7 @@ def export_lane_table(session: ProjectSession) -> Path:
             " restore them before exporting",
             ids=bad,
         )
+    _refuse_outdated_nets(session, project)
     conditions, samples, included = spine_axes(batch.lanes)
     nets, clipped = results.lane_nets(batch), results.lane_clipped(batch)
     names = export.lane_columns([(p.id, p.name) for p in batch.proteins]).proteins
@@ -2561,8 +2591,9 @@ def export_bundle(
     :func:`compute_view`'s, so the export shows what the screen does.
 
     Refused as :func:`export_lane_table` is, before anything is written: no
-    lanes (``NO_LANES``), or an image file missing or changed since import
-    (``IMAGE_FILE_CHANGED``); an unknown chart format, error type or method
+    lanes (``NO_LANES``), an image file missing or changed since import
+    (``IMAGE_FILE_CHANGED``), or nets measured on a reading this version no
+    longer makes (``UNREADABLE_IMAGE``); an unknown chart format, error type or method
     or statistics setting (``INVALID_INPUT``); and a project folder whose path
     leaves the file names less than :data:`~proteia.core.export.MIN_NAME_ROOM` characters
     (``PATH_TOO_LONG``: Windows takes no path over 259 characters while long
@@ -2587,6 +2618,7 @@ def export_bundle(
             " restore them before exporting",
             ids=bad,
         )
+    _refuse_outdated_nets(session, project)
     moment = session.clock()  # one moment: the folder's name and the record's time
     exported_at = format_timestamp(moment)
     exports = session.folder / storage.EXPORTS_DIR

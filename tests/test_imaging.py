@@ -2,17 +2,25 @@
 """Tests for reading image files and rendering previews; files are generated here."""
 
 import hashlib
+import itertools
+import os
+import re
+import struct
+from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pytest
 import tifffile
-from PIL import Image
+from PIL import Image, ImageCms
 from skimage import io
 
 from proteia.core.imaging import (
+    UnsupportedColourSpaceError,
     _Declared,
     _read_tiff_with_pillow,
     clipping_depth,
+    converts_cmyk,
     display_rgb,
     file_colours,
     from_pixels,
@@ -225,16 +233,20 @@ def test_every_warning_that_turns_the_clipping_check_off_says_so(tmp_path):
     # (clipping_depth), and each warning tells the user so.
     rgb = np.zeros((4, 5, 3), dtype=np.uint8)
     rgb[..., 0] = 200
+    cmyk = tmp_path / "gray in CMYK.tif"
+    Image.fromarray(_gray(np.uint8, 255)).convert("CMYK").save(cmyk)
     loaded = [
         from_pixels(_gray(np.uint8, 255), lossy=True),
         from_pixels(rgb),
         from_pixels(np.full((4, 6), 20.0)),
+        load_image(cmyk),
     ]
     warnings = [warning for image in loaded for warning in image.warnings]
     assert [w.code for w in warnings] == [
         "lossy_format",
         "color_channels_differ",
         "unknown_bit_depth",
+        "cmyk_converted",
     ]
     for image in loaded:
         assert clipping_depth(image.bit_depth, image.warnings) is None
@@ -401,9 +413,11 @@ def _palette_png() -> Image.Image:
         ("palette.png", _palette_png(), {}, "rgb"),
         ("gray.png", _gray(np.uint8, 255), {}, None),
         ("rgb.jpg", _rgb8(), {"quality": 95}, "rgb"),
-        # CMYK is not converted, so its colours cannot be shown as the file's own.
-        ("cmyk.jpg", Image.fromarray(_rgb8()).convert("CMYK"), {"quality": 95}, None),
-        ("cmyk.tif", Image.fromarray(_rgb8()).convert("CMYK"), {}, None),
+        # CMYK is read converted to red, green and blue (#131).
+        ("cmyk.jpg", Image.fromarray(_rgb8()).convert("CMYK"), {"quality": 95}, "rgb"),
+        ("cmyk.tif", Image.fromarray(_rgb8()).convert("CMYK"), {}, "rgb"),
+        # CIELAB is refused on import: it has no colours to show.
+        ("lab.tif", _rgb8(), {"photometric": "cielab"}, None),
     ],
 )
 def test_file_colours_say_from_the_header_how_a_file_holds_colour(
@@ -435,7 +449,454 @@ def test_read_colours_looks_a_palette_tiff_up_in_its_colour_map(tmp_path):
     np.testing.assert_array_equal(shown[..., 0], indices)  # the high byte of level * 257
     np.testing.assert_array_equal(shown[..., 1], indices // 2)
     np.testing.assert_array_equal(shown[..., 2], (255 - indices) // 4)
-    # Anything else reads as it is stored.
+    # Anything else reads as read_pixels reads it: CMYK converted.
+    cmyk = _write(tmp_path / "cmyk.jpg", Image.fromarray(_rgb8()).convert("CMYK"), quality=95)
+    np.testing.assert_array_equal(read_colours(cmyk), read_pixels(cmyk))
+    assert read_colours(cmyk).shape == (6, 8, 3)
     for name, pixels in (("rgb.tif", _rgb8()), ("gray.png", _gray(np.uint8, 255))):
         other = _write(tmp_path / name, pixels)
         np.testing.assert_array_equal(read_colours(other), pixels)
+
+
+# --- CMYK and colour spaces other than gray and RGB (#131) ---
+
+# A CMYK press profile Windows ships; other systems may have none.
+RSWOP = Path(os.environ.get("SystemRoot", "C:/Windows"), "System32/spool/drivers/color/RSWOP.icm")
+SRGB = ImageCms.createProfile("sRGB")
+
+
+def _blot_rgb() -> np.ndarray:
+    """The blot of #131: a light membrane (RGB 230) with a dark band (RGB 40),
+    and a first row of colours, so that the channels differ."""
+    rgb = np.full((6, 8, 3), 230, dtype=np.uint8)
+    rgb[2:5, 2:6] = 40
+    rgb[0] = _rgb8()[3]
+    return rgb
+
+
+def _inks(rgb: np.ndarray) -> np.ndarray:
+    """CMYK inks that the standard formula reads back as ``rgb`` exactly (8- or
+    16-bit): no black ink, and C = top - R and so on, as Pillow converts RGB."""
+    top = np.iinfo(rgb.dtype).max
+    return np.dstack([top - rgb, np.zeros(rgb.shape[:2], dtype=rgb.dtype)])
+
+
+def _s15(value: float) -> bytes:
+    return struct.pack(">i", round(value * 65536))
+
+
+def _cmyk_profile() -> bytes:
+    """A minimal ICC v2 profile for CMYK input, built here since Pillow builds
+    none: CMYK to CIELAB through a 2-point table, gray only, L* falling with the
+    inks (black the most). No library or file ships one on every system."""
+    table = []
+    for c, m, y, k in itertools.product((0, 1), repeat=4):  # the first ink varies slowest
+        lightness = (1 - k) * (1 - 0.25 * (c + m + y))
+        table += [round(lightness * 0xFF00), 0x8000, 0x8000]  # v2 16-bit L*, a* = b* = 0
+    identity = b"".join(_s15(v) for v in (1, 0, 0, 0, 1, 0, 0, 0, 1))
+    a2b0 = b"".join(
+        [
+            b"mft2",
+            bytes(4),
+            bytes([4, 3, 2, 0]),  # 4 inks in, 3 out, 2 grid points
+            identity,
+            struct.pack(">HH", 2, 2),
+            struct.pack(">8H", *[0, 0xFFFF] * 4),
+            struct.pack(f">{len(table)}H", *table),
+            struct.pack(">6H", *[0, 0xFFFF] * 3),
+        ]
+    )
+    name = b"CMYK test\x00"
+    desc = b"desc" + bytes(4) + struct.pack(">I", len(name)) + name + bytes(78)
+    d50 = _s15(0.9642) + _s15(1.0) + _s15(0.8249)
+    tags = [(b"desc", desc), (b"wtpt", b"XYZ " + bytes(4) + d50), (b"A2B0", a2b0)]
+    start = 128 + 4 + 12 * len(tags)
+    directory, data = struct.pack(">I", len(tags)), b""
+    for signature, body in tags:
+        body += bytes(-len(body) % 4)
+        directory += signature + struct.pack(">II", start + len(data), len(body))
+        data += body
+    header = b"".join(
+        [
+            struct.pack(">I", start + len(data)),
+            bytes(4),
+            struct.pack(">I", 0x02100000),
+            b"scnrCMYKLab ",
+            bytes(12),
+            b"acsp",
+            bytes(28),
+            d50,
+            bytes(48),
+        ]
+    )
+    return header + directory + data
+
+
+def _through(image: Image.Image, profile: bytes) -> np.ndarray:
+    """``image``'s CMYK in sRGB through ``profile``, as a colour-managed reader converts it."""
+    return np.asarray(
+        ImageCms.profileToProfile(
+            image,
+            ImageCms.ImageCmsProfile(BytesIO(profile)),
+            SRGB,
+            renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+            outputMode="RGB",
+            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+        )
+    )
+
+
+def _write_cmyk(path: Path, rgb: np.ndarray, writer: str, **options) -> Path:
+    if writer == "pillow":
+        Image.fromarray(rgb).convert("CMYK").save(path, **options)
+    elif writer == "tifffile":
+        tifffile.imwrite(path, _inks(rgb), photometric="separated", **options)
+    else:  # planar: the inks stored one plane after another
+        planes = np.moveaxis(_inks(rgb), -1, 0)
+        tifffile.imwrite(path, planes, photometric="separated", planarconfig="separate")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("writer", "options"),
+    [
+        ("pillow", {}),
+        ("pillow", {"compression": "tiff_lzw"}),  # decoded by Pillow, not tifffile
+        ("tifffile", {}),
+        ("planar", {}),
+    ],
+    ids=["pillow", "pillow-lzw", "tifffile", "planar"],
+)
+def test_a_cmyk_tiff_is_converted_to_red_green_and_blue_then_gray(tmp_path, writer, options):
+    # Read as if C, M and Y were R, G and B, the membrane was 25 and the band 215.
+    rgb = _blot_rgb()
+    path = _write_cmyk(tmp_path / "cmyk µ.tif", rgb, writer, **options)
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, rgb)  # exact: no black ink, no profile
+    np.testing.assert_array_equal(loaded.array, rgb.mean(axis=-1))
+    assert (loaded.array[5, 0], loaded.array[3, 3]) == (230, 40)
+    assert loaded.bit_depth == 8
+    assert _codes(loaded) == ["cmyk_converted", "color_channels_differ"]
+    converted, differ = loaded.warnings
+    assert converted.message == (
+        "The file's colours are CMYK: they were converted to red, green and blue with"
+        " the standard formula, as it embeds no ICC colour profile, then to gray. Values"
+        " from a converted file are approximate, so over-exposure cannot be checked."
+    )
+    assert differ.message == (
+        "The red, green and blue channels converted from the file's CMYK differ; they"
+        " were averaged into one gray channel, so over-exposure cannot be checked."
+    )
+    assert clipping_depth(loaded.bit_depth, loaded.warnings) is None
+    np.testing.assert_array_equal(read_pixels(path), rgb)
+    np.testing.assert_array_equal(read_colours(path), rgb)  # its colours, converted
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_the_black_ink_of_a_cmyk_tiff_is_not_dropped(tmp_path, dtype):
+    # Gray printed with black ink alone: C, M and Y are 0 everywhere, so the
+    # mean of the first three channels read the whole image as 0.
+    top = np.iinfo(dtype).max
+    gray = _gray(dtype, top)
+    inks = np.zeros((*gray.shape, 4), dtype=dtype)
+    inks[..., 3] = top - gray
+    path = tmp_path / "black ink.tif"
+    tifffile.imwrite(path, inks, photometric="separated")
+    loaded = load_image(path)
+    assert loaded.pixels.dtype == dtype  # 16-bit inks keep their scale
+    assert loaded.bit_depth == (16 if dtype is np.uint16 else 8)
+    np.testing.assert_array_equal(loaded.array, gray.astype(np.float64))
+    assert _codes(loaded) == ["cmyk_converted"]  # equal channels: gray
+
+
+def _formula(inks: np.ndarray) -> np.ndarray:
+    """R = (1 - C)(1 - K) and so on, on inks scaled to 1, rounded to the nearest
+    level (a product over an odd top level never falls on a half)."""
+    top = np.iinfo(inks.dtype).max
+    white = top - inks.astype(np.float64)
+    return np.floor(white[..., :3] * white[..., 3:] / top + 0.5).astype(inks.dtype)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_the_standard_formula_takes_every_ink_into_account(tmp_path, dtype):
+    # Every cyan and black ink level on 8 bits (magenta and yellow vary too),
+    # and the same inks on 16 bits; at 8 bits, what Pillow's CMYK to RGB gives.
+    level = np.arange(256, dtype=np.uint8)
+    cyan, black = np.meshgrid(level, level)
+    inks = np.dstack([cyan, black[::-1], cyan + black, black]).astype(np.uint8)
+    if dtype is np.uint16:
+        inks = inks.astype(np.uint16) * 257
+    path = tmp_path / "every level.tif"
+    tifffile.imwrite(path, inks, photometric="separated")
+    np.testing.assert_array_equal(read_pixels(path), _formula(inks))
+    if dtype is np.uint8:
+        pillow = Image.frombytes("CMYK", (256, 256), inks.tobytes()).convert("RGB")
+        np.testing.assert_array_equal(read_pixels(path), np.asarray(pillow))
+
+
+def test_a_cmyk_jpeg_is_converted_after_its_adobe_inversion(tmp_path):
+    # Pillow writes a CMYK JPEG as Adobe software does, with the inks inverted
+    # and an Adobe marker saying so, and reads the inks back the right way up.
+    rgb = _blot_rgb()
+    path = tmp_path / "cmyk β.jpg"
+    Image.fromarray(rgb).convert("CMYK").save(path, quality=95)
+    with Image.open(path) as stored:
+        assert (stored.mode, "adobe" in stored.info) == ("CMYK", True)
+    loaded = load_image(path)
+    assert _codes(loaded) == ["lossy_format", "cmyk_converted", "color_channels_differ"]
+    assert np.abs(loaded.array - rgb.mean(axis=-1)).max() <= 3  # JPEG's own error at quality 95
+    assert loaded.array[5, 0] > 225 and loaded.array[3, 3] < 45
+    np.testing.assert_array_equal(read_colours(path), loaded.pixels)
+    assert "standard formula" in loaded.warnings[1].message
+
+
+@pytest.mark.parametrize(
+    ("name", "save"),
+    [
+        ("pillow.tif", lambda path, inks, profile: inks.save(path, icc_profile=profile)),
+        (
+            "tifffile.tif",
+            lambda path, inks, profile: tifffile.imwrite(
+                path, np.asarray(inks), photometric="separated", iccprofile=profile
+            ),
+        ),
+        ("β.jpg", lambda path, inks, profile: inks.save(path, quality=95, icc_profile=profile)),
+    ],
+    ids=["tiff-pillow", "tiff-tifffile", "jpeg"],
+)
+def test_a_cmyk_file_is_converted_through_the_profile_it_embeds(tmp_path, name, save):
+    profile = _cmyk_profile()
+    path = tmp_path / name
+    save(path, Image.fromarray(_blot_rgb()).convert("CMYK"), profile)
+    with Image.open(path) as stored:  # the inks as decoded, JPEG's error included
+        expected, formula = _through(stored, profile), np.asarray(stored.convert("RGB"))
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, expected)
+    assert np.abs(expected.astype(int) - formula).max() > 20  # the profile, not the formula
+    (converted,) = [w for w in loaded.warnings if w.code == "cmyk_converted"]
+    assert "converted to red, green and blue through the ICC colour profile it embeds" in (
+        converted.message
+    )
+    assert clipping_depth(loaded.bit_depth, loaded.warnings) is None
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [ImageCms.ImageCmsProfile(SRGB).tobytes(), b"not a profile"],
+    ids=["rgb-profile", "damaged-profile"],
+)
+def test_a_profile_that_cannot_convert_cmyk_leaves_the_standard_formula(tmp_path, profile):
+    rgb = _blot_rgb()
+    path = _write_cmyk(tmp_path / "profile.tif", rgb, "tifffile", iccprofile=profile)
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, rgb)
+    assert (
+        "with the standard formula, as the ICC colour profile it embeds could not be used,"
+        in loaded.warnings[0].message
+    )
+
+
+def test_a_16_bit_cmyk_tiff_is_not_converted_through_its_profile(tmp_path):
+    # Pillow's colour management takes 8-bit CMYK only: 16-bit inks keep their
+    # scale through the standard formula instead.
+    rgb = _blot_rgb().astype(np.uint16) * 257
+    path = tmp_path / "16-bit.tif"
+    tifffile.imwrite(path, _inks(rgb), photometric="separated", iccprofile=_cmyk_profile())
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, rgb)
+    assert loaded.bit_depth == 16
+    assert (
+        "with the standard formula, as its ICC colour profile is applied to 8-bit CMYK only,"
+        in loaded.warnings[0].message
+    )
+
+
+def test_an_rgb_file_with_a_profile_is_read_as_stored(tmp_path):
+    # Only CMYK is converted: RGB keeps its values, whatever profile it embeds.
+    rgb = _rgb8()
+    path = tmp_path / "rgb with profile.tif"
+    srgb = ImageCms.ImageCmsProfile(SRGB).tobytes()
+    tifffile.imwrite(path, rgb, photometric="rgb", iccprofile=srgb)
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, rgb)
+    assert _codes(loaded) == ["color_channels_differ"]
+    assert loaded.warnings[0].message.startswith("The red, green and blue channels differ;")
+
+
+@pytest.mark.skipif(not RSWOP.is_file(), reason="no CMYK press profile on this system")
+@pytest.mark.parametrize(
+    ("intent", "flags", "within"),
+    [
+        (ImageCms.Intent.RELATIVE_COLORIMETRIC, ImageCms.Flags.BLACKPOINTCOMPENSATION, 15),
+        (ImageCms.Intent.RELATIVE_COLORIMETRIC, ImageCms.Flags.NONE, 12),
+        (ImageCms.Intent.PERCEPTUAL, ImageCms.Flags.NONE, 27),
+    ],
+    ids=["relative-bpc", "relative", "perceptual"],
+)
+def test_cmyk_made_through_a_press_profile_reads_close_to_its_rgb_original(
+    tmp_path, intent, flags, within
+):
+    # A gray ramp converted to SWOP press CMYK and back: the press's paper white
+    # and ink black bound what the file can hold, so the darkest grays come back
+    # lighter. How close the rest comes depends on the intent the file was made
+    # with, which it does not say. Made as it is read back (relative colorimetric
+    # with black point compensation), from 40 to 230 the gray levels stay within
+    # 15 of the original, on a line of slope 1; made with the perceptual intent,
+    # Pillow's default, only within 27. The standard formula strays further.
+    ramp = np.arange(256, dtype=np.uint8)
+    rgb = np.stack([np.tile(ramp, (4, 1))] * 3, axis=-1)
+    press = ImageCms.getOpenProfile(str(RSWOP))
+    inks = ImageCms.profileToProfile(
+        Image.fromarray(rgb),
+        SRGB,
+        press,
+        renderingIntent=intent,
+        outputMode="CMYK",
+        flags=flags,
+    )
+    path = tmp_path / "swop.tif"
+    inks.save(path, icc_profile=press.tobytes())
+    gray = load_image(path).array[0]
+    formula = np.asarray(inks.convert("RGB")).mean(axis=-1)[0]
+    mid = slice(40, 231)
+    assert np.abs(gray[mid] - ramp[mid]).max() <= within
+    assert np.abs(gray[mid] - ramp[mid]).max() < np.abs(formula[mid] - ramp[mid]).max()
+    if flags == ImageCms.Flags.BLACKPOINTCOMPENSATION:
+        assert abs(np.polyfit(ramp[mid], gray[mid], 1)[0] - 1) <= 0.02
+
+
+def test_cmyk_with_an_alpha_channel_drops_the_alpha(tmp_path):
+    rgb = _blot_rgb()
+    alpha = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+    path = tmp_path / "cmyk alpha.tif"
+    inks = np.dstack([_inks(rgb), alpha])
+    tifffile.imwrite(path, inks, photometric="separated", extrasamples=[2])
+    np.testing.assert_array_equal(read_pixels(path), rgb)
+
+
+@pytest.mark.parametrize(
+    ("pixels", "options", "words"),
+    [
+        (_inks(_rgb8()), {"extratags": [(332, 3, 1, 2, True)]}, "inks that are not CMYK"),
+        (
+            np.dstack([_inks(_rgb8()), _gray(np.uint8, 255)]),
+            {"extratags": [(334, 3, 1, 5, True)]},
+            "5 inks",
+        ),
+        (_inks(_rgb8()).astype(np.float32) / 255, {}, "float32 inks"),
+    ],
+    ids=["not-cmyk-inks", "five-inks", "float"],
+)
+def test_a_separated_tiff_that_is_not_8_or_16_bit_cmyk_is_refused(tmp_path, pixels, options, words):
+    path = tmp_path / "separated.tif"
+    tifffile.imwrite(path, pixels, photometric="separated", **options)
+    for read in (load_image, read_pixels, read_colours):
+        with pytest.raises(ValueError, match=re.escape(words)) as info:
+            read(path)
+        assert str(info.value).startswith("separated.tif:")
+
+
+@pytest.mark.parametrize(
+    ("photometric", "pixels", "words"),
+    [
+        ("cielab", _rgb8(), "in the CIELAB colour space"),
+        ("icclab", _rgb8(), "in the ICC L*a*b* colour space"),
+        ("itulab", _rgb8(), "in the ITU L*a*b* colour space"),
+        ("ycbcr", _rgb8(), "in the YCbCr colour space"),
+        # A camera's raw mosaic is no gray image either.
+        ("cfa", _gray(np.uint16, 65535), "with photometric interpretation CFA"),
+    ],
+)
+def test_a_tiff_in_another_colour_space_is_refused_by_name(tmp_path, photometric, pixels, words):
+    # Read as they are stored, their channels would be taken for red, green and blue.
+    path = tmp_path / f"{photometric} α.tif"
+    options = {"subsampling": (1, 1)} if photometric == "ycbcr" else {}
+    tifffile.imwrite(path, pixels, photometric=photometric, **options)
+    for read in (load_image, read_pixels, read_colours):
+        with pytest.raises(ValueError, match=re.escape(words)) as info:
+            read(path)
+        assert str(info.value).startswith(f"{photometric} α.tif:")
+
+
+def test_a_cielab_tiff_saved_by_pillow_is_refused(tmp_path):
+    path = tmp_path / "lab.tif"
+    Image.fromarray(_rgb8()).convert("LAB").save(path)
+    with pytest.raises(ValueError, match="CIELAB"):
+        load_image(path)
+
+
+@pytest.mark.parametrize(
+    ("name", "write", "converts"),
+    [
+        ("gray.tif", lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535)), False),
+        ("rgb.tif", lambda path: tifffile.imwrite(path, _rgb8(), photometric="rgb"), False),
+        ("rgb.jpg", lambda path: Image.fromarray(_rgb8()).save(path, quality=95), False),
+        ("rgb.png", lambda path: Image.fromarray(_rgb8()).save(path), False),
+        ("cmyk µ.tif", lambda path: _write_cmyk(path, _blot_rgb(), "pillow"), True),
+        (
+            "lzw.tif",
+            lambda path: _write_cmyk(path, _blot_rgb(), "pillow", compression="tiff_lzw"),
+            True,
+        ),
+        ("planar.tif", lambda path: _write_cmyk(path, _blot_rgb(), "planar"), True),
+        ("cmyk.jpg", lambda path: _write_cmyk(path, _blot_rgb(), "pillow", quality=95), True),
+    ],
+)
+def test_the_header_tells_whether_reading_converts_cmyk(tmp_path, name, write, converts):
+    # For an image imported before CMYK was converted (#131): whether reading its
+    # file now converts CMYK, from the header alone, as reading it does.
+    path = tmp_path / name
+    write(path)
+    assert converts_cmyk(path) is converts
+    assert ("cmyk_converted" in _codes(load_image(path))) is converts
+
+
+@pytest.mark.parametrize(
+    ("photometric", "pixels", "problem"),
+    [
+        (
+            "cielab",
+            _rgb8(),
+            "its pixels are stored in the CIELAB colour space, which Proteia does not"
+            " convert to gray",
+        ),
+        (
+            "separated",
+            _inks(_rgb8()).astype(np.float32) / 255,
+            "this separated TIFF has float32 inks, and only CMYK with 8- or 16-bit inks"
+            " can be converted to gray",
+        ),
+    ],
+    ids=["cielab", "float-inks"],
+)
+def test_the_header_refuses_a_colour_space_as_reading_does(tmp_path, photometric, pixels, problem):
+    # The refusal says what the file holds on its own (problem), for a message
+    # that names the file otherwise.
+    path = tmp_path / "refused α.tif"
+    tifffile.imwrite(path, pixels, photometric=photometric)
+    refusals = []
+    for read in (converts_cmyk, load_image, read_colours):
+        with pytest.raises(UnsupportedColourSpaceError) as info:
+            read(path)
+        refusals.append((info.value.problem, str(info.value)))
+    assert (
+        refusals
+        == [(problem, f"refused α.tif: {problem}; save the image as a gray or RGB TIFF")] * 3
+    )
+
+
+@pytest.mark.parametrize("name", ["damaged.tif", "damaged.png"])
+def test_the_header_of_a_damaged_file_is_no_colour_space_refusal(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(b"not an image")
+    with pytest.raises((ValueError, OSError)) as info:
+        converts_cmyk(path)
+    assert not isinstance(info.value, UnsupportedColourSpaceError)
+
+
+def test_a_jpeg_compressed_cmyk_tiff_is_lossy_and_converted(tmp_path):
+    rgb = _blot_rgb()
+    path = _write_cmyk(tmp_path / "jpeg cmyk.tif", rgb, "pillow", compression="jpeg", quality=95)
+    loaded = load_image(path)
+    assert _codes(loaded) == ["lossy_format", "cmyk_converted", "color_channels_differ"]
+    assert np.abs(loaded.array - rgb.mean(axis=-1)).max() <= 3
