@@ -513,6 +513,7 @@ function render() {
   laneTable.render(project, state.results);
   charts.render(state.results);
   dock.render(state.results);
+  renderRequantify(project);
 }
 
 function renderImages(project, image) {
@@ -1214,6 +1215,134 @@ $("import-polarity").addEventListener("change", (event) => {
   $("import-button").classList.toggle("disabled", !event.target.value);
 });
 
+// --- Requantifying with the local background ---
+
+// The background method of a project quantified before the local background:
+// each net above its image's median. It stays until the project is requantified.
+const LEGACY_BACKGROUND = "global_median";
+
+let requantifying = false; // a press has no answer yet
+
+// Whether any protein has a box on an image.
+function hasBoxes(project) {
+  return project.proteins.some((protein) => protein.bands.length);
+}
+
+// The offer in the results' header, while the nets use the legacy background
+// and there are boxes to measure again (the Checks say why); it goes once the
+// project is on the local background. In view whatever the side panel shows,
+// next to the numbers it changes.
+function renderRequantify(project) {
+  $("requantify-offer").hidden = !(
+    project.background_method === LEGACY_BACKGROUND && hasBoxes(project)
+  );
+  $("requantify").disabled = requantifying;
+}
+
+// Measure every box again against the local background, in one change the
+// status line offers to Undo. Like an undo or a clear, it runs in the panel's
+// queue once the edits made before it have their answers (a box being placed
+// is measured again too), so it never reaches a project opened after it was
+// asked for, and the edits made after it wait for it. Pressed twice (a double
+// click), it is sent once: the button stays disabled until the answer.
+function requantify() {
+  if (requantifying || !state.project || $("workspace").hidden) {
+    return;
+  }
+  requantifying = true;
+  $("requantify").disabled = true;
+  const after = Promise.allSettled([pending(), proteinPanel.adding]);
+  const asked = proteinPanel.queueEdit(
+    async (current) => {
+      const before = state.project;
+      const opened = shownOpening();
+      try {
+        const answer = await send("POST", "/api/requantify");
+        if (answer && current()) {
+          showRequantified(answer, before);
+        }
+      } catch (error) {
+        if (current() && opened === shownOpening()) {
+          reportRequantify(error);
+        }
+      }
+      return null;
+    },
+    { after },
+  );
+  const done = () => {
+    requantifying = false;
+    const button = $("requantify");
+    button.disabled = false;
+    if (!$("requantify-offer").hidden) {
+      // Still offered (refused): the keyboard stays on it.
+      if (focusLost()) {
+        button.focus();
+      }
+    } else {
+      // Gone: the keyboard is on the status line's Undo (showRequantified), or,
+      // with none (nothing was done), goes on to Undo or Redo.
+      keepFocus(button, "undo", null);
+    }
+  };
+  asked.then(done, done);
+}
+
+$("requantify").addEventListener("click", requantify);
+
+// What the requantify did, with an Undo of it that goes once the history moves
+// on. It did nothing if the project was on the local background already: the
+// revision shown did not move, or, once another tab requantified since this
+// page showed the project, no image was measured again although it has boxes
+// (a requantify measures every image with boxes). Then the last change is not
+// this one: no Undo.
+function showRequantified(answer, before) {
+  const project = answer.project;
+  const count = answer.images.length;
+  if (
+    (before.open_id === project.open_id && before.revision === project.revision) ||
+    (!count && hasBoxes(project))
+  ) {
+    showStatus("The nets already use the local background."); // nothing logged
+    return;
+  }
+  const text = count
+    ? `Requantified ${counted(count, "image", "images")} with the local background`
+    : "Switched to the local background (no boxes to requantify)";
+  const step = project.history.undo;
+  const undo =
+    step && step.action === "requantify"
+      ? {
+          label: "Undo",
+          name: "Undo requantifying with the local background",
+          seq: step.seq,
+          run: () => takeStep("undo", { seq: step.seq, back: () => $("requantify") }),
+        }
+      : null;
+  const button = showStatus(text, undo);
+  // The offer has gone: the keyboard goes on to that Undo. The hidden button
+  // may still hold the focus until the browser moves it, as Clear boxes may.
+  if (button && (focusLost() || document.activeElement === $("requantify"))) {
+    button.focus();
+  }
+}
+
+// A refusal changes nothing: the server's reason, with the images it names by
+// their file names (a missing or changed image file).
+function reportRequantify(error) {
+  if (error instanceof ApiError && error.status === 401) {
+    return;
+  }
+  const names = (error.ids || [])
+    .map((id) => state.project.images.find((image) => image.id === id))
+    .filter(Boolean)
+    .map((image) => isolate(image.original_name));
+  const which = names.length ? ` (${inWords(names)})` : "";
+  showStatus(
+    `Not requantified: ${sentence(`${error.message}${which}`)} The nets are as they were.`,
+  );
+}
+
 // --- Undo and redo ---
 
 // Each change the server logs, in the words of the control that makes it.
@@ -1235,6 +1364,7 @@ const ACTION_WORDS = {
   clear_boxes: "clear boxes",
   detect_row_boxes: "detect row boxes",
   remove_undetected: "remove n.d. mark",
+  requantify: "requantify with local background",
   undo: "undo",
   redo: "redo",
 };
@@ -1315,15 +1445,18 @@ function reportStep(direction, error) {
 // Undo or redo once every edit made before it has its answer (the panel's
 // queue and adds, the box and image edits in flight), so it takes back or
 // makes again the change the history names by then. `seq`: only if that change
-// is still the one logged as `seq` (the status line's Undo of a clear). It runs
-// in the panel's queue and its answer goes through send(), so it never reaches
-// or shows a project opened after it was asked for (see openProject); the
-// edits made after it wait for it (ordered, and the queue).
-function takeStep(direction, { seq = null } = {}) {
+// is still the one logged as `seq` (the status line's Undo of a clear); `back`
+// then gives the control that made it (Clear boxes by default), where the
+// keyboard goes once that Undo has gone. It runs in the panel's queue and its
+// answer goes through send(), so it never reaches or shows a project opened
+// after it was asked for (see openProject); the edits made after it wait for
+// it (ordered, and the queue).
+function takeStep(direction, { seq = null, back = () => $("clear-boxes") } = {}) {
   if (!state.project || $("workspace").hidden) {
     return;
   }
   const had = document.activeElement;
+  const from = seq !== null ? back : null; // taken from the status line
   const offered = state.project.history[direction]; // what the page showed when asked
   const after = Promise.allSettled([pending(), proteinPanel.adding]);
   proteinPanel.queueEdit(
@@ -1333,7 +1466,7 @@ function takeStep(direction, { seq = null } = {}) {
         showStatus(
           "Not undone: other changes were made since. Undo at the top takes back the last one.",
         );
-        keepFocus(had, direction, true);
+        keepFocus(had, direction, from);
         return null;
       }
       if (!step) {
@@ -1353,12 +1486,12 @@ function takeStep(direction, { seq = null } = {}) {
           return null;
         }
         showStatus(stepText(direction, answer, before));
-        keepFocus(had, direction, seq !== null);
+        keepFocus(had, direction, from);
         return answer;
       } catch (error) {
         if (current() && opened === shownOpening()) {
           reportStep(direction, error);
-          keepFocus(had, direction, seq !== null);
+          keepFocus(had, direction, from);
         }
         return null;
       }
@@ -1368,16 +1501,19 @@ function takeStep(direction, { seq = null } = {}) {
 }
 
 // The control a step was taken from (`had`, focused then) may be gone (the
-// status line's Undo) or disabled (the last Undo): if the focus was still on
-// it, the keyboard goes on to the next useful one.
-function keepFocus(had, direction, fromStatus) {
-  const gone = had && (!had.isConnected || had.disabled);
+// status line's Undo), hidden (Requantify once the project is on the local
+// background, the box panel's Delete box once its box is gone: a redo of their
+// change) or disabled (the last Undo): if the focus was still on it, the
+// keyboard goes on to the next useful one: from the status line, the control
+// whose change it took back (`from()`, if any), then Undo or Redo.
+function keepFocus(had, direction, from) {
+  const gone = had && (!had.isConnected || had.disabled || !had.getClientRects().length);
   if (!gone || !(focusLost() || document.activeElement === had)) {
     return;
   }
   const other = direction === "undo" ? "redo" : "undo";
-  const targets = [...(fromStatus ? [$("clear-boxes")] : []), $(direction), $(other)];
-  const target = targets.find((t) => !t.disabled && t.getClientRects().length);
+  const targets = [...(from ? [from()] : []), $(direction), $(other)];
+  const target = targets.find((t) => t && !t.disabled && t.getClientRects().length);
   if (target) {
     target.focus();
   }
