@@ -6,6 +6,7 @@ import pytest
 from proteia.core.analyze import reduce_samples
 from proteia.core.project import (
     align_to_lanes,
+    anchoring_lanes,
     build_spine,
     join_to_spine,
     lane_pitch,
@@ -344,3 +345,32 @@ def test_excluded_lane_drops_out_of_reduction():
     conditions, samples, included = spine_axes(spine)
     reduction = reduce_samples(nets, conditions, samples, included=included)
     assert reduction.groups == {"A": [2.0, 4.0]}  # excluded lane absent
+
+
+# --- anchoring_lanes: the kept lanes a lane's expected x comes from ---
+
+SMILE = [(50.0, 0), (530.0, 4), (800.0, 7)]
+
+
+@pytest.mark.parametrize(
+    ("lanes", "anchoring"),
+    [
+        ([2], {0, 4}),  # interpolated between kept lanes 0 and 4
+        ([4], {4}),  # a kept lane: its own anchor
+        ([9], {7}),  # past the kept lanes: stepped from the nearest
+        ([-1], {0}),
+        ([2, 5, 9], {0, 4, 7}),
+        ([], set()),
+    ],
+    ids=["between", "kept", "past-last", "before-first", "several", "none"],
+)
+def test_anchoring_lanes(lanes, anchoring):
+    assert anchoring_lanes(SMILE, lanes) == anchoring
+
+
+def test_anchoring_lanes_are_the_kept_ones_and_need_two():
+    anchors = [(30.0 + 60 * lane, lane) for lane in range(7)]
+    anchors.append((150.0, 7))  # lane 7 dragged over lane 2: not kept
+    assert anchoring_lanes(anchors, [7, 8]) == {6}
+    assert anchoring_lanes([(330.0, 0), (270.0, 1)], [3]) == {1}  # mirrored
+    assert anchoring_lanes([(100.0, 1), (104.0, 1)], [0, 2]) == set()  # one lane: no pitch

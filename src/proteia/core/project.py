@@ -159,6 +159,26 @@ def lane_positions(
     return positions
 
 
+def anchoring_lanes(anchors: Sequence[tuple[float, int]], lanes: Iterable[int]) -> set[int]:
+    """The kept lanes (:func:`propose_lane`) that :func:`lane_positions` reads
+    the expected x of each of ``lanes`` from: a kept lane's own anchor, the two
+    neighbouring kept lanes a lane lies between, or the nearest kept lane past
+    them. Empty with fewer than two kept lanes, as the positions are."""
+    points, _ = _kept(anchors)
+    if len(points) < 2:
+        return set()
+    kept = [lane for lane, _ in points]
+    found: set[int] = set()
+    for lane in lanes:
+        below = [k for k in kept if k <= lane]
+        above = [k for k in kept if k >= lane]
+        if below and above:
+            found |= {below[-1], above[0]}
+        else:
+            found.add(min(kept, key=lambda k: abs(k - lane)))
+    return found
+
+
 def lanes_run_right_to_left(anchors: Sequence[tuple[float, int]]) -> bool | None:
     """Whether the kept anchors number the lanes right to left (a mirrored
     image), as :func:`propose_lane` and :func:`lane_positions` read them; None

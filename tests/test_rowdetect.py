@@ -26,16 +26,19 @@ from skimage.morphology import reconstruction
 
 from proteia.core import rowdetect
 from proteia.core.evaluate import hit_rate, iou
-from proteia.core.grow import grow_box
+from proteia.core.grow import NOISE_K, grow_box
 from proteia.core.model import BoxSize, overlaps
 from proteia.core.quantify import estimate_background
 from proteia.core.rowdetect import (
     AMBIGUITY_MARGIN,
     BG_GUARD,
     BG_GUARD_MIN,
+    CUT_LEVEL,
     DETECT_K,
     EMPTY_WINDOW,
+    EXTENT_LEVEL,
     FIT_MAX_PIXELS,
+    MEMBRANE_SHIFT_K,
     REFUSING_FLAGS,
     SIZE_GUARD,
     SMOOTH,
@@ -236,7 +239,9 @@ def test_more_pieces_than_lanes_merge_or_drop_the_weak_one():
         ("nbr_above_miss", 1000, 2, "edge_signal"),  # only the neighbouring row's rows
         ("blotch_empty", 1000, 4, "artefact"),  # a broad stain, rejected as flat
         ("vstreak_empty", 1001, 4, "artefact"),  # a streak down the empty lane
-        ("vstreak_empty", 1000, 4, "unassigned"),  # the streak kept, but in no piece
+        # The streak peaks on an edge row of the box: signal at the box's edge,
+        # never kept (#123: its SNR leaves it out, so it is not unassigned).
+        ("vstreak_empty", 1000, 4, "edge_signal"),
     ],
 )
 def test_empty_lane_reasons(key, seed, lane, reason):
@@ -246,12 +251,92 @@ def test_empty_lane_reasons(key, seed, lane, reason):
     empty = found.lanes[lane]
     assert (empty.rect, empty.reason, empty.components) == (None, reason, 0)
     assert empty.window is not None  # measured, whatever the reason
-    if reason == "edge_signal":  # the neighbouring row's rows are left out of the slot
+    if key == "nbr_above_miss":  # the neighbouring row's rows are left out of the slot
         assert empty.window[1] > case.row[1]
-    if reason == "unassigned":
-        assert empty.snr >= DETECT_K  # signal in the lane's rows, in no piece
-    elif reason == "edge_signal":
-        assert empty.snr < DETECT_K  # the signal is only in the rows left out
+    if reason == "edge_signal":
+        assert empty.snr < DETECT_K  # the signal is only at the box's edge
+    assert not empty.cut  # a neighbouring row, a streak: no band the box cuts through
+
+
+def test_a_kept_band_in_no_assigned_piece_leaves_its_lane_unassigned():
+    # Lane 2 spreads to 1.4 pitches over empty lane 3: the piece is lane 2's,
+    # and the kept signal it spills into lane 3 reaches the detection level.
+    found = _detected("wide_next_empty/1000")
+    empty = found.lanes[3]
+    assert (empty.rect, empty.reason) == (None, "unassigned")
+    assert empty.snr >= DETECT_K  # a kept candidate in the lane's rows, in no piece
+
+
+def darkness(case: RowCase, window) -> float:
+    """The strongest box-smoothed darkening of the case's membrane in
+    ``window``, as the detector smooths its signal."""
+    x0, y0, x1, y1 = window
+    smoothed = uniform_filter(case.image, size=SMOOTH, mode="nearest")
+    return float((MEMBRANE - smoothed[y0:y1, x0:x1]).max())
+
+
+@pytest.mark.parametrize(
+    "speck",
+    [
+        # 3x3 px: gone under the running median along x.
+        pytest.param(blob(5, 1.2, 30000), id="under-the-running-median"),
+        # 5x7 px: taller, it outlasts the running median, but its core there
+        # is narrower than the dust floor.
+        pytest.param(blob(5, 2.0, 30000, ry=3.0), id="below-the-width-floor"),
+    ],
+)
+def test_a_speck_in_an_empty_lane_leaves_it_no_band(speck):
+    # A speck in empty end lane 5 reaches the detection level, but the dust
+    # rules reject it: the lane holds no band (#123), so it gets a not-detected
+    # record instead of reading as signal that fits no lane or at the edge.
+    case = adversarial_row("speck", 1000, missing=[5], artefacts=[speck])
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    lane = found.lanes[5]
+    assert darkness(case, lane.window) >= DETECT_K * found.noise  # it is there
+    assert (lane.reason, lane.components, lane.cut) == ("no_band", 0, False)
+    assert lane.snr < DETECT_K
+    assert found.flags == ()
+
+
+def test_a_speck_on_the_row_box_edge_is_dust_not_a_cut_band():
+    # A 3x3 px speck centred on the box's top row, in empty end lane 5: dust
+    # wherever it peaks, so the lane holds no band (#123) and no band is cut
+    # (#115); the bands below stay whole.
+    case = adversarial_row(
+        "edge speck", 1000, missing=[5], artefacts=[blob(5, 1.2, 30000, dy=-10.0)]
+    )
+    x0, _, x1, y1 = case.row
+    top = round(case.lane_cy[5] - 10.0)  # the speck's centre row
+    found = detect(dataclasses.replace(case, row=(x0, top, x1, y1)))
+    assert_hits_own_lanes(case, found)
+    lane = found.lanes[5]
+    assert darkness(case, (lane.window[0], top, lane.window[2], top + 1)) >= DETECT_K * found.noise
+    assert (lane.reason, lane.cut) == ("no_band", False)
+    assert found.flags == ()
+
+
+def test_a_band_below_the_detection_level_keeps_its_snr():
+    # The empty lane's SNR still tells how close a faint band came.
+    case = adversarial_row("faint", 1000, depths={5: 500.0})
+    lane = detect(case).lanes[5]
+    assert lane.reason == "no_band"
+    assert NOISE_K < lane.snr < DETECT_K
+
+
+def test_a_band_peaked_on_the_row_box_edge_is_signal_at_the_edge():
+    # The box's top edge runs through the bands' centres: each band's peak
+    # lies on its top row, so no band is kept, and each lane holds signal at
+    # the box's edge only (not signal that fits no lane).
+    case = CUT_BASE
+    x0, _, x1, y1 = case.row
+    found = detect(dataclasses.replace(case, row=(x0, _centre_row(case), x1, y1)))
+    assert found.size is None
+    assert [lane.reason for lane in found.lanes] == ["edge_signal"] * 6
+    assert all(lane.snr < DETECT_K for lane in found.lanes)
+    # Each is a band the box cuts through, kept or not (#115, #117).
+    assert [lane.cut for lane in found.lanes] == [True] * 6
+    assert (found.flags, found.notes) == (("cut_by_row_box",), (CUT_NOTE,))
 
 
 # --- Flags ---
@@ -269,6 +354,132 @@ def test_bench_flags_notes_and_one_component_per_band(name):
     assert found.flags == BENCH_FLAGS.get(name, ())
     assert found.notes == BENCH_NOTES.get(name, ())
     assert components(found) == [int(lane.rect is not None) for lane in found.lanes]
+    assert not any(lane.cut for lane in found.lanes)  # no bench box cuts a band (#115)
+    assert found.membrane_shift < MEMBRANE_SHIFT_K  # membrane around every row's bands
+
+
+# --- #115: bands the row box cuts through ---
+
+CUT_BASE = adversarial_row("cut", 1000)  # six bands, about 12 px high
+CUT_NOTE = (
+    "lanes 1, 2, 3, 4, 5, 6: the row box's top or bottom edge cuts through the band"
+    " (the box's edge row holds at least 30% of its peak)"
+)
+
+
+def _centre_row(case: RowCase) -> int:
+    """The row through the bands' mean centre."""
+    return round(float(np.mean(case.lane_cy)))
+
+
+def cut_row(case: RowCase, edge: str, into: int) -> tuple[int, int, int, int]:
+    """The case's row box with its top or bottom edge moved ``into`` px short of
+    the bands' mean centre row."""
+    x0, y0, x1, y1 = case.row
+    centre = _centre_row(case)
+    return (x0, centre - into, x1, y1) if edge == "top" else (x0, y0, x1, centre + into)
+
+
+@pytest.mark.parametrize("edge", ["top", "bottom"])
+def test_a_row_box_edge_through_the_bands_flags_them_cut(monkeypatch, edge):
+    row = cut_row(CUT_BASE, edge, 4)
+    found = detect(dataclasses.replace(CUT_BASE, row=row))
+    assert found.flags == ("cut_by_row_box",)
+    assert found.notes == (CUT_NOTE,)
+    assert [lane.cut for lane in found.lanes] == [True] * 6
+    edge_y = row[1] if edge == "top" else row[3]
+    assert all(edge_y in (lane.extent[1], lane.extent[3]) for lane in found.lanes)
+    assert not found.refused  # a warning: the boxes are placed as without it
+    monkeypatch.setattr(rowdetect, "CUT_LEVEL", 1.0)  # no edge row holds the whole peak
+    uncut = detect(dataclasses.replace(CUT_BASE, row=row))
+    assert (uncut.flags, uncut.notes) == ((), ())
+    assert not any(lane.cut for lane in uncut.lanes)
+    assert (uncut.slots, uncut.size) == (found.slots, found.size)
+
+
+def test_a_band_the_box_edge_only_grazes_is_not_cut():
+    # The edge row a little past the band's own extent holds less than
+    # CUT_LEVEL of its peak: the box takes the whole band.
+    found = detect(dataclasses.replace(CUT_BASE, row=cut_row(CUT_BASE, "top", 8)))
+    assert found.flags == ()
+    assert not any(lane.cut for lane in found.lanes)
+
+
+def test_only_the_lanes_the_box_cuts_are_named():
+    # A smile: the outer bands sit higher, so a low top edge cuts only them.
+    case = adversarial_row("smile_cut", 1000, smile=8.0)
+    x0, y0, x1, y1 = case.row
+    middle = min(case.lane_cy)
+    found = detect(dataclasses.replace(case, row=(x0, round(middle) - 2, x1, y1)))
+    cut = [lane.lane for lane in found.lanes if lane.cut]
+    assert cut and len(cut) < 6
+    assert found.flags == ("cut_by_row_box",)
+    assert found.notes[-1].startswith(f"lanes {', '.join(str(i + 1) for i in cut)}: ")
+
+
+def test_a_band_left_out_for_peaking_on_the_box_edge_is_named_cut():
+    # A lower top edge still: the smile's outer bands peak on its row and are
+    # left out (edge_signal), the next ones reach it as kept extents. Both are
+    # bands the box cuts through (#115), placed or not, and the row is placed.
+    case = adversarial_row("smile_cut", 1000, smile=8.0)
+    x0, _, x1, y1 = case.row
+    found = detect(dataclasses.replace(case, row=(x0, math.floor(min(case.lane_cy)) + 2, x1, y1)))
+    assert [lane.reason for lane in found.lanes] == ["edge_signal", *["band"] * 4, "edge_signal"]
+    assert [lane.cut for lane in found.lanes] == [True, True, False, False, True, True]
+    assert found.flags == ("cut_by_row_box",)
+    assert found.notes[-1].startswith("lanes 1, 2, 5, 6: ")
+
+
+def test_the_cut_flag_is_a_warning_listed_with_its_setting():
+    assert "cut_by_row_box" in WARNING_FLAGS
+    assert settings()["cut_level"] == CUT_LEVEL == EXTENT_LEVEL
+
+
+# --- #117: a box with too little membrane around its bands ---
+
+BLANK = adversarial_row("blank", 1000, missing=range(6))
+
+
+@pytest.mark.parametrize(
+    ("case", "background", "too_little"),
+    [
+        # Saturated touching bands fill a snug box: detection takes their level
+        # for the membrane and finds nothing.
+        pytest.param(
+            adversarial_row(
+                "thick", 1000, h=30.0, pitch=48.0, w=60.0, depth_range=(75000.0, 80000.0), my=0
+            ),
+            None,
+            True,
+            id="filled-by-bands",
+        ),
+        # A box just inside six saturated bands' 20% extents: the bands take in
+        # the noise estimate, so nothing reaches the detection level.
+        pytest.param(
+            adversarial_row("snug", 1000, w=56.0, h=12.0, depth_range=(75000.0, 80000.0), my=-1),
+            None,
+            True,
+            id="snug",
+        ),
+        pytest.param(BLANK, None, False, id="blank"),
+        # The membrane under the box 7.5 noise sigmas darker than the stored
+        # background (a darker stretch of membrane): membrane all the same.
+        pytest.param(BLANK, MEMBRANE + 3000.0, False, id="darker-than-stored"),
+        # Bands too faint to detect, with membrane around them.
+        pytest.param(
+            adversarial_row("faint", 1000, depth_range=(500.0, 500.0)), None, False, id="faint"
+        ),
+    ],
+)
+def test_membrane_shift_tells_a_box_with_too_little_membrane(case, background, too_little):
+    background = estimate_background(case.image) if background is None else background
+    found = detect_row(case.image, case.row, case.n_lanes, background=background)
+    assert found.size is None
+    assert (found.membrane_shift >= MEMBRANE_SHIFT_K) == too_little
+
+
+def test_the_membrane_shift_setting_is_listed():
+    assert settings()["membrane_shift_k"] == MEMBRANE_SHIFT_K == DETECT_K
 
 
 def test_ambiguous_lanes_refuses():
@@ -1061,7 +1272,13 @@ def check_invariants(case: RowCase, found: RowDetection) -> None:
             assert all(type(v) is int for v in lane.window)
             wx0, wy0, wx1, wy1 = lane.window
             assert rx0 <= wx0 < wx1 <= rx1 and ry0 <= wy0 < wy1 <= ry1
+        if lane.cut and lane.extent is not None:  # it reaches the top or bottom edge
+            assert lane.extent[1] == ry0 or lane.extent[3] == ry1
+        elif lane.cut:  # an empty lane: its band peaks on the edge row
+            assert lane.reason == "edge_signal"
         assert math.isfinite(lane.snr) and math.isfinite(lane.expected_x)
+    assert ("cut_by_row_box" in found.flags) == any(lane.cut for lane in found.lanes)
+    assert math.isfinite(found.membrane_shift)
 
 
 @pytest.mark.parametrize("name", INVARIANT_CASES)
@@ -1155,6 +1372,8 @@ def test_polarity_symmetry(name):
     assert [lane.reason for lane in inverse.lanes] == [lane.reason for lane in found.lanes]
     assert [lane.window for lane in inverse.lanes] == [lane.window for lane in found.lanes]
     assert components(inverse) == components(found)
+    assert [lane.cut for lane in inverse.lanes] == [lane.cut for lane in found.lanes]
+    assert inverse.membrane_shift == pytest.approx(found.membrane_shift, abs=1e-6)
     for a, b in zip(inverse.lanes, found.lanes, strict=True):
         assert (a.bg_offset is None) == (b.bg_offset is None)
         if b.bg_offset is not None:
@@ -1167,6 +1386,7 @@ def test_polarity_symmetry(name):
         ("missing_first", {}),
         ("tall_band/1000", {"lane 4:": "lane 3:"}),  # size_outlier
         ("doublet_deep/1000", {"lane 3:": "lane 4:"}),  # multiple_components
+        ("tilt_cut/1000", {"lanes 1, 2:": "lanes 5, 6:"}),  # cut_by_row_box
     ],
 )
 def test_lanes_numbered_right_to_left_are_the_same_reading_reversed(name, renumbered):
