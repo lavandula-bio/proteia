@@ -140,12 +140,12 @@ function seriesName(series) {
 export class LaneTable {
   // handlers: queueEdit(task, {after}) runs `task(current)` in the app's edit
   // queue (ProteinPanel.queueEdit): after the edits before it, and never once
-  // another project is asked for; pending() gives a Promise that settles once
-  // the edits made outside that queue so far have their answers; send(method,
-  // path, json) gives a Promise of the server's answer once the app has
-  // applied it (null if it is about a project opened before the one shown),
-  // and rejects with the server's refusal (code, message, ids); status(text)
-  // shows a line to the user.
+  // another project is asked for or shown; pending() gives a Promise that
+  // settles once the edits made outside that queue so far have their answers;
+  // send(method, path, json) gives a Promise of the server's answer once the
+  // app has applied it (null if it is about a project opened before the one
+  // shown), and rejects with the server's refusal (code, message, ids);
+  // status(text) shows a line to the user.
   constructor(handlers) {
     this.handlers = handlers;
     this.project = null;
