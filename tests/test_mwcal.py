@@ -480,6 +480,15 @@ def test_disagreement_ignores_a_band_marked_on_one_side():
     assert fitted.disagreement.value < 1e-9
 
 
+def test_a_quality_past_what_a_float_holds_is_infinite():
+    # MWs the model takes (finite, above 0) a pixel apart across hundreds of
+    # decades: the relative error at the middle point is past the largest float.
+    ys = (0.0, 999.9, 1000.0)
+    mws = (1e308, 1e-10, 1e-320)
+    worst = mwcal_module._quality(ys, tuple(math.log10(m) for m in mws), mws)
+    assert worst is not None and worst.value == math.inf and worst.mw == 1e-10
+
+
 def test_disagreement_past_what_a_float_holds_is_infinite():
     # 25 kDa one pixel under 250 on both sides, and the right ladder's top 400 px
     # low: midway, one decade spans a pixel there, so the error is 10**400 - 1,

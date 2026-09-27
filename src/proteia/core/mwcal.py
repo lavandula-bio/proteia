@@ -345,7 +345,7 @@ def _quality(
     for i in range(1, len(ys) - 1):
         f = (ys[i] - ys[i - 1]) / (ys[i + 1] - ys[i - 1])
         predicted = _lerp(zs[i - 1], zs[i + 1], f)
-        value = abs(10.0 ** (zs[i] - predicted) - 1.0)
+        value = _relative_error(zs[i] - predicted)
         if worst is None or value > worst.value:
             worst = Quality(value, mws[i], 10.0**predicted)
     return worst
