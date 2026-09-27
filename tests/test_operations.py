@@ -5230,6 +5230,27 @@ def test_a_band_is_off_its_lane_on_lanes_numbered_right_to_left():
     assert ops._off_lanes({0: 299.0, 1: 301.0, 2: 231.0, 3: 156.0}, expected) == [0, 1, 2, 3]
 
 
+# Kept lanes 0, 2, 4 and 7, at 60 px per lane.
+NAMING = [(30.0, 0), (150.0, 2), (270.0, 4), (450.0, 7)]
+
+
+@pytest.mark.parametrize(
+    ("off", "named"),
+    [
+        ([4], {2, 4, 7}),  # its own box, and those of lanes 3 and 5 beside it
+        ([2], {0, 2, 4}),
+        ([3], {2, 4}),  # between 2 and 4, as are its neighbours
+        ([8], {7}),  # past the last kept lane
+        ([1, 5], {0, 2, 4, 7}),
+        ([], set()),
+    ],
+)
+def test_an_off_lane_names_the_boxes_its_yardstick_comes_from(off, named):
+    # _off_lanes measures a lane against its own expected x and a
+    # neighbour's: a wrong box behind either can make it off.
+    assert ops._named_lanes(NAMING, off) == named
+
+
 # --- #117: a refused row says why, by what the detector saw ---
 
 CENTRE_ROW = round(float(np.mean(SCENE.lane_cy)))  # the row through SCENE's band centres

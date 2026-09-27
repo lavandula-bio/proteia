@@ -2470,8 +2470,9 @@ def _loading_lanes(client: Client, target: str, loading: str) -> list[str]:
     """Nothing to set up: the loading control's boxes place the lanes the row
     is checked against, and a row that does not line up with them names those
     its bands' lanes are read from. Leaving out lane 0, the row reads its four
-    bands a lane off, as lanes 0 to 3: the boxes of those lanes, not lane 4's."""
-    return column(client.ok("GET", "/api/project"), loading)["band_ids"][:4]
+    bands a lane off, as lanes 0 to 3: the boxes of those lanes, and lane 4's,
+    whose x lane 3's band is measured against."""
+    return column(client.ok("GET", "/api/project"), loading)["band_ids"][:5]
 
 
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:

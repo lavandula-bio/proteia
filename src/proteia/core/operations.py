@@ -1632,6 +1632,15 @@ def _off_lanes(centres: Mapping[int, float], expected: Mapping[int, float]) -> l
     return off
 
 
+def _named_lanes(anchors: Sequence[tuple[float, int]], off: Iterable[int]) -> set[int]:
+    """The kept lanes whose boxes decided that ``off`` lanes are off
+    (:func:`_off_lanes`): those each off lane's expected x, and its neighbours'
+    (the half-pitch yardstick), are read from
+    (:func:`~proteia.core.project.anchoring_lanes`). A box in the wrong lane
+    beside an off lane can be the cause, so it is named too."""
+    return anchoring_lanes(anchors, {lane + d for lane in off for d in (-1, 0, 1)})
+
+
 def _in_words(items: Sequence[str]) -> str:
     """``a``, ``a and b``, ``a, b and c``."""
     return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
@@ -1917,8 +1926,8 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     lanes, repeated over many, drifts). A band found whose extent's centre
     lies more than half the local pitch from its lane's expected x
     (:func:`_off_lanes`) refuses the row (``ROW_LANES_UNCLEAR``; ``ids``: the
-    boxes of the lanes those bands' expected x are read from
-    (:func:`~proteia.core.project.anchoring_lanes`), in the order of
+    boxes of the lanes those bands' expected x, and their neighbours', are
+    read from (:func:`_named_lanes`), in the order of
     :func:`~proteia.core.project.lane_anchor_ids`, since one of them may be in
     the wrong lane; ``detail``: ``{"cause": "off_lanes", "off_lanes": [...]}``,
     the lanes off as read). So a row read
@@ -2021,8 +2030,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     }
     off = _off_lanes(centres, expected) if expected else []
     if off:
-        # The boxes of the lanes those bands' expected x are read from.
-        named = anchoring_lanes(anchors, off)
+        named = _named_lanes(anchors, off)
         placed_ids = lane_anchor_ids(batch, image, without=detectors)
         raise OperationError(
             ErrorCode.ROW_LANES_UNCLEAR,
