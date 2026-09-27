@@ -5,7 +5,14 @@ import csv
 
 import pytest
 
-from proteia.core.export import LANE_TABLE_DECIMALS, lane_table_bytes, write_lane_table
+from proteia.core.export import (
+    LANE_TABLE_DECIMALS,
+    LANE_TABLE_RATIO_DECIMALS,
+    SeriesColumn,
+    lane_columns,
+    lane_table_bytes,
+    write_lane_table,
+)
 
 BOM = b"\xef\xbb\xbf"
 
@@ -29,9 +36,9 @@ def test_lane_table_round_trips_non_ascii_names(tmp_path):
     assert path.read_bytes().startswith(BOM)  # Excel detects UTF-8 from the BOM
     assert _read_rows(path) == [
         ["lane", "condition", "sample", "include", "β-actin", "α-tubulin"],
-        ["0", "vehicle", "α1", "yes", "1.0", "0.5"],
-        ["1", "10 µM", "β2", "yes", "2.5", ""],
-        ["2", "10 µM", "", "no", "", "3.25"],
+        ["1", "vehicle", "α1", "yes", "1.0", "0.5"],  # lanes numbered from 1, as the app does
+        ["2", "10 µM", "β2", "yes", "2.5", ""],
+        ["3", "10 µM", "", "no", "", "3.25"],
     ]
 
 
@@ -101,8 +108,8 @@ def test_lane_table_bytes_match_the_written_file(tmp_path):
     assert LANE_TABLE_DECIMALS == 3
     rows = (
         "lane,condition,sample,include,β-actin,β-actin clipped\r\n"
-        "0,vehicle,α1,yes,1.235,no\r\n"  # rounded to LANE_TABLE_DECIMALS
-        "1,10 µM,,no,,\r\n"
+        "1,vehicle,α1,yes,1.235,no\r\n"  # rounded to LANE_TABLE_DECIMALS
+        "2,10 µM,,no,,\r\n"
     )
     assert data == BOM + rows.encode()
 
@@ -117,3 +124,188 @@ def test_lane_table_bytes_match_the_written_file(tmp_path):
             clipped={"p": [True]},
         )
     assert not collision.exists()  # checked before the file is opened
+
+
+def test_lane_table_series_columns_follow_the_proteins():
+    data = lane_table_bytes(
+        ["vehicle", "10 µM", "10 µM"],
+        ["α1", "β2", None],
+        [True, True, False],
+        [("β-actin", [1.0, 2.0, None])],
+        clipped={"β-actin": [False, None, None]},
+        series=[
+            ("β-actin ÷ GAPDH normalized", [0.123456789, None, 2.0]),
+            ("β-actin ÷ GAPDH fold change vs vehicle", [1.0, float("nan"), float("inf")]),
+        ],
+    )
+    assert LANE_TABLE_RATIO_DECIMALS == 6
+    rows = (
+        "lane,condition,sample,include,β-actin,β-actin clipped,"
+        "β-actin ÷ GAPDH normalized,β-actin ÷ GAPDH fold change vs vehicle\r\n"
+        "1,vehicle,α1,yes,1.0,no,0.123457,1.0\r\n"  # rounded to LANE_TABLE_RATIO_DECIMALS
+        "2,10 µM,β2,yes,2.0,,,\r\n"  # no value, or none that is finite: an empty cell
+        "3,10 µM,,no,,,2.0,\r\n"
+    )
+    assert data == BOM + rows.encode()
+    with pytest.raises(ValueError, match="2 values but there are 3 lanes"):
+        lane_table_bytes(["a"] * 3, [None] * 3, [True] * 3, [], series=[("r", [1.0, 2.0])])
+    with pytest.raises(ValueError, match="share a name"):
+        lane_table_bytes(["a"], [None], [True], [("r", [1.0])], series=[("r", [1.0])])
+
+
+def test_lane_table_cells_are_written_as_typed():
+    # Provisional (#53): a cell that a spreadsheet reads as a formula is not
+    # changed; whether to guard such cells is the maintainer's decision.
+    data = lane_table_bytes(["-DOX", "+LPS", "=1+1", "@x"], [None] * 4, [True] * 4, [])
+    rows = data.decode("utf-8-sig").splitlines()[1:]
+    assert [row.split(",")[1] for row in rows] == ["-DOX", "+LPS", "=1+1", "@x"]
+
+
+# --- Column names: each unique among a lane table's headers ---
+
+
+def _table_of(columns, proteins, series=()) -> list[str]:
+    """The headers of a lane table (with no lane) whose columns ``columns`` names:
+    lane_table_bytes refuses any two that share a name."""
+    names = [columns.proteins[protein_id] for protein_id, _ in proteins]
+    data = lane_table_bytes(
+        [],
+        [],
+        [],
+        [(name, []) for name in names],
+        clipped={name: [] for name in names},
+        series=[(columns.series[column], []) for column in series],
+    )
+    return data.decode("utf-8-sig").splitlines()[0].split(",")
+
+
+def test_a_protein_whose_columns_another_column_has_takes_a_number():
+    proteins = [("p1", "GAPDH"), ("p2", "GAPDH clipped")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {"p1": "GAPDH", "p2": "GAPDH clipped (2)"}
+    assert _table_of(columns, proteins)[4:] == [
+        "GAPDH",
+        "GAPDH clipped",
+        "GAPDH clipped (2)",
+        "GAPDH clipped (2) clipped",
+    ]
+    assert columns.renamed == (
+        'The protein "GAPDH clipped" is named "GAPDH clipped (2)" in its columns,'
+        ' "GAPDH clipped (2)" and "GAPDH clipped (2) clipped": the column'
+        ' "GAPDH clipped" holds the clipping flags of the protein "GAPDH".',
+    )
+    # The protein before keeps its name, whichever it is.
+    proteins = [("p1", "GAPDH clipped"), ("p2", "GAPDH")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {"p1": "GAPDH clipped", "p2": "GAPDH (2)"}
+    assert columns.renamed == (
+        'The protein "GAPDH" is named "GAPDH (2)" in its columns, "GAPDH (2)" and'
+        ' "GAPDH (2) clipped": the column "GAPDH clipped" holds the nets of the'
+        ' protein "GAPDH clipped".',
+    )
+    _table_of(columns, proteins)
+
+
+def test_column_names_compare_exactly_and_a_number_takes_no_proteins_own_name():
+    # Exactly, as lane_table_bytes compares them: case and look-alikes differ.
+    proteins = [("p1", "lane"), ("p2", "Lane"), ("p3", "include clipped"), ("p4", "gapdh clipped")]
+    proteins += [("p5", "GAPDH"), ("p6", "ＧＡＰＤＨ clipped")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {
+        "p1": "lane (2)",
+        "p2": "Lane",
+        "p3": "include clipped",  # not the lane column "include"
+        "p4": "gapdh clipped",
+        "p5": "GAPDH",
+        "p6": "ＧＡＰＤＨ clipped",
+    }
+    assert columns.renamed == (
+        'The protein "lane" is named "lane (2)" in its columns, "lane (2)" and'
+        ' "lane (2) clipped": the column "lane" holds the lane numbers.',
+    )
+    _table_of(columns, proteins)
+    # A protein named as a number would name another one keeps its name, and
+    # that one takes the next number.
+    proteins = [("a", "X"), ("b", "X clipped"), ("c", "X clipped (2)")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {"a": "X", "b": "X clipped (3)", "c": "X clipped (2)"}
+    _table_of(columns, proteins)
+
+
+def test_a_protein_gives_way_to_a_series_column_named_from_its_proteins_columns():
+    proteins = [("t", "GAPDH"), ("l", "α-tubulin"), ("t2", "GAPDH clipped")]
+    proteins += [("p", "GAPDH ÷ α-tubulin normalized"), ("q", "GAPDH ÷ α-tubulin fold change vs v")]
+    series = [
+        SeriesColumn("t", "l"),
+        SeriesColumn("t", "l", "v clipped"),
+        SeriesColumn("t2", "l"),
+        SeriesColumn("t2", "l", "v clipped"),
+    ]
+    columns = lane_columns(proteins, series)
+    assert columns.proteins == {
+        "t": "GAPDH",
+        "l": "α-tubulin",
+        "t2": "GAPDH clipped (2)",
+        "p": "GAPDH ÷ α-tubulin normalized (2)",
+        "q": "GAPDH ÷ α-tubulin fold change vs v (2)",  # its clipping column was a series'
+    }
+    # A series is named from its proteins' columns.
+    assert columns.series == {
+        series[0]: "GAPDH ÷ α-tubulin normalized",
+        series[1]: "GAPDH ÷ α-tubulin fold change vs v clipped",
+        series[2]: "GAPDH clipped (2) ÷ α-tubulin normalized",
+        series[3]: "GAPDH clipped (2) ÷ α-tubulin fold change vs v clipped",
+    }
+    assert _table_of(columns, proteins, series)[4:] == [
+        "GAPDH",
+        "GAPDH clipped",
+        "α-tubulin",
+        "α-tubulin clipped",
+        "GAPDH clipped (2)",
+        "GAPDH clipped (2) clipped",
+        "GAPDH ÷ α-tubulin normalized (2)",
+        "GAPDH ÷ α-tubulin normalized (2) clipped",
+        "GAPDH ÷ α-tubulin fold change vs v (2)",
+        "GAPDH ÷ α-tubulin fold change vs v (2) clipped",
+        *columns.series.values(),
+    ]
+    assert columns.renamed == (
+        'The protein "GAPDH clipped" is named "GAPDH clipped (2)" in its columns,'
+        ' "GAPDH clipped (2)" and "GAPDH clipped (2) clipped", and in those of its'
+        ' series: the column "GAPDH clipped" holds the clipping flags of the protein'
+        ' "GAPDH".',
+        'The protein "GAPDH ÷ α-tubulin normalized" is named "GAPDH ÷ α-tubulin'
+        ' normalized (2)" in its columns, "GAPDH ÷ α-tubulin normalized (2)" and'
+        ' "GAPDH ÷ α-tubulin normalized (2) clipped": the column "GAPDH ÷ α-tubulin'
+        ' normalized" holds the normalized values of the target "GAPDH" over the'
+        ' loading control "α-tubulin".',
+        'The protein "GAPDH ÷ α-tubulin fold change vs v" is named "GAPDH ÷'
+        ' α-tubulin fold change vs v (2)" in its columns, "GAPDH ÷ α-tubulin fold'
+        ' change vs v (2)" and "GAPDH ÷ α-tubulin fold change vs v (2) clipped": the'
+        ' column "GAPDH ÷ α-tubulin fold change vs v clipped" holds the fold changes'
+        ' vs "v clipped" of the target "GAPDH" over the loading control "α-tubulin".',
+    )
+
+
+def test_a_series_column_that_a_column_before_it_has_takes_a_number():
+    # Two series that one name would name: names holding " ÷ " make it possible.
+    proteins = [("a", "X ÷ Y"), ("b", "Z"), ("c", "Y ÷ Z"), ("d", "X")]
+    series = [SeriesColumn("a", "b"), SeriesColumn("d", "c"), SeriesColumn("d", "c", "v")]
+    columns = lane_columns(proteins, series)
+    assert columns.proteins == dict(proteins)
+    assert columns.series == {
+        series[0]: "X ÷ Y ÷ Z normalized",
+        series[1]: "X ÷ Y ÷ Z normalized (2)",
+        series[2]: "X ÷ Y ÷ Z fold change vs v",
+    }
+    assert columns.renamed == (
+        'The normalized values of the target "X" over the loading control "Y ÷ Z" are'
+        ' in the column "X ÷ Y ÷ Z normalized (2)": the column "X ÷ Y ÷ Z normalized"'
+        ' holds the normalized values of the target "X ÷ Y" over the loading control'
+        ' "Z".',
+    )
+    _table_of(columns, proteins, series)
+    # A series column listed twice (by both result sets) is one column.
+    assert lane_columns([("a", "p"), ("b", "q")], [SeriesColumn("a", "b")] * 2).series == {
+        SeriesColumn("a", "b"): "p ÷ q normalized"
+    }

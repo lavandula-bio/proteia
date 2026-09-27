@@ -34,6 +34,7 @@ from conftest import (
     V1_CONTENT_HASH,
     FakeClock,
     make_project,
+    make_project_with_clashing_names,
     make_project_with_undetected,
     sample_doc_v1,
     synthetic_blot,
@@ -2098,7 +2099,7 @@ def test_export_lane_table(tmp_path, monkeypatch):
         "GAPDH clipped",
     ]
     assert rows[1] == [
-        "0",
+        "1",  # lanes numbered from 1, as the app does
         "vehicle",
         "v1",
         "yes",
@@ -2109,7 +2110,7 @@ def test_export_lane_table(tmp_path, monkeypatch):
         "5120.5",
         "",
     ]
-    assert rows[3][:6] == ["2", "10 µM", "a1", "yes", "", ""]  # no β-catenin box in lane 2
+    assert rows[3][:6] == ["3", "10 µM", "a1", "yes", "", ""]  # no β-catenin box in lane 3
     assert rows[4][3] == "no"
     assert rows[4][5] == "no"  # band-12 was checked and is not clipped
     assert len(rows) == 5
@@ -2134,6 +2135,44 @@ def test_export_lane_table(tmp_path, monkeypatch):
     with pytest.raises(OperationError) as info:
         ops.export_lane_table(empty)
     assert info.value.code is ErrorCode.NO_LANES
+
+
+def test_export_lane_table_numbers_columns_that_would_share_a_name(tmp_path):
+    # "GAPDH clipped" names the clipping column of GAPDH (a project.json may hold
+    # both names; the operations refuse the second): the bundle's rule applies.
+    s = open_sample(tmp_path, None, make_project_with_clashing_names())
+    path = ops.export_lane_table(s)
+    data = path.read_bytes()
+    table = list(csv.reader(io.StringIO(data.decode("utf-8-sig"), newline="")))
+    assert table[0] == [
+        "lane",
+        "condition",
+        "sample",
+        "include",
+        "GAPDH",
+        "GAPDH clipped",
+        "α-tubulin",
+        "α-tubulin clipped",
+        "GAPDH clipped (2)",
+        "GAPDH clipped (2) clipped",
+    ]
+    rows = [dict(zip(table[0], row, strict=True)) for row in table[1:]]
+    nets = results.lane_nets(s.project.batch)
+    for column, protein_id in (("GAPDH", "prot-7"), ("GAPDH clipped (2)", "prot-9")):
+        assert [row[column] for row in rows] == [
+            "" if net is None else str(round(net, 3)) for net in nets[protein_id]
+        ]
+    assert [row["GAPDH clipped"] for row in rows] == ["yes", "no", "", "no"]
+    assert [row["GAPDH clipped (2) clipped"] for row in rows] == ["no", "yes", "", ""]
+    doc = json.loads((path.parent / ops.LANE_TABLE_RECORD_FILE).read_bytes())
+    assert doc["files"] == {
+        ops.LANE_TABLE_FILE: {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    }
+    # Both exports agree: the bundle's table of the lane table's include flags
+    # holds these columns first, under the same names.
+    bundle = ops.export_bundle(s, formats=[])
+    applied = (bundle.folder / bundle.files[0]).read_bytes().decode("utf-8-sig")
+    assert [row[:10] for row in csv.reader(io.StringIO(applied, newline=""))] == table
 
 
 def test_a_first_export_whose_record_fails_leaves_no_table(tmp_path, monkeypatch):

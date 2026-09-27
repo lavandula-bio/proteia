@@ -23,8 +23,17 @@ box edit may change every net on its image (each band's background ring leaves
 out every box there), and every answer carries every protein's numbers, so the
 browser redraws them all.
 
+``POST /api/export`` writes the results into a new export folder
+(:func:`~proteia.core.operations.export_bundle`), computed with the settings the
+results are shown with, and answers the folder, relative to the project folder
+(``exports/<name>``), and the names of the files in it. ``POST
+/api/project/reveal`` shows the project folder in the system file manager, or,
+with ``{"folder": "exports/<name>"}`` as the export answered it, that export
+folder.
+
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
-with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
+with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404, and
+an export folder to reveal that does not exist 404 ``folder_not_found``;
 ``no_project`` 409 before a project is open; ``invalid_input`` 422 for a request
 the routes cannot read.
 """
@@ -58,11 +67,13 @@ from pydantic import (
 )
 
 from proteia.core import operations as ops
+from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
+from proteia.core.export import DEFAULT_CHART_FORMATS
 from proteia.core.model import BoxSize, UnknownIdError
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
-from proteia.core.session import Clock, OperationError, ProjectSession, utc_now
+from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
 from proteia.web import projects
 from proteia.web.charts import ChartStore
@@ -87,6 +98,10 @@ class UnsavedChangesError(RuntimeError):
 
 class UploadTooLargeError(ValueError):
     """An upload longer than :data:`MAX_UPLOAD_BYTES`."""
+
+
+class FolderNotFoundError(LookupError):
+    """No export folder of the open project has this name."""
 
 
 @dataclass(frozen=True)
@@ -155,6 +170,12 @@ class Workspace:
             if self._session is None:
                 raise NoProjectError("create or open a project first")
             return self._session
+
+    @property
+    def settings(self) -> ResultSettings:
+        """How the results are computed: for what the browser shows, and for exports."""
+        with self._lock:
+            return self._settings
 
     @property
     def open_name(self) -> str | None:
@@ -429,6 +450,15 @@ class LaneIndexBody(_Body):
     lane_index: StrictInt
 
 
+class ExportBody(_Body):
+    # Chart formats ("svg", "png", "pdf"); left out or null: the default formats.
+    formats: list[str] | None = None
+
+
+class RevealBody(_Body):
+    folder: str  # an export folder as POST /api/export answered it: "exports/<name>"
+
+
 # --- Routes ---
 
 
@@ -516,9 +546,38 @@ def get_project(workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, workspace.current())
 
 
+def _export_folder(project: Path, folder: str) -> Path:
+    """The export folder ``folder`` names in the project folder ``project``:
+    ``exports/<name>``, with one plain name that no file system reads as more
+    than a name (no separator, drive or control character, and no dot or space
+    at either end, which Windows drops, so ``..`` and ``...`` are refused too).
+    ``invalid_input`` for any other text; :class:`FolderNotFoundError` when no
+    such folder exists."""
+    parent, _, name = folder.partition("/")
+    if (
+        parent != storage.EXPORTS_DIR
+        or not name
+        or name != name.strip(" .")
+        or any(c in "/\\:" or not c.isprintable() for c in name)
+    ):
+        raise OperationError(
+            ErrorCode.INVALID_INPUT,
+            f"{folder!r} is not an export folder: give one as the export answered it,"
+            f" {storage.EXPORTS_DIR}/<name>",
+        )
+    path = project / storage.EXPORTS_DIR / name
+    if not path.is_dir():
+        raise FolderNotFoundError(f"the project has no export folder {folder!r}")
+    return path
+
+
 @router.post("/project/reveal", status_code=204)
-def reveal_project(workspace: WorkspaceDep) -> Response:
-    workspace.reveal(workspace.current().folder)
+def reveal_project(workspace: WorkspaceDep, body: RevealBody | None = None) -> Response:
+    """Show the project folder in the system file manager or, with ``folder``,
+    one of its export folders, as ``POST /api/export`` answered it."""
+    session = workspace.current()
+    folder = session.folder if body is None else _export_folder(session.folder, body.folder)
+    workspace.reveal(folder)
     return Response(status_code=204)
 
 
@@ -747,6 +806,27 @@ def requantify(workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, session, images=list(images))
 
 
+@router.post("/export", status_code=201)
+def export_bundle(workspace: WorkspaceDep, body: ExportBody | None = None) -> dict[str, Any]:
+    """Write the results into a new export folder
+    (:func:`~proteia.core.operations.export_bundle`), computed with the settings
+    they are shown with, in the chart ``formats`` asked for (by default
+    :data:`~proteia.core.export.DEFAULT_CHART_FORMATS`). Answers the folder,
+    relative to the project folder (``exports/<name>``, for ``POST
+    /api/project/reveal``), and the files in it, by name, in the order written.
+    Refusals are 422 with the operation's codes: ``no_lanes``,
+    ``image_file_changed``, ``path_too_long`` and ``invalid_input``."""
+    session = workspace.current()
+    formats = DEFAULT_CHART_FORMATS if body is None or body.formats is None else body.formats
+    bundle = ops.export_bundle(session, formats=formats, **dataclasses.asdict(workspace.settings))
+    return _answer(
+        workspace,
+        session,
+        folder=bundle.folder.relative_to(session.folder).as_posix(),
+        files=list(bundle.files),
+    )
+
+
 @router.post("/undo")
 def undo(workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.current()
@@ -773,6 +853,7 @@ def install(app: FastAPI, workspace: Workspace) -> None:
     answers: dict[type[Exception], Callable[[Exception], JSONResponse]] = {
         OperationError: lambda e: _error(422, e.code.value, str(e), e.ids),
         UnknownIdError: lambda e: _error(404, "unknown_id", str(e)),
+        FolderNotFoundError: lambda e: _error(404, "folder_not_found", str(e)),
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
         UnsavedChangesError: lambda e: _error(409, "unsaved_changes", str(e)),
         UploadTooLargeError: lambda e: _error(413, "image_too_large", str(e)),

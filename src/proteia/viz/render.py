@@ -2,8 +2,14 @@
 """Draw a :class:`~proteia.core.plotspec.PlotSpec` as a bar chart with matplotlib.
 
 A functional, legible draft — bars (mean), error bars, individual lane points,
-and significance brackets. Publication styling (fonts, palettes, layout) is a
-later phase and lives here when it comes; nothing upstream depends on it.
+and significance brackets, with a caption under the axis that says what the
+bars and error bars are (``Bars: mean ± SD``). Publication styling (fonts,
+palettes, layout) is a later phase and lives here when it comes; nothing
+upstream depends on it.
+
+One figure (:func:`render_figure`) is drawn to three formats, each the same
+bytes for the same spec: SVG for the screen and exports (:func:`render_svg`),
+and PNG and PDF for exports (:func:`render_png`, :func:`render_pdf`).
 
 The drawn marks carry ids that name what they show, so a drawing can be read
 back against its spec: ``bar-i`` is ``spec.bars[i]``, ``point-i-j`` is
@@ -43,10 +49,17 @@ _NOT_XML: Final = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010f
 _SVG_SETTINGS: Final = {"svg.hashsalt": "proteia-chart", "svg.fonttype": "path"}
 # No metadata block: no date, and none of the URLs matplotlib's metadata names.
 _SVG_METADATA: Final = {"Date": None, "Creator": None, "Type": None, "Format": None}
-# rc_context changes matplotlib's global settings for as long as it lasts, so
-# drawings made at once would see each other's. One at a time: drawing is
-# CPU-bound under the GIL, so threads would not draw faster anyway.
-_svg_lock = threading.Lock()
+# A PDF with TrueType (Type 42) fonts, as journals and vector editors take them
+# (many refuse Type 3), and no date, creator or producer: the same bytes for
+# the same spec.
+_PDF_SETTINGS: Final = {"pdf.fonttype": 42}
+_PDF_METADATA: Final = {"Creator": None, "Producer": None, "CreationDate": None}
+_PNG_METADATA: Final = {"Software": None}  # no software tag
+# rc_context changes matplotlib's global settings for as long as it lasts, and
+# restores all of them when it ends, so drawings made at once would see (and
+# undo) each other's. One at a time, in every format: drawing is CPU-bound
+# under the GIL, so threads would not draw faster anyway.
+_draw_lock = threading.Lock()
 
 
 def _shown(text: str) -> str:
@@ -77,6 +90,10 @@ def _p_text(p: float) -> str:
 
 def render_figure(spec: PlotSpec) -> Figure:
     """Render the spec to a matplotlib :class:`Figure` (no global pyplot state).
+
+    The caption under the axis says what the bars show: ``Bars: mean ± SD`` or
+    ``± SEM`` (the spec's error type), so a chart shared on its own still says
+    which error bars it has.
 
     The title's lines: the spec's title, its subtitle (the result set) when it has
     one, the test (by the name a reader knows it by) and its p when a test ran,
@@ -113,6 +130,7 @@ def render_figure(spec: PlotSpec) -> Figure:
     ax.set_xticks(xs)
     ax.set_xticklabels([f"{_shown(b.label)}\n(n={b.n})" for b in spec.bars], parse_math=False)
     ax.set_ylabel(_shown(spec.y_label), parse_math=False)
+    ax.set_xlabel(f"Bars: mean ± {spec.error_type.value}", parse_math=False)
     lines = [spec.title or "Quantification"]
     if spec.subtitle:
         lines.append(spec.subtitle)
@@ -220,9 +238,29 @@ def render_svg(spec: PlotSpec) -> bytes:
     SVG itself, and there is no metadata. The glyphs are paths, so there is no
     text element and no font to load.
     """
-    with _svg_lock, matplotlib.rc_context(_SVG_SETTINGS):
+    with _draw_lock, matplotlib.rc_context(_SVG_SETTINGS):
         buffer = io.BytesIO()
         render_figure(spec).savefig(buffer, format="svg", metadata=_SVG_METADATA)
+    return buffer.getvalue()
+
+
+def render_png(spec: PlotSpec, *, dpi: int) -> bytes:
+    """The spec's figure (:func:`render_figure`) as PNG at ``dpi`` dots per inch,
+    which the file states: the same bytes for the same spec and dpi, with no
+    software tag."""
+    with _draw_lock:
+        buffer = io.BytesIO()
+        render_figure(spec).savefig(buffer, format="png", dpi=dpi, metadata=_PNG_METADATA)
+    return buffer.getvalue()
+
+
+def render_pdf(spec: PlotSpec) -> bytes:
+    """The spec's figure (:func:`render_figure`) as PDF: vector, with TrueType
+    (Type 42) fonts, and the same bytes for the same spec (no date, creator
+    or producer)."""
+    with _draw_lock, matplotlib.rc_context(_PDF_SETTINGS):
+        buffer = io.BytesIO()
+        render_figure(spec).savefig(buffer, format="pdf", metadata=_PDF_METADATA)
     return buffer.getvalue()
 
 

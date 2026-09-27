@@ -41,9 +41,9 @@ loading. The loading therefore cancels in β-catenin / α-tubulin, and a lane's
 fold change (its ratio over the mean ratio of the vehicle lanes, as Proteia
 computes it) is its sample's expression: vehicle 1.12, 0.86, 1.15, 0.87 (mean
 1.00), treatment 2.31, 1.72, 2.19, 1.78 (mean 2.00). The truth table numbers
-lanes from 1, as the app shows them, but Proteia's lane-table export
-(``exports/lane-table.csv``) numbers them from 0: match the two files' rows on
-``sample`` (V1-V4, T1-T4), not on ``lane``.
+lanes from 1, as the app shows them and as Proteia's lane-table exports do
+(``exports/lane-table.csv`` and the lane tables in an export folder), so the
+files' rows match on ``lane`` as well as on ``sample`` (V1-V4, T1-T4).
 
 What Proteia measures on them. A net integrates inside the box, above the ring
 background, so it reads 85-90 % of the true signal: the band's tails lie outside
@@ -423,9 +423,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Sample files already in FOLDER with the same contents are left as they"
             " are. If any differ, nothing is written unless --force is given. Other"
             " files in FOLDER are never touched. To check Proteia's results against"
-            f" {TRUTH_FILE}, match rows on the sample (V1-V4, T1-T4), not the lane:"
-            " the truth table numbers lanes from 1, as the app shows them, and the"
-            " lane-table export numbers them from 0."
+            f" {TRUTH_FILE}, match rows on the lane or the sample (V1-V4, T1-T4):"
+            " the truth table and the lane-table export both number lanes from 1,"
+            " as the app shows them."
         ),
     )
     parser.add_argument(

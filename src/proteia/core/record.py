@@ -16,8 +16,11 @@ numbers came from and how:
   and ``history_issues``: what the log cannot vouch for;
 * ``software`` and ``settings``: the versions and the code-level constants of
   the build that exported (each log entry's ``version`` names the build that
-  made that change);
-* ``files``: the SHA-256 and size of each exported file;
+  made that change), among them how its lane tables number lanes and round
+  values and at what resolution its PNG charts are drawn;
+* ``files``: the SHA-256 and size of each exported file (an export bundle's
+  record lists every other file of its folder, see
+  :func:`~proteia.core.operations.export_bundle`);
 * ``results``: the compute settings of the results the export used, or None.
 
 Nothing is sent anywhere, and no platform, host name, user or path is recorded.
@@ -48,7 +51,7 @@ from pydantic import JsonValue, TypeAdapter
 
 import proteia
 from proteia.core import export, grow, quantify, rowdetect, storage
-from proteia.core.model import LogEntry, Project, Timestamp
+from proteia.core.model import LogEntry, Project, Timestamp, lane_number
 from proteia.core.results import Results
 
 RECORD_FORMAT: Final = 1
@@ -75,7 +78,8 @@ def software_versions() -> dict[str, str | None]:
 
 
 def settings() -> dict[str, JsonValue]:
-    """The code-level settings behind the stored numbers and the exported table.
+    """The code-level settings behind the stored numbers and the exported tables
+    and charts.
 
     ``background`` is the local background method this build quantifies with
     (:func:`~proteia.core.quantify.background_settings`); a record also names
@@ -91,6 +95,10 @@ def settings() -> dict[str, JsonValue]:
         },
         "clipped_pixels_threshold": quantify.CLIPPED_PIXELS_THRESHOLD,
         "lane_table_decimals": export.LANE_TABLE_DECIMALS,
+        "lane_table_ratio_decimals": export.LANE_TABLE_RATIO_DECIMALS,
+        # The number the lane table gives the lane of stored index 0 (0 before #53).
+        "lane_table_first_lane": lane_number(0),
+        "chart_png_dpi": export.CHART_PNG_DPI,
         # What detect_row_boxes runs (rowdetect.detect_row with its defaults).
         "detect_row": rowdetect.settings(),
     }

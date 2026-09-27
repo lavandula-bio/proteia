@@ -23,11 +23,11 @@ then autosaves. So an edit is all or nothing:
   is committed and the hook does not run.
 * Every committed change appends one log entry (see
   :class:`~proteia.core.model.LogEntry`); a refusal or a no-op appends none, and
-  so do :func:`compute_view`, :func:`compute`, :func:`export_lane_table` and
-  :func:`save`, which change no state. The params record the inputs as they
-  took effect (cleaned text, the stored spelling, the proposed lane, the
-  snapped rect, the size used) and the ids created or removed; objects are
-  named by id, never by path or typed text.
+  so do :func:`compute_view`, :func:`compute`, :func:`export_lane_table`,
+  :func:`export_bundle` and :func:`save`, which change no state. The params
+  record the inputs as they took effect (cleaned text, the stored spelling, the
+  proposed lane, the snapped rect, the size used) and the ids created or
+  removed; objects are named by id, never by path or typed text.
   Clients commit a drag or a cell edit once, when it ends, not on every pointer
   move or keystroke.
 * Every committed change, of any operation, can be undone: the session keeps
@@ -85,7 +85,8 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-from collections.abc import Callable, Collection, Mapping, Sequence
+import shutil
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -94,9 +95,16 @@ from typing import Any, BinaryIO, Concatenate, Final
 import numpy as np
 from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, record, results, rowdetect, storage
+from proteia.core import boxes, export, record, results, rowdetect, storage
 from proteia.core.analyze import ReduceMethod
-from proteia.core.export import LANE_COLUMNS, lane_table_bytes
+from proteia.core.export import (
+    BUNDLE_RECORD_FILE,
+    DEFAULT_CHART_FORMATS,
+    LANE_COLUMNS,
+    MIN_NAME_ROOM,
+    ChartFormat,
+    lane_table_bytes,
+)
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import clipping_depth, load_image
 from proteia.core.model import (
@@ -123,6 +131,7 @@ from proteia.core.model import (
     UndetectedReason,
     UnknownIdError,
     apply_change,
+    format_timestamp,
     lane_number,
     lanes_phrase,
     overlaps,
@@ -171,6 +180,7 @@ __all__ = [
     "ClearedBoxes",
     "ComputedView",
     "ErrorCode",
+    "ExportBundle",
     "Keep",
     "LaneInput",
     "LanesUpdate",
@@ -184,6 +194,7 @@ __all__ = [
     "compute_view",
     "detect_row_boxes",
     "edit_protein",
+    "export_bundle",
     "export_lane_table",
     "import_image",
     "move_box",
@@ -210,6 +221,8 @@ LANE_TABLE_FILE: Final = "lane-table.csv"
 LANE_TABLE_RECORD_FILE: Final = "lane-table.record.json"
 # A protein name must not read as one of the lane table's own columns.
 _RESERVED_KEYS: Final = frozenset(name_key(column) for column in LANE_COLUMNS)
+# How many names an export tries for its new folder: the plain one, then numbered.
+_FOLDER_ATTEMPTS: Final = 1000
 
 
 class Keep(Enum):
@@ -2269,7 +2282,10 @@ def export_lane_table(session: ProjectSession) -> Path:
     (:func:`~proteia.core.record.build_record`); return the table's path.
 
     The same stored-index nets the results table shows, each followed by its
-    clipping flags, in UTF-8 with a BOM. An image file that is missing or changed
+    clipping flags, in UTF-8 with a BOM. Each protein's columns carry its name,
+    numbered as the bundle's are where a column before them has it
+    (:func:`~proteia.core.export.lane_columns`; this table has no series
+    columns to give way to). An image file that is missing or changed
     since import is refused (``IMAGE_FILE_CHANGED``, with those images): a record
     never vouches for pixels that are no longer on disk. Both files are built
     before either is written, and each is replaced atomically, the table first;
@@ -2291,12 +2307,13 @@ def export_lane_table(session: ProjectSession) -> Path:
         )
     conditions, samples, included = spine_axes(batch.lanes)
     nets, clipped = results.lane_nets(batch), results.lane_clipped(batch)
+    names = export.lane_columns([(p.id, p.name) for p in batch.proteins]).proteins
     table = lane_table_bytes(
         conditions,
         samples,
         included,
-        [(p.name, nets[p.id]) for p in batch.proteins],
-        clipped={p.name: clipped[p.id] for p in batch.proteins},
+        [(names[p.id], nets[p.id]) for p in batch.proteins],
+        clipped={names[p.id]: clipped[p.id] for p in batch.proteins},
     )
     doc = record.build_record(
         project, exported_at=session.timestamp(), files={LANE_TABLE_FILE: table}
@@ -2318,6 +2335,134 @@ def export_lane_table(session: ProjectSession) -> Path:
                 path.unlink(missing_ok=True)
         raise
     return path
+
+
+@dataclass(frozen=True)
+class ExportBundle:
+    """What :func:`export_bundle` wrote."""
+
+    folder: Path  # the new folder, exports/<name> in the project folder
+    files: tuple[str, ...]  # the files in it, by name, in the order written: the record last
+
+
+def _chart_formats(formats: object) -> tuple[ChartFormat, ...]:
+    """The chart formats ``formats`` names, each once, in the order given."""
+    if isinstance(formats, (str, bytes)) or not isinstance(formats, Iterable):
+        raise _invalid(f"chart formats must be a list of formats, not {formats!r}")
+    return tuple(dict.fromkeys(_member(ChartFormat, f, "a chart format") for f in formats))
+
+
+def _new_folder(parent: Path, name: str) -> Path:
+    """A folder made now in ``parent``: ``name``, or ``name (2)``, ``name (3)``
+    and so on, the first that no file or folder has (in any case), so nothing is
+    ever written into a folder that was there before."""
+    for number in range(1, _FOLDER_ATTEMPTS + 1):
+        folder = parent / (name if number == 1 else f"{name} ({number})")
+        try:
+            folder.mkdir()
+        except FileExistsError:
+            continue
+        return folder
+    raise FileExistsError(f"no free folder name for {name!r} in {parent}")
+
+
+@_locked
+def export_bundle(
+    session: ProjectSession,
+    *,
+    formats: Iterable[ChartFormat | str] = DEFAULT_CHART_FORMATS,
+    plot_conditions: Collection[str] | None = None,
+    error_type: ErrorType | str = ErrorType.SD,
+    method: ReduceMethod | str = ReduceMethod.MEAN,
+) -> ExportBundle:
+    """Write the results into a new folder of their own (#53): each result set's
+    lane table and charts, a README and the reproducibility record, so files
+    that belong together stay together.
+
+    The folder is ``exports/<local date and time>`` in the project folder
+    (:func:`~proteia.core.export.bundle_folder_name`), numbered ``(2)``,
+    ``(3)`` and on when that name is taken: every export makes a new folder,
+    and nothing that was there is overwritten. (A plain text sort puts ``(10)``
+    before ``(2)``; a file manager's sort by number does not.) The file names
+    are fitted to the room the folder's path leaves
+    (:func:`~proteia.core.storage.name_fits`, with the longest folder name this
+    export could take), so a long project path cuts the protein names and
+    labels in them further. It holds, in the order written
+    (:func:`~proteia.core.export.bundle_files`): each set's lane table, each
+    set's charts in each of ``formats`` (drawn by the renderer the screen uses;
+    a chart names its set in its subtitle and its file name, and its error bars
+    under its axis), ``README.txt``, and ``export.record.json``
+    (:func:`~proteia.core.record.build_record`), which lists every other file
+    with its SHA-256, and the compute settings. When lanes the lane table
+    excludes hold values, the all-lanes set is written too, in files of its own
+    (#71). ``formats`` lists :class:`~proteia.core.export.ChartFormat` values
+    (``"svg"``, ``"png"``, ``"pdf"``), each written once, in the order given;
+    an empty list writes no chart. The default,
+    :data:`~proteia.core.export.DEFAULT_CHART_FORMATS`, is provisional.
+    ``plot_conditions``, ``error_type`` and ``method`` are
+    :func:`compute_view`'s, so the export shows what the screen does.
+
+    Refused as :func:`export_lane_table` is, before anything is written: no
+    lanes (``NO_LANES``), or an image file missing or changed since import
+    (``IMAGE_FILE_CHANGED``); an unknown chart format, error type or method
+    (``INVALID_INPUT``); and a project folder whose path leaves the file names
+    less than :data:`~proteia.core.export.MIN_NAME_ROOM` characters
+    (``PATH_TOO_LONG``: Windows takes no path over 259 characters while long
+    paths are off, its default). Every file is built before the folder is made, and
+    each is written atomically; a failure while writing (``OSError``, which
+    propagates) removes the folder with what was written into it.
+    Not a state change: no log entry, no autosave.
+    """
+    chosen = _chart_formats(formats)
+    error_type = _member(ErrorType, error_type, "error type")
+    method = _member(ReduceMethod, method, "method")
+    project = session.project  # one snapshot for every file
+    batch = project.batch
+    if not batch.lanes:
+        raise OperationError(ErrorCode.NO_LANES, "declare the lanes before exporting them")
+    bad = storage.verify_images(project, session.folder)
+    if bad:
+        raise OperationError(
+            ErrorCode.IMAGE_FILE_CHANGED,
+            f"image files changed or missing since import: {', '.join(bad)};"
+            " restore them before exporting",
+            ids=bad,
+        )
+    moment = session.clock()  # one moment: the folder's name and the record's time
+    exported_at = format_timestamp(moment)
+    exports = session.folder / storage.EXPORTS_DIR
+    folder_name = export.bundle_folder_name(moment)
+    # File names are fitted to the longest name the new folder can take.
+    widest = exports / f"{folder_name} ({_FOLDER_ATTEMPTS})"
+    if not storage.name_fits(widest, "x" * MIN_NAME_ROOM):
+        raise OperationError(
+            ErrorCode.PATH_TOO_LONG,
+            "the project folder's path is too long for an export: its files' paths would"
+            " pass the file system's limit (259 characters on Windows); move the project"
+            " to a folder with a shorter path",
+        )
+    computed = results.compute_results(
+        batch, plot_conditions=plot_conditions, error_type=error_type, method=method
+    )
+    files = export.bundle_files(
+        computed,
+        formats=chosen,
+        exported_at=exported_at,
+        name_fits=functools.partial(storage.name_fits, widest),
+    )
+    doc = record.build_record(project, exported_at=exported_at, files=files, results=computed)
+    files[BUNDLE_RECORD_FILE] = record.record_bytes(doc)
+
+    exports.mkdir(parents=True, exist_ok=True)
+    folder = _new_folder(exports, folder_name)
+    try:
+        for name, data in files.items():
+            storage.write_atomic(folder / name, data)
+    except BaseException:
+        # Never leave numbers behind that no record describes.
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    return ExportBundle(folder, tuple(files))
 
 
 @_locked
