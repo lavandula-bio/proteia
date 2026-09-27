@@ -588,6 +588,50 @@ button:disabled {
   font-size: 0.85rem;
 }
 
+/* In the header while the nets use the legacy background (app.js
+   renderRequantify): the control that requantifies and, on the same line, what
+   it changes, so it takes none of the lane table's height and stays when the
+   results are hidden. Only its note gives way, cut short ("…"; its tooltip has
+   it whole): the header keeps one line and the button keeps its place. */
+.dock-head > * {
+  flex-shrink: 0;
+}
+
+.dock-head > .requantify-offer {
+  display: flex;
+  flex-shrink: 1;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.requantify-offer button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.requantify-note {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* A narrow window: the header has the tabs, so the offer takes a line of its
+   own under them (the only width at which it takes height from the table). */
+@media (max-width: 1100px) {
+  .dock-head {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .dock-head > .requantify-offer {
+    flex-basis: 100%;
+    order: 1;
+  }
+}
+
 .dock-tabs {
   display: flex;
   gap: 0.25rem;
