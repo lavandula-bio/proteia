@@ -445,6 +445,18 @@ export class ImageView {
         return;
       }
       const target = event.target;
+      const overImage = !document.querySelector("dialog[open]") && canvas.matches(":hover");
+      if (target instanceof HTMLSelectElement) {
+        // Space opens a select's list, and the page may never see its release:
+        // over the image it pans instead (the list stays shut); elsewhere it
+        // opens the list and is not held.
+        if (overImage) {
+          event.preventDefault();
+          this.spaceTaken = true;
+          this.holdSpace(true);
+        }
+        return;
+      }
       if (!this.spaceHeld && hasCaret(target)) {
         const { value, selectionStart: start, selectionEnd: end } = target;
         this.spaceTyped = { field: target, value, start, end };
