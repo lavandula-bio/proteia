@@ -13,11 +13,13 @@ import http.client
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,7 +28,9 @@ from urllib.parse import quote
 import numpy as np
 import pytest
 import tifffile
+from fastapi.routing import APIRoute
 from PIL import Image
+from starlette.routing import Mount
 
 from conftest import (
     MEMBRANE_LEVEL,
@@ -43,6 +47,7 @@ from proteia.core import session as session_module
 from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
+    BoxSize,
     Project,
     ProposalSource,
     Region,
@@ -79,9 +84,16 @@ class Client:
         self.workspace = workspace
 
     def call(
-        self, method: str, path: str, body: Any = None, *, raw: bytes | None = None
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        raw: bytes | None = None,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, Any]:
-        headers = {"Authorization": f"Bearer {self.token}"}
+        """``headers`` are sent too, such as the opening the request names."""
+        headers = {"Authorization": f"Bearer {self.token}", **(headers or {})}
         data = raw
         if raw is not None:
             headers["Content-Type"] = "application/octet-stream"
@@ -1231,6 +1243,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     # Every route that answers with the project is exercised above.
     others = {
         "GET /api/projects",
+        "GET /api/workspace",
         "POST /api/project/reveal",
         "GET /api/images/{image_id}/preview",
         "GET /api/charts/{key}.svg",
@@ -2259,7 +2272,9 @@ def test_reading_the_project_never_waits_for_a_running_operation(tmp_path):
     session = workspace.create("A µ")
     blot_upload(session, tmp_path, "α.tif")
     answers: list[dict[str, Any]] = []
-    reader = threading.Thread(target=lambda: answers.append(api.get_project(workspace)))
+    reader = threading.Thread(
+        target=lambda: answers.append(api.get_project(workspace.current(), workspace))
+    )
     with session.lock:  # as an operation holds it while it runs, e.g. a large import
         reader.start()
         reader.join(10)
@@ -2498,6 +2513,7 @@ def test_a_row_box_boxes_every_lane_and_answers_the_nets_and_the_chart(client, t
         # The loading control's row lies beyond every ring the new boxes change.
         "remeasured": [],
         "largest_change": None,
+        "unlocated_lanes": [],
     }
 
     # The nets of the new boxes and the chart they make, in the same answer.
@@ -2563,6 +2579,28 @@ def test_a_lane_without_a_band_gets_a_not_detected_record(client, tmp_path):
     assert "below_detection" in notice_codes(answer)
     assert bar(only_series(answer), "10 µM")["lane_indices"] == [3, 4]
     assert logged(client)[-1] == "detect_row_boxes"
+
+
+def test_one_band_on_an_image_without_lanes_placed_answers_the_lanes_it_cannot_locate(
+    client, tmp_path
+):
+    # The target's band in lane 2 alone and nothing else boxed on the image:
+    # the other lanes' slots rest on that one band, so they get no record, and
+    # the answer names them apart from the lanes not measured for a reason of
+    # the detector's.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    depths = (0.0, 0.0, 30000.0, 0.0, 0.0)
+    status, answer = upload(client, two_row_bytes(tmp_path, depths, (25000.0,) * 5))
+    assert status == 201, answer
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": c} for c in DOSES]})
+    body = {"name": "β-catenin", "role": "target", "image_id": answer["image_id"], "box_size": SIZE}
+    target = client.ok("POST", "/api/proteins", body)["protein_id"]
+    answer = drag(client, target)
+    assert [lane for lane, band_id in enumerate(answer["band_ids"]) if band_id] == [2]
+    assert (answer["undetected_lanes"], answer["unlocated_lanes"]) == ([], [0, 1, 3, 4])
+    assert answer["unmeasured_lanes"] == [0, 1, 3, 4]
+    assert {entry["reason"] for entry in answer["empty"]} == {"no_band"}
+    assert protein_of(answer, target)["undetected"] == []
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
@@ -3324,3 +3362,703 @@ def test_a_sample_project_in_a_projects_root_that_cannot_be_written_answers_json
     client.root.write_text("a file where the projects folder should be", encoding="utf-8")
     assert client.refused("POST", "/api/projects/sample")[:2] == (500, "file_error")
     assert client.refused("GET", "/api/project")[:2] == (409, "no_project")
+
+
+# --- A page that shows a project no longer open (#134) ---
+
+OPENING = "Proteia-Opening"
+
+# The routes that need no opening, since none reads or edits the open project,
+# and why. Every other route under /api refuses a request that names another
+# opening (found from the app's routes), so a new route is guarded unless it is
+# added here.
+NEEDS_NO_OPENING = {
+    ("GET", "/api/status"): "says which app answers",
+    ("POST", "/api/quit"): "stops Proteia, whichever project the page shows",
+    ("GET", "/api/projects"): "lists the projects root",
+    ("POST", "/api/projects"): "creates the project the request names, and opens it",
+    ("POST", "/api/projects/open"): "opens the project the request names",
+    ("POST", "/api/projects/sample"): "creates the sample project, and opens it",
+    ("GET", "/api/workspace"): "says which opening is open: how a page finds it changed",
+}
+
+
+def _declared(routes: list[Any]) -> Iterator[APIRoute]:
+    """The routes in ``routes`` and in the routers included there: FastAPI keeps
+    an included router as one route that holds it (``original_router``)."""
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        elif hasattr(route, "original_router"):
+            yield from _declared(route.original_router.routes)
+        else:
+            assert isinstance(route, Mount) and route.path == "/static", route
+
+
+def api_routes() -> set[tuple[str, str]]:
+    """Every (method, path) the app serves under /api, as its routes declare them."""
+    workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
+    app = server.create_app(
+        token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
+    ).app
+    routes = {
+        (method, route.path)
+        for route in _declared(app.routes)
+        if route.path.startswith("/api/")
+        for method in route.methods
+    }
+    described = {
+        (method.upper(), path)
+        for path, methods in app.openapi()["paths"].items()
+        for method in methods
+    }
+    assert described <= routes  # every route found
+    return routes
+
+
+def files_of(folder: Path) -> dict[str, bytes]:
+    """Every file in ``folder``, by its path there, with its bytes."""
+    return {
+        path.relative_to(folder).as_posix(): path.read_bytes()
+        for path in sorted(folder.rglob("*"))
+        if path.is_file()
+    }
+
+
+def opened_elsewhere(client: Client, tmp_path: Path) -> tuple[dict, int]:
+    """Blot set up (:func:`live`); then a page opened Other, and another page
+    Blot again. Gives the answer that page got, and the opening the first page
+    shows (Other's)."""
+    live(client, tmp_path, DOSES)
+    shown = client.ok("POST", "/api/projects", {"name": "Other"})["project"]["open_id"]
+    return client.ok("POST", "/api/projects/open", {"name": "Blot"}), shown
+
+
+def test_every_route_on_the_open_project_refuses_another_opening(client, tmp_path):
+    # A page still showing Other must neither edit nor read Blot, whose ids are
+    # Other's too (img-1, prot-1). Each route is sent with the ids Blot has and
+    # no body: the refusal comes before the body is read, and changes nothing.
+    # So is each route that takes its session in use only later
+    # (USES_ITS_SESSION_LATER): it checks the opening as early.
+    routes = api_routes()
+    assert set(NEEDS_NO_OPENING) <= routes  # none of them has gone
+    guarded = sorted(routes - set(NEEDS_NO_OPENING))
+    assert {("GET", "/api/project"), ("PUT", "/api/boxes/{band_id}")} <= set(guarded)
+    assert set(USES_ITS_SESSION_LATER) <= set(guarded)
+    answer, shown = opened_elsewhere(client, tmp_path)
+    project = answer["project"]
+    protein = next(p for p in project["proteins"] if p["bands"])
+    ids = {
+        "image_id": project["images"][0]["id"],
+        "protein_id": protein["id"],
+        "band_id": protein["bands"][0]["id"],
+        "lane_index": "0",
+        "key": only_series(answer)["chart_url"].removeprefix("/api/charts/").removesuffix(".svg"),
+    }
+    paths = [
+        (method, re.sub(r"\{(\w+)\}", lambda m: ids.get(m[1], "0"), path))
+        for method, path in guarded
+    ]
+    paths.append(("GET", f"/api/images/{ids['image_id']}/preview?colour=original"))
+    folder = client.root / "Blot"
+    before = files_of(folder)
+
+    answered = {}
+    for method, path in paths:
+        status, payload = client.call(method, path, headers={OPENING: str(shown)})
+        got = (payload["code"], payload.get("detail")) if isinstance(payload, dict) else payload
+        answered[f"{method} {path}"] = (status, got)
+    status, payload = client.call(  # an upload: refused before its body is stored
+        "POST",
+        "/api/images?name=a.tif&kind=chemiluminescence&polarity=dark_on_light",
+        raw=blot_bytes(tmp_path),
+        headers={OPENING: str(shown)},
+    )
+    answered["POST /api/images with a file"] = (status, (payload["code"], payload.get("detail")))
+
+    refused = (409, ("project_changed", {"open": "Blot", "open_id": project["open_id"]}))
+    assert {route: got for route, got in answered.items() if got != refused} == {}
+    assert files_of(folder) == before
+    assert client.revealed == []
+    after = client.ok("GET", "/api/project")["project"]
+    assert (after["open_id"], after["revision"]) == (project["open_id"], project["revision"])
+
+
+def test_a_request_naming_the_open_opening_or_none_is_served(client, tmp_path):
+    answer, _ = opened_elsewhere(client, tmp_path)
+    project = answer["project"]
+    now = {OPENING: str(project["open_id"])}
+    read = client.ok("GET", "/api/project", headers=now)["project"]
+    assert (read["open_id"], read["revision"]) == (project["open_id"], project["revision"])
+    band = next(p for p in project["proteins"] if p["bands"])["bands"][0]
+    x0, y0, x1, y1 = band["rect"]
+    rect = [x0 + 2, y0, x1 + 2, y1]
+    moved = client.ok("PUT", f"/api/boxes/{band['id']}", {"rect": rect}, headers=now)
+    assert moved["project"]["revision"] == project["revision"] + 1
+    image_id = project["images"][0]["id"]
+    status, (kind, _) = client.call("GET", f"/api/images/{image_id}/preview", headers=now)
+    assert (status, kind) == (200, "image/png")
+    status, (kind, _) = client.call("GET", only_series(moved)["chart_url"], headers=now)
+    assert (status, kind) == (200, "image/svg+xml")
+    # Without the header a request acts on whichever project is open, as before.
+    assert client.ok("POST", "/api/undo")["action"] == "move_box"
+
+
+@pytest.mark.parametrize(
+    "given",
+    ["", "one", "01", "+2", "2.0", "2_0", "0x2", pytest.param("9" * 5000, id="5000 digits")],
+)
+def test_an_opening_not_in_plain_digits_is_refused(client, given):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("POST", "/api/projects", {"name": "Other"})  # open id 2
+    before = files_of(client.root / "Other")
+    lanes = {"lanes": [{"condition": "vehicle"}]}
+    status, code, _ = client.refused("PUT", "/api/lanes", lanes, headers={OPENING: given})
+    assert (status, code) == (422, "invalid_input")
+    assert files_of(client.root / "Other") == before
+
+
+def test_two_openings_in_one_request_are_refused(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        conn.putrequest("GET", "/api/project")
+        conn.putheader("Authorization", f"Bearer {client.token}")
+        conn.putheader(OPENING, "1")
+        conn.putheader(OPENING, "1")
+        conn.endheaders()
+        response = conn.getresponse()
+        status, body = response.status, json.loads(response.read())
+    finally:
+        conn.close()
+    assert (status, body["code"]) == (422, "invalid_input")
+
+
+def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    stale = {OPENING: "7"}  # an opening that never was
+    # The page shell, served without the token, holds no user data.
+    for path in ("/", "/static/app.js"):
+        assert client.call("GET", path, headers=stale)[0] == 200
+    bodies: dict[tuple[str, str], Any] = {
+        ("GET", "/api/status"): None,
+        ("GET", "/api/projects"): None,
+        ("GET", "/api/workspace"): None,
+        ("POST", "/api/projects"): {"name": "Other"},
+        ("POST", "/api/projects/open"): {"name": "Blot"},
+        ("POST", "/api/projects/sample"): None,
+        ("POST", "/api/quit"): None,  # last: it stops the server
+    }
+    assert set(bodies) == set(NEEDS_NO_OPENING)
+    answers = {route: client.call(*route, body, headers=stale) for route, body in bodies.items()}
+    assert {route: status for route, (status, _) in answers.items()} == {
+        ("GET", "/api/status"): 200,
+        ("GET", "/api/projects"): 200,
+        ("GET", "/api/workspace"): 200,
+        ("POST", "/api/projects"): 201,
+        ("POST", "/api/projects/open"): 200,
+        ("POST", "/api/projects/sample"): 201,
+        ("POST", "/api/quit"): 202,
+    }
+    opened = [
+        answers[("POST", path)][1]["project"] for path in ("/api/projects", "/api/projects/open")
+    ]
+    assert [(p["name"], p["open_id"]) for p in opened] == [("Other", 2), ("Blot", 3)]
+
+
+def test_the_workspace_says_which_opening_is_open_without_reading_it(client, monkeypatch):
+    calls: list = []
+    _counting(monkeypatch, calls)
+    root = str(client.root)
+    assert client.ok("GET", "/api/workspace") == {"root": root, "open": None, "open_id": None}
+    client.ok("POST", "/api/projects", {"name": "Blot µ"})
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    computed = len(calls)
+    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Other", "open_id": 2}
+    client.ok("POST", "/api/projects/open", {"name": "Blot µ"})
+    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Blot µ", "open_id": 3}
+    assert len(calls) == computed + 1  # the open's answer only
+
+
+def test_the_open_session_is_given_only_for_its_own_opening(tmp_path):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    with pytest.raises(api.NoProjectError):
+        workspace.current(1)
+    first = workspace.create("A µ")
+    assert workspace.current(1) is first
+    second = workspace.create("B")
+    with pytest.raises(api.ProjectChangedError) as refused:
+        workspace.current(1)
+    assert (refused.value.open, refused.value.open_id) == ("B", 2)
+    assert workspace.current(2) is workspace.current() is second
+
+
+def test_a_project_read_again_refuses_its_earlier_opening(client, tmp_path):
+    # Its project.json changed outside Proteia (a synced copy): the reopen reads
+    # it again under the next open id, and a page showing it as it was before
+    # is refused until it reads it again.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    session = client.workspace.current()
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    remote = api.ops.open_project(other, clock=FakeClock())
+    api.ops.set_lanes(remote, [api.ops.LaneInput("drug")])
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+    assert client.ok("POST", "/api/projects/open", {"name": "Blot"})["project"]["open_id"] == 2
+
+    lanes = {"lanes": [{"condition": "vehicle"}, {"condition": "stale"}]}
+    status, payload = client.call("PUT", "/api/lanes", lanes, headers={OPENING: "1"})
+    assert (status, payload["code"], payload["detail"]) == (
+        409,
+        "project_changed",
+        {"open": "Blot", "open_id": 2},
+    )
+    saved = storage.load_project(session.folder)
+    assert [lane.label for lane in saved.batch.lanes] == ["drug"]
+
+
+# --- A request runs within the opening it named (#134's review) ---
+
+
+def _held_until_released(
+    monkeypatch, owner: Any, name: str
+) -> tuple[threading.Event, threading.Event]:
+    """Hold each call of ``owner.name`` (what a route calls once its request is
+    past the check) until released: (entered, release)."""
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(owner, name)
+
+    def held(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, held)
+    return entered, release
+
+
+def _reads_recorded(monkeypatch, session: api.ProjectSession) -> threading.Event:
+    """Set once ``session`` is asked to read its project.json again."""
+    asked = threading.Event()
+    reload = session.reload
+
+    def reloading() -> bool:
+        asked.set()
+        return reload()
+
+    monkeypatch.setattr(session, "reload", reloading)
+    return asked
+
+
+def _in_thread(target: Callable[[], Any]) -> tuple[threading.Thread, list[Any]]:
+    """``target`` started in a thread: (the thread, the list its result goes to)."""
+    result: list[Any] = []
+    thread = threading.Thread(target=lambda: result.append(target()))
+    thread.start()
+    return thread, result
+
+
+def test_an_edit_past_the_check_is_made_in_its_opening_before_a_reopen_reads_the_file(
+    client, tmp_path, monkeypatch
+):
+    # A page shows opening 1 and moves a box; its request passes the check, and
+    # before the move runs another page opens the project again, whose
+    # project.json changed outside Proteia: in another copy the band's id went
+    # to another box (the same next id). Read again first, the move would be
+    # made to that box, in a project the page never showed, and its answer, of
+    # opening 2, would be the page's first sign of that opening. The reopen
+    # waits for the request instead: the move is made to the box the page shows
+    # and answered as of opening 1. Saved, it replaces the outside change, as an
+    # edit made just before the reopen does, so the reopen finds nothing to read.
+    target_id, _, _ = live(client, tmp_path, DOSES, boxed=(0, 1, 2))
+    session = client.workspace.current()
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    placed = client.ok(
+        "POST",
+        "/api/boxes",
+        {"protein_id": target_id, "x": LANE_X[3], "y": TARGET_ROW, "lane_index": 3},
+    )
+    band_id, shown = placed["band_id"], placed["project"]["open_id"]
+    remote = api.ops.open_project(other, clock=FakeClock())
+    elsewhere = api.ops.place_box(
+        remote, target_id, LANE_X[4], TARGET_ROW, lane_index=4, grow=False
+    )
+    assert elsewhere == band_id
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+    band = next(b for p in placed["project"]["proteins"] for b in p["bands"] if b["id"] == band_id)
+    x0, y0, x1, y1 = band["rect"]
+    rect = [x0 + 2, y0, x1 + 2, y1]
+
+    entered, release = _held_until_released(monkeypatch, api.ops, "move_box")
+    asked = _reads_recorded(monkeypatch, session)
+    moving, moved = _in_thread(
+        lambda: client.call(
+            "PUT", f"/api/boxes/{band_id}", {"rect": rect}, headers={OPENING: str(shown)}
+        )
+    )
+    assert entered.wait(20)
+    reopening, reopened = _in_thread(
+        lambda: client.call("POST", "/api/projects/open", {"name": "Blot"})
+    )
+    reopening.join(1.0)  # time to read the file, were it not waiting for the move
+    read_meanwhile = asked.is_set()
+    release.set()
+    for thread in (moving, reopening):
+        thread.join(30)
+        assert not thread.is_alive()
+
+    (status, answer), (reopen_status, reopen) = moved[0], reopened[0]
+    assert status == 200, answer
+    assert answer["project"]["open_id"] == shown
+    box = next(b for p in answer["project"]["proteins"] for b in p["bands"] if b["id"] == band_id)
+    assert (box["lane_index"], box["rect"]) == (3, rect)
+    assert not read_meanwhile
+    assert reopen_status == 200, reopen
+    assert (reopen["project"]["open_id"], reopen["project"]["revision"]) == (
+        shown,
+        answer["project"]["revision"],
+    )
+    _, saved = storage.load_project(session.folder).batch.find_band(band_id)
+    assert (saved.lane_index, list(saved.box.rect(BoxSize(width=SIZE[0], height=SIZE[1])))) == (
+        3,
+        rect,
+    )
+
+
+def test_a_read_past_the_check_answers_its_opening_before_a_reopen_reads_the_file(
+    client, tmp_path, monkeypatch
+):
+    # The same race with a read: were the file read again while it runs, the
+    # answer to a request naming opening 1 would be of opening 2, or of opening
+    # 1 with opening 2's project in it. The reopen waits for it, then reads the
+    # file: the read answers opening 1 as it was, the reopen opening 2.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    session = client.workspace.current()
+    other = tmp_path / "copy µ"
+    shutil.copytree(session.folder, other)
+    api.ops.set_lanes(api.ops.open_project(other, clock=FakeClock()), [api.ops.LaneInput("drug")])
+    shutil.copytree(other, session.folder, dirs_exist_ok=True)
+
+    entered, release = _held_until_released(monkeypatch, api, "_answer")
+    asked = _reads_recorded(monkeypatch, session)
+    reading, read = _in_thread(
+        lambda: client.call("GET", "/api/project", headers={OPENING: str(shown["open_id"])})
+    )
+    assert entered.wait(20)
+    reopening, reopened = _in_thread(
+        lambda: client.call("POST", "/api/projects/open", {"name": "Blot"})
+    )
+    reopening.join(1.0)  # time to read the file, were it not waiting for the read
+    read_meanwhile = asked.is_set()
+    release.set()
+    for thread in (reading, reopening):
+        thread.join(30)
+        assert not thread.is_alive()
+
+    (status, answer), (reopen_status, reopen) = read[0], reopened[0]
+    assert status == 200, answer
+    assert answer["project"] == shown
+    assert answer["results"]["open_id"] == shown["open_id"]
+    assert not read_meanwhile
+    assert reopen_status == 200, reopen
+    assert reopen["project"]["open_id"] == shown["open_id"] + 1
+    assert [lane["condition"] for lane in reopen["project"]["lanes"]] == ["drug"]
+
+
+def test_a_request_made_while_a_reopen_waits_is_checked_against_the_opening_it_leaves(tmp_path):
+    # A reopen waits for the requests in use on the session; one made
+    # meanwhile waits for the reopen, so it never runs between the two: then it
+    # is checked against the opening the reopen leaves (here a new one).
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    project_file = session.folder / storage.PROJECT_FILE
+    empty = project_file.read_bytes()
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+    project_file.write_bytes(empty)  # changed outside Proteia
+
+    def later() -> Any:
+        try:
+            with workspace.using(1):
+                return "served"
+        except api.ProjectChangedError as refused:
+            return refused.open_id
+
+    with workspace.using(1) as used:
+        assert used is session
+        reopening, reopened = _in_thread(lambda: workspace.open("A µ"))
+        deadline = time.monotonic() + 10
+        while workspace._reopening is not session:  # it waits for the request in use
+            assert reopening.is_alive() and time.monotonic() < deadline
+            time.sleep(0.005)
+        asking, asked = _in_thread(later)
+        asking.join(0.3)
+        assert asking.is_alive()  # it waits for the reopen
+        assert workspace.view(session)[0] == 1 and session.project.batch.lanes  # nothing read
+    for thread in (reopening, asking):
+        thread.join(10)
+        assert not thread.is_alive()
+    assert reopened == [session]
+    assert asked == [2]
+    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+
+
+def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_path, monkeypatch):
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    session = workspace.create("A µ")
+    project_file = session.folder / storage.PROJECT_FILE
+    empty = project_file.read_bytes()
+    api.ops.set_lanes(session, [api.ops.LaneInput("vehicle")])
+    project_file.write_bytes(empty)  # changed outside Proteia
+    project = session.project
+    monkeypatch.setattr(api, "REOPEN_WAIT_S", 0.2)
+
+    with workspace.using(1):
+        assert workspace.open("A µ") is session  # answered as it is
+        assert session.project is project and workspace.view(session)[0] == 1
+        with workspace.using(1) as again:  # nothing waits once the reopen has ended
+            assert again is session
+    assert workspace.open("A µ") is session  # nothing in use now: read again
+    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+
+
+# The routes on the open project that check the opening their request names as
+# early as every other (before its path, query and body are), but take the
+# session in use only later, themselves, and why. Each has a test of its own
+# that it holds the session while it uses it.
+USES_ITS_SESSION_LATER = {
+    ("POST", "/api/images"): "reads its body first, which may take minutes: no reopen waits for it",
+}
+
+
+def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
+    # The routes as test_every_route_on_the_open_project_refuses_another_opening
+    # finds them: each gets its session from _open_session, which keeps it in
+    # use (Workspace.using) until the route returns, so no reopen reads the
+    # project again while one runs. Those in USES_ITS_SESSION_LATER get it from
+    # _checked_session, which checks it and no more, and take it in use
+    # themselves (test_an_upload_holds_its_session_while_it_imports_and_answers).
+    workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
+    app = server.create_app(
+        token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
+    ).app
+
+    def given(dependant: Any, call: Callable[..., Any]) -> Iterator[Any]:
+        for sub in dependant.dependencies:
+            if sub.call is call:
+                yield sub
+            yield from given(sub, call)
+
+    guarded = api_routes() - set(NEEDS_NO_OPENING)
+    assert set(USES_ITS_SESSION_LATER) <= guarded
+    found = {
+        (method, route.path): (
+            [sub.scope for sub in given(route.dependant, api._open_session)],
+            [sub.scope for sub in given(route.dependant, api._checked_session)],
+        )
+        for route in _declared(app.routes)
+        for method in route.methods
+        if (method, route.path) in guarded
+    }
+    assert found == {
+        route: ([], [None]) if route in USES_ITS_SESSION_LATER else (["function"], [])
+        for route in guarded
+    }
+
+
+# --- An upload holds its session only once its body is stored (#134's review) ---
+
+UPLOAD = "/api/images?name=a.tif&kind=chemiluminescence&polarity=dark_on_light"
+
+
+def _spools(monkeypatch) -> threading.Event:
+    """Set once an upload's route makes the temporary file its body goes to:
+    the request is past its check, and its body is read next."""
+    made = threading.Event()
+    temporary_file = api.tempfile.TemporaryFile
+
+    def spool(*args: Any, **kwargs: Any) -> Any:
+        made.set()
+        return temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(api.tempfile, "TemporaryFile", spool)
+    return made
+
+
+def _upload_begun(
+    client: Client, size: int, headers: dict[str, str] | None = None
+) -> http.client.HTTPConnection:
+    """An upload of ``size`` bytes (:data:`UPLOAD`) with its request line and
+    headers sent, and none of its body: the caller sends the body, as slowly as
+    it likes, reads the answer (:func:`_answered`) and closes the connection."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    conn.putrequest("POST", UPLOAD)
+    sent = {
+        "Authorization": f"Bearer {client.token}",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(size),
+        **(headers or {}),
+    }
+    for name, value in sent.items():
+        conn.putheader(name, value)
+    conn.endheaders()
+    return conn
+
+
+def _answered(conn: http.client.HTTPConnection) -> tuple[int, Any]:
+    response = conn.getresponse()
+    return response.status, json.loads(response.read())
+
+
+def _lanes_set(client: Client, name: str) -> tuple[dict, Path, bytes]:
+    """The project ``name`` created, then its lanes set. Gives that answer's
+    project (opening 1, as a page shows it), the project folder, and its
+    project.json from before the lanes were set: an earlier copy, which, once
+    restored outside Proteia, a reopen reads again."""
+    client.ok("POST", "/api/projects", {"name": name})
+    folder = client.root / name
+    earlier = (folder / storage.PROJECT_FILE).read_bytes()
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    return shown, folder, earlier
+
+
+def test_a_reopen_does_not_wait_for_an_upload_whose_body_is_on_its_way(
+    client, tmp_path, monkeypatch
+):
+    # A large file over a slow link takes seconds or minutes to arrive. Were
+    # the session in use meanwhile, a reopen from another page would hold up
+    # every request on the project for REOPEN_WAIT_S, then give up and leave
+    # the changed file unread, with nothing to say so. The upload holds nothing
+    # until its body is stored: the reopen reads the file at once, and an
+    # upload naming no opening is then imported into the project read again.
+    shown, folder, earlier = _lanes_set(client, "Blot")
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    data = blot_bytes(tmp_path)
+    spooled = _spools(monkeypatch)
+    conn = _upload_begun(client, len(data))
+    try:
+        conn.send(data[:1000])
+        assert spooled.wait(20)
+        started = time.monotonic()
+        reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})["project"]
+        took = time.monotonic() - started
+        conn.send(data[1000:])
+        status, imported = _answered(conn)
+    finally:
+        conn.close()
+    assert (reopened["open_id"], reopened["lanes"]) == (shown["open_id"] + 1, [])
+    assert took < api.REOPEN_WAIT_S
+    assert status == 201, imported
+    project = imported["project"]
+    assert (project["open_id"], project["lanes"]) == (reopened["open_id"], [])
+    assert [image["id"] for image in project["images"]] == [imported["image_id"]]
+
+
+@pytest.mark.parametrize(("meanwhile", "now"), [("reopen", "Blot"), ("create", "Other")])
+def test_an_upload_whose_opening_ended_on_its_way_is_refused_and_leaves_nothing(
+    client, tmp_path, monkeypatch, meanwhile, now
+):
+    # The page named opening 1. While its file was on its way, another page
+    # opened the project again, which was read again (opening 2: perhaps with
+    # other images and lanes), or created another project. The import is not
+    # made in a project the page does not show: it is refused once the body is
+    # stored, and neither the image nor its file is left, nor the temporary
+    # file the body went to.
+    shown, folder, earlier = _lanes_set(client, "Blot")
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    before = files_of(folder)
+    data = blot_bytes(tmp_path)
+    spooled = _spools(monkeypatch)
+    conn = _upload_begun(client, len(data), {OPENING: str(shown["open_id"])})
+    try:
+        conn.send(data[:1000])
+        assert spooled.wait(20)
+        if meanwhile == "reopen":
+            client.ok("POST", "/api/projects/open", {"name": "Blot"})
+        else:
+            client.ok("POST", "/api/projects", {"name": "Other"})
+        conn.send(data[1000:])
+        status, answer = _answered(conn)
+    finally:
+        conn.close()
+    open_id = shown["open_id"] + 1
+    assert status == 409, answer
+    assert (answer["code"], answer["detail"]) == (
+        "project_changed",
+        {"open": now, "open_id": open_id},
+    )
+    assert files_of(folder) == before
+    project = client.ok("GET", "/api/project")["project"]
+    assert (project["name"], project["open_id"], project["images"]) == (now, open_id, [])
+
+
+def test_an_upload_naming_another_opening_is_refused_before_its_body_is_read(
+    client, tmp_path, monkeypatch
+):
+    # Refused on its headers alone: none of a file of perhaps hundreds of
+    # megabytes is read, or stored even for a while, for a page that shows a
+    # project no longer open. The body is never sent: were it waited for, no
+    # answer would come.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    client.ok("POST", "/api/projects", {"name": "Other"})  # opening 2
+    before = files_of(client.root)
+    spooled = _spools(monkeypatch)
+    conn = _upload_begun(client, len(blot_bytes(tmp_path)), {OPENING: "1"})
+    try:
+        status, answer = _answered(conn)
+    finally:
+        conn.close()
+    assert (status, answer["code"], answer["detail"]) == (
+        409,
+        "project_changed",
+        {"open": "Other", "open_id": 2},
+    )
+    assert not spooled.is_set()
+    assert files_of(client.root) == before
+
+
+@pytest.mark.parametrize("held", ["import", "answer"])
+def test_an_upload_holds_its_session_while_it_imports_and_answers(
+    client, tmp_path, monkeypatch, held
+):
+    # Once its body is stored the upload takes the session in use, as every
+    # other route on the open project does from its start
+    # (USES_ITS_SESSION_LATER): its import is made, and answered, within the
+    # opening it named. project.json changes outside Proteia while it runs; a
+    # reopen meanwhile waits for it, then finds the import saved over the
+    # change (held in the import) or reads the change (held in the answer).
+    shown, folder, earlier = _lanes_set(client, "Blot")
+    session = client.workspace.current()
+    owner, name = {"import": (api.ops, "import_image"), "answer": (api, "_answer")}[held]
+    entered, release = _held_until_released(monkeypatch, owner, name)
+    asked = _reads_recorded(monkeypatch, session)
+    data = blot_bytes(tmp_path)
+    uploading, uploaded = _in_thread(
+        lambda: client.call("POST", UPLOAD, raw=data, headers={OPENING: str(shown["open_id"])})
+    )
+    assert entered.wait(20)
+    (folder / storage.PROJECT_FILE).write_bytes(earlier)  # restored outside Proteia
+    reopening, reopened = _in_thread(
+        lambda: client.call("POST", "/api/projects/open", {"name": "Blot"})
+    )
+    reopening.join(1.0)  # time to read the file, were it not waiting for the upload
+    read_meanwhile = asked.is_set()
+    release.set()
+    for thread in (uploading, reopening):
+        thread.join(30)
+        assert not thread.is_alive()
+
+    (status, answer), (reopen_status, reopen) = uploaded[0], reopened[0]
+    assert status == 201, answer
+    project = answer["project"]
+    assert (project["open_id"], project["lanes"]) == (shown["open_id"], shown["lanes"])
+    assert [image["id"] for image in project["images"]] == [answer["image_id"]]
+    assert not read_meanwhile
+    assert reopen_status == 200, reopen
+    after = reopen["project"]
+    if held == "import":  # saved over the change: nothing to read
+        assert (after["open_id"], after["revision"]) == (shown["open_id"], project["revision"])
+    else:
+        assert (after["open_id"], after["lanes"], after["images"]) == (shown["open_id"] + 1, [], [])

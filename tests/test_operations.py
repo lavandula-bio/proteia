@@ -97,6 +97,7 @@ from rowcases import (
     adversarial_row,
     band_between,
     bench_cases,
+    bottom_strip,
     hstripe,
     synthetic_row,
     vstreak,
@@ -3977,6 +3978,57 @@ def test_other_empty_lanes_are_left_not_measured(tmp_path, key, lane, reason):
     assert ops.compute(s).proteins[0].detected[lane] is None
 
 
+# #116: a band in lane 3 alone. The other lanes' slots are that band's centre
+# stepped by a pitch the box's width suggests, whatever lanes the image holds:
+# those check the band's own lane, not the slots.
+ONE_BAND = adversarial_row("one band", 1000, missing=[0, 1, 2, 4, 5])
+OTHER_LANES = (0, 1, 2, 4, 5)
+# The box dragged 60 px loose on the left, under a pitch: the slots the box's
+# width suggests lie up to 44 px off the lanes, lane 0's beside its band.
+LOOSE_ONE_BAND_ROW = (ONE_BAND.row[0] - 60, *ONE_BAND.row[1:])
+
+
+@pytest.mark.parametrize(
+    ("placed", "row"),
+    [
+        ((), ONE_BAND.row),
+        ((2,), ONE_BAND.row),
+        ((0, 5), ONE_BAND.row),
+        ((0, 5), LOOSE_ONE_BAND_ROW),
+        (tuple(range(6)), LOOSE_ONE_BAND_ROW),
+    ],
+    ids=[
+        "no-lanes-placed",
+        "one-lane-placed",
+        "two-lanes-placed",
+        "two-lanes-placed-loose-box",
+        "every-lane-placed-loose-box",
+    ],
+)
+def test_one_band_writes_no_record_at_slots_that_rest_on_it(tmp_path, placed, row):
+    # The slots rest on the one band: the box is placed, the other lanes get
+    # no record (an older one goes, as this run's outcome replaces it), and
+    # the answer says which.
+    s, image, protein = row_session(tmp_path, ONE_BAND)
+    if placed:
+        other_protein_in_lanes(s, image, ONE_BAND, placed)
+    old = _record(0)
+    plant_records(s, protein, old)
+    found = detected(s, protein, row)
+    assert [lane.reason for lane in found.lanes] == ["no_band"] * 3 + ["band"] + ["no_band"] * 2
+
+    placement = ops.detect_row_boxes(s, protein, row)
+    assert sorted(lane_bands(s, protein)) == [3]
+    assert protein_of(s, protein).undetected == []
+    assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), OTHER_LANES)
+    assert placement.unlocated_lanes == OTHER_LANES
+    assert [lane for lane, *_ in placement.empty] == list(OTHER_LANES)
+    params = s.project.log[-1].params
+    assert (params["undetected_written"], params["unlocated_lanes"]) == ([], list(OTHER_LANES))
+    assert params["dropped_undetected"] == [_record_json(protein, old)]
+    assert ops.compute(s).proteins[0].detected == [None, None, None, True, None, None]
+
+
 # Rows whose one empty lane holds nothing that reaches the detection limit, or
 # something the detector cannot read.
 EMPTY_LANES = [
@@ -4401,6 +4453,7 @@ def test_the_row_commit_logs_every_lane(tmp_path):
             "removed_band_ids": [removed],
             "undetected_written": [_record_json(protein, written)],
             "dropped_undetected": [_record_json(protein, old)],
+            "unlocated_lanes": [],
             "box_size": _size_of(s, protein),
             "pitch": found.pitch,
             "noise": found.noise,
@@ -5389,6 +5442,18 @@ TOO_LITTLE_MEMBRANE = (
     " membrane above and below the bands"
 )
 NO_BAND = "no band found in the row box"
+AT_THE_SIDE = (
+    "the only signal in the row box rises into its left or right edge: the box cuts through a"
+    " band there, or the image's edge is dark; draw it over whole bands"
+)
+SIDE_UNCLEAR = (
+    "the row box's left or right edge cuts through a band, so it does not show which lane each"
+    " band is in; draw it over the whole bands of every declared lane, empty end lanes included"
+)
+ACROSS = (
+    "the only signal in the row box runs across the lanes as a line or strip, not as bands: a"
+    " frame line, or a dark strip along the image's edge; draw the box over the bands only"
+)
 
 # Six touching, saturated bands filling a snug box: the detector takes their
 # level for the membrane and finds nothing.
@@ -5412,6 +5477,18 @@ DARK_STRIPE = adversarial_row(
 # the box's top row, so none of them reaches the edge as a kept extent.
 STRAY = adversarial_row("stray", 1001, artefacts=[band_between(2, 10.0, 6.0, 20000.0, dy=12.0)])
 STRAY_ROW = (STRAY.row[0], round(float(np.mean(STRAY.lane_cy))), STRAY.row[2], STRAY.row[3] + 4)
+# #116: a box over a screenshot's toolbar along the image's bottom, and boxes
+# whose right edge runs 8 px past the last lane's band centre, over that one
+# band alone and over the whole row.
+STRIP = adversarial_row(
+    "strip",
+    1000,
+    missing=range(6),
+    artefacts=[bottom_strip(14, 20000.0)],
+    box_adjust=(0, 52, 0, 80),
+)
+SIDE_ONLY = adversarial_row("side only", 1000, missing=range(5))
+SIDE_ROW = (*SIDE_ONLY.row[:2], math.floor(SIDE_ONLY.lane_cx[-1]) - 8, SIDE_ONLY.row[3])
 
 
 def row_refused(s: ProjectSession, protein_id: str, row) -> OperationError:
@@ -5507,6 +5584,25 @@ def assert_raw_reason(detail: dict, found: RowDetection) -> None:
         pytest.param(
             DARK_STRIPE, None, ErrorCode.NO_BAND_FOUND, NO_BAND, "no_band", id="darker-membrane"
         ),
+        # The last lane's band rises into the box's right edge; the other
+        # lanes are empty, or hold bands that leave that lane outside the box.
+        pytest.param(
+            SIDE_ONLY,
+            SIDE_ROW,
+            ErrorCode.NO_BAND_FOUND,
+            AT_THE_SIDE,
+            "side_signal",
+            id="at-the-side",
+        ),
+        pytest.param(
+            SCENE,
+            (*SCENE.row[:2], math.floor(SCENE.lane_cx[-1]) - 8, SCENE.row[3]),
+            ErrorCode.ROW_LANES_UNCLEAR,
+            SIDE_UNCLEAR,
+            "side_signal",
+            id="side-and-unclear",
+        ),
+        pytest.param(STRIP, None, ErrorCode.NO_BAND_FOUND, ACROSS, "line", id="strip-only"),
         pytest.param(SCENE, BLANK_ROW, ErrorCode.NO_BAND_FOUND, NO_BAND, "no_band", id="blank"),
     ],
 )
@@ -5547,6 +5643,33 @@ def test_bands_that_fit_no_lane_are_not_no_band(tmp_path, monkeypatch):
     assert (error.code, str(error)) == (ErrorCode.NO_BAND_FOUND, UNFIT)
     assert error.detail["cause"] == "unassigned"
     assert_raw_reason(error.detail, unfit)
+
+
+def test_crowded_lanes_beside_signal_at_the_side_are_worded_as_crowded(tmp_path, monkeypatch):
+    # A row over every lane refused because two lanes' extents crowd each
+    # other, whose empty first lane holds only signal rising into the box's
+    # left edge (a dark image edge): that edge leaves no lane out, so the
+    # words are the crowded lanes', not a side edge cutting a band.
+    s, _, protein = row_session(tmp_path, SCENE)
+    measure = rowdetect._measure
+
+    def crowd(lanes, *args):
+        measure(lanes, *args)
+        a, b = lanes[2].rect, lanes[3].rect
+        x = (a[0] + a[2]) // 2 - (b[2] - b[0]) // 2
+        lanes[3].rect = (x, b[1], x + b[2] - b[0], b[3])
+
+    monkeypatch.setattr(rowdetect, "_measure", crowd)
+    found = detected(s, protein, SCENE.row)
+    assert found.flags == ("ambiguous_lanes",) and found.lanes[0].reason == "no_band"
+    assert any("extents closer than the narrowest band" in note for note in found.notes)
+    first = dataclasses.replace(found.lanes[0], reason="side_signal")
+    edged = dataclasses.replace(found, lanes=(first, *found.lanes[1:]))
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: edged)
+    error = row_refused(s, protein, SCENE.row)
+    assert (error.code, str(error)) == (ErrorCode.ROW_LANES_UNCLEAR, UNCLEAR)
+    assert error.detail["cause"] == "ambiguous_lanes"
+    assert_raw_reason(error.detail, edged)
 
 
 def test_a_refusal_before_detection_carries_no_detail(tmp_path):
