@@ -15,10 +15,13 @@ lists of ids. Undo and redo answer the change they took back or made again
 (``action``, ``seq``) and the ids and not-detected record keys that went or came
 back (:class:`~proteia.core.operations.Restored`); clearing a protein's boxes
 answers the band ids removed and the (lane index, band index) of each record
-dropped; requantifying answers the images re-quantified. Any box edit may change
-every net on its image (each band's background ring leaves out every box
-there), and every answer carries every protein's numbers, so the browser
-redraws them all.
+dropped; a row box answers what it did in each lane: every field of
+:class:`~proteia.core.operations.RowPlacement`, each empty lane as
+``{lane_index, reason, snr, expected_x}``; requantifying answers the images
+re-quantified. Lane indices in requests and answers are 0-based, as stored. Any
+box edit may change every net on its image (each band's background ring leaves
+out every box there), and every answer carries every protein's numbers, so the
+browser redraws them all.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value; an unknown id 404;
@@ -410,6 +413,18 @@ class MoveBody(_Body):
     rect: tuple[StrictInt, StrictInt, StrictInt, StrictInt]
 
 
+# A row box corner in image pixels, held to 32 bits: the row is clipped to the
+# image, but logged as given, and the project file's reader refuses a number of
+# more than 4300 characters, which JSON requests may carry.
+RowCoordinate = Annotated[StrictInt, Field(ge=-(2**31), lt=2**31)]
+
+
+class RowBody(_Body):
+    protein_id: str
+    # x0, y0, x1, y1, end-exclusive
+    rect: tuple[RowCoordinate, RowCoordinate, RowCoordinate, RowCoordinate]
+
+
 class LaneIndexBody(_Body):
     lane_index: StrictInt
 
@@ -445,6 +460,30 @@ def _answer(workspace: Workspace, session: ProjectSession, **extra: Any) -> dict
 def _cascade(cascade: ops.Cascade) -> dict[str, list[str]]:
     """Every field of what a removal took with it, as lists of ids."""
     return {field.name: list(getattr(cascade, field.name)) for field in dataclasses.fields(cascade)}
+
+
+def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
+    """Every field of what a row box did
+    (:class:`~proteia.core.operations.RowPlacement`), with lists for tuples, the
+    box size as ``{width, height}`` and each empty lane as ``{lane_index,
+    reason, snr, expected_x}``."""
+    size = placement.box_size
+    return {
+        "band_ids": list(placement.band_ids),
+        "box_size": {"width": size.width, "height": size.height},
+        "kept_lanes": list(placement.kept_lanes),
+        "replaced_band_ids": list(placement.replaced_band_ids),
+        "removed_band_ids": list(placement.removed_band_ids),
+        "undetected_lanes": list(placement.undetected_lanes),
+        "unmeasured_lanes": list(placement.unmeasured_lanes),
+        "empty": [
+            {"lane_index": lane, "reason": reason, "snr": snr, "expected_x": expected_x}
+            for lane, reason, snr, expected_x in placement.empty
+        ],
+        "flags": list(placement.flags),
+        "notes": list(placement.notes),
+        "right_to_left": placement.right_to_left,
+    }
 
 
 router = APIRouter(prefix="/api")
@@ -637,6 +676,17 @@ def place_box(body: PlaceBody, workspace: WorkspaceDep) -> dict[str, Any]:
         session, body.protein_id, body.x, body.y, lane_index=body.lane_index, grow=body.grow
     )
     return _answer(workspace, session, band_id=band_id)
+
+
+@router.post("/boxes/row", status_code=201)
+def detect_row_boxes(body: RowBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Box the protein's first band in every declared lane from the row box
+    dragged over its row (:func:`~proteia.core.operations.detect_row_boxes`),
+    in image pixels. Answers what the row did in each lane
+    (:func:`_row_placement`); the same drag again changes nothing."""
+    session = workspace.current()
+    placement = ops.detect_row_boxes(session, body.protein_id, body.rect)
+    return _answer(workspace, session, **_row_placement(placement))
 
 
 @router.put("/boxes/{band_id}")
