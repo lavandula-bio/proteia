@@ -85,12 +85,22 @@ whose outcome in each lane replaces the record there
 
 Functions return ids or small frozen dataclasses, never model objects. Typed text
 follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxes`.
+
+Besides the log entry that the session logs for every commit, the operations
+log (Python's :mod:`logging`, at INFO: the session log of #137) the fallbacks a
+committed change took, as it first took them: a band whose background was
+measured another way (``asymmetric`` or ``image``: its ring cut short), a band
+whose over-exposure could not be checked (its image's warnings or unknown bit
+depth say why, and whether it is assessed near the limit instead), an image
+imported with warnings, and a row box whose detector warned or left lanes it
+could not locate; and the exports written. None of it changes what they do.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import logging
 import math
 import shutil
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
@@ -113,7 +123,12 @@ from proteia.core.export import (
     lane_table_bytes,
 )
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
-from proteia.core.imaging import clipping_depth, load_image, possible_clipping_depth
+from proteia.core.imaging import (
+    UNTRUSTED_WARNINGS,
+    clipping_depth,
+    load_image,
+    possible_clipping_depth,
+)
 from proteia.core.model import (
     DETECTING_SOURCES,
     IMAGE_SUFFIXES,
@@ -241,6 +256,14 @@ _FOLDER_ATTEMPTS: Final = 1000
 # image by at most this share of the smaller box's area (#114): more, and the
 # two would measure the same band.
 COVER_SHARE: Final = 0.5
+# How a band's background was measured when its ring was cut short
+# (quantify.band_backgrounds), as the session log words it.
+_CUT_BACKGROUNDS: Final = {
+    "asymmetric": "too few paired pixels around its box: a robust plane over its ring",
+    "image": "too little membrane around its box: the image's median",
+}
+
+_log = logging.getLogger(__name__)
 
 
 class Keep(Enum):
@@ -431,11 +454,67 @@ def _apply[T](
 ) -> T:
     """:func:`_prepare`, then commit with the log entry ``params(result)`` unless
     the project did not change."""
+    before = session.project
     new, result = _prepare(session, change)
-    if new == session.project:  # a no-op: nothing committed, no entry, no hook
+    if new == before:  # a no-op: nothing committed, no entry, no hook
         return result
     session._commit(new, action=action, params=params(result), **commit_kw)
+    _log_fallbacks(session, before)
     return result
+
+
+def _unchecked_why(image: ImageRef) -> str:
+    """Why over-exposure cannot be checked on ``image``, and what runs instead."""
+    codes = [w.code for w in image.import_warnings if w.code in UNTRUSTED_WARNINGS]
+    why = ", ".join(codes) if codes else "unknown bit depth"
+    if possible_clipping_depth(image.bit_depth, image.import_warnings) is not None:
+        return f"{why}; assessed near the detector limit instead"
+    return f"{why}; not assessed either"
+
+
+def _log_fallbacks(session: ProjectSession, before: Project) -> None:
+    """Log the fallbacks of the change just committed over ``before``, each as
+    it is first taken: the bands whose background is now measured another way
+    than before (their ring cut short), and the bands new or newly unchecked
+    for over-exposure, per image."""
+    if not _log.isEnabledFor(logging.INFO):
+        return
+    old = {
+        band.id: (band.background_mode, band.clipped)
+        for protein in before.batch.proteins
+        for band in protein.bands
+    }
+    batch, name = session.project.batch, session.folder.name
+    for image in batch.iter_images():
+        cut: dict[str, list[str]] = {}
+        unchecked: list[str] = []
+        for protein in batch.proteins:
+            if protein.image_id != image.id:
+                continue
+            for band in protein.bands:
+                was = old.get(band.id)
+                mode = band.background_mode
+                if mode in _CUT_BACKGROUNDS and (was is None or was[0] != mode):
+                    cut.setdefault(mode, []).append(band.id)
+                if band.clipped is None and (was is None or was[1] is not None):
+                    unchecked.append(band.id)
+        for mode, band_ids in cut.items():
+            _log.info(
+                "in %r: the background of %s on %s was measured another way, %s (%s)",
+                name,
+                ", ".join(band_ids),
+                image.id,
+                mode,
+                _CUT_BACKGROUNDS[mode],
+            )
+        if unchecked:
+            _log.info(
+                "in %r: over-exposure could not be checked on %s on %s (%s)",
+                name,
+                ", ".join(unchecked),
+                image.id,
+                _unchecked_why(image),
+            )
 
 
 def _size(size: BoxSize) -> dict[str, JsonValue]:
@@ -1007,6 +1086,7 @@ def import_image(
         session._commit(
             new, action="import_image", params=params, add_pixels={image_id: loaded.array}
         )
+        _log_import(session, image_id)
     except BaseException:
         # _commit can raise before committing (a bad clock or params) or after
         # (a hook bug): keep the file only if the committed project uses it.
@@ -1015,6 +1095,28 @@ def import_image(
                 path.unlink(missing_ok=True)
         raise
     return image_id
+
+
+def _log_import(session: ProjectSession, image_id: str) -> None:
+    """Log the warnings an image was imported with, and whether over-exposure
+    can be checked on it."""
+    image = session.project.batch.find_image(image_id)
+    name = session.folder.name
+    for warning in image.import_warnings:
+        _log.info(
+            "in %r: %s was imported with a warning, %s: %s",
+            name,
+            image_id,
+            warning.code,
+            warning.message,
+        )
+    if clipping_depth(image.bit_depth, image.import_warnings) is None:
+        _log.info(
+            "in %r: over-exposure cannot be checked on %s (%s)",
+            name,
+            image_id,
+            _unchecked_why(image),
+        )
 
 
 @_locked
@@ -2785,7 +2887,18 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
             "settings": rowdetect.settings(),
         }
 
+    prior = session.project
     band_ids, _, _, _ = _apply(session, "detect_row_boxes", change, params)
+    if session.project is not prior and (warnings or unlocated):
+        _log.info(
+            "in %r: the row box of %s on %s: the detector warns of %s; lanes not located"
+            " (one band found): %s",
+            session.folder.name,
+            protein_id,
+            image.id,
+            ", ".join(warnings) or "nothing",
+            ", ".join(str(lane_number(lane)) for lane in unlocated) or "none",
+        )
     # The other proteins' nets on the image the row changed; the same drag
     # again, a no-op, changes none.
     remeasured, largest = _remeasured(batch, session.project.batch, image.id, protein_id)
@@ -3137,6 +3250,12 @@ def export_lane_table(session: ProjectSession) -> Path:
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
         raise
+    _log.info(
+        "in %r: exported the lane table to %s/%s",
+        session.folder.name,
+        storage.EXPORTS_DIR,
+        LANE_TABLE_FILE,
+    )
     return path
 
 
@@ -3277,6 +3396,13 @@ def export_bundle(
         # Never leave numbers behind that no record describes.
         shutil.rmtree(folder, ignore_errors=True)
         raise
+    _log.info(
+        "in %r: exported %d files to %s/%s",
+        session.folder.name,
+        len(files),
+        storage.EXPORTS_DIR,
+        folder.name,
+    )
     return ExportBundle(folder, tuple(files))
 
 

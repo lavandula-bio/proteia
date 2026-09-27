@@ -10,10 +10,11 @@ its ``numbers`` with an unfrozen run (``packaging/windows/build.py``).
 
 It writes only in the temporary folder (and where the libraries keep their
 caches, such as matplotlib's font list): no project in ``Documents/Proteia``, no
-file in the per-user state folder, no browser (the launcher is given an opener
-that only records the address), and no connection but to its own loopback
-port. The names it gives folders, projects and files include µ, α and β, as
-users' names may.
+file in the per-user state folder, no session log (:mod:`proteia.web.logs`: the
+launcher runs the self-test before it would set one up), no browser (the
+launcher is given an opener that only records the address), and no connection
+but to its own loopback port. The names it gives folders, projects and files
+include µ, α and β, as users' names may.
 
 The steps, each run even when an earlier one failed:
 
@@ -119,6 +120,7 @@ MODULES: Final = (
     "proteia.web.api",
     "proteia.web.charts",
     "proteia.web.launch",
+    "proteia.web.logs",
     "proteia.web.projects",
     "proteia.web.results_view",
     "proteia.web.sample_project",

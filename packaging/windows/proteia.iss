@@ -23,8 +23,9 @@
 ;   running Proteia;
 ; - an uninstall removes the program files and the launcher's own files in the
 ;   uninstalling user's state folder (instance.lock, instance.json,
-;   open-proteia.html), keeps whatever else that folder holds (the session logs,
-;   #137), and never touches the projects in Documents\Proteia.
+;   open-proteia.html), keeps whatever else that folder holds (the session log
+;   in its logs folder, proteia.web.logs, #137), and never touches the projects
+;   in Documents\Proteia.
 ; The state folder is found as the launcher finds it (proteia.web.launch.state_dir):
 ; %LOCALAPPDATA%\Proteia, from the environment variable first.
 
@@ -375,7 +376,7 @@ begin
     DeleteFile(Folder + '\' + LockFileName);
     DeleteFile(Folder + '\' + InstanceFileName);
     DeleteFile(Folder + '\' + RedirectFileName);
-    { Only when nothing else is left in it: the session logs stay. }
+    { Only when nothing else is left in it: the logs folder (the session log) stays. }
     RemoveDir(Folder);
   end;
 end;
