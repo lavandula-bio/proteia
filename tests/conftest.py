@@ -174,6 +174,23 @@ def make_project_with_undetected() -> Project:
     return Project.model_validate(doc)
 
 
+def make_project_with_clashing_names() -> Project:
+    """:func:`make_project` with protein names whose lane-table columns would
+    share a name, as a ``project.json`` may hold them (the operations refuse
+    them): β-catenin named ``GAPDH`` and GAPDH named ``GAPDH clipped``, a target
+    of α-tubulin, whose net column the first one's clipping column would name.
+    Every band of both was checked for clipping: ``GAPDH`` is clipped in lane
+    1 (index 0), ``GAPDH clipped`` in lane 2 (index 1)."""
+    doc = _sample_doc()
+    first, _, second = doc["batch"]["proteins"]
+    first["name"] = "GAPDH"
+    second.update(name="GAPDH clipped", role="target", loading_control_ids=["prot-8"])
+    for protein, clipped_lane in ((first, 0), (second, 1)):
+        for band in protein["bands"]:
+            band["clipped"] = band["lane_index"] == clipped_lane
+    return Project.model_validate(doc)
+
+
 def _sample_doc_v1() -> dict:
     """The sample project as a schema-1 ``project.json`` held it (see
     :func:`sample_doc_v1`)."""

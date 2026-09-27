@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from conftest import FakeClock, make_project, write_image_files
+from conftest import FakeClock, make_project, make_project_with_clashing_names, write_image_files
 from proteia import viz
 from proteia.core import operations as ops
 from proteia.core import record, storage
@@ -601,6 +601,137 @@ def test_an_export_only_project_writes_its_nets_and_no_chart(tmp_path):
     ]
     readme = (bundle.folder / BUNDLE_README_FILE).read_text(encoding="utf-8")
     assert "No chart" in readme
+
+
+# --- Column names ---
+
+
+def table_rows(bundle: ops.ExportBundle, name: str) -> tuple[list[str], list[dict[str, str]]]:
+    """A lane table's header and its rows by header, which must be unique."""
+    data = (bundle.folder / name).read_bytes()
+    header = next(csv.reader(io.StringIO(data.decode("utf-8-sig"), newline="")))
+    assert len(set(header)) == len(header), header
+    return header, read_rows(data)
+
+
+def nets(values) -> list[str]:
+    """Nets as a lane table's cells hold them."""
+    return ["" if v is None else str(round(v, LANE_TABLE_DECIMALS)) for v in values]
+
+
+def test_proteins_whose_columns_would_share_a_name_take_a_number(tmp_path):
+    # "GAPDH clipped" names the clipping column of GAPDH: a project.json may
+    # hold both names, though the operations refuse the second.
+    s = open_sample(tmp_path, project=make_project_with_clashing_names())
+    bundle = ops.export_bundle(s, formats=["svg"])
+    renamed = "GAPDH clipped (2)"
+    assert list(bundle.files) == [
+        f"lane-table ({APPLIED}).csv",
+        f"lane-table ({ALL}).csv",
+        f"chart GAPDH ÷ α-tubulin ({APPLIED}).svg",
+        f"chart GAPDH clipped ÷ α-tubulin ({APPLIED}).svg",  # file names are not renamed
+        f"chart GAPDH ÷ α-tubulin ({ALL}).svg",
+        f"chart GAPDH clipped ÷ α-tubulin ({ALL}).svg",
+        BUNDLE_README_FILE,
+        BUNDLE_RECORD_FILE,
+    ]
+    res = ops.compute(s)
+    for name, results in ((bundle.files[0], res), (bundle.files[1], res.all_lanes)):
+        header, rows = table_rows(bundle, name)
+        assert header[4:] == [
+            "GAPDH",
+            "GAPDH clipped",
+            "α-tubulin",
+            "α-tubulin clipped",
+            renamed,
+            f"{renamed} clipped",
+            "GAPDH ÷ α-tubulin normalized",
+            "GAPDH ÷ α-tubulin fold change vs vehicle",
+            f"{renamed} ÷ α-tubulin normalized",  # its series carry its column name
+            f"{renamed} ÷ α-tubulin fold change vs vehicle",
+        ]
+        by_id = {column.protein_id: column for column in results.proteins}
+        assert [by_id["prot-7"].name, by_id["prot-9"].name] == ["GAPDH", "GAPDH clipped"]
+        assert [row["GAPDH"] for row in rows] == nets(by_id["prot-7"].nets)
+        assert [row[renamed] for row in rows] == nets(by_id["prot-9"].nets)
+        assert [row["GAPDH clipped"] for row in rows] == ["yes", "no", "", "no"]
+        assert [row[f"{renamed} clipped"] for row in rows] == ["no", "yes", "", ""]
+        first, second = results.series
+        assert (first.target_id, second.target_id) == ("prot-7", "prot-9")
+        assert [row["GAPDH ÷ α-tubulin normalized"] for row in rows] == ratios(first.normalized)
+        assert [row[f"{renamed} ÷ α-tubulin normalized"] for row in rows] == ratios(
+            second.normalized
+        )
+        assert [row[f"{renamed} ÷ α-tubulin fold change vs vehicle"] for row in rows] == ratios(
+            second.fold_change
+        )
+
+    assert (
+        "Renamed columns: no two columns of a lane table share a name. Where two would,"
+        " one takes a number."
+        ' The protein "GAPDH clipped" is named "GAPDH clipped (2)" in its columns,'
+        ' "GAPDH clipped (2)" and "GAPDH clipped (2) clipped", and in those of its series:'
+        ' the column "GAPDH clipped" holds the clipping flags of the protein "GAPDH".'
+    ) in readme_text(bundle)
+    # The record lists every file as written, the README among them.
+    written = files_of(bundle)
+    doc = json.loads(written.pop(BUNDLE_RECORD_FILE))
+    assert doc["files"] == {
+        name: {"sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}
+        for name, content in written.items()
+    }
+    assert doc["content_hash"] == storage.content_hash(s.project)
+
+
+def test_a_protein_named_like_a_series_column_gives_way_to_it(tmp_path):
+    s = open_sample(tmp_path)
+    ops.edit_protein(s, "prot-9", name=f"{SERIES} normalized")  # a name the operations take
+    bundle = ops.export_bundle(s, formats=[])
+    res = ops.compute(s)
+    for name, results in ((bundle.files[0], res), (bundle.files[1], res.all_lanes)):
+        header, rows = table_rows(bundle, name)
+        assert header[4:] == [
+            "β-catenin",
+            "β-catenin clipped",
+            "α-tubulin",
+            "α-tubulin clipped",
+            f"{SERIES} normalized (2)",
+            f"{SERIES} normalized (2) clipped",
+            f"{SERIES} normalized",
+            f"{SERIES} fold change vs vehicle",
+        ]
+        [series] = results.series
+        assert [row[f"{SERIES} normalized"] for row in rows] == ratios(series.normalized)
+        [gapdh] = [column for column in results.proteins if column.protein_id == "prot-9"]
+        assert [row[f"{SERIES} normalized (2)"] for row in rows] == nets(gapdh.nets)
+    assert (
+        f'The protein "{SERIES} normalized" is named "{SERIES} normalized (2)" in its'
+        f' columns, "{SERIES} normalized (2)" and "{SERIES} normalized (2) clipped": the'
+        f' column "{SERIES} normalized" holds the normalized values of the target'
+        ' "β-catenin" over the loading control "α-tubulin".'
+    ) in readme_text(bundle)
+
+
+def test_two_series_that_one_name_would_name_are_told_apart(tmp_path):
+    s = open_sample(tmp_path)  # names the operations take, holding " ÷ "
+    ops.edit_protein(s, "prot-7", name="X ÷ Y")  # the target of prot-8
+    ops.edit_protein(s, "prot-8", name="Z")
+    ops.edit_protein(s, "prot-9", name="Y ÷ Z")
+    ops.add_protein(s, "X", Role.TARGET, "img-4", loading_control_ids=["prot-9"])
+    bundle = ops.export_bundle(s, formats=[])
+    header, rows = table_rows(bundle, bundle.files[0])
+    assert header[12:] == [
+        "X ÷ Y ÷ Z normalized",
+        "X ÷ Y ÷ Z fold change vs vehicle",
+        "X ÷ Y ÷ Z normalized (2)",  # X over Y ÷ Z: no value, no fold change
+    ]
+    first, _ = ops.compute(s).series
+    assert [row["X ÷ Y ÷ Z normalized"] for row in rows] == ratios(first.normalized)
+    assert [row["X ÷ Y ÷ Z normalized (2)"] for row in rows] == [""] * 4
+    assert (
+        'The normalized values of the target "X" over the loading control "Y ÷ Z" are in'
+        ' the column "X ÷ Y ÷ Z normalized (2)"'
+    ) in readme_text(bundle)
 
 
 # --- Long paths ---

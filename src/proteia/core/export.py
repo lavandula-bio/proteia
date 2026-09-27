@@ -18,7 +18,10 @@ stored 0-based index.
 A bundle's file names come from protein names and result-set labels, made safe
 for every supported file system (:func:`file_stem`, which keeps µ, α and β),
 cut to fit the room the folder's path leaves (:func:`bundle_files`), and told
-apart when two would name one file (:func:`unique_stems`).
+apart when two would name one file (:func:`unique_stems`). A lane table's
+column names come from protein names too; where two columns would share a
+name, one takes a number (:func:`lane_columns`), and a bundle's README says
+which and why.
 
 Provisional until the maintainer decides (#53): the chart formats a bundle
 writes by default (:data:`DEFAULT_CHART_FORMATS`); cells that a spreadsheet
@@ -35,10 +38,11 @@ import math
 import textwrap
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 import proteia
 from proteia.core.analyze import LaneNets, ReduceMethod
@@ -180,33 +184,199 @@ def write_lane_table(
     Path(path).write_bytes(data)
 
 
+# --- Column names ---
+
+
+class SeriesColumn(NamedTuple):
+    """One column of a series in a lane table: its normalized values, or its
+    fold changes vs ``reference``."""
+
+    target_id: str
+    loading_id: str
+    reference: str | None = None  # None: the normalized values
+
+    def header(self, target: str, loading: str) -> str:
+        """The column's name, from the names its proteins' columns carry, as
+        the web UI's lane table names it: ``β-catenin ÷ α-tubulin normalized``,
+        ``β-catenin ÷ α-tubulin fold change vs vehicle``."""
+        kind = "normalized" if self.reference is None else f"fold change vs {self.reference}"
+        return f"{target} ÷ {loading} {kind}"
+
+    def holds(self, target: str, loading: str) -> str:
+        """What the column holds, with its proteins' names, for a README."""
+        if self.reference is None:
+            values = "normalized values"
+        else:
+            values = f'fold changes vs "{self.reference}"'
+        return f'{values} of the target "{target}" over the loading control "{loading}"'
+
+
+@dataclass(frozen=True)
+class LaneColumns:
+    """The names of a lane table's protein and series columns (:func:`lane_columns`)."""
+
+    proteins: dict[str, str]  # by protein id: the name its net and clipping columns carry
+    series: dict[SeriesColumn, str]  # the name of each series column
+    renamed: tuple[str, ...]  # per renamed column, a sentence: what it holds, and why
+
+
+# What each lane column holds, for a README.
+_LANE_HOLDS: Final = {
+    "lane": "the lane numbers",
+    "condition": "the lanes' conditions",
+    "sample": "the lanes' samples",
+    "include": "the include flags",
+}
+
+
+def _protein_headers(name: str) -> tuple[str, str]:
+    """The columns of a protein whose columns carry ``name``: its nets, then its
+    clipping flags (as :func:`lane_table_bytes` names them)."""
+    return name, f"{name} clipped"
+
+
+def _numbered(text: str, free: Callable[[str], bool]) -> str:
+    """``text`` with the lowest number from 2 that ``free`` takes: ``text (2)``."""
+    number = 2
+    while not free(f"{text} ({number})"):
+        number += 1
+    return f"{text} ({number})"
+
+
+def lane_columns(
+    proteins: Sequence[tuple[str, str]], series: Sequence[SeriesColumn] = ()
+) -> LaneColumns:
+    """The names of the columns of a lane table with ``proteins`` ((id, name),
+    in table order) and ``series`` columns, each unique among the table's
+    headers, as :func:`lane_table_bytes` requires; names are compared exactly,
+    as it compares them.
+
+    A protein's columns carry its name (its nets, then ``<name> clipped``)
+    unless another column has the name of either: a lane column
+    (:data:`LANE_COLUMNS`), a column of a protein before it, or a series column
+    as the proteins' own names name it. Then they carry its name with the
+    lowest number that frees both and that no protein's own columns have:
+    ``GAPDH clipped (2)`` and ``GAPDH clipped (2) clipped`` for a protein
+    ``GAPDH clipped`` after ``GAPDH``. A series column is named from its
+    proteins' columns (:meth:`SeriesColumn.header`), so a renamed protein's
+    series carry its number; one whose name a column before it has (two series
+    whose names hold `` ÷ ``, say) takes a number the same way. A series column
+    listed twice is one column. ``renamed`` gives a sentence per renamed
+    protein or series column: what it holds, and which column has its name.
+
+    The operations refuse a protein name that is a lane column or that would
+    share a name with another protein's clipping column (ignoring case), but a
+    ``project.json`` may hold one; and nothing refuses a name like a series
+    column's.
+    """
+    names = dict(proteins)
+    series = list(dict.fromkeys(series))
+    # Each column named so far, with what it holds.
+    held: dict[str, str] = {column: _LANE_HOLDS[column] for column in LANE_COLUMNS}
+    # The series columns as the proteins' own names name them: proteins give way.
+    usual: dict[str, str] = {}
+    for column in series:
+        target, loading = names[column.target_id], names[column.loading_id]
+        usual.setdefault(column.header(target, loading), f"the {column.holds(target, loading)}")
+    own = {header for _, name in proteins for header in _protein_headers(name)}
+    in_series = {pid for column in series for pid in (column.target_id, column.loading_id)}
+
+    def clash(name: str) -> str | None:
+        """The first of the columns ``name`` gives a protein that another column has."""
+        return next((h for h in _protein_headers(name) if h in held or h in usual), None)
+
+    columns: dict[str, str] = {}
+    renamed: list[str] = []
+    for protein_id, name in proteins:
+        column = name
+        taken = clash(name)
+        if taken is not None:
+            column = _numbered(
+                name, lambda c: clash(c) is None and own.isdisjoint(_protein_headers(c))
+            )
+            net, clipped = _protein_headers(column)
+            where = ", and in those of its series" if protein_id in in_series else ""
+            holder = held[taken] if taken in held else usual[taken]
+            renamed.append(
+                f'The protein "{name}" is named "{column}" in its columns, "{net}" and'
+                f' "{clipped}"{where}: the column "{taken}" holds {holder}.'
+            )
+        columns[protein_id] = column
+        net, clipped = _protein_headers(column)
+        held[net] = f'the nets of the protein "{name}"'
+        held[clipped] = f'the clipping flags of the protein "{name}"'
+
+    headers: dict[SeriesColumn, str] = {}
+    for column in series:
+        holds = column.holds(names[column.target_id], names[column.loading_id])
+        header = column.header(columns[column.target_id], columns[column.loading_id])
+        if header in held:
+            numbered = _numbered(header, lambda c: c not in held and c not in own)
+            renamed.append(
+                f'The {holds} are in the column "{numbered}": the column "{header}"'
+                f" holds {held[header]}."
+            )
+            header = numbered
+        headers[column] = header
+        held[header] = f"the {holds}"
+    return LaneColumns(columns, headers, tuple(renamed))
+
+
+def _series_values(
+    results: Results, series: SeriesResult
+) -> list[tuple[SeriesColumn, Sequence[float | None]]]:
+    """The columns of a series in a set's lane table, with their values: its
+    normalized values and, when the set forms them, its fold changes."""
+    columns: list[tuple[SeriesColumn, Sequence[float | None]]] = [
+        (SeriesColumn(series.target_id, series.loading_id), series.normalized)
+    ]
+    if series.fold_change is not None:
+        reference = results.reference_condition
+        columns.append(
+            (SeriesColumn(series.target_id, series.loading_id, reference), series.fold_change)
+        )
+    return columns
+
+
+def result_columns(results: Results) -> LaneColumns:
+    """The column names of the lane tables of ``results`` and of its all-lanes
+    set (:func:`lane_columns`): one naming for both, so a protein's or a
+    series' columns have one name in every table of a bundle."""
+    sets = [results] if results.all_lanes is None else [results, results.all_lanes]
+    return lane_columns(
+        [(column.protein_id, column.name) for column in results.proteins],
+        [
+            column
+            for one in sets
+            for series in one.series
+            for column, _ in _series_values(one, series)
+        ],
+    )
+
+
 # --- The export bundle ---
 
 
-def _series_name(series: SeriesResult) -> str:
-    """A series as the web UI's lane table names it: ``β-catenin ÷ α-tubulin``."""
-    return f"{series.target} ÷ {series.loading}"
-
-
-def result_set_table(results: Results) -> bytes:
+def result_set_table(results: Results, columns: LaneColumns | None = None) -> bytes:
     """The lane table of one result set (:func:`lane_table_bytes`), as the web
     UI's lane table shows it: the lanes with this set's include flags, each
     protein's net and clipping flags, then each series' normalized values and,
-    when the set forms its fold changes, those."""
-    columns: list[tuple[str, Sequence[float | None]]] = []
-    for series in results.series:
-        name = _series_name(series)
-        columns.append((f"{name} normalized", series.normalized))
-        if series.fold_change is not None:
-            vs = f"fold change vs {results.reference_condition}"
-            columns.append((f"{name} {vs}", series.fold_change))
+    when the set forms its fold changes, those. ``columns`` names the columns
+    (by default, :func:`result_columns` of ``results``)."""
+    if columns is None:
+        columns = result_columns(results)
+    names = columns.proteins
     return lane_table_bytes(
         [lane.condition for lane in results.lanes],
         [lane.sample for lane in results.lanes],
         [lane.included for lane in results.lanes],
-        [(column.name, column.nets) for column in results.proteins],
-        clipped={column.name: column.clipped for column in results.proteins},
-        series=columns,
+        [(names[column.protein_id], column.nets) for column in results.proteins],
+        clipped={names[column.protein_id]: column.clipped for column in results.proteins},
+        series=[
+            (columns.series[column], values)
+            for series in results.series
+            for column, values in _series_values(results, series)
+        ],
     )
 
 
@@ -364,11 +534,12 @@ def bundle_files(
     sets = [results] if results.all_lanes is None else [results, results.all_lanes]
     files: dict[str, bytes] = {}
     about: dict[str, str] = {}
+    columns = result_columns(results)
     table_fits = _stem_fits(name_fits, ["csv"], len(sets))
     table_stems = unique_stems([_table_stem(one, table_fits) for one in sets])
     for one, stem in zip(sets, table_stems, strict=True):
         name = f"{stem}.csv"
-        files[name] = result_set_table(one)
+        files[name] = result_set_table(one, columns)
         about[name] = "The lane table" + (f' of the set "{one.label}".' if one.label else ".")
 
     charted = [
@@ -406,13 +577,26 @@ def bundle_files(
         " and the SHA-256 and size of every other file here."
     )
     files[BUNDLE_README_FILE] = _readme(
-        results, sets, about, no_chart=no_chart, exported_at=exported_at
+        results,
+        sets,
+        about,
+        no_chart=no_chart,
+        exported_at=exported_at,
+        renamed=columns.renamed,
     )
     return files
 
 
-def _paragraph(text: str) -> list[str]:
-    return [*textwrap.wrap(text, _WIDTH, break_long_words=False, break_on_hyphens=False), ""]
+def _paragraph(text: str, indent: str = "") -> list[str]:
+    lines = textwrap.wrap(
+        text,
+        _WIDTH,
+        initial_indent=indent,
+        subsequent_indent=indent,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    return [*lines, ""]
 
 
 def _readme(
@@ -422,10 +606,12 @@ def _readme(
     *,
     no_chart: str | None,
     exported_at: str,
+    renamed: Sequence[str] = (),
 ) -> bytes:
     """The README of a bundle: what it holds and how to read it, in plain text
     (UTF-8, LF). ``about`` describes each file, in order; ``no_chart`` says why
-    there is no chart, if there is none."""
+    there is no chart, if there is none; ``renamed`` says which lane-table
+    columns were renamed, and why (:func:`lane_columns`)."""
     lines = ["Proteia export", "==============", ""]
     lines += _paragraph(
         f"Exported at {exported_at} (UTC) by Proteia {proteia.__version__}. Every file"
@@ -465,6 +651,13 @@ def _readme(
         f" its fold change, rounded to {LANE_TABLE_RATIO_DECIMALS} decimals. An"
         " empty cell has no value. UTF-8 with a byte-order mark; text as typed."
     )
+    if renamed:
+        lines += _paragraph(
+            "Renamed columns: no two columns of a lane table share a name. Where two"
+            " would, one takes a number."
+        )
+        for sentence in renamed:
+            lines += _paragraph(sentence, "    ")
     lines += ["Files", "-----", ""]
     for name, text in about.items():
         lines.append(name)

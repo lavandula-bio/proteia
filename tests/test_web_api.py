@@ -28,6 +28,7 @@ from conftest import (
     MEMBRANE_LEVEL,
     FakeClock,
     make_project,
+    make_project_with_clashing_names,
     make_project_with_undetected,
     synthetic_blot,
     write_image_files,
@@ -2532,6 +2533,38 @@ def test_an_export_answers_its_folder_and_files(client):
         "chart β-catenin ÷ α-tubulin (All lanes).pdf",
     ]
     assert len(export_folders(client)) == 3
+
+
+def test_an_export_of_names_whose_columns_would_clash_answers_201(client):
+    # A name the routes take: a protein named like a series column.
+    open_sample(client)
+    client.ok("PATCH", "/api/proteins/prot-9", {"name": "β-catenin ÷ α-tubulin normalized"})
+    status, answer = client.call("POST", "/api/export", {"formats": ["svg"]})
+    assert status == 201, answer
+    table = client.root / SAMPLE / answer["folder"] / answer["files"][0]
+    assert table.read_bytes().decode("utf-8-sig").splitlines()[0].split(",")[8:] == [
+        "β-catenin ÷ α-tubulin normalized (2)",
+        "β-catenin ÷ α-tubulin normalized (2) clipped",
+        "β-catenin ÷ α-tubulin normalized",
+        "β-catenin ÷ α-tubulin fold change vs vehicle",
+    ]
+
+    # Names a project.json may hold: "GAPDH clipped" next to GAPDH.
+    project = make_project_with_clashing_names()
+    write_image_files(client.root / "Clash", project)
+    storage.save_project(project, client.root / "Clash")
+    client.ok("POST", "/api/projects/open", {"name": "Clash"})
+    status, answer = client.call("POST", "/api/export", {"formats": ["svg"]})
+    assert status == 201, answer
+    table = client.root / "Clash" / answer["folder"] / answer["files"][0]
+    assert table.read_bytes().decode("utf-8-sig").splitlines()[0].split(",")[4:10] == [
+        "GAPDH",
+        "GAPDH clipped",
+        "α-tubulin",
+        "α-tubulin clipped",
+        "GAPDH clipped (2)",
+        "GAPDH clipped (2) clipped",
+    ]
 
 
 def test_an_export_uses_the_workspaces_result_settings(client):

@@ -2282,7 +2282,10 @@ def export_lane_table(session: ProjectSession) -> Path:
     (:func:`~proteia.core.record.build_record`); return the table's path.
 
     The same stored-index nets the results table shows, each followed by its
-    clipping flags, in UTF-8 with a BOM. An image file that is missing or changed
+    clipping flags, in UTF-8 with a BOM. Each protein's columns carry its name,
+    numbered as the bundle's are where a column before them has it
+    (:func:`~proteia.core.export.lane_columns`; this table has no series
+    columns to give way to). An image file that is missing or changed
     since import is refused (``IMAGE_FILE_CHANGED``, with those images): a record
     never vouches for pixels that are no longer on disk. Both files are built
     before either is written, and each is replaced atomically, the table first;
@@ -2304,12 +2307,13 @@ def export_lane_table(session: ProjectSession) -> Path:
         )
     conditions, samples, included = spine_axes(batch.lanes)
     nets, clipped = results.lane_nets(batch), results.lane_clipped(batch)
+    names = export.lane_columns([(p.id, p.name) for p in batch.proteins]).proteins
     table = lane_table_bytes(
         conditions,
         samples,
         included,
-        [(p.name, nets[p.id]) for p in batch.proteins],
-        clipped={p.name: clipped[p.id] for p in batch.proteins},
+        [(names[p.id], nets[p.id]) for p in batch.proteins],
+        clipped={names[p.id]: clipped[p.id] for p in batch.proteins},
     )
     doc = record.build_record(
         project, exported_at=session.timestamp(), files={LANE_TABLE_FILE: table}

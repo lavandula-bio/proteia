@@ -8,6 +8,8 @@ import pytest
 from proteia.core.export import (
     LANE_TABLE_DECIMALS,
     LANE_TABLE_RATIO_DECIMALS,
+    SeriesColumn,
+    lane_columns,
     lane_table_bytes,
     write_lane_table,
 )
@@ -157,3 +159,153 @@ def test_lane_table_cells_are_written_as_typed():
     data = lane_table_bytes(["-DOX", "+LPS", "=1+1", "@x"], [None] * 4, [True] * 4, [])
     rows = data.decode("utf-8-sig").splitlines()[1:]
     assert [row.split(",")[1] for row in rows] == ["-DOX", "+LPS", "=1+1", "@x"]
+
+
+# --- Column names: each unique among a lane table's headers ---
+
+
+def _table_of(columns, proteins, series=()) -> list[str]:
+    """The headers of a lane table (with no lane) whose columns ``columns`` names:
+    lane_table_bytes refuses any two that share a name."""
+    names = [columns.proteins[protein_id] for protein_id, _ in proteins]
+    data = lane_table_bytes(
+        [],
+        [],
+        [],
+        [(name, []) for name in names],
+        clipped={name: [] for name in names},
+        series=[(columns.series[column], []) for column in series],
+    )
+    return data.decode("utf-8-sig").splitlines()[0].split(",")
+
+
+def test_a_protein_whose_columns_another_column_has_takes_a_number():
+    proteins = [("p1", "GAPDH"), ("p2", "GAPDH clipped")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {"p1": "GAPDH", "p2": "GAPDH clipped (2)"}
+    assert _table_of(columns, proteins)[4:] == [
+        "GAPDH",
+        "GAPDH clipped",
+        "GAPDH clipped (2)",
+        "GAPDH clipped (2) clipped",
+    ]
+    assert columns.renamed == (
+        'The protein "GAPDH clipped" is named "GAPDH clipped (2)" in its columns,'
+        ' "GAPDH clipped (2)" and "GAPDH clipped (2) clipped": the column'
+        ' "GAPDH clipped" holds the clipping flags of the protein "GAPDH".',
+    )
+    # The protein before keeps its name, whichever it is.
+    proteins = [("p1", "GAPDH clipped"), ("p2", "GAPDH")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {"p1": "GAPDH clipped", "p2": "GAPDH (2)"}
+    assert columns.renamed == (
+        'The protein "GAPDH" is named "GAPDH (2)" in its columns, "GAPDH (2)" and'
+        ' "GAPDH (2) clipped": the column "GAPDH clipped" holds the nets of the'
+        ' protein "GAPDH clipped".',
+    )
+    _table_of(columns, proteins)
+
+
+def test_column_names_compare_exactly_and_a_number_takes_no_proteins_own_name():
+    # Exactly, as lane_table_bytes compares them: case and look-alikes differ.
+    proteins = [("p1", "lane"), ("p2", "Lane"), ("p3", "include clipped"), ("p4", "gapdh clipped")]
+    proteins += [("p5", "GAPDH"), ("p6", "ＧＡＰＤＨ clipped")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {
+        "p1": "lane (2)",
+        "p2": "Lane",
+        "p3": "include clipped",  # not the lane column "include"
+        "p4": "gapdh clipped",
+        "p5": "GAPDH",
+        "p6": "ＧＡＰＤＨ clipped",
+    }
+    assert columns.renamed == (
+        'The protein "lane" is named "lane (2)" in its columns, "lane (2)" and'
+        ' "lane (2) clipped": the column "lane" holds the lane numbers.',
+    )
+    _table_of(columns, proteins)
+    # A protein named as a number would name another one keeps its name, and
+    # that one takes the next number.
+    proteins = [("a", "X"), ("b", "X clipped"), ("c", "X clipped (2)")]
+    columns = lane_columns(proteins)
+    assert columns.proteins == {"a": "X", "b": "X clipped (3)", "c": "X clipped (2)"}
+    _table_of(columns, proteins)
+
+
+def test_a_protein_gives_way_to_a_series_column_named_from_its_proteins_columns():
+    proteins = [("t", "GAPDH"), ("l", "α-tubulin"), ("t2", "GAPDH clipped")]
+    proteins += [("p", "GAPDH ÷ α-tubulin normalized"), ("q", "GAPDH ÷ α-tubulin fold change vs v")]
+    series = [
+        SeriesColumn("t", "l"),
+        SeriesColumn("t", "l", "v clipped"),
+        SeriesColumn("t2", "l"),
+        SeriesColumn("t2", "l", "v clipped"),
+    ]
+    columns = lane_columns(proteins, series)
+    assert columns.proteins == {
+        "t": "GAPDH",
+        "l": "α-tubulin",
+        "t2": "GAPDH clipped (2)",
+        "p": "GAPDH ÷ α-tubulin normalized (2)",
+        "q": "GAPDH ÷ α-tubulin fold change vs v (2)",  # its clipping column was a series'
+    }
+    # A series is named from its proteins' columns.
+    assert columns.series == {
+        series[0]: "GAPDH ÷ α-tubulin normalized",
+        series[1]: "GAPDH ÷ α-tubulin fold change vs v clipped",
+        series[2]: "GAPDH clipped (2) ÷ α-tubulin normalized",
+        series[3]: "GAPDH clipped (2) ÷ α-tubulin fold change vs v clipped",
+    }
+    assert _table_of(columns, proteins, series)[4:] == [
+        "GAPDH",
+        "GAPDH clipped",
+        "α-tubulin",
+        "α-tubulin clipped",
+        "GAPDH clipped (2)",
+        "GAPDH clipped (2) clipped",
+        "GAPDH ÷ α-tubulin normalized (2)",
+        "GAPDH ÷ α-tubulin normalized (2) clipped",
+        "GAPDH ÷ α-tubulin fold change vs v (2)",
+        "GAPDH ÷ α-tubulin fold change vs v (2) clipped",
+        *columns.series.values(),
+    ]
+    assert columns.renamed == (
+        'The protein "GAPDH clipped" is named "GAPDH clipped (2)" in its columns,'
+        ' "GAPDH clipped (2)" and "GAPDH clipped (2) clipped", and in those of its'
+        ' series: the column "GAPDH clipped" holds the clipping flags of the protein'
+        ' "GAPDH".',
+        'The protein "GAPDH ÷ α-tubulin normalized" is named "GAPDH ÷ α-tubulin'
+        ' normalized (2)" in its columns, "GAPDH ÷ α-tubulin normalized (2)" and'
+        ' "GAPDH ÷ α-tubulin normalized (2) clipped": the column "GAPDH ÷ α-tubulin'
+        ' normalized" holds the normalized values of the target "GAPDH" over the'
+        ' loading control "α-tubulin".',
+        'The protein "GAPDH ÷ α-tubulin fold change vs v" is named "GAPDH ÷'
+        ' α-tubulin fold change vs v (2)" in its columns, "GAPDH ÷ α-tubulin fold'
+        ' change vs v (2)" and "GAPDH ÷ α-tubulin fold change vs v (2) clipped": the'
+        ' column "GAPDH ÷ α-tubulin fold change vs v clipped" holds the fold changes'
+        ' vs "v clipped" of the target "GAPDH" over the loading control "α-tubulin".',
+    )
+
+
+def test_a_series_column_that_a_column_before_it_has_takes_a_number():
+    # Two series that one name would name: names holding " ÷ " make it possible.
+    proteins = [("a", "X ÷ Y"), ("b", "Z"), ("c", "Y ÷ Z"), ("d", "X")]
+    series = [SeriesColumn("a", "b"), SeriesColumn("d", "c"), SeriesColumn("d", "c", "v")]
+    columns = lane_columns(proteins, series)
+    assert columns.proteins == dict(proteins)
+    assert columns.series == {
+        series[0]: "X ÷ Y ÷ Z normalized",
+        series[1]: "X ÷ Y ÷ Z normalized (2)",
+        series[2]: "X ÷ Y ÷ Z fold change vs v",
+    }
+    assert columns.renamed == (
+        'The normalized values of the target "X" over the loading control "Y ÷ Z" are'
+        ' in the column "X ÷ Y ÷ Z normalized (2)": the column "X ÷ Y ÷ Z normalized"'
+        ' holds the normalized values of the target "X ÷ Y" over the loading control'
+        ' "Z".',
+    )
+    _table_of(columns, proteins, series)
+    # A series column listed twice (by both result sets) is one column.
+    assert lane_columns([("a", "p"), ("b", "q")], [SeriesColumn("a", "b")] * 2).series == {
+        SeriesColumn("a", "b"): "p ÷ q normalized"
+    }
