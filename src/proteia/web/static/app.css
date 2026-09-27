@@ -398,10 +398,19 @@ button:disabled {
   color: var(--muted);
 }
 
-.stage {
-  position: relative;
+/* The right side: the image over the results dock (dock.js sizes the dock). */
+.work-area {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
+}
+
+.stage {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 8rem;
   background: var(--stage);
 }
 
@@ -490,4 +499,387 @@ button:disabled {
 
 .group .error {
   margin: 0.3rem 0 0;
+}
+
+/* Read by screen readers only. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+/* --- The results dock --- */
+
+.splitter {
+  flex: none;
+  height: 7px;
+  border-block: 1px solid var(--line);
+  background: color-mix(in srgb, CanvasText 8%, Canvas);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.splitter:hover,
+.splitter.dragging {
+  background: color-mix(in srgb, Highlight 45%, Canvas);
+}
+
+.splitter:focus-visible {
+  outline: 2px solid Highlight;
+  outline-offset: -2px;
+}
+
+.dock {
+  display: flex;
+  flex: 0 0 40%;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 12rem;
+  overflow: hidden;
+  background: Canvas;
+}
+
+.dock.collapsed {
+  flex-basis: auto !important; /* over the share dock.js sets */
+  min-height: 0;
+}
+
+.dock-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.3rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.dock-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.dock-head button {
+  padding: 0.1rem 0.6rem;
+}
+
+.tier {
+  padding: 0.05rem 0.45rem;
+  border-radius: 3px;
+  background: var(--chosen);
+  font-size: 0.8rem;
+}
+
+.updating {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.dock-tabs {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.dock-tabs [role="tab"][aria-selected="true"] {
+  background: var(--chosen);
+  font-weight: 600;
+}
+
+/* The charts column holds only its placeholder until the chart cards come
+   (a later change): the lane table takes the room. */
+.dock-body {
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr) 11rem;
+  min-height: 0;
+}
+
+.dock.tabbed .dock-body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.dock-panel {
+  min-width: 0;
+  min-height: 0;
+  padding: 0.35rem 0.75rem 0.4rem;
+  overflow: auto;
+}
+
+.panel-title {
+  margin: 0 0 0.3rem;
+  font-size: 0.9rem;
+}
+
+.charts-panel {
+  border-left: 1px solid var(--line);
+}
+
+.dock.tabbed .charts-panel {
+  border-left: 0;
+}
+
+.charts-empty {
+  margin: 0;
+  padding: 1.5rem 1rem;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* The lane table: its toolbar and notes stay put, the table scrolls. */
+.lanes-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.lane-tools {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.8rem;
+}
+
+.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.lane-tools .panel-title {
+  margin: 0 0.4rem 0 0;
+}
+
+.lane-tools select {
+  max-width: 12rem;
+}
+
+.bulk-lanes {
+  display: flex;
+  flex: 1 1 26rem;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.bulk-lanes .inline {
+  flex: 1;
+  min-width: 0;
+}
+
+.bulk-lanes input {
+  flex: 1;
+  min-width: 6rem;
+  max-width: 22rem;
+}
+
+.lanes-help {
+  flex: 1 1 18rem;
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.25;
+}
+
+.lanes-panel .error {
+  flex: none;
+  margin: 0 0 0.3rem;
+}
+
+.table-scroll {
+  flex: 1 1 auto;
+  min-height: 4rem;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.lane-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.lane-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 2; /* over the sticky cells of the rows scrolled under it */
+}
+
+.lane-table th,
+.lane-table td {
+  padding: 0.1rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.lane-table thead th {
+  background: Canvas;
+  font-weight: 600;
+  line-height: 1.2; /* a header of several lines leaves room for the rows */
+  vertical-align: bottom;
+}
+
+/* A header over two or more columns wraps rather than widen them. */
+.lane-table thead .spanning {
+  white-space: normal;
+}
+
+.lane-table .spanning {
+  text-align: center;
+}
+
+.lane-table .value {
+  text-align: right;
+}
+
+.column-name {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.3rem;
+}
+
+/* A protein name in a header: cut with an ellipsis past its width (the
+   tooltip has it in full), so long names leave room for the values. */
+.lane-table .clip {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.column-name .clip {
+  min-width: 0;
+  max-width: 8rem;
+}
+
+/* A series: the target, then "÷ loading control" beside it or under it. */
+.series-name {
+  display: block;
+  max-width: 11rem;
+  margin-left: auto;
+  white-space: normal;
+}
+
+.spanning .series-name {
+  margin-right: auto;
+}
+
+.column-note {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 400;
+}
+
+.lane-head {
+  min-width: 2.5rem;
+}
+
+/* The lane's number, tags and condition stay in view while the table scrolls
+   sideways (lanes.js gives the width of the number column). */
+.lane-table .lane-head,
+.lane-table .condition {
+  position: sticky;
+  z-index: 1;
+  background: Canvas;
+}
+
+.lane-table .lane-head {
+  left: 0;
+}
+
+.lane-table .condition {
+  left: var(--lane-column, 2.5rem);
+  box-shadow: inset -1px 0 var(--line);
+}
+
+tbody .lane-head {
+  font-weight: 400;
+}
+
+.lane-number {
+  display: inline-block;
+  min-width: 1.4rem;
+  font-weight: 600;
+  text-align: right;
+}
+
+.lane-tags {
+  display: inline-flex;
+  gap: 0.2rem;
+  margin-left: 0.3rem;
+}
+
+.lane-tags .tag {
+  font-size: 0.75rem;
+}
+
+.ref-tag {
+  background: color-mix(in srgb, #2ca02c 30%, Canvas);
+}
+
+.lane-table input[type="text"] {
+  padding: 0 0.3rem;
+}
+
+/* As wide as the longest condition or sample in the table (lanes.js counts
+   its characters), within limits; a text cut at the limit is in the tooltip. */
+.lane-condition {
+  width: clamp(7rem, calc(var(--condition-chars, 0) * 1ch + 1.2rem), 16rem);
+}
+
+.lane-sample {
+  width: clamp(6.5rem, calc(var(--sample-chars, 0) * 1ch + 1.2rem), 11rem);
+}
+
+/* A narrow window (the dock has tabs, dock.js) keeps long names shorter still,
+   so the values stay in view. */
+@media (max-width: 1100px) {
+  .lane-condition {
+    max-width: 10rem;
+  }
+
+  .column-name .clip {
+    max-width: 6rem;
+  }
+
+  .series-name {
+    max-width: 9rem;
+  }
+}
+
+.lane-table .include {
+  text-align: center;
+}
+
+.lane-table .missing {
+  color: var(--muted);
+}
+
+.over {
+  margin-right: 0.15rem;
+  color: #e0187a;
+  font-size: 0.7rem;
+}
+
+/* An excluded lane stays in the table, its values greyed. */
+.lane-table tr.excluded .value,
+.lane-table tr.excluded .lane-number {
+  color: var(--muted);
+}
+
+/* While an answer is awaited, the values it may change are dimmed. */
+.lane-table .value {
+  transition: opacity 0.2s;
+}
+
+.dock.waiting tbody .value {
+  opacity: 0.5;
 }

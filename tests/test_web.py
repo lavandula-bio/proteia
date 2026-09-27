@@ -536,7 +536,9 @@ def test_every_module_the_page_imports_is_served(running):
                 pending.append(target)
     assert seen == {
         "/static/app.js",
+        "/static/dock.js",
         "/static/dom.js",
+        "/static/lanes.js",
         "/static/proteins.js",
         "/static/view.js",
     }

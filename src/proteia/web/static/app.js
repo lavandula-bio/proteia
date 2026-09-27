@@ -3,7 +3,19 @@
 // shows the open project's images, proteins, boxes and checks. Every edit, and
 // every undo and redo, goes to the server, which answers with the stored
 // project and its results; the page only draws what it is given.
-import { $, counted, focusLost, inWords, isolate, rebuild, span } from "/static/dom.js";
+import { Dock } from "/static/dock.js";
+import {
+  $,
+  counted,
+  focusLost,
+  inWords,
+  isolate,
+  netText,
+  rebuild,
+  sentence,
+  span,
+} from "/static/dom.js";
+import { LaneTable } from "/static/lanes.js";
 import { colorOf, ProteinPanel } from "/static/proteins.js";
 import { ImageView, MISSING_COLOR } from "/static/view.js";
 
@@ -23,6 +35,9 @@ function takeToken() {
 }
 
 const token = takeToken();
+
+// The results dock: its "Updating…" counts every answer awaited (call()).
+const dock = new Dock();
 
 // --- Talking to the server ---
 
@@ -62,8 +77,11 @@ async function request(method, path, { json, body, contentType } = {}) {
 }
 
 async function call(method, path, json) {
-  const response = await request(method, path, { json });
-  return response.status === 204 ? null : response.json();
+  return dock.track(
+    request(method, path, { json }).then((response) =>
+      response.status === 204 ? null : response.json(),
+    ),
+  );
 }
 
 // --- Page state ---
@@ -276,6 +294,15 @@ const proteinPanel = new ProteinPanel({
   laneName: (index) => laneName(state.project, index),
 });
 
+// Its edits run in the panel's queue: in order with the protein edits, the
+// undos and redos, and before the box edits made after them.
+const laneTable = new LaneTable({
+  queueEdit: (task, options) => proteinPanel.queueEdit(task, options),
+  pending,
+  send,
+  status: showStatus,
+});
+
 // --- Projects ---
 
 async function showProjects() {
@@ -343,6 +370,7 @@ async function openProject(path, name) {
       forgetBitmap(id);
     }
     proteinPanel.forgetTyped();
+    laneTable.forgetTyped();
     $("lane-picker").hidden = true; // its retry places a box in the project it asked about
     applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
     $("projects-dialog").close();
@@ -428,6 +456,8 @@ function render() {
   renderNotices(project);
   renderHint(project, image);
   renderView(project);
+  laneTable.render(project, state.results);
+  dock.render(state.results);
 }
 
 function renderImages(project, image) {
@@ -517,21 +547,16 @@ const PLACED_BY = {
   row_box: "Row box detection",
   mw_guided: "Molecular-weight guide",
 };
-const WHOLE = new Intl.NumberFormat("en", { maximumFractionDigits: 0 });
-const SMALL = new Intl.NumberFormat("en", { maximumSignificantDigits: 4 });
 
 // The box's net from the results: the lane whose band is this box.
-function netText(protein, band) {
+function boxNetText(protein, band) {
   const column = state.results.proteins.find((c) => c.protein_id === protein.id);
   const lane = column ? column.band_ids.indexOf(band.id) : -1;
   if (lane < 0) {
     return band.band_index > 0 ? "Not quantified (an extra band)" : "—";
   }
   const net = column.nets[lane];
-  if (net === null) {
-    return "—";
-  }
-  return Math.abs(net) >= 100 ? WHOLE.format(net) : SMALL.format(net);
+  return net === null ? "—" : netText(net);
 }
 
 function renderBox(project) {
@@ -548,7 +573,7 @@ function renderBox(project) {
       : band.clipped === null
         ? "Not checked"
         : "No";
-  $("box-net").textContent = netText(protein, band);
+  $("box-net").textContent = boxNetText(protein, band);
   const edited = band.manually_edited ? "; moved or re-laned by hand since" : "";
   $("box-source").textContent = `${PLACED_BY[band.source] || band.source}${edited}`;
   const select = $("box-lane");
@@ -557,12 +582,6 @@ function renderBox(project) {
     select.append(new Option(laneName(project, lane.index), String(lane.index)));
   }
   select.value = String(band.lane_index);
-}
-
-// A core notice as a sentence: capitalized, with a full stop.
-function sentence(text) {
-  const capital = text.charAt(0).toUpperCase() + text.slice(1);
-  return /[.!?]$/.test(capital) ? capital : `${capital}.`;
 }
 
 function renderNotices(project) {
@@ -825,10 +844,12 @@ $("import-file").addEventListener("change", async (event) => {
   showStatus(`Importing ${isolate(file.name)}…`);
   try {
     const answer = await ordered(() =>
-      request("POST", `/api/images?${query}`, {
-        body: file,
-        contentType: "application/octet-stream",
-      }).then((response) => response.json()),
+      dock.track(
+        request("POST", `/api/images?${query}`, {
+          body: file,
+          contentType: "application/octet-stream",
+        }).then((response) => response.json()),
+      ),
     );
     applyAnswer(answer, { choose: { imageId: answer.image_id, boxId: null } });
     const image = answer.project.images.find((i) => i.id === answer.image_id);
