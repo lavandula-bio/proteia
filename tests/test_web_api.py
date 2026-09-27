@@ -1383,6 +1383,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "POST /api/incoming",
         "POST /api/handoffs",
         "POST /api/handoffs/{handoff_id}/discard",
+        "GET /api/diagnostics",
+        "POST /api/diagnostics",
+        "POST /api/diagnostics/reveal",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -3846,6 +3849,7 @@ NEEDS_NO_OPENING = {
         "POST",
         "/api/handoffs/{handoff_id}/discard",
     ): "drops files handed off, as the page shows them",
+    ("POST", "/api/diagnostics/reveal"): "shows the diagnostics folder, in the state folder",
 }
 
 
@@ -4023,6 +4027,7 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
     bodies[("POST", "/api/handoffs")] = {
         "refused": [{"name": "a.bmp", "code": "x", "message": "y"}]
     }
+    bodies[("POST", "/api/diagnostics/reveal")] = None
     bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
     paths = {incoming: "/api/incoming?name=a.tif", discard: f"/api/handoffs/{handoff_id}/discard"}
     assert set(bodies) == set(NEEDS_NO_OPENING)
@@ -4046,6 +4051,7 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         incoming: 201,
         discard: 204,
         ("POST", "/api/handoffs"): 201,
+        ("POST", "/api/diagnostics/reveal"): 204,
         ("POST", "/api/quit"): 202,
     }
     opened = [
@@ -4341,6 +4347,14 @@ USES_ITS_SESSION_LATER = {
 REPLACES_ITS_SESSION = {
     ("POST", "/api/handoffs/{handoff_id}/accept"): "imports images into a new project it opens",
 }
+# The routes that read the open project if one is open, and work with none (a
+# diagnostic file with no project, #138): they get the session, or None, from
+# _any_session, which checks the opening and keeps the session in use as
+# _open_session does.
+WORKS_WITH_NO_PROJECT = {
+    ("GET", "/api/diagnostics"): "lists the files of a diagnostic file",
+    ("POST", "/api/diagnostics"): "writes a diagnostic file",
+}
 
 
 def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
@@ -4362,24 +4376,28 @@ def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
             yield from given(sub, call)
 
     guarded = api_routes() - set(NEEDS_NO_OPENING)
-    assert set(USES_ITS_SESSION_LATER) | set(REPLACES_ITS_SESSION) <= guarded
+    special = set(USES_ITS_SESSION_LATER) | set(REPLACES_ITS_SESSION) | set(WORKS_WITH_NO_PROJECT)
+    assert special <= guarded
     found = {
         (method, route.path): (
             [sub.scope for sub in given(route.dependant, api._open_session)],
             [sub.scope for sub in given(route.dependant, api._checked_session)],
             [sub.scope for sub in given(route.dependant, api._no_other_opening)],
+            [sub.scope for sub in given(route.dependant, api._any_session)],
         )
         for route in _declared(app.routes)
         for method in route.methods
         if (method, route.path) in guarded
     }
 
-    def expected(route: tuple[str, str]) -> tuple[list, list, list]:
+    def expected(route: tuple[str, str]) -> tuple[list, list, list, list]:
         if route in USES_ITS_SESSION_LATER:
-            return [], [None], []
+            return [], [None], [], []
         if route in REPLACES_ITS_SESSION:
-            return [], [], [None]
-        return ["function"], [], []
+            return [], [], [None], []
+        if route in WORKS_WITH_NO_PROJECT:
+            return [], [], [], ["function"]
+        return ["function"], [], [], []
 
     assert found == {route: expected(route) for route in guarded}
 

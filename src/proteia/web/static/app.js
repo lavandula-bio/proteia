@@ -4,6 +4,7 @@
 // every undo and redo, goes to the server, which answers with the stored
 // project and its results; the page only draws what it is given.
 import { ChartCards } from "/static/charts.js";
+import { DiagnosticsDialog } from "/static/diagnostics.js";
 import { Dock } from "/static/dock.js";
 import {
   $,
@@ -612,6 +613,7 @@ const NOT_DONE = {
   undo: "Nothing was undone.",
   redo: "Nothing was redone.",
   export: "Nothing was exported.",
+  diagnostics: "No diagnostic file was written.",
 };
 
 // The requests other than a change, by path: what their refusal did not do (a
@@ -620,6 +622,7 @@ const REFUSED_AS = {
   "/api/undo": "undo",
   "/api/redo": "redo",
   "/api/export": "export",
+  "/api/diagnostics": "diagnostics",
 };
 
 let following = null; // the follow under way: {refused, done}, or null
@@ -744,6 +747,20 @@ $("projects-dialog").addEventListener("cancel", (event) => {
   }
 });
 $("switch-project").addEventListener("click", () => showProjects().catch(report));
+
+// --- The diagnostic file for a bug report ---
+
+// Diagnostics… in the header, and in the Projects dialog, which is all a page
+// with no project open can reach (it is modal). Its requests are sent as every
+// other, naming the opening shown; a refusal as project_changed makes the page
+// follow first (request()), and the dialog waits for that before it lists
+// what the file would hold now. Neither an edit nor awaited as one.
+const diagnostics = new DiagnosticsDialog({
+  ask: (method, path, json) => request(method, path, { json, answer: true }),
+  settled: () => (following ? following.done : Promise.resolve()),
+});
+$("diagnostics").addEventListener("click", () => diagnostics.show());
+$("projects-diagnostics").addEventListener("click", () => diagnostics.show());
 $("reveal").addEventListener("click", () => call("POST", "/api/project/reveal").catch(report));
 
 // --- Applying the server's state ---
@@ -2411,6 +2428,7 @@ $("quit").addEventListener("click", async () => {
     showStatus("Proteia has stopped. You can close this tab.");
     $("workspace").hidden = true;
     $("quit").hidden = true;
+    $("diagnostics").hidden = true;
     $("export").hidden = true;
     $("undo").hidden = true;
     $("redo").hidden = true;
@@ -2438,6 +2456,7 @@ async function start() {
   try {
     const listing = await call("GET", "/api/projects");
     $("quit").hidden = false;
+    $("diagnostics").hidden = false;
     showStatus("");
     if (listing.open) {
       applyAnswer(await call("GET", "/api/project"));

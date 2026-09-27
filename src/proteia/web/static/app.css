@@ -551,6 +551,72 @@ button:disabled {
   flex: 1 1 12rem;
 }
 
+.projects-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+}
+
+.diagnostics-dialog {
+  width: min(38rem, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.diagnostics-dialog h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.diagnostics-summary {
+  margin: 0.3rem 0 0.5rem;
+  padding-left: 1.2rem;
+}
+
+.diagnostics-summary li,
+.diagnostics-dialog p {
+  overflow-wrap: anywhere;
+}
+
+/* Every file listed, however many: the list scrolls, the dialog keeps its size. */
+.diagnostics-files {
+  max-height: 11rem;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.diagnostics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.diagnostics-table th {
+  position: sticky;
+  top: 0;
+  background: Canvas;
+  text-align: left;
+  font-weight: 600;
+}
+
+.diagnostics-table th,
+.diagnostics-table td {
+  padding: 0.15rem 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-table .size {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.diagnostics-actions {
+  justify-content: flex-end;
+  margin-top: 0.6rem;
+}
+
 .error {
   color: var(--error);
 }
