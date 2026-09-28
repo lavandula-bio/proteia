@@ -3066,6 +3066,18 @@ def _moved(found: RowDetection, dy: Callable[[int], int]) -> RowDetection:
     return dataclasses.replace(found, lanes=lanes)
 
 
+def _without_peak_ys(found: RowDetection) -> RowDetection:
+    lanes = tuple(
+        dataclasses.replace(lane, peaks=tuple(p._replace(y=0.0) for p in lane.peaks))
+        for lane in found.lanes
+    )
+    return dataclasses.replace(found, lanes=lanes)
+
+
+def _peak_ys(found: RowDetection) -> list[float]:
+    return [p.y for lane in found.lanes for p in lane.peaks]
+
+
 _PAD = 20  # rows of membrane above and below a row turned along a line
 
 
@@ -3106,7 +3118,12 @@ def test_detect_row_along_known_shift(name, line):
         background=background,
         dark_on_light=case.dark_on_light,
     )
-    assert along == _moved(level, lambda x: _PAD + shift(x))
+    expected = _moved(level, lambda x: _PAD + shift(x))
+    # Exact but for a peak's y: its offset is summed in another order, which
+    # may round the last bit differently from one platform to another.
+    assert _without_peak_ys(along) == _without_peak_ys(expected)
+    for got, want in zip(_peak_ys(along), _peak_ys(expected), strict=True):
+        assert math.isclose(got, want, rel_tol=0.0, abs_tol=1e-9)
     moved = [lane.rect for lane in along.lanes if lane.rect is not None]
     assert len({(r[2] - r[0], r[3] - r[1]) for r in moved}) == 1  # one shared size
     assert not any(overlaps(a, b) for a, b in itertools.combinations(moved, 2))
