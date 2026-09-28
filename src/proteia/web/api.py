@@ -1114,6 +1114,8 @@ class ProteinBody(_Body):
     expected_mw: ExpectedMw = None
     loading_control_ids: list[str] = []
     box_size: tuple[PositiveInt, PositiveInt] | None = None  # width, height
+    # The MW check's tolerance, a share (0.1: ±10%, #58); absent or null: the default.
+    mw_tolerance: StrictFloat | None = None
 
 
 class ProteinEditBody(_Body):
@@ -1125,6 +1127,7 @@ class ProteinEditBody(_Body):
     role: str = ""
     expected_mw: ExpectedMw = None
     loading_control_ids: list[str] = []
+    mw_tolerance: StrictFloat = 0.1  # a share (0.1: ±10%, #58); never null
 
 
 class BoxSizeBody(_Body):
@@ -1960,6 +1963,7 @@ def add_protein(body: ProteinBody, session: OpenSession, workspace: WorkspaceDep
         expected_mw=body.expected_mw,
         loading_control_ids=body.loading_control_ids,
         box_size=size,
+        mw_tolerance=body.mw_tolerance,
     )
     return _answer(workspace, session, protein_id=protein_id)
 

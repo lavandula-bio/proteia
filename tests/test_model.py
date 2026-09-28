@@ -258,6 +258,27 @@ def test_a_possible_flag_is_left_out_while_unset_and_never_beside_the_exact_one(
             )
 
 
+def test_a_band_count_is_left_out_while_unset_and_kept_to_detector_boxes():
+    # #58, D10: bands_found belongs to a detector's box nobody edited.
+    band = Band(id="band-1", lane_index=0, box=Box(x=0, y=0), source="row_box", **MEASURED)
+    for mode in ("python", "json"):
+        assert "bands_found" not in band.model_dump(mode=mode)
+        counted = Band.model_validate({**band.model_dump(mode=mode), "bands_found": 2})
+        assert counted.model_dump(mode=mode)["bands_found"] == 2
+    for source in ("row_box", "mw_guided"):
+        Band.model_validate({**band.model_dump(), "source": source, "bands_found": 1})
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        Band.model_validate({**band.model_dump(), "bands_found": 0})
+    cases = [
+        ({"manually_edited": True}, "was edited by hand"),
+        ({"source": "click"}, "was placed by click"),
+        ({"source": "manual"}, "was placed by manual"),
+    ]
+    for fields, how in cases:
+        with pytest.raises(ValidationError, match=f"band band-1: a band count .* {how}"):
+            Band.model_validate({**band.model_dump(), "bands_found": 1, **fields})
+
+
 def test_polarity_gives_the_dark_on_light_flag():
     assert Polarity.DARK_ON_LIGHT.dark_on_light is True
     assert Polarity.LIGHT_ON_DARK.dark_on_light is False

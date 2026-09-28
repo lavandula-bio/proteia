@@ -47,19 +47,40 @@ exclusion can make the replicates unequal); each chart states its own. There is
 no correction across charts: the charts of several targets are each their own
 family of comparisons.
 
+Molecular weights (#58). Each protein's column carries its expected MW and
+tolerance, and per lane its box's apparent MW (stored, read from its image's
+calibration at the box's centre) and two checks, each ``passed``, ``failed``
+or ``not_run`` (None: no box). The MW check (D7) passes an apparent MW within
+the tolerance of the expected one, either way; it is not run without an
+expected MW, without a curve on the image (``mw_not_run`` says which), or for
+a box outside the calibrated range. The band count (D10) passes a lane whose
+detector found no more bands in the count window around the box than the
+protein is expected to have (:func:`count_window`, ``Band.bands_found``);
+missing bands are not count failures (a lane below the detection limit is
+``below_detection``), and a box placed or edited by hand is not counted. The
+notices about them, and about the calibration they rest on (a curve from two
+points, a ladder that fits poorly, two ladders that disagree, a ladder side
+not used, rows that slope against the protein line), name the images and MWs
+involved (:attr:`Notice.image_ids`) and count only the lanes of their set.
+Every check reads the stored model: nothing is fitted to pixels here.
+
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
+MWs in them are whole kDa (one decimal below 10 kDa).
 """
 
 from __future__ import annotations
 
+import math
+import statistics as stats
 from collections.abc import Callable, Collection, Mapping, Sequence
 from enum import StrEnum
 from functools import partial
+from typing import Final, Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, JsonValue, model_validator
 
-from proteia.core import analyze, model
+from proteia.core import analyze, ladders, model, mwcal
 from proteia.core.analyze import (
     ALPHA,
     BaselineError,
@@ -145,6 +166,24 @@ class NoticeCode(StrEnum):
     LOG_SCALE_UNAVAILABLE = "log_scale_unavailable"
     # Per series: a rank test whose smallest possible p is not below alpha.
     RANK_TEST_CANNOT_REACH_ALPHA = "rank_test_cannot_reach_alpha"
+    # #58. Per protein: apparent MWs beyond its tolerance of the expected MW.
+    MW_DEVIATION = "mw_deviation"
+    # Per protein: lanes with more bands in the count window than it is expected to have.
+    BAND_COUNT = "band_count"
+    # Per protein: an expected MW and boxes, but no curve on its image.
+    MW_NOT_CHECKED = "mw_not_checked"
+    # Per protein: boxes whose centre lies outside the calibrated range.
+    MW_OUTSIDE_CALIBRATION = "mw_outside_calibration"
+    # Per ladder with boxes on its images: its curve rests on two points (D7).
+    CALIBRATION_TWO_POINTS = "calibration_two_points"
+    # Per ladder: a point its neighbours put more than mwcal.FIT_WARN away (D2).
+    CALIBRATION_POOR_FIT = "calibration_poor_fit"
+    # Per image: the rows slope against the protein line, so MWs drift across it.
+    ROWS_TILTED = "rows_tilted"
+    # Per register group: its two ladders disagree beyond mwcal.LADDERS_WARN (D1).
+    LADDERS_DISAGREE = "ladders_disagree"
+    # Per register group: a ladder side marked but not used, and why.
+    LADDER_SIDE_IGNORED = "ladder_side_ignored"
 
 
 class Level(StrEnum):
@@ -159,6 +198,9 @@ _INFO_CODES = frozenset(
         NoticeCode.EXTRA_BANDS_IGNORED,
         NoticeCode.LEGACY_BACKGROUND,
         NoticeCode.LOG_SCALE_UNAVAILABLE,
+        NoticeCode.MW_NOT_CHECKED,
+        NoticeCode.CALIBRATION_TWO_POINTS,
+        NoticeCode.LADDER_SIDE_IGNORED,
     }
 )
 # Notices about one set's charts: the tests of the two sets are their own (an
@@ -209,6 +251,29 @@ class Notice(BaseModel, frozen=True):
     protein_ids: tuple[str, ...] = ()
     lane_indices: tuple[int, ...] = ()
     conditions: tuple[str, ...] = ()
+    image_ids: tuple[str, ...] = ()  # the images a calibration or MW notice concerns (#58)
+
+
+# The state of an MW or band-count check in one lane (#58); None where the lane has no box.
+CheckState = Literal["passed", "failed", "not_run"]
+# Why a protein's MW is checked in no lane: no expected MW, or no curve on its
+# image (no calibration point in its register group, or one).
+MwNotRun = Literal["no_expected_mw", "no_points", "one_point"]
+
+
+class ImageCalibration(BaseModel, frozen=True):
+    """The calibration of a protein's image, as the results name it (#58):
+    whether it comes from two ladders, the line's slope across the blot
+    (degrees, positive where the right side runs lower) and how far the two
+    ladders disagree once that slope is taken out, at which MW. The last three
+    are None with one ladder; an infinite disagreement (degenerate ladders
+    only) is None, with ``disagreement_infinite``, since JSON has no infinity."""
+
+    two_ladders: bool
+    tilt_deg: float | None
+    disagreement: float | None
+    disagreement_mw: float | None
+    disagreement_infinite: bool = False
 
 
 class LaneRow(BaseModel, frozen=True):
@@ -236,6 +301,21 @@ class ProteinColumn(BaseModel, frozen=True):
     # Per lane: True = a box; False = not detected (below the detection limit, no
     # value); None = not measured.
     detected: list[bool | None]
+    # #58. The expected MWs, top band first (empty: none given), and the MW
+    # check's tolerance, a share (0.1: ±10%).
+    expected_mws: list[float]
+    mw_tolerance: float
+    # Per lane: the box's apparent MW, kDa; None = no box, or no curve at its centre.
+    apparent_mw: list[float | None]
+    mw_check: list[CheckState | None]  # per lane; None = no box
+    # Why no lane's MW is checked; None = checked wherever a box lies in the
+    # calibrated range (a lane outside it is not_run).
+    mw_not_run: MwNotRun | None
+    # Per lane: the bands the detector found in the count window; None = no box,
+    # or not counted (placed or edited by hand, or cleared).
+    bands_found: list[int | None]
+    count_check: list[CheckState | None]  # per lane; None = no box; not_run = not counted
+    calibration: ImageCalibration | None  # its image's; None = no curve there
 
 
 class SeriesResult(BaseModel, frozen=True):
@@ -389,6 +469,541 @@ def _background_notices(
             protein_ids=(protein.id,),
             lane_indices=uneven,
         )
+
+
+# --- Molecular weights (#58): the MW and band-count checks ---
+
+# rows_tilted (D9 pending; D1): the MW drift across the lanes from which the
+# rows' slope against the protein line warns, and the fewest boxes of one
+# protein (a detector's, nobody edited, in the set's lanes) a slope is read from.
+TILT_WARN: Final = 0.05
+TILT_MIN_LANES: Final = 4
+
+_Fitted = mwcal.Calibration | mwcal.NoCalibration
+
+
+def count_window(fitted: _Fitted, rect: model.Rect, tolerance: float) -> tuple[float, float] | None:
+    """The rows a band count reads around a box ``rect`` (#58, D10): the box's
+    centre plus or minus ``log10(1 + tolerance)`` decades of MW, in the pixels
+    per decade of the image's calibration at that centre (12 px on a blot of
+    300 px per decade at ±10%), so a neighbouring protein further off in MW is
+    not counted. None where the image has no curve there: a count then reads
+    the row box's rows."""
+    if not isinstance(fitted, mwcal.Calibration):
+        return None
+    cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+    ppd = fitted.px_per_decade(cx, cy)
+    if ppd is None or not math.isfinite(ppd):
+        return None
+    half = math.log10(1.0 + tolerance) * ppd
+    return cy - half, cy + half
+
+
+def mw_check_settings() -> dict[str, JsonValue]:
+    """How the MW and band-count checks run (#58), JSON-plain: what an export
+    record reports under ``mw`` (with :func:`~proteia.core.mwcal.settings`)."""
+    return {
+        "apparent_mw": "the image's calibration at the box's centre, padding included",
+        "deviation": "apparent / expected - 1",
+        "passes": "(1 - tolerance) * expected <= apparent <= (1 + tolerance) * expected",
+        "default_tolerance": model.Protein.model_fields["mw_tolerance"].default,
+        "count_window": (
+            "the box's centre +/- log10(1 + tolerance) decades on the image's calibration"
+            " there; the row box's rows without a curve"
+        ),
+        "count": (
+            "the band, and each other peak of the lane in the window that reaches the"
+            " detector's second_share of the lane's peak and is as wide as a band; tops"
+            " side by side in one band count once"
+        ),
+        "count_passes": "at most the expected band count",
+        "tilt": (
+            "per protein with tilt_min_lanes detector boxes nobody edited, the least-squares"
+            " slope across the lanes of each box centre's offset from the protein line at"
+            " its expected MW where the calibration reaches it (else the boxes' median"
+            " apparent MW); the median slope over the lanes' span, as an MW drift at the"
+            " middle lane"
+        ),
+        "tilt_warn": TILT_WARN,
+        "tilt_min_lanes": TILT_MIN_LANES,
+    }
+
+
+def _mw_check(
+    expected: float | None, tolerance: float, fitted: _Fitted, apparent: float | None
+) -> CheckState:
+    if expected is None or not isinstance(fitted, mwcal.Calibration) or apparent is None:
+        return "not_run"
+    within = (1.0 - tolerance) * expected <= apparent <= (1.0 + tolerance) * expected
+    return "passed" if within else "failed"
+
+
+def _count_check(band: model.Band, expected_count: int) -> CheckState:
+    if band.bands_found is None:
+        return "not_run"
+    return "passed" if band.bands_found <= expected_count else "failed"
+
+
+def _mw_not_run(protein: model.Protein, fitted: _Fitted) -> MwNotRun | None:
+    if protein.expected_mw is None:
+        return "no_expected_mw"
+    if isinstance(fitted, mwcal.NoCalibration):
+        return fitted.reason
+    return None
+
+
+def _beyond_range(fitted: mwcal.Calibration, protein: model.Protein, band: model.Band) -> bool:
+    """Whether a box's centre lies outside its image's calibrated range, as a
+    box without an apparent MW does, but for one stored by a fit from before
+    #58 (its MW stays as stored until a calibration change refits it)."""
+    size = protein.box_size
+    try:
+        mw = fitted.mw_at(band.box.x + size.width / 2, band.box.y + size.height / 2)
+    except OverflowError:  # past the largest float: only a ladder labelled near it
+        return True
+    return mw is None
+
+
+def _image_calibration(fitted: _Fitted) -> ImageCalibration | None:
+    if not isinstance(fitted, mwcal.Calibration):
+        return None
+    disagreement = fitted.disagreement
+    infinite = disagreement is not None and not math.isfinite(disagreement.value)
+    return ImageCalibration(
+        two_ladders=fitted.two_ladders,
+        tilt_deg=fitted.tilt_deg,
+        disagreement=None if disagreement is None or infinite else disagreement.value,
+        disagreement_mw=None if disagreement is None else disagreement.mw,
+        disagreement_infinite=infinite,
+    )
+
+
+def _kda(mw: float) -> str:
+    """An MW as the notices write it: whole kDa, one decimal below 10 kDa, and
+    in significant digits from a million kDa up or below 0.1 kDa (a ladder
+    labelled far past any protein)."""
+    if not math.isfinite(mw):
+        return "∞"
+    if mw >= 1e6 or mw < 0.1:
+        return f"{mw:.3g}"
+    return str(round(mw)) if mw >= 10.0 else f"{mw:.1f}".removesuffix(".0")
+
+
+def _kda_at(z: float) -> str:
+    """The MW ``10 ** z`` (a range end) as the notices write it; ∞ past the
+    largest float, which only a ladder labelled near it reaches."""
+    try:
+        return _kda(10.0**z)
+    except OverflowError:
+        return "∞"
+
+
+def _limit(share: float) -> str:
+    """A tolerance or a threshold (a share) as a percentage, as given: ``10%``,
+    ``12.5%``."""
+    return f"{100.0 * share:.6g}%"
+
+
+def _away(value: float, decimals: int, *, up: bool) -> float:
+    """``value`` rounded to ``decimals`` up or down (a hair of float error
+    taken off first, so 100.1 stays 100.1)."""
+    scale = 10.0**decimals
+    return (math.ceil if up else math.floor)(round(value * scale, 6)) / scale
+
+
+def _percent_past(share: float, limit: float, *, signed: bool = True) -> str:
+    """A share past ``limit`` in size, as a percentage: whole percent, or where
+    that would read as within the limit as :func:`_limit` writes it (−10% past
+    ±10%), with up to three decimals, rounded away from zero, so it does not.
+    ``signed``: with its sign, a true minus sign (``+8%``, ``−10.1%``)."""
+    size, bound = 100.0 * abs(share), float(_limit(limit).removesuffix("%"))
+    decimals, shown = 0, float(f"{size:.0f}")
+    while shown <= bound and decimals < 3:
+        decimals += 1
+        shown = _away(size, decimals, up=True)
+    text = f"{shown:.{decimals}f}%"
+    if not signed:
+        return text
+    return ("−" if share < 0 else "+") + text
+
+
+def _kda_past(mw: float, expected: float, limit: float) -> str:
+    """An MW past ``limit`` of ``expected`` as :func:`_kda` writes it, or where
+    that would read as within the limit (83 kDa for 82.78 against 92 at ±10%),
+    with up to three more decimals, rounded away from ``expected``, so it does
+    not."""
+    text = _kda(mw)
+    if not 0.1 <= mw < 1e6:  # written in significant digits: far past any limit
+        return text
+    bound = float(_limit(limit).removesuffix("%"))
+    decimals = 0 if mw >= 10.0 else 1
+    shown, extra = float(text), 0
+    while round(100.0 * abs(shown / expected - 1.0), 9) <= bound and extra < 3:
+        extra += 1
+        shown = _away(mw, decimals + extra, up=mw > expected)
+        text = f"{shown:.{decimals + extra}f}"
+    return text
+
+
+def _ladder_words(membrane: model.Membrane) -> str:
+    """The membrane's ladder, for a deviation notice: a wrong buffer system reads
+    true bands 10 to 19% off (D3), which no fit measure catches."""
+    name = membrane.calibration.ladder
+    if name is None:
+        return ""
+    preset = ladders.preset(name)
+    if preset is None:
+        return f"; its ladder is {name!r}"
+    return f"; its ladder, {preset.product}, is read with the values for {preset.system}"
+
+
+def _mw_protein_notices(
+    batch: model.Batch,
+    protein: model.Protein,
+    fitted: _Fitted,
+    bands: list[model.Band | None],
+    included: list[bool],
+    note: Callable[..., None],
+) -> None:
+    """The MW and band-count notices of one protein's first bands in the set's lanes."""
+    shown = [(i, band) for i, band in enumerate(bands) if band is not None and included[i]]
+    if not shown:
+        return
+    ids, image = (protein.id,), (protein.image_id,)
+    expected, tolerance = protein.expected_mw, protein.mw_tolerance
+    if expected is not None and isinstance(fitted, mwcal.NoCalibration):
+        points = batch.membrane_of(protein.image_id).calibration.points
+        sides = {point.side for point in points if point.image_id in fitted.group}
+        if fitted.reason == "no_points":
+            missing = "no molecular-weight calibration"
+            advice = (
+                "mark the ladder on its marker image, or link it to the marker image it was"
+                " taken with"
+            )
+        elif len(sides) > 1:  # one point on each side: neither is a ladder
+            missing = "one calibration point per ladder side"
+            advice = f"mark at least {mwcal.MIN_LADDER_POINTS} on one side"
+        else:
+            missing = "one calibration point"
+            advice = f"mark at least {mwcal.MIN_LADDER_POINTS}"
+        note(
+            NoticeCode.MW_NOT_CHECKED,
+            f"{protein.name!r} has {missing} on {protein.image_id}: its bands are taken to"
+            f" be at {expected:g} kDa and their MW is not checked; {advice}",
+            protein_ids=ids,
+            image_ids=image,
+        )
+    if expected is not None and isinstance(fitted, mwcal.Calibration):
+        failed = [
+            (i, band.apparent_mw)
+            for i, band in shown
+            if _mw_check(expected, tolerance, fitted, band.apparent_mw) == "failed"
+        ]
+        if failed:
+            mws = [mw for _, mw in failed if mw is not None]
+            lanes = tuple(i for i, _ in failed)
+            ends = (min(mws), max(mws))
+            low, high = (_kda_past(mw, expected, tolerance) for mw in ends)
+            at = low if low == high else f"{low}–{high}"
+            low, high = (_percent_past(mw / expected - 1.0, tolerance) for mw in ends)
+            spread = low if low == high else f"{low} to {high}"
+            membrane = batch.membrane_of(protein.image_id)
+            note(
+                NoticeCode.MW_DEVIATION,
+                f"{protein.name!r} runs at {at} kDa in {lanes_phrase(lanes)} ({spread}), more"
+                f" than ±{_limit(tolerance)} from its expected {expected:g} kDa"
+                f"{_ladder_words(membrane)}",
+                protein_ids=ids,
+                lane_indices=lanes,
+                image_ids=image,
+            )
+        outside = tuple(
+            i
+            for i, band in shown
+            if band.apparent_mw is None and _beyond_range(fitted, protein, band)
+        )
+        if outside:
+            where = ", where both ladders reach" if fitted.two_ladders else ""
+            lies = "lies" if len(outside) == 1 else "lie"
+            note(
+                NoticeCode.MW_OUTSIDE_CALIBRATION,
+                f"{protein.name!r} in {lanes_phrase(outside)} {lies} outside the calibrated"
+                f" range of {protein.image_id} ({_kda_at(fitted.z_hi)}–{_kda_at(fitted.z_lo)} kDa"
+                f"{where}): its MW is not checked there",
+                protein_ids=ids,
+                lane_indices=outside,
+                image_ids=image,
+            )
+    expected_count = protein.expected_band_count
+    extra = [
+        (i, band.bands_found)
+        for i, band in shown
+        if _count_check(band, expected_count) == "failed" and band.bands_found is not None
+    ]
+    if extra:
+        counts = " or ".join(str(n) for n in sorted({n for _, n in extra}))
+        lanes = tuple(i for i, _ in extra)
+        window = (
+            f"within ±{_limit(tolerance)} of its box's MW"
+            if isinstance(fitted, mwcal.Calibration)
+            else "in its row box"
+        )
+        are = "is" if expected_count == 1 else "are"
+        note(
+            NoticeCode.BAND_COUNT,
+            f"{protein.name!r}: {counts} separate bands {window} in {lanes_phrase(lanes)},"
+            f" where {expected_count} {are} expected",
+            protein_ids=ids,
+            lane_indices=lanes,
+            image_ids=image,
+        )
+
+
+def _ladder_images(
+    membrane: model.Membrane, group: frozenset[str], side: model.LadderSide
+) -> tuple[str, ...]:
+    """The images of a register group holding points of one ladder side, in
+    membrane order."""
+    holding = {p.image_id for p in membrane.calibration.points if p.side == side}
+    return tuple(image.id for image in membrane.images if image.id in group and image.id in holding)
+
+
+def _two_sides(fitted: mwcal.Calibration) -> bool:
+    """Whether a register group has points on both sides, used or not: its
+    notices then name each ladder's side."""
+    sides = {ladder.side for ladder in fitted.ladders} | {side for side, _ in fitted.ignored}
+    return sides != {model.LadderSide.LEFT}
+
+
+def _calibration_notices(
+    membrane: model.Membrane,
+    group: frozenset[str],
+    fitted: mwcal.Calibration,
+    proteins: tuple[str, ...],
+    note: Callable[..., None],
+) -> None:
+    """The notices of one register group's calibration, whose images hold the
+    boxes of ``proteins`` (in any lane; some of them in the set's): a ladder
+    of two points, a ladder point its neighbours put elsewhere, two ladders
+    that disagree, and a side not used."""
+    strip = model.CalibrationPointSource.STRIP_EDGE
+    two_sides = _two_sides(fitted)
+    for ladder in fitted.ladders:
+        images = _ladder_images(membrane, group, ladder.side)
+        named = ", ".join(images)
+        name = (
+            f"the {ladder.side.value} ladder of {named}" if two_sides else f"the ladder of {named}"
+        )
+        if len(ladder.mws) == 2:
+            kind = (
+                "strip edges"
+                if all(source is strip for source in ladder.sources)
+                else "ladder bands"
+                if strip not in ladder.sources
+                else "a ladder band and a strip edge"
+            )
+            first, second = (_kda(mw) for mw in ladder.mws)
+            subject = name if two_sides else f"the calibration of {named}"
+            note(
+                NoticeCode.CALIBRATION_TWO_POINTS,
+                f"{subject} rests on two points ({kind} at {first} and {second} kDa): apparent"
+                " MWs are less reliable",
+                protein_ids=proteins,
+                image_ids=images,
+            )
+        quality = ladder.quality
+        if quality is not None and quality.value > mwcal.FIT_WARN:
+            # The share compared: the label against where its neighbours put it.
+            way = "higher" if quality.mw > quality.predicted_mw else "lower"
+            off = (
+                f"{_percent_past(quality.value, mwcal.FIT_WARN, signed=False)} {way}"
+                if math.isfinite(quality.value)
+                else f"{way} by more than any MW spans"
+            )
+            note(
+                NoticeCode.CALIBRATION_POOR_FIT,
+                f"{_kda(quality.mw)} kDa on {name} sits where the bands above and below it put"
+                f" {_kda(quality.predicted_mw)} kDa, so its label is {off}: check the label",
+                protein_ids=proteins,
+                image_ids=images,
+            )
+    disagreement = fitted.disagreement
+    if disagreement is not None and disagreement.value > mwcal.LADDERS_WARN:
+        marked = {p.image_id for p in membrane.calibration.points}
+        images = tuple(image.id for image in membrane.images if image.id in group & marked)
+        by = (
+            f"{disagreement.value:.0%}"
+            if math.isfinite(disagreement.value)
+            else "by more than any MW spans"
+        )
+        note(
+            NoticeCode.LADDERS_DISAGREE,
+            f"the left and right ladders of {', '.join(images)} disagree near"
+            f" {_kda(disagreement.mw)} kDa ({by}): check both ladders' labels",
+            protein_ids=proteins,
+            image_ids=images,
+        )
+    for side, reason in fitted.ignored:
+        images = _ladder_images(membrane, group, side)
+        where = f"the {side.value} ladder of {', '.join(images)}"
+        if reason == "one_point":
+            why = f"{where} has 1 point and is not used; mark at least {mwcal.MIN_LADDER_POINTS}"
+        else:
+            why = (
+                f"{where} shares fewer than {mwcal.MIN_SHARED_MWS} marked MWs with the left one"
+                " and is not used; mark the same bands on both"
+            )
+        note(
+            NoticeCode.LADDER_SIDE_IGNORED,
+            why,
+            protein_ids=proteins,
+            image_ids=images,
+        )
+
+
+def _tilt_boxes(
+    protein: model.Protein, bands: list[model.Band | None], included: list[bool]
+) -> list[model.Band]:
+    """The first bands of a protein the tilt is read from: a detector's, nobody
+    edited, in the set's lanes."""
+    return [
+        band
+        for i, band in enumerate(bands)
+        if band is not None
+        and included[i]
+        and band.source in model.DETECTING_SOURCES
+        and not band.manually_edited
+    ]
+
+
+def _tilt_reference(
+    fitted: mwcal.Calibration, protein: model.Protein, boxes: list[model.Band]
+) -> float | None:
+    """The MW of the protein line a protein's rows are read against: its
+    expected MW where the calibration reaches it, else its boxes' median
+    apparent MW (with one ladder, any MW in range gives the same slope); None
+    without either."""
+    expected = protein.expected_mw
+    if expected is not None and fitted.z_lo <= math.log10(expected) <= fitted.z_hi:
+        return expected
+    mws = [band.apparent_mw for band in boxes if band.apparent_mw is not None]
+    return stats.median(mws) if mws else None
+
+
+def _rows_tilted(
+    image_id: str,
+    fitted: mwcal.Calibration,
+    proteins: Sequence[model.Protein],
+    joined: Mapping[str, list[model.Band | None]],
+    included: list[bool],
+    note: Callable[..., None],
+) -> None:
+    """``rows_tilted`` for one image (#58): how far the rows of its proteins
+    slope against the protein line (its one ladder's level line, or the line
+    between its two ladders). Per protein with at least :data:`TILT_MIN_LANES`
+    boxes (:func:`_tilt_boxes`), each box centre's offset from the line at
+    :func:`_tilt_reference` and the least-squares slope of those offsets
+    across the lanes; the median slope over the lanes' span gives the drift,
+    in MW at the middle lane. The notice names every protein of ``proteins``
+    (those boxed on the image, in any lane): the tilt moves all their MWs,
+    and the two result sets name the same ones."""
+    slopes: list[float] = []
+    xs: list[float] = []
+    ys: list[float] = []
+    for protein in proteins:
+        boxes = _tilt_boxes(protein, joined[protein.id], included)
+        if len(boxes) < TILT_MIN_LANES:
+            continue
+        size = protein.box_size
+        reference = _tilt_reference(fitted, protein, boxes)
+        if reference is None:
+            continue
+        points: list[tuple[float, float, float]] = []
+        for band in boxes:
+            cx, cy = band.box.x + size.width / 2, band.box.y + size.height / 2
+            line = fitted.y_at(reference, cx)
+            if line is not None:
+                points.append((cx, cy, cy - line))
+        if len(points) < TILT_MIN_LANES or len({cx for cx, _, _ in points}) < 2:
+            continue
+        fit = stats.linear_regression([cx for cx, _, _ in points], [r for _, _, r in points])
+        slopes.append(fit.slope)
+        xs.extend(cx for cx, _, _ in points)
+        ys.extend(cy for _, cy, _ in points)
+    if not slopes:
+        return
+    slope = stats.median(slopes)
+    shift = abs(slope) * (max(xs) - min(xs))
+    ppd = fitted.px_per_decade(stats.median(xs), stats.median(ys))
+    if ppd is None or not ppd > 0.0:
+        return
+    try:
+        drift = 10.0 ** (shift / ppd) - 1.0
+    except OverflowError:
+        drift = math.inf
+    if not drift >= TILT_WARN:
+        return
+    angle = abs(math.degrees(math.atan(slope)))
+    if fitted.two_ladders:
+        against = "the protein line between its ladders"
+        advice = "check both ladders' marks"
+    else:
+        [ladder] = fitted.ladders
+        against = f"the {ladder.side.value} ladder" if _two_sides(fitted) else "the ladder"
+        advice = "mark the ladder on the other side of the blot too"
+        for side, reason in fitted.ignored:  # the other side, marked but not used
+            advice = (
+                f"mark at least {mwcal.MIN_LADDER_POINTS} points on the {side.value} ladder so"
+                " that it is used too"
+                if reason == "one_point"
+                else f"mark the same bands on both ladders so that the {side.value} one is used too"
+            )
+    by = f"by up to {drift:.0%}" if math.isfinite(drift) else "past any MW"
+    note(
+        NoticeCode.ROWS_TILTED,
+        f"{image_id}'s rows slope by about {angle:.1f}° against {against}"
+        f" ({shift:.0f} px across the lanes), so apparent MWs drift {by} from one side to"
+        f" the other; {advice}, or widen the tolerance",
+        protein_ids=tuple(protein.id for protein in proteins),
+        image_ids=(image_id,),
+    )
+
+
+def _mw_notices(
+    batch: model.Batch,
+    fits: Mapping[str, _Fitted],
+    joined: Mapping[str, list[model.Band | None]],
+    included: list[bool],
+    note: Callable[..., None],
+) -> None:
+    """Every MW, band-count and calibration notice of a set (#58): per protein,
+    then per register group with boxes in the set's lanes, then per image.
+    The notices of a group or an image name every protein boxed on its images
+    in any lane, so that the two result sets' copies of one name the same
+    proteins (the all-lanes view tells them apart by code and proteins)."""
+    for protein in batch.proteins:
+        fitted = fits[protein.image_id]
+        _mw_protein_notices(batch, protein, fitted, joined[protein.id], included, note)
+    boxed = [
+        protein
+        for protein in batch.proteins
+        if any(band is not None for band in joined[protein.id])
+    ]
+    in_set = {
+        protein.id
+        for protein in boxed
+        if any(band is not None and included[i] for i, band in enumerate(joined[protein.id]))
+    }
+    for membrane in batch.membranes:
+        for group, fitted in mwcal.calibrations(membrane).items():
+            on = tuple(protein.id for protein in boxed if protein.image_id in group)
+            if in_set.intersection(on) and isinstance(fitted, mwcal.Calibration):
+                _calibration_notices(membrane, group, fitted, on, note)
+    for image in batch.iter_images():
+        fitted = fits.get(image.id)
+        on_image = [protein for protein in boxed if protein.image_id == image.id]
+        if in_set.intersection(p.id for p in on_image) and isinstance(fitted, mwcal.Calibration):
+            _rows_tilted(image.id, fitted, on_image, joined, included, note)
 
 
 def chart_test(
@@ -745,6 +1360,11 @@ def _compute(
     joined = {protein.id: _join(protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
+    # Each protein image's calibration (#58), from the stored points.
+    fits = {
+        p.image_id: mwcal.calibration_for(batch.membrane_of(p.image_id), p.image_id)
+        for p in batch.proteins
+    }
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -756,6 +1376,22 @@ def _compute(
             clipped=_field(joined[p.id], "clipped"),
             possibly_clipped=_field(joined[p.id], "possibly_clipped"),
             detected=detected[p.id],
+            expected_mws=[] if p.expected_mw is None else [p.expected_mw],
+            mw_tolerance=p.mw_tolerance,
+            apparent_mw=_field(joined[p.id], "apparent_mw"),
+            mw_check=[
+                None
+                if band is None
+                else _mw_check(p.expected_mw, p.mw_tolerance, fits[p.image_id], band.apparent_mw)
+                for band in joined[p.id]
+            ],
+            mw_not_run=_mw_not_run(p, fits[p.image_id]),
+            bands_found=_field(joined[p.id], "bands_found"),
+            count_check=[
+                None if band is None else _count_check(band, p.expected_band_count)
+                for band in joined[p.id]
+            ],
+            calibration=_image_calibration(fits[p.image_id]),
         )
         for p in batch.proteins
     ]
@@ -856,6 +1492,7 @@ def _compute(
             lane_indices=below,
             conditions=tuple(dict.fromkeys(conditions[i] for i in below)),
         )
+    _mw_notices(batch, fits, joined, included, note)  # #58, in lanes this set includes
     labels = list(dict.fromkeys(conditions))  # distinct, in lane order
     similar: dict[str, list[str]] = {}
     for label in labels:

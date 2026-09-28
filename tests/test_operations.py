@@ -3637,14 +3637,16 @@ def _size_of(s: ProjectSession, protein_id: str) -> dict[str, int]:
 
 
 def _protein(protein_id: str, name: str, role: str, image_id: str, **fields) -> dict:
-    """add_protein's params with its defaults (no expected MW, no loading
-    controls, the initial box size of the blot, nothing pinned)."""
+    """add_protein's params with its defaults (no expected MW, the default MW
+    tolerance, no loading controls, the initial box size of the blot, nothing
+    pinned)."""
     return {
         "protein_id": protein_id,
         "name": name,
         "role": role,
         "image_id": image_id,
         "expected_mw": None,
+        "mw_tolerance": 0.1,
         "loading_control_ids": [],
         "box_size": {"width": 20, "height": 5},  # boxes.initial_box_size(W, H)
         "pinned_targets": [],
