@@ -63,10 +63,12 @@ Pipeline, in crop coordinates (rects are offset back at the end):
 8. Each band's lane: its separate components counted (peaks split as pieces
    are along x; a second one only at :data:`SECOND_SHARE` of the lane's
    peak, in the band's rows and as wide as a band; a peak inside the band's
-   grown extent is the band's own: :func:`_count_components`), and whether
-   the band is hollow (:func:`_hollow`). Empty lanes get a reason; flags; one
-   shared size by :data:`SIZE_RULE`, capped by the lane spacing and the box;
-   bounded isotonic placement (:func:`~proteia.core.boxes.place_in_row`).
+   grown extent is the band's own: :func:`_count_components`), its peaks
+   listed (``peaks``: every one, wherever it lies in the lane, for a count
+   of the bands in a window along it, #58), and whether the band is hollow
+   (:func:`_hollow`). Empty lanes get a reason; flags; one shared size by
+   :data:`SIZE_RULE`, capped by the lane spacing and the box; bounded
+   isotonic placement (:func:`~proteia.core.boxes.place_in_row`).
 9. The row's line through the boxes' centres (:func:`_row_line`): a box off
    it is off the row.
 10. The lane reading against the bands' own spacing (:func:`_doubts`): a
@@ -123,7 +125,7 @@ import math
 import numbers
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Final, Literal
+from typing import Final, Literal, NamedTuple
 
 import numpy as np
 from pydantic import JsonValue
@@ -286,6 +288,33 @@ class RowDetectError(ValueError):
         self.code: RowDetectErrorCode = code
 
 
+class Peak(NamedTuple):
+    """One separate peak of a lane's detection signal (#58): a top of the kept
+    signal at ``DETECT_K`` sigma that :func:`_count_components` finds, in image
+    coordinates.
+
+    ``y`` and ``x`` are continuous, as a box centre is (row r covers [r, r+1)):
+    the top's pixel centre, ``y`` refined by a parabola through the smoothed
+    signal on the rows above and below it (at most half a row either way).
+    ``snr`` is its height over the noise. ``own``: it lies in the band's grown
+    extent, the band's own peak (a dumbbell's or a hollow band's ends are two
+    of them). ``other_band``: it reads as another band, wherever it lies along
+    the lane: outside the band's grown extent, at least ``SECOND_SHARE`` of the
+    lane's peak (the band's highest pixel, or a higher peak in the lane), and
+    its hill as wide as a band (the candidates' width rule), as ``components``
+    counts a second component; unlike there, a band apart above or below, with
+    membrane between, is one. Of the tops of one such band side by side (a
+    dumbbell's ends, a hollow band's), only the highest: the band's own tops
+    are one band, and so are another's (:func:`_one_top_per_band`). Neither: a
+    weaker peak, a band's second top, or JPEG block noise."""
+
+    y: float
+    x: float
+    snr: float
+    own: bool
+    other_band: bool
+
+
 @dataclass(frozen=True)
 class LaneDetection:
     """What :func:`detect_row` found in one declared lane (image coordinates).
@@ -358,6 +387,10 @@ class LaneDetection:
       ``ROW_LINE_K`` either way the box is off the row (``off_row_line``).
       None for an empty lane, and for every lane of a row with fewer than
       ``ROW_LINE_MIN`` boxes (not checked) unless they lie on two rows.
+    * ``peaks``: every separate peak of the lane's detection signal between its
+      walls (:class:`Peak`), top to bottom, the band's own included: where a
+      count of the bands in a window along the lane reads them (#58,
+      :func:`bands_in`). ``()`` for an empty lane.
     """
 
     lane: int
@@ -372,6 +405,17 @@ class LaneDetection:
     window: Rect | None
     cut: bool
     line_offset: float | None
+    peaks: tuple[Peak, ...] = ()
+
+
+def bands_in(lane: LaneDetection, top: float, bottom: float) -> int:
+    """How many bands a lane holds between the rows ``top`` and ``bottom``
+    (continuous, both included) by its peaks (#58): its band, and each peak
+    in them that reads as another band (:attr:`Peak.other_band`). 0 for an
+    empty lane."""
+    if lane.rect is None:
+        return 0
+    return 1 + sum(1 for peak in lane.peaks if peak.other_band and top <= peak.y <= bottom)
 
 
 @dataclass(frozen=True)
@@ -1302,6 +1346,8 @@ class _Lane:
     grown: np.ndarray | None = None  # the grown region's mask (crop shape)
     components: int = 0
     hollow: bool = False
+    # (crop y, crop x, snr, own, other_band) of each peak: _count_components
+    peaks: tuple[tuple[float, float, float, bool, bool], ...] = ()
     window: Rect | None = None  # an empty lane's measured slot (crop coordinates)
     cut: bool = False  # an empty lane's band peaks on the box's edge row (_empty_lanes)
     side: bool = False  # read from a piece rising into the box's side: not measured
@@ -1622,10 +1668,40 @@ def _hill(ks: np.ndarray, comps: np.ndarray, top: tuple[int, int]) -> np.ndarray
     return hill
 
 
+def _row_offset(column: np.ndarray, row: int) -> float:
+    """How far a peak at ``row`` of ``column`` lies from that row's centre: the
+    vertex of the parabola through it and its neighbours, at most half a row
+    either way; 0 at the column's ends or where the three are not a peak."""
+    if row <= 0 or row >= column.size - 1:
+        return 0.0
+    below, at, above = float(column[row - 1]), float(column[row]), float(column[row + 1])
+    curvature = below - 2.0 * at + above
+    if curvature >= 0.0:
+        return 0.0
+    return min(0.5, max(-0.5, 0.5 * (below - above) / curvature))
+
+
+def _one_top_per_band(
+    ks: np.ndarray, tops: list[tuple[tuple[int, int], slice]]
+) -> set[tuple[int, int]]:
+    """Of the tops of other bands in a lane (each with its hill's rows,
+    :func:`_hill`), one per band (#58): a top lies beside a higher one, in
+    the same band, when that one's row is among its hill's rows. A hill stops
+    at the saddle to higher ground, so it reaches the row of a higher top
+    beside it (a dumbbell's other end, or a hollow band's other half, joined
+    or not) but not that of a band stacked above or below it."""
+    kept: list[tuple[int, int]] = []
+    for top, rows in sorted(tops, key=lambda t: (-float(ks[t[0]]), t[0])):
+        if not any(rows.start <= higher[0] < rows.stop for higher in kept):
+            kept.append(top)
+    return set(kept)
+
+
 def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
-    """Each measured lane's components, from the :func:`_peaks` of the kept
-    signal at ``DETECT_K`` sigma, and whether its band is hollow (#121,
-    :func:`_hollow`). Run once, on the pass that gives the result.
+    """Each measured lane's components and peaks (:class:`Peak`), from the
+    :func:`_peaks` of the kept signal at ``DETECT_K`` sigma, and whether its
+    band is hollow (#121, :func:`_hollow`). Run once, on the pass that gives
+    the result.
 
     A peak inside the band's grown extent is the band's own: a dip between two
     of them (a dumbbell, a hollow centre) leaves one band. Any other peak in
@@ -1635,6 +1711,9 @@ def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
     band's kept component (its signal above ``NOISE_K`` sigma) fills in the
     span, as a doublet's band joined to it does, or a band's half beside it;
     and the hill passes the candidates' width rule (:func:`_dust`).
+    Every peak in the span is listed; one that passes all but the band's rows
+    reads as another band (``other_band``), since a band apart above or below
+    is one, the highest of its tops side by side only (#58).
     ``saturated``: the crop's pixels at the saturation level, or None where it
     is unknown (no band is then hollow)."""
     sig = res.sig
@@ -1651,21 +1730,37 @@ def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
     thr = NOISE_K * sig.sigma_sm
     min_w = _min_width(ks.shape[1], len(res.lanes))
     for ln, (lo, hi), grown in measured:
-        others = [p for p in tops if lo <= p[1] < hi and not grown[p]]
+        spanned = [p for p in tops if lo <= p[1] < hi]
+        others = [p for p in spanned if not grown[p]]
         peak = max([float(ks[grown].max()), *(float(ks[p]) for p in others)])
         own = np.unique(comps[grown])  # a burnt-out centre it holds may lie below the noise
         band = np.isin(comps[:, lo:hi], own[own > 0]).any(axis=1)
         second = 0
+        passed: list[tuple[tuple[int, int], slice]] = []  # each top and its hill's rows
         for p in others:
             if ks[p] < SECOND_SHARE * peak:
                 continue
             hill = _hill(ks, comps, p)
-            if hill is None or not (band & hill.any(axis=1)).any():
-                continue  # no peak of its own, or above or below the band
+            if hill is None:
+                continue  # no peak of its own
             [region] = find_objects(hill.astype(np.int8))
-            if not _dust(hill[region], sig.s_ds[region], float(ks[p]), thr, min_w):
+            if _dust(hill[region], sig.s_ds[region], float(ks[p]), thr, min_w):
+                continue
+            passed.append((p, region[0]))
+            if (band & hill.any(axis=1)).any():  # not above or below the band
                 second += 1
         ln.components = 1 + second
+        other_bands = _one_top_per_band(ks, passed)
+        ln.peaks = tuple(
+            (
+                y + 0.5 + _row_offset(sig.s_sm[:, x], y),
+                x + 0.5,
+                float(ks[y, x]) / sig.sigma_sm,
+                bool(grown[y, x]),
+                (y, x) in other_bands,
+            )
+            for y, x in sorted(spanned)
+        )
         ln.hollow = saturated is not None and _hollow(
             grown, sig.s_sm, saturated, DETECT_K * sig.sigma_sm
         )
@@ -2431,6 +2526,11 @@ def detect_row(
                 window=window,
                 cut=i in cut,
                 line_offset=offsets.get(i),
+                peaks=()
+                if rect is None
+                else tuple(
+                    Peak(y0 + py, x0 + px, snr, own, other) for py, px, snr, own, other in ln.peaks
+                ),
             )
         )
     if right_to_left:
