@@ -5,7 +5,8 @@ its range and quality, and the protein line between two ladders.
 The literals come from exact synthetic geometry: the sample blot's migration
 law without its smile, rotated about the blot's centre, and a vendor-shaped
 ladder (PageRuler Plus on a Tris-glycine 4-20 % gel, the vendor's band
-positions). No test reads pixels.
+positions). Only the snapping tests (:func:`~proteia.core.mwcal.refine_point`)
+read pixels: synthetic ladder bands and strips, with seeded noise.
 """
 
 import ast
@@ -13,10 +14,11 @@ import math
 import statistics
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import proteia.core.mwcal as mwcal_module
-from conftest import make_project
+from conftest import MEMBRANE_LEVEL, make_project, synthetic_blot
 from proteia.core import ladders, mwcal
 from proteia.core.model import (
     CalibrationPoint,
@@ -37,6 +39,11 @@ from proteia.core.mwcal import (
     LADDERS_WARN,
     MIN_LADDER_POINTS,
     MIN_SHARED_MWS,
+    SNAP_HALF_X,
+    SNAP_HALF_Y,
+    SNAP_K,
+    SNAP_MARKED_GAP,
+    SNAP_STRIP_BORDER,
     Calibration,
     NoCalibration,
 )
@@ -593,7 +600,29 @@ def test_settings_are_the_constants():
         "min_ladder_points": MIN_LADDER_POINTS,
         "min_shared_mws": MIN_SHARED_MWS,
         "ladder_offsets": "at the MWs both ladders hold",
+        "snap": {
+            "half_x": SNAP_HALF_X,
+            "half_y": SNAP_HALF_Y,
+            "marked_gap": SNAP_MARKED_GAP,
+            "k": SNAP_K,
+            "signal": (
+                "deviation from the window's median, by the image's polarity on a marker"
+                " image, its absolute value for a faint marker on a chemiluminescence image;"
+                " the mean along each row, less its median; noise the robust sigma of the"
+                " row-to-row steps over the square root of two"
+            ),
+            "ladder_band": (
+                "the local maximum nearest the click, refined by a parabola (at most half a"
+                " row), at row + 0.5"
+            ),
+            "strip_edge": "the same on the size of the row-to-row steps, at the edge between rows",
+            "strip_edge_noise": "the robust sigma of the row-to-row steps",
+            "strip_edge_border": SNAP_STRIP_BORDER,
+            "no_band": "the clicked y is kept",
+        },
     }
+    assert (SNAP_HALF_X, SNAP_HALF_Y, SNAP_MARKED_GAP, SNAP_K) == (12, 12, 0.45, 4.0)
+    assert SNAP_STRIP_BORDER == 1.0
 
 
 def test_mwcal_imports_only_the_model():
@@ -605,4 +634,119 @@ def test_mwcal_imports_only_the_model():
         elif isinstance(node, ast.ImportFrom):
             modules.add(node.module)
     assert {m for m in modules if m.split(".")[0] == "proteia"} == {"proteia.core.model"}
-    assert not {m for m in modules if m.split(".")[0] in {"numpy", "scipy", "skimage"}}
+    # numpy for the pixels a click is snapped on (refine_point), nothing more.
+    assert not {m for m in modules if m.split(".")[0] in {"scipy", "skimage"}}
+
+
+# --- Snapping a click (refine_point) ---
+
+SNAP_W, SNAP_H = 60, 200
+SNAP_X = 30.0
+DARK, LIGHT = Polarity.DARK_ON_LIGHT, Polarity.LIGHT_ON_DARK
+CHEMI_MARKER = CalibrationPointSource.CHEMILUMINESCENCE_MARKER
+STRIP = CalibrationPointSource.STRIP_EDGE
+
+
+def _bands(*bands: tuple[float, float]) -> np.ndarray:
+    """Dark bands ``(y, depth)`` wide across the window, centred at the
+    continuous ``y`` (row r covers [r, r+1), so a band on row r's centre lies
+    at r + 0.5), on a flat membrane; float, without noise."""
+    spots = [(SNAP_X, y - 0.5, 40.0, 2.5, depth) for y, depth in bands]
+    return synthetic_blot((SNAP_H, SNAP_W), spots, dtype=np.float64)
+
+
+def _noisy(array: np.ndarray, seed: int = 58) -> np.ndarray:
+    return array + np.random.default_rng(seed).normal(0.0, 60.0, array.shape)
+
+
+def _ladder_pixels(ys, *, depth: float = 12000.0) -> np.ndarray:
+    return _noisy(_bands(*((y, depth) for y in ys)))
+
+
+def _snap(array, y, *, source=MARKER, polarity=DARK, marked=()):
+    return mwcal.refine_point(array, SNAP_X, y, source=source, polarity=polarity, marked_ys=marked)
+
+
+def test_snap_lands_on_the_band_centre_in_continuous_coordinates():
+    truth = [40.5, 71.3, 103.8, 150.0]
+    array = _ladder_pixels(truth)
+    for y in truth:
+        for off in (-8.0, -3.0, 0.0, 3.0, 8.0):
+            got = _snap(array, y + off)
+            assert got is not None and abs(got - y) < 0.2, (y, off, got)
+    # Without noise, a band on row 70's centre lies at 70.5, not at the row index.
+    assert _close(_snap(_bands((70.5, 12000.0)), 66.0), 70.5)
+
+
+def test_snap_prefers_the_nearest_band_not_the_strongest():
+    faint, strong = 60.5, 76.5
+    array = _noisy(_bands((faint, 6000.0), (strong, 30000.0)), seed=3)
+    assert abs(_snap(array, 65.0) - faint) < 0.2  # 4.5 px from it, 11.5 from the strong one
+    assert abs(_snap(array, 72.0) - strong) < 0.2
+    # Two bands as near: the higher one.
+    assert _close(_snap(_bands((60.5, 12000.0), (76.5, 12000.0)), 68.5), 60.5)
+
+
+def test_snap_never_reaches_a_marked_band():
+    array = _ladder_pixels([50.5, 76.5])
+    assert abs(_snap(array, 70.0) - 76.5) < 0.2  # the nearer band, unmarked
+    # Marked already, the band at 76.5 is out of reach: the window stops 0.45 of
+    # the way to it, and the band at 50.5 lies past its other end.
+    assert _snap(array, 70.0, marked=[76.5]) is None
+    assert abs(_snap(array, 60.0, marked=[76.5]) - 50.5) < 0.2
+    assert _snap(array, 76.5, marked=[76.5]) is None  # on a marked point: no window at all
+
+
+def test_snap_keeps_the_click_where_nothing_stands_out():
+    flat = _noisy(np.full((SNAP_H, SNAP_W), MEMBRANE_LEVEL), seed=1)
+    for source in CalibrationPointSource:  # an absolute value's mean is no band either
+        assert _snap(flat, 100.0, source=source) is None, source
+    # A band too faint for SNAP_K noise sigmas, and one past the window.
+    assert _snap(_ladder_pixels([100.5], depth=40.0), 100.0) is None
+    assert _snap(_ladder_pixels([100.5]), 100.0 + SNAP_HALF_Y + 3.0) is None
+    # A window cut to under three rows by the image's edge.
+    assert _snap(_ladder_pixels([1.0]), 0.2) is None
+
+
+def test_snap_follows_the_polarity_and_takes_a_faint_marker_either_way():
+    dark = _ladder_pixels([80.5])
+    light = 2 * MEMBRANE_LEVEL - dark  # the same band, bright on a dark membrane
+    assert abs(_snap(dark, 84.0) - 80.5) < 0.2
+    assert abs(_snap(light, 84.0, polarity=LIGHT) - 80.5) < 0.2
+    # Read the wrong way round, a band is a trough: no peak reaches the noise.
+    assert _snap(light, 84.0, polarity=DARK) is None
+    # A faint marker on a chemiluminescence image may show either way.
+    for array in (dark, light):
+        for polarity in (DARK, LIGHT):
+            got = _snap(array, 84.0, source=CHEMI_MARKER, polarity=polarity)
+            assert got is not None and abs(got - 80.5) < 0.2
+
+
+def test_snap_finds_a_strip_edge_between_rows():
+    array = np.full((SNAP_H, SNAP_W), 2000.0)
+    array[:120] = MEMBRANE_LEVEL  # the strip ends between rows 119 and 120: y = 120
+    array = _noisy(array, seed=5)
+    for click in (118.0, 122.0, 110.0):
+        got = _snap(array, click, source=STRIP)
+        assert got is not None and abs(got - 120.0) < 0.5, (click, got)
+    assert _snap(array, 60.0, source=STRIP) is None  # no edge within reach
+
+
+def test_snap_keeps_a_strip_edge_clicked_on_the_image_border():
+    # A strip cropped at its cut: the edge is the image's border, past which no
+    # row lies to step from, so a step found from a click there is noise or a
+    # band's flank. Here half a marker band the cut runs through at the top,
+    # and a band ten rows above the bottom.
+    array = _noisy(_bands((0.5, 12000.0), (SNAP_H - 10.5, 12000.0)), seed=7)
+    for click in (0.0, 0.5, 1.0, SNAP_H - 1.0, SNAP_H - 0.5, float(SNAP_H)):
+        assert _snap(array, click, source=STRIP) is None, click
+    # Only a strip edge: a ladder band by the border snaps from a click on it.
+    near = _ladder_pixels([2.5, SNAP_H - 2.5])
+    assert abs(_snap(near, 0.0) - 2.5) < 0.2 and abs(_snap(near, SNAP_H) - (SNAP_H - 2.5)) < 0.2
+    # An image not cropped at the cut: the edge three rows inside snaps from a
+    # click more than a pixel from the border; clicked on the border, it is kept.
+    inner = np.full((SNAP_H, SNAP_W), 2000.0)
+    inner[3:] = MEMBRANE_LEVEL  # the strip begins between rows 2 and 3: y = 3
+    inner = _noisy(inner, seed=5)
+    assert abs(_snap(inner, 2.0, source=STRIP) - 3.0) < 0.5
+    assert _snap(inner, 1.0, source=STRIP) is None

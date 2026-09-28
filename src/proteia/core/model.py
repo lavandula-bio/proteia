@@ -594,7 +594,9 @@ class Band(_Model):
     background_level: Finite
     background_mode: BackgroundMode
     background_spread: NonNegative
-    apparent_mw: Kda | None = None  # from the calibration (#58); None = not computed
+    # Its image's calibration at the box's centre (#58); None = no curve there, or the centre
+    # lies outside its range.
+    apparent_mw: Kda | None = None
     clipped: bool | None = None  # #44; None = not checked (not "passed")
     # #112; None = not assessed: the exact check ran, the image has no known
     # range, or the project was saved before #112 (requantify assesses it).

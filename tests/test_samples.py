@@ -191,6 +191,40 @@ def test_the_marker_shows_the_ladder_where_the_migration_law_puts_it(sample_fold
     assert lanes.min() > samples.MARKER_MEMBRANE - 20
 
 
+def test_marker_ladder_snaps_to_truth(tmp_path, sample_folder):
+    # #58: each ladder band clicked 3 or 8 px off, above or below, snaps onto
+    # it. A band the law centres on index row y lies at y + 0.5 in the
+    # continuous coordinates points and box centres share. measured: 0.03 to
+    # 0.09 px
+    s = ops.new_project(tmp_path / FOLDER, autosave=None, clock=FakeClock())
+    blot, marker = import_samples(s, sample_folder)
+    ops.set_marker_image(s, blot, marker)
+    [membrane] = s.project.batch.membranes
+    ops.set_ladder(s, membrane.id, "pageruler_plus/tris_glycine")
+    for i, kda in enumerate(samples.LADDER_KDA):
+        truth = samples.band_y(kda, samples.LADDER_X) + 0.5
+        off = (3.0, -8.0, 8.0, -3.0)[i % 4]
+        update = ops.add_calibration_point(
+            s, marker, truth + off, kda, "visible_marker", x=samples.LADDER_X
+        )
+        assert update.point["snapped"] and abs(update.point["y"] - truth) <= 0.2, kda
+    # The β-catenin row's boxes read about its 92 kDa: low in the middle lanes,
+    # which ran 6 px further (the smile, which one ladder cannot see).
+    # measured: 85.4 to 90.1 kDa
+    ops.set_lanes(
+        s,
+        [
+            LaneInput(c, sample)
+            for c, sample in zip(samples.CONDITIONS, samples.SAMPLES, strict=True)
+        ],
+    )
+    target = ops.add_protein(s, samples.TARGET, Role.TARGET, blot, expected_mw=92)
+    ops.detect_row_boxes(s, target, row_box(samples.TARGET_ROW))
+    mws = [band.apparent_mw for band in s.project.batch.find_protein(target).bands]
+    assert len(mws) == samples.LANES
+    assert all(0.9 * samples.TARGET_ROW.kda <= mw <= 1.02 * samples.TARGET_ROW.kda for mw in mws)
+
+
 def test_the_truth_table(sample_folder):
     data = (sample_folder / samples.TRUTH_FILE).read_bytes()
     assert data.startswith(b"\xef\xbb\xbf") and data.endswith(b"\r\n")
