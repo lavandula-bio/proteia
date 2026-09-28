@@ -19,6 +19,7 @@ import pytest
 
 import proteia.core.mwcal as mwcal_module
 from conftest import MEMBRANE_LEVEL, make_project, synthetic_blot
+from proteia import samples
 from proteia.core import ladders, mwcal
 from proteia.core.model import (
     CalibrationPoint,
@@ -34,11 +35,19 @@ from proteia.core.model import (
 )
 from proteia.core.mwcal import (
     DEFAULT_FIT_METHOD,
+    EXTRA_COST,
     EXTRAPOLATE_DECADES,
+    FIND_BACKGROUND,
+    FIND_BUDGET,
+    FIND_HALF_X,
     FIT_WARN,
+    GAP_WARN,
     LADDERS_WARN,
     MIN_LADDER_POINTS,
     MIN_SHARED_MWS,
+    MISS_COST,
+    PRIOR_DECADES,
+    REF_COST,
     SNAP_HALF_X,
     SNAP_HALF_Y,
     SNAP_K,
@@ -620,6 +629,49 @@ def test_settings_are_the_constants():
             "strip_edge_border": SNAP_STRIP_BORDER,
             "no_band": "the clicked y is kept",
         },
+        "find_ladder": {
+            "half_x": FIND_HALF_X,
+            "k": SNAP_K,
+            "background": FIND_BACKGROUND,
+            "peaks": (
+                "local maxima of the lane's profile (the signal as for a snap, down the whole"
+                " lane) standing k noise sigmas above the membrane around them (the profile's"
+                " running median over a background share of the rows, at least the snap's"
+                " half_y each way) and above the profile around them (their prominence),"
+                " refined by a parabola, at row + 0.5; a peak's strength is its height above"
+                " the membrane in noise sigmas"
+            ),
+            "noise": (
+                "the snap's, but at least the robust sigma of the differences between"
+                " neighbouring pixels along each row (each less its column's median), taken"
+                " between pixels off the window's lowest and highest values, over the square"
+                " root of twice the window's columns, and the grey levels' spacing over the"
+                " square root of twelve times the window's columns"
+            ),
+            "labelling": "peaks and ladder MWs matched in order; either may stay unmatched",
+            "prior_decades": PRIOR_DECADES,
+            "score": (
+                "the squared residuals of log10(MW) from the labelling's least-squares"
+                " quadratic in y, which must fall over its peaks; for a second ladder, plus the"
+                " weighted squared spread of its height differences from the first ladder, each"
+                " over the first ladder's pixels per decade; both over prior_decades squared"
+            ),
+            "miss_cost": MISS_COST,
+            "extra_cost": EXTRA_COST,
+            "reference_cost": REF_COST,
+            "reference": (
+                "per reference MW not carried by one of the strongest labelled peaks, as many as"
+                " there are reference MWs; colour is not used"
+            ),
+            "predicted": (
+                "each ladder MW left unmatched, from the winning quadratic on its falling side;"
+                " not drawn off the image or out of order with the found ticks"
+            ),
+            "gap": "how much worse the best labelling that labels some peak otherwise scores",
+            "gap_warn": GAP_WARN,
+            "budget": FIND_BUDGET,
+            "budget_reached": "the best labelling found is kept, with a gap of 0 (doubtful)",
+        },
     }
     assert (SNAP_HALF_X, SNAP_HALF_Y, SNAP_MARKED_GAP, SNAP_K) == (12, 12, 0.45, 4.0)
     assert SNAP_STRIP_BORDER == 1.0
@@ -750,3 +802,385 @@ def test_snap_keeps_a_strip_edge_clicked_on_the_image_border():
     inner = _noisy(inner, seed=5)
     assert abs(_snap(inner, 2.0, source=STRIP) - 3.0) < 0.5
     assert _snap(inner, 1.0, source=STRIP) is None
+
+
+# --- Finding a ladder (find_ladder) ---
+
+FIND_X = 40.0
+# The vendor's band positions for PageRuler Plus on four gels (px, top to
+# bottom; the 10 kDa band ran off the 10 % gel), with the ladder's MWs and its
+# two orange reference bands.
+VENDOR_LADDERS = {
+    "TG 4-20%": (VENDOR_YS, KDA, (70, 25)),
+    "TG 10%": ((277.5, 317.5, 352.5, 392.5, 437.5, 528.5, 587.5, 720.5), KDA[:-1], (70, 25)),
+    "BT 4-12% MOPS": (
+        (320.5, 363.0, 405.5, 454.0, 512.5, 614.0, 662.0, 736.5, 773.5),
+        (185, 115, 80, 65, 50, 30, 25, 15, 10),
+        (65, 25),
+    ),
+    "BT 4-12% MES": (
+        (309.5, 352.5, 384.5, 405.5, 469.5, 560.5, 598.0, 688.5, 768.5),
+        (190, 115, 80, 70, 50, 30, 25, 15, 10),
+        (70, 25),
+    ),
+}
+CHANGES = ("none", "top", "bottom", "extra")
+# The gap to the next-best labelling of each gel and change, with the
+# reference bands as anchors: every labelling right, and the false band of
+# "extra" leaves every gel doubtful. (Anchors taken as a hard rule would put
+# the 10 % gel without its bottom band at 15.1; a reference MW off the
+# strongest peaks costs REF_COST here.)
+ANCHORED_GAPS = {
+    "TG 4-20%": (12.7, 10.4, 6.8, 1.4),
+    "TG 10%": (13.2, 10.6, 9.9, 1.6),
+    "BT 4-12% MOPS": (11.1, 6.7, 8.8, 1.7),
+    "BT 4-12% MES": (13.3, 10.4, 6.1, 2.8),
+}
+# From the band positions alone: 10 of the 16 right, and the gap of the
+# labelling proposed, right or wrong.
+POSITION_GAPS = {
+    "TG 4-20%": ((12.7, True), (3.2, True), (2.5, False), (2.6, False)),
+    "TG 10%": ((13.2, True), (2.5, True), (0.3, False), (1.7, False)),
+    "BT 4-12% MOPS": ((11.1, True), (1.1, True), (0.4, True), (1.4, False)),
+    "BT 4-12% MES": ((13.3, True), (5.6, True), (1.6, True), (0.5, False)),
+}
+
+
+def _marker_lane(bands, *, height: int = 860, width: int = 80, seed: int = 7) -> np.ndarray:
+    """A visible-light marker's ladder lane at FIND_X: dark bands ``(y, depth)``
+    centred at the continuous ``y``, 60 px wide and a few rows high, with
+    seeded noise of 60 counts on a flat membrane."""
+    spots = [(FIND_X, y - 0.5, 30.0, 3.0, depth) for y, depth in bands]
+    return _noisy(synthetic_blot((height, width), spots, dtype=np.float64), seed)
+
+
+def _vendor_case(name: str, change: str):
+    """A gel's band positions changed as ``change`` says, as the lane's pixels,
+    its MWs, its reference MWs and the true y of each MW: the reference bands
+    twice as dark; ``top`` and ``bottom`` leave that band out, ``extra`` adds a
+    fainter false band halfway between the 4th and the 5th."""
+    ys, kda, reference = VENDOR_LADDERS[name]
+    bands = [(y, 12000.0 if mw in reference else 6000.0) for y, mw in zip(ys, kda, strict=True)]
+    if change == "top":
+        bands = bands[1:]
+    elif change == "bottom":
+        bands = bands[:-1]
+    elif change == "extra":
+        bands.append((0.5 * (ys[3] + ys[4]), 4800.0))
+    return _marker_lane(bands), kda, reference, dict(zip(kda, ys, strict=True))
+
+
+def _find(array, kda, reference=(), *, x=FIND_X, polarity=DARK, source=MARKER, other=None):
+    return mwcal.find_ladder(
+        array, x, kda=kda, reference_kda=reference, source=source, polarity=polarity, other=other
+    )
+
+
+def _found(proposal: mwcal.LadderProposal) -> dict[float, float]:
+    return {tick.mw: tick.y for tick in proposal.ticks if tick.found}
+
+
+def _right(proposal: mwcal.LadderProposal | None, truth: dict[float, float]) -> bool:
+    """Every found tick within 3 px of its MW's band."""
+    return proposal is not None and all(
+        abs(truth[mw] - y) <= 3.0 for mw, y in _found(proposal).items()
+    )
+
+
+@pytest.mark.parametrize("name", VENDOR_LADDERS)
+def test_find_ladder_on_vendor_band_positions(name):
+    for change, gap in zip(CHANGES, ANCHORED_GAPS[name], strict=True):
+        array, kda, reference, truth = _vendor_case(name, change)
+        proposal = _find(array, kda, reference)
+        assert proposal is not None
+        # Every band drawn is found where it lies, and labelled right; the
+        # false band is left over.
+        found = _found(proposal)
+        left_out = {"top": kda[0], "bottom": kda[-1]}.get(change)
+        assert set(found) == {mw for mw in kda if mw != left_out}, change
+        assert all(abs(found[mw] - truth[mw]) < 0.05 for mw in found), change
+        assert len(proposal.extra) == (change == "extra")
+        assert math.isclose(proposal.gap, gap, abs_tol=0.05), (change, proposal.gap)
+        assert proposal.doubtful is (change == "extra") is (proposal.gap < GAP_WARN)
+
+
+@pytest.mark.parametrize("name", VENDOR_LADDERS)
+def test_find_ladder_on_vendor_band_positions_alone_is_often_one_band_off(name):
+    # Without the reference bands, the positions alone mislabel 6 of the 16.
+    for change, (gap, right) in zip(CHANGES, POSITION_GAPS[name], strict=True):
+        array, kda, _, truth = _vendor_case(name, change)
+        proposal = _find(array, kda)
+        assert _right(proposal, truth) is right, change
+        assert math.isclose(proposal.gap, gap, abs_tol=0.05), (change, proposal.gap)
+
+
+def _sample_marker_cases():
+    """The sample marker's ladder lane: level, turned by 2 degrees
+    either way (bilinear, as a rotated photo is), with the 250 kDa band cut off,
+    and with a speck of dust on the 35 kDa band; each as the image, the lane's
+    x and the true y of each band."""
+    from scipy import ndimage
+
+    marker = samples.render_marker().astype(float)
+    height, width = marker.shape
+    truth = {mw: samples.band_y(mw, samples.LADDER_X) + 0.5 for mw in samples.LADDER_KDA}
+    cases = {"level": (marker, samples.LADDER_X, truth)}
+    cx, cy = (width - 1) / 2, (height - 1) / 2
+    for degrees in (2.0, -2.0):
+        turned = ndimage.rotate(marker, degrees, reshape=False, order=1, mode="nearest")
+        cos, sin = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+        x = cx + (samples.LADDER_X - cx) * cos + (250 - cy) * sin
+        moved = {
+            mw: cy - (samples.LADDER_X - cx) * sin + (y - 0.5 - cy) * cos + 0.5
+            for mw, y in truth.items()
+        }
+        cases[f"turned {degrees:+.0f}"] = (turned, x, moved)
+    cases["250 cut off"] = (marker[70:], samples.LADDER_X, {m: y - 70 for m, y in truth.items()})
+    rows, columns = np.mgrid[0:height, 0:width]
+    dust = np.exp(-((rows - 300) ** 2 + (columns - samples.LADDER_X) ** 2) / (2 * 3.0**2))
+    cases["dust"] = (marker - 60 * dust, samples.LADDER_X, truth)
+    return cases
+
+
+# The gap on each of the sample marker's cases, with its darker bands or with
+# the preset's reference bands (the sample does not darken the green 10 kDa
+# band).
+SAMPLE_GAPS = {
+    "level": 19.2,
+    "turned +2": 19.3,
+    "turned -2": 19.3,
+    "250 cut off": 5.3,
+    "dust": 19.2,
+}
+
+
+@pytest.mark.parametrize("case", SAMPLE_GAPS)
+def test_find_ladder_on_the_sample_marker(case):
+    array, x, truth = _sample_marker_cases()[case]
+    preset = ladders.preset("pageruler_plus/tris_glycine")
+    for reference in (samples.LADDER_REFERENCE_KDA, tuple(b.kda for b in preset.reference)):
+        proposal = _find(array, samples.LADDER_KDA, reference, x=x)
+        found = _found(proposal)
+        # Every band on the image found and labelled right: none left over,
+        # none predicted (the band cut off would lie above the image).
+        expected = [mw for mw in samples.LADDER_KDA if 0 < truth[mw] < array.shape[0]]
+        assert list(found) == expected and len(proposal.ticks) == len(expected)
+        tolerance = 0.3 if case in ("level", "250 cut off", "dust") else 1.0
+        assert all(abs(found[mw] - truth[mw]) < tolerance for mw in found), found
+        assert proposal.extra == ()
+        assert math.isclose(proposal.gap, SAMPLE_GAPS[case], abs_tol=0.1), proposal.gap
+        assert not proposal.doubtful
+        assert all(tick.strength > 100 for tick in proposal.ticks)
+        assert proposal.x == x
+
+
+def test_find_ladder_positions_are_continuous_and_follow_the_click():
+    # Without noise, bands centred on rows 99 and 199 lie at y = 99.5 and 199.5.
+    array = synthetic_blot(
+        (300, 80), [(FIND_X, y, 30.0, 3.0, 6000.0) for y in (99.0, 199.0)], dtype=np.float64
+    )
+    proposal = _find(array, (100, 50))
+    assert [(t.mw, t.y, t.found) for t in proposal.ticks] == [(100, 99.5, True), (50, 199.5, True)]
+    # A lane 90 px to the right, on bare membrane: nothing to find there.
+    wide = np.pad(array, ((0, 0), (0, 80)), constant_values=MEMBRANE_LEVEL)
+    assert _find(wide, (100, 50), x=FIND_X + 90) is None
+
+
+def test_find_ladder_predicts_the_bands_it_did_not_find():
+    ys, kda, reference = VENDOR_LADDERS["TG 4-20%"]
+    # The 250 and 55 kDa bands left out.
+    bands = [(y, 12000.0 if mw in reference else 6000.0) for y, mw in zip(ys, kda, strict=True)]
+    proposal = _find(_marker_lane(bands[1:4] + bands[5:]), kda, reference)
+    ticks = {tick.mw: tick for tick in proposal.ticks}
+    assert [tick.mw for tick in proposal.ticks] == list(kda)  # top to bottom
+    assert [mw for mw, tick in ticks.items() if not tick.found] == [250, 55]
+    assert ticks[250].strength is None and ticks[55].strength is None
+    # Each where the quadratic through the found bands puts it: 55 kDa between
+    # its neighbours, near where the vendor draws it; 250 kDa above 130.
+    assert ticks[70].y < ticks[55].y < ticks[35].y
+    assert abs(ticks[55].y - ys[4]) < 10.0
+    assert 0.0 < ticks[250].y < ticks[130].y
+
+
+def test_find_ladder_draws_no_tick_the_quadratic_never_reaches():
+    # Five bands on a ladder whose log10(MW) turns over just below them: its
+    # quadratic never reaches 35 kDa, so the lighter MWs get no tick.
+    turn, a = 600.0, (math.log10(250) - math.log10(45)) / 500.0**2
+    ys = [turn - math.sqrt((math.log10(mw) - math.log10(45)) / a) for mw in KDA[:5]]
+    proposal = _find(_marker_lane([(y, 6000.0) for y in ys], height=700), KDA)
+    assert [(tick.mw, tick.found) for tick in proposal.ticks] == [(mw, True) for mw in KDA[:5]]
+    assert all(abs(tick.y - y) < 0.05 for tick, y in zip(proposal.ticks, ys, strict=True))
+
+
+def test_find_ladder_draws_no_predicted_tick_out_of_order_or_off_the_image():
+    # A quadratic that misses its found bands can put a predicted tick above a
+    # heavier found band: it is not drawn. Here z = -u, u = (y - 250) / 150.
+    peaks = [(100.0, 5.0), (110.0, 5.0), (400.0, 5.0)]
+    labelling = mwcal._Labelling(
+        pairs=((0, 0), (1, 2), (2, 4)),
+        score=0.0,
+        gap=math.inf,
+        fitted=(0.0, -1.0, 0.0),
+        mid=250.0,
+        scale=150.0,
+    )
+    kda = tuple(10.0**z for z in (1.2, 1.1, 0.9, 0.5, -0.8))
+    ticks = mwcal._ticks(peaks, kda, labelling, 500.0)
+    # 1.1 would lie at y = 85, above the found 1.2 at 100; 0.5 at y = 175.
+    assert [(t.mw, t.y, t.found) for t in ticks] == [
+        (kda[0], 100.0, True),
+        (kda[2], 110.0, True),
+        (kda[3], pytest.approx(175.0), False),
+        (kda[4], 400.0, True),
+    ]
+    # On an image 150 px high, 175 lies off it.
+    assert [t.mw for t in mwcal._ticks(peaks, kda, labelling, 150.0)] == [kda[0], kda[2], kda[4]]
+
+
+def test_find_ladder_follows_the_polarity_and_takes_a_faint_marker_either_way():
+    array, kda, reference, truth = _vendor_case("TG 4-20%", "none")
+    light = 2 * MEMBRANE_LEVEL - array  # the same bands, bright on a dark membrane
+    assert _right(_find(light, kda, reference, polarity=LIGHT), truth)
+    # Read the wrong way round, the bands are troughs: no band is found.
+    wrong = _find(light, kda, reference, polarity=DARK)
+    assert wrong is None or not any(
+        abs(y - band) < 5.0 for y in _found(wrong).values() for band in truth.values()
+    )
+    for image in (array, light):
+        for polarity in (DARK, LIGHT):
+            proposal = _find(image, kda, reference, polarity=polarity, source=CHEMI_MARKER)
+            assert _right(proposal, truth) and len(_found(proposal)) == len(kda)
+
+
+def test_find_ladder_takes_no_shading_for_a_band():
+    # A membrane shaded from top to bottom by 14 noise sigmas of its profile:
+    # no band.
+    shaded = np.full((860, 80), MEMBRANE_LEVEL) + np.linspace(-400.0, 400.0, 860)[:, None]
+    for seed in range(5):
+        assert _find(_noisy(shaded, seed), KDA) is None, seed
+    # The vendor's bands on it are found as on a flat membrane.
+    array, kda, reference, truth = _vendor_case("TG 4-20%", "none")
+    proposal = _find(array + np.linspace(-400.0, 400.0, 860)[:, None], kda, reference)
+    assert _right(proposal, truth) and len(_found(proposal)) == len(kda) and not proposal.extra
+
+
+def _written_lane(membrane: float, noise: float, *, depth: float = 110.0, dtype=np.uint8):
+    """The vendor's TG 4-20 % bands on a membrane at ``membrane`` counts with
+    seeded noise of ``noise``, rounded and clipped to ``dtype`` as an imager
+    writes them: a membrane past its range is clipped flat, one with little
+    noise is flat within a grey level. The bands are ``depth`` counts darker
+    (brighter where negative), the reference bands half as much again."""
+    ys, kda, reference = VENDOR_LADDERS["TG 4-20%"]
+    spots = [
+        (FIND_X, y - 0.5, 30.0, 3.0, depth * (1.5 if mw in reference else 1.0))
+        for y, mw in zip(ys, kda, strict=True)
+    ]
+    image = synthetic_blot((860, 80), spots, dtype=np.float64) - MEMBRANE_LEVEL + membrane
+    image += np.random.default_rng(3).normal(0.0, noise, image.shape)
+    info = np.iinfo(dtype)
+    return np.clip(np.round(image), info.min, info.max).astype(dtype)
+
+
+# An 8-bit marker lane whose membrane is clipped white: wholly (its steps are
+# 0, however noisy the bands are) or all but a few pixels (its steps are far
+# smaller than the bands' noise); one on a membrane flat within a grey level;
+# a faint marker on a 16-bit chemiluminescence image whose background the
+# imager clipped at 0, wholly or in part.
+WRITTEN_LANES = {
+    "clipped white": (lambda: _written_lane(265.0, 4.0), MARKER, DARK),
+    "clipped white but a few pixels": (lambda: _written_lane(264.0, 4.0), MARKER, DARK),
+    "flat within a grey level": (lambda: _written_lane(200.0, 0.15), MARKER, DARK),
+    "background clipped at 0": (
+        lambda: _written_lane(-100.0, 30.0, depth=-600.0, dtype=np.uint16),
+        CHEMI_MARKER,
+        LIGHT,
+    ),
+    "background clipped at 0 in part": (
+        lambda: _written_lane(-40.0, 30.0, depth=-600.0, dtype=np.uint16),
+        CHEMI_MARKER,
+        LIGHT,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", WRITTEN_LANES)
+def test_find_ladder_on_a_membrane_clipped_or_flat_within_a_grey_level(case):
+    # The noise is the bands' own, not the flat membrane's: found as on a
+    # membrane with noise, with no ripple on a band taken for one.
+    make, source, polarity = WRITTEN_LANES[case]
+    ys, kda, reference = VENDOR_LADDERS["TG 4-20%"]
+    reference = reference if source is MARKER else ()
+    proposal = _find(make(), kda, reference, source=source, polarity=polarity)
+    truth = dict(zip(kda, ys, strict=True))
+    assert _right(proposal, truth) and len(_found(proposal)) == len(kda)
+    assert proposal.extra == () and not proposal.doubtful
+    assert math.isclose(proposal.gap, ANCHORED_GAPS["TG 4-20%"][0], abs_tol=0.1), proposal.gap
+    assert all(tick.strength < 1e4 for tick in proposal.ticks)
+
+
+def test_find_ladder_needs_two_bands():
+    flat = _noisy(np.full((400, 80), MEMBRANE_LEVEL), seed=1)
+    assert _find(flat, KDA) is None
+    assert _find(_marker_lane([(200.5, 6000.0)], height=400), KDA) is None
+    lane = _marker_lane([(100.5, 6000.0), (200.5, 6000.0)], height=400)
+    assert _find(lane, KDA[:1]) is None  # a ladder of one MW
+    assert _find(lane, KDA, x=-40.0) is None  # no column of the lane on the image
+    assert _find(lane[:2], KDA) is None  # two rows: no peak can stand out
+
+
+def test_find_ladder_gap_without_another_labelling_is_infinite():
+    # Two bands and two MWs: one labelling only, none to be one band off.
+    proposal = _find(_marker_lane([(100.5, 6000.0), (200.5, 6000.0)], height=400), (100, 50))
+    assert [(t.mw, t.found) for t in proposal.ticks] == [(100, True), (50, True)]
+    assert (proposal.gap, proposal.doubtful, proposal.score) == (math.inf, False, 0.0)
+
+
+def test_find_ladder_second_ladder_takes_the_first_as_other():
+    # The gels whose bottom band is missing mislabel from positions alone. A
+    # second ladder 10 px lower than a first one marked on every band keeps its
+    # height difference from that one steady only when labelled right.
+    for name in ("TG 4-20%", "TG 10%"):
+        ys, kda, reference = VENDOR_LADDERS[name]
+        zs = tuple(math.log10(mw) for mw in kda)
+        first = mwcal.LadderCurve(ys, zs, zs[-1] - 0.1, zs[0] + 0.1)
+        bands = [
+            (y + 10.0, 12000.0 if mw in reference else 6000.0)
+            for y, mw in zip(ys, kda, strict=True)
+        ]
+        lane = _marker_lane(bands[:-1])
+        truth = {mw: y + 10.0 for mw, y in zip(kda, ys, strict=True)}
+        assert not _right(_find(lane, kda), truth), name
+        proposal = _find(lane, kda, other=first)
+        assert _right(proposal, truth) and set(_found(proposal)) == set(kda[:-1]), name
+        # With the reference bands too, the next labelling lies much further.
+        alone, both = _find(lane, kda, reference), _find(lane, kda, reference, other=first)
+        assert _right(both, truth) and not both.doubtful
+        assert both.gap > alone.gap + 5.0, (alone.gap, both.gap)
+
+
+def test_find_ladder_is_deterministic():
+    array, kda, reference, _ = _vendor_case("BT 4-12% MES", "extra")
+    assert _find(array, kda, reference) == _find(array.copy(), kda, reference)
+
+
+def test_find_ladder_stops_at_its_budget(monkeypatch):
+    array, kda, reference, _ = _vendor_case("TG 4-20%", "none")
+    monkeypatch.setattr(mwcal, "FIND_BUDGET", 5)
+    proposal = _find(array, kda, reference)
+    # The best labelling it found, doubtful: nothing shows it is the best.
+    assert (proposal.gap, proposal.doubtful) == (0.0, True)
+    assert proposal.ticks
+
+
+def test_find_ladder_refuses_a_strip_edge_or_mws_out_of_order():
+    lane = _marker_lane([(100.5, 6000.0), (200.5, 6000.0)], height=400)
+    with pytest.raises(ValueError, match="strip edge"):
+        _find(lane, KDA, source=STRIP)
+    for kda in ((100, 100), (50, 100), (100, 0), (100, math.nan)):
+        with pytest.raises(ValueError, match="ladder MWs"):
+            _find(lane, kda)
+
+
+def test_find_ladder_constants():
+    assert (FIND_HALF_X, FIND_BACKGROUND, PRIOR_DECADES, GAP_WARN) == (20, 0.1, 0.05, 5.0)
+    assert (MISS_COST, EXTRA_COST, REF_COST, FIND_BUDGET) == (9.0, 9.0, 9.0, 200_000)
