@@ -3,9 +3,9 @@
 between two ladders.
 
 Pure: it reads :mod:`proteia.core.model` objects and arrays it is given and
-never writes them, and opens no file; only :func:`refine_point` and
-:func:`find_ladder` read pixels (with numpy). Positions are continuous
-coordinates of an image's analysis array
+never writes them, and opens no file; only :func:`refine_point`,
+:func:`is_snap_position` and :func:`find_ladder` read pixels (with numpy).
+Positions are continuous coordinates of an image's analysis array
 (:class:`~proteia.core.model.CalibrationPoint`): pixel row r covers [r, r+1),
 so a band peaking on row r lies at y = r + 0.5, as a box centre does.
 
@@ -39,7 +39,13 @@ Snapping a click (:func:`refine_point`). A click on a ladder band or a strip
 edge is moved to the band's peak, or the edge, nearest it within a small
 window, which stops short of the points already marked on the same ladder, so
 a click never snaps onto a band that is marked already. With nothing there
-that stands out of the noise, the click is kept as it is.
+that stands out of the noise, the click is kept as it is. The window decides
+only which band a click takes: where that band lies comes from its own rows'
+means across the lane, so a band is snapped to the same y wherever it was
+clicked from, and a band saturated or clipped flat lies at the middle of its
+flat top. So a y a snap gave can be told afterwards from one placed by hand
+(:func:`is_snap_position`, at the x it was snapped at): it is where the peak
+its own row climbs to lies, to the bit.
 
 Finding a ladder (:func:`find_ladder`, D8). A click on the ladder lane finds
 the bands down it and proposes which ladder MW each one is: every in-order
@@ -95,6 +101,13 @@ SNAP_K: Final = 4.0
 # border itself (a strip cropped at its cut): no row lies past it to step from,
 # so a step found near it is noise or a band's flank, and the click is kept.
 SNAP_STRIP_BORDER: Final = 1.0
+# A y a snap gave lies where the peak its own row climbs to lies, to the bit:
+# the same rows' means give the same y, whatever window found the band. This
+# much (px) is hundreds of times a float's rounding at 10^4 px, and far below
+# how near a snap comes to a whole number: a strip edge thousands of counts
+# high, which a parabola barely moves, may lie 1e-7 px from one, where a y is
+# as likely typed by hand.
+SNAP_POSITION_TOLERANCE: Final = 1e-9
 # A robust sigma from the median absolute deviation of normal noise.
 _MAD_SIGMA: Final = 1.4826
 
@@ -559,6 +572,94 @@ def _peak_offset(below: float, at: float, above: float) -> float:
     return min(0.5, max(-0.5, 0.5 * (below - above) / curvature))
 
 
+def _maxima(series: Sequence[float]) -> list[tuple[int, int]]:
+    """Each local maximum of ``series`` as the run of equal samples it is,
+    ``(first, last)``: one sample, or a flat top of several (a band saturated
+    or clipped flat), with a lower sample on each side, so none touches an
+    end."""
+    maxima = []
+    first, count = 0, len(series)
+    while first < count:
+        last = first
+        while last + 1 < count and series[last + 1] == series[first]:
+            last += 1
+        if 0 < first and last < count - 1 and series[first - 1] < series[first] > series[last + 1]:
+            maxima.append((first, last))
+        first = last + 1
+    return maxima
+
+
+def _top(series: Sequence[float], first: int, last: int, origin: float) -> float:
+    """Where a local maximum ``first..last`` of ``series`` (:func:`_maxima`)
+    peaks, ``origin`` being where sample 0 lies: a lone sample refined by the
+    parabola through it and its neighbours (strictly the highest, so within
+    half a sample of it), a flat top at its middle."""
+    if first == last:
+        return origin + first + _peak_offset(series[first - 1], series[first], series[first + 1])
+    return origin + 0.5 * (first + last)
+
+
+def _climb(series: Sequence[float], start: int) -> tuple[int, int] | None:
+    """The local maximum of ``series`` (:func:`_maxima`) reached from sample
+    ``start`` by stepping to a higher neighbour while there is one (the
+    higher of two, the earlier of two as high); None where that ends on a
+    run touching an end of the series."""
+    count = len(series)
+    first = last = start
+    while True:
+        value = series[first]
+        while first > 0 and series[first - 1] == value:
+            first -= 1
+        while last < count - 1 and series[last + 1] == value:
+            last += 1
+        higher = [i for i in (first - 1, last + 1) if 0 <= i < count and series[i] > value]
+        if not higher:
+            return (first, last) if 0 < first and last < count - 1 else None
+        first = last = max(higher, key=lambda i: (series[i], -i))
+
+
+def _row_means(block: np.ndarray) -> list[float]:
+    """The mean of each row of ``block`` (a lane's columns), its sum correctly
+    rounded (:func:`math.fsum`): a row's mean does not depend on which other
+    rows were read with it, or on the order a sum took."""
+    columns = block.shape[1]
+    return [math.fsum(row) / columns for row in block.tolist()]
+
+
+def _shows(
+    means: Sequence[float], source: CalibrationPointSource, polarity: Polarity
+) -> list[list[float]]:
+    """The series on which a snap finds where a band lies, from the mean of
+    each row across the lane (``means``, :func:`_row_means`), one for each way
+    a band may show: the means turned by the image's polarity for a band on a
+    marker image, the means either way for a faint marker on a
+    chemiluminescence image, the size of their row-to-row steps for a strip
+    edge (step k between rows k and k + 1). None has a window's level taken
+    off, so where a band peaks on it does not depend on the window a click
+    gave."""
+    if source is CalibrationPointSource.STRIP_EDGE:
+        return [[abs(b - a) for a, b in itertools.pairwise(means)]]
+    bright = list(means)
+    dark = [-v for v in bright]
+    if source is CalibrationPointSource.CHEMILUMINESCENCE_MARKER:
+        return [bright, dark]
+    return [bright] if polarity is Polarity.LIGHT_ON_DARK else [dark]
+
+
+def _lane_columns(x: float, width: int) -> tuple[int, int]:
+    """The first and last columns a snap at ``x`` reads: those whose centres
+    lie within :data:`SNAP_HALF_X` px of it, on an image ``width`` px wide
+    (the first past the last where none does)."""
+    c0 = max(0, math.ceil(x - SNAP_HALF_X - 0.5))
+    return c0, min(width - 1, math.floor(x + SNAP_HALF_X - 0.5))
+
+
+def _origin(source: CalibrationPointSource) -> float:
+    # Where sample 0 of a snap's series lies: row 0's centre, or for a strip
+    # edge the step between rows 0 and 1.
+    return 1.0 if source is CalibrationPointSource.STRIP_EDGE else 0.5
+
+
 def refine_point(
     array: np.ndarray,
     x: float,
@@ -585,14 +686,23 @@ def refine_point(
     root of two the profile's.
 
     A ladder band is a local maximum of the profile reaching :data:`SNAP_K`
-    noise sigmas, the one nearest the click (of two as near, the higher),
-    refined by a parabola through it and its neighbours (at most half a row
-    either way): row r of the image lies at y = r + 0.5. A strip edge
-    (``strip_edge``) is the same on the size of the profile's steps, against
-    the steps' noise, the edge between rows r and r + 1 lying at y = r + 1;
-    one clicked within :data:`SNAP_STRIP_BORDER` px of the image's top or
-    bottom is that border (None): an edge a few rows inside it, on an image
-    not cropped at the cut, snaps from a click further in."""
+    noise sigmas (a flat top of equal rows, where a band saturates, is one),
+    the one nearest the click (of two as near, the higher). Where it lies is
+    found on the rows' own means across the lane (:func:`_shows`: turned by
+    the polarity; for a faint marker, the way the band shows against the
+    window's median), not on the profile, whose level (and, for a faint
+    marker, whose absolute value) follows the window: from the band's row,
+    up to the local maximum of the means there (none where that leaves the
+    window; its neighbours may lie a row past it), refined by a parabola
+    through it and its neighbours, or at the middle of a flat top (row r of
+    the image lies at y = r + 0.5). So a band snaps to one y wherever it was
+    clicked from, and :func:`is_snap_position` tells that y from one placed
+    by hand. A strip edge (``strip_edge``) is the same on the size of the
+    profile's steps, against the steps' noise, the edge between rows r and
+    r + 1 lying at y = r + 1; one clicked within :data:`SNAP_STRIP_BORDER` px
+    of the image's top or bottom is that border (None): an edge a few rows
+    inside it, on an image not cropped at the cut, snaps from a click
+    further in."""
     height, width = array.shape[:2]
     if source is CalibrationPointSource.STRIP_EDGE and not (
         SNAP_STRIP_BORDER < y < height - SNAP_STRIP_BORDER
@@ -606,26 +716,83 @@ def refine_point(
             bottom = min(bottom, y + SNAP_MARKED_GAP * (marked - y))
     # The rows and columns whose centres lie in the window.
     r0, r1 = max(0, math.ceil(top - 0.5)), min(height - 1, math.floor(bottom - 0.5))
-    c0 = max(0, math.ceil(x - SNAP_HALF_X - 0.5))
-    c1 = min(width - 1, math.floor(x + SNAP_HALF_X - 0.5))
+    c0, c1 = _lane_columns(x, width)
     if r1 - r0 < 2 or c1 < c0:  # a peak needs a row on each side
         return None
     window = np.asarray(array[r0 : r1 + 1, c0 : c1 + 1], dtype=float)
     profile, step_noise = _profile(window, source, polarity)
-    steps = np.diff(profile)
     if source is CalibrationPointSource.STRIP_EDGE:
         # Step k lies between rows k and k + 1.
-        series, first, noise = np.abs(steps), r0 + 1.0, step_noise
+        series, noise = np.abs(np.diff(profile)), step_noise
     else:
-        series, first, noise = profile, r0 + 0.5, step_noise / math.sqrt(2.0)
+        series, noise = profile, step_noise / math.sqrt(2.0)
+    values = [float(v) for v in series]
+    # The means reach a row past the window each way, where the image has
+    # one: a band peaking on the window's first or last row has a neighbour.
+    # Sample k of the window's series is sample k + skip of theirs.
+    e0, e1 = max(0, r0 - 1), min(height - 1, r1 + 1)
+    lane = np.asarray(array[e0 : e1 + 1, c0 : c1 + 1], dtype=float)
+    shows = _shows(_row_means(lane), source, polarity)
+    skip = r0 - e0
     found: list[float] = []
-    for k in range(1, len(series) - 1):
-        below, at, above = float(series[k - 1]), float(series[k]), float(series[k + 1])
-        if at > below and at >= above and at > 0.0 and at >= SNAP_K * noise:
-            found.append(first + k + _peak_offset(below, at, above))
+    for first, last in _maxima(values):
+        if not (values[first] > 0.0 and values[first] >= SNAP_K * noise):
+            continue
+        means = shows[0]
+        if len(shows) > 1 and np.mean(window[first : last + 1]) < np.median(window):
+            means = shows[1]  # a faint marker darker than the window around it
+        peak = _climb(means, skip + (first + last) // 2)
+        if peak is not None and skip <= peak[0] and peak[1] < skip + len(values):
+            found.append(_top(means, *peak, e0 + _origin(source)))
     if not found:
         return None
     return min(found, key=lambda peak: (abs(peak - y), peak))
+
+
+def is_snap_position(
+    array: np.ndarray,
+    x: float,
+    y: float,
+    *,
+    source: CalibrationPointSource,
+    polarity: Polarity,
+) -> bool:
+    """Whether ``y`` is where :func:`refine_point` at ``x`` puts the band (or
+    strip edge) it lies on: climbing from the sample ``y`` lies on (either,
+    on the boundary between two) on the rows' means across the lane
+    (:func:`_shows`; for a faint marker either way, for a strip edge the steps
+    between rows) ends on a peak that lies at ``y``, within
+    :data:`SNAP_POSITION_TOLERANCE` px. A y a snap at ``x`` gave lies there to
+    the bit, wherever the snap was clicked from down the lane and whatever the
+    marked points cut from its window; a y placed by hand, only where it was
+    put on that peak exactly. A snap at another x reads other columns, whose
+    means put the band a hair elsewhere: a y is judged at the x it was snapped
+    at. The noise is not asked: whether a band stood out of it depends on the
+    window a click gave, which a y alone does not tell.
+
+    Only the rows about ``y`` are read: a peak a snap gives is at most a
+    window high, and a climb that leaves them does not end at ``y``."""
+    height, width = array.shape[:2]
+    c0, c1 = _lane_columns(x, width)
+    if c1 < c0 or not math.isfinite(y):
+        return False
+    origin = _origin(source)
+    at = y - origin + 0.5  # sample k covers [k, k + 1) here
+    r0 = max(0, math.floor(at) - 2 * SNAP_HALF_Y)
+    r1 = min(height - 1, math.ceil(at) + 2 * SNAP_HALF_Y)
+    if r1 - r0 < 2:
+        return False
+    means = _row_means(np.asarray(array[r0 : r1 + 1, c0 : c1 + 1], dtype=float))
+    starts = {math.floor(at) - r0, math.ceil(at) - 1 - r0}
+    for series in _shows(means, source, polarity):
+        for start in starts:
+            if 0 <= start < len(series):
+                peak = _climb(series, start)
+                if peak is not None:
+                    lies = _top(series, *peak, r0 + origin)
+                    if abs(lies - y) <= SNAP_POSITION_TOLERANCE:
+                        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -694,11 +861,12 @@ def _ladder_peaks(profile: np.ndarray, noise: float) -> list[tuple[float, float]
     :data:`FIND_BACKGROUND` share of the rows, at least :data:`SNAP_HALF_Y` each
     way, so a slow shading of the membrane is no peak) and as far above the
     profile around it (its prominence, so a ripple on a band is none), refined
-    by a parabola as :func:`refine_point` refines a band, at y = row + 0.5 +
-    offset. Its strength is its height above the membrane in noise sigmas. The
-    noise is the profile's (:func:`_lane_noise`), and at least a billionth of
-    the profile's largest value (a profile without noise has none), so a
-    strength is finite."""
+    by a parabola through it and its neighbours, at y = row + 0.5 + offset, or
+    at the middle of a flat top of equal rows, where a band saturates
+    (:func:`_top`). Its strength is its height above the membrane (at the
+    middle of a flat top) in noise sigmas. The noise is the profile's
+    (:func:`_lane_noise`), and at least a billionth of the profile's largest
+    value (a profile without noise has none), so a strength is finite."""
     values = [float(v) for v in profile]
     scale = max((abs(v) for v in values), default=0.0)
     noise = max(noise, 1e-9 * scale)
@@ -708,11 +876,10 @@ def _ladder_peaks(profile: np.ndarray, noise: float) -> list[tuple[float, float]
     level = [float(v) for v in _background(profile, radius)]
     prominence = _prominences(values)
     peaks = []
-    for k in range(1, len(values) - 1):
-        below, at, above = values[k - 1], values[k], values[k + 1]
-        height = at - level[k]
-        if at > below and at >= above and min(height, prominence[k]) >= SNAP_K * noise:
-            peaks.append((k + 0.5 + _peak_offset(below, at, above), height / noise))
+    for first, last in _maxima(values):
+        height = values[first] - level[(first + last) // 2]
+        if min(height, prominence[first]) >= SNAP_K * noise:
+            peaks.append((_top(values, first, last, 0.5), height / noise))
     return peaks
 
 
@@ -979,7 +1146,8 @@ def find_ladder(
     chemiluminescence image (``chemiluminescence_marker``). Its peaks are the
     local maxima standing :data:`SNAP_K` noise sigmas above the membrane around
     them and above the profile around them (:func:`_ladder_peaks`), refined by
-    a parabola to y = row + 0.5 + offset. The noise is its steps', but at least
+    a parabola to y = row + 0.5 + offset, a flat top of equal rows (a band
+    saturated or clipped) at its middle. The noise is its steps', but at least
     what the lane's unclipped pixels and its grey levels give
     (:func:`_lane_noise`): a membrane clipped or flat has steps of 0.
 
@@ -1165,8 +1333,12 @@ def settings() -> dict[str, JsonValue]:
             "strip_edge_noise": "the robust sigma of the row-to-row steps",
             "strip_edge_border": SNAP_STRIP_BORDER,
             "ladder_band": (
-                "the local maximum nearest the click, refined by a parabola (at most half a"
-                " row), at row + 0.5"
+                "the local maximum nearest the click (a flat top of equal rows is one), placed"
+                " on the rows' own means across the lane, turned by the polarity (for a faint"
+                " marker, the way the band shows against the window's median), at their local"
+                " maximum reached from it: refined by a parabola (at most half a row), or the"
+                " middle of a flat top, at row + 0.5 (one y per band, wherever it is clicked"
+                " from)"
             ),
             "strip_edge": "the same on the size of the row-to-row steps, at the edge between rows",
             "no_band": "the clicked y is kept",
@@ -1180,8 +1352,9 @@ def settings() -> dict[str, JsonValue]:
                 " lane) standing k noise sigmas above the membrane around them (the profile's"
                 " running median over a background share of the rows, at least the snap's"
                 " half_y each way) and above the profile around them (their prominence),"
-                " refined by a parabola, at row + 0.5; a peak's strength is its height above"
-                " the membrane in noise sigmas"
+                " refined by a parabola, or at the middle of a flat top of equal rows, at"
+                " row + 0.5; a peak's strength is its height above the membrane in noise"
+                " sigmas"
             ),
             "noise": (
                 "the snap's, but at least the robust sigma of the differences between"

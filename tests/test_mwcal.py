@@ -621,8 +621,12 @@ def test_settings_are_the_constants():
                 " row-to-row steps over the square root of two"
             ),
             "ladder_band": (
-                "the local maximum nearest the click, refined by a parabola (at most half a"
-                " row), at row + 0.5"
+                "the local maximum nearest the click (a flat top of equal rows is one), placed"
+                " on the rows' own means across the lane, turned by the polarity (for a faint"
+                " marker, the way the band shows against the window's median), at their local"
+                " maximum reached from it: refined by a parabola (at most half a row), or the"
+                " middle of a flat top, at row + 0.5 (one y per band, wherever it is clicked"
+                " from)"
             ),
             "strip_edge": "the same on the size of the row-to-row steps, at the edge between rows",
             "strip_edge_noise": "the robust sigma of the row-to-row steps",
@@ -638,8 +642,9 @@ def test_settings_are_the_constants():
                 " lane) standing k noise sigmas above the membrane around them (the profile's"
                 " running median over a background share of the rows, at least the snap's"
                 " half_y each way) and above the profile around them (their prominence),"
-                " refined by a parabola, at row + 0.5; a peak's strength is its height above"
-                " the membrane in noise sigmas"
+                " refined by a parabola, or at the middle of a flat top of equal rows, at"
+                " row + 0.5; a peak's strength is its height above the membrane in noise"
+                " sigmas"
             ),
             "noise": (
                 "the snap's, but at least the robust sigma of the differences between"
@@ -675,6 +680,7 @@ def test_settings_are_the_constants():
     }
     assert (SNAP_HALF_X, SNAP_HALF_Y, SNAP_MARKED_GAP, SNAP_K) == (12, 12, 0.45, 4.0)
     assert SNAP_STRIP_BORDER == 1.0
+    assert mwcal.SNAP_POSITION_TOLERANCE == 1e-9
 
 
 def test_mwcal_imports_only_the_model():
@@ -802,6 +808,236 @@ def test_snap_keeps_a_strip_edge_clicked_on_the_image_border():
     inner = _noisy(inner, seed=5)
     assert abs(_snap(inner, 2.0, source=STRIP) - 3.0) < 0.5
     assert _snap(inner, 1.0, source=STRIP) is None
+
+
+def _faint_lane(sign: float, seed: int) -> tuple[np.ndarray, list[float]]:
+    """Eight bands 250 counts deep (dark; bright where ``sign`` is negative),
+    20 px wide and a few rows high, under 60 counts of seeded noise, as 16-bit
+    pixels: a faint marker, whose bands reach the lane's edge columns under
+    the noise. With the bands' ys."""
+    ys = [30.5 + 20.3 * i for i in range(8)]
+    spots = [(SNAP_X, y - 0.5, 10.0, 2.0, sign * 250.0) for y in ys]
+    noisy = _noisy(synthetic_blot((SNAP_H, SNAP_W), spots, dtype=np.float64), seed)
+    return np.clip(np.round(noisy), 0, 65535).astype(np.uint16), ys
+
+
+FAINT_LANES = {
+    "marker": (MARKER, DARK, 1.0),
+    "chemiluminescence, dark": (CHEMI_MARKER, DARK, 1.0),
+    "chemiluminescence, bright": (CHEMI_MARKER, LIGHT, -1.0),
+}
+
+
+@pytest.mark.parametrize("case", FAINT_LANES)
+def test_snap_lands_on_one_y_per_band_wherever_it_is_clicked_from(case):
+    # Where a snap lands on a band depends on the band's rows alone, not on
+    # the window the click and the points marked cut: every click that takes
+    # a band lands on the same y, and a snap from there with nothing marked
+    # lands there again. (For a faint marker, an absolute value moved the
+    # parabola with the window's median.) From half a pixel or 4 px off the
+    # band, a snap lands elsewhere.
+    source, polarity, sign = FAINT_LANES[case]
+    for seed in range(3):
+        array, ys = _faint_lane(sign, seed)
+        for i, y in enumerate(ys):
+            got = set()
+            for click in (y - 3.0, y - 1.5, y + 0.25, y + 1.5, y + 3.0):
+                for marked in ((), ys[:i] + ys[i + 1 :], (y - 12.0, y + 9.0), (y + 7.0,)):
+                    snapped = _snap(array, click, source=source, polarity=polarity, marked=marked)
+                    if snapped is not None and abs(snapped - y) < 1.0:
+                        got.add(snapped)
+            assert len(got) == 1, (seed, y, got)
+            [band] = got
+            assert _close(_snap(array, band, source=source, polarity=polarity), band)
+            for off in (0.5, 4.0):
+                again = _snap(array, band + off, source=source, polarity=polarity)
+                assert again is None or abs(again - band - off) > 0.01, (seed, y, off)
+
+
+def _is_snap(array, y, *, source=MARKER, polarity=DARK):
+    return mwcal.is_snap_position(array, SNAP_X, y, source=source, polarity=polarity)
+
+
+def test_every_y_a_snap_lands_on_is_a_snap_position():
+    # From clicks all down the image, with points marked around them or not,
+    # each ladder band, faint marker and strip edge a snap lands on lies where
+    # the climb from its own row, on the rows' means across the lane, ends
+    # (is_snap_position), whatever window the click and the points marked
+    # gave: so a y a snap gave can be told from one placed by hand. Half a
+    # pixel, or a fiftieth of one, off it is no such y.
+    cases = [
+        (_ladder_pixels([40.5, 71.3, 103.8, 150.0]), MARKER, DARK),
+        (_noisy(_bands((60.5, 6000.0), (76.5, 30000.0)), seed=3), MARKER, DARK),
+        (2 * MEMBRANE_LEVEL - _ladder_pixels([80.5]), CHEMI_MARKER, DARK),
+        (_ladder_pixels([80.5]), CHEMI_MARKER, LIGHT),
+        (_noisy(np.full((SNAP_H, SNAP_W), MEMBRANE_LEVEL), seed=1), MARKER, DARK),
+        (_faint_lane(1.0, 5)[0], CHEMI_MARKER, DARK),
+        (_faint_lane(-1.0, 6)[0], MARKER, LIGHT),
+    ]
+    strip = np.full((SNAP_H, SNAP_W), 2000.0)
+    strip[:120] = MEMBRANE_LEVEL
+    cases.append((_noisy(strip, seed=5), STRIP, DARK))
+    for array, source, polarity in cases:
+        for click in np.arange(2.0, SNAP_H - 2.0, 0.7):
+            for marked in ((), (click - 6.0, click + 4.0), (click + 3.0,)):
+                got = _snap(array, click, source=source, polarity=polarity, marked=marked)
+                if got is None:
+                    continue
+                assert _is_snap(array, got, source=source, polarity=polarity), (source, click, got)
+                for off in (-0.5, -0.02, 0.02, 0.5):
+                    assert not _is_snap(array, got + off, source=source, polarity=polarity), (
+                        source,
+                        click,
+                        got,
+                        off,
+                    )
+
+
+def test_a_snap_position_is_where_the_climb_from_its_row_ends():
+    # A band on row 80's centre, without noise, peaks at 80.5 exactly: a snap
+    # lands there, and only there is a snap position; not on the row's edges,
+    # the next row's centre, the band's flank or the membrane below it.
+    clean = _bands((80.5, 12000.0))
+    assert _snap(clean, 84.0) == 80.5 and _is_snap(clean, 80.5)
+    for y in (80.0, 81.0, 81.5, 80.5 + 1e-8, 84.0, 120.5, -3.0, SNAP_H + 3.0):
+        assert not _is_snap(clean, y), y
+    # Read 12 px to the side, the band peaks at the same y: it is as high
+    # either side of row 80 in every column. Past the image's side, no column
+    # is read.
+    assert mwcal.is_snap_position(clean, SNAP_X + 12.0, 80.5, source=MARKER, polarity=DARK)
+    assert not mwcal.is_snap_position(clean, -20.0, 80.5, source=MARKER, polarity=DARK)
+    # A faint marker may show either way; read as a marker band of the wrong
+    # polarity, a band is a trough, and its peak no snap position.
+    dark = _ladder_pixels([80.5])
+    light = 2 * MEMBRANE_LEVEL - dark
+    for array in (dark, light):
+        got = _snap(array, 84.0, source=CHEMI_MARKER)
+        assert _is_snap(array, got, source=CHEMI_MARKER)
+        assert _is_snap(array, got, source=CHEMI_MARKER, polarity=LIGHT)
+    got = _snap(light, 84.0, polarity=LIGHT)
+    assert _is_snap(light, got, polarity=LIGHT) and not _is_snap(light, got, polarity=DARK)
+    # A strip edge: on the steps between rows.
+    strip = np.full((SNAP_H, SNAP_W), 2000.0)
+    strip[:120] = MEMBRANE_LEVEL
+    strip = _noisy(strip, seed=5)
+    got = _snap(strip, 118.0, source=STRIP)
+    assert _is_snap(strip, got, source=STRIP) and not _is_snap(strip, got, source=MARKER)
+    assert not _is_snap(strip, 120.0, source=STRIP) and got != 120.0
+
+
+def test_a_strong_broad_faint_marker_snaps_from_most_clicks_near_it():
+    # One faint marker band, 30000 counts (500 noise sigmas) deep, 12 px
+    # (1/e) across, with a sigma of 4.5 rows down, dark or bright on the
+    # membrane: a click within 5 px of it snaps onto it, but for a few whose
+    # windows the band's own flanks fill with steps (the noise is the steps')
+    # as large as the band stands out. A band need not stand out of a window
+    # around itself as well: from there, where its flanks fill the window, it
+    # often does not.
+    snapped, clicks = 0, 0
+    for seed in range(6):
+        y = 100.5 + 0.2 * seed
+        spot = [(SNAP_X, y - 0.5, 12.0, 4.5 * math.sqrt(2.0), 30000.0)]
+        dark = _noisy(synthetic_blot((SNAP_H, SNAP_W), spot, dtype=np.float64), seed)
+        for array in (dark, 2 * MEMBRANE_LEVEL - dark):
+            for click in y + np.arange(-5.0, 5.01, 0.5):
+                clicks += 1
+                got = _snap(array, click, source=CHEMI_MARKER)
+                if got is not None and abs(got - y) < 1.0:
+                    snapped += 1
+                    assert _is_snap(array, got, source=CHEMI_MARKER)
+    assert clicks == 252 and snapped >= 240
+
+
+def _dense_ladder(depth: float, rows: float, seed: int, *, bright: bool = False):
+    """Sixteen bands about 10 px apart (each up to half a pixel off its
+    place), ``depth`` counts deep, 20 px wide and ``rows`` px (1/e) high,
+    under 60 counts of seeded noise, as 16-bit pixels (bright on the membrane
+    where ``bright``). With the bands' ys and a ruler's drags off them, 0.3
+    to 3 px either way, all seeded."""
+    rng = np.random.default_rng(seed)
+    ys = [25.5 + 10.0 * i + float(rng.uniform(-0.5, 0.5)) for i in range(16)]
+    spots = [(SNAP_X, y - 0.5, 10.0, rows, depth) for y in ys]
+    array = synthetic_blot((SNAP_H, SNAP_W), spots, dtype=np.float64)
+    array = array + rng.normal(0.0, 60.0, array.shape)
+    if bright:
+        array = 2 * MEMBRANE_LEVEL - array
+    drags = [float(rng.uniform(0.3, 3.0) * rng.choice([-1, 1])) for _ in ys]
+    return np.clip(np.round(array), 0, 65535).astype(np.uint16), ys, drags
+
+
+DENSE_LADDERS = {
+    # source, polarity, depth, rows, bright: of 112 interior bands, how many
+    # Snap all and single clicks snap onto.
+    "marker": (MARKER, DARK, 960.0, 1.5, False, 60, 78),
+    "chemiluminescence, strong": (CHEMI_MARKER, LIGHT, 4000.0, 2.0, True, 38, 60),
+}
+
+
+@pytest.mark.parametrize("case", DENSE_LADDERS)
+def test_a_dense_ladder_snaps_as_far_as_the_marked_gaps_allow(case):
+    # Bands 10 px apart, on eight seeded images. Snap all snaps each tick of a
+    # dragged ruler within the gaps to the other ticks; a click marks the
+    # bands top to bottom, each within the gaps to those marked before it.
+    # How many bands they take is set by the windows the neighbours cut (a
+    # band needs a lower row on each side in it) and what stands out of them;
+    # a band need not stand out of a window around itself as well, which its
+    # neighbours' flanks fill. Every y they land on is a snap position.
+    source, polarity, depth, rows, bright, snap_all, single = DENSE_LADDERS[case]
+    took = {"snap_all": 0, "single": 0}
+    for seed in range(8):
+        array, ys, drags = _dense_ladder(depth, rows, seed, bright=bright)
+        given = [y + d for y, d in zip(ys, drags, strict=True)]
+        marked: list[float] = []
+        for k, y in enumerate(ys):
+            others = given[:k] + given[k + 1 :]
+            all_ = _snap(array, given[k], source=source, polarity=polarity, marked=others)
+            one = _snap(array, given[k], source=source, polarity=polarity, marked=marked)
+            marked.append(given[k] if one is None else one)
+            for how, got in (("snap_all", all_), ("single", one)):
+                assert got is None or _is_snap(array, got, source=source, polarity=polarity)
+                took[how] += 0 < k < len(ys) - 1 and got is not None and abs(got - y) < 1.0
+    assert took["snap_all"] >= snap_all and took["single"] >= single, took
+
+
+SATURATED_KDA = (220, 120, 100, 80, 60, 50, 40, 30, 20)
+SATURATED_YS = (79.5, 145.5, 175.5, 236.5, 289.5, 395.5, 468.5, 596.5, 727.5)
+
+
+def _saturated_lane(kind: str) -> tuple[np.ndarray, CalibrationPointSource, Polarity]:
+    """A ladder at x = 60 whose bands saturate over their middle nine rows,
+    80 px wide (wider than the columns a snap or a found ladder reads): a
+    chemiluminescence marker exposed long enough to reach 65535 on a 16-bit
+    chemiluminescence image, or a dark visible marker clipped at 0 on an 8-bit
+    marker image. With its source and polarity."""
+    rows, columns = np.mgrid[0:860, 0:120]
+    shape = sum(np.exp(-((rows - (y - 0.5)) ** 2) / 18.0) for y in SATURATED_YS)
+    shape = shape * (np.abs(columns - 60) < 40)
+    noise = np.random.default_rng(0).normal(0.0, 1.0, shape.shape)
+    if kind == "chemiluminescence":
+        image = np.clip(np.round(800.0 + 200000.0 * shape + 30.0 * noise), 0, 65535)
+        return image.astype(np.uint16), CHEMI_MARKER, LIGHT
+    image = np.clip(np.round(200.0 - 700.0 * shape + 4.0 * noise), 0, 255)
+    return image.astype(np.uint8), MARKER, DARK
+
+
+@pytest.mark.parametrize("kind", ("chemiluminescence", "visible"))
+def test_a_saturated_band_lies_at_the_middle_of_its_flat_top(kind):
+    # Each band's middle nine rows are clipped to one value: its flat top is
+    # found, and snapped to, at its middle (not 3.5 px above it, at the lower
+    # edge of its first row).
+    array, source, polarity = _saturated_lane(kind)
+    assert all(
+        np.all(array[round(y - 0.5) + d, 40:81] == array[round(y - 0.5), 60])
+        for y in SATURATED_YS
+        for d in range(-4, 5)
+    )
+    proposal = mwcal.find_ladder(array, 60.0, kda=SATURATED_KDA, source=source, polarity=polarity)
+    assert [(t.mw, t.y, t.found) for t in proposal.ticks] == [
+        (mw, y, True) for mw, y in zip(SATURATED_KDA, SATURATED_YS, strict=True)
+    ]
+    for y in SATURATED_YS:
+        for click in (y - 3.0, y, y + 3.0):
+            assert mwcal.refine_point(array, 60.0, click, source=source, polarity=polarity) == y
 
 
 # --- Finding a ladder (find_ladder) ---

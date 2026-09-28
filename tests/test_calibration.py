@@ -1143,6 +1143,143 @@ def test_placed_labels_found_snapped_hand(tmp_path):
     assert "proposal" not in s.project.log[-1].params
 
 
+def test_every_snapped_tick_is_logged_snapped(tmp_path):
+    # Each tick of a ruler dragged 1.5 to 3 px off its band and snapped back
+    # is logged as snapped, wherever the snap was clicked from: on the
+    # marker, and on a faint marker of a chemiluminescence image (bands 5 to
+    # 10 noise sigmas deep), whose absolute value moved a snap's parabola with
+    # the window it read. A tick placed by hand half a pixel or a few px off
+    # its band is logged as placed by hand.
+    c = ruler_ready(tmp_path)
+    s = c.session
+    images = [c.marker]
+    for depth in (300.0, 450.0, 600.0):
+        bands = [(CAL_LEFT_X, cal_y(mw, CAL_LEFT_X) - 0.5, 10.0, 2.0, depth) for mw in CAL_KDA]
+        pixels = noisy16(synthetic_blot((CAL_H, CAL_W), bands, dtype=np.float64), 7)
+        images.append(import_blot(s, pixels, f"faint {depth:g}.tif", membrane_id=c.membrane))
+    drags = (2.0, -2.5, 3.0, -1.5, 2.5, -3.0, 1.5, -2.0)
+    for image in images:
+        given = [cal_y(mw, CAL_LEFT_X) + d for mw, d in zip(CAL_KDA, drags, strict=True)]
+        snapped = ops.snap_ladder(s, image, CAL_LEFT_X, given)
+        assert all(moved for _, moved in snapped), image
+        ys = [y for y, _ in snapped]
+        update = ops.set_ladder_points(
+            s, image, LEFT, list(zip(ys, CAL_KDA, strict=True)), x=CAL_LEFT_X
+        )
+        assert placed(update) == [(float(mw), "snapped", None) for mw in CAL_KDA], image
+        # 100 kDa half a pixel below where it snapped; 35 kDa 4 px below its
+        # band, on the membrane between bands.
+        by_hand = {100: ys[2] + 0.5, 35: ys[5] + 4.0}
+        ruler = [(by_hand.get(mw, y), mw) for y, mw in zip(ys, CAL_KDA, strict=True)]
+        update = ops.set_ladder_points(s, image, LEFT, ruler, x=CAL_LEFT_X)
+        assert placed(update) == [
+            (float(mw), "hand" if mw in by_hand else "snapped", None) for mw in CAL_KDA
+        ], image
+
+
+def test_a_point_snapped_where_it_was_clicked_is_logged_snapped_in_a_ruler(tmp_path):
+    # Ladder bands marked by single clicks 2 to 3 px either side of the
+    # lane's x, each snapped where it was clicked, then applied unchanged as
+    # one ruler at the lane's x (adjusted, then applied): each is logged as
+    # snapped. A snap reads the columns about its click; those about the
+    # ruler's x put its band a hair elsewhere, so a point keeping the y of one
+    # it replaces is judged where that one was snapped, on its image: also in
+    # a ruler applied on the other image of the register group, and with its
+    # label changed. A point clicked without a snap is placed by hand.
+    c = ruler_ready(tmp_path)
+    s = c.session
+    dxs = (2.0, -2.5, 3.0, -2.0, 2.5, -3.0, 2.0, -2.5)
+    drags = (1.5, -2.0, 2.0, -1.5, 1.0, -2.0, 1.5, -1.0)
+    kept = 55  # clicked without a snap
+    for mw, dx, dy in zip(CAL_KDA, dxs, drags, strict=True):
+        x = CAL_LEFT_X + dx
+        y = cal_y(mw, x) + dy
+        update = ops.add_calibration_point(s, c.marker, y, mw, MARKER_BAND, x=x, snap=mw != kept)
+        assert update.point["snapped"] is (mw != kept)
+    clicked = [(y, mw) for _, y, mw, _, _, _ in points(c, LEFT)]
+    marker = s.pixels(c.marker)
+    at_ruler = [
+        mwcal.is_snap_position(
+            marker, CAL_LEFT_X, y, source=MARKER_BAND, polarity=Polarity.DARK_ON_LIGHT
+        )
+        for y, _ in clicked
+    ]
+    assert not any(at_ruler)  # a snap at the ruler's x puts no band where these lie
+    expected = [(float(mw), "hand" if mw == kept else "snapped", None) for mw in CAL_KDA]
+    for image in (c.marker, c.blot):
+        update = ops.set_ladder_points(s, image, LEFT, clicked, x=CAL_LEFT_X)
+        assert placed(update) == expected, image
+        ops.undo(s)
+    relabelled = [(y, 140.0 if mw == 130 else mw) for y, mw in clicked]
+    update = ops.set_ladder_points(s, c.marker, LEFT, relabelled, x=CAL_LEFT_X)
+    assert placed(update) == [(140.0 if mw == 130 else mw, how, None) for mw, how, _ in expected]
+
+
+DENSE_KDA = (300, 250, 200, 150, 120, 100, 85, 70, 60, 50, 40, 30, 25, 20, 15, 10)
+DENSE_YS = tuple(25.3 + 10.0 * i for i in range(len(DENSE_KDA)))
+
+
+def dense_ladder(depth: float, rows: float, seed: int) -> np.ndarray:
+    """A ladder band at each of :data:`DENSE_YS` (10 px apart) down the left
+    lane, ``depth`` counts deep, 20 px wide and ``rows`` px (1/e) high, under
+    60 counts of seeded noise, as 16-bit pixels."""
+    bands = [(CAL_LEFT_X, y - 0.5, 10.0, rows, depth) for y in DENSE_YS]
+    return noisy16(synthetic_blot((CAL_H, CAL_W), bands, dtype=np.float64), seed)
+
+
+def test_every_tick_snap_all_moves_on_a_dense_ladder_is_logged_snapped(tmp_path):
+    # Bands 10 px apart, on a marker and on a faint marker of a
+    # chemiluminescence image; a ruler's ticks dragged 1.2 to 2.4 px off
+    # them. Snap all moves most ticks onto their bands, each within the gaps
+    # to the other ticks, and each tick it moved is logged as snapped: a snap
+    # from its y within the gaps to the ticks as applied, or with nothing
+    # marked, need not find its band again. The ticks it kept are placed by
+    # hand. Then ticks moved by hand from where they snapped, half a pixel, a
+    # fiftieth of one, onto their row's centre, 3 px off their bands or
+    # halfway to the next band, are logged as placed by hand.
+    c = ruler_ready(tmp_path)
+    s = c.session
+    marker = import_blot(
+        s,
+        dense_ladder(960.0, 1.5, 1),
+        "dense marker µ.tif",
+        kind=ImageKind.VISIBLE_MARKER,
+        membrane_id=c.membrane,
+    )
+    faint = import_blot(s, dense_ladder(4000.0, 2.0, 0), "dense α.tif", membrane_id=c.membrane)
+    drags = (1.6, -2.0, 2.4, -1.2, 2.0, -2.4, 1.2, -1.6)
+    for image, moves in ((marker, 12), (faint, 10)):
+        given = [y + drags[k % len(drags)] for k, y in enumerate(DENSE_YS)]
+        snapped = ops.snap_ladder(s, image, CAL_LEFT_X, given)
+        moved = [k for k, (_, m) in enumerate(snapped) if m]
+        assert len(moved) >= moves, (image, moved)
+        assert all(abs(snapped[k][0] - DENSE_YS[k]) < 1.0 for k in moved), image
+        ys = [y for y, _ in snapped]
+        update = ops.set_ladder_points(
+            s, image, LEFT, list(zip(ys, DENSE_KDA, strict=True)), x=CAL_LEFT_X
+        )
+        assert placed(update) == [
+            (float(mw), "snapped" if k in moved else "hand", None) for k, mw in enumerate(DENSE_KDA)
+        ], image
+        half, fiftieth, centre, off, between = [k for k in moved if k < len(DENSE_YS) - 1][:5]
+        by_hand = {
+            half: ys[half] + 0.5,
+            fiftieth: ys[fiftieth] - 0.02,
+            centre: math.floor(ys[centre]) + 0.5,
+            off: DENSE_YS[off] + 3.0,
+            between: 0.5 * (DENSE_YS[between] + DENSE_YS[between + 1]),
+        }
+        assert all(y != ys[k] for k, y in by_hand.items())
+        ruler = [
+            (by_hand.get(k, y), mw) for k, (y, mw) in enumerate(zip(ys, DENSE_KDA, strict=True))
+        ]
+        update = ops.set_ladder_points(s, image, LEFT, ruler, x=CAL_LEFT_X)
+        assert placed(update) == [
+            (float(mw), "snapped" if k in moved and k not in by_hand else "hand", None)
+            for k, mw in enumerate(DENSE_KDA)
+        ], image
+
+
 def test_relabelled_points_are_logged(tmp_path):
     c = ruler_ready(tmp_path)
     s = c.session

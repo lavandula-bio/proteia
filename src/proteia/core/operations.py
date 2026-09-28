@@ -2444,19 +2444,27 @@ def _placed(
     session: ProjectSession,
     image: ImageRef,
     applied: Sequence[CalibrationPoint],
+    replaced: Sequence[CalibrationPoint],
     proposal: mwcal.LadderProposal | None,
     proposed: bool,
 ) -> list[dict[str, JsonValue]]:
     """Each applied point as stored, with how it was placed, derived here and
     not taken from the client: ``found`` where it is a found tick of the
     proposal (the same MW, within :data:`PLACED_TOLERANCE` px); ``snapped``
-    where a snap from its y (within the gaps to the other points, as
-    :func:`snap_ladder` snaps) gives it back, or it sits on a peak the proposal
-    found (a label moved by one band keeps its band's y); ``hand`` otherwise.
-    With a proposal asked for (``proposed``), also ``relabelled``: whether its
-    MW differs from that of the proposal's tick at its y."""
+    where its y is where a snap at its x puts the band its row lies on
+    (:func:`~proteia.core.mwcal.is_snap_position`: a snap puts a band there
+    to the bit, however it was clicked and whichever ticks cut its window in
+    :func:`snap_ladder`), or where a snap put a point it ``replaced`` at the
+    same y (judged at that point's x, on its image, as its source: a band
+    clicked and snapped where it was clicked, then applied unchanged in a
+    ruler at the lane's x, whose columns put the band a hair elsewhere), or
+    where it sits on a peak the proposal found (a label moved by one band
+    keeps its band's y); ``hand`` otherwise. With a proposal asked for
+    (``proposed``), also ``relabelled``: whether its MW differs from that of
+    the proposal's tick at its y."""
     if not applied:
         return []
+    batch = session.project.batch
     array = session.pixels(image.id)
     source = _band_source(image)
     peaks = [] if proposal is None else [t.y for t in proposal.ticks if t.found]
@@ -2470,16 +2478,29 @@ def _placed(
     for point in applied:
         if point.x is None:  # unreachable: every applied point is marked at x
             raise RuntimeError("an applied ladder point has no x")
-        others = [p.y for p in applied if p is not point]
         on_tick = next((t for t in ticks if near(t.y, point.y)), None)
         if on_tick is not None and on_tick.found and math.log10(on_tick.mw) == math.log10(point.mw):
             how = "found"
         else:
-            snap = mwcal.refine_point(
-                array, point.x, point.y, source=source, polarity=image.polarity, marked_ys=others
-            )
             on_peak = any(near(peak, point.y) for peak in peaks)
-            how = "snapped" if on_peak or (snap is not None and near(snap, point.y)) else "hand"
+            snapped = (
+                on_peak
+                or mwcal.is_snap_position(
+                    array, point.x, point.y, source=source, polarity=image.polarity
+                )
+                or any(
+                    mwcal.is_snap_position(
+                        session.pixels(old.image_id),
+                        old.x,
+                        old.y,
+                        source=old.source,
+                        polarity=batch.find_image(old.image_id).polarity,
+                    )
+                    for old in replaced
+                    if old.y == point.y and old.x is not None
+                )
+            )
+            how = "snapped" if snapped else "hand"
         entry = {**_point_json(point), "placed": how}
         if proposed:
             entry["relabelled"] = on_tick is not None and math.log10(on_tick.mw) != math.log10(
@@ -2576,7 +2597,7 @@ def set_ladder_points(
     if refusal is not None:
         raise refusal
     proposal = None if found_x is None else _proposal(session, membrane, image, found_x, side)
-    placed = _placed(session, image, applied, proposal, found_x is not None)
+    placed = _placed(session, image, applied, replaced, proposal, found_x is not None)
 
     def edit(draft: Project) -> None:
         calibration = draft.batch.membrane_of(image_id).calibration
