@@ -336,7 +336,7 @@ def test_two_ladder_row_at_minus_2_degrees(tmp_path):
     # The blot and its ladders turned by -2 degrees (the right side up): two
     # ladders give the protein line, and the slot follows it, 18 px higher at
     # the right end than in the middle. Both rows, 16 of 16 lanes, each box on
-    # its band and within ±10% of its MW. R2 m1: along the line 16/16.
+    # its band and within ±10% of its MW.
     b = calibrated(tmp_path, degrees=-2.0)
     s = b.session
     loading, target = add(b, LOADING, "α-tubulin"), add(b, TARGET)
@@ -350,7 +350,7 @@ def test_two_ladder_row_at_minus_2_degrees(tmp_path):
     for protein, row in ((loading, LOADING), (target, TARGET)):
         placed_well(s, protein, row, -2.0)
     # One ladder, the left, cannot see the tilt: its level slot reads the
-    # right half of the blot too heavy (R2 m1: 8 of 16 outside ±10%).
+    # right half of the blot too heavy (8 of 16 outside ±10%).
     c = calibrated(tmp_path / "one ladder", degrees=-2.0, sides=(LEFT,))
     within = 0
     for row, name in ((LOADING, "α-tubulin"), (TARGET, "β-catenin")):
@@ -377,8 +377,7 @@ def test_a_steep_row_is_noted(tmp_path, monkeypatch):
 def test_span_between_ladders(tmp_path, degrees):
     # No lanes placed yet: the span lies between the two ladders, each taken a
     # lane pitch outside its end lane (128 px here), inset by half a pitch:
-    # 141 to 1165 on the level blot. Every lane placed, none doubtful. R2 m4
-    # took the ladder band's half width (46 px) instead: 8/8 at 0 and ±2°.
+    # 141 to 1165 on the level blot. Every lane placed, none doubtful.
     b = calibrated(tmp_path, degrees=degrees)
     target = add(b, TARGET)
     placed = ops.detect_mw_row(b.session, target)

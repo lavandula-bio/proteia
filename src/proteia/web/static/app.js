@@ -2664,6 +2664,7 @@ const ACTION_WORDS = {
   edit_calibration_point: "move ladder mark",
   remove_calibration_point: "remove ladder mark",
   clear_calibration: "clear ladder marks",
+  set_ladder_points: "apply ladder",
   requantify: "requantify",
   undo: "undo",
   redo: "redo",

@@ -65,11 +65,13 @@ from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 from rowcases import RowCase, adversarial
 from test_operations import (
+    CAL_H,
     CAL_KDA,
     CAL_LANES,
     CAL_LEFT_X,
     CAL_RIGHT_X,
     CAL_TILT,
+    CAL_W,
     cal_blot,
     cal_marker,
     cal_y,
@@ -1431,6 +1433,10 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["DELETE /api/images/{image_id}/calibration"] = client.ok(
         "DELETE", f"/api/images/{image_id}/calibration"
     )
+    ruler = {"x": 10.0, "points": [{"y": 20.0, "mw": 100}, {"y": 40.0, "mw": 50}]}
+    answers["PUT /api/images/{image_id}/calibration/{side}/ladder"] = client.ok(
+        "PUT", f"/api/images/{marker['image_id']}/calibration/left/ladder", ruler
+    )
     answers["POST /api/undo"] = client.ok("POST", "/api/undo")
     answers["POST /api/redo"] = client.ok("POST", "/api/redo")
     # A row box over the three declared lanes, on the image that kept the blot's polarity.
@@ -1498,6 +1504,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "GET /api/notices",
         "GET /api/ladders",
         "POST /api/notices/cloud_sync/dismiss",
+        # Only read: they answer what they found, not the project.
+        "POST /api/images/{image_id}/ladder-proposal",
+        "POST /api/images/{image_id}/ladder-snap",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -6058,6 +6067,180 @@ def test_calibration_routes(client, tmp_path):
     unlinked = client.ok("PUT", link, {"marker_image_id": None})
     assert len(unlinked["project"]["membranes"][0]["groups"]) == 3
     assert client.ok("POST", "/api/undo")["action"] == "set_marker_image"
+
+
+def _ladder_marker(client: Client, tmp_path: Path, image_id: str) -> tuple[str, str]:
+    """The two-ladder test marker (test_operations' cal_marker) uploaded on the
+    blot's membrane, and its own MWs chosen as a custom ladder: (marker image
+    id, membrane id)."""
+    membrane = client.ok("GET", "/api/project")["project"]["images"][0]["membrane_id"]
+    data = write_tiff(tmp_path / "ladder α.tif", cal_marker()).read_bytes()
+    _, marker = upload(client, data, "ladder α.tif", kind="visible_marker", membrane_id=membrane)
+    client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "ladder µ", "kda": list(CAL_KDA)},
+    )
+    return marker["image_id"], membrane
+
+
+def test_proposal_routes_change_nothing(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    session = client.workspace.current()
+    shown = client.ok("GET", "/api/project")["project"]
+    folder = client.root / "Blot"
+    files, entries, committed = files_of(folder), len(session.project.log), session.project
+    digest = storage.content_hash(committed)
+
+    answer = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
+    )
+    assert set(answer) == {"proposal"}  # no project: nothing changed to show
+    proposal = answer["proposal"]
+    assert [(tick["mw"], tick["found"]) for tick in proposal["ticks"]] == [
+        (float(mw), True) for mw in CAL_KDA
+    ]
+    assert all(abs(t["y"] - cal_y(t["mw"], CAL_LEFT_X)) < 0.05 for t in proposal["ticks"])
+    assert (proposal["x"], proposal["extra"], proposal["doubtful"]) == (CAL_LEFT_X, [], False)
+    assert (proposal["gap_infinite"], proposal["gap"] > 5.0) == (False, True)
+    right = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_RIGHT_X, "side": "right"}
+    )["proposal"]
+    assert len(right["ticks"]) == len(CAL_KDA)
+    # Where no ladder stands out: null.
+    empty = client.ok("POST", f"/api/images/{marker}/ladder-proposal", {"x": 240.0})
+    assert empty == {"proposal": None}
+    ys = [cal_y(70, CAL_LEFT_X) + 3.0, 190.0]
+    snapped = client.ok("POST", f"/api/images/{marker}/ladder-snap", {"x": CAL_LEFT_X, "ys": ys})
+    assert set(snapped) == {"points"}
+    [first, second] = snapped["points"]
+    assert first["snapped"] and abs(first["y"] - cal_y(70, CAL_LEFT_X)) < 0.2
+    assert second == {"y": 190.0, "snapped": False}
+
+    # Nothing changed, logged or saved: the same project, hash, log and files.
+    assert session.project is committed and len(session.project.log) == entries
+    assert storage.content_hash(session.project) == digest
+    assert files_of(folder) == files
+    now = client.ok("GET", "/api/project")["project"]
+    assert (now["open_id"], now["revision"]) == (shown["open_id"], shown["revision"])
+
+
+def test_ladder_route_applies_a_ruler_in_one_step(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    proposal = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
+    )["proposal"]
+    ticks = [{"y": tick["y"], "mw": tick["mw"]} for tick in proposal["ticks"]]
+    body = {"x": CAL_LEFT_X, "points": ticks, "found_at": CAL_LEFT_X}
+    answer = client.ok("PUT", f"/api/images/{marker}/calibration/left/ladder", body)
+    assert answer["sides_swapped"] is False and answer["point"] is None
+    assert [(p["mw"], p["placed"], p["relabelled"]) for p in answer["points"]] == [
+        (float(mw), "found", False) for mw in CAL_KDA
+    ]
+    assert answer["fit"]["ladders"][0]["points"] == len(CAL_KDA)
+    assert answer["curves_changed"] == [marker]
+    [state] = answer["project"]["membranes"]
+    group = next(g for g in state["groups"] if g["image_ids"] == [marker])
+    assert [(p["y"], p["mw"], p["x"], p["side"]) for p in group["points"]] == [
+        (t["y"], t["mw"], CAL_LEFT_X, "left") for t in ticks
+    ]
+    # One step back.
+    undone = client.ok("POST", "/api/undo")
+    assert undone["action"] == "set_ladder_points"
+    [state] = undone["project"]["membranes"]
+    assert all(g["points"] == [] for g in state["groups"]) and state["id"] == membrane
+    # A second ladder, given as the right one but left of the only one: the
+    # sides swap in the same change.
+    client.ok("POST", "/api/redo")
+    right = client.ok(
+        "PUT",
+        f"/api/images/{marker}/calibration/right/ladder",
+        {"x": 10.0, "points": ticks[:3]},
+    )
+    assert right["sides_swapped"] is True
+    assert {p["side"] for p in right["points"]} == {"left"}
+
+
+def test_ladder_routes_refuse_what_they_cannot_read(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    ladder = f"/api/images/{marker}/calibration/left/ladder"
+    proposal = f"/api/images/{marker}/ladder-proposal"
+    snap = f"/api/images/{marker}/ladder-snap"
+    point = {"y": 20.0, "mw": 250}
+    # A side the path names that is neither: no such ladder.
+    up = f"/api/images/{marker}/calibration/up/ladder"
+    assert client.refused("PUT", up, {"x": 5.0, "points": [point]})[:2] == (404, "unknown_id")
+    assert client.refused("POST", "/api/images/img-99/ladder-proposal", {"x": 5.0})[:2] == (
+        404,
+        "unknown_id",
+    )
+    too_many = {"x": 5.0, "points": [point] * (api.MAX_RULER_TICKS + 1)}
+    refusals = [
+        ("PUT", ladder, too_many),
+        ("PUT", ladder, {"x": 5.0, "points": [{"y": 20.0}]}),
+        ("PUT", ladder, {"x": "5", "points": [point]}),
+        ("PUT", ladder, {"x": 5.0, "points": [point], "extra": 1}),
+        ("POST", snap, {"x": 5.0, "ys": [20.0] * (api.MAX_RULER_TICKS + 1)}),
+        ("POST", snap, {"x": 5.0, "ys": ["20"]}),
+        ("POST", proposal, {"x": 5.0, "side": "middle"}),
+        ("POST", proposal, {"side": "left"}),
+    ]
+    for method, path, body in refusals:
+        assert client.refused(method, path, body)[:2] == (422, "invalid_input"), body
+    assert client.refused("POST", proposal, {"x": CAL_W + 1.0})[:2] == (422, "out_of_image")
+    assert client.refused("PUT", ladder, {"x": 5.0, "points": [point, point]})[:2] == (
+        422,
+        "duplicate_mw",
+    )
+    # JSON's non-numbers, which Python's reader takes, are no positions either.
+    for path, body in ((proposal, b'{"x": NaN}'), (ladder, b'{"x": Infinity, "points": []}')):
+        assert _raw_json(client, "PUT" if path == ladder else "POST", path, body) == (
+            422,
+            "invalid_input",
+        )
+    # A ladder must be chosen before one is found.
+    client.ok("PUT", f"/api/membranes/{membrane}/calibration/ladder", {"ladder": None})
+    assert client.refused("POST", proposal, {"x": CAL_LEFT_X})[:2] == (422, "invalid_input")
+
+
+def _raw_json(client: Client, method: str, path: str, body: bytes) -> tuple[int, str]:
+    """A request whose body is sent as JSON as it is; its status and code."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        headers = {"Authorization": f"Bearer {client.token}", "Content-Type": "application/json"}
+        conn.request(method, path, body=body, headers=headers)
+        response = conn.getresponse()
+        return response.status, json.loads(response.read())["code"]
+    finally:
+        conn.close()
+
+
+def test_a_proposal_with_no_other_labelling_answers_strict_json(client, tmp_path):
+    # Two bands, a ladder of two MWs: one labelling, so its gap is infinite,
+    # which JSON cannot hold (the client parses strictly).
+    image_id, _ = ready(client, tmp_path)
+    membrane = client.ok("GET", "/api/project")["project"]["images"][0]["membrane_id"]
+    bands = [(CAL_LEFT_X, cal_y(kda, CAL_LEFT_X) - 0.5, 10.0, 2.0, 20000.0) for kda in (250, 15)]
+    data = write_tiff(tmp_path / "two.tif", synthetic_blot((CAL_H, CAL_W), bands)).read_bytes()
+    _, marker = upload(client, data, "two β.tif", kind="visible_marker", membrane_id=membrane)
+    client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "two", "kda": [250, 15]},
+    )
+    path = f"/api/images/{marker['image_id']}/ladder-proposal"
+    proposal = client.ok("POST", path, {"x": CAL_LEFT_X})["proposal"]
+    assert (proposal["gap"], proposal["gap_infinite"], proposal["doubtful"]) == (None, True, False)
+    ticks = [{"y": t["y"], "mw": t["mw"]} for t in proposal["ticks"]]
+    applied = client.ok(
+        "PUT",
+        f"/api/images/{marker['image_id']}/calibration/left/ladder",
+        {"x": CAL_LEFT_X, "points": ticks, "found_at": CAL_LEFT_X},
+    )
+    assert [p["placed"] for p in applied["points"]] == ["found", "found"]
 
 
 # --- Rows placed by their expected MW (#58, D11, D12) ---

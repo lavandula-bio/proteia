@@ -64,6 +64,20 @@ infinite quality or disagreement, which JSON cannot hold, is null with
 changed (``curves_changed``) and the not-detected records dropped
 (``dropped_undetected``, as ``[protein id, lane index, band index]``).
 
+Finding a ladder (#58). ``POST /api/images/{image_id}/ladder-proposal``,
+``{x, side?}``, finds the ladder whose lane was clicked at ``x`` and answers
+``{proposal}``: its ticks, extra peaks, score, gap and whether it is doubtful
+(:func:`~proteia.core.operations.proposal_json`), or null where no ladder
+stands out. ``POST /api/images/{image_id}/ladder-snap``, ``{x, ys}``, snaps
+each tick of a ruler to its band and answers ``{points: [{y, snapped}]}``, in
+the order given. Both only read: nothing is changed, logged or saved, and
+they answer no project. ``PUT /api/images/{image_id}/calibration/{side}/ladder``,
+``{x, points: [{y, mw}], found_at?}``, applies a ruler in one change and one
+undo step (:func:`~proteia.core.operations.set_ladder_points`), and answers as
+the other calibration routes do, with the ``points`` applied, each with how it
+was ``placed`` (and, with ``found_at``, whether it was ``relabelled``), and
+``sides_swapped``. A ruler holds at most :data:`MAX_RULER_TICKS` ticks.
+
 A row placed by its expected MW (#58, D11, D12). ``POST /api/boxes/mw-row``,
 ``{protein_id, span?: [x0, x1]}`` (the columns dragged across the lanes, end
 exclusive; left out: read from the lanes placed or the ladders), places the
@@ -1181,6 +1195,39 @@ class PointEditBody(_Body):
     snap: StrictBool = False
 
 
+# At most this many ticks in a ruler sent to snap or apply: a ladder has a
+# dozen bands, and a list is checked tick by tick.
+MAX_RULER_TICKS: Final = 200
+
+
+class LadderProposalBody(_Body):
+    """Where a ladder lane was clicked, and which ladder of the register group
+    it is (``left`` or ``right``)."""
+
+    x: StrictFloat
+    side: str = "left"
+
+
+class LadderSnapBody(_Body):
+    """A ruler's ticks, drawn at ``x``, to snap each to its band."""
+
+    x: StrictFloat
+    ys: Annotated[list[StrictFloat], Field(max_length=MAX_RULER_TICKS)]
+
+
+class RulerTickBody(_Body):
+    y: StrictFloat
+    mw: StrictFloat
+
+
+class LadderPointsBody(_Body):
+    """A ruler applied: its ticks at ``x``, and the x it was found at, if it was."""
+
+    x: StrictFloat
+    points: Annotated[list[RulerTickBody], Field(max_length=MAX_RULER_TICKS)]
+    found_at: StrictFloat | None = None
+
+
 class BoxPaddingBody(_Body):
     """A protein's padding, whole pixels on each side: ``across`` left and right,
     ``along`` above and below. A field left out keeps its value: only the fields
@@ -1941,6 +1988,49 @@ def clear_calibration(
     chosen = None if side is None else LadderSide(side)
     update = ops.clear_calibration(session, image_id, side=chosen)
     return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.post("/images/{image_id}/ladder-proposal")
+def propose_ladder(image_id: str, body: LadderProposalBody, session: OpenSession) -> dict[str, Any]:
+    """Find the ladder clicked at ``x`` and propose its labels
+    (:func:`~proteia.core.operations.propose_ladder`); changes nothing."""
+    proposal = ops.propose_ladder(session, image_id, body.x, body.side)
+    return {"proposal": None if proposal is None else ops.proposal_json(proposal)}
+
+
+@router.post("/images/{image_id}/ladder-snap")
+def snap_ladder(image_id: str, body: LadderSnapBody, session: OpenSession) -> dict[str, Any]:
+    """Snap each tick of a ruler to its band
+    (:func:`~proteia.core.operations.snap_ladder`); changes nothing."""
+    snapped = ops.snap_ladder(session, image_id, body.x, body.ys)
+    return {"points": [{"y": y, "snapped": moved} for y, moved in snapped]}
+
+
+@router.put("/images/{image_id}/calibration/{side}/ladder")
+def set_ladder_points(
+    image_id: str,
+    side: str,
+    body: LadderPointsBody,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+) -> dict[str, Any]:
+    """Apply a ruler to the ladder ``side`` of the image's register group, in
+    one step (:func:`~proteia.core.operations.set_ladder_points`)."""
+    update = ops.set_ladder_points(
+        session,
+        image_id,
+        _side(side),
+        [(point.y, point.mw) for point in body.points],
+        x=body.x,
+        found_at=body.found_at,
+    )
+    return _answer(
+        workspace,
+        session,
+        **_calibration_update(update),
+        points=list(update.points),
+        sides_swapped=update.sides_swapped,
+    )
 
 
 @router.get("/images/{image_id}/preview")
