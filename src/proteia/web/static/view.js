@@ -73,9 +73,10 @@ function pressedBySpace(element) {
 
 // Whether Space presses `element` even with the pointer over the image: a
 // control it presses inside an element marked data-space-presses (#58: a
-// ladder ruler's tick buttons, and the popup a tick or a mark opens over the
-// image). Any other control's Space is the image's there: a tap meant to pan
-// presses nothing (an Undo, Clear marks, Remove).
+// ladder ruler's tick buttons, and the popup opened from one of them). Any
+// other control's Space is the image's there, a popup opened by a click on the
+// image included: a tap meant to pan presses nothing (an Undo, Clear marks,
+// Remove, a popup's MW or Remove this mark).
 function pressedOverImage(element) {
   return pressedBySpace(element) && element.closest("[data-space-presses]") !== null;
 }
@@ -811,11 +812,11 @@ export class ImageView {
     // Space held makes a drag pan, whatever has the focus. With the pointer
     // over the image it is also taken (it neither scrolls nor presses a
     // focused control, which it would on its release), but never from a field
-    // it types into, a select, a dialog, or a ruler tick or its popup
-    // (pressedOverImage: Space on a tick's button relabels it). Their release
-    // after a drag it panned is taken instead (nothing is pressed then), and
-    // typed into a text field, the press on the image takes the spaces back
-    // (untype).
+    // it types into, a select, a dialog, or a ruler tick or the popup opened
+    // from it (pressedOverImage: Space on a tick's button relabels it). Their
+    // release after a drag it panned is taken instead (nothing is pressed
+    // then), and typed into a text field, the press on the image takes the
+    // spaces back (untype).
     const isSpace = (event) => event.code === "Space" || event.key === " ";
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && this.gesture) {

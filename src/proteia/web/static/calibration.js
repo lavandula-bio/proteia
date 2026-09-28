@@ -1475,9 +1475,12 @@ export class CalibrationPanel {
             ` ${this.findAgain()}.`,
         );
       } else {
-        this.sayOnceRead(
-          openId,
-          () => `The membrane's ladder was changed (in another tab, say): ${this.findAgain()}.`,
+        // Another image shown meanwhile: what was refused, and no next step.
+        this.sayOnceRead(image, openId, (shown) =>
+          shown
+            ? `The membrane's ladder was changed (in another tab, say): ${this.findAgain()}.`
+            : "Find ladder was refused: the membrane's ladder was changed (in another tab," +
+              " say).",
         );
       }
       return;
@@ -2055,15 +2058,19 @@ export class CalibrationPanel {
         // Undo queued before Apply, say, changed its ladder first.
         return;
       }
+      const image = this.image; // the ruler's: another shown drops it (staleRuler)
       this.closeDraft(); // the keyboard goes on once it is answered (focusAfterApply)
       this.handlers.changed();
       const why = CHANGED_WORDS[error.detail && error.detail.changed];
       this.sayOnceRead(
+        image,
         this.project.open_id,
-        () =>
-          why
-            ? `The ruler was not applied: ${why}. Nothing was stored; ${this.findAgain()}.`
-            : sentence(error.message),
+        (shown) =>
+          !why
+            ? sentence(error.message)
+            : shown
+              ? `The ruler was not applied: ${why}. Nothing was stored; ${this.findAgain()}.`
+              : `The ruler was not applied: ${why}. Nothing was stored.`,
         true,
       );
       return;
@@ -2535,17 +2542,20 @@ export class CalibrationPanel {
   }
 
   // Once the project is read again (another tab changed what this page
-  // shows), while it still shows the opening `openId`: `words()`, worded from
-  // what it shows then, on the status line. With `refocus` (the keyboard was
-  // in this section: Apply), the keyboard, if its control is disabled or
-  // hidden now (Find ladder, with no MWs listed now), goes on (keepFocus).
-  // Nothing about another project is said.
-  async sayOnceRead(openId, words, refocus = false) {
+  // shows), while it still shows the opening `openId`: `words(shown)` on the
+  // status line, `shown` whether it still shows `image`, the one refused.
+  // Only then may the words say what the membrane shown lists or what to do
+  // next: another image shown meanwhile (by keyboard, say) may be another
+  // membrane's, whose ladder the refusal was not about. With `refocus` (the
+  // keyboard was in this section: Apply), the keyboard, if its control is
+  // disabled or hidden now (Find ladder, with no MWs listed now), goes on
+  // (keepFocus). Nothing about another project is said.
+  async sayOnceRead(image, openId, words, refocus = false) {
     await this.handlers.reread();
     if (!this.project || this.project.open_id !== openId) {
       return;
     }
-    this.handlers.status(words());
+    this.handlers.status(words(this.shows(image, openId) && Boolean(this.membrane)));
     if (refocus && this.membrane) {
       this.keepFocus();
     }
@@ -2565,8 +2575,8 @@ export class CalibrationPanel {
     const said =
       `${verb}: the membrane's ladder ${how}, and the MW was chosen from the ladder before.` +
       " Nothing was stored";
-    this.sayOnceRead(openId, () => {
-      if (!this.shows(image, openId) || !this.membrane) {
+    this.sayOnceRead(image, openId, (shown) => {
+      if (!shown) {
         return `${said}.`;
       }
       const listed = this.membrane.ladder === null ? null : this.ladderKda().length > 0;
@@ -2583,6 +2593,11 @@ export class CalibrationPanel {
   // (`extra`: {label, run}).
   // `choose(mw, listed)` takes the MW chosen, `listed` whether it was one of
   // `choices` (not typed); the keyboard goes back to `back` when it closes.
+  // `back` is the ruler tick's button it was opened from, or null for one
+  // opened by a click on the image (a tick or a mark there, a band marked).
+  // Only the first takes Space with the pointer over the image, as the tick
+  // does (data-space-presses, view.js): over the image, a Space tap is meant
+  // to pan, and presses nothing in a popup the click left the keyboard in.
   openMenu({
     title,
     choices,
@@ -2596,6 +2611,7 @@ export class CalibrationPanel {
   }) {
     const menu = $("cal-menu");
     this.closeMenu(false);
+    menu.toggleAttribute("data-space-presses", Boolean(back));
     $("cal-menu-title").textContent = title;
     const colors = this.referenceColors();
     const buttons = [];

@@ -307,8 +307,9 @@
         <button id="lane-picker-cancel" type="button">Cancel</button>
       </div>
       <!-- Beside a ruler tick or a band clicked (calibration.js): its MW, from the
-        ladder's; Esc or a click elsewhere closes it. -->
-      <div id="cal-menu" class="cal-menu" role="dialog" aria-labelledby="cal-menu-title" data-space-presses hidden>
+        ladder's; Esc or a click elsewhere closes it. Opened from a tick's button,
+        it is marked data-space-presses (openMenu). -->
+      <div id="cal-menu" class="cal-menu" role="dialog" aria-labelledby="cal-menu-title" hidden>
         <p id="cal-menu-title"></p>
         <div id="cal-menu-choices" class="cal-menu-choices"></div>
         <form id="cal-menu-other" class="cal-menu-other" hidden>

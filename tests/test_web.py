@@ -2712,11 +2712,36 @@ def test_a_mark_or_relabel_names_the_ladder_its_mw_was_chosen_from():
         refused = _method(panel, method)
         assert 'error.code === "calibration_changed"' in refused, method
         assert "this.ladderChanged(" in refused, method
-    assert "this.sayOnceRead(openId, () => {" in _method(panel, "ladderChanged(")
+    assert "this.sayOnceRead(image, openId, (shown) => {" in _method(panel, "ladderChanged(")
     once = _method(panel, "async sayOnceRead(")
     assert once.index("await this.handlers.reread();") < once.index(
-        "this.handlers.status(words());"
+        "this.handlers.status(words(this.shows(image, openId) && Boolean(this.membrane)));"
     )
+
+
+def test_a_refusal_read_again_says_what_to_do_only_on_its_image():
+    # A refusal said once the project is read again (the ladder changed in
+    # another tab) says what to do next from the membrane shown then (its
+    # ladder, findAgain), so only while the image refused is still shown:
+    # another image shown meanwhile, by keyboard say, may be another
+    # membrane's. Then what was refused is said, with no next step. Apply,
+    # Find ladder, and a mark or relabel pass the image refused.
+    panel = _code("calibration.js")
+    once = _method(panel, "async sayOnceRead(")
+    assert once.startswith("  async sayOnceRead(image, openId, words, refocus = false) {")
+    assert "words(this.shows(image, openId) && Boolean(this.membrane))" in once
+    assert re.findall(r"this\.sayOnceRead\(\s*(\w+),", panel) == ["image", "image", "image"]
+    refused = _method(panel, "applyRefused(")
+    ruler = refused.index("const image = this.image;")
+    assert ruler < refused.index("this.closeDraft();") < refused.index("this.sayOnceRead(")
+    for words in (refused, _method(panel, "async find(")):
+        said = words[words.index("this.sayOnceRead(") :]
+        said = said[: said.index(");\n")]
+        then, *otherwise = said[said.index("shown\n") :].splitlines()[1:]
+        assert then.lstrip().startswith("? `") and "${this.findAgain()}" in then
+        assert otherwise[0].lstrip().startswith(": ")
+        assert not any("findAgain" in line for line in otherwise)
+    assert "if (!shown) {\n        return `${said}.`;" in _method(panel, "ladderChanged(")
 
 
 def test_a_ladder_refusal_is_worded_from_its_code_and_detail():
@@ -2751,8 +2776,10 @@ def test_space_presses_only_a_tick_or_its_popup_over_the_image():
     # Space held pans the image, with the pointer over it, and a tap of it
     # there presses no focused control (the status line's Undo, Clear marks,
     # Remove): it was meant to pan. Only a ruler tick's button (its relabel
-    # popup) and that popup's controls, which sit over the image, are pressed
-    # by it; and a drag it panned makes its release press nothing.
+    # popup) and the controls of the popup opened from it, which sit over the
+    # image, are pressed by it; not those of a popup opened by a click on the
+    # image (a band marked, a stored mark, a tick there), which the click left
+    # the keyboard in. And a drag it panned makes its release press nothing.
     view = _code("view.js")
     _, over = _function(view, "function pressedOverImage(")
     assert "pressedBySpace(element)" in over and '.closest("[data-space-presses]")' in over
@@ -2764,5 +2791,13 @@ def test_space_presses_only_a_tick_or_its_popup_over_the_image():
     assert "this.untype();\n        this.spacePanned = true;" in view
     page = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
     marked = re.findall(r'<\w+ id="([\w-]+)"[^>]*\bdata-space-presses\b', page)
-    assert sorted(marked) == ["cal-menu", "cal-ticks"]
-    assert page.count("data-space-presses") == 2
+    assert marked == ["cal-ticks"]
+    assert re.search(r'<div id="cal-menu"[^>]*>', page).group().count("data-space-presses") == 0
+    panel = _code("calibration.js")
+    opened = _method(panel, "openMenu(")
+    assert 'menu.toggleAttribute("data-space-presses", Boolean(back));' in opened
+    assert opened.index("this.closeMenu(false);") < opened.index("menu.toggleAttribute(")
+    # Only a tick's button opens one with somewhere to go back to.
+    assert "this.relabelMenu(tick.id, button)" in panel
+    assert "this.relabelMenu(step.part.id, null, step);" in panel
+    assert re.findall(r"\bback(?:: (\w+))?,\n", panel) == ["", "null", "null", ""]
