@@ -24,7 +24,8 @@ then autosaves. So an edit is all or nothing:
 * Every committed change appends one log entry (see
   :class:`~proteia.core.model.LogEntry`); a refusal or a no-op appends none, and
   so do :func:`compute_view`, :func:`compute`, :func:`export_lane_table`,
-  :func:`export_bundle` and :func:`save`, which change no state. The params
+  :func:`export_bundle`, :func:`save`, :func:`propose_ladder` and
+  :func:`snap_ladder`, which change no state. The params
   record the inputs as they took effect (cleaned text, the stored spelling, the
   proposed lane, the snapped rect, the size used) and the ids created or
   removed; objects are named by id, never by path or typed text.
@@ -83,11 +84,12 @@ what it holds. The operations that place, move or resize boxes
 :func:`set_box_padding`, :func:`detect_row_boxes`), change a calibration or a
 marker link (:func:`set_marker_image`, :func:`set_ladder`,
 :func:`add_calibration_point`, :func:`edit_calibration_point`,
-:func:`remove_calibration_point`, :func:`clear_calibration`) or remove an
-image call it. A calibration that no #58 build has fitted (a project saved
-before #58) keeps its stored fit and MWs until one of them refits it; that
-refit counts as a change to the curve of every image of its membrane, so it
-rewrites every MW on the membrane and drops the MW-guided records there. An
+:func:`remove_calibration_point`, :func:`clear_calibration`,
+:func:`set_ladder_points`) or remove an image call it. A calibration that
+no #58 build has fitted (a project saved before #58) keeps its stored fit
+and MWs until one of them refits it; that refit counts as a change to the
+curve of every image of its membrane, so it rewrites every MW on the
+membrane and drops the MW-guided records there. An
 operation on calibration points or a marker link logs its register group's
 fit after the change (:class:`CalibrationFit`), the images whose curve changed
 and the records it dropped.
@@ -135,9 +137,10 @@ measured another way (``asymmetric`` or ``image``: its ring cut short), a band
 whose over-exposure could not be checked (its image's warnings or unknown bit
 depth say why, and whether it is assessed near the limit instead), an image
 imported with warnings, a row box whose detector warned or left lanes it
-could not locate, and a calibration point whose click found nothing to snap
-to (the clicked position was kept); and the exports written. None of it
-changes what they do.
+could not locate, a calibration point whose click found nothing to snap
+to (the clicked position was kept), and a ladder ruler applied from a
+proposal whose labels may be one band off (its gap is low); and the exports
+written. None of it changes what they do.
 """
 
 from __future__ import annotations
@@ -149,7 +152,7 @@ import logging
 import math
 import shutil
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Concatenate, Final
@@ -287,6 +290,8 @@ __all__ = [
     "new_project",
     "open_project",
     "place_box",
+    "proposal_json",
+    "propose_ladder",
     "redo",
     "remove_box",
     "remove_calibration_point",
@@ -299,10 +304,12 @@ __all__ = [
     "set_box_padding",
     "set_box_size",
     "set_ladder",
+    "set_ladder_points",
     "set_lanes",
     "set_marker_image",
     "set_polarity",
     "set_reference_condition",
+    "snap_ladder",
     "unassessed_images",
     "undo",
 ]
@@ -575,6 +582,10 @@ class CalibrationUpdate:
     fit: CalibrationFit | None
     curves_changed: tuple[str, ...]
     dropped_undetected: tuple[tuple[str, int, int], ...]
+    # set_ladder_points: the points applied, as stored, each with how it was
+    # placed; and whether they went to the other side than the one given.
+    points: tuple[dict[str, JsonValue], ...] = ()
+    sides_swapped: bool = False
 
 
 # --- Common machinery ---
@@ -2319,6 +2330,380 @@ def clear_calibration(
     }
     change, logged = _calibration_change(session, image_id, edit, params)
     return _calibration_update(_apply(session, "clear_calibration", change, logged))
+
+
+# --- Finding a ladder and applying it (#58, D8) ---
+
+# How close, in px, an applied point must lie to a position the server finds
+# again (a found tick, a peak, a snap) to count as placed there.
+PLACED_TOLERANCE: Final = 0.01
+
+
+def _band_source(image: ImageRef) -> CalibrationPointSource:
+    """The source of a ladder band marked on ``image``: a band of a visible-light
+    marker on a marker or merged image, a faint marker on a chemiluminescence
+    image."""
+    if image.kind is ImageKind.CHEMILUMINESCENCE:
+        return CalibrationPointSource.CHEMILUMINESCENCE_MARKER
+    return CalibrationPointSource.VISIBLE_MARKER
+
+
+def _lane_x(image: ImageRef, x: object, what: str = "x") -> float:
+    """A ladder lane's x across ``image``: a finite number (``INVALID_INPUT``)
+    on the image (``OUT_OF_IMAGE``)."""
+    number = _number(x, what)
+    _within_image(image, x=number, y=None)
+    return number
+
+
+def _proposal(
+    session: ProjectSession,
+    membrane: Membrane,
+    image: ImageRef,
+    x: float,
+    side: LadderSide,
+) -> mwcal.LadderProposal | None:
+    """:func:`~proteia.core.mwcal.find_ladder` on the committed project: at
+    ``x`` on ``image``, with the membrane's ladder MWs and its preset's
+    reference bands (none for a custom ladder), and, for the right ladder, the
+    register group's left ladder as the other one. ``INVALID_INPUT`` while the
+    membrane has no ladder MWs (choose its ladder first)."""
+    calibration = membrane.calibration
+    if not calibration.ladder_kda:
+        raise _invalid(
+            f"membrane {membrane.id} has no ladder MWs to find: choose its ladder first",
+            ids=(membrane.id,),
+        )
+    preset = None if calibration.ladder is None else ladders.preset(calibration.ladder)
+    reference = () if preset is None else tuple(band.kda for band in preset.reference)
+    other = None
+    if side is LadderSide.RIGHT:
+        fitted = mwcal.calibration_for(membrane, image.id)
+        if isinstance(fitted, mwcal.Calibration):
+            other = next(
+                (ladder.curve for ladder in fitted.ladders if ladder.side is LadderSide.LEFT), None
+            )
+    return mwcal.find_ladder(
+        session.pixels(image.id),
+        x,
+        kda=calibration.ladder_kda,
+        reference_kda=reference,
+        source=_band_source(image),
+        polarity=image.polarity,
+        other=other,
+    )
+
+
+def proposal_json(proposal: mwcal.LadderProposal) -> dict[str, JsonValue]:
+    """A ladder proposal JSON-plain, as its route answers it and a log entry
+    holds it: ``x``, the ``ticks`` (``{mw, y, found, strength}``, top to
+    bottom), the ``extra`` peaks' ys, ``score``, ``gap`` and ``doubtful``. JSON
+    has no infinity: a gap with no other labelling to measure it by is null,
+    with ``gap_infinite`` true."""
+    return {
+        "x": proposal.x,
+        "ticks": [
+            {"mw": tick.mw, "y": tick.y, "found": tick.found, "strength": tick.strength}
+            for tick in proposal.ticks
+        ],
+        "extra": list(proposal.extra),
+        "score": proposal.score,
+        "gap": _finite(proposal.gap),
+        "gap_infinite": not math.isfinite(proposal.gap),
+        "doubtful": proposal.doubtful,
+    }
+
+
+@_locked
+def propose_ladder(
+    session: ProjectSession, image_id: str, x: float, side: LadderSide = LadderSide.LEFT
+) -> mwcal.LadderProposal | None:
+    """Find the ladder whose lane was clicked at ``x`` on an image, and propose
+    its labels (:func:`~proteia.core.mwcal.find_ladder`) with the membrane's
+    ladder MWs and its preset's reference bands; for the ``right`` ladder, with
+    the register group's left ladder as the other one. None where fewer than
+    two bands stand out. Reads only: nothing is changed or logged.
+
+    Refused: an unknown image (``UnknownIdError``); an unknown side, an ``x``
+    that is not a finite number, or a membrane with no ladder MWs chosen
+    (``INVALID_INPUT``); an ``x`` off the image (``OUT_OF_IMAGE``); an image
+    file changed or unreadable."""
+    batch = session.project.batch
+    membrane, image, _ = _calibration_target(batch, image_id)
+    side = _member(LadderSide, side, "ladder side")
+    return _proposal(session, membrane, image, _lane_x(image, x), side)
+
+
+@_locked
+def snap_ladder(
+    session: ProjectSession, image_id: str, x: float, ys: Sequence[float]
+) -> tuple[tuple[float, bool], ...]:
+    """Snap each of the ticks ``ys`` of a ruler drawn at ``x`` on an image to
+    the ladder band nearest it (:func:`~proteia.core.mwcal.refine_point`, a band
+    of the image's marker source), each within the gaps to the other ticks, so
+    no tick snaps onto a neighbour's band. Gives ``(y, snapped)`` per tick, in
+    the order given: the y snapped to, or the one given where nothing stands
+    out. Reads only: nothing is changed or logged.
+
+    Refused: an unknown image (``UnknownIdError``); an ``x`` or a y that is
+    not a finite number, or ``ys`` not a list (``INVALID_INPUT``); a position
+    off the image (``OUT_OF_IMAGE``); an image file changed or unreadable."""
+    batch = session.project.batch
+    _, image, _ = _calibration_target(batch, image_id)
+    x = _lane_x(image, x)
+    if isinstance(ys, str | bytes) or not isinstance(ys, Sequence):
+        raise _invalid(f"the ticks' ys must be a list of numbers, not {ys!r}")
+    given = [_number(y, "y") for y in ys]
+    for y in given:
+        _within_image(image, x=None, y=y)
+    if not given:
+        return ()
+    array = session.pixels(image.id)
+    source = _band_source(image)
+    snapped = []
+    for index, y in enumerate(given):
+        others = given[:index] + given[index + 1 :]
+        found = mwcal.refine_point(
+            array, x, y, source=source, polarity=image.polarity, marked_ys=others
+        )
+        snapped.append((y, False) if found is None else (found, True))
+    return tuple(snapped)
+
+
+def _ladder_pairs(image: ImageRef, points: object) -> list[tuple[float, float]]:
+    """The ``(y, mw)`` of each point of a ruler, checked as
+    :func:`add_calibration_point` checks one: a y that is a finite number
+    (``INVALID_INPUT``) on the image (``OUT_OF_IMAGE``), an MW that is a positive
+    number of kDa (``INVALID_INPUT``)."""
+    if isinstance(points, str | bytes) or not isinstance(points, Sequence):
+        raise _invalid(f"a ladder's points must be a list of (y, MW) pairs, not {points!r}")
+    pairs = []
+    for point in points:
+        if isinstance(point, str | bytes) or not isinstance(point, Sequence) or len(point) != 2:
+            raise _invalid(f"a ladder point must be a (y, MW) pair, not {point!r}")
+        y = _number(point[0], "y")
+        _within_image(image, x=None, y=y)
+        pairs.append((y, _kda(point[1])))
+    return pairs
+
+
+def _placed(
+    session: ProjectSession,
+    image: ImageRef,
+    applied: Sequence[CalibrationPoint],
+    replaced: Sequence[CalibrationPoint],
+    proposal: mwcal.LadderProposal | None,
+    proposed: bool,
+) -> list[dict[str, JsonValue]]:
+    """Each applied point as stored, with how it was placed, derived here and
+    not taken from the client: ``found`` where it is a found tick of the
+    proposal (the same MW, within :data:`PLACED_TOLERANCE` px); ``snapped``
+    where its y is where a snap at its x puts the band its row lies on
+    (:func:`~proteia.core.mwcal.is_snap_position`: a snap puts a band there
+    to the bit, however it was clicked and whichever ticks cut its window in
+    :func:`snap_ladder`), or where a snap put a point it ``replaced`` at the
+    same y (judged at that point's x, on its image, as its source: a band
+    clicked and snapped where it was clicked, then applied unchanged in a
+    ruler at the lane's x, whose columns put the band a hair elsewhere), or
+    where it sits on a peak the proposal found (a label moved by one band
+    keeps its band's y); ``hand`` otherwise. With a proposal asked for
+    (``proposed``), also ``relabelled``: whether its MW differs from that of
+    the proposal's tick at its y."""
+    if not applied:
+        return []
+    batch = session.project.batch
+    array = session.pixels(image.id)
+    source = _band_source(image)
+    peaks = [] if proposal is None else [t.y for t in proposal.ticks if t.found]
+    peaks += [] if proposal is None else list(proposal.extra)
+    ticks = () if proposal is None else proposal.ticks
+
+    def near(a: float, b: float) -> bool:
+        return abs(a - b) <= PLACED_TOLERANCE
+
+    def snapped_where(old: CalibrationPoint) -> bool:
+        # Where a replaced point was snapped, on its own image: another image
+        # of the group, whose stored file may no longer read. The ruler reads
+        # only its own image, so it is not refused for that one: a point it
+        # cannot check is not taken as snapped.
+        try:
+            pixels = session.pixels(old.image_id)
+        except OperationError:
+            return False
+        return mwcal.is_snap_position(
+            pixels,
+            old.x,
+            old.y,
+            source=old.source,
+            polarity=batch.find_image(old.image_id).polarity,
+        )
+
+    placed = []
+    for point in applied:
+        if point.x is None:  # unreachable: every applied point is marked at x
+            raise RuntimeError("an applied ladder point has no x")
+        on_tick = next((t for t in ticks if near(t.y, point.y)), None)
+        if on_tick is not None and on_tick.found and math.log10(on_tick.mw) == math.log10(point.mw):
+            how = "found"
+        else:
+            on_peak = any(near(peak, point.y) for peak in peaks)
+            snapped = (
+                on_peak
+                or mwcal.is_snap_position(
+                    array, point.x, point.y, source=source, polarity=image.polarity
+                )
+                or any(
+                    snapped_where(old) for old in replaced if old.y == point.y and old.x is not None
+                )
+            )
+            how = "snapped" if snapped else "hand"
+        entry = {**_point_json(point), "placed": how}
+        if proposed:
+            entry["relabelled"] = on_tick is not None and math.log10(on_tick.mw) != math.log10(
+                point.mw
+            )
+        placed.append(entry)
+    return placed
+
+
+@_locked
+def set_ladder_points(
+    session: ProjectSession,
+    image_id: str,
+    side: LadderSide,
+    points: Sequence[tuple[float, float]],
+    *,
+    x: float,
+    found_at: float | None = None,
+) -> CalibrationUpdate:
+    """Apply a ruler: replace every point of the ``side`` ladder of the register
+    group ``image_id`` belongs to with ``points``, each ``(y, MW)``, all marked
+    on ``image_id`` at ``x`` (the source follows the image kind: a marker band
+    on a marker or merged image, a faint marker on a chemiluminescence one), in
+    one change, one log entry and one undo step. An empty list clears the side.
+    ``found_at`` is the x the ruler was found at (:func:`propose_ladder`), if it
+    was.
+
+    Sides follow x. A lone ladder is the left one, whichever side was given.
+    A second ladder given as ``right`` but left of the only one (or as ``left``
+    but right of it) makes that one the right (left) ladder and the new points
+    the other, in the same change; the side given holds no ladder then when it
+    has fewer than :data:`~proteia.core.mwcal.MIN_LADDER_POINTS` points, which
+    the new points replace. Either way ``sides_swapped`` says the points went
+    to the other side than the one given. Any other crossing is refused.
+
+    Refused, changing nothing: an unknown image (``UnknownIdError``); an
+    unknown side, an ``x`` or ``found_at`` that is not a finite number, points
+    that are not ``(y, MW)`` pairs, or a found ruler on a membrane with no
+    ladder MWs (``INVALID_INPUT``); then per point, as
+    :func:`add_calibration_point` refuses one, a position off the image
+    (``OUT_OF_IMAGE``) or an MW that is not a positive number
+    (``INVALID_INPUT``); then on the group's points as they would be: two at one
+    MW on a ladder (``DUPLICATE_MW``), two at one y or MWs out of order down it
+    (``CALIBRATION_ORDER``), or the ladders crossing, a right ladder beside a
+    strip edge or a point saved without its x (``LADDER_SIDES``); an image file
+    changed or unreadable.
+
+    The log entry holds ``membrane_id``, ``group``, ``side`` (where the points
+    were stored), ``image_id``, ``x``, ``found_at``, ``sides_swapped``, the
+    points of that side it replaced, whole (``removed``), the points applied as
+    stored, each with ``placed`` (``found``, ``snapped`` or ``hand``, derived
+    here: :func:`_placed`) and, with ``found_at``, ``relabelled``; with
+    ``found_at``, the ``proposal`` found there again from the same pixels
+    (:func:`proposal_json`, null where none is found); and what
+    :func:`_calibration_change` adds. A proposal found there that is doubtful
+    (its labels may be one band off) is also logged at INFO once committed.
+    The update's ``points`` are those applied points."""
+    batch = session.project.batch
+    membrane, image, group = _calibration_target(batch, image_id)
+    side = _member(LadderSide, side, "ladder side")
+    x = _lane_x(image, x)
+    found_x = None if found_at is None else _lane_x(image, found_at, "found_at")
+    if found_x is not None and not membrane.calibration.ladder_kda:
+        raise _invalid(
+            f"membrane {membrane.id} has no ladder MWs, so no ruler was found on it: choose its"
+            " ladder first",
+            ids=(membrane.id,),
+        )
+    pairs = _ladder_pairs(image, points)
+    source = _band_source(image)
+    held = [p for p in membrane.calibration.points if p.image_id in group]
+    replaced = [p for p in held if p.side == side]
+    opposite = [p for p in held if p.side != side]
+    stored, swapped = side, False
+    if pairs:
+        opposite_xs = [p.x for p in opposite if p.x is not None]
+        if not opposite:
+            # A lone ladder is the left one.
+            stored, swapped = LadderSide.LEFT, side is LadderSide.RIGHT
+        elif len(replaced) < mwcal.MIN_LADDER_POINTS and opposite_xs:
+            # The side given holds no ladder (too few points to be used: a
+            # stray point is replaced as well), so the other side's is the
+            # only one.
+            beyond = x < min(opposite_xs) if side is LadderSide.RIGHT else x > max(opposite_xs)
+            if beyond:  # the second ladder is on the other side of the only one
+                stored, swapped = _other_side(side), True
+    moved = _other_side(stored) if swapped else None
+    applied = [
+        CalibrationPoint(image_id=image_id, y=y, mw=mw, source=source, x=x, side=stored)
+        for y, mw in sorted(pairs)
+    ]
+    kept = [p.model_copy(update={"side": moved}) if moved is not None else p for p in opposite]
+    refusal = _ladder_refusal(membrane, group, [*kept, *applied])
+    if refusal is not None:
+        raise refusal
+    proposal = None if found_x is None else _proposal(session, membrane, image, found_x, side)
+    placed = _placed(session, image, applied, replaced, proposal, found_x is not None)
+
+    def edit(draft: Project) -> None:
+        calibration = draft.batch.membrane_of(image_id).calibration
+        others = [p for p in calibration.points if p.image_id not in group]
+        calibration.points = [
+            *others,
+            *(p.model_copy() for p in kept),
+            *(p.model_copy() for p in applied),
+        ]
+
+    params: dict[str, JsonValue] = {
+        "membrane_id": membrane.id,
+        "group": [i.id for i in membrane.images if i.id in group],
+        "side": stored.value,
+        "image_id": image_id,
+        "x": x,
+        "found_at": found_x,
+        "sides_swapped": swapped,
+        "removed": [_point_json(p) for p in replaced],
+        "points": list(placed),
+    }
+    if found_x is not None:
+        params["proposal"] = None if proposal is None else proposal_json(proposal)
+    before = session.project
+    change, logged = _calibration_change(session, image_id, edit, params)
+    update = _calibration_update(_apply(session, "set_ladder_points", change, logged))
+    if proposal is not None and proposal.doubtful:
+        _log_doubtful(session, before, image_id, proposal)
+    return replace(update, points=tuple(placed), sides_swapped=swapped)
+
+
+def _log_doubtful(
+    session: ProjectSession, before: Project, image_id: str, proposal: mwcal.LadderProposal
+) -> None:
+    """Log, once committed, a ruler applied from a proposal whose labels may be
+    one band off (its gap is below :data:`~proteia.core.mwcal.GAP_WARN`)."""
+    if session.project is not before:
+        _log.info(
+            "in %r: the ladder found at x=%g on %s may be one band off (gap %.3g to the"
+            " next-best labelling, below %g); the ruler is applied as given",
+            session.folder.name,
+            proposal.x,
+            image_id,
+            proposal.gap,
+            mwcal.GAP_WARN,
+        )
+
+
+def _other_side(side: LadderSide) -> LadderSide:
+    return LadderSide.RIGHT if side is LadderSide.LEFT else LadderSide.LEFT
 
 
 # --- Lanes and the reference ---

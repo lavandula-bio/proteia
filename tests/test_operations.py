@@ -8181,6 +8181,7 @@ MW_WRITERS = frozenset(
         "edit_calibration_point",
         "remove_calibration_point",
         "clear_calibration",
+        "set_ladder_points",
     }
 )
 MW_NEUTRAL = frozenset(
@@ -8196,6 +8197,8 @@ MW_NEUTRAL = frozenset(
         "import_image",
         "new_project",
         "open_project",
+        "proposal_json",
+        "propose_ladder",
         "redo",
         "remove_box",
         "remove_protein",
@@ -8206,6 +8209,7 @@ MW_NEUTRAL = frozenset(
         "set_lanes",
         "set_polarity",
         "set_reference_condition",
+        "snap_ladder",
         "unassessed_images",
         "undo",
     }
@@ -8274,6 +8278,11 @@ def test_mw_current_after_each_operation(tmp_path):
     assert all(band.apparent_mw is None for band in protein_of(s, c.protein).bands)
     step("set_marker_image", lambda: ops.set_marker_image(s, c.blot, c.marker))
     step("clear_calibration", lambda: ops.clear_calibration(s, c.marker, side=RIGHT))
+    right = [(cal_y(kda, CAL_RIGHT_X), kda) for kda in CAL_KDA[:5]]
+    step(
+        "set_ladder_points",
+        lambda: ops.set_ladder_points(s, c.marker, RIGHT, right, x=CAL_RIGHT_X),
+    )
     step("remove_image", lambda: ops.remove_image(s, c.marker))
     assert ran == MW_WRITERS
     calibration = s.project.batch.membranes[0].calibration
