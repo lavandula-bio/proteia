@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from conftest import MEMBRANE_LEVEL, synthetic_blot
-from proteia.core import ladders, mwcal
+from proteia.core import ladders, mwcal, storage
 from proteia.core import operations as ops
 from proteia.core.model import (
     CalibrationPoint,
@@ -29,7 +29,7 @@ from proteia.core.model import (
     UnknownIdError,
 )
 from proteia.core.operations import CalibrationFit, ErrorCode, LadderFit, OperationError
-from proteia.core.session import save_to_folder
+from proteia.core.session import open_project, save_to_folder
 from test_operations import (
     CAL_H,
     CAL_KDA,
@@ -1213,6 +1213,29 @@ def test_a_point_snapped_where_it_was_clicked_is_logged_snapped_in_a_ruler(tmp_p
     relabelled = [(y, 140.0 if mw == 130 else mw) for y, mw in clicked]
     update = ops.set_ladder_points(s, c.marker, LEFT, relabelled, x=CAL_LEFT_X)
     assert placed(update) == [(140.0 if mw == 130 else mw, how, None) for mw, how, _ in expected]
+
+
+def test_a_ruler_applies_when_the_image_its_points_were_snapped_on_cannot_be_read(tmp_path):
+    # Points snapped on the marker, then applied unchanged in a ruler on the
+    # blot of the same register group after the marker's stored file was
+    # changed outside Proteia: the ruler reads only the blot, so it applies;
+    # where each point was snapped cannot be checked, so each is logged as
+    # placed by hand.
+    c = ruler_ready(tmp_path)
+    s = c.session
+    for mw in CAL_KDA:
+        y = cal_y(mw, CAL_LEFT_X + 2.0) + 1.5
+        ops.add_calibration_point(s, c.marker, y, mw, MARKER_BAND, x=CAL_LEFT_X + 2.0, snap=True)
+    save_to_folder(s)
+    clicked = [(y, mw) for _, y, mw, _, _, _ in points(c, LEFT)]
+    reopened = open_project(s.folder)
+    stored = storage.image_path(s.folder, reopened.project.batch.find_image(c.marker))
+    stored.write_bytes(stored.read_bytes() + b"x")
+    with pytest.raises(OperationError) as caught:
+        reopened.pixels(c.marker)
+    assert caught.value.code is ErrorCode.IMAGE_FILE_CHANGED
+    update = ops.set_ladder_points(reopened, c.blot, LEFT, clicked, x=CAL_LEFT_X)
+    assert [how for _, how, _ in placed(update)] == ["hand"] * len(CAL_KDA)
 
 
 DENSE_KDA = (300, 250, 200, 150, 120, 100, 85, 70, 60, 50, 40, 30, 25, 20, 15, 10)

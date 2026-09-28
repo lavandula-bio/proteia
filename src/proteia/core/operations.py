@@ -2521,6 +2521,23 @@ def _placed(
     def near(a: float, b: float) -> bool:
         return abs(a - b) <= PLACED_TOLERANCE
 
+    def snapped_where(old: CalibrationPoint) -> bool:
+        # Where a replaced point was snapped, on its own image: another image
+        # of the group, whose stored file may no longer read. The ruler reads
+        # only its own image, so it is not refused for that one: a point it
+        # cannot check is not taken as snapped.
+        try:
+            pixels = session.pixels(old.image_id)
+        except OperationError:
+            return False
+        return mwcal.is_snap_position(
+            pixels,
+            old.x,
+            old.y,
+            source=old.source,
+            polarity=batch.find_image(old.image_id).polarity,
+        )
+
     placed = []
     for point in applied:
         if point.x is None:  # unreachable: every applied point is marked at x
@@ -2536,15 +2553,7 @@ def _placed(
                     array, point.x, point.y, source=source, polarity=image.polarity
                 )
                 or any(
-                    mwcal.is_snap_position(
-                        session.pixels(old.image_id),
-                        old.x,
-                        old.y,
-                        source=old.source,
-                        polarity=batch.find_image(old.image_id).polarity,
-                    )
-                    for old in replaced
-                    if old.y == point.y and old.x is not None
+                    snapped_where(old) for old in replaced if old.y == point.y and old.x is not None
                 )
             )
             how = "snapped" if snapped else "hand"
