@@ -51,10 +51,15 @@ point is named by the register group of the image in the path, its ladder
 ``side`` (``left`` or ``right``; any other word answers 404 ``unknown_id``) and
 its MW, written in the path as Python writes the number (``100``, ``61.5``):
 ``POST /api/images/{image_id}/calibration/{side}/points`` marks one, ``{y, mw,
-source, x, snap?}`` (:func:`~proteia.core.operations.add_calibration_point`),
-``PATCH .../points/{mw}`` moves or relabels it, ``{y?, mw?, snap?}``, a field
-left out kept (:func:`~proteia.core.operations.edit_calibration_point`), and
-``DELETE .../points/{mw}`` removes it; ``DELETE
+source, x, snap?, ladder_kda?}`` (:func:`~proteia.core.operations.add_calibration_point`),
+``PATCH .../points/{mw}`` moves or relabels it, ``{y?, mw?, snap?, ladder_kda?}``,
+a field left out kept (:func:`~proteia.core.operations.edit_calibration_point`),
+and ``DELETE .../points/{mw}`` removes it. ``ladder_kda``, when given, is the
+membrane's ladder MWs the MW (the new label) was chosen from, as the page
+listed them; a list that is no longer the membrane's (another tab chose
+another ladder since) is refused first, storing nothing, as
+``calibration_changed`` 409, ``detail.changed`` ``ladder_kda``. An MW typed
+names none, and is not checked. ``DELETE
 /api/images/{image_id}/calibration`` removes every point of the image's group,
 or those of one side with ``?side=``. These answer, besides the state, what the
 change did (:class:`~proteia.core.operations.CalibrationUpdate`): the ``point``
@@ -66,17 +71,29 @@ changed (``curves_changed``) and the not-detected records dropped
 
 Finding a ladder (#58). ``POST /api/images/{image_id}/ladder-proposal``,
 ``{x, side?}``, finds the ladder whose lane was clicked at ``x`` and answers
-``{proposal}``: its ticks, extra peaks, score, gap and whether it is doubtful
-(:func:`~proteia.core.operations.proposal_json`), or null where no ladder
-stands out. ``POST /api/images/{image_id}/ladder-snap``, ``{x, ys}``, snaps
+``{proposal, ladder_kda}``: its ticks, extra peaks, score, gap and whether it
+is doubtful (:func:`~proteia.core.operations.proposal_json`), or null where no
+ladder stands out; and the membrane's ladder MWs its labels are, read with it
+(a page's copy of the project may be older: another tab chose another ladder
+since). A membrane whose ladder lists no MWs (none chosen, or a custom one
+without them) is refused as ``invalid_input``, after what the request names is
+checked, with ``detail`` ``{ladder_kda: []}``, the MWs it lists: for a page
+that listed others to know the ladder changed. ``POST
+/api/images/{image_id}/ladder-snap``, ``{x, ys}``, snaps
 each tick of a ruler to its band and answers ``{points: [{y, snapped}]}``, in
 the order given. Both only read: nothing is changed, logged or saved, and
 they answer no project. ``PUT /api/images/{image_id}/calibration/{side}/ladder``,
-``{x, points: [{y, mw}], found_at?}``, applies a ruler in one change and one
-undo step (:func:`~proteia.core.operations.set_ladder_points`), and answers as
-the other calibration routes do, with the ``points`` applied, each with how it
-was ``placed`` (and, with ``found_at``, whether it was ``relabelled``), and
-``sides_swapped``. A ruler holds at most :data:`MAX_RULER_TICKS` ticks.
+``{x, points: [{y, mw}], found_at?, ladder_kda?, group?}``, applies a ruler in
+one change and one undo step (:func:`~proteia.core.operations.set_ladder_points`),
+and answers as the other calibration routes do, with the ``points`` applied,
+each with how it was ``placed`` (and, with ``found_at``, whether it was
+``relabelled``), and ``sides_swapped``. A ruler holds at most
+:data:`MAX_RULER_TICKS` ticks. ``ladder_kda`` and ``group``, when given, are
+what the ruler was opened with: the membrane's ladder MWs its labels are, and
+the image ids of the register group whose marks it replaces; either one
+changed since (another tab chose another ladder, or linked or unlinked an
+image) is refused, storing nothing, as ``calibration_changed`` 409, whose
+``detail.changed`` names the field (``ladder_kda`` or ``group``).
 
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
@@ -169,12 +186,17 @@ shows another.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
-refusal carries one (a row box's: what the detector saw); an unknown id 404, and
+refusal carries one (a row box's: what the detector saw; a calibration point's
+``calibration_order``, ``duplicate_mw`` or ``ladder_sides``: the ladder side,
+the MWs in conflict and why, never an id or a position); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
 ``no_project`` 409 before a project is open; ``no_state_folder`` 409 for a
 diagnostic file, or a notice's dismissal, when Proteia was served without its
 state folder, and
 ``files_changed`` 409 for one whose project files are not those listed;
+``calibration_changed`` 409 for a ruler whose ladder or register group changed
+since it was opened, or a mark whose MW was chosen from a ladder list changed
+since;
 ``project_changed`` 409 for a
 request that names an opening no longer open, with ``detail`` ``{open,
 open_id}``: the open project's name and open id; ``invalid_input`` 422 for a
@@ -233,7 +255,14 @@ from proteia.core import ladders, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import DEFAULT_CHART_FORMATS
-from proteia.core.model import BoxSize, ImageKind, LadderSide, Polarity, UnknownIdError
+from proteia.core.model import (
+    BoxSize,
+    ImageKind,
+    LadderSide,
+    Membrane,
+    Polarity,
+    UnknownIdError,
+)
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
@@ -375,6 +404,34 @@ class FilesChangedError(RuntimeError):
     """A diagnostic file would hold other project files than the page listed
     (:meth:`proteia.web.diagnostics.Plan.digest`): made or removed since, in
     the same opening."""
+
+
+class CalibrationChangedError(RuntimeError):
+    """A ruler applied (#58) names what it was opened with, or a mark (a new
+    one, or one relabelled) the ladder list its MW was chosen from, and that
+    changed since, in the same opening (another tab, say): ``changed`` is the
+    field that no longer holds, ``ladder_kda`` (the membrane's ladder MWs,
+    which its labels are) or ``group`` (the register group whose marks it
+    replaces); ``mark`` for a mark's."""
+
+    def __init__(self, changed: Literal["ladder_kda", "group"], *, mark: bool = False) -> None:
+        if mark:
+            message = (
+                "the membrane's ladder changed since this MW was chosen from its list, so it is"
+                " an MW of the ladder before: nothing was stored; choose the MW again"
+            )
+        elif changed == "ladder_kda":
+            message = (
+                "the membrane's ladder changed since this ruler was labelled, so its labels are"
+                " those of the ladder before: nothing was stored; find the ladder again"
+            )
+        else:
+            message = (
+                "the image's marker link changed since this ruler was opened, and with it the"
+                " marks the ruler replaces: nothing was stored; find the ladder again"
+            )
+        super().__init__(message)
+        self.changed = changed
 
 
 @dataclass(frozen=True)
@@ -1158,25 +1215,35 @@ class LadderBody(_Body):
     kda: list[StrictFloat] | None = None  # the ladder's MWs, top to bottom
 
 
+# A ladder MW as a page names it (a ruler's labels, the list a mark's MW was
+# chosen from): a positive, finite number of kDa.
+RulerKda = Annotated[StrictFloat, Field(gt=0, allow_inf_nan=False)]
+
+
 class PointBody(_Body):
     """A calibration point, in continuous coordinates of the image's analysis
-    array; ``x`` is required: every new point records where it was marked."""
+    array; ``x`` is required: every new point records where it was marked.
+    ``ladder_kda``, when the page names it, is the membrane's ladder MWs the
+    MW was chosen from (none for an MW typed)."""
 
     y: StrictFloat
     mw: StrictFloat
     source: str
     x: StrictFloat
     snap: StrictBool = True
+    ladder_kda: list[RulerKda] | None = None
 
 
 class PointEditBody(_Body):
     """A calibration point's new position (``y``) or label (``mw``). A field
     left out keeps its value: only the fields the request set are passed on,
-    so these defaults are never used."""
+    so these defaults are never used. ``ladder_kda``, when the page names it,
+    is the membrane's ladder MWs the new label was chosen from."""
 
     y: StrictFloat = 0.0
     mw: StrictFloat = 0.0
     snap: StrictBool = False
+    ladder_kda: list[RulerKda] | None = None
 
 
 # At most this many ticks in a ruler sent to snap or apply: a ladder has a
@@ -1205,11 +1272,16 @@ class RulerTickBody(_Body):
 
 
 class LadderPointsBody(_Body):
-    """A ruler applied: its ticks at ``x``, and the x it was found at, if it was."""
+    """A ruler applied: its ticks at ``x``, and the x it was found at, if it
+    was; and, when the page names them, what the ruler was opened with: the
+    membrane's ladder MWs its labels are (``ladder_kda``) and the image ids of
+    the register group whose marks it replaces (``group``, in any order)."""
 
     x: StrictFloat
     points: Annotated[list[RulerTickBody], Field(max_length=MAX_RULER_TICKS)]
     found_at: StrictFloat | None = None
+    ladder_kda: list[RulerKda] | None = None
+    group: list[str] | None = None
 
 
 class BoxPaddingBody(_Body):
@@ -1895,10 +1967,23 @@ def add_calibration_point(
     image_id: str, side: str, body: PointBody, session: OpenSession, workspace: WorkspaceDep
 ) -> dict[str, Any]:
     """Mark a calibration point on the ladder ``side`` of the image's register
-    group (:func:`~proteia.core.operations.add_calibration_point`)."""
-    update = ops.add_calibration_point(
-        session, image_id, body.y, body.mw, body.source, x=body.x, side=_side(side), snap=body.snap
-    )
+    group (:func:`~proteia.core.operations.add_calibration_point`), unless the
+    ladder list its MW was chosen from, as the body names it, is no longer the
+    membrane's (:func:`_check_ladder_kda`): checked first, and marked, under
+    the session lock, so no change falls between the two."""
+    ladder_side = _side(side)
+    with session.transaction():
+        _check_ladder_kda(session, image_id, body.ladder_kda)
+        update = ops.add_calibration_point(
+            session,
+            image_id,
+            body.y,
+            body.mw,
+            body.source,
+            x=body.x,
+            side=ladder_side,
+            snap=body.snap,
+        )
     return _answer(workspace, session, **_calibration_update(update))
 
 
@@ -1912,17 +1997,23 @@ def edit_calibration_point(
     workspace: WorkspaceDep,
 ) -> dict[str, Any]:
     """Move or relabel the point at ``mw``, in one change
-    (:func:`~proteia.core.operations.edit_calibration_point`)."""
+    (:func:`~proteia.core.operations.edit_calibration_point`), unless the
+    ladder list its new label was chosen from, as the body names it, is no
+    longer the membrane's: checked first, under the session lock, as a new
+    mark's is."""
+    ladder_side = _side(side)
     given = body.model_dump(exclude_unset=True)
-    update = ops.edit_calibration_point(
-        session,
-        image_id,
-        mw,
-        side=_side(side),
-        y=given.get("y", ops.KEEP),
-        new_mw=given.get("mw", ops.KEEP),
-        snap=body.snap,
-    )
+    with session.transaction():
+        _check_ladder_kda(session, image_id, body.ladder_kda)
+        update = ops.edit_calibration_point(
+            session,
+            image_id,
+            mw,
+            side=ladder_side,
+            y=given.get("y", ops.KEEP),
+            new_mw=given.get("mw", ops.KEEP),
+            snap=body.snap,
+        )
     return _answer(workspace, session, **_calibration_update(update))
 
 
@@ -1953,9 +2044,17 @@ def clear_calibration(
 @router.post("/images/{image_id}/ladder-proposal")
 def propose_ladder(image_id: str, body: LadderProposalBody, session: OpenSession) -> dict[str, Any]:
     """Find the ladder clicked at ``x`` and propose its labels
-    (:func:`~proteia.core.operations.propose_ladder`); changes nothing."""
-    proposal = ops.propose_ladder(session, image_id, body.x, body.side)
-    return {"proposal": None if proposal is None else ops.proposal_json(proposal)}
+    (:func:`~proteia.core.operations.propose_ladder`); changes nothing. The
+    answer names the membrane's ladder MWs the labels are (``ladder_kda``),
+    read under the session lock with the proposal, so no change falls between
+    the two: a page's copy of the project may be older."""
+    with session.transaction():
+        proposal = ops.propose_ladder(session, image_id, body.x, body.side)
+        kda = session.project.batch.membrane_of(image_id).calibration.ladder_kda
+    return {
+        "proposal": None if proposal is None else ops.proposal_json(proposal),
+        "ladder_kda": list(kda),
+    }
 
 
 @router.post("/images/{image_id}/ladder-snap")
@@ -1964,6 +2063,40 @@ def snap_ladder(image_id: str, body: LadderSnapBody, session: OpenSession) -> di
     (:func:`~proteia.core.operations.snap_ladder`); changes nothing."""
     snapped = ops.snap_ladder(session, image_id, body.x, body.ys)
     return {"points": [{"y": y, "snapped": moved} for y, moved in snapped]}
+
+
+def _same_ladder(membrane: Membrane, ladder_kda: Sequence[float]) -> bool:
+    """Whether ``ladder_kda`` is the membrane's ladder MWs: compared on log10,
+    as the model compares MWs, and in order."""
+    now = [math.log10(mw) for mw in membrane.calibration.ladder_kda]
+    return [math.log10(mw) for mw in ladder_kda] == now
+
+
+def _check_ladder_kda(
+    session: ProjectSession, image_id: str, ladder_kda: Sequence[float] | None
+) -> None:
+    """Refuse a mark, new or relabelled, whose MW was chosen from the ladder
+    list ``ladder_kda`` (None: none named, as for an MW typed, not checked)
+    that is no longer the membrane's (another tab chose another ladder since
+    the page listed it): :class:`CalibrationChangedError`. An unknown image is
+    ``UnknownIdError``."""
+    if ladder_kda is None:
+        return
+    if not _same_ladder(session.project.batch.membrane_of(image_id), ladder_kda):
+        raise CalibrationChangedError("ladder_kda", mark=True)
+
+
+def _check_ruler_scope(session: ProjectSession, image_id: str, body: LadderPointsBody) -> None:
+    """Refuse a ruler whose ladder MWs or register group, as its body names
+    them, are no longer the membrane's and the image's (a field left out is
+    not checked): MWs as :func:`_same_ladder` compares them; the group as a
+    set. An unknown image is ``UnknownIdError``."""
+    batch = session.project.batch
+    membrane = batch.membrane_of(image_id)
+    if body.ladder_kda is not None and not _same_ladder(membrane, body.ladder_kda):
+        raise CalibrationChangedError("ladder_kda")
+    if body.group is not None and set(body.group) != membrane.group_of(image_id):
+        raise CalibrationChangedError("group")
 
 
 @router.put("/images/{image_id}/calibration/{side}/ladder")
@@ -1975,15 +2108,21 @@ def set_ladder_points(
     workspace: WorkspaceDep,
 ) -> dict[str, Any]:
     """Apply a ruler to the ladder ``side`` of the image's register group, in
-    one step (:func:`~proteia.core.operations.set_ladder_points`)."""
-    update = ops.set_ladder_points(
-        session,
-        image_id,
-        _side(side),
-        [(point.y, point.mw) for point in body.points],
-        x=body.x,
-        found_at=body.found_at,
-    )
+    one step (:func:`~proteia.core.operations.set_ladder_points`), unless the
+    ladder or the group the ruler names changed since it was opened
+    (:class:`CalibrationChangedError`): checked and applied under the session
+    lock, so no change falls between the two."""
+    ladder_side = _side(side)
+    with session.transaction():
+        _check_ruler_scope(session, image_id, body)
+        update = ops.set_ladder_points(
+            session,
+            image_id,
+            ladder_side,
+            [(point.y, point.mw) for point in body.points],
+            x=body.x,
+            found_at=body.found_at,
+        )
     return _answer(
         workspace,
         session,
@@ -2374,6 +2513,9 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
         NoStateFolderError: lambda e: _error(409, "no_state_folder", str(e)),
         FilesChangedError: lambda e: _error(409, "files_changed", str(e)),
+        CalibrationChangedError: lambda e: _error(
+            409, "calibration_changed", str(e), detail={"changed": e.changed}
+        ),
         ProjectChangedError: lambda e: _error(
             409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
         ),
