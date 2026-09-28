@@ -298,11 +298,13 @@ function saidElsewhere(error) {
   );
 }
 
-function report(error) {
+// Show a refusal in the status line: the server's message, or `text` (the
+// refusal as the control that was refused words it).
+function report(error, text = null) {
   if (saidElsewhere(error)) {
     return;
   }
-  showStatus(error.message);
+  showStatus(text || error.message);
 }
 
 // Answers can arrive out of order: one is shown only if it is not older than
@@ -467,6 +469,7 @@ const calibration = new CalibrationPanel(view, {
   status: showStatus,
   report,
   undo: (seq) => takeStep("undo", { seq }),
+  reread: () => reread().catch(report),
   showImage: (imageId) => {
     state.imageId = imageId;
     state.boxId = null;
@@ -2840,12 +2843,16 @@ function takeStep(direction, { seq = null, back = () => $("clear-boxes") } = {})
       }
       const before = state.project;
       const opened = shownOpening();
+      calibration.takeDropped(); // said already: only a ruler this step drops is said with it
       try {
         const answer = await send("POST", `/api/${direction}`);
         if (!answer || !current()) {
           return null;
         }
-        showStatus(stepText(direction, answer, before));
+        // A ruler open on the ladder or the marker link the step changed is
+        // dropped as the answer is drawn: said after the step's own words.
+        const dropped = calibration.takeDropped();
+        showStatus([stepText(direction, answer, before), dropped].filter(Boolean).join(" "));
         keepFocus(had, direction, from);
         return answer;
       } catch (error) {

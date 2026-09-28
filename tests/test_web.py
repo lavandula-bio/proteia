@@ -2469,7 +2469,7 @@ def test_a_stored_mark_dragged_or_clicked_is_one_edit():
     point = _method(panel, "ladderPoint(")
     assert "this.movePoint(tick.point, y, !alt)" in point and "this.pointMenu(" in point
     edit = _method(panel, "async editPoint(")
-    assert 'this.handlers.edit("PATCH", this.pointPath(point), body)' in edit
+    assert 'this.handlers.edit("PATCH", this.pointPath(point), body, {' in edit
     assert '"edit_calibration_point"' in edit
     remove = _method(panel, "async removePoint(")
     assert 'this.handlers.edit("DELETE", this.pointPath(point))' in remove
@@ -2650,3 +2650,79 @@ def test_nothing_opens_a_ruler_or_a_popup_while_a_ladder_is_found():
     assert "Boolean(this.draft) || this.applying || this.finding;" in marking
     assert "this.draft || this.applying || this.finding" in _method(panel, "adjust(")
     assert "if (this.finding || this.applying)" in _method(panel, "arm(")
+
+
+def test_apply_names_what_its_ruler_was_opened_with():
+    # The server refuses a ruler whose ladder or register group changed since
+    # it was opened (calibration_changed, another tab's change this page does
+    # not know of), but only when the page names them: a page that stopped
+    # sending them would lose the check without a sign. Apply sends every
+    # field the route reads, as the ruler was opened; such a refusal drops
+    # the ruler, says why and reads the project again.
+    panel = _code("calibration.js")
+    apply = _method(panel, "async apply(")
+    start = apply.index("const body = {")
+    fields = re.findall(r"^\s*(\w+):", apply[start : apply.index("};", start)], re.MULTILINE)
+    assert sorted(fields) == sorted(api.LadderPointsBody.model_fields)
+    assert "ladder_kda: draft.ladderKda," in apply and "group: draft.groupIds," in apply
+    opened = _method(panel, "openDraft(")
+    assert "ladderKda: [...this.ladderKda()]," in opened
+    assert "groupIds: [...this.group.image_ids]," in opened
+    # A found ruler's labels are the ladder the proposal names (the server's
+    # when it labelled them), opened only while it is the ladder shown.
+    find = _method(panel, "async find(")
+    same = find.index("if (!sameLadder(labels, this.ladderKda())) {")
+    assert find.index("const labels = answer.ladder_kda;") < same < find.index("this.openDraft(")
+    assert find.index("this.handlers.reread();", same) < find.index("this.openDraft(")
+    assert "ladderKda: [...labels]," in find
+    refused = _method(panel, "applyRefused(")
+    changed = refused.index('error.code === "calibration_changed"')
+    assert changed < refused.index("this.closeDraft();") < refused.index("this.handlers.reread();")
+    # Its words, by the field the refusal names.
+    start = panel.index("const CHANGED_WORDS = {")
+    words = set(re.findall(r"^  (\w+):", panel[start : panel.index("};", start)], re.MULTILINE))
+    assert words == {"ladder_kda", "group"} <= set(api.LadderPointsBody.model_fields)
+    assert "reread: () => reread().catch(report)," in _code("app.js")
+
+
+def test_a_ladder_refusal_is_worded_from_its_code_and_detail():
+    # A refusal of the ladder's order, of an MW held twice or of the ladders'
+    # sides is worded from its code and detail (the ladder side and the MWs
+    # the server gives), never shown as the server's message, which names ids
+    # and positions; any other keeps that message. Apply, a mark, a mark moved
+    # or relabelled and a link say it so.
+    panel = _code("calibration.js")
+    _, words = _function(panel, "function ladderRefusalWords(")
+    for code in ("calibration_order", "duplicate_mw", "ladder_sides"):
+        assert f'error.code === "{code}"' in words
+    for field in ("detail.upper", "detail.lower", "detail.mw", "detail.side"):
+        assert field in words
+    for reason in ("same_height", "strip_edge", "no_x", "not_right"):
+        assert f'detail.reason === "{reason}"' in words
+    assert "return null;" in words
+    _, text = _function(panel, "function refusalText(")
+    assert "sentence(error.message)" in text
+    for method, verb in (
+        ("applyRefused(", '"Not applied"'),
+        ("async mark(", '"Not marked"'),
+        ("async editPoint(", '"Not moved"'),
+        ("async link(", '"Not linked"'),
+    ):
+        assert verb in _method(panel, method), method
+    _, report = _function(_code("app.js"), "function report(")
+    assert "showStatus(text || error.message);" in report
+
+
+def test_space_presses_a_focused_control_over_the_image():
+    # Space held pans the image, with the pointer over it; but Space on a
+    # control with the focus is the control's (a ruler tick's button opens its
+    # relabel popup), and only a drag it panned makes its release press
+    # nothing.
+    view = _code("view.js")
+    _, pressed = _function(view, "function pressedBySpace(")
+    assert "HTMLButtonElement" in pressed and "PRESSED.has(element.type)" in pressed
+    keydown = view[view.index('document.addEventListener("keydown"') :]
+    keydown = keydown[: keydown.index('document.addEventListener("keyup"')]
+    assert "!typesSpace(target) &&\n        !pressedBySpace(target) &&" in keydown
+    assert "if (this.spaceTaken || this.spacePanned) {" in view
+    assert "this.untype();\n        this.spacePanned = true;" in view

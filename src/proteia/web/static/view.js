@@ -61,6 +61,16 @@ function typesSpace(element) {
   );
 }
 
+// Whether Space presses `element`: a button (a ruler tick's too), a check box
+// or another input it presses, a disclosure's summary.
+function pressedBySpace(element) {
+  return (
+    element instanceof HTMLButtonElement ||
+    (element instanceof HTMLInputElement && PRESSED.has(element.type)) ||
+    (element instanceof HTMLElement && element.tagName === "SUMMARY")
+  );
+}
+
 // Whether `element` is a text field with a caret (whose typing can be taken back).
 function hasCaret(element) {
   return (
@@ -132,7 +142,8 @@ export class ImageView {
     this.rulerLabels = []; // per ruler tick, its label's [x0, x1] on the canvas, as last drawn
     this.ladderSpans = new Map(); // ladder mark -> its label's [x0, x1], as last drawn
     this.spaceHeld = false; // Space is down: a drag pans
-    this.spaceTaken = false; // ...and its default (a scroll, a button press) was prevented
+    this.spaceTaken = false; // ...and its default (a scroll) was prevented
+    this.spacePanned = false; // ...and a drag panned with it: its release presses nothing
     this.spaceTyped = null; // {field, value, start, end}: the text field it types into, before
     this.bindEvents();
     new ResizeObserver(() => this.resize()).observe(canvas);
@@ -635,6 +646,7 @@ export class ImageView {
       const pan = middle || this.spaceHeld;
       if (pan && !middle) {
         this.untype();
+        this.spacePanned = true;
       }
       // A ladder being marked or adjusted (#58) takes the press before a box.
       const at = this.toCanvas(event);
@@ -786,10 +798,12 @@ export class ImageView {
     });
 
     // Space held makes a drag pan, whatever has the focus. With the pointer
-    // over the image it is also taken (it neither scrolls nor presses a focused
-    // button, which it would on its release after the drag), but never from a
-    // field it types into, a select or a dialog: typed into a text field, the
-    // press on the image takes the spaces back (untype).
+    // over the image it is also taken, so it does not scroll the page; but
+    // never from a control it presses (a ruler tick's button relabels it), a
+    // field it types into, a select or a dialog. Its release after a drag it
+    // panned is taken instead (a focused button is not pressed then), and
+    // typed into a text field, the press on the image takes the spaces back
+    // (untype).
     const isSpace = (event) => event.code === "Space" || event.key === " ";
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && this.gesture) {
@@ -822,6 +836,7 @@ export class ImageView {
       this.holdSpace(true);
       if (
         !typesSpace(target) &&
+        !pressedBySpace(target) &&
         !document.querySelector("dialog[open]") &&
         canvas.matches(":hover")
       ) {
@@ -831,8 +846,8 @@ export class ImageView {
     });
     document.addEventListener("keyup", (event) => {
       if (isSpace(event)) {
-        if (this.spaceTaken) {
-          event.preventDefault();
+        if (this.spaceTaken || this.spacePanned) {
+          event.preventDefault(); // no scroll, and no press of a focused button after a pan
         }
         this.holdSpace(false);
       }
@@ -843,6 +858,7 @@ export class ImageView {
   holdSpace(held) {
     if (!held) {
       this.spaceTaken = false;
+      this.spacePanned = false;
       this.spaceTyped = null;
     }
     if (this.spaceHeld !== held) {

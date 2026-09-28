@@ -140,13 +140,17 @@
         </div>
         <div class="actions cal-tools">
           <button id="cal-up" type="button" aria-label="Move every label up one band"
+            aria-describedby="cal-shift-why"
             title="Move every label up one band: each band then reads the next lighter MW">▲</button>
           <button id="cal-down" type="button" aria-label="Move every label down one band"
+            aria-describedby="cal-shift-why"
             title="Move every label down one band: each band then reads the next heavier MW">▼</button>
           <button id="cal-snap" type="button"
             title="Move each tick onto the band nearest it; a hollow tick that lands on a band is stored">Snap
             all</button>
         </div>
+        <!-- Why ▲▼ are disabled, when a label has no band to move to. -->
+        <p id="cal-shift-why" class="hint note" hidden></p>
         <ol id="cal-ticks" class="cal-ticks" aria-label="Ruler ticks, top to bottom"></ol>
         <p class="hint note">Solid ticks are stored, hollow ones (predicted) are not. Tab: next
           tick · ↑↓: move it 0.5 px (Shift: 5 px) · Space: relabel · Delete: not a ladder band</p>

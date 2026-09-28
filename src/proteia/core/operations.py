@@ -1758,12 +1758,24 @@ def _ladder_refusal(
     (``CALIBRATION_ORDER``); then a right ladder beside a strip edge or a point
     with no x, or not right of the left one (``LADDER_SIDES``). ``new`` is the
     point added or edited, whose neighbours an order refusal names; otherwise
-    it names the two points in conflict (points joined by a marker link)."""
+    it names the two points in conflict (points joined by a marker link).
+
+    Each refusal's ``detail`` holds what a page words it with, never an id or
+    a position: the ladder ``side`` and the ``mw`` held twice; the ``side``,
+    the ``reason`` (``order`` or ``same_height``) and the MWs of the two points
+    in conflict, the ``upper`` one's (the smaller y) and the ``lower`` one's;
+    or the ``reason`` the sides are refused (``strip_edge``, ``no_x`` with the
+    ``side`` and ``mw`` of the point without its x, or ``not_right``)."""
     names = _group_names(membrane, group)
     head = f"membrane {membrane.id}:"
 
     def at(point: CalibrationPoint) -> str:
         return f"{point.mw:g} kDa at y={point.y:g} on {point.image_id}"
+
+    def conflict(
+        reason: str, upper: CalibrationPoint, lower: CalibrationPoint
+    ) -> dict[str, JsonValue]:
+        return {"side": upper.side.value, "reason": reason, "upper": upper.mw, "lower": lower.mw}
 
     for side in LadderSide:
         ladder = sorted((p for p in points if p.side == side), key=lambda p: (p.y, p.mw))
@@ -1782,7 +1794,8 @@ def _ladder_refusal(
                         f"{head} {where} would hold {point.mw:g} kDa twice:"
                         f" {at(other)} and {at(point)}"
                     )
-                return OperationError(ErrorCode.DUPLICATE_MW, message)
+                detail = {"side": side.value, "mw": point.mw}
+                return OperationError(ErrorCode.DUPLICATE_MW, message, detail=detail)
             held[z] = point
         for above, below in itertools.pairwise(ladder):
             if above.y == below.y:
@@ -1790,6 +1803,7 @@ def _ladder_refusal(
                     ErrorCode.CALIBRATION_ORDER,
                     f"{head} two points at y={above.y:g} on {where}: {at(above)} and {at(below)};"
                     " each ladder band lies at its own height",
+                    detail=conflict("same_height", above, below),
                 )
         for above, below in itertools.pairwise(ladder):
             if math.log10(below.mw) < math.log10(above.mw):
@@ -1812,7 +1826,9 @@ def _ladder_refusal(
                     f"{head} calibration points out of order on {where}: {at(below)} lies"
                     f" below {at(above)}"
                 )
-            return OperationError(ErrorCode.CALIBRATION_ORDER, message)
+            return OperationError(
+                ErrorCode.CALIBRATION_ORDER, message, detail=conflict("order", above, below)
+            )
     right = [p for p in points if p.side == LadderSide.RIGHT]
     if not right:
         return None
@@ -1822,6 +1838,7 @@ def _ladder_refusal(
                 ErrorCode.LADDER_SIDES,
                 f"{head} {names} would have a right ladder and a strip edge"
                 f" ({at(point)}); a strip edge calibrates a group with one ladder only",
+                detail={"reason": "strip_edge"},
             )
         if point.x is None:
             return OperationError(
@@ -1829,6 +1846,7 @@ def _ladder_refusal(
                 f"{head} {names} would have a right ladder, so every point there needs the x it"
                 f" was marked at, and {at(point)} has none (it was saved before points recorded"
                 " their x): remove it and mark it again",
+                detail={"reason": "no_x", "side": point.side.value, "mw": point.mw},
             )
     left_x = [p.x for p in points if p.side == LadderSide.LEFT and p.x is not None]
     right_x = min(p.x for p in right if p.x is not None)
@@ -1837,6 +1855,7 @@ def _ladder_refusal(
             ErrorCode.LADDER_SIDES,
             f"{head} the right ladder of {names} (x={right_x:g}) would not lie right of its left"
             f" ladder (x={max(left_x):g}); the second ladder is the one right of the first",
+            detail={"reason": "not_right"},
         )
     return None
 

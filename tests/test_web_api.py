@@ -46,6 +46,7 @@ from conftest import (
 )
 from proteia import samples
 from proteia.core import ladders, storage
+from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
@@ -6084,7 +6085,9 @@ def test_proposal_routes_change_nothing(client, tmp_path):
     answer = client.ok(
         "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
     )
-    assert set(answer) == {"proposal"}  # no project: nothing changed to show
+    # No project, nothing changed to show: the proposal and the ladder MWs
+    # its labels are.
+    assert set(answer) == {"proposal", "ladder_kda"}
     proposal = answer["proposal"]
     assert [(tick["mw"], tick["found"]) for tick in proposal["ticks"]] == [
         (float(mw), True) for mw in CAL_KDA
@@ -6098,7 +6101,7 @@ def test_proposal_routes_change_nothing(client, tmp_path):
     assert len(right["ticks"]) == len(CAL_KDA)
     # Where no ladder stands out: null.
     empty = client.ok("POST", f"/api/images/{marker}/ladder-proposal", {"x": 240.0})
-    assert empty == {"proposal": None}
+    assert empty == {"proposal": None, "ladder_kda": [float(mw) for mw in CAL_KDA]}
     ys = [cal_y(70, CAL_LEFT_X) + 3.0, 190.0]
     snapped = client.ok("POST", f"/api/images/{marker}/ladder-snap", {"x": CAL_LEFT_X, "ys": ys})
     assert set(snapped) == {"points"}
@@ -6151,6 +6154,242 @@ def test_ladder_route_applies_a_ruler_in_one_step(client, tmp_path):
     assert {p["side"] for p in right["points"]} == {"left"}
 
 
+def _opened_ruler(client: Client, marker: str) -> dict[str, Any]:
+    """A ruler as a page opens it on ``marker``: the proposal's ticks and the
+    ladder MWs they are labelled with, as the proposal names them, and the
+    register group's image ids as they are now."""
+    found = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
+    )
+    [membrane] = client.ok("GET", "/api/project")["project"]["membranes"]
+    [group] = [g["image_ids"] for g in membrane["groups"] if marker in g["image_ids"]]
+    return {
+        "x": CAL_LEFT_X,
+        "points": [{"y": tick["y"], "mw": tick["mw"]} for tick in found["proposal"]["ticks"]],
+        "found_at": CAL_LEFT_X,
+        "ladder_kda": found["ladder_kda"],
+        "group": group,
+    }
+
+
+DUAL_COLOR = "precision_plus_dual_color/tris_glycine"
+
+
+def test_a_proposal_names_the_ladder_it_is_labelled_with(client, tmp_path):
+    # A proposal is labelled with the membrane's ladder MWs as the server holds
+    # them when it is made, which a page's copy of the project may no longer
+    # be (another tab chose another ladder since the page read it). The answer
+    # names them: a page opens a ruler of those labels only while they are the
+    # ladder it shows, and names them when it applies the ruler.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    path = f"/api/images/{marker}/ladder-proposal"
+    answer = client.ok("POST", path, {"x": CAL_LEFT_X, "side": "left"})
+    assert answer["ladder_kda"] == [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0]
+    # Another ladder chosen (in another tab, say): labelled with it, and named.
+    client.ok("PUT", f"/api/membranes/{membrane}/calibration/ladder", {"ladder": DUAL_COLOR})
+    dual = [250.0, 150.0, 100.0, 75.0, 50.0, 37.0, 25.0, 20.0, 15.0, 10.0]
+    answer = client.ok("POST", path, {"x": CAL_LEFT_X})
+    assert answer["ladder_kda"] == dual
+    assert answer["proposal"] is not None
+    assert {tick["mw"] for tick in answer["proposal"]["ticks"]} <= set(dual)
+    # Where no ladder stands out, the answer names the ladder all the same.
+    assert client.ok("POST", path, {"x": 240.0}) == {"proposal": None, "ladder_kda": dual}
+    # A ruler of those labels names that ladder when applied: the membrane's
+    # ladder chosen back since (A, B, A), it is refused, storing nothing.
+    found = {"x": CAL_LEFT_X, "points": [], "found_at": CAL_LEFT_X, "group": [marker]}
+    found["points"] = [{"y": t["y"], "mw": t["mw"]} for t in answer["proposal"]["ticks"]]
+    found["ladder_kda"] = answer["ladder_kda"]
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": list(CAL_KDA)})
+    refused = _refused_unchanged(client, f"/api/images/{marker}/calibration/left/ladder", found)
+    assert refused["detail"] == {"changed": "ladder_kda"}
+
+
+def test_a_proposal_and_its_ladder_are_read_with_no_change_between(client, tmp_path, monkeypatch):
+    # The ladder a proposal names is read under the session's lock with the
+    # proposal: another tab's choice of ladder waits until both are read, so
+    # the answer never names a ladder its labels are not.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    session = client.workspace.current()
+    proposed = ops.propose_ladder
+    other: list[tuple[threading.Thread, bool]] = []
+
+    def propose_then_change(*args: Any, **kwargs: Any) -> Any:
+        proposal = proposed(*args, **kwargs)
+        change = threading.Thread(target=ops.set_ladder, args=(session, membrane, DUAL_COLOR))
+        change.start()
+        change.join(0.3)
+        other.append((change, change.is_alive()))  # still waiting: the lock is held
+        return proposal
+
+    monkeypatch.setattr(ops, "propose_ladder", propose_then_change)
+    answer = client.ok("POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X})
+    [(change, waited)] = other
+    assert waited, "another tab's ladder fell between the proposal and the ladder it names"
+    change.join(10)
+    assert not change.is_alive()
+    assert answer["ladder_kda"] == [float(mw) for mw in CAL_KDA]
+    assert {tick["mw"] for tick in answer["proposal"]["ticks"]} == set(answer["ladder_kda"])
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    assert state["ladder"] == DUAL_COLOR  # made after, in order
+
+
+def _refused_unchanged(client: Client, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """PUT ``body`` to ``path``, refused as calibration_changed with nothing
+    changed, logged or saved; the refusal."""
+    session = client.workspace.current()
+    folder = client.root / "Blot"
+    files, entries, committed = files_of(folder), len(session.project.log), session.project
+    status, answer = client.call("PUT", path, body)
+    assert (status, answer["code"], answer["ids"]) == (409, "calibration_changed", []), answer
+    # Said without the ids or coordinates a user never sees.
+    assert not re.search(r"\b(img|mem|prot|band)-\d|y=|x=", answer["message"]), answer
+    assert session.project is committed and len(session.project.log) == entries
+    assert files_of(folder) == files
+    return answer
+
+
+def test_a_ruler_labelled_with_a_ladder_changed_since_is_refused(client, tmp_path):
+    # A page's ruler is labelled with the membrane's ladder as it was when the
+    # ruler opened. Another tab chooses another ladder meanwhile: Apply names
+    # the MWs its labels are, and is refused, storing nothing, rather than
+    # store 130, 70, 55 kDa marks on a membrane whose ladder has none of them.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    body = _opened_ruler(client, marker)
+    assert body["ladder_kda"] == [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0]
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    client.ok("PUT", ladder, {"ladder": "precision_plus_dual_color/tris_glycine"})
+    refused = _refused_unchanged(client, path, body)
+    assert refused["detail"] == {"changed": "ladder_kda"}
+    assert "ladder" in refused["message"]
+    # One MW more, or one less, is another ladder too.
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": [*CAL_KDA, 10]})
+    assert _refused_unchanged(client, path, body)["detail"] == {"changed": "ladder_kda"}
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": list(CAL_KDA[:-1])})
+    assert _refused_unchanged(client, path, body)["detail"] == {"changed": "ladder_kda"}
+    # The same MWs under another name: the labels are still the ladder's; the
+    # MWs named in another order are not the ladder's list.
+    client.ok("PUT", ladder, {"ladder": "renamed ν", "kda": list(CAL_KDA)})
+    backwards = {**body, "ladder_kda": body["ladder_kda"][::-1]}
+    assert _refused_unchanged(client, path, backwards)["detail"] == {"changed": "ladder_kda"}
+    applied = client.ok("PUT", path, body)
+    assert [p["mw"] for p in applied["points"]] == [float(mw) for mw in CAL_KDA]
+
+
+def test_a_ruler_is_checked_and_applied_with_no_change_between(client, tmp_path, monkeypatch):
+    # The check of what the ruler was opened with and its Apply run under the
+    # session's lock: another request's change (the ladder chosen in another
+    # tab) waits until the ruler is applied, never falls between the two.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    body = _opened_ruler(client, marker)
+    session = client.workspace.current()
+    checked = api._check_ruler_scope
+    other: list[tuple[threading.Thread, bool]] = []
+
+    def check_then_change(*args: Any) -> None:
+        checked(*args)
+        chosen = "precision_plus_dual_color/tris_glycine"
+        change = threading.Thread(target=ops.set_ladder, args=(session, membrane, chosen))
+        change.start()
+        change.join(0.3)
+        other.append((change, change.is_alive()))  # still waiting: the lock is held
+
+    monkeypatch.setattr(api, "_check_ruler_scope", check_then_change)
+    applied = client.ok("PUT", f"/api/images/{marker}/calibration/left/ladder", body)
+    assert len(applied["points"]) == len(CAL_KDA)
+    [(change, waited)] = other
+    assert waited, "the other tab's change fell between the check and the Apply"
+    change.join(10)
+    assert not change.is_alive()
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    assert state["ladder"] == "precision_plus_dual_color/tris_glycine"  # made after, in order
+    history = [entry.action for entry in session.project.log[-2:]]
+    assert history == ["set_ladder_points", "set_ladder"]
+
+
+def test_a_ruler_opened_on_a_register_group_changed_since_is_refused(client, tmp_path):
+    # Apply replaces the marks of the register group the ruler was opened on.
+    # Another tab links an image to the marker meanwhile (or unlinks one): the
+    # marks Apply would replace are no longer those, and it is refused.
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    data = write_tiff(tmp_path / "chemi γ.tif", synthetic_blot((CAL_H, CAL_W), [])).read_bytes()
+    membrane = client.ok("GET", "/api/project")["project"]["images"][0]["membrane_id"]
+    _, chemi = upload(client, data, "chemi γ.tif", membrane_id=membrane)
+    body = _opened_ruler(client, marker)
+    assert body["group"] == [marker]
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    link = f"/api/images/{chemi['image_id']}/marker"
+    client.ok("PUT", link, {"marker_image_id": marker})
+    refused = _refused_unchanged(client, path, body)
+    assert refused["detail"] == {"changed": "group"}
+    assert "marker link" in refused["message"]
+    # Opened on the linked group (listed in any order), unlinked since.
+    linked = _opened_ruler(client, marker)
+    assert sorted(linked["group"]) == sorted([chemi["image_id"], marker])
+    linked["group"].reverse()
+    assert linked["group"] != sorted(linked["group"])
+    client.ok("PUT", link, {"marker_image_id": None})
+    assert _refused_unchanged(client, path, linked)["detail"] == {"changed": "group"}
+    # Linked again: the same group, in another order, is applied.
+    client.ok("PUT", link, {"marker_image_id": marker})
+    assert len(client.ok("PUT", path, linked)["points"]) == len(CAL_KDA)
+    client.ok("POST", "/api/undo")
+    # An image of the group removed since: another group as well.
+    client.ok("DELETE", f"/api/images/{chemi['image_id']}")
+    assert _refused_unchanged(client, path, linked)["detail"] == {"changed": "group"}
+
+
+def test_a_ruler_opened_as_things_are_is_applied(client, tmp_path):
+    # The ladder and the group as the ruler names them (the group in any
+    # order): applied. A page that names neither (an older one) is applied
+    # as before, and so is one that names only one of them.
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    body = _opened_ruler(client, marker)
+    applied = client.ok("PUT", path, body)
+    assert [p["mw"] for p in applied["points"]] == [float(mw) for mw in CAL_KDA]
+    client.ok("POST", "/api/undo")
+    for left_out in (("ladder_kda", "group"), ("ladder_kda",), ("group",)):
+        older = {key: value for key, value in body.items() if key not in left_out}
+        applied = client.ok("PUT", path, older)
+        assert len(applied["points"]) == len(CAL_KDA), left_out
+        client.ok("POST", "/api/undo")
+    # A custom ladder with no MWs listed: a ruler adjusted from its marks.
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    client.ok("PUT", f"/api/membranes/{state['id']}/calibration/ladder", {"ladder": "none µ"})
+    bare = {**body, "found_at": None, "ladder_kda": []}
+    assert len(client.ok("PUT", path, bare)["points"]) == len(CAL_KDA)
+
+
+def test_a_ruler_precondition_that_cannot_be_read_is_invalid_input(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    body = _opened_ruler(client, marker)
+    for field, value in (
+        ("ladder_kda", [250.0, 0.0]),
+        ("ladder_kda", [-250.0]),
+        ("ladder_kda", ["250"]),
+        ("ladder_kda", 250.0),
+        ("group", [marker, 3]),
+        ("group", marker),
+    ):
+        refused = client.refused("PUT", path, {**body, field: value})
+        assert refused[:2] == (422, "invalid_input"), (field, value)
+    for text in (b"NaN", b"Infinity"):
+        raw = json.dumps({**body, "ladder_kda": [123.25]}).encode()
+        assert raw.count(b"123.25") == 1
+        raw = raw.replace(b"123.25", text)
+        assert _raw_json(client, "PUT", path, raw) == (422, "invalid_input"), text
+
+
 def test_ladder_routes_refuse_what_they_cannot_read(client, tmp_path):
     image_id, _ = ready(client, tmp_path)
     marker, membrane = _ladder_marker(client, tmp_path, image_id)
@@ -6182,6 +6421,14 @@ def test_ladder_routes_refuse_what_they_cannot_read(client, tmp_path):
     assert client.refused("PUT", ladder, {"x": 5.0, "points": [point, point]})[:2] == (
         422,
         "duplicate_mw",
+    )
+    # What a page words a refusal with: the ladder and the MWs, in ``detail``.
+    crossed = [{"y": 20.0, "mw": 130}, {"y": 30.0, "mw": 250}]
+    status, answer = client.call("PUT", ladder, {"x": 5.0, "points": crossed})
+    assert (status, answer["code"], answer["detail"]) == (
+        422,
+        "calibration_order",
+        {"side": "left", "reason": "order", "upper": 130.0, "lower": 250.0},
     )
     # JSON's non-numbers, which Python's reader takes, are no positions either.
     for path, body in ((proposal, b'{"x": NaN}'), (ladder, b'{"x": Infinity, "points": []}')):

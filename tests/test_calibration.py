@@ -669,6 +669,82 @@ def test_out_of_order_refused(tmp_path):
     refused(ErrorCode.CALIBRATION_ORDER, ops.edit_calibration_point, s, c.marker, 55, y=y70 - 2.0)
 
 
+def test_ladder_refusals_say_which_ladder_and_mws(tmp_path):
+    # A refusal of the ladder's order, a duplicate MW or the ladders' sides
+    # carries, as ``detail``, what a page words it with: the ladder side and
+    # the MWs in conflict (the upper mark's, then the lower's), or why the
+    # sides are refused; never an id or a position.
+    c = calibrated(tmp_path, sides=(LEFT,))
+    s = c.session
+    y70 = cal_y(70, CAL_LEFT_X)
+
+    def add(session, y, mw, source=MARKER_BAND, *, x=CAL_LEFT_X, side=LEFT):
+        return ops.add_calibration_point(
+            session, c.marker, y, mw, source, x=x, side=side, snap=False
+        )
+
+    def detail(code, call, *args, **kwargs):
+        return refused(code, call, *args, **kwargs).detail
+
+    order = ErrorCode.CALIBRATION_ORDER
+    assert detail(order, add, s, y70 - 1.0, 60) == {
+        "side": "left",
+        "reason": "order",
+        "upper": 60.0,
+        "lower": 70.0,
+    }
+    assert detail(order, add, s, 5.0, 10) == {
+        "side": "left",
+        "reason": "order",
+        "upper": 10.0,
+        "lower": 250.0,
+    }
+    assert detail(order, add, s, y70, 60) == {
+        "side": "left",
+        "reason": "same_height",
+        "upper": 60.0,
+        "lower": 70.0,
+    }
+    moved = detail(order, ops.edit_calibration_point, s, c.marker, 55, y=y70 - 2.0)
+    assert moved == {"side": "left", "reason": "order", "upper": 55.0, "lower": 70.0}
+    duplicate = ErrorCode.DUPLICATE_MW
+    assert detail(duplicate, add, s, 190.0, 100) == {"side": "left", "mw": 100.0}
+    # A ruler applied with 250 kDa dragged below 130 kDa, on the right ladder.
+    ruler = [(cal_y(mw, CAL_RIGHT_X), mw) for mw in CAL_KDA]
+    ruler[0] = (ruler[1][0] + 3.0, 250)
+    assert detail(order, ops.set_ladder_points, s, c.marker, RIGHT, ruler, x=CAL_RIGHT_X) == {
+        "side": "right",
+        "reason": "order",
+        "upper": 130.0,
+        "lower": 250.0,
+    }
+    sides = ErrorCode.LADDER_SIDES
+    y = cal_y(70, CAL_RIGHT_X)
+    assert detail(sides, add, s, cal_y(70, 10.0), 70, x=10.0, side=RIGHT) == {"reason": "not_right"}
+    ops.add_calibration_point(s, c.marker, 1.0, 400, STRIP, x=5.0, snap=False)
+    assert detail(sides, add, s, y, 70, x=CAL_RIGHT_X, side=RIGHT) == {"reason": "strip_edge"}
+    ops.remove_calibration_point(s, c.marker, 400)
+
+    def legacy(draft: Project) -> None:
+        points = draft.batch.membranes[0].calibration.points
+        points.append(
+            CalibrationPoint(image_id=c.marker, y=cal_y(12, CAL_LEFT_X), mw=12, source=MARKER_BAND)
+        )
+
+    plant(s, legacy)
+    assert detail(sides, add, s, y, 70, x=CAL_RIGHT_X, side=RIGHT) == {
+        "reason": "no_x",
+        "side": "left",
+        "mw": 12.0,
+    }
+    # A link joining two groups that hold one MW twice.
+    ops.remove_calibration_point(s, c.marker, 12)
+    ops.set_marker_image(s, c.blot, None)
+    ops.add_calibration_point(s, c.blot, y70 + 5.0, 70, CHEMI_MARKER, x=CAL_LEFT_X, snap=False)
+    linked = detail(duplicate, ops.set_marker_image, s, c.blot, c.marker)
+    assert linked == {"side": "left", "mw": 70.0}
+
+
 def test_faint_click_keeps_given_y(tmp_path, caplog):
     c = calibrated(tmp_path, sides=())
     s = c.session

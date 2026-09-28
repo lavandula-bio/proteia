@@ -62,6 +62,11 @@ function sameMw(a, b) {
   return Math.abs(Math.log10(a) - Math.log10(b)) < 1e-12;
 }
 
+// Whether two ladders' MWs (top to bottom) are one list.
+function sameLadder(a, b) {
+  return Array.isArray(a) && a.length === b.length && a.every((mw, i) => sameMw(mw, b[i]));
+}
+
 // A tick on a band (found, snapped to, placed or stored), not only predicted.
 function solid(tick) {
   return tick.state !== "predicted";
@@ -88,6 +93,71 @@ function shown(tick) {
 function tickName(tick) {
   return labelled(tick) ? `${kdaText(tick.mw)} kDa` : "the band with no label";
 }
+
+// A ladder side as the page names it.
+function ladderName(side) {
+  return side === "right" ? "the second ladder (right)" : "the ladder";
+}
+
+// A refusal of the ladder's marks in words, from its code and detail (the
+// ladder side and the MWs the server names): never an id or a position; null
+// for any other refusal, whose own message is shown.
+function ladderRefusalWords(error) {
+  const detail = error.detail || {};
+  const ladder = ladderName(detail.side);
+  if (error.code === "calibration_order" && detail.upper != null && detail.lower != null) {
+    const [upper, lower] = [kdaText(detail.upper), kdaText(detail.lower)];
+    return detail.reason === "same_height"
+      ? `on ${ladder}, ${upper} and ${lower} kDa would lie at the same height, but each band` +
+          " lies at its own: move one of them"
+      : `on ${ladder}, ${lower} kDa would lie below ${upper} kDa, but heavier bands lie higher` +
+          " up: move one of them back, or relabel it";
+  }
+  if (error.code === "duplicate_mw" && detail.mw != null) {
+    return `${ladder} would hold ${kdaText(detail.mw)} kDa twice: relabel or remove one of them`;
+  }
+  if (error.code === "ladder_sides" && detail.reason === "strip_edge") {
+    return (
+      "a second ladder cannot be used with strip edges, which calibrate images with one ladder" +
+      " only: remove the strip edges first"
+    );
+  }
+  if (error.code === "ladder_sides" && detail.reason === "no_x" && detail.mw != null) {
+    return (
+      `a second ladder needs the lane of every mark, and the ${kdaText(detail.mw)} kDa mark of` +
+      ` ${ladderName(detail.side)} has none (it was saved before marks kept it): remove it and` +
+      " mark it again"
+    );
+  }
+  if (error.code === "ladder_sides" && detail.reason === "not_right") {
+    return "the second ladder must lie right of the first one: find or mark it right of that lane";
+  }
+  return null;
+}
+
+// A calibration refusal for the status line: `verb` ("Not applied") and its
+// words (ladderRefusalWords), or the server's message.
+function refusalText(error, verb) {
+  const words = ladderRefusalWords(error);
+  return words ? `${verb}: ${words}.` : sentence(error.message);
+}
+
+// Why a ruler's Apply was refused as calibration_changed (detail.changed):
+// what it was opened with changed since, in another tab say.
+const CHANGED_WORDS = {
+  ladder_kda:
+    "the membrane's ladder was changed (in another tab, say), and its labels are the ladder" +
+    " before",
+  group:
+    "the image's marker link was changed (in another tab, say), and with it the marks a ruler" +
+    " replaces",
+};
+
+// The titles of ▲ and ▼ (index.html's), while they can move the labels.
+const SHIFT_TITLES = {
+  "cal-up": "Move every label up one band: each band then reads the next lighter MW",
+  "cal-down": "Move every label down one band: each band then reads the next heavier MW",
+};
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -216,7 +286,11 @@ export class CalibrationPanel {
     // "mark", side, edges}, each with the openId and groupScope() it was armed
     // on (newTool); null: nothing of this section's.
     this.tool = null;
-    this.menu = null; // the open popup: {back}, the control it returns the keyboard to
+    // The open popup: {back, scope}, the control it returns the keyboard to,
+    // and what it was opened on (menuScope).
+    this.menu = null;
+    this.customFor = null; // the opening and membrane the Custom ladder form was opened for
+    this.dropped = null; // why render() last dropped a stale ruler, until taken (takeDropped)
     this.bind();
   }
 
@@ -225,6 +299,8 @@ export class CalibrationPanel {
   // Another project is shown: nothing of the one before carries over.
   forget() {
     this.closeDraft();
+    this.closeCustom(false);
+    this.dropped = null;
     this.tool = null;
     this.ladderShown = null;
     this.markersShown = null;
@@ -348,11 +424,21 @@ export class CalibrationPanel {
     if (stale !== null) {
       this.closeDraft();
       if (stale) {
+        this.dropped = stale; // an Undo or Redo says it after its own words (takeDropped)
         this.handlers.status(stale);
       }
     }
     if (this.tool && !this.toolFits(this.tool)) {
       this.tool = null; // armed on another register group, or its button disabled since
+    }
+    if (this.customFor !== null && this.customFor !== this.customScope()) {
+      // Typed for another membrane, or another project: it sets no ladder here.
+      this.closeCustom($("cal-custom").contains(document.activeElement));
+    }
+    if (this.menu && this.menu.scope !== this.menuScope()) {
+      // Opened on another image, ladder or register group (the image switched
+      // by keyboard, an Undo): its MWs, and what a choice marks, were those.
+      this.closeMenu($("cal-menu").contains(document.activeElement));
     }
     $("calibration").hidden = !this.group;
     this.renderMarkerLink();
@@ -376,6 +462,26 @@ export class CalibrationPanel {
 
   groupScope() {
     return JSON.stringify(this.group ? [this.membrane.id, [...this.group.image_ids].sort()] : null);
+  }
+
+  // The Custom ladder form's scope: the project opening and the membrane shown.
+  customScope() {
+    return JSON.stringify(this.membrane ? [this.project.open_id, this.membrane.id] : null);
+  }
+
+  // A popup's scope: the project opening, the image shown, its ladder and its
+  // register group.
+  menuScope() {
+    const image = this.image ? this.image.id : null;
+    return JSON.stringify([this.project.open_id, image, this.ladderScope(), this.groupScope()]);
+  }
+
+  // Why the last drawing dropped a ruler (staleRuler), once: an Undo or Redo
+  // says it after its own words, which replace the status line. "" for none.
+  takeDropped() {
+    const dropped = this.dropped;
+    this.dropped = null;
+    return dropped || "";
   }
 
   // Why the ruler can no longer be applied as it is drawn, for the status line
@@ -823,11 +929,18 @@ export class CalibrationPanel {
         ` ruler does not hold (Undo brings ${lost.length === 1 ? "it" : "them"} back).`
       : "";
     const busy = this.applying;
+    // Why ▲▼ cannot move the labels, said beside them too: a disabled
+    // button's tooltip is out of the keyboard's reach.
+    const cannot = this.shiftRefusal();
+    const why = $("cal-shift-why");
+    why.textContent = cannot ? `${cannot}.` : "";
+    why.hidden = !cannot;
     for (const [id, step] of [
       ["cal-up", 1],
       ["cal-down", -1],
     ]) {
       $(id).disabled = busy || !this.canShift(step);
+      $(id).title = cannot || SHIFT_TITLES[id];
     }
     $("cal-snap").disabled = busy;
     const apply = $("cal-apply");
@@ -1197,6 +1310,11 @@ export class CalibrationPanel {
   ruler(step) {
     const draft = this.draft;
     if (!draft || this.applying) {
+      if (step.phase === "drop" || step.phase === "cancel") {
+        // A drag ended while Apply was sent (Enter during it): its steps were
+        // not taken, and the next drag starts from the ruler as it is.
+        this.base = null;
+      }
       return;
     }
     if (step.phase === "click") {
@@ -1352,6 +1470,18 @@ export class CalibrationPanel {
       );
       return;
     }
+    // The ladder the proposal is labelled with, as the server held it: this
+    // page's copy may be older (another tab chose another ladder since it was
+    // read), and a ruler's labels must be the ladder the page shows.
+    const labels = answer.ladder_kda;
+    if (!sameLadder(labels, this.ladderKda())) {
+      this.handlers.status(
+        "The membrane's ladder was changed (in another tab, say): it is shown now. Find ladder" +
+          " again.",
+      );
+      this.handlers.reread();
+      return;
+    }
     const proposal = answer.proposal;
     if (!proposal) {
       // Fewer than two bands stand out there: mark the ladder's bands by clicking them.
@@ -1370,8 +1500,9 @@ export class CalibrationPanel {
       foundAt: proposal.x,
       doubtful: proposal.doubtful,
       extra: [...proposal.extra],
+      ladderKda: [...labels],
       ticks: proposal.ticks.map((tick) =>
-        newTick(tick.mw, tick.y, tick.found ? "found" : "predicted", this.ladderKda()),
+        newTick(tick.mw, tick.y, tick.found ? "found" : "predicted", labels),
       ),
     });
     this.handlers.status(this.proposalText(proposal));
@@ -1408,6 +1539,10 @@ export class CalibrationPanel {
       openId: this.project.open_id,
       ladder: this.ladderScope(),
       group: this.groupScope(),
+      // The ladder MWs its labels are, which Apply names to the server
+      // (calibration_changed): a proposal's (find), or else the page's.
+      ladderKda: [...this.ladderKda()],
+      groupIds: [...this.group.image_ids],
       error: "",
       ...fields,
       ticks: sortTicks(fields.ticks),
@@ -1466,6 +1601,11 @@ export class CalibrationPanel {
     }
     const ruler = orderedHollow(sortTicks(ticks));
     this.openDraft({ side, x, foundAt: null, doubtful: false, extra: [], ticks: ruler });
+    if (this.focusLost()) {
+      // Adjust is disabled while the ruler is open: the keyboard goes on to it.
+      const first = $("cal-ticks").querySelector("button");
+      (first || $("cal-apply")).focus();
+    }
     const predicted = ruler.length - marks.length;
     const which = side === "right" ? "second ladder" : "ladder";
     const more = predicted ? `, and ${predicted} predicted (hollow)` : "";
@@ -1503,8 +1643,40 @@ export class CalibrationPanel {
     this.refresh();
   }
 
-  // Whether ▲ (1) or ▼ (−1) leaves a solid tick with a label.
+  // The solid ticks whose MW the ladder's list does not hold (a mark of
+  // another MW, typed while marking): ▲▼ have no band to move their labels to.
+  unlisted() {
+    const draft = this.draft;
+    return draft ? draft.ticks.filter((tick) => kept(tick) && tick.index === null) : [];
+  }
+
+  // Why ▲▼ have no band to move a label to, or "": the ladder lists no MWs,
+  // or a tick's MW is not in its list (unlisted).
+  shiftRefusal() {
+    if (!this.ladderKda().length) {
+      return (
+        "The ladder lists no MWs, so ▲▼ have no band to move a label to: relabel a tick by" +
+        " typing its MW (click it, or Space)"
+      );
+    }
+    const unlisted = this.unlisted();
+    if (!unlisted.length) {
+      return "";
+    }
+    const be = unlisted.length === 1 ? "is" : "are";
+    return (
+      `${inWords(unlisted.map((tick) => kdaText(tick.mw)))} kDa ${be} not in the ladder's list,` +
+      " so ▲▼ have no band to move a label to: relabel each tick instead (click it, or Space)"
+    );
+  }
+
+  // Whether ▲ (1) or ▼ (−1) leaves a solid tick with a label; never while a
+  // tick's MW is not in the ladder's list (unlisted): moved one band, the
+  // other labels would pass it.
   canShift(step) {
+    if (this.unlisted().length) {
+      return false;
+    }
     const count = this.ladderKda().length;
     const draft = this.draft;
     const moves = (tick) => {
@@ -1546,6 +1718,12 @@ export class CalibrationPanel {
     }
     this.handlers.status(`${parts.join("; ")}.`);
     this.refresh();
+    if (this.focusLost()) {
+      // Its button is disabled now (the labels are at the end of the list):
+      // the keyboard goes on to the other one, or to Apply.
+      const other = $(step > 0 ? "cal-down" : "cal-up");
+      (other.disabled ? $("cal-apply") : other).focus();
+    }
   }
 
   // The snap route on the ruler's ticks, as they are now: [{y, snapped}] per
@@ -1688,6 +1866,9 @@ export class CalibrationPanel {
     this.openMenu({
       title: `Label the band at y = ${tick.y.toFixed(1)} (${now})`,
       choices,
+      // With no MWs listed to choose from, one is typed (▲▼ say so).
+      other: !choices.length,
+      otherLabel: "Relabel",
       choose: (mw) => this.relabel(id, mw),
       extra: { label: "Not a ladder band", run: () => this.notABand(id) },
       where: where || this.view.clientOf(draft.x, tick.y),
@@ -1719,6 +1900,7 @@ export class CalibrationPanel {
       return;
     }
     const tick = draft.ticks[index];
+    const place = draft.ticks.filter(shown).findIndex((each) => each.id === id); // its button's
     const ticks = draft.ticks.filter((each) => each.id !== id);
     const onPeak = solid(tick) && tick.state !== "hand";
     const extra = onPeak ? [...draft.extra, tick.y].sort((a, b) => a - b) : draft.extra;
@@ -1728,7 +1910,7 @@ export class CalibrationPanel {
     this.handlers.status(`Took ${tickName(tick)} off the ruler: not a ladder band.`);
     if (hadFocus) {
       const buttons = [...$("cal-ticks").querySelectorAll("button")];
-      const next = buttons[Math.min(index, buttons.length - 1)] || $("cal-apply");
+      const next = buttons[Math.min(place, buttons.length - 1)] || $("cal-apply");
       next.focus();
     }
   }
@@ -1741,6 +1923,7 @@ export class CalibrationPanel {
     if (!this.draft || this.applying) {
       return;
     }
+    const had = document.activeElement; // Apply, or a tick: Apply is disabled while it is sent
     this.applying = true;
     this.refresh();
     try {
@@ -1760,22 +1943,21 @@ export class CalibrationPanel {
         return;
       }
       const path = `/api/images/${draft.imageId}/calibration/${draft.side}/ladder`;
+      // With what the ruler was opened with: the server refuses it if either
+      // changed since (calibration_changed), which this page may not know of.
       const body = {
         x: draft.x,
         points: ticks.map((tick) => ({ y: tick.y, mw: tick.mw })),
         found_at: draft.foundAt,
+        ladder_kda: draft.ladderKda,
+        group: draft.groupIds,
       };
       const lost = this.lostPoints(draft);
       let before = null; // the state shown when it was sent
       let answer = null;
       try {
         answer = await this.handlers.edit("PUT", path, body, {
-          refused: (error) => {
-            if (this.draft === draft) {
-              this.draft = { ...draft, error: sentence(error.message) };
-            }
-            this.handlers.report(error);
-          },
+          refused: (error) => this.applyRefused(error, draft),
           sent: (project) => {
             before = project;
           },
@@ -1814,7 +1996,57 @@ export class CalibrationPanel {
       if (this.membrane) {
         this.refresh();
       }
+      if (this.focusLost()) {
+        this.focusAfterApply(had);
+      }
     }
+  }
+
+  // Where the keyboard goes once Apply is answered, the control it was on
+  // (`had`) disabled or gone meanwhile. Not applied, the ruler kept to fix:
+  // back to `had`, or Apply, or the ruler's first tick. The ruler dropped
+  // (calibration_changed): on to Find ladder (keepFocus).
+  focusAfterApply(had) {
+    if (!this.draft) {
+      this.keepFocus();
+      return;
+    }
+    const usable = (control) =>
+      control && control.isConnected && !control.disabled && control.getClientRects().length;
+    const first = $("cal-ticks").querySelector("button");
+    const target = [had, $("cal-apply"), first].find(usable);
+    if (target) {
+      target.focus();
+    }
+  }
+
+  // A refusal of the ruler's Apply. What it was opened with changed since
+  // (calibration_changed: another tab chose another ladder, or linked or
+  // unlinked an image): the ruler is dropped, the page reads the project as
+  // it is, and the status line says why. Otherwise the ruler stays to fix,
+  // the refusal in words under it and in the status line.
+  applyRefused(error, draft) {
+    if (error.code === "calibration_changed") {
+      if (this.draft !== draft) {
+        // This page dropped the ruler already, and said why (staleRuler): an
+        // Undo queued before Apply, say, changed its ladder first.
+        return;
+      }
+      this.closeDraft(); // the keyboard goes on once it is answered (focusAfterApply)
+      this.handlers.changed();
+      const why = CHANGED_WORDS[error.detail && error.detail.changed];
+      this.handlers.report(
+        error,
+        why ? `The ruler was not applied: ${why}. Nothing was stored; Find ladder again.` : null,
+      );
+      this.handlers.reread();
+      return;
+    }
+    const text = refusalText(error, "Not applied");
+    if (this.draft === draft) {
+      this.draft = { ...draft, error: text };
+    }
+    this.handlers.report(error, text);
   }
 
   // The ruler with each snapped tick moved sideways since snapped again at
@@ -1892,6 +2124,7 @@ export class CalibrationPanel {
   // band the cut runs through); with two marks on the ladder already, the MW
   // they put there, nearest unmarked, is offered first.
   askMark(tool, x, y, where) {
+    const image = this.image; // a choice marks the image clicked
     const side = this.markSide(tool, x);
     const marks = this.sidePoints(side);
     const kda = this.ladderKda();
@@ -1922,7 +2155,7 @@ export class CalibrationPanel {
       choices,
       proposed,
       other: true,
-      choose: (mw) => this.mark(tool, side, x, y, mw),
+      choose: (mw) => this.mark(tool, side, image, x, y, mw),
       where,
       back: null,
     });
@@ -1946,8 +2179,7 @@ export class CalibrationPanel {
     return x > lane + (this.image.width - lane) / 2 ? "right" : "left";
   }
 
-  async mark(tool, side, x, y, mw) {
-    const image = this.image;
+  async mark(tool, side, image, x, y, mw) {
     const source = tool.edges
       ? "strip_edge"
       : image.kind === "chemiluminescence"
@@ -1959,6 +2191,7 @@ export class CalibrationPanel {
         "POST",
         `/api/images/${image.id}/calibration/${side}/points`,
         { y, mw, source, x, snap: true },
+        { refused: (error) => this.handlers.report(error, refusalText(error, "Not marked")) },
       );
     } catch {
       return; // refused: said
@@ -1997,6 +2230,8 @@ export class CalibrationPanel {
     this.openMenu({
       title: `The ${kdaText(point.mw)} kDa mark: relabel it`,
       choices,
+      other: !choices.length, // no MWs listed: one is typed
+      otherLabel: "Relabel",
       choose: (mw) => {
         if (!sameMw(mw, point.mw)) {
           const said = `Relabelled the ${kdaText(point.mw)} kDa mark ${kdaText(mw)} kDa.`;
@@ -2025,7 +2260,10 @@ export class CalibrationPanel {
   async editPoint(point, body, said) {
     let answer = null;
     try {
-      answer = await this.handlers.edit("PATCH", this.pointPath(point), body);
+      const verb = body.mw === undefined ? "Not moved" : "Not relabelled";
+      answer = await this.handlers.edit("PATCH", this.pointPath(point), body, {
+        refused: (error) => this.handlers.report(error, refusalText(error, verb)),
+      });
     } catch {
       return; // refused: said, and the mark is drawn where it is stored
     }
@@ -2137,6 +2375,7 @@ export class CalibrationPanel {
   openCustom() {
     const form = $("cal-custom");
     form.hidden = false;
+    this.customFor = this.customScope(); // closed once another membrane is shown (render)
     $("cal-custom-error").textContent = "";
     const ladder = this.membrane.ladder;
     if (ladder !== null && !ladder.includes("/")) {
@@ -2150,13 +2389,18 @@ export class CalibrationPanel {
     const form = $("cal-custom");
     form.reset();
     form.hidden = true;
+    this.customFor = null;
     $("cal-custom-error").textContent = "";
-    if (refocus) {
+    if (refocus && $("cal-ladder").getClientRects().length) {
       $("cal-ladder").focus();
     }
   }
 
   async submitCustom() {
+    if (this.customFor === null || this.customFor !== this.customScope()) {
+      this.closeCustom(true); // typed for a membrane no longer shown: it sets no ladder
+      return;
+    }
     const name = $("cal-custom-name").value.trim();
     const typed = $("cal-custom-kda").value.trim();
     const words = typed ? typed.split(/[\s,;]+/).filter(Boolean) : [];
@@ -2177,9 +2421,12 @@ export class CalibrationPanel {
   async link(imageId, markerId) {
     let answer = null;
     try {
-      answer = await this.handlers.edit("PUT", `/api/images/${imageId}/marker`, {
-        marker_image_id: markerId,
-      });
+      answer = await this.handlers.edit(
+        "PUT",
+        `/api/images/${imageId}/marker`,
+        { marker_image_id: markerId },
+        { refused: (error) => this.handlers.report(error, refusalText(error, "Not linked")) },
+      );
     } catch {
       this.markersShown = null;
       this.handlers.changed(); // the link stored, back in the select
@@ -2205,10 +2452,21 @@ export class CalibrationPanel {
   // A popup beside `where` (client coordinates) on the image: a button per
   // ladder MW (`choices`: {mw, current, disabled: why, or ""}; the reference
   // bands with their colour, `proposed` first to the keyboard), a field for
-  // another MW (`other`), and one more action (`extra`: {label, run}).
+  // another MW (`other`, its button `otherLabel`), and one more action
+  // (`extra`: {label, run}).
   // `choose(mw)` takes the MW chosen; the keyboard goes back to `back` when
   // it closes.
-  openMenu({ title, choices, proposed = null, other = false, choose, extra = null, where, back }) {
+  openMenu({
+    title,
+    choices,
+    proposed = null,
+    other = false,
+    otherLabel = "Mark",
+    choose,
+    extra = null,
+    where,
+    back,
+  }) {
     const menu = $("cal-menu");
     this.closeMenu(false);
     $("cal-menu-title").textContent = title;
@@ -2240,6 +2498,7 @@ export class CalibrationPanel {
     }
     const form = $("cal-menu-other");
     form.hidden = !other;
+    form.querySelector('button[type="submit"]').textContent = otherLabel;
     form.onsubmit = (event) => {
       event.preventDefault();
       const mw = Number($("cal-menu-mw").value);
@@ -2265,7 +2524,7 @@ export class CalibrationPanel {
     const top = Math.min(where.clientY - stage.top - 16, stage.height - menu.offsetHeight - 8);
     menu.style.left = `${Math.max(8, left)}px`;
     menu.style.top = `${Math.max(8, top)}px`;
-    this.menu = { back };
+    this.menu = { back, scope: this.menuScope() };
     const offered = ([choice, button]) =>
       !button.disabled && proposed !== null && sameMw(choice.mw, proposed);
     const first =
