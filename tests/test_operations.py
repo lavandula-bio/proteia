@@ -7255,6 +7255,81 @@ def test_a_row_box_over_two_rows_that_cuts_bands_names_the_lanes_off_its_line(tm
     assert_raw_reason(error.detail, found)
 
 
+def _crossed(dy: float, rel: float, **kwargs) -> tuple[RowCase, RowDetection]:
+    """A row smiling 8 px with another row ``dy`` px below it (above if
+    negative), ``rel`` times as deep, the row box over both, detected with the
+    expected row 3.5 px off the row's bands towards the other row where they
+    lie nearest it: its middle lanes (with the other row above) or its end
+    lanes (below) grow from the other row's bands, the rest from the row's
+    own (#58)."""
+    adjust = (0, -30, 0, 0) if dy < 0 else (0, 0, 0, 30)
+    case = adversarial_row(
+        "smiling",
+        1000,
+        smile=8.0,
+        neighbour_dy=dy,
+        neighbour_rel=rel,
+        box_adjust=kwargs.pop("box_adjust", adjust),
+        **kwargs,
+    )
+    ys = [cy + 0.5 for cy in case.lane_cy]
+    found = rowdetect.detect_row(
+        case.image,
+        case.row,
+        case.n_lanes,
+        background=estimate_background(case.image),
+        prefer_y=min(ys) - 3.5 if dy < 0 else max(ys) + 3.5,
+    )
+    return case, found
+
+
+def _off_line(found: RowDetection) -> list[int]:
+    return [
+        lane.lane
+        for lane in found.lanes
+        if lane.line_offset is not None and abs(lane.line_offset) > rowdetect.ROW_LINE_K
+    ]
+
+
+def test_lanes_grown_from_bands_on_two_rows_are_named_before_a_lane_off_the_line():
+    # Lanes 1, 2, 5, 6 grew from bands on two rows, and lane 3's bands lie
+    # 9 px below the others' (a montage's panel), off the row's line. The
+    # lanes grown from two rows say why the row box covers more than one row:
+    # they are named, not lane 3.
+    case, found = _crossed(-16.0, 2.0, shifts={2: 9.0})
+    assert found.crossed == (0, 1, 4, 5)
+    assert _off_line(found) == [2]
+    error = ops._row_refusal(found, case.row[0], case.row[2])
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
+    assert str(error) == (
+        "the bands found in lanes 1, 2, 5, 6 lie on two rows, a lane's on one and its"
+        " neighbour's on the other, each lane holding a band on both: the row box covers more"
+        " than one row, and the bands nearest the expected row do not lie on one; draw it over"
+        " one row only, or box those lanes by clicking their bands"
+    )
+
+
+def test_lanes_grown_from_bands_on_two_rows_refuse_the_row_as_off_its_line_when_it_cuts():
+    # The row box's bottom edge runs 2 px above the other row's bands'
+    # centres in lanes 3 and 4, cutting them. The lanes are read, and lanes
+    # 1, 2, 5, 6 grew from bands on two rows: said so, with the cut, not that
+    # the box does not show which lane each band is in.
+    case, found = _crossed(16.0, 3.0, box_adjust=(0, 0, 0, 2))
+    assert found.crossed == (0, 1, 4, 5)
+    assert [lane.lane for lane in found.lanes if lane.cut] == [2, 3]
+    assert _off_line(found) == []
+    error = ops._row_refusal(found, case.row[0], case.row[2])
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
+    assert str(error).startswith(
+        "the row box cuts through the bands, and the bands found in lanes 1, 2, 5, 6 lie on"
+        " two rows,"
+    )
+    assert str(error).endswith(
+        "draw it over one row only, over the whole band height, or box those lanes by"
+        " clicking their bands"
+    )
+
+
 def test_two_boxes_on_two_rows_are_both_named(tmp_path):
     # Two lanes, the first one's strongest band in the row above: neither box
     # is the row's.

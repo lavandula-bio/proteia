@@ -175,12 +175,15 @@ def calibrated(
     rows: tuple = ROWS,
     sides: Sequence[LadderSide] = (LEFT, RIGHT),
     hook=None,
+    pixels: np.ndarray | None = None,
 ) -> Blot:
     """The blot and its marker imported onto one membrane and linked, the
     PageRuler Plus preset chosen, every ladder band of ``sides`` marked where
-    it lies (not snapped), and the sample's eight lanes declared."""
+    it lies (not snapped), and the sample's eight lanes declared. ``pixels``
+    replaces the blot drawn from ``rows``."""
     s = session_on(tmp_path, hook)
-    blot_id = import_blot(s, np.array(blot_pixels(degrees, rows)), "blot β.tif")
+    blot = blot_pixels(degrees, rows) if pixels is None else pixels
+    blot_id = import_blot(s, np.array(blot), "blot β.tif")
     membrane = s.project.batch.membrane_of(blot_id).id
     marker_id = import_blot(
         s,
@@ -675,6 +678,83 @@ def test_a_deeper_band_above_is_never_boxed_with_the_target(tmp_path, kda, rel, 
     if crossed:  # lanes 2 and 3, 6 and 7 grew from bands on two rows
         assert str(error).startswith("the bands found in lanes 2, 3, 6, 7 lie on two rows,")
         assert "expected row" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("depth", "other", "deeper"),
+    [
+        (70000.0, 80.0, 150000.0),
+        (90000.0, 80.0, 150000.0),
+        (70000.0, 80.0, 110000.0),
+        (150000.0, 80.0, 150000.0),
+        (70000.0, 104.0, 150000.0),
+        (90000.0, 104.0, 150000.0),
+    ],
+)
+def test_a_band_as_saturated_as_the_target_is_not_boxed_with_it(tmp_path, depth, other, deeper):
+    # The target clipped at 0, and a band 18 px below it (80 kDa) or 16 px
+    # above it (104 kDa) as deep or deeper, clipped too: their tops differ by
+    # the background alone, and the growth from the target's peak climbed
+    # into the other band, every box 96 x 34 to 100 x 38 over both, at most
+    # the row box's edge flagged. Neither is clearly lower: each box on the
+    # target alone, the other band a second component. Where the valley
+    # between the two clipped cores stays above VALLEY_FRAC of their clipped
+    # height (both 150000 deep at 80 kDa, 104 kDa), each lane held one peak
+    # over both; clipped, the valley is deeper than it shows, and the cores
+    # are two peaks.
+    row = (TARGET[0], depth, 16.0)
+    b = calibrated(tmp_path, rows=(row, (other, deeper, 16.0)))
+    s = b.session
+    target = add(b, row)
+    placed = ops.detect_mw_row(s, target)
+    assert on_truth(s, target, TARGET[0]) == list(range(8))
+    assert on_truth(s, target, other) == []
+    assert "multiple_components" in placed.flags
+    assert all(0.9 * TARGET[0] <= mw <= 1.1 * TARGET[0] for mw in mws(s, target))
+
+
+BURNT_TARGET = (TARGET[0], 120000.0, 10.0)  # clipped at 0, over twice the membrane
+
+
+def burnt_out_pixels(light: float, smear: float) -> np.ndarray:
+    """The blot of BURNT_TARGET, each band lightened by ``light`` in its
+    centre through its whole height and more (burnt out), and a smear
+    ``smear`` deep under its left half (from 40 to 16 px left of its centre)
+    from 8 px below its centre down, fading over 20 px."""
+    kda, depth, height = BURNT_TARGET
+    darkening = np.zeros((HEIGHT, WIDTH))
+    ys, xs = np.mgrid[0:HEIGHT, 0:WIDTH]
+    for x in LANES:
+        _darken(darkening, x, kda, depth, height, 0.0)
+        cx, cy = truth(kda, x)
+        darkening -= light * np.exp(-0.5 * (((xs - cx) / 12.0) ** 2 + ((ys - cy) / 18.0) ** 2))
+        across = (
+            1.0 / (1.0 + np.exp(-(xs - cx + 40.0) / 2.0)) / (1.0 + np.exp((xs - cx + 16.0) / 2.0))
+        )
+        d = ys - cy
+        down = np.where(d < 0.0, 0.0, np.where(d < 8.0, 1.0, np.exp(-(d - 8.0) / 20.0)))
+        darkening += smear * across * down
+    return _image(darkening, 58)
+
+
+@pytest.mark.parametrize("smear", [0.0, 2500.0, 4000.0])
+def test_a_burnt_out_band_with_a_smear_under_one_half_is_boxed_whole(tmp_path, smear):
+    # #121: each target band clipped, its centre burnt out below the noise,
+    # splitting it along x; a faint smear under its left half. The smear
+    # drained into that half's basin, which then spanned far more rows than
+    # the other half's: the halves were read as two bands, the other half
+    # left out of the growth, every box 42 x 10 on one half (none on the
+    # band's centre), a second component flagged, and the over-exposure
+    # warning lost. The halves span the same rows at the growth level: one
+    # hollow band, boxed whole, as without the smear.
+    b = calibrated(tmp_path, rows=(BURNT_TARGET,), pixels=burnt_out_pixels(120000.0, smear))
+    s = b.session
+    target = add(b, BURNT_TARGET)
+    placed = ops.detect_mw_row(s, target)
+    assert "hollow_band" in placed.flags
+    assert "multiple_components" not in placed.flags
+    assert on_truth(s, target, TARGET[0]) == list(range(8))
+    assert protein_of(s, target).box_size.width >= 90
 
 
 DUMBBELL_TARGET = (TARGET[0], TARGET[1], 8.0, 0.5, 0.05)  # half as deep in its middle
