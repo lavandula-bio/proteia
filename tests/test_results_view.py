@@ -90,6 +90,15 @@ def _results(**fields) -> Results:
                 clipped=[False, True, None, None, False],
                 possibly_clipped=[None, None, None, True, None],  # lane 3 not checked (#112)
                 detected=[True, True, False, True, True],
+                # #58: no expected MW, no calibration; lanes 1 and 4 counted by a detector.
+                expected_mws=[],
+                mw_tolerance=0.1,
+                apparent_mw=[None, None, None, None, None],
+                mw_check=["not_run", "not_run", None, "not_run", "not_run"],
+                mw_not_run="no_expected_mw",
+                bands_found=[1, None, None, 2, None],
+                count_check=["passed", "not_run", None, "failed", "not_run"],
+                calibration=None,
             )
         ],
         "series": [_series()],
@@ -145,6 +154,14 @@ def test_the_payload_is_a_translation_of_one_result_set():
             "clipped": [False, True, None, None, False],
             "possibly_clipped": [None, None, None, True, None],
             "detected": [True, True, False, True, True],
+            "expected_mws": [],
+            "mw_tolerance": 0.1,
+            "apparent_mw": [None, None, None, None, None],
+            "mw_check": ["not_run", "not_run", None, "not_run", "not_run"],
+            "mw_not_run": "no_expected_mw",
+            "bands_found": [1, None, None, 2, None],
+            "count_check": ["passed", "not_run", None, "failed", "not_run"],
+            "calibration": None,
         }
     ]
     (only,) = payload["sets"]
@@ -258,7 +275,9 @@ def _translated(series: SeriesResult) -> dict:
 # The sample's bands not checked for over-exposure (#112), one notice per
 # protein: those on its JPEG, and the flags the fixture leaves out on its 16-bit
 # images. With every lane included, only the JPEG's lanes change (lane 4 too).
+# The JPEG's strip is calibrated from its two edges (#58, D7): the same in both sets.
 UNCHECKED = ["clipping_not_checked"] * 3
+APPLIED = [*UNCHECKED, "calibration_two_points"]
 
 
 @pytest.mark.parametrize(
@@ -269,14 +288,14 @@ UNCHECKED = ["clipping_not_checked"] * 3
             ["vehicle", "vehicle", "10 µM", "10 µM"],
             (["vehicle"], ["vehicle", "10 µM"]),
             ("fold_change", "fold_change"),
-            (UNCHECKED, UNCHECKED[:1]),
+            (APPLIED, UNCHECKED[:1]),
         ),
         # The excluded lane is the reference condition's only lane.
         (
             ["10 µM", "10 µM", "50 µM", "vehicle"],
             (["10 µM"], ["10 µM", "vehicle"]),
             ("normalized", "fold_change"),
-            ([*UNCHECKED, "reference_all_excluded"], UNCHECKED[:1]),
+            ([*APPLIED, "reference_all_excluded"], UNCHECKED[:1]),
         ),
     ],
     ids=["only value of a condition", "only lane of the reference"],
@@ -359,6 +378,7 @@ def test_notices_keep_their_objects():
             "protein_ids": ["prot-1"],
             "lane_indices": [1],
             "conditions": [],
+            "image_ids": [],
         }
     ]
 

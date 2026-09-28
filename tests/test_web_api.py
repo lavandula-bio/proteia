@@ -2101,6 +2101,58 @@ def test_an_expected_mw_may_be_a_whole_number(client, tmp_path):
     assert protein_of(edited, protein)["expected_mw"] == 92.0
 
 
+def test_a_protein_carries_its_mw_tolerance(client, tmp_path):
+    # #58: the MW check's tolerance, a share, set on add and edit.
+    image_id, protein = ready(client, tmp_path)
+    assert protein_of(client.ok("GET", "/api/project"), protein)["mw_tolerance"] == 0.1
+    body = {"name": "GAPDH", "role": "loading control", "image_id": image_id}
+    added = client.ok("POST", "/api/proteins", {**body, "mw_tolerance": 0.15})
+    gapdh = added["protein_id"]
+    assert protein_of(added, gapdh)["mw_tolerance"] == 0.15
+    column = next(c for c in added["results"]["proteins"] if c["protein_id"] == gapdh)
+    assert (column["mw_tolerance"], column["expected_mws"], column["mw_not_run"]) == (
+        0.15,
+        [],
+        "no_expected_mw",
+    )
+    path = f"/api/proteins/{protein}"
+    edited = client.ok("PATCH", path, {"mw_tolerance": 0.2, "expected_mw": 42})
+    assert protein_of(edited, protein)["mw_tolerance"] == 0.2
+    assert logged(client)[-1] == "edit_protein"
+    for bad in (None, 0, 1, 1.5, -0.1, "0.1", True):
+        assert unchanged_refusal(client, "PATCH", path, {"mw_tolerance": bad}) == (
+            "invalid_input",
+            [],
+        ), bad
+    for bad in (0, 1, "0.1", True):
+        refused = {**body, "name": "α-actin", "mw_tolerance": bad}
+        assert unchanged_refusal(client, "POST", "/api/proteins", refused) == (
+            "invalid_input",
+            [],
+        ), bad
+
+
+def test_a_row_answers_its_band_counts_and_checks(client, tmp_path):
+    # #58, D10: each box the row places counts the bands in its lane; the
+    # results carry the counts, the checks, and the calibration (none here).
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    client.ok("PATCH", f"/api/proteins/{target}", {"expected_mw": 92})
+    answer = drag(client, target)
+    assert [band["bands_found"] for band in protein_of(answer, target)["bands"]] == [1] * 5
+    got = column(answer, target)
+    assert got["bands_found"] == [1] * 5 and got["count_check"] == ["passed"] * 5
+    assert (got["mw_check"], got["mw_not_run"], got["calibration"]) == (
+        ["not_run"] * 5,
+        "no_points",
+        None,
+    )
+    assert got["apparent_mw"] == [None] * 5 and got["expected_mws"] == [92.0]
+    notices = answer["results"]["sets"][0]["notices"]
+    [unchecked] = [n for n in notices if n["code"] == "mw_not_checked"]
+    assert (unchecked["level"], unchecked["protein_ids"]) == ("info", [target])
+    assert unchecked["image_ids"] == [answer["project"]["images"][0]["id"]]
+
+
 def test_removing_a_protein_answers_its_cascade_and_drops_its_series(client, tmp_path):
     target, loading, before = live(client, tmp_path, DOSES)
     assert len(before["results"]["sets"][0]["series"]) == 1

@@ -94,6 +94,21 @@ operation on calibration points or a marker link logs its register group's
 fit after the change (:class:`CalibrationFit`), the images whose curve changed
 and the records it dropped.
 
+Band counts (#58, D10). A band a row commit places (:func:`detect_row_boxes`)
+stores ``bands_found``: the bands its lane holds in the count window around its
+box (:func:`~proteia.core.results.count_window`: its protein's MW tolerance
+either way on its image's calibration, or the row box's rows without a
+curve), read from the detector's peaks (:func:`~proteia.core.rowdetect.bands_in`).
+It belongs to that detection and cannot be redone from the model, so an edit
+that invalidates it clears it in the same change: the box moved or given
+another lane by hand (:func:`move_box`, :func:`set_box_lane`), its image's
+polarity (:func:`set_polarity`) or curve (:func:`_refresh_mw`) changed, its
+protein's MW tolerance changed where the window came from it (its image has a
+curve), or an MW-guided band's expected MW changed (:func:`edit_protein`).
+Resizing or padding the boxes keeps it. Like nets, a cleared count is a field
+of a band with an id and is not logged: a calibration operation's
+``curves_changed`` names the images whose counts went.
+
 A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
 detector's measurement that cannot be redone from the model alone, so an edit
 that invalidates one drops it, in the same change, and logs it in full: a box
@@ -925,7 +940,8 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
        moved or was resized, or whose image's curve changed (appeared, went,
        or its ladders changed);
     3. drop the MW-guided not-detected records of every protein on an image
-       whose curve changed: their slot came from the old curve.
+       whose curve changed, and clear the band counts (``bands_found``) of
+       every band there: their slot and count window came from the old curve.
 
     A refit of a fit no #58 build computed (:func:`_fitted_before_58`)
     changes the curve of every image of its membrane: their stored MWs came
@@ -971,6 +987,8 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
                 band.apparent_mw = _apparent_mw(fitted, band.box, size)
         if protein.image_id in moved_curves:
             dropped.extend(_drop_mw_guided(protein))
+            for band in protein.bands:
+                band.bands_found = None
     return _MwRefresh(curves_changed=tuple(changed), dropped=tuple(dropped))
 
 
@@ -1105,6 +1123,30 @@ def _expected_mw(value: object) -> float | None:
     if number is None or not math.isfinite(number) or number <= 0:
         raise _invalid(f"expected molecular weight must be a positive number of kDa, not {value!r}")
     return number
+
+
+def _mw_tolerance(value: object) -> float:
+    """An MW tolerance as a share: a number above 0 and below 1 (0.1 is ±10%)."""
+    number: float | None = None
+    if not isinstance(value, bool) and isinstance(value, int | float):
+        try:
+            number = float(value)
+        except OverflowError:
+            number = None
+    if number is None or not 0.0 < number < 1.0:  # NaN fails both
+        raise _invalid(
+            f"MW tolerance must be a share above 0 and below 1 (0.1 is ±10%), not {value!r}"
+        )
+    return number
+
+
+def _count_cleared_by_tolerance(batch: Batch, protein: Protein) -> bool:
+    """Whether a new MW tolerance clears the protein's band counts: their count
+    window was sized from it, as it is wherever its image has a curve (a curve
+    change clears them, so a count there was made with that curve); without
+    one, the window is the row box's rows."""
+    membrane = batch.membrane_of(protein.image_id)
+    return isinstance(mwcal.calibration_for(membrane, protein.image_id), mwcal.Calibration)
 
 
 def _loading_controls(batch: Batch, protein_id: str | None, role: Role, ids: object) -> list[str]:
@@ -1527,7 +1569,8 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     The not-detected records of every protein on the image are dropped and
     logged: their SNR was measured with the other signal direction, against the
     row's fitted background, so it cannot be recomputed here. A later detection
-    run writes them again.
+    run writes them again. The band counts there (#58) go too, for the same
+    reason.
     """
     polarity = _member(Polarity, polarity, "polarity")
     batch = session.project.batch
@@ -1543,6 +1586,10 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
         drafted.import_warnings = warnings
         if array is not None:
             _quantify_image(draft, image_id, array)
+        for protein in draft.batch.proteins:
+            if protein.image_id == image_id:
+                for band in protein.bands:
+                    band.bands_found = None
         return [
             dropped
             for protein in draft.batch.proteins
@@ -2789,15 +2836,19 @@ def add_protein(
     expected_mw: float | None = None,
     loading_control_ids: Sequence[str] = (),
     box_size: BoxSize | None = None,
+    mw_tolerance: float | None = None,
 ) -> str:
     """Add a protein on a signal image, last in the protein order; return its id.
 
     The name is stored cleaned and must be unique ignoring case and look-alike
     characters. ``loading_control_ids`` (targets only) keeps its order, the series
     order. ``box_size`` defaults to :func:`~proteia.core.boxes.initial_box_size`;
-    the first grown box replaces it. The image cannot be changed later. Adding a
-    second loading control writes the first into the targets that used it
-    without naming it, so their results do not change.
+    the first grown box replaces it. ``mw_tolerance`` is how far, as a share,
+    an apparent MW may lie from the expected one and pass (#58; None: the
+    model's default, 0.1, ±10%); it also sizes the band count's window. The
+    image cannot be changed later. Adding a second loading control writes the
+    first into the targets that used it without naming it, so their results
+    do not change.
     """
     batch = session.project.batch
     role = _member(Role, role, "role")
@@ -2810,6 +2861,7 @@ def add_protein(
             ids=(image_id,),
         )
     mw = _expected_mw(expected_mw)
+    tolerance = None if mw_tolerance is None else _mw_tolerance(mw_tolerance)
     controls = _loading_controls(batch, None, role, loading_control_ids)
     if box_size is None:
         size = boxes.initial_box_size(image.width, image.height)
@@ -2819,17 +2871,18 @@ def add_protein(
     def change(draft: Project) -> tuple[str, list[str]]:
         pinned = _pin_single_loading_control(draft.batch) if role is Role.LOADING_CONTROL else []
         protein_id = draft.new_id("prot")
-        draft.batch.proteins.append(
-            Protein(
-                id=protein_id,
-                name=name,
-                role=role,
-                image_id=image_id,
-                loading_control_ids=controls,
-                expected_mw=mw,
-                box_size=size,
-            )
+        added = Protein(
+            id=protein_id,
+            name=name,
+            role=role,
+            image_id=image_id,
+            loading_control_ids=controls,
+            expected_mw=mw,
+            box_size=size,
         )
+        if tolerance is not None:
+            added.mw_tolerance = tolerance
+        draft.batch.proteins.append(added)
         return protein_id, pinned
 
     def params(result: tuple[str, list[str]]) -> _Params:
@@ -2840,6 +2893,9 @@ def add_protein(
             "role": role.value,
             "image_id": image_id,
             "expected_mw": mw,
+            "mw_tolerance": Protein.model_fields["mw_tolerance"].default
+            if tolerance is None
+            else tolerance,
             "loading_control_ids": list(controls),
             "box_size": _size(size),
             "pinned_targets": pinned,
@@ -2858,6 +2914,7 @@ def edit_protein(
     role: Role | Keep = KEEP,
     expected_mw: float | None | Keep = KEEP,
     loading_control_ids: Sequence[str] | Keep = KEEP,
+    mw_tolerance: float | Keep = KEEP,
 ) -> None:
     """Edit a protein's fields; ``KEEP`` leaves one unchanged. No net changes.
 
@@ -2867,13 +2924,19 @@ def edit_protein(
     batch's only one, cannot become a target (``LOADING_CONTROL_IN_USE``, with
     those targets): choose other loading controls for them first. A changed
     expected MW drops the protein's MW-guided not-detected records, whose slot
-    came from the old one (``dropped_undetected``, logged in full).
+    came from the old one (``dropped_undetected``, logged in full), and clears
+    the band counts of its MW-guided bands. A changed MW tolerance (#58) is
+    read by the MW check at once; it clears the band counts of the protein's
+    detector bands where their window came from it (its image has a curve),
+    and drops no record.
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     new_name = protein.name if name is KEEP else _protein_name(batch, name, protein_id=protein_id)
     new_role = protein.role if role is KEEP else _member(Role, role, "role")
     mw = protein.expected_mw if expected_mw is KEEP else _expected_mw(expected_mw)
+    tolerance = protein.mw_tolerance if mw_tolerance is KEEP else _mw_tolerance(mw_tolerance)
+    recount = tolerance != protein.mw_tolerance and _count_cleared_by_tolerance(batch, protein)
     if protein.role is Role.LOADING_CONTROL and new_role is Role.TARGET:
         users = _users(batch, protein_id)
         if users:
@@ -2896,10 +2959,15 @@ def edit_protein(
         edited.name = new_name
         edited.role = new_role
         edited.expected_mw = mw
+        edited.mw_tolerance = tolerance
         edited.loading_control_ids = controls
         dropped: list[JsonValue] = []
         if mw != protein.expected_mw:
             dropped.extend(_drop_mw_guided(edited))
+        for band in edited.bands:  # counts whose window or slot the edit moved
+            guided = mw != protein.expected_mw and band.source is ProposalSource.MW_GUIDED
+            if recount or guided:
+                band.bands_found = None
         pinned = [target for target in pinned if target != protein_id]  # its own is cleared
         return pinned, dropped
 
@@ -2918,6 +2986,8 @@ def edit_protein(
             edits["role"] = new_role.value
         if mw != protein.expected_mw:
             edits["expected_mw"] = mw
+        if tolerance != protein.mw_tolerance:
+            edits["mw_tolerance"] = tolerance
         if controls != protein.loading_control_ids:
             edits["loading_control_ids"] = list(controls)
         return edits
@@ -3148,7 +3218,8 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
     smaller box's area (``OVERLAP``, as :func:`place_box`). Every band on the
     image is
     re-quantified, since the box leaves one ring and may cut another; its lane
-    never changes. Marks the band as manually edited.
+    never changes. Marks the band as manually edited, which clears its band
+    count (#58): the detector counted around the box it placed.
     """
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
@@ -3174,6 +3245,7 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         edited, moved = draft.batch.find_band(band_id)
         _set_box(moved, new)
         moved.manually_edited = True
+        moved.bands_found = None
         _quantify_image(draft, edited.image_id, array)
         _refresh_box_mws(session.project, draft)
 
@@ -3205,9 +3277,9 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
 
     The lane must be one of the declared lanes (``LANE_OUT_OF_RANGE``) where the
     protein has no box for the same band yet (``LANE_OCCUPIED``). The box counts
-    as edited by the user. The same lane is a no-op. A not-detected record for
-    the same band in the new lane is replaced (``replaced_undetected``); the lane
-    the box leaves gets no record.
+    as edited by the user, so it loses its band count (#58). The same lane is a
+    no-op. A not-detected record for the same band in the new lane is replaced
+    (``replaced_undetected``); the lane the box leaves gets no record.
     """
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
@@ -3231,6 +3303,7 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
         edited_protein, edited = draft.batch.find_band(band_id)
         edited.lane_index = lane
         edited.manually_edited = True
+        edited.bands_found = None
         return _drop_undetected(edited_protein, lane, edited.band_index)
 
     _apply(
@@ -3871,6 +3944,23 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     return OperationError(code, message, detail=detail)
 
 
+def _bands_found(
+    lane: rowdetect.LaneDetection,
+    rect: Rect,
+    fitted: mwcal.Calibration | mwcal.NoCalibration,
+    tolerance: float,
+    row: Rect,
+    height: int,
+) -> int:
+    """A placed band's count (#58, D10): its lane's bands in the count window
+    around ``rect`` (:func:`~proteia.core.results.count_window`), or in the rows
+    of the row box ``row`` (clipped to the image's ``height``) where the image
+    has no curve there."""
+    window = results.count_window(fitted, rect, tolerance)
+    top, bottom = window if window is not None else (max(0, row[1]), min(height, row[3]))
+    return rowdetect.bands_in(lane, top, bottom)
+
+
 def _row(row: object) -> Rect:
     """A row box as given: four ints ``(x0, y0, x1, y1)`` with ``x0 < x1`` and
     ``y0 < y1``, else ``INVALID_INPUT``. Text and bytes are sequences, but not
@@ -3928,6 +4018,13 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     over a band the detector finds takes that band until it is edited by hand.
 
     Boxes and records of another band index are left alone.
+
+    Each band placed or replaced in place gets its band count (#58, D10,
+    ``bands_found``): the band and the other bands its lane holds in the count
+    window around its box (:func:`~proteia.core.results.count_window`: the
+    protein's MW tolerance either way on the image's calibration at the box's
+    centre, or the row box's rows without a curve there), as the detector's
+    peaks show them (:func:`~proteia.core.rowdetect.bands_in`).
 
     The detector's size is the fitted size; the protein's padding
     (:func:`set_box_padding`) is added to it, on each side. If a box of the
@@ -4203,6 +4300,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     unlocated = () if located else tuple(lane.lane for lane in measured)
     replaced = [yielding[lane] for lane in rects if lane in yielding]
     removed = [yielding[lane] for lane in sorted(yielding) if lane not in rects]
+    # Each band's count, in the window around the box it gets (#58, D10).
+    fitted = mwcal.calibration_for(batch.membrane_of(image.id), image.id)
+    counts = {
+        lane.lane: _bands_found(lane, rects[lane.lane], fitted, protein.mw_tolerance, given, height)
+        for lane in placed
+    }
     warnings = [flag for flag in found.flags if flag in rowdetect.WARNING_FLAGS]
     notes = found.notes
     # The lanes on the image checked the lane numbers of the bands between
@@ -4239,6 +4342,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                     source=ProposalSource.ROW_BOX,
                     **_UNQUANTIFIED,
                 )
+            band.bands_found = counts[lane]
             edited.bands.append(band)
         # The boxes placed, moved and removed change every ring on the image.
         _quantify_image(draft, edited.image_id, array)

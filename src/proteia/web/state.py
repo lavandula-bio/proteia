@@ -52,10 +52,13 @@ reads a stored file here: a header, once per image (TIFF, or a colour file).
 Molecular weights (#58). Each image's ``marker_image_id`` names the marker image
 a chemiluminescence image is linked to (null: none), and each band's
 ``apparent_mw`` its MW read from its image's calibration at the box's centre
-(null: no curve there, or outside its range). ``membranes`` lists each
-membrane's ``id``, its ``image_ids``, its ``ladder`` (a preset key or a custom
-name, or null) and ``ladder_kda`` (the ladder's MWs, top to bottom), and its
-register groups (``groups``), in the order of their first image: each group's
+(null: no curve there, or outside its range) and ``bands_found`` how many
+bands the detector that placed it found in the count window around it (null:
+not counted); each protein's ``mw_tolerance`` is its MW check's tolerance, a
+share (0.1: ±10%). ``membranes`` lists each membrane's ``id``, its
+``image_ids``, its ``ladder`` (a preset key or a custom name, or null) and
+``ladder_kda`` (the ladder's MWs, top to bottom), and its register groups
+(``groups``), in the order of their first image: each group's
 ``image_ids``, its calibration ``points`` (``image_id``, ``y``, ``mw``,
 ``source``, ``x`` and ``side``, in continuous coordinates of the analysis
 array) and its ``fit`` (:meth:`~proteia.core.operations.CalibrationFit.as_json`,
@@ -187,6 +190,7 @@ def project_state(
                 "image_id": protein.image_id,
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
+                "mw_tolerance": protein.mw_tolerance,
                 "box_size": {"width": size.width, "height": size.height},
                 "fitted_size": {"width": fitted.width, "height": fitted.height},
                 "box_padding": {"across": padding.across, "along": padding.along},
@@ -197,6 +201,7 @@ def project_state(
                         "band_index": band.band_index,
                         "rect": list(band.box.rect(size)),
                         "apparent_mw": band.apparent_mw,
+                        "bands_found": band.bands_found,
                         "clipped": band.clipped,
                         "possibly_clipped": band.possibly_clipped,
                         "background_mode": band.background_mode,

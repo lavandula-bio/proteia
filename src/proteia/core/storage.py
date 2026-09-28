@@ -53,7 +53,8 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   image of known bit depth have it. The fourth is in the molecular-weight
   calibration (#58): ``CalibrationPoint.x`` is left out while ``null``,
   ``CalibrationPoint.side`` while ``"left"`` and ``MwCalibration.ladder_kda``
-  while empty. Writing the empty value instead would
+  while empty, and in the band count (#58): ``Band.bands_found`` while
+  ``null``. Writing the empty value instead would
   move every existing project's hash, so every export would report
   ``content_changed_outside_log``.
 * The hash covers ``schema_version``, the background method, every id, the lane
