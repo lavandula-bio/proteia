@@ -107,6 +107,11 @@ Resizing or padding the boxes keeps it. Like nets, a cleared count is a field
 of a band with an id and is not logged: a calibration operation's
 ``curves_changed`` names the images whose counts went.
 
+A row placed by its expected MW (:func:`detect_mw_row`, #58) commits as a
+dragged row box does, through the commit every row shares (:func:`_place_row`):
+what is said here of :func:`detect_row_boxes` holds for it, with source
+``mw_guided`` on the boxes it places and the records it writes.
+
 A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
 detector's measurement that cannot be redone from the model alone, so an edit
 that invalidates one drops it, in the same change, and logs it in full: a box
@@ -149,7 +154,7 @@ import logging
 import math
 import shutil
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Concatenate, Final
@@ -157,7 +162,7 @@ from typing import Any, BinaryIO, Concatenate, Final
 import numpy as np
 from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, export, ladders, mwcal, record, results, rowdetect, storage
+from proteia.core import boxes, export, ladders, mwcal, mwrow, record, results, rowdetect, storage
 from proteia.core.analyze import ReduceMethod, StatisticsSetting, statistics_setting
 from proteia.core.export import (
     BUNDLE_RECORD_FILE,
@@ -265,6 +270,7 @@ __all__ = [
     "LadderFit",
     "LaneInput",
     "LanesUpdate",
+    "MwRowPlacement",
     "OperationError",
     "PaddingChange",
     "ProjectSession",
@@ -277,6 +283,7 @@ __all__ = [
     "clear_calibration",
     "compute",
     "compute_view",
+    "detect_mw_row",
     "detect_row_boxes",
     "edit_calibration_point",
     "edit_protein",
@@ -421,6 +428,35 @@ class RowPlacement:
     remeasured: tuple[tuple[str, float, float], ...] = ()  # other proteins' nets it changed
     largest_change: tuple[str, float] | None = None  # (band id, share of its net before)
     unlocated_lanes: tuple[int, ...] = ()  # no_band lanes whose slot rests on one band alone
+
+
+@dataclass(frozen=True, kw_only=True)
+class MwRowPlacement(RowPlacement):
+    """What :func:`detect_mw_row` did: a :class:`RowPlacement`, and where the
+    row was searched (#58, D11, D12).
+
+    ``row`` is the slot at the span's centre, as a row box; along the protein
+    line it lies ``shift_ends`` rows lower at the span's first and last
+    columns (0 and 0 on a level line). ``expected_y`` is each expected MW's y
+    at the centre. ``span`` is the lanes' columns, ``x0`` to ``x1 - 1``, read
+    from ``span_from``: ``given`` (dragged), ``anchors`` (the lanes already
+    placed on the image), ``group_anchors`` (those of its register group's
+    image with the most) or ``ladders`` (between its two ladders).
+    ``two_ladders`` and ``tilt_deg`` describe the protein line
+    (:class:`CalibrationFit`), ``slope_deg`` its slope at the expected MW.
+    ``span_hint`` is set when lanes read between the ladders are doubtful
+    (``doubtful_lanes``): the ladder lanes may be declared as lanes, or a well
+    beside a ladder empty, and a drag across the lanes settles them."""
+
+    row: Rect
+    shift_ends: tuple[int, int]
+    expected_y: tuple[float, ...]
+    span: tuple[int, int]
+    span_from: str
+    two_ladders: bool
+    tilt_deg: float | None
+    slope_deg: float
+    span_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3771,9 +3807,50 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     given = _row(row)
-    n = len(batch.lanes)
-    if n == 0:
+    if not batch.lanes:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before detecting a row")
+    return _place_row(
+        session,
+        protein,
+        given,
+        action="detect_row_boxes",
+        source=ProposalSource.ROW_BOX,
+        detect=rowdetect.detect_row,
+        lead={"row": list(given)},
+    )
+
+
+# The detection a row commit runs, called as rowdetect.detect_row is:
+# detect(array, row, n_lanes, background=..., dark_on_light=..., right_to_left=...,
+# saturated_at=...).
+_Detect = Callable[..., rowdetect.RowDetection]
+
+
+def _place_row(
+    session: ProjectSession,
+    protein: Protein,
+    given: Rect,
+    *,
+    action: str,
+    source: ProposalSource,
+    detect: _Detect,
+    lead: Mapping[str, JsonValue],
+    what: str = "row box",
+    also_notes: Sequence[str] = (),
+) -> RowPlacement:
+    """The commit a row shares, whoever placed it (:func:`detect_row_boxes`,
+    :func:`detect_mw_row`): detect one band per declared lane in the rows of
+    ``given`` with ``detect`` and commit the outcome for the protein's band
+    index 0, as :func:`detect_row_boxes` describes, under the log action
+    ``action``. The boxes placed or replaced in place, and the not-detected
+    records written, take ``source``. The log entry's params are the
+    protein's id, then ``lead`` (what placed the row), then the outcome, lane
+    by lane, from ``lanes`` to ``settings``; ``also_notes`` follow the
+    detector's notes. ``what`` names the row in the session log. The declared
+    lanes are not checked: the caller refused a batch without them."""
+    protein_id = protein.id
+    batch = session.project.batch
+    n = len(batch.lanes)
     image = batch.find_image(protein.image_id)
     width, height = image.width, image.height
     # The lanes on the image, less this protein's boxes that give way to the
@@ -3809,7 +3886,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         # record reports (record.settings) with how saturated_at is chosen; the
         # rest comes from the image and its lanes, and the log keeps the
         # direction and the saturation level.
-        found = rowdetect.detect_row(
+        found = detect(
             array,
             given,
             n,
@@ -3939,6 +4016,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     if checked and all(min(checked) <= lane <= max(checked) for lane in centres):
         warnings = [flag for flag in warnings if flag != "doubtful_lanes"]
         notes = tuple(note for note in notes if note != found.doubt_note)
+    notes = (*notes, *also_notes)
 
     def change(
         draft: Project,
@@ -3956,21 +4034,20 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                 band = by_id[yielding[lane]]
                 if rect != band.box.rect(old_size):  # else it keeps what its position gave it
                     _set_box(band, rect)
-                band.source = ProposalSource.ROW_BOX
+                band.source = source
             else:
                 band = Band(
                     id=draft.new_id("band"),
                     lane_index=lane,
                     band_index=0,
                     box=Box(x=rect[0], y=rect[1]),
-                    source=ProposalSource.ROW_BOX,
+                    source=source,
                     **_UNQUANTIFIED,
                 )
             band.bands_found = counts[lane]
             edited.bands.append(band)
         # The boxes placed, moved and removed change every ring on the image.
         _quantify_image(draft, edited.image_id, array)
-        _refresh_box_mws(session.project, draft)
         # Every band-index-0 record gives way to this run's outcome in its lane (a
         # kept box's lane holds none).
         dropped: list[JsonValue] = list(
@@ -3986,10 +4063,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                 snr=lane.snr,
                 threshold=rowdetect.DETECT_K,
                 region=Region(x0=x0, y0=y0, x1=x1, y1=y1),
-                source=ProposalSource.ROW_BOX,
+                source=source,
             )
             edited.undetected.append(record)
             written.append(_undetected_json(protein_id, record))
+        # The MWs of the boxes placed, moved or resized, last (#58).
+        _refresh_box_mws(session.project, draft)
         # Each lane's first-band box after the change: placed, replaced or kept.
         after = {b.lane_index: b for b in edited.bands if b.band_index == 0}
         band_ids = [after[lane].id if lane in after else None for lane in range(n)]
@@ -4002,7 +4081,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         band_ids, lane_rects, written, dropped = result
         return {
             "protein_id": protein_id,
-            "row": list(given),
+            **lead,
             "lanes": [
                 {
                     "band_id": band_ids[lane.lane],
@@ -4030,12 +4109,13 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         }
 
     prior = session.project
-    band_ids, _, _, _ = _apply(session, "detect_row_boxes", change, params)
+    band_ids, _, _, _ = _apply(session, action, change, params)
     if session.project is not prior and (warnings or unlocated):
         _log.info(
-            "in %r: the row box of %s on %s: the detector warns of %s; lanes not located"
+            "in %r: the %s of %s on %s: the detector warns of %s; lanes not located"
             " (one band found): %s",
             session.folder.name,
+            what,
             protein_id,
             image.id,
             ", ".join(warnings) or "nothing",
@@ -4067,6 +4147,237 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         remeasured=remeasured,
         largest_change=largest,
         unlocated_lanes=unlocated,
+    )
+
+
+def _span(span: object) -> tuple[int, int]:
+    """A lane span as given: two ints ``(x0, x1)`` with ``x0 < x1``, else
+    ``INVALID_INPUT``."""
+    if (
+        isinstance(span, str | bytes | bytearray | memoryview)
+        or not isinstance(span, Sequence)
+        or len(span) != 2
+    ):
+        raise _invalid(f"span must be (x0, x1), not {span!r}")
+    x0, x1 = (_int(v, "span coordinate") for v in span)
+    if x1 <= x0:
+        raise _invalid(f"span {(x0, x1)} is empty or inverted")
+    return x0, x1
+
+
+def _no_calibration(
+    membrane: Membrane, image: ImageRef, fitted: mwcal.NoCalibration
+) -> OperationError:
+    """The refusal of a row placed by MW on an image without a curve, worded by
+    why it has none."""
+    names = _group_names(membrane, fitted.group)
+    if fitted.reason == "one_point":
+        message = f"{names}: each ladder there has one calibration point; mark at least two"
+    elif image.marker_image_id is not None:
+        message = (
+            f"{names} have no calibration points: mark the ladder on the marker image"
+            f" {image.marker_image_id}"
+        )
+    else:
+        message = (
+            f"{image.id} has no calibration points: mark the ladder on its marker image and"
+            f" link {image.id} to it, or mark the ladder on {image.id} itself"
+        )
+    return OperationError(ErrorCode.NO_CALIBRATION, message, ids=(image.id,))
+
+
+@_locked
+def detect_mw_row(
+    session: ProjectSession, protein_id: str, *, span: Sequence[int] | None = None
+) -> MwRowPlacement:
+    """Place a protein's row by its expected MW (#58, D11, D12): detect one band
+    per declared lane where its image's calibration puts the MW, and commit the
+    outcome for the protein's band index 0 as a dragged row box's
+    (:func:`detect_row_boxes`), with source ``mw_guided``.
+
+    The slot (:func:`~proteia.core.mwrow.slot`): the rows from the expected MW
+    times ``1 + 2 x tolerance`` down to it over that (the protein's MW
+    tolerance, within the calibrated range), plus a margin of 0.04 decade of
+    MW (at least 6 px) above and below, read at the centre of the lanes'
+    span. With two ladders it follows the protein line: each column of the
+    span is shifted by whole pixels so the line lies level, detection runs on
+    it (:func:`~proteia.core.rowdetect.detect_row_along`, so the row's line
+    check runs on the levelled row), and each box is moved back by the shift
+    of its centre column. Its rows are cut to those every column's shift keeps
+    on the image. Each lane grows from its peak nearest the expected MW's row
+    (``prefer_y``), not from a stronger band beside it in the slot. A line
+    sloping more than :data:`~proteia.core.mwrow.STEEP_ROW_DEG` across the span
+    adds a note: the boxes are level rectangles.
+
+    The lanes' span (:func:`~proteia.core.mwrow.lane_span`): ``span``, the
+    columns ``(x0, x1)`` the user dragged across (end-exclusive, only x);
+    else the lanes already placed on the image (the first-band boxes of every
+    protein, less this protein's boxes a detector placed that nobody edited),
+    half a lane pitch past the end lanes; else those of the image of its
+    register group with the most lanes placed; else between its two ladders,
+    each taken to stand one pitch outside its end lane, inset by half a pitch.
+    A row whose lanes the reading refuses (``ROW_LANES_UNCLEAR``), with the
+    span not dragged, says so and asks for the drag (``detail``: ``span_from``,
+    ``hint``: ``lane_span_required``); lanes read between the ladders that
+    are doubtful (``doubtful_lanes``) are placed with ``span_hint``.
+
+    Refused, changing nothing, in this order: ``span`` not two ints, or empty
+    or inverted (``INVALID_INPUT``); no lanes (``NO_LANES``); no expected MW,
+    or a protein expecting several bands (``MW_REQUIRED``); an image without a
+    curve (``NO_CALIBRATION``, with the reason); an expected MW outside the
+    calibrated range (``MW_OUTSIDE_CALIBRATION``: with two ladders, where both
+    reach); no span (``LANE_SPAN_REQUIRED``); a span off the image, or a slot
+    no row of which stays on it (``OUT_OF_IMAGE``); a protein line that folds
+    over within the span (``MW_OUTSIDE_CALIBRATION``); then every refusal of
+    a row box, in its order.
+
+    The log entry (``detect_mw_row``) holds the protein, its expected MWs and
+    tolerance, the search factor, its image's calibration
+    (:class:`CalibrationFit`) with ``two_ladders`` and ``tilt_deg``, the
+    expected ys (2 decimals), the slot (``row``, ``shift_ends``, ``m_top``,
+    ``m_bot``, ``margin``), the line's ``slope_deg``, the ``span``, where it
+    came from (``span_from``) and the boxes it was read from (``anchor_ids``,
+    on ``anchor_image_id``), then every param a row box logs, from ``lanes``
+    to ``settings``. The same placement again changes nothing.
+    """
+    batch = session.project.batch
+    protein = batch.find_protein(protein_id)
+    given = None if span is None else _span(span)
+    n = len(batch.lanes)
+    if n == 0:
+        raise OperationError(ErrorCode.NO_LANES, "declare the lanes before placing a row")
+    if protein.expected_mw is None:
+        raise OperationError(
+            ErrorCode.MW_REQUIRED,
+            f"{protein.name!r} has no expected MW: enter it to place its row by MW",
+            ids=(protein_id,),
+        )
+    if protein.expected_band_count != 1:
+        count = protein.expected_band_count
+        raise OperationError(
+            ErrorCode.MW_REQUIRED,
+            f"{protein.name!r} expects {count} bands: placing its row by MW needs the MW of"
+            f" each of the {count}",
+            ids=(protein_id,),
+        )
+    mws = (protein.expected_mw,)
+    image = batch.find_image(protein.image_id)
+    membrane = batch.membrane_of(image.id)
+    fitted = mwcal.calibration_for(membrane, image.id)
+    if isinstance(fitted, mwcal.NoCalibration):
+        raise _no_calibration(membrane, image, fitted)
+    names = _group_names(membrane, fitted.group)
+    for mw in mws:
+        if not fitted.z_lo <= math.log10(mw) <= fitted.z_hi:
+            raise OperationError(
+                ErrorCode.MW_OUTSIDE_CALIBRATION,
+                mwrow.outside_words(fitted, mw, names),
+                ids=(image.id,),
+            )
+    if given is not None:
+        x0, x1 = max(0, given[0]), min(image.width, given[1])
+        if x1 <= x0:
+            raise OperationError(
+                ErrorCode.OUT_OF_IMAGE,
+                f"span {given} lies outside the {image.width}x{image.height} image {image.id}",
+                ids=(image.id,),
+            )
+        lanes_span: mwrow.LaneSpan | None = mwrow.LaneSpan(x0, x1, "given")
+    else:
+        lanes_span = mwrow.lane_span(batch, protein, fitted)
+    if lanes_span is None:
+        raise OperationError(
+            ErrorCode.LANE_SPAN_REQUIRED,
+            f"no lanes are placed on {names} and no two ladders show where they lie: drag"
+            f" across all {n} lanes (only the left and right ends are used)",
+            ids=(image.id,),
+        )
+    try:
+        slot = mwrow.slot(
+            fitted, mws, protein.mw_tolerance, lanes_span.x0, lanes_span.x1, image.height
+        )
+    except mwrow.SlotError as exc:
+        outside = exc.code == "outside_range"
+        code = ErrorCode.MW_OUTSIDE_CALIBRATION if outside else ErrorCode.OUT_OF_IMAGE
+        raise OperationError(code, str(exc), ids=(image.id,)) from exc
+    fit = calibration_fit(membrane, image.id)
+    lead: dict[str, JsonValue] = {
+        "expected_mws": list(mws),
+        "mw_tolerance": protein.mw_tolerance,
+        "search_factor": mwrow.SEARCH_FACTOR,
+        "fit": None if fit is None else fit.as_json(),
+        "two_ladders": fitted.two_ladders,
+        "tilt_deg": fitted.tilt_deg,
+        "expected_y": [round(y, 2) for y in slot.expected_y],
+        "row": list(slot.row),
+        "shift_ends": list(slot.shift_ends),
+        "m_top": _finite(slot.m_top),
+        "m_bot": _finite(slot.m_bot),
+        "margin": slot.margin,
+        "slope_deg": slot.slope_deg,
+        "span": [lanes_span.x0, lanes_span.x1],
+        "span_from": lanes_span.source,
+        "anchor_ids": list(lanes_span.anchor_ids),
+        "anchor_image_id": lanes_span.image_id,
+    }
+    steep = (
+        f"the row slopes steeply along the protein line (about {abs(slot.slope_deg):.1f}°);"
+        " boxes are level rectangles"
+    )
+    detect = functools.partial(
+        rowdetect.detect_row_along, shifts=slot.shifts, prefer_y=slot.expected_y[0]
+    )
+    drag = f"drag across all {n} lanes (only the left and right ends are used)"
+    where = {
+        "anchors": f"where the boxes already on {lanes_span.image_id} put them",
+        "group_anchors": f"where the boxes already on {lanes_span.image_id} put them",
+        "ladders": "between the two ladders",
+    }.get(lanes_span.source)
+    try:
+        placed = _place_row(
+            session,
+            protein,
+            slot.row,
+            action="detect_mw_row",
+            source=ProposalSource.MW_GUIDED,
+            detect=detect,
+            lead=lead,
+            what="row placed by its MW",
+            also_notes=(steep,) if slot.steep else (),
+        )
+    except OperationError as exc:
+        # A reading of the lanes refused (not lanes on the image numbered
+        # inconsistently, which carry no detail): the span was not dragged.
+        if exc.code is not ErrorCode.ROW_LANES_UNCLEAR or exc.detail is None or where is None:
+            raise
+        raise OperationError(
+            exc.code,
+            f"{exc}; the lanes were taken to lie {where}: {drag}",
+            ids=exc.ids,
+            detail={
+                **exc.detail,
+                "span_from": lanes_span.source,
+                "hint": ErrorCode.LANE_SPAN_REQUIRED.value,
+            },
+        ) from exc
+    hint = None
+    if lanes_span.source == "ladders" and "doubtful_lanes" in placed.flags:
+        hint = (
+            "the lanes were taken to lie between the two ladders, each a lane pitch outside"
+            " its end lane; if a ladder lane is declared as a lane, or a well beside a ladder"
+            f" is empty, {drag}"
+        )
+    return MwRowPlacement(
+        **{field.name: getattr(placed, field.name) for field in fields(RowPlacement)},
+        row=slot.row,
+        shift_ends=slot.shift_ends,
+        expected_y=slot.expected_y,
+        span=(lanes_span.x0, lanes_span.x1),
+        span_from=lanes_span.source,
+        two_ladders=fitted.two_ladders,
+        tilt_deg=fitted.tilt_deg,
+        slope_deg=slot.slope_deg,
+        span_hint=hint,
     )
 
 

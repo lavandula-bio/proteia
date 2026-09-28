@@ -54,7 +54,8 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    each piece to one lane, or a touching run to several, with empty lanes as
    gaps; the second-best reading measures how certain that is.
 6. Per lane: growth with the click's rule (:func:`~proteia.core.grow.grow_region`
-   at ``EXTENT_LEVEL`` of the lane's strongest pixel) between the lane's walls,
+   at ``EXTENT_LEVEL`` of the lane's strongest pixel, or of its peak nearest
+   the row a caller expects the band on, ``prefer_y``) between the lane's walls,
    joined across a burnt-out centre that splits a saturated band along x
    (:func:`_join_burnt_out`, where the saturation level is known). A lane
    read from a marked piece is not grown: it stays empty.
@@ -116,6 +117,10 @@ Flags (:attr:`RowDetection.flags`):
   that edge row itself and was left out (``edge_signal``).
 
 Every setting is a module constant, reported by :func:`settings`.
+
+A row along a sloping line (:func:`detect_row_along`, #58): the columns of the
+row box are moved by whole pixels so the line lies level, :func:`detect_row`
+runs unchanged on them, and what it found is moved back.
 """
 
 from __future__ import annotations
@@ -125,7 +130,7 @@ import math
 import numbers
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Final, Literal, NamedTuple
+from typing import Any, Final, Literal, NamedTuple
 
 import numpy as np
 from pydantic import JsonValue
@@ -1501,6 +1506,8 @@ def _measure(
     kept: np.ndarray,
     sigma_sm: float,
     saturated: np.ndarray | None,
+    tops: list[tuple[int, int]] | None = None,
+    prefer: float | None = None,
 ) -> None:
     """Grow each present lane from its strongest kept pixel, confined between its
     walls: the midpoint to a present neighbour, the centre of an empty one, the
@@ -1508,7 +1515,14 @@ def _measure(
     saturation level), a band split along x by a burnt-out centre is grown
     whole (:func:`_join_burnt_out`). A touching cell keeps its own x-range. A
     lane read from a piece rising into the box's side is not grown, and ends up
-    empty, but walls its neighbour in as a present one does."""
+    empty, but walls its neighbour in as a present one does.
+
+    Given a preferred row ``prefer`` (continuous, in the crop's rows) and the
+    separate peaks ``tops`` of the kept signal (:func:`_peaks` at
+    ``DETECT_K`` sigma), a lane grows instead from the peak in its seed range
+    nearest that row (of two as near, the higher), or from its strongest
+    kept pixel when the range holds none (#58: the row an expected MW
+    predicts, not a stronger band beside it)."""
     wc = s.shape[1]
     n = len(lanes)
     ks = np.where(kept, s, 0.0)
@@ -1521,9 +1535,13 @@ def _measure(
             a0, b0 = a0 + q, b0 - q
         wa = max(0, int(math.floor(a0)))
         wb = min(wc, max(wa + 1, int(math.ceil(b0))))
-        sub = ks[:, wa:wb]
-        sy, sx = divmod(int(np.argmax(sub)), sub.shape[1])
-        sx += wa
+        near = [] if prefer is None or tops is None else [t for t in tops if wa <= t[1] < wb]
+        if near:
+            sy, sx = min(near, key=lambda t: (abs(t[0] + 0.5 - prefer), t[0]))
+        else:
+            sub = ks[:, wa:wb]
+            sy, sx = divmod(int(np.argmax(sub)), sub.shape[1])
+            sx += wa
         v = float(ks[sy, sx])
         if v <= 0.0:
             ln.present = False
@@ -1725,7 +1743,7 @@ def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
     if not measured:
         return
     ks = np.where(res.cand.kept, sig.s_sm, 0.0)
-    tops = _peaks(ks, DETECT_K * sig.sigma_sm)
+    tops = res.tops if res.tops is not None else _peaks(ks, DETECT_K * sig.sigma_sm)
     comps, _ = label(ks > 0.0)
     thr = NOISE_K * sig.sigma_sm
     min_w = _min_width(ks.shape[1], len(res.lanes))
@@ -1867,6 +1885,9 @@ class _Pass:
     notes: list[str]
     pieces: list[_Piece]  # the pieces the reading assigns (_reduce's), in order
     joined: list[_Joined]  # the pairs _reduce merged or dropped one of
+    # The kept signal's peaks (_peaks), found once where a preferred row seeds
+    # the lanes and reused to count the components; None: not found yet.
+    tops: list[tuple[int, int]] | None = None
 
 
 def _run_pass(
@@ -1875,10 +1896,13 @@ def _run_pass(
     x_offset: int,
     image_rows: tuple[bool, bool],
     saturated: np.ndarray | None,
+    prefer: float | None = None,
 ) -> _Pass:
     """Steps 3 to 6 of the pipeline on one signal; ``image_rows``: whether the
     box's top and bottom rows are the image's (:func:`_lines`); ``saturated``:
-    the crop's pixels at the saturation level, or None (:func:`_measure`)."""
+    the crop's pixels at the saturation level, or None (:func:`_measure`);
+    ``prefer``: the row the lanes are seeded nearest, in the crop's rows, or
+    None (:func:`_measure`)."""
     wc = sig.s_sm.shape[1]
     notes: list[str] = []
     cand = _candidates(sig, n, image_rows)
@@ -1887,8 +1911,12 @@ def _run_pass(
     if assign is None:
         return _Pass(sig, cand, None, math.inf, [_Lane() for _ in range(n)], notes, pieces, joined)
     lanes = _lanes_from(assign, pieces, n)
-    _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm, saturated)
-    return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined)
+    if prefer is None:
+        _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm, saturated)
+        return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined)
+    tops = _peaks(np.where(cand.kept, sig.s_sm, 0.0), DETECT_K * sig.sigma_sm)
+    _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm, saturated, tops, prefer)
+    return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined, tops)
 
 
 def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
@@ -2317,6 +2345,7 @@ def detect_row(
     size_rule: str = SIZE_RULE,
     right_to_left: bool = False,
     saturated_at: float | None = None,
+    prefer_y: float | None = None,
 ) -> RowDetection:
     """One slot per declared lane in ``row`` ``(x0, y0, x1, y1)``: a box of one
     shared size, or None for an empty lane (see the module docstring).
@@ -2334,8 +2363,15 @@ def detect_row(
     one (the detector limit, or near it where compression or colour moved
     saturated pixels off it); None where the image has no known limit, and no
     band is then called hollow (``hollow_band``).
+    ``prefer_y`` is the row, in the image's continuous rows (row r covers [r,
+    r+1)), where the caller expects the band (#58: its expected MW's): each
+    lane then grows from the peak in its seed range nearest it, not from its
+    strongest pixel, in both stages, so a stronger band nearby in the lane is
+    not boxed, nor taken for the membrane; ``snr`` is that peak's. With None,
+    the default, the result is as without it, bit for bit.
     Raises :class:`RowDetectError` for a row it cannot use, and ValueError for
-    an unknown ``size_rule`` or a ``saturated_at`` that is not a finite number.
+    an unknown ``size_rule``, or a ``saturated_at`` or ``prefer_y`` that is not
+    a finite number.
     """
     if size_rule not in SIZE_RULES:
         raise ValueError(f"unknown size rule {size_rule!r}; expected one of {SIZE_RULES}")
@@ -2343,8 +2379,15 @@ def detect_row(
         isinstance(saturated_at, numbers.Real) and math.isfinite(saturated_at)
     ):
         raise ValueError(f"saturated_at must be a finite number or None, not {saturated_at!r}")
+    if prefer_y is not None and not (
+        isinstance(prefer_y, numbers.Real)
+        and not isinstance(prefer_y, bool)
+        and math.isfinite(prefer_y)
+    ):
+        raise ValueError(f"prefer_y must be a finite number or None, not {prefer_y!r}")
     gray = np.asarray(gray)
     x0, y0, x1, y1 = _check_row(gray, row, n_lanes, background)
+    prefer = None if prefer_y is None else float(prefer_y) - y0
     n = int(n_lanes)
     crop = np.asarray(gray[y0:y1, x0:x1], dtype=np.float64)
     if not np.isfinite(crop).all():
@@ -2367,7 +2410,12 @@ def detect_row(
     crop_ds = _despeckle(crop, _despeckle_width(wc, n))
     image_rows = (y0 == 0, y1 == gray.shape[0])
     res = _run_pass(
-        _signal(crop, crop_ds, plane, sign, sigma_px, floor, None), n, x0, image_rows, saturated
+        _signal(crop, crop_ds, plane, sign, sigma_px, floor, None),
+        n,
+        x0,
+        image_rows,
+        saturated,
+        prefer,
     )
 
     # Stage 2: the plane (or the stored background, the same choice) and the
@@ -2385,6 +2433,7 @@ def detect_row(
             x0,
             image_rows,
             saturated,
+            prefer,
         )
     sig, assign, lanes = res.sig, res.assign, res.lanes
     # The membrane's level in the signal, for bg_offset: stage 2 measured it on
@@ -2546,10 +2595,14 @@ def detect_row(
     multiple = [ld.lane for ld in result if ld.components > 1]
     if multiple:
         flags.append("multiple_components")
+        covers = (
+            "the one with the lane's strongest pixel"
+            if prefer is None
+            else "the one nearest the expected row"
+        )
         notes.append(
             f"{lanes_phrase(multiple)}: a second separate component reaches "
-            f"{SECOND_SHARE:.0%} of the lane's peak; the box covers the one with the lane's"
-            " strongest pixel"
+            f"{SECOND_SHARE:.0%} of the lane's peak; the box covers {covers}"
         )
     hollow = [ld.lane for ld in result if ld.hollow]
     if hollow:
@@ -2586,6 +2639,88 @@ def detect_row(
         margin=margin,
         membrane_shift=min(-ends, float(rows.max()) - ends) / sigma_px,
     )
+
+
+def detect_row_along(
+    gray: np.ndarray,
+    row: Sequence[int],
+    n_lanes: int,
+    shifts: Sequence[int],
+    *,
+    background: float,
+    **kwargs: Any,
+) -> RowDetection:
+    """:func:`detect_row` along a line that slopes across the row (#58, D11: the
+    protein line between two ladders).
+
+    ``shifts`` holds one whole-pixel shift per column of ``row`` as given, x0 to
+    x1 - 1: at column x the line lies ``shifts[x - x0]`` rows lower than the
+    row's own rows. Each column of the row box is moved up by its shift, so
+    the line lies level along the box's rows: a permutation of the image's own
+    pixels, with no value new or changed (the noise, the signal-to-noise and
+    the saturated pixels read as before). :func:`detect_row` then runs,
+    unchanged, on the image so levelled, with the other arguments as given
+    (``background``, ``dark_on_light``, ``prefer_y`` in the levelled rows, and
+    so on), so its checks, the row's line among them, see the row level. What
+    it found is moved back down: each rect, grown extent and empty lane's
+    window by the shift of its centre column (x0 + x1) // 2, each peak by the
+    shift of its own column. Boxes do not overlap along x, so they do not
+    overlap once moved; each keeps the shared size.
+
+    With every shift 0 the result is :func:`detect_row`'s, bit for bit. The
+    image outside the row box is never read, as by :func:`detect_row`.
+
+    Raises :class:`RowDetectError` as :func:`detect_row` does; ``invalid_row``
+    for ``shifts`` that are not one int per column of the row; and
+    ``row_outside_image`` for a row whose rows, shifted at any of its columns
+    inside the image, leave the image (the caller cuts the row to the rows
+    every column can be shifted in)."""
+    gray = np.asarray(gray)
+    cx0, cy0, cx1, cy1 = _check_row(gray, row, n_lanes, background)
+    x0 = int(tuple(row)[0])
+    width = int(tuple(row)[2]) - x0
+    if (
+        isinstance(shifts, str | bytes)
+        or len(shifts) != width
+        or not all(_is_int(s) for s in shifts)
+    ):
+        raise RowDetectError(
+            "invalid_row", f"shifts must be one int per column of the row ({width}), not {shifts!r}"
+        )
+    s = np.asarray(shifts[cx0 - x0 : cx1 - x0], dtype=np.int64)
+    if cy0 + int(s.min()) < 0 or cy1 + int(s.max()) > gray.shape[0]:
+        raise RowDetectError(
+            "row_outside_image",
+            f"row {tuple(int(v) for v in row)} shifted along its line by"
+            f" {int(s.min())} to {int(s.max())} rows leaves the image",
+        )
+    if not s.any():
+        return detect_row(gray, row, n_lanes, background=background, **kwargs)
+    levelled = gray.copy()
+    rows = np.arange(cy0, cy1)[:, None] + s[None, :]
+    levelled[cy0:cy1, cx0:cx1] = gray[rows, np.arange(cx0, cx1)[None, :]]
+    found = detect_row(levelled, row, n_lanes, background=background, **kwargs)
+
+    def shift(column: int) -> int:
+        return int(s[column - cx0])
+
+    def back(rect: Rect | None) -> Rect | None:
+        if rect is None:
+            return None
+        dy = shift((rect[0] + rect[2]) // 2)
+        return (rect[0], rect[1] + dy, rect[2], rect[3] + dy)
+
+    lanes = tuple(
+        replace(
+            lane,
+            rect=back(lane.rect),
+            extent=back(lane.extent),
+            window=back(lane.window),
+            peaks=tuple(p._replace(y=p.y + shift(math.floor(p.x))) for p in lane.peaks),
+        )
+        for lane in found.lanes
+    )
+    return replace(found, lanes=lanes)
 
 
 def settings() -> dict[str, JsonValue]:

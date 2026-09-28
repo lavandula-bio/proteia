@@ -8174,6 +8174,7 @@ MW_WRITERS = frozenset(
         "set_box_size",
         "set_box_padding",
         "detect_row_boxes",
+        "detect_mw_row",
         "remove_image",
         "set_marker_image",
         "set_ladder",
@@ -8218,11 +8219,12 @@ def test_every_operation_is_classified_for_the_mw_writer():
     functions = {name for name in ops.__all__ if inspect.isfunction(getattr(ops, name))}
     assert MW_WRITERS | MW_NEUTRAL == functions
     assert not MW_WRITERS & MW_NEUTRAL
+    writers = ("_refresh_mw(", "_refresh_box_mws(", "_calibration_change(", "_place_row(")
     for name in MW_WRITERS:
         source = inspect.getsource(getattr(ops, name))
-        assert any(
-            call in source for call in ("_refresh_mw(", "_refresh_box_mws(", "_calibration_change(")
-        ), name
+        assert any(call in source for call in writers), name
+    # The commit every row shares (detect_row_boxes, detect_mw_row) calls it.
+    assert "_refresh_box_mws(" in inspect.getsource(ops._place_row)
 
 
 def test_mw_current_after_each_operation(tmp_path):
@@ -8249,6 +8251,9 @@ def test_mw_current_after_each_operation(tmp_path):
     )
     step("detect_row_boxes", lambda: ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX))
     assert all(band.apparent_mw is not None for band in protein_of(s, c.protein).bands)
+    # The same row placed by its expected MW, between the ladders: in place, MW-guided.
+    step("detect_mw_row", lambda: ops.detect_mw_row(s, c.protein))
+    assert {band.source for band in protein_of(s, c.protein).bands} == {ProposalSource.MW_GUIDED}
     moved = lane_bands(s, c.protein)[2]
     x0, y0, x1, y1 = moved.box.rect(protein_of(s, c.protein).box_size)
     step("move_box", lambda: ops.move_box(s, moved.id, (x0 + 2, y0 + 3, x1 + 2, y1 + 3)))

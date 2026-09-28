@@ -166,6 +166,14 @@ class ErrorCode(StrEnum):
     # a point with no x) would share a register group with a right ladder.
     LADDER_SIDES = "ladder_sides"
     MARKER_SIZE_MISMATCH = "marker_size_mismatch"  # a marker and its image differ in size
+    # Placing a row by its expected MW (#58, D11, D12): the image has no curve
+    # (the reason in words); the protein has no expected MW (every band's, for
+    # a protein expecting several); an expected MW outside the calibrated range
+    # at the lanes; the lanes' span is not known yet (drag across them once).
+    NO_CALIBRATION = "no_calibration"
+    MW_REQUIRED = "mw_required"
+    MW_OUTSIDE_CALIBRATION = "mw_outside_calibration"
+    LANE_SPAN_REQUIRED = "lane_span_required"
 
 
 class OperationError(ValueError):

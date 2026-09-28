@@ -2656,6 +2656,7 @@ const ACTION_WORDS = {
   set_box_padding: "change box padding",
   clear_boxes: "clear boxes",
   detect_row_boxes: "detect row boxes",
+  detect_mw_row: "place row by MW",
   remove_undetected: "remove n.d. mark",
   set_marker_image: "link marker image",
   set_ladder: "choose ladder",

@@ -10,6 +10,7 @@ import json
 import math
 import re
 import time
+from collections.abc import Callable, Sequence
 from functools import cache
 from pathlib import Path
 
@@ -3014,3 +3015,164 @@ def test_another_band_with_two_tops_side_by_side_is_one_band(seed, saturated):
     # Two bands stacked in a lane stay two (a doublet's).
     doublet = detect(_adversarial("doublet_deep", 1000)).lanes[2]
     assert rowdetect.bands_in(doublet, -math.inf, math.inf) == 2
+
+
+# --- #58: a row along a sloping line, grown at an expected row ---
+
+
+@pytest.mark.parametrize("name", INVARIANT_CASES)
+def test_detect_row_along_zero_shift_is_identical(name):
+    # A level line: detect_row's result, bit for bit, preferred row or not.
+    case = _case(name)
+    x0, _, x1, _ = case.row
+    level = [0] * (x1 - x0)
+    background = estimate_background(case.image)
+    kwargs = {"background": background, "dark_on_light": case.dark_on_light}
+    along = rowdetect.detect_row_along(case.image, case.row, case.n_lanes, level, **kwargs)
+    assert along == detect(case)
+    prefer = 0.5 * (case.row[1] + case.row[3])
+    along = rowdetect.detect_row_along(
+        case.image, case.row, case.n_lanes, level, prefer_y=prefer, **kwargs
+    )
+    assert along == detect(case, prefer_y=prefer)
+
+
+def _moved(found: RowDetection, dy: Callable[[int], int]) -> RowDetection:
+    """``found`` with each rect, extent and window moved down by ``dy`` of its
+    centre column, and each peak by ``dy`` of its own column."""
+
+    def back(rect):
+        return (
+            None
+            if rect is None
+            else (
+                rect[0],
+                rect[1] + dy((rect[0] + rect[2]) // 2),
+                rect[2],
+                rect[3] + dy((rect[0] + rect[2]) // 2),
+            )
+        )
+
+    lanes = tuple(
+        dataclasses.replace(
+            lane,
+            rect=back(lane.rect),
+            extent=back(lane.extent),
+            window=back(lane.window),
+            peaks=tuple(p._replace(y=p.y + dy(math.floor(p.x))) for p in lane.peaks),
+        )
+        for lane in found.lanes
+    )
+    return dataclasses.replace(found, lanes=lanes)
+
+
+_PAD = 20  # rows of membrane above and below a row turned along a line
+
+
+def _along_a_line(case: RowCase, shift: Callable[[int], int]) -> np.ndarray:
+    """The case's image with each column x moved ``_PAD + shift(x)`` rows down,
+    on a canvas ``2 * _PAD`` rows higher: its bands along a line."""
+    height, width = case.image.shape
+    level = FULL_SCALE - MEMBRANE if not case.dark_on_light else MEMBRANE
+    canvas = np.full((height + 2 * _PAD, width), level)
+    for x in range(width):
+        top = _PAD + shift(x)
+        canvas[top : top + height, x] = case.image[:, x]
+    return canvas
+
+
+_LINES = {
+    "ramp": lambda x: round(-12.0 + 24.0 * x / 500.0),  # a straight line, 24 rows over 500 px
+    "steps": lambda x: 7 if (x // 37) % 2 else -5,  # an uneven one: the columns are free
+}
+
+
+@pytest.mark.parametrize("name", ["all_present", "missing_middle", "smile", "light_on_dark"])
+@pytest.mark.parametrize("line", list(_LINES))
+def test_detect_row_along_known_shift(name, line):
+    # A row turned along a known line is found where the level row is, each
+    # box moved by its centre column's shift: the levelled pixels are the
+    # level row's own.
+    case = BENCH[name]
+    shift = _LINES[line]
+    x0, y0, x1, y1 = case.row
+    background = estimate_background(case.image)
+    level = detect(case)
+    along = rowdetect.detect_row_along(
+        _along_a_line(case, shift),
+        (x0, y0 + _PAD, x1, y1 + _PAD),
+        case.n_lanes,
+        [shift(x) for x in range(x0, x1)],
+        background=background,
+        dark_on_light=case.dark_on_light,
+    )
+    assert along == _moved(level, lambda x: _PAD + shift(x))
+    moved = [lane.rect for lane in along.lanes if lane.rect is not None]
+    assert len({(r[2] - r[0], r[3] - r[1]) for r in moved}) == 1  # one shared size
+    assert not any(overlaps(a, b) for a, b in itertools.combinations(moved, 2))
+
+
+def test_detect_row_along_refuses_rows_the_line_takes_off_the_image():
+    case = BENCH["all_present"]
+    x0, y0, x1, y1 = case.row
+    height = case.image.shape[0]
+    background = estimate_background(case.image)
+
+    def along(row, shifts):
+        return rowdetect.detect_row_along(
+            case.image, row, case.n_lanes, shifts, background=background
+        )
+
+    # Up past the top at the row's first column, or down past the bottom at its last.
+    for shifts in ([-y0 - 1] + [0] * (x1 - x0 - 1), [0] * (x1 - x0 - 1) + [height - y1 + 1]):
+        with pytest.raises(RowDetectError) as refused:
+            along(case.row, shifts)
+        assert refused.value.code == "row_outside_image"
+    # Just inside: found.
+    assert along(case.row, [-y0] + [0] * (x1 - x0 - 2) + [height - y1]).size is not None
+    # Columns past the image's side are not checked: they are never read.
+    wide = (-5, y0, x1, y1)
+    assert along(wide, [-y0 - 50] * 5 + [0] * x1).size is not None
+    for shifts in ([0] * (x1 - x0 - 1), [0.0] * (x1 - x0), "0" * (x1 - x0)):
+        with pytest.raises(RowDetectError) as refused:
+            along(case.row, shifts)
+        assert refused.value.code == "invalid_row"
+
+
+def _stronger_row_above(seed: int) -> RowCase:
+    """A row with another row 20 px above it, twice as deep, the row box over both."""
+    return adversarial_row(
+        "stronger_above", seed, neighbour_dy=-20.0, neighbour_rel=2.0, box_adjust=(0, -30, 0, 0)
+    )
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_prefer_y_grows_each_lane_at_the_expected_row(seed):
+    # #58: without a preferred row each lane grows from its strongest pixel,
+    # the deeper row above; with the row's own y, from its band there.
+    case = _stronger_row_above(seed)
+    below = [cy + 0.5 for cy in case.lane_cy]  # continuous rows
+    above = [cy - 20.0 for cy in below]
+
+    def rows_held(found: RowDetection, ys: Sequence[float]) -> list[bool]:
+        return [
+            lane.rect is not None and lane.rect[1] <= y <= lane.rect[3]
+            for lane, y in zip(found.lanes, ys, strict=True)
+        ]
+
+    strongest = detect(case)
+    assert all(rows_held(strongest, above)), strongest
+    preferred = detect(case, prefer_y=float(np.mean(below)))
+    assert all(rows_held(preferred, below)), preferred
+    check_invariants(case, preferred)
+    assert all(
+        p.snr < s.snr for p, s in zip(preferred.lanes, strongest.lanes, strict=True)
+    )  # the band's own peak, not the deeper row's
+    # Nearest the preferred row wins whichever way: the row above, preferred.
+    assert all(rows_held(detect(case, prefer_y=float(np.mean(above))), above))
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, "80", True])
+def test_a_preferred_row_that_is_not_a_finite_number_is_refused(value):
+    with pytest.raises(ValueError, match="prefer_y"):
+        detect(BENCH["all_present"], prefer_y=value)

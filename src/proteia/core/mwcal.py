@@ -150,6 +150,11 @@ class LadderCurve:
         z = math.log10(mw)
         return self._y(z) if self.z_lo <= z <= self.z_hi else None
 
+    def y_at_log(self, z: float) -> float | None:
+        """The y of the MW whose log10 is ``z``; None outside the range. A range
+        end's own y, which ``y_at(10 ** z)`` may miss by the last bit."""
+        return self._y(z) if self.z_lo <= z <= self.z_hi else None
+
     def px_per_decade(self, y: float) -> float:
         """How many pixels one decade of MW spans at ``y``: the slope of the
         segment there (a breakpoint takes the segment below it)."""
