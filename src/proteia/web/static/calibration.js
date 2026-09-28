@@ -501,7 +501,7 @@ export class CalibrationPanel {
     if (draft.ladder !== this.ladderScope()) {
       return (
         "The ruler was dropped: the membrane's ladder changed, and its labels were the ladder" +
-        " before. Nothing was stored; Find ladder again."
+        ` before. Nothing was stored; ${this.findAgain()}.`
       );
     }
     if (draft.group !== this.groupScope()) {
@@ -649,7 +649,8 @@ export class CalibrationPanel {
   }
 
   // The marks the view draws: every mark of the group, but those of the side
-  // the ruler replaces while it is adjusted.
+  // the ruler replaces while it is adjusted; each known by its side and MW,
+  // which name a mark of the group (a drag of one follows it by that).
   marksShown() {
     if (!this.group || !this.image) {
       return [];
@@ -659,6 +660,7 @@ export class CalibrationPanel {
       .filter((point) => point.side !== replaced)
       .map((point) => ({
         point,
+        id: JSON.stringify([point.side, point.mw]),
         x: point.x,
         y: point.y,
         label: `${kdaText(point.mw)} kDa`,
@@ -1441,16 +1443,14 @@ export class CalibrationPanel {
     this.refresh();
     this.handlers.status("Finding the ladder…");
     let answer = null;
+    let refusal = null;
     try {
       answer = await this.handlers.read("POST", `/api/images/${image.id}/ladder-proposal`, {
         x,
         side,
       });
     } catch (error) {
-      if (this.shows(image, openId)) {
-        this.handlers.report(error);
-      }
-      return;
+      refusal = error;
     } finally {
       this.finding = false;
       if (this.membrane) {
@@ -1460,13 +1460,35 @@ export class CalibrationPanel {
     if (!this.shows(image, openId)) {
       return;
     }
-    if (this.draft || this.ladderScope() !== scope[0] || this.groupScope() !== scope[1]) {
+    const changedHere = this.ladderScope() !== scope[0] || this.groupScope() !== scope[1];
+    if (refusal) {
+      // A ladder that lists no MWs, as the server holds it (detail.ladder_kda):
+      // nothing can be found on it. Changed elsewhere (another tab chose one
+      // without MWs, or took the ladder back) while this page listed some, it
+      // is read again first; the refusal's own words name an id.
+      const listed = refusal.detail && refusal.detail.ladder_kda;
+      if (!Array.isArray(listed)) {
+        this.handlers.report(refusal);
+      } else if (changedHere || sameLadder(listed, this.ladderKda())) {
+        this.handlers.status(
+          "The ladder or the marker link changed while the ladder was being found:" +
+            ` ${this.findAgain()}.`,
+        );
+      } else {
+        this.sayOnceRead(
+          openId,
+          () => `The membrane's ladder was changed (in another tab, say): ${this.findAgain()}.`,
+        );
+      }
+      return;
+    }
+    if (this.draft || changedHere) {
       // Undo, Redo or another tab changed the ladder or the marker link
       // meanwhile: the proposal's labels, or the marks it would replace, are
       // no longer those.
       this.handlers.status(
-        "The ladder or the marker link changed while the ladder was being found: Find ladder" +
-          " again.",
+        "The ladder or the marker link changed while the ladder was being found:" +
+          ` ${this.findAgain()}.`,
       );
       return;
     }
@@ -2023,8 +2045,9 @@ export class CalibrationPanel {
   // A refusal of the ruler's Apply. What it was opened with changed since
   // (calibration_changed: another tab chose another ladder, or linked or
   // unlinked an image): the ruler is dropped, the page reads the project as
-  // it is, and the status line says why. Otherwise the ruler stays to fix,
-  // the refusal in words under it and in the status line.
+  // it is, then the status line says why, and what finds the ladder now
+  // (findAgain: the ladder read may list no MWs). Otherwise the ruler stays
+  // to fix, the refusal in words under it and in the status line.
   applyRefused(error, draft) {
     if (error.code === "calibration_changed") {
       if (this.draft !== draft) {
@@ -2035,11 +2058,14 @@ export class CalibrationPanel {
       this.closeDraft(); // the keyboard goes on once it is answered (focusAfterApply)
       this.handlers.changed();
       const why = CHANGED_WORDS[error.detail && error.detail.changed];
-      this.handlers.report(
-        error,
-        why ? `The ruler was not applied: ${why}. Nothing was stored; Find ladder again.` : null,
+      this.sayOnceRead(
+        this.project.open_id,
+        () =>
+          why
+            ? `The ruler was not applied: ${why}. Nothing was stored; ${this.findAgain()}.`
+            : sentence(error.message),
+        true,
       );
-      this.handlers.reread();
       return;
     }
     const text = refusalText(error, "Not applied");
@@ -2122,7 +2148,8 @@ export class CalibrationPanel {
 
   // A click while marking: the popup asks which MW it is (a strip edge's, the
   // band the cut runs through); with two marks on the ladder already, the MW
-  // they put there, nearest unmarked, is offered first.
+  // they put there, nearest unmarked, is offered first. An MW chosen from the
+  // ladder's list names that list to the server (mark), one typed none.
   askMark(tool, x, y, where) {
     const image = this.image; // a choice marks the image clicked
     const side = this.markSide(tool, x);
@@ -2155,7 +2182,7 @@ export class CalibrationPanel {
       choices,
       proposed,
       other: true,
-      choose: (mw) => this.mark(tool, side, image, x, y, mw),
+      choose: (mw, listed) => this.mark(tool, side, image, x, y, mw, listed ? kda : null),
       where,
       back: null,
     });
@@ -2179,21 +2206,46 @@ export class CalibrationPanel {
     return x > lane + (this.image.width - lane) / 2 ? "right" : "left";
   }
 
-  async mark(tool, side, image, x, y, mw) {
+  // Mark `mw` where the click was: `kda` is the ladder's list it was chosen
+  // from (null: typed), which the server refuses once it is no longer the
+  // membrane's (calibration_changed: another tab chose another ladder), so
+  // no MW of a ladder before is stored.
+  async mark(tool, side, image, x, y, mw, kda) {
     const source = tool.edges
       ? "strip_edge"
       : image.kind === "chemiluminescence"
         ? "chemiluminescence_marker"
         : "visible_marker";
+    const openId = this.project.open_id;
+    const body = { y, mw, source, x, snap: true, ...(kda ? { ladder_kda: kda } : {}) };
     let answer = null;
     try {
       answer = await this.handlers.edit(
         "POST",
         `/api/images/${image.id}/calibration/${side}/points`,
-        { y, mw, source, x, snap: true },
-        { refused: (error) => this.handlers.report(error, refusalText(error, "Not marked")) },
+        body,
+        {
+          refused: (error) => {
+            if (error.code !== "calibration_changed") {
+              this.handlers.report(error, refusalText(error, "Not marked"));
+            }
+          },
+        },
       );
-    } catch {
+    } catch (error) {
+      if (error.code === "calibration_changed") {
+        const what = tool.edges ? "edge" : "band";
+        this.ladderChanged("Not marked", kda, image, openId, (listed) => {
+          const armed = this.tool && this.tool.kind === "mark" && this.tool.edges === tool.edges;
+          const button = tool.edges ? "Mark strip edges" : "Mark ladder bands";
+          const click = armed ? `click the ${what} again` : `press ${button} and click the ${what}`;
+          return listed === null
+            ? `no ladder is chosen now: choose it, then mark the ${what} again`
+            : listed
+              ? `${click} to choose its MW from the ladder shown now`
+              : `the ladder lists no MWs now: ${click} and type its MW`;
+        });
+      }
       return; // refused: said
     }
     if (!answer) {
@@ -2213,10 +2265,14 @@ export class CalibrationPanel {
 
   // --- The marks ---
 
-  // The popup of a mark on the image: relabel it (one step), or remove it.
+  // The popup of a mark on the image: relabel it (one step), or remove it. A
+  // label chosen from the ladder's list names that list to the server
+  // (editPoint), one typed none.
   pointMenu(point, where) {
+    const image = this.image;
+    const kda = this.ladderKda();
     const others = this.sidePoints(point.side).filter((mark) => !sameMw(mark.mw, point.mw));
-    const choices = this.ladderKda().map((mw) => ({
+    const choices = kda.map((mw) => ({
       mw,
       current: sameMw(mw, point.mw),
       disabled: sameMw(mw, point.mw)
@@ -2232,10 +2288,10 @@ export class CalibrationPanel {
       choices,
       other: !choices.length, // no MWs listed: one is typed
       otherLabel: "Relabel",
-      choose: (mw) => {
+      choose: (mw, listed) => {
         if (!sameMw(mw, point.mw)) {
           const said = `Relabelled the ${kdaText(point.mw)} kDa mark ${kdaText(mw)} kDa.`;
-          this.editPoint(point, { mw }, said);
+          this.editPoint(point, listed ? { mw, ladder_kda: kda } : { mw }, said, image);
         }
       },
       extra: { label: "Remove this mark", run: () => this.removePoint(point) },
@@ -2257,14 +2313,30 @@ export class CalibrationPanel {
     this.editPoint(point, { y: to, snap }, null);
   }
 
-  async editPoint(point, body, said) {
+  // Move or relabel a mark (`body`: {y, snap} or {mw, ladder_kda?}, as the
+  // route takes it), `said` the status line of a relabel; `image` the image
+  // shown when its popup opened.
+  async editPoint(point, body, said, image = this.image) {
+    const openId = this.project.open_id;
+    const verb = body.mw === undefined ? "Not moved" : "Not relabelled";
     let answer = null;
     try {
-      const verb = body.mw === undefined ? "Not moved" : "Not relabelled";
       answer = await this.handlers.edit("PATCH", this.pointPath(point), body, {
-        refused: (error) => this.handlers.report(error, refusalText(error, verb)),
+        refused: (error) => {
+          if (error.code !== "calibration_changed") {
+            this.handlers.report(error, refusalText(error, verb));
+          }
+        },
       });
-    } catch {
+    } catch (error) {
+      if (error.code === "calibration_changed" && image) {
+        this.ladderChanged(verb, body.ladder_kda, image, openId, (listed) =>
+          listed
+            ? "click the mark again to relabel it from the ladder shown now"
+            : `${listed === null ? "no ladder is chosen" : "the ladder lists no MWs"} now:` +
+              " click the mark again and type its new MW",
+        );
+      }
       return; // refused: said, and the mark is drawn where it is stored
     }
     if (!answer) {
@@ -2447,6 +2519,61 @@ export class CalibrationPanel {
     this.handlers.status(text, this.undoOf(answer, "set_marker_image", name));
   }
 
+  // --- The ladder changed elsewhere ---
+
+  // What finds the ladder now, for the status line: Find ladder again; or,
+  // with no ladder chosen, or one that lists no MWs (Find ladder needs them),
+  // what can be done instead.
+  findAgain() {
+    if (!this.membrane || this.membrane.ladder === null) {
+      return "no ladder is chosen now; choose it, then Find ladder";
+    }
+    return this.ladderKda().length
+      ? "Find ladder again"
+      : "the ladder lists no MWs now, and Find ladder needs them; mark its bands by clicking" +
+          " them (Mark ladder bands)";
+  }
+
+  // Once the project is read again (another tab changed what this page
+  // shows), while it still shows the opening `openId`: `words()`, worded from
+  // what it shows then, on the status line. With `refocus` (the keyboard was
+  // in this section: Apply), the keyboard, if its control is disabled or
+  // hidden now (Find ladder, with no MWs listed now), goes on (keepFocus).
+  // Nothing about another project is said.
+  async sayOnceRead(openId, words, refocus = false) {
+    await this.handlers.reread();
+    if (!this.project || this.project.open_id !== openId) {
+      return;
+    }
+    this.handlers.status(words());
+    if (refocus && this.membrane) {
+      this.keepFocus();
+    }
+  }
+
+  // A mark's MW, or a relabel's, chosen from the ladder's list `kda` on
+  // `image`, refused as calibration_changed: the membrane's ladder is no
+  // longer that list. Nothing was stored. Said once the project is read
+  // again, as a change made elsewhere (another tab) unless this page showed
+  // it already (an Undo of its own); then, while `image` is shown, what can
+  // be done with the ladder shown now: `next(listed)`, `listed` true while it
+  // lists MWs, false while it lists none, null with no ladder chosen.
+  ladderChanged(verb, kda, image, openId, next) {
+    const before = this.project.membranes.find((each) => each.id === image.membrane_id);
+    const elsewhere = Boolean(before) && sameLadder(kda, before.ladder_kda);
+    const how = elsewhere ? "was changed (in another tab, say)" : "changed meanwhile";
+    const said =
+      `${verb}: the membrane's ladder ${how}, and the MW was chosen from the ladder before.` +
+      " Nothing was stored";
+    this.sayOnceRead(openId, () => {
+      if (!this.shows(image, openId) || !this.membrane) {
+        return `${said}.`;
+      }
+      const listed = this.membrane.ladder === null ? null : this.ladderKda().length > 0;
+      return `${said}; ${next(listed)}.`;
+    });
+  }
+
   // --- The popup ---
 
   // A popup beside `where` (client coordinates) on the image: a button per
@@ -2454,8 +2581,8 @@ export class CalibrationPanel {
   // bands with their colour, `proposed` first to the keyboard), a field for
   // another MW (`other`, its button `otherLabel`), and one more action
   // (`extra`: {label, run}).
-  // `choose(mw)` takes the MW chosen; the keyboard goes back to `back` when
-  // it closes.
+  // `choose(mw, listed)` takes the MW chosen, `listed` whether it was one of
+  // `choices` (not typed); the keyboard goes back to `back` when it closes.
   openMenu({
     title,
     choices,
@@ -2491,7 +2618,7 @@ export class CalibrationPanel {
       button.title = choice.disabled || "";
       button.addEventListener("click", () => {
         this.closeMenu(true);
-        choose(choice.mw);
+        choose(choice.mw, true);
       });
       list.append(button);
       buttons.push([choice, button]);
@@ -2504,7 +2631,7 @@ export class CalibrationPanel {
       const mw = Number($("cal-menu-mw").value);
       if (Number.isFinite(mw) && mw > 0) {
         this.closeMenu(true);
-        choose(mw);
+        choose(mw, false);
       }
     };
     $("cal-menu-mw").value = "";
@@ -2570,10 +2697,11 @@ export class CalibrationPanel {
   }
 
   // The ruler's panel closed: the keyboard goes on to Find ladder (or, with no
-  // MWs listed to find, to Mark ladder bands).
+  // MWs listed to find, to Mark ladder bands; with no ladder chosen, to the
+  // ladder's select).
   keepFocus() {
     if (this.focusLost()) {
-      const next = ["cal-find", "cal-mark"]
+      const next = ["cal-find", "cal-mark", "cal-ladder"]
         .map((id) => $(id))
         .find((button) => !button.disabled && button.getClientRects().length);
       if (next) {

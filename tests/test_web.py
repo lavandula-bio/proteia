@@ -2606,7 +2606,8 @@ def test_the_keyboard_focus_never_stays_on_a_hidden_control():
     escape = _method(panel, "escape(")
     assert escape.index("this.closeDraft();") < escape.index("this.keepFocus();")
     keep = _method(panel, "keepFocus(")
-    assert '["cal-find", "cal-mark"]' in keep and "button.getClientRects().length" in keep
+    assert '["cal-find", "cal-mark", "cal-ladder"]' in keep
+    assert "button.getClientRects().length" in keep
 
 
 def test_snap_all_names_the_ticks_it_left_where_they_are():
@@ -2677,12 +2678,45 @@ def test_apply_names_what_its_ruler_was_opened_with():
     assert "ladderKda: [...labels]," in find
     refused = _method(panel, "applyRefused(")
     changed = refused.index('error.code === "calibration_changed"')
-    assert changed < refused.index("this.closeDraft();") < refused.index("this.handlers.reread();")
+    assert changed < refused.index("this.closeDraft();") < refused.index("this.sayOnceRead(")
     # Its words, by the field the refusal names.
     start = panel.index("const CHANGED_WORDS = {")
     words = set(re.findall(r"^  (\w+):", panel[start : panel.index("};", start)], re.MULTILINE))
     assert words == {"ladder_kda", "group"} <= set(api.LadderPointsBody.model_fields)
     assert "reread: () => reread().catch(report)," in _code("app.js")
+
+
+def test_a_mark_or_relabel_names_the_ladder_its_mw_was_chosen_from():
+    # The server refuses a mark, or a relabel, whose MW was chosen from a
+    # ladder list that is no longer the membrane's (calibration_changed:
+    # another tab chose another ladder), but only when the page names that
+    # list: a page that stopped sending it would lose the check without a
+    # sign. The popup's list is sent with an MW chosen from it, never with a
+    # typed one; such a refusal is said and the project read again.
+    panel = _code("calibration.js")
+    mark = _method(panel, "async mark(")
+    body = mark[mark.index("const body = {") :]
+    body = body[: body.index(";")]
+    sent = set(re.findall(r"[{,] (?:\.\.\.\(kda \? \{ )?(\w+)", body))
+    assert sent == set(api.PointBody.model_fields)
+    assert "...(kda ? { ladder_kda: kda } : {})" in body
+    ask = _method(panel, "askMark(")
+    chosen = "choose: (mw, listed) => this.mark(tool, side, image, x, y, mw, listed ? kda : null),"
+    assert chosen in ask
+    menu = _method(panel, "pointMenu(")
+    assert "this.editPoint(point, listed ? { mw, ladder_kda: kda } : { mw }, said, image);" in menu
+    assert "ladder_kda" in api.PointEditBody.model_fields
+    opened = _method(panel, "openMenu(")
+    assert "choose(choice.mw, true);" in opened and "choose(mw, false);" in opened
+    for method in ("async mark(", "async editPoint("):
+        refused = _method(panel, method)
+        assert 'error.code === "calibration_changed"' in refused, method
+        assert "this.ladderChanged(" in refused, method
+    assert "this.sayOnceRead(openId, () => {" in _method(panel, "ladderChanged(")
+    once = _method(panel, "async sayOnceRead(")
+    assert once.index("await this.handlers.reread();") < once.index(
+        "this.handlers.status(words());"
+    )
 
 
 def test_a_ladder_refusal_is_worded_from_its_code_and_detail():
@@ -2713,16 +2747,22 @@ def test_a_ladder_refusal_is_worded_from_its_code_and_detail():
     assert "showStatus(text || error.message);" in report
 
 
-def test_space_presses_a_focused_control_over_the_image():
-    # Space held pans the image, with the pointer over it; but Space on a
-    # control with the focus is the control's (a ruler tick's button opens its
-    # relabel popup), and only a drag it panned makes its release press
-    # nothing.
+def test_space_presses_only_a_tick_or_its_popup_over_the_image():
+    # Space held pans the image, with the pointer over it, and a tap of it
+    # there presses no focused control (the status line's Undo, Clear marks,
+    # Remove): it was meant to pan. Only a ruler tick's button (its relabel
+    # popup) and that popup's controls, which sit over the image, are pressed
+    # by it; and a drag it panned makes its release press nothing.
     view = _code("view.js")
-    _, pressed = _function(view, "function pressedBySpace(")
-    assert "HTMLButtonElement" in pressed and "PRESSED.has(element.type)" in pressed
+    _, over = _function(view, "function pressedOverImage(")
+    assert "pressedBySpace(element)" in over and '.closest("[data-space-presses]")' in over
     keydown = view[view.index('document.addEventListener("keydown"') :]
     keydown = keydown[: keydown.index('document.addEventListener("keyup"')]
-    assert "!typesSpace(target) &&\n        !pressedBySpace(target) &&" in keydown
+    assert "!typesSpace(target) &&\n        !pressedOverImage(target) &&" in keydown
+    assert "pressedBySpace(target)" not in keydown
     assert "if (this.spaceTaken || this.spacePanned) {" in view
     assert "this.untype();\n        this.spacePanned = true;" in view
+    page = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    marked = re.findall(r'<\w+ id="([\w-]+)"[^>]*\bdata-space-presses\b', page)
+    assert sorted(marked) == ["cal-menu", "cal-ticks"]
+    assert page.count("data-space-presses") == 2

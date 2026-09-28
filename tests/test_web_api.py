@@ -6236,13 +6236,15 @@ def test_a_proposal_and_its_ladder_are_read_with_no_change_between(client, tmp_p
     assert state["ladder"] == DUAL_COLOR  # made after, in order
 
 
-def _refused_unchanged(client: Client, path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """PUT ``body`` to ``path``, refused as calibration_changed with nothing
-    changed, logged or saved; the refusal."""
+def _refused_unchanged(
+    client: Client, path: str, body: dict[str, Any], method: str = "PUT"
+) -> dict[str, Any]:
+    """``body`` sent to ``path`` (PUT, or ``method``), refused as
+    calibration_changed with nothing changed, logged or saved; the refusal."""
     session = client.workspace.current()
     folder = client.root / "Blot"
     files, entries, committed = files_of(folder), len(session.project.log), session.project
-    status, answer = client.call("PUT", path, body)
+    status, answer = client.call(method, path, body)
     assert (status, answer["code"], answer["ids"]) == (409, "calibration_changed", []), answer
     # Said without the ids or coordinates a user never sees.
     assert not re.search(r"\b(img|mem|prot|band)-\d|y=|x=", answer["message"]), answer
@@ -6388,6 +6390,184 @@ def test_a_ruler_precondition_that_cannot_be_read_is_invalid_input(client, tmp_p
         assert raw.count(b"123.25") == 1
         raw = raw.replace(b"123.25", text)
         assert _raw_json(client, "PUT", path, raw) == (422, "invalid_input"), text
+
+
+DUAL_KDA = [250.0, 150.0, 100.0, 75.0, 50.0, 37.0, 25.0, 20.0, 15.0, 10.0]
+
+
+def _mark_body(mw: float, y: float, **more: Any) -> dict[str, Any]:
+    """A band of the test marker's left ladder marked at ``y`` as ``mw``, not snapped."""
+    return {"y": y, "mw": mw, "source": "visible_marker", "x": CAL_LEFT_X, "snap": False, **more}
+
+
+def test_a_mark_chosen_from_a_ladder_changed_since_is_refused(client, tmp_path):
+    # A page offers a band's MWs from the membrane's ladder as it read it.
+    # Another tab chooses another ladder meanwhile: the mark names the list
+    # its MW was chosen from, and is refused, storing nothing, rather than
+    # store a 70 kDa mark on a membrane whose ladder has no 70.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    listed = [float(mw) for mw in CAL_KDA]
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    points = f"/api/images/{marker}/calibration/left/points"
+    y70 = cal_y(70, CAL_LEFT_X)
+    mark = _mark_body(70.0, y70, ladder_kda=listed)
+    client.ok("PUT", ladder, {"ladder": DUAL_COLOR})
+    refused = _refused_unchanged(client, points, mark, method="POST")
+    assert refused["detail"] == {"changed": "ladder_kda"}
+    assert "ladder" in refused["message"] and "ruler" not in refused["message"]
+    # The second ladder's marks too.
+    right = f"/api/images/{marker}/calibration/right/points"
+    body = {**mark, "x": CAL_RIGHT_X, "y": cal_y(70, CAL_RIGHT_X)}
+    assert _refused_unchanged(client, right, body, method="POST")["detail"] == {
+        "changed": "ladder_kda"
+    }
+    # One MW more, or one less, is another ladder too; the MWs named in
+    # another order are not the ladder's list.
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": [*CAL_KDA, 10]})
+    assert _refused_unchanged(client, points, mark, method="POST")["detail"] == {
+        "changed": "ladder_kda"
+    }
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": list(CAL_KDA[:-1])})
+    _refused_unchanged(client, points, mark, method="POST")
+    client.ok("PUT", ladder, {"ladder": "renamed ν", "kda": list(CAL_KDA)})
+    _refused_unchanged(client, points, {**mark, "ladder_kda": listed[::-1]}, method="POST")
+    # The same MWs under another name: the MW is still the ladder's.
+    status, answer = client.call("POST", points, mark)
+    assert (status, answer["point"]["mw"], answer["point"]["y"]) == (201, 70.0, y70)
+    # Checked first: under another ladder, a mark that would also be refused
+    # for itself (70 kDa held twice) is refused as the ladder's change.
+    client.ok("PUT", ladder, {"ladder": DUAL_COLOR})
+    _refused_unchanged(client, points, _mark_body(70.0, y70 + 30.0, ladder_kda=listed), "POST")
+    # A typed MW names no ladder: marked, whatever the ladder is now; and one
+    # chosen from the ladder as it is now is marked.
+    typed = client.call("POST", points, _mark_body(60.0, y70 + 10.0))
+    assert (typed[0], typed[1]["point"]["mw"]) == (201, 60.0)
+    chosen = client.call(
+        "POST", points, _mark_body(37.0, cal_y(35, CAL_LEFT_X), ladder_kda=DUAL_KDA)
+    )
+    assert (chosen[0], chosen[1]["point"]["mw"]) == (201, 37.0)
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    [group] = [g for g in state["groups"] if marker in g["image_ids"]]
+    assert sorted(p["mw"] for p in group["points"]) == [37.0, 60.0, 70.0]
+    # An empty list names a ladder that listed no MWs: checked as any list is.
+    empty = _mark_body(20.0, cal_y(20, CAL_LEFT_X), ladder_kda=[])
+    assert _refused_unchanged(client, points, empty, "POST")["detail"] == {"changed": "ladder_kda"}
+
+
+def test_a_relabel_chosen_from_a_ladder_changed_since_is_refused(client, tmp_path):
+    # A stored mark relabelled from the ladder's MWs as the page read them:
+    # another tab's ladder chosen since, it is refused and the mark stays.
+    # A mark moved, or relabelled with a typed MW, names no ladder.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    listed = [float(mw) for mw in CAL_KDA]
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    points = f"/api/images/{marker}/calibration/left/points"
+    y70 = cal_y(70, CAL_LEFT_X)
+    client.ok("POST", points, _mark_body(70.0, y70))
+    client.ok("PUT", ladder, {"ladder": DUAL_COLOR})
+    body = {"mw": 55.0, "ladder_kda": listed}
+    refused = _refused_unchanged(client, f"{points}/70", body, method="PATCH")
+    assert refused["detail"] == {"changed": "ladder_kda"}
+    # Checked first: a mark no longer there is refused as the ladder's change.
+    _refused_unchanged(client, f"{points}/130", body, method="PATCH")
+    moved = client.ok("PATCH", f"{points}/70", {"y": y70 + 1.0})
+    assert (moved["point"]["mw"], moved["point"]["y"]) == (70.0, y70 + 1.0)
+    typed = client.ok("PATCH", f"{points}/70", {"mw": 72.5})
+    assert typed["point"]["mw"] == 72.5
+    chosen = client.ok("PATCH", f"{points}/72.5", {"mw": 75.0, "ladder_kda": DUAL_KDA})
+    assert chosen["point"]["mw"] == 75.0
+    history = [entry.action for entry in client.workspace.current().project.log[-3:]]
+    assert history == ["edit_calibration_point"] * 3
+
+
+def test_a_mark_is_checked_and_stored_with_no_change_between(client, tmp_path, monkeypatch):
+    # The check of the ladder a mark's MW was chosen from and the mark itself
+    # run under the session's lock: another tab's choice of ladder waits until
+    # the mark is stored, never falls between the two.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    session = client.workspace.current()
+    checked = api._check_ladder_kda
+    # The other tab's ladders, one per check: the dual colour, then back.
+    ladders_chosen = [(DUAL_COLOR, None), ("ladder µ", list(CAL_KDA))]
+    other: list[tuple[threading.Thread, bool]] = []
+
+    def check_then_change(*args: Any, **kwargs: Any) -> None:
+        checked(*args, **kwargs)
+        name, kda = ladders_chosen[len(other)]
+        change = threading.Thread(
+            target=ops.set_ladder, args=(session, membrane, name), kwargs={"kda": kda}
+        )
+        change.start()
+        change.join(0.3)
+        other.append((change, change.is_alive()))  # still waiting: the lock is held
+
+    monkeypatch.setattr(api, "_check_ladder_kda", check_then_change)
+    listed = [float(mw) for mw in CAL_KDA]
+    points = f"/api/images/{marker}/calibration/left/points"
+    added = client.ok("POST", points, _mark_body(70.0, cal_y(70, CAL_LEFT_X), ladder_kda=listed))
+    assert added["point"]["mw"] == 70.0
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    assert state["ladder"] == DUAL_COLOR  # made after the mark, in order
+    edited = client.ok("PATCH", f"{points}/70", {"mw": 75.0, "ladder_kda": DUAL_KDA})
+    assert edited["point"]["mw"] == 75.0
+    assert len(other) == 2
+    for change, waited in other:
+        assert waited, "the other tab's ladder fell between the check and the change"
+        change.join(10)
+        assert not change.is_alive()
+    history = [entry.action for entry in session.project.log[-4:]]
+    assert history == [
+        "add_calibration_point",
+        "set_ladder",
+        "edit_calibration_point",
+        "set_ladder",
+    ]
+
+
+def test_a_point_precondition_that_cannot_be_read_is_invalid_input(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    listed = [float(mw) for mw in CAL_KDA]
+    points = f"/api/images/{marker}/calibration/left/points"
+    y70 = cal_y(70, CAL_LEFT_X)
+    for value in ([250.0, 0.0], [-250.0], ["250"], 250.0, [math.inf]):
+        mark = _mark_body(70.0, y70, ladder_kda=value)
+        assert client.refused("POST", points, mark)[:2] == (422, "invalid_input"), value
+    raw = json.dumps(_mark_body(70.0, y70, ladder_kda=[123.25])).encode().replace(b"123.25", b"NaN")
+    assert _raw_json(client, "POST", points, raw) == (422, "invalid_input")
+    # The ladder's list as it is: read, and marked.
+    assert client.call("POST", points, _mark_body(70.0, y70, ladder_kda=listed))[0] == 201
+    for value in ([70.0, 0.0], ["70"], 70.0):
+        body = {"mw": 55.0, "ladder_kda": value}
+        assert client.refused("PATCH", f"{points}/70", body)[:2] == (422, "invalid_input"), value
+    assert (
+        client.ok("PATCH", f"{points}/70", {"mw": 55.0, "ladder_kda": listed})["point"]["mw"] == 55
+    )
+
+
+def test_a_proposal_on_a_ladder_listing_no_mws_names_that_list(client, tmp_path):
+    # Another tab chose a ladder that lists no MWs (or took the ladder back):
+    # nothing can be found on it. The refusal names the ladder's MWs, none,
+    # as an answer names them, so a page still showing the ladder before
+    # knows the ladder changed and reads it again.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    proposal = f"/api/images/{marker}/ladder-proposal"
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    for chosen in ({"ladder": "Lab mix"}, {"ladder": None}):
+        client.ok("PUT", ladder, chosen)
+        for side in ("left", "right"):
+            status, answer = client.call("POST", proposal, {"x": CAL_LEFT_X, "side": side})
+            assert (status, answer["code"]) == (422, "invalid_input"), chosen
+            assert answer["detail"] == {"ladder_kda": []}, chosen
+        # What cannot be read is refused first, as before, naming no ladder.
+        status, answer = client.call("POST", proposal, {"x": CAL_LEFT_X, "side": "middle"})
+        assert (status, answer["code"], "detail" in answer) == (422, "invalid_input", False)
+        status, answer = client.call("POST", proposal, {"x": CAL_W + 1.0})
+        assert (status, answer["code"], "detail" in answer) == (422, "out_of_image", False)
 
 
 def test_ladder_routes_refuse_what_they_cannot_read(client, tmp_path):

@@ -2386,12 +2386,16 @@ def _proposal(
     ``x`` on ``image``, with the membrane's ladder MWs and its preset's
     reference bands (none for a custom ladder), and, for the right ladder, the
     register group's left ladder as the other one. ``INVALID_INPUT`` while the
-    membrane has no ladder MWs (choose its ladder first)."""
+    membrane has no ladder MWs (choose its ladder first), whose ``detail``
+    names them, none (``ladder_kda``): a client that listed others knows the
+    ladder changed."""
     calibration = membrane.calibration
     if not calibration.ladder_kda:
-        raise _invalid(
+        raise OperationError(
+            ErrorCode.INVALID_INPUT,
             f"membrane {membrane.id} has no ladder MWs to find: choose its ladder first",
             ids=(membrane.id,),
+            detail={"ladder_kda": []},
         )
     preset = None if calibration.ladder is None else ladders.preset(calibration.ladder)
     reference = () if preset is None else tuple(band.kda for band in preset.reference)
@@ -2443,10 +2447,11 @@ def propose_ladder(
     the register group's left ladder as the other one. None where fewer than
     two bands stand out. Reads only: nothing is changed or logged.
 
-    Refused: an unknown image (``UnknownIdError``); an unknown side, an ``x``
-    that is not a finite number, or a membrane with no ladder MWs chosen
-    (``INVALID_INPUT``); an ``x`` off the image (``OUT_OF_IMAGE``); an image
-    file changed or unreadable."""
+    Refused, in this order: an unknown image (``UnknownIdError``); an unknown
+    side, or an ``x`` that is not a finite number (``INVALID_INPUT``); an ``x``
+    off the image (``OUT_OF_IMAGE``); a membrane with no ladder MWs chosen
+    (``INVALID_INPUT``, with ``detail`` ``{"ladder_kda": []}``); an image file
+    changed or unreadable."""
     batch = session.project.batch
     membrane, image, _ = _calibration_target(batch, image_id)
     side = _member(LadderSide, side, "ladder side")

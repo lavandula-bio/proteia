@@ -61,14 +61,23 @@ function typesSpace(element) {
   );
 }
 
-// Whether Space presses `element`: a button (a ruler tick's too), a check box
-// or another input it presses, a disclosure's summary.
+// Whether Space presses `element`: a button, a check box or another input it
+// presses, a disclosure's summary.
 function pressedBySpace(element) {
   return (
     element instanceof HTMLButtonElement ||
     (element instanceof HTMLInputElement && PRESSED.has(element.type)) ||
     (element instanceof HTMLElement && element.tagName === "SUMMARY")
   );
+}
+
+// Whether Space presses `element` even with the pointer over the image: a
+// control it presses inside an element marked data-space-presses (#58: a
+// ladder ruler's tick buttons, and the popup a tick or a mark opens over the
+// image). Any other control's Space is the image's there: a tap meant to pan
+// presses nothing (an Undo, Clear marks, Remove).
+function pressedOverImage(element) {
+  return pressedBySpace(element) && element.closest("[data-space-presses]") !== null;
 }
 
 // Whether `element` is a text field with a caret (whose typing can be taken back).
@@ -131,8 +140,8 @@ export class ImageView {
     this.gesture = null;
     this.rowTool = null; // {proteinId, color, lanes}: what a drag on the membrane boxes, or null
     this.sentRow = null; // {rect, color}: the row box sent, shown until its answer
-    // #58: the ladder marks of the shown image's register group ({x (null: the
-    // left edge), y, label, color, labelsLeft}); the ruler being adjusted
+    // #58: the ladder marks of the shown image's register group ({id, x (null:
+    // the left edge), y, label, color, labelsLeft}); the ruler being adjusted
     // ({x, labelsLeft, ticks: [{id, y, label, color, reference, solid,
     // focused}], extra: [y]}) or null; and the pick tool (a click reports
     // where it was) or null.
@@ -191,8 +200,10 @@ export class ImageView {
   }
 
   // The ladder marks drawn on the image (#58), each a tick at its x labelled
-  // with its MW; a mark can be dragged up or down, or clicked, while no ruler
-  // or pick tool is set. A drag of one under way keeps the mark it started on.
+  // with its MW and known by its `id`; a mark can be dragged up or down, or
+  // clicked, while no ruler or pick tool is set. A drag of one under way keeps
+  // the mark it started on, drawn where the drag puts it, whatever new marks
+  // are set meanwhile (each answer draws them again): the one of its id.
   setLadderTicks(ticks) {
     this.ladderTicks = ticks;
     this.ladderSpans = new Map();
@@ -315,8 +326,8 @@ export class ImageView {
     }
     const g = this.gesture;
     for (const tick of this.ladderTicks) {
-      const dragged = g && g.kind === "point" && g.tick === tick;
-      this.drawLadderTick(tick, dragged ? tick.y + g.dy : tick.y, dragged);
+      const dragged = g && g.kind === "point" && g.tick.id === tick.id;
+      this.drawLadderTick(tick, dragged ? g.tick.y + g.dy : tick.y, dragged);
     }
     if (this.ruler) {
       this.drawRuler(this.ruler);
@@ -798,10 +809,11 @@ export class ImageView {
     });
 
     // Space held makes a drag pan, whatever has the focus. With the pointer
-    // over the image it is also taken, so it does not scroll the page; but
-    // never from a control it presses (a ruler tick's button relabels it), a
-    // field it types into, a select or a dialog. Its release after a drag it
-    // panned is taken instead (a focused button is not pressed then), and
+    // over the image it is also taken (it neither scrolls nor presses a
+    // focused control, which it would on its release), but never from a field
+    // it types into, a select, a dialog, or a ruler tick or its popup
+    // (pressedOverImage: Space on a tick's button relabels it). Their release
+    // after a drag it panned is taken instead (nothing is pressed then), and
     // typed into a text field, the press on the image takes the spaces back
     // (untype).
     const isSpace = (event) => event.code === "Space" || event.key === " ";
@@ -836,7 +848,7 @@ export class ImageView {
       this.holdSpace(true);
       if (
         !typesSpace(target) &&
-        !pressedBySpace(target) &&
+        !pressedOverImage(target) &&
         !document.querySelector("dialog[open]") &&
         canvas.matches(":hover")
       ) {

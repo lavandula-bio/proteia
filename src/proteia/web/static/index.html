@@ -151,7 +151,7 @@
         </div>
         <!-- Why ▲▼ are disabled, when a label has no band to move to. -->
         <p id="cal-shift-why" class="hint note" hidden></p>
-        <ol id="cal-ticks" class="cal-ticks" aria-label="Ruler ticks, top to bottom"></ol>
+        <ol id="cal-ticks" class="cal-ticks" aria-label="Ruler ticks, top to bottom" data-space-presses></ol>
         <p class="hint note">Solid ticks are stored, hollow ones (predicted) are not. Tab: next
           tick · ↑↓: move it 0.5 px (Shift: 5 px) · Space: relabel · Delete: not a ladder band</p>
       </div>
@@ -308,7 +308,7 @@
       </div>
       <!-- Beside a ruler tick or a band clicked (calibration.js): its MW, from the
         ladder's; Esc or a click elsewhere closes it. -->
-      <div id="cal-menu" class="cal-menu" role="dialog" aria-labelledby="cal-menu-title" hidden>
+      <div id="cal-menu" class="cal-menu" role="dialog" aria-labelledby="cal-menu-title" data-space-presses hidden>
         <p id="cal-menu-title"></p>
         <div id="cal-menu-choices" class="cal-menu-choices"></div>
         <form id="cal-menu-other" class="cal-menu-other" hidden>
