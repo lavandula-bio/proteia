@@ -158,6 +158,14 @@ class ErrorCode(StrEnum):
     LEFTOVER_FILE = "leftover_file"  # an orphan holding the next image id could not be deleted
     NOTHING_TO_UNDO = "nothing_to_undo"
     NOTHING_TO_REDO = "nothing_to_redo"
+    # Molecular-weight calibration (#58). A calibration point would be out of
+    # order on its ladder (or share another's position there).
+    CALIBRATION_ORDER = "calibration_order"
+    DUPLICATE_MW = "duplicate_mw"  # that ladder already has a point at this MW
+    # The right ladder would not lie right of the left one, or a strip edge (or
+    # a point with no x) would share a register group with a right ladder.
+    LADDER_SIDES = "ladder_sides"
+    MARKER_SIZE_MISMATCH = "marker_size_mismatch"  # a marker and its image differ in size
 
 
 class OperationError(ValueError):

@@ -13,6 +13,7 @@ import http.client
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -44,8 +45,8 @@ from conftest import (
     write_tiff,
 )
 from proteia import samples
+from proteia.core import ladders, storage
 from proteia.core import session as session_module
-from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
     BoxSize,
@@ -1392,6 +1393,34 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["PUT /api/proteins/{protein_id}/box-size"] = client.ok(
         "PUT", f"/api/proteins/{protein}/box-size", {"width": 16, "height": 12}
     )
+    # The molecular-weight calibration (#58), on a marker image of the membrane.
+    membrane = answers["POST /api/images"]["project"]["images"][0]["membrane_id"]
+    _, marker = upload(
+        client, blot_bytes(tmp_path), "marker.tif", kind="visible_marker", membrane_id=membrane
+    )
+    answers["PUT /api/images/{image_id}/marker"] = client.ok(
+        "PUT", f"/api/images/{image_id}/marker", {"marker_image_id": marker["image_id"]}
+    )
+    answers["PUT /api/membranes/{membrane_id}/calibration/ladder"] = client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "pageruler_plus/tris_glycine"},
+    )
+    points = f"/api/images/{marker['image_id']}/calibration/left/points"
+    point = {"y": 20.0, "mw": 100, "source": "visible_marker", "x": 10.0, "snap": False}
+    answers["POST /api/images/{image_id}/calibration/{side}/points"] = client.ok(
+        "POST", points, point
+    )
+    client.ok("POST", points, {**point, "y": 40.0, "mw": 50})
+    answers["PATCH /api/images/{image_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "PATCH", f"/api/images/{image_id}/calibration/left/points/100", {"y": 21.5}
+    )
+    answers["DELETE /api/images/{image_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "DELETE", f"{points}/50"
+    )
+    answers["DELETE /api/images/{image_id}/calibration"] = client.ok(
+        "DELETE", f"/api/images/{image_id}/calibration"
+    )
     answers["POST /api/undo"] = client.ok("POST", "/api/undo")
     answers["POST /api/redo"] = client.ok("POST", "/api/redo")
     # A row box over the three declared lanes, on the image that kept the blot's polarity.
@@ -1448,6 +1477,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "POST /api/diagnostics",
         "POST /api/diagnostics/reveal",
         "GET /api/notices",
+        "GET /api/ladders",
         "POST /api/notices/cloud_sync/dismiss",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
@@ -3915,6 +3945,7 @@ NEEDS_NO_OPENING = {
     ): "drops files handed off, as the page shows them",
     ("POST", "/api/diagnostics/reveal"): "shows the diagnostics folder, in the state folder",
     ("GET", "/api/notices"): "says whether the projects folder is synced: no project's",
+    ("GET", "/api/ladders"): "lists the ladder presets: no project's",
     (
         "POST",
         "/api/notices/cloud_sync/dismiss",
@@ -4101,6 +4132,7 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
     bodies[("POST", "/api/diagnostics/reveal")] = None
     bodies[("GET", "/api/notices")] = None
     bodies[("POST", "/api/notices/cloud_sync/dismiss")] = None
+    bodies[("GET", "/api/ladders")] = None
     bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
     paths = {
         incoming: "/api/incoming?name=a.tif",
@@ -4132,6 +4164,7 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
         ("POST", "/api/diagnostics/reveal"): 204,
         ("GET", "/api/notices"): 200,
         ("POST", "/api/notices/cloud_sync/dismiss"): 204,
+        ("GET", "/api/ladders"): 200,
         ("POST", "/api/quit"): 202,
     }
     opened = [
@@ -5808,3 +5841,149 @@ def test_an_accept_checks_the_opening_again_once_no_other_switch_runs(tmp_path):
 
 def test_the_status_says_proteia_takes_handed_off_files(client):
     assert client.ok("GET", "/api/status")["handoff"] == server.HANDOFF == 1
+
+
+# --- Molecular-weight calibration (#58) ---
+
+
+def test_ladders_route(client):
+    # No project needs to be open: the presets are the build's.
+    answer = client.ok("GET", "/api/ladders")
+    assert answer == {
+        "ladders": [
+            {
+                "key": preset.key,
+                "product": preset.product,
+                "catalog_numbers": list(preset.catalog_numbers),
+                "system": preset.system,
+                "kda": list(preset.kda),
+                "reference": [{"kda": b.kda, "colour": b.colour} for b in preset.reference],
+                "source": preset.source,
+            }
+            for preset in ladders.PRESETS
+        ]
+    }
+    assert answer["ladders"][0]["key"] == "pageruler_plus/tris_glycine"
+
+
+def test_calibration_routes(client, tmp_path):
+    image_id, protein = ready(client, tmp_path)
+    project = client.ok("GET", "/api/project")["project"]
+    membrane = project["images"][0]["membrane_id"]
+    assert project["images"][0]["marker_image_id"] is None
+    assert project["membranes"] == [
+        {
+            "id": membrane,
+            "image_ids": [image_id],
+            "ladder": None,
+            "ladder_kda": [],
+            "groups": [{"image_ids": [image_id], "points": [], "fit": None}],
+        }
+    ]
+    _, marker = upload(
+        client, blot_bytes(tmp_path), "marker α.tif", kind="visible_marker", membrane_id=membrane
+    )
+    marker_id = marker["image_id"]
+    small = write_tiff(tmp_path / "small.tif", synthetic_blot((H - 1, W), [])).read_bytes()
+    _, other = upload(client, small, "small.tif", kind="visible_marker", membrane_id=membrane)
+    link = f"/api/images/{image_id}/marker"
+    assert client.refused("PUT", link, {"marker_image_id": other["image_id"]})[:2] == (
+        422,
+        "marker_size_mismatch",
+    )
+    answer = client.ok("PUT", link, {"marker_image_id": marker_id})
+    assert {key: answer[key] for key in ("point", "fit", "curves_changed")} == {
+        "point": None,
+        "fit": None,
+        "curves_changed": [],
+    }
+    images = {image["id"]: image for image in answer["project"]["images"]}
+    assert images[image_id]["marker_image_id"] == marker_id
+    answer = client.ok(
+        "PUT", f"/api/membranes/{membrane}/calibration/ladder", {"ladder": "Ours", "kda": [100, 50]}
+    )
+    [state] = answer["project"]["membranes"]
+    assert (state["ladder"], state["ladder_kda"]) == ("Ours", [100.0, 50.0])
+
+    points = f"/api/images/{marker_id}/calibration/left/points"
+    point = {"y": 10.0, "mw": 100, "source": "visible_marker", "x": 10.0, "snap": False}
+    first = client.call("POST", points, point)
+    assert first[0] == 201
+    assert first[1]["point"] == {
+        "image_id": marker_id,
+        "y": 10.0,
+        "mw": 100.0,
+        "source": "visible_marker",
+        "x": 10.0,
+        "side": "left",
+        "snapped": False,
+    }
+    body = client.ok("POST", points, {**point, "y": 50.0, "mw": 50})
+    assert body["curves_changed"] == [image_id, marker_id]
+    fit = body["fit"]
+    assert (fit["image_ids"], fit["method"], fit["disagreement_infinite"]) == (
+        [image_id, marker_id],
+        "log_linear_piecewise",
+        False,
+    )
+    assert fit["ladders"][0]["points"] == 2
+    # The blot's group, and the small marker's, a group of its own.
+    group, alone = body["project"]["membranes"][0]["groups"]
+    assert (group["image_ids"], group["fit"], len(group["points"])) == (
+        [image_id, marker_id],
+        fit,
+        2,
+    )
+    assert alone == {"image_ids": [other["image_id"]], "points": [], "fit": None}
+    # A box on the blot reads its MW from the curve at its centre.
+    placed = client.ok(
+        "POST", "/api/boxes", {"protein_id": protein, "x": LANE_X[0], "y": ROW, "lane_index": 0}
+    )
+    band = bands(placed)[placed["band_id"]]
+    x0, y0, x1, y1 = band["rect"]
+    centre = (y0 + y1) / 2
+    assert math.isclose(band["apparent_mw"], 100.0 * 0.5 ** ((centre - 10.0) / 40.0), rel_tol=1e-12)
+
+    # A point is its group's (any image names it), side and MW, the MW spelled
+    # as Python writes it.
+    edited = client.ok(
+        "PATCH", f"/api/images/{image_id}/calibration/left/points/100", {"y": 12.0, "mw": 90}
+    )
+    assert (edited["point"]["y"], edited["point"]["mw"]) == (12.0, 90.0)
+    assert client.refused("PATCH", f"{points}/1e2", {"y": 1.0})[:2] == (422, "invalid_input")
+    assert client.refused("PATCH", f"{points}/90.0", {"y": 1.0, "snap": "no"})[:2] == (
+        422,
+        "invalid_input",
+    )
+    assert client.refused("DELETE", f"{points}/70")[:2] == (404, "unknown_id")
+    assert client.refused("POST", f"/api/images/{marker_id}/calibration/up/points", point)[:2] == (
+        404,
+        "unknown_id",
+    )
+    # 90 kDa, the label the point at 100 took.
+    duplicate = {**point, "mw": 90, "y": 60.0}
+    assert client.refused("POST", points, duplicate)[:2] == (422, "duplicate_mw")
+    refused = client.refused("POST", points, {**point, "mw": 40, "y": 5.0})
+    assert refused[:2] == (422, "calibration_order")
+    right = f"/api/images/{marker_id}/calibration/right/points"
+    assert client.refused("POST", right, {**point, "x": 5.0, "mw": 70, "y": 30.0})[:2] == (
+        422,
+        "ladder_sides",
+    )
+    no_x = {key: value for key, value in point.items() if key != "x"}
+    assert client.refused("POST", points, {**no_x, "mw": 70, "y": 30.0})[:2] == (
+        422,
+        "invalid_input",
+    )
+    removed = client.ok("DELETE", f"{points}/50")
+    assert removed["fit"] is None and removed["curves_changed"] == [image_id, marker_id]
+    assert bands(removed)[placed["band_id"]]["apparent_mw"] is None
+    assert client.refused("DELETE", f"/api/images/{image_id}/calibration?side=up")[:2] == (
+        422,
+        "invalid_input",
+    )
+    cleared = client.ok("DELETE", f"/api/images/{image_id}/calibration?side=left")
+    assert cleared["project"]["membranes"][0]["groups"][0]["points"] == []
+    unlinked = client.ok("PUT", link, {"marker_image_id": None})
+    assert len(unlinked["project"]["membranes"][0]["groups"]) == 3
+    assert client.ok("POST", "/api/undo")["action"] == "set_marker_image"

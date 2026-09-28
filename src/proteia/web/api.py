@@ -39,6 +39,31 @@ along}``, ``net_change`` as ``[smallest, largest]`` (or null), the band ids in
 ``edge_shifted`` and ``overlapping``, and the other proteins' bands it
 re-measured and the largest change as a row box answers them.
 
+Molecular-weight calibration (#58). ``GET /api/ladders`` lists the ladder
+presets (:mod:`proteia.core.ladders`), each as ``{key, product,
+catalog_numbers, system, kda, reference: [{kda, colour}], source}``; it reads no
+project. ``PUT /api/images/{image_id}/marker`` links a chemiluminescence image
+to its marker image, ``{marker_image_id}``, or unlinks it with null
+(:func:`~proteia.core.operations.set_marker_image`); ``PUT
+/api/membranes/{membrane_id}/calibration/ladder`` chooses the membrane's ladder,
+``{ladder, kda?}`` (:func:`~proteia.core.operations.set_ladder`). A calibration
+point is named by the register group of the image in the path, its ladder
+``side`` (``left`` or ``right``; any other word answers 404 ``unknown_id``) and
+its MW, written in the path as Python writes the number (``100``, ``61.5``):
+``POST /api/images/{image_id}/calibration/{side}/points`` marks one, ``{y, mw,
+source, x, snap?}`` (:func:`~proteia.core.operations.add_calibration_point`),
+``PATCH .../points/{mw}`` moves or relabels it, ``{y?, mw?, snap?}``, a field
+left out kept (:func:`~proteia.core.operations.edit_calibration_point`), and
+``DELETE .../points/{mw}`` removes it; ``DELETE
+/api/images/{image_id}/calibration`` removes every point of the image's group,
+or those of one side with ``?side=``. These answer, besides the state, what the
+change did (:class:`~proteia.core.operations.CalibrationUpdate`): the ``point``
+as stored with ``snapped``, the group's ``fit`` (null without a curve; an
+infinite quality or disagreement, which JSON cannot hold, is null with
+``quality_infinite`` or ``disagreement_infinite`` true), the images whose curve
+changed (``curves_changed``) and the not-detected records dropped
+(``dropped_undetected``, as ``[protein id, lane index, band index]``).
+
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
 ``?colour=original``, its stored file in its own colours, for display only.
@@ -161,6 +186,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -189,11 +215,11 @@ from pydantic import (
 )
 from starlette.exceptions import HTTPException
 
+from proteia.core import ladders, storage
 from proteia.core import operations as ops
-from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import DEFAULT_CHART_FORMATS
-from proteia.core.model import BoxSize, ImageKind, Polarity, UnknownIdError
+from proteia.core.model import BoxSize, ImageKind, LadderSide, Polarity, UnknownIdError
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
@@ -1014,6 +1040,42 @@ def _url_index(value: object) -> object:
 UrlIndex = Annotated[int, BeforeValidator(_url_index)]
 
 
+def _plain_int(value: str) -> bool:
+    try:
+        return str(int(value)) == value
+    except ValueError:
+        return False
+
+
+def _url_kda(value: object) -> object:
+    """A molecular weight in a URL as a float, only if it is written as Python
+    writes the number: ``100``, ``61.5`` or ``100.0``, not ``1e2``, ``+100``,
+    ``0100`` or ``61.50``, so one MW has one spelling. Whether it is a positive
+    MW is the operation's to check."""
+    if not isinstance(value, str):
+        return value
+    try:
+        number = float(value)
+    except ValueError:
+        number = math.nan
+    if not math.isfinite(number) or not (repr(number) == value or _plain_int(value)):
+        raise ValueError(
+            f"must be a molecular weight in kDa as plain digits, such as 100 or 61.5, not {value!r}"
+        )
+    return number
+
+
+UrlKda = Annotated[float, BeforeValidator(_url_kda)]
+
+
+def _side(side: str) -> LadderSide:
+    """The ladder side a path names; any other word is no such side (404)."""
+    try:
+        return LadderSide(side)
+    except ValueError:
+        raise UnknownIdError(f"no ladder side {side!r}: left or right") from None
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1068,6 +1130,36 @@ class ProteinEditBody(_Body):
 class BoxSizeBody(_Body):
     width: PositiveInt
     height: PositiveInt
+
+
+class MarkerBody(_Body):
+    marker_image_id: str | None  # required: null unlinks
+
+
+class LadderBody(_Body):
+    ladder: str | None  # required: a preset key or a custom name; null clears it
+    kda: list[StrictFloat] | None = None  # the ladder's MWs, top to bottom
+
+
+class PointBody(_Body):
+    """A calibration point, in continuous coordinates of the image's analysis
+    array; ``x`` is required: every new point records where it was marked."""
+
+    y: StrictFloat
+    mw: StrictFloat
+    source: str
+    x: StrictFloat
+    snap: StrictBool = True
+
+
+class PointEditBody(_Body):
+    """A calibration point's new position (``y``) or label (``mw``). A field
+    left out keeps its value: only the fields the request set are passed on,
+    so these defaults are never used."""
+
+    y: StrictFloat = 0.0
+    mw: StrictFloat = 0.0
+    snap: StrictBool = False
 
 
 class BoxPaddingBody(_Body):
@@ -1320,6 +1412,19 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
         "right_to_left": placement.right_to_left,
         **_remeasured(placement.remeasured, placement.largest_change),
         "unlocated_lanes": list(placement.unlocated_lanes),
+    }
+
+
+def _calibration_update(update: ops.CalibrationUpdate) -> dict[str, Any]:
+    """What a calibration change did
+    (:class:`~proteia.core.operations.CalibrationUpdate`): the point as stored
+    with ``snapped`` (or None), the group's fit as JSON (or None), and lists
+    for tuples."""
+    return {
+        "point": update.point,
+        "fit": None if update.fit is None else update.fit.as_json(),
+        "curves_changed": list(update.curves_changed),
+        "dropped_undetected": [list(key) for key in update.dropped_undetected],
     }
 
 
@@ -1692,6 +1797,107 @@ def set_polarity(
 ) -> dict[str, Any]:
     ops.set_polarity(session, image_id, body.polarity)
     return _answer(workspace, session)
+
+
+@router.get("/ladders")
+def list_ladders() -> dict[str, Any]:
+    """The ladder presets, as :mod:`proteia.core.ladders` holds them; no
+    project is read."""
+    return {
+        "ladders": [
+            {
+                "key": preset.key,
+                "product": preset.product,
+                "catalog_numbers": list(preset.catalog_numbers),
+                "system": preset.system,
+                "kda": list(preset.kda),
+                "reference": [
+                    {"kda": band.kda, "colour": band.colour} for band in preset.reference
+                ],
+                "source": preset.source,
+            }
+            for preset in ladders.PRESETS
+        ]
+    }
+
+
+@router.put("/images/{image_id}/marker")
+def set_marker_image(
+    image_id: str, body: MarkerBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Link the chemiluminescence image to its marker image, or unlink it with
+    null (:func:`~proteia.core.operations.set_marker_image`)."""
+    update = ops.set_marker_image(session, image_id, body.marker_image_id)
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.put("/membranes/{membrane_id}/calibration/ladder")
+def set_ladder(
+    membrane_id: str, body: LadderBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Choose the membrane's ladder (:func:`~proteia.core.operations.set_ladder`)."""
+    ops.set_ladder(session, membrane_id, body.ladder, kda=body.kda)
+    return _answer(workspace, session)
+
+
+@router.post("/images/{image_id}/calibration/{side}/points", status_code=201)
+def add_calibration_point(
+    image_id: str, side: str, body: PointBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Mark a calibration point on the ladder ``side`` of the image's register
+    group (:func:`~proteia.core.operations.add_calibration_point`)."""
+    update = ops.add_calibration_point(
+        session, image_id, body.y, body.mw, body.source, x=body.x, side=_side(side), snap=body.snap
+    )
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.patch("/images/{image_id}/calibration/{side}/points/{mw}")
+def edit_calibration_point(
+    image_id: str,
+    side: str,
+    mw: UrlKda,
+    body: PointEditBody,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+) -> dict[str, Any]:
+    """Move or relabel the point at ``mw``, in one change
+    (:func:`~proteia.core.operations.edit_calibration_point`)."""
+    given = body.model_dump(exclude_unset=True)
+    update = ops.edit_calibration_point(
+        session,
+        image_id,
+        mw,
+        side=_side(side),
+        y=given.get("y", ops.KEEP),
+        new_mw=given.get("mw", ops.KEEP),
+        snap=body.snap,
+    )
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.delete("/images/{image_id}/calibration/{side}/points/{mw}")
+def remove_calibration_point(
+    image_id: str, side: str, mw: UrlKda, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Remove the point at ``mw`` (:func:`~proteia.core.operations.remove_calibration_point`)."""
+    update = ops.remove_calibration_point(session, image_id, mw, side=_side(side))
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.delete("/images/{image_id}/calibration")
+def clear_calibration(
+    image_id: str,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+    side: Literal["left", "right"] | None = None,
+) -> dict[str, Any]:
+    """Remove every point of the image's register group, or those of one
+    ``side`` (:func:`~proteia.core.operations.clear_calibration`); none there is
+    a no-op."""
+    chosen = None if side is None else LadderSide(side)
+    update = ops.clear_calibration(session, image_id, side=chosen)
+    return _answer(workspace, session, **_calibration_update(update))
 
 
 @router.get("/images/{image_id}/preview")

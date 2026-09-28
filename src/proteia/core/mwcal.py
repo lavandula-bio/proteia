@@ -2,9 +2,11 @@
 """Molecular-weight calibration (#58): each ladder's curve, and the protein line
 between two ladders.
 
-Pure: it reads :mod:`proteia.core.model` objects and never writes them, opens no
-file and uses no numpy. Positions are continuous coordinates of an image's
-analysis array (:class:`~proteia.core.model.CalibrationPoint`).
+Pure: it reads :mod:`proteia.core.model` objects and arrays it is given and
+never writes them, and opens no file; only :func:`refine_point` reads pixels
+(with numpy). Positions are continuous coordinates of an image's analysis array
+(:class:`~proteia.core.model.CalibrationPoint`): pixel row r covers [r, r+1), so
+a band peaking on row r lies at y = r + 0.5, as a box centre does.
 
 Register groups. The images of a membrane whose pixel rows line up, a
 chemiluminescence image and the marker image it is linked to, form a register
@@ -31,6 +33,12 @@ bands above and below it; the largest relative MW disagreement.
 
 Every range test compares log10(MW), never a MW computed back from it:
 ``10 ** log10(75)`` need not be 75, and a strip cut at 75 kDa must hold 75 kDa.
+
+Snapping a click (:func:`refine_point`). A click on a ladder band or a strip
+edge is moved to the band's peak, or the edge, nearest it within a small
+window, which stops short of the points already marked on the same ladder, so
+a click never snaps onto a band that is marked already. With nothing there
+that stands out of the noise, the click is kept as it is.
 """
 
 from __future__ import annotations
@@ -39,9 +47,11 @@ import bisect
 import itertools
 import math
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
+import numpy as np
 from pydantic import JsonValue
 
 from proteia.core.model import (
@@ -50,6 +60,7 @@ from proteia.core.model import (
     FitMethod,
     LadderSide,
     Membrane,
+    Polarity,
 )
 
 EXTRAPOLATE_DECADES: Final = 0.1  # D6: past an outermost ladder band (x/÷ 1.26 in MW)
@@ -58,6 +69,21 @@ LADDERS_WARN: Final = 0.05  # D1: the two ladders disagree beyond this
 MIN_LADDER_POINTS: Final = 2  # a side with fewer is not used
 MIN_SHARED_MWS: Final = 2  # two ladders combine only when they share this many MWs
 DEFAULT_FIT_METHOD: Final = FitMethod.LOG_LINEAR_PIECEWISE
+
+# Snapping a click (refine_point): the window, px either side of the click across
+# the lane and above and below it; how far towards a point already marked on the
+# same ladder the window reaches, as a share of the distance to it; and how many
+# noise sigmas a band's peak (or an edge's step) must reach.
+SNAP_HALF_X: Final = 12
+SNAP_HALF_Y: Final = 12
+SNAP_MARKED_GAP: Final = 0.45
+SNAP_K: Final = 4.0
+# A strip edge clicked within this many px of the image's top or bottom is the
+# border itself (a strip cropped at its cut): no row lies past it to step from,
+# so a step found near it is noise or a band's flank, and the click is kept.
+SNAP_STRIP_BORDER: Final = 1.0
+# A robust sigma from the median absolute deviation of normal noise.
+_MAD_SIGMA: Final = 1.4826
 
 # Why a side of a register group is not used.
 IgnoredReason = Literal["one_point", "few_shared_mws"]
@@ -429,6 +455,92 @@ def fit_method(membrane: Membrane) -> FitMethod:
     return FitMethod.LOG_LINEAR
 
 
+def _peak_offset(below: float, at: float, above: float) -> float:
+    # The vertex of the parabola through three neighbouring samples, from the
+    # middle one, clipped to half a sample either way; 0 where they are flat.
+    curvature = below - 2.0 * at + above
+    if curvature >= 0.0:
+        return 0.0
+    return min(0.5, max(-0.5, 0.5 * (below - above) / curvature))
+
+
+def refine_point(
+    array: np.ndarray,
+    x: float,
+    y: float,
+    *,
+    source: CalibrationPointSource,
+    polarity: Polarity,
+    marked_ys: Sequence[float] = (),
+) -> float | None:
+    """Where a click at ``(x, y)`` on a ladder band or a strip edge meant, or
+    None when nothing near it stands out of the noise (the click is then kept).
+
+    The window reaches :data:`SNAP_HALF_X` px either side of the click and
+    :data:`SNAP_HALF_Y` px above and below it, clipped to the image, and only
+    :data:`SNAP_MARKED_GAP` of the way to the nearest point in ``marked_ys``
+    (those already marked on the same ladder) on each side, so a click never
+    snaps onto a marked band. Its signal is each pixel's deviation from the
+    window's median: turned by the image's ``polarity`` for a band on a marker
+    image (``visible_marker``), and its absolute value for a faint marker on a
+    chemiluminescence image (``chemiluminescence_marker``), which may show
+    either way. The profile is the signal's mean along each row, less its
+    median over the window (an absolute value's mean is not 0); the robust
+    sigma of its row-to-row steps is the steps' noise, and over the square
+    root of two the profile's.
+
+    A ladder band is a local maximum of the profile reaching :data:`SNAP_K`
+    noise sigmas, the one nearest the click (of two as near, the higher),
+    refined by a parabola through it and its neighbours (at most half a row
+    either way): row r of the image lies at y = r + 0.5. A strip edge
+    (``strip_edge``) is the same on the size of the profile's steps, against
+    the steps' noise, the edge between rows r and r + 1 lying at y = r + 1;
+    one clicked within :data:`SNAP_STRIP_BORDER` px of the image's top or
+    bottom is that border (None): an edge a few rows inside it, on an image
+    not cropped at the cut, snaps from a click further in."""
+    height, width = array.shape[:2]
+    if source is CalibrationPointSource.STRIP_EDGE and not (
+        SNAP_STRIP_BORDER < y < height - SNAP_STRIP_BORDER
+    ):
+        return None
+    top, bottom = y - SNAP_HALF_Y, y + SNAP_HALF_Y
+    for marked in marked_ys:
+        if marked <= y:
+            top = max(top, y - SNAP_MARKED_GAP * (y - marked))
+        if marked >= y:
+            bottom = min(bottom, y + SNAP_MARKED_GAP * (marked - y))
+    # The rows and columns whose centres lie in the window.
+    r0, r1 = max(0, math.ceil(top - 0.5)), min(height - 1, math.floor(bottom - 0.5))
+    c0 = max(0, math.ceil(x - SNAP_HALF_X - 0.5))
+    c1 = min(width - 1, math.floor(x + SNAP_HALF_X - 0.5))
+    if r1 - r0 < 2 or c1 < c0:  # a peak needs a row on each side
+        return None
+    window = np.asarray(array[r0 : r1 + 1, c0 : c1 + 1], dtype=float)
+    deviation = window - float(np.median(window))
+    if source is CalibrationPointSource.CHEMILUMINESCENCE_MARKER:
+        deviation = np.abs(deviation)
+    elif polarity is Polarity.DARK_ON_LIGHT:
+        deviation = -deviation
+    # Above the profile's own level: an absolute value's is its noise's mean.
+    profile = deviation.mean(axis=1)
+    profile = profile - float(np.median(profile))
+    steps = np.diff(profile)
+    step_noise = _MAD_SIGMA * float(np.median(np.abs(steps - np.median(steps))))
+    if source is CalibrationPointSource.STRIP_EDGE:
+        # Step k lies between rows k and k + 1.
+        series, first, noise = np.abs(steps), r0 + 1.0, step_noise
+    else:
+        series, first, noise = profile, r0 + 0.5, step_noise / math.sqrt(2.0)
+    found: list[float] = []
+    for k in range(1, len(series) - 1):
+        below, at, above = float(series[k - 1]), float(series[k]), float(series[k + 1])
+        if at > below and at >= above and at > 0.0 and at >= SNAP_K * noise:
+            found.append(first + k + _peak_offset(below, at, above))
+    if not found:
+        return None
+    return min(found, key=lambda peak: (abs(peak - y), peak))
+
+
 def settings() -> dict[str, JsonValue]:
     """How molecular weights are calibrated, JSON-plain: what an export record
     reports (with the ladder presets' version, which the record adds)."""
@@ -450,4 +562,24 @@ def settings() -> dict[str, JsonValue]:
         "min_ladder_points": MIN_LADDER_POINTS,
         "min_shared_mws": MIN_SHARED_MWS,
         "ladder_offsets": "at the MWs both ladders hold",
+        "snap": {
+            "half_x": SNAP_HALF_X,
+            "half_y": SNAP_HALF_Y,
+            "marked_gap": SNAP_MARKED_GAP,
+            "k": SNAP_K,
+            "signal": (
+                "deviation from the window's median, by the image's polarity on a marker"
+                " image, its absolute value for a faint marker on a chemiluminescence image;"
+                " the mean along each row, less its median; noise the robust sigma of the"
+                " row-to-row steps over the square root of two"
+            ),
+            "strip_edge_noise": "the robust sigma of the row-to-row steps",
+            "strip_edge_border": SNAP_STRIP_BORDER,
+            "ladder_band": (
+                "the local maximum nearest the click, refined by a parabola (at most half a"
+                " row), at row + 0.5"
+            ),
+            "strip_edge": "the same on the size of the row-to-row steps, at the edge between rows",
+            "no_band": "the clicked y is kept",
+        },
     }
