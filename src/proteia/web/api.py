@@ -78,6 +78,20 @@ the other calibration routes do, with the ``points`` applied, each with how it
 was ``placed`` (and, with ``found_at``, whether it was ``relabelled``), and
 ``sides_swapped``. A ruler holds at most :data:`MAX_RULER_TICKS` ticks.
 
+A row placed by its expected MW (#58, D11, D12). ``POST /api/boxes/mw-row``,
+``{protein_id, span?: [x0, x1]}`` (the columns dragged across the lanes, end
+exclusive; left out: read from the lanes placed or the ladders), places the
+protein's row where its image's calibration puts its MW
+(:func:`~proteia.core.operations.detect_mw_row`) and answers as a row box
+does, plus where it searched: ``row`` (the slot at the span's centre),
+``shift_ends``, ``expected_y``, ``span``, ``span_from``, ``two_ladders``,
+``tilt_deg``, ``slope_deg`` and ``span_hint``. ``POST /api/proteins`` with
+``place_by_mw: true`` places the new protein's row so at once when it has an
+expected MW and its image a curve: a second change, under the same lock as the
+add, so undo takes them back one at a time. The add answers ``placement``
+(what the row did, as above; null when not placed) and ``placement_error``
+(``{code, message, ids, detail}`` of a placement refused; the protein stays).
+
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
 ``?colour=original``, its stored file in its own colours, for display only.
@@ -229,7 +243,7 @@ from pydantic import (
 )
 from starlette.exceptions import HTTPException
 
-from proteia.core import ladders, storage
+from proteia.core import ladders, mwrow, storage
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import DEFAULT_CHART_FORMATS
@@ -1130,6 +1144,8 @@ class ProteinBody(_Body):
     box_size: tuple[PositiveInt, PositiveInt] | None = None  # width, height
     # The MW check's tolerance, a share (0.1: ±10%, #58); absent or null: the default.
     mw_tolerance: StrictFloat | None = None
+    # Place the row by its expected MW at once, where the image has a curve (#58, D12).
+    place_by_mw: StrictBool = False
 
 
 class ProteinEditBody(_Body):
@@ -1244,6 +1260,12 @@ class RowBody(_Body):
     protein_id: str
     # x0, y0, x1, y1, end-exclusive
     rect: tuple[RowCoordinate, RowCoordinate, RowCoordinate, RowCoordinate]
+
+
+class MwRowBody(_Body):
+    protein_id: str
+    # x0, x1 of the lanes, end-exclusive; absent or null: read from the image
+    span: tuple[RowCoordinate, RowCoordinate] | None = None
 
 
 class LaneIndexBody(_Body):
@@ -1462,6 +1484,24 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
         "right_to_left": placement.right_to_left,
         **_remeasured(placement.remeasured, placement.largest_change),
         "unlocated_lanes": list(placement.unlocated_lanes),
+    }
+
+
+def _mw_row_placement(placement: ops.MwRowPlacement) -> dict[str, Any]:
+    """Every field of what a row placed by its MW did
+    (:class:`~proteia.core.operations.MwRowPlacement`): a row box's
+    (:func:`_row_placement`), then where it searched, with lists for tuples."""
+    return {
+        **_row_placement(placement),
+        "row": list(placement.row),
+        "shift_ends": list(placement.shift_ends),
+        "expected_y": list(placement.expected_y),
+        "span": list(placement.span),
+        "span_from": placement.span_from,
+        "two_ladders": placement.two_ladders,
+        "tilt_deg": placement.tilt_deg,
+        "slope_deg": placement.slope_deg,
+        "span_hint": placement.span_hint,
     }
 
 
@@ -2042,20 +2082,46 @@ def set_reference_condition(
 
 @router.post("/proteins", status_code=201)
 def add_protein(body: ProteinBody, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Add a protein (:func:`~proteia.core.operations.add_protein`). With
+    ``place_by_mw``, a protein with an expected MW on an image with a curve
+    has its row placed at once (:func:`~proteia.core.operations.detect_mw_row`),
+    as a second change under the same lock, so no other request commits
+    between the two: ``placement`` answers what the row did, or
+    ``placement_error`` why it was refused, and the protein stays either way."""
     size = (
         None if body.box_size is None else BoxSize(width=body.box_size[0], height=body.box_size[1])
     )
-    protein_id = ops.add_protein(
+    placement: dict[str, Any] | None = None
+    placement_error: dict[str, Any] | None = None
+    with session.lock:
+        protein_id = ops.add_protein(
+            session,
+            body.name,
+            body.role,
+            body.image_id,
+            expected_mw=body.expected_mw,
+            loading_control_ids=body.loading_control_ids,
+            box_size=size,
+            mw_tolerance=body.mw_tolerance,
+        )
+        batch = session.project.batch
+        if body.place_by_mw and mwrow.placed_on_add(batch, batch.find_protein(protein_id)):
+            try:
+                placement = _mw_row_placement(ops.detect_mw_row(session, protein_id))
+            except OperationError as exc:
+                placement_error = {
+                    "code": exc.code.value,
+                    "message": str(exc),
+                    "ids": list(exc.ids),
+                    "detail": exc.detail,
+                }
+    return _answer(
+        workspace,
         session,
-        body.name,
-        body.role,
-        body.image_id,
-        expected_mw=body.expected_mw,
-        loading_control_ids=body.loading_control_ids,
-        box_size=size,
-        mw_tolerance=body.mw_tolerance,
+        protein_id=protein_id,
+        placement=placement,
+        placement_error=placement_error,
     )
-    return _answer(workspace, session, protein_id=protein_id)
 
 
 @router.patch("/proteins/{protein_id}")
@@ -2130,6 +2196,17 @@ def detect_row_boxes(
     (:func:`_row_placement`); the same drag again changes nothing."""
     placement = ops.detect_row_boxes(session, body.protein_id, body.rect)
     return _answer(workspace, session, **_row_placement(placement))
+
+
+@router.post("/boxes/mw-row", status_code=201)
+def detect_mw_row(body: MwRowBody, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Place the protein's row by its expected MW
+    (:func:`~proteia.core.operations.detect_mw_row`), across ``span`` or the
+    lanes' span read from the image. Answers what the row did in each lane
+    and where it searched (:func:`_mw_row_placement`); the same placement
+    again changes nothing."""
+    placement = ops.detect_mw_row(session, body.protein_id, span=body.span)
+    return _answer(workspace, session, **_mw_row_placement(placement))
 
 
 @router.put("/boxes/{band_id}")

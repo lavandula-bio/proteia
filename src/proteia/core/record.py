@@ -53,7 +53,7 @@ from typing import Any, Final
 from pydantic import JsonValue, TypeAdapter
 
 import proteia
-from proteia.core import analyze, export, grow, ladders, mwcal, quantify, rowdetect, storage
+from proteia.core import analyze, export, grow, ladders, mwcal, mwrow, quantify, rowdetect, storage
 from proteia.core.model import LogEntry, Project, Timestamp, lane_number
 from proteia.core.results import Results, mw_check_settings
 
@@ -123,12 +123,13 @@ def settings() -> dict[str, JsonValue]:
         # polarity, the lanes' direction) and the saturation level, chosen as
         # "saturated_at" says. Each commit's log entry keeps the level it used.
         "detect_row": {**rowdetect.settings(), "saturated_at": _SATURATED_AT},
-        # How molecular weights are calibrated and checked (#58), and the version
-        # of the ladder presets this build offers (a calibration stores the MWs it
-        # used).
+        # How molecular weights are calibrated and checked (#58), how a row is
+        # placed by its MW, and the version of the ladder presets this build
+        # offers (a calibration stores the MWs it used).
         "mw": {
             **mwcal.settings(),
             "check": mw_check_settings(),
+            "placement": mwrow.settings(),
             "presets_version": ladders.PRESETS_VERSION,
         },
         # How the charts' tests compute: every test is two-sided.

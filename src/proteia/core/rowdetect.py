@@ -54,10 +54,15 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    each piece to one lane, or a touching run to several, with empty lanes as
    gaps; the second-best reading measures how certain that is.
 6. Per lane: growth with the click's rule (:func:`~proteia.core.grow.grow_region`
-   at ``EXTENT_LEVEL`` of the lane's strongest pixel) between the lane's walls,
-   joined across a burnt-out centre that splits a saturated band along x
-   (:func:`_join_burnt_out`, where the saturation level is known). A lane
-   read from a marked piece is not grown: it stays empty.
+   at ``EXTENT_LEVEL`` of the lane's strongest pixel, or of its peak nearest
+   the row a caller expects the band on, ``prefer_y``, stopping at the valley
+   to a band above or below it not clearly lower: :func:`_apart_from_higher`;
+   there, where the saturation level is known, two clipped cores with a
+   valley of ``DETECT_K`` sigma between them are two peaks, :func:`_clipped_peaks`)
+   between the lane's walls, joined across a burnt-out centre that splits a
+   saturated band along x (:func:`_join_burnt_out`, where the saturation
+   level is known). A lane read from a marked piece is not grown: it stays
+   empty.
 7. Stage 2: the plane (or the stored background, chosen as in stage 1) and the
    noise again from the band-free pixels of the row, then steps 3 to 6 again.
 8. Each band's lane: its separate components counted (peaks split as pieces
@@ -70,7 +75,8 @@ Pipeline, in crop coordinates (rects are offset back at the end):
    :data:`SIZE_RULE`, capped by the lane spacing and the box; bounded
    isotonic placement (:func:`~proteia.core.boxes.place_in_row`).
 9. The row's line through the boxes' centres (:func:`_row_line`): a box off
-   it is off the row.
+   it is off the row; so are lanes grown with ``prefer_y`` from bands on two
+   rows (``crossed``, :func:`_measure`).
 10. The lane reading against the bands' own spacing (:func:`_doubts`): a
     reading that does not fit it is placed, its lane numbers doubtful.
 
@@ -87,6 +93,10 @@ Flags (:attr:`RowDetection.flags`):
   than :data:`ROW_SMILE` box heights apart: the row box covers more than one
   row (a neighbouring row's band is stronger in some lanes), or a lane's band
   lies above or below the others (a montage's panel, a mark beside the row);
+  or, with ``prefer_y``, two neighbouring lanes grew from bands on two rows,
+  each lane holding a band on both (``crossed``: the row box covers two rows
+  and the expected row lies between them, nearer one in some lanes and the
+  other in the rest);
 * ``doubtful_lanes``: the lane reading does not fit the bands' own spacing,
   so the lanes may be numbered wrong (:func:`_doubts`): the fitted pitch lies
   more than :data:`PITCH_DOUBT` of that spacing off it, the resolved bands or
@@ -104,7 +114,9 @@ Flags (:attr:`RowDetection.flags`):
 * ``multiple_components``: a lane holds a second, separate component (see
   ``components``): a doublet's weaker band, a non-specific band, a band split
   by a bubble; its box is grown from the lane's strongest pixel, as a click
-  there would be (quantifying doublets is #58's);
+  there would be (quantifying doublets is #58's), or with ``prefer_y`` from
+  its peak nearest that row, a band beside it not clearly lower left out, or
+  a clearly weaker one grown into with it (the note names those lanes);
 * ``hollow_band``: a lane's band is hollow (see ``hollow``): lighter in its
   centre than the saturated pixels on either side of it, a sign of
   over-exposure (#121); only where the caller gives the saturation level
@@ -116,6 +128,10 @@ Flags (:attr:`RowDetection.flags`):
   that edge row itself and was left out (``edge_signal``).
 
 Every setting is a module constant, reported by :func:`settings`.
+
+A row along a sloping line (:func:`detect_row_along`, #58): the columns of the
+row box are moved by whole pixels so the line lies level, :func:`detect_row`
+runs unchanged on them, and what it found is moved back.
 """
 
 from __future__ import annotations
@@ -125,7 +141,7 @@ import math
 import numbers
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Final, Literal, NamedTuple
+from typing import Any, Final, Literal, NamedTuple
 
 import numpy as np
 from pydantic import JsonValue
@@ -350,17 +366,21 @@ class LaneDetection:
     * ``components``: the separate peaks of the lane's detection signal, in its
       x-range and between its walls; a peak is separate from a higher one if
       the saddle between them is ``DETECT_K`` sigma below it and at most
-      ``VALLEY_FRAC`` of it, as two pieces along x. A peak inside the band's
-      grown extent is the band's own: a dip between two of them (a dumbbell,
-      a hollow centre) leaves one band. Any other counts only if it reaches
-      ``SECOND_SHARE`` of the lane's peak, its own part of the signal (above
-      its saddle to higher ground) overlaps the band's rows (those the band's
-      signal above ``NOISE_K`` sigma fills in the lane: a doublet's band
-      joined to it does, as does a half beside it), and it passes the
-      candidates' width rule, as a band does: JPEG block noise and specks,
-      and a band apart above or below with membrane between, do not. 1 for a
-      lone band, 2 or more for several (a doublet, a non-specific band joined
-      to it, a band split by a bubble), 0 when empty.
+      ``VALLEY_FRAC`` of it, as two pieces along x (with ``prefer_y`` and the
+      saturation level, a clipped peak whose clipped pixels lie apart from
+      the higher one's needs only the first: :func:`_clipped_peaks`). A peak
+      inside the band's grown extent is the band's own: a dip between two of
+      them (a dumbbell, a hollow centre) leaves one band. Any other counts
+      only if it reaches ``SECOND_SHARE`` of the lane's peak, its own part of
+      the signal (above its saddle to higher ground) overlaps the band's rows
+      (those the band's signal above ``NOISE_K`` sigma fills in the lane: a
+      doublet's band joined to it does, as does a half beside it), and it
+      passes the candidates' width rule, as a band does: JPEG block noise and
+      specks, and a band apart above or below with membrane between, do not. With
+      ``prefer_y``, a band above or below the one grown that its extent took
+      in, clearly weaker than it, counts too, its peak still the band's own.
+      1 for a lone band, 2 or more for several (a doublet, a non-specific band
+      joined to it, a band split by a bubble), 0 when empty.
     * ``hollow``: the lane's band is hollow (``hollow_band``, :func:`_hollow`):
       burnt out in its middle, lighter there than the pixels at or past
       ``saturated_at`` on either side of it along its rows, a sign of
@@ -442,7 +462,10 @@ class RowDetection:
     that detection took for its membrane: the box holds too little membrane to
     measure the bands against (a snug box around thick bands). The stored
     background plays no part, so a membrane darker than it is not taken for a
-    band.
+    band. ``crossed`` holds the lanes, as numbered, grown with ``prefer_y``
+    from bands on two rows (``off_row_line``): each next to a lane grown from
+    a band on the other row, both holding a band on both rows (see
+    :func:`_measure`); empty without ``prefer_y``.
     """
 
     lanes: tuple[LaneDetection, ...]
@@ -455,6 +478,7 @@ class RowDetection:
     cost: float | None
     margin: float | None
     membrane_shift: float
+    crossed: tuple[int, ...] = ()
 
     @property
     def slots(self) -> tuple[Rect | None, ...]:
@@ -1351,6 +1375,12 @@ class _Lane:
     window: Rect | None = None  # an empty lane's measured slot (crop coordinates)
     cut: bool = False  # an empty lane's band peaks on the box's edge row (_empty_lanes)
     side: bool = False  # read from a piece rising into the box's side: not measured
+    crossed: bool = False  # grown from a band on another row than a neighbour's (_measure)
+    # With prefer_y: the tops (crop coordinates) of the other bands in the
+    # lane's window, each with its band (_band_basins), and how many of those
+    # bands its grown extent holds (_count_components).
+    apart: dict[tuple[int, int], int] | None = None
+    within: int = 0
 
 
 def _lanes_from(assign: _Assignment, pieces: list[_Piece], n: int) -> list[_Lane]:
@@ -1385,11 +1415,11 @@ def _fill_centres(lanes: list[_Lane], pitch: float) -> None:
             ln.centre = float(np.interp(i, idx, cx))
 
 
-def _peaks(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
+def _peaks(ks: np.ndarray, h: float, frac: float = VALLEY_FRAC) -> list[tuple[int, int]]:
     """``(y, x)`` of the separate peaks of ``ks`` (>= 0): the highest, if it
     reaches ``h``, and each other peak whose highest saddle to a higher peak is
-    at least ``h`` below it and at most ``VALLEY_FRAC`` of it, the rule that
-    separates two pieces along x (:func:`_split_run`). A peak is a 4-connected
+    at least ``h`` below it and at most ``frac`` of it (``VALLEY_FRAC``: the rule
+    that separates two pieces along x, :func:`_split_run`). A peak is a 4-connected
     set of equal pixels, reported at its first pixel in raster order. Noise on
     a band's top, and a dent in it, fall far short; a second band does not.
 
@@ -1397,7 +1427,7 @@ def _peaks(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
     ``ks - h`` under ``ks`` leaves ``h`` on top of the peaks at least ``h`` above
     their saddle, and of peaks of one height joined above that. Then, from the
     highest down, a candidate is dropped if its region above the saddle level
-    ``min(height - h, VALLEY_FRAC * height)`` holds a higher pixel or a peak
+    ``min(height - h, frac * height)`` holds a higher pixel or a peak
     already found. Only the bounding box of the nonzero pixels is searched;
     around it all is 0, which moves no saddle. ``h * 1e-9`` absorbs rounding.
 
@@ -1421,7 +1451,7 @@ def _peaks(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
     heights = [float(box[p]) for p in tops]
     # Non-increasing, as the heights: each candidate's level joins at least
     # what the previous one's did.
-    levels = [min(v - h, VALLEY_FRAC * v) + eps for v in heights]
+    levels = [min(v - h, frac * v) + eps for v in heights]
     edges = _saddles(box, tops, levels[-1]) if len(tops) > 1 else []
     parent = list(range(len(tops)))  # a root is its set's highest candidate
     holds_found = [False] * len(tops)
@@ -1446,6 +1476,59 @@ def _peaks(ks: np.ndarray, h: float) -> list[tuple[int, int]]:
             found.append(top)
             holds_found[r] = True
     return [(y + y0, x + x0) for y, x in found]
+
+
+def _clipped_peaks(
+    s: np.ndarray,
+    kept: np.ndarray,
+    h: float,
+    saturated: np.ndarray,
+    tops: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """The peaks of the kept signal ``ks`` (``s`` where ``kept``, else 0) at
+    the saturation level that :func:`_peaks` at ``h`` leaves out of its
+    ``tops`` for a shallow valley to a clipped band above or below them
+    (#58), highest first: each peak on a pixel of ``saturated`` whose highest
+    saddle to higher ground lies ``h`` below it, however near its height,
+    where each top that :func:`_peaks` joins it to (the tops in its region
+    above the level it reads, ``min(height - h, VALLEY_FRAC * height)``: a
+    lower one lies outside it by the same rule) holds clipped pixels stacked
+    above or below its own (the 4-connected pieces of ``saturated`` in
+    ``ks > 0`` holding the two share too few rows to lie side by side,
+    :func:`_share_rows`; one piece shares all of its own),
+    and the extent a click on it would grow (``ks`` above ``EXTENT_LEVEL`` of
+    it) is not hollow (:func:`_hollow`).
+
+    Clipped, a peak's height is not its band's: the valley to a band as
+    clipped above or below it is deeper than its height shows, and
+    ``VALLEY_FRAC`` cannot be read from it. Two clipped bands stacked are two
+    peaks where their valley falls ``h``. Clipped pixels side by side are one
+    band's, as tops side by side are (:func:`_band_basins`): a clipped
+    dumbbell's ends; so are the pixels of one piece, and a ring of them
+    round a lighter centre, whole or, tilted, in two pieces. A top joined to
+    one that is not clipped stays as :func:`_peaks` reads it."""
+    ks = np.where(kept, s, 0.0)
+    cores, count = label(saturated & (ks > 0.0))
+    if count == 0:
+        return []
+    spans = [(r.start, r.stop) for r, _ in find_objects(cores)]
+    found = list(tops)
+    extra: list[tuple[int, int]] = []
+    for t in _peaks(ks, h, frac=1.0):
+        if t in found or not saturated[t]:
+            continue
+        v = float(ks[t])
+        region, _ = label(ks > min(v - h, VALLEY_FRAC * v) + h * 1e-9)
+        own = cores[t]
+        joined = [cores[u] for u in found if region[u] == region[t]]  # all at least as high
+        if any(c == 0 or _share_rows(spans[c - 1], spans[own - 1]) for c in joined):
+            continue
+        extent, _ = label(ks > EXTENT_LEVEL * v)
+        if _hollow(extent == extent[t], s, saturated, h):
+            continue
+        found.append(t)
+        extra.append(t)
+    return extra
 
 
 def _saddles(
@@ -1501,6 +1584,8 @@ def _measure(
     kept: np.ndarray,
     sigma_sm: float,
     saturated: np.ndarray | None,
+    tops: list[tuple[int, int]] | None = None,
+    prefer: float | None = None,
 ) -> None:
     """Grow each present lane from its strongest kept pixel, confined between its
     walls: the midpoint to a present neighbour, the centre of an empty one, the
@@ -1508,10 +1593,31 @@ def _measure(
     saturation level), a band split along x by a burnt-out centre is grown
     whole (:func:`_join_burnt_out`). A touching cell keeps its own x-range. A
     lane read from a piece rising into the box's side is not grown, and ends up
-    empty, but walls its neighbour in as a present one does."""
+    empty, but walls its neighbour in as a present one does.
+
+    Given a preferred row ``prefer`` (continuous, in the crop's rows) and the
+    separate peaks ``tops`` of the kept signal (:func:`_peaks` at
+    ``DETECT_K`` sigma, and :func:`_clipped_peaks` where the saturation level
+    is known), a lane grows instead from the peak in its seed range
+    nearest that row (of two as near, the higher), or from its strongest
+    kept pixel when the range holds none (#58: the row an expected MW
+    predicts, not a stronger band beside it). A band grown from such a peak
+    stops at the valley to a band above or below it that is not clearly
+    lower (:func:`_apart_from_higher`), which stays another band; the peaks
+    in the lane's window are read as bands by :func:`_band_basins`, and the
+    other bands' tops kept for the components (``apart``). Two neighbouring
+    lanes so grown are ``crossed`` when each holds another band's top nearer
+    the other's peak (moved by the step between the lanes' rows,
+    :func:`_step`) than any of its own band's: they grew from bands on two
+    rows, as when the expected row lies between two rows and a smile brings
+    it nearer the one in some lanes and the other in the rest."""
     wc = s.shape[1]
     n = len(lanes)
     ks = np.where(kept, s, 0.0)
+    # Each lane grown from a peak nearest the preferred row: that peak's row,
+    # each of its seed range's peaks' rows with whether it is of its band, and
+    # the seed range's highest signal in each row.
+    rows: dict[int, tuple[float, list[tuple[float, bool]], np.ndarray]] = {}
     for i, ln in enumerate(lanes):
         if not ln.present or ln.x_range is None or ln.side:
             continue
@@ -1521,9 +1627,13 @@ def _measure(
             a0, b0 = a0 + q, b0 - q
         wa = max(0, int(math.floor(a0)))
         wb = min(wc, max(wa + 1, int(math.ceil(b0))))
-        sub = ks[:, wa:wb]
-        sy, sx = divmod(int(np.argmax(sub)), sub.shape[1])
-        sx += wa
+        near = [] if prefer is None or tops is None else [t for t in tops if wa <= t[1] < wb]
+        if near:
+            sy, sx = min(near, key=lambda t: (abs(t[0] + 0.5 - prefer), t[0]))
+        else:
+            sub = ks[:, wa:wb]
+            sy, sx = divmod(int(np.argmax(sub)), sub.shape[1])
+            sx += wa
         v = float(ks[sy, sx])
         if v <= 0.0:
             ln.present = False
@@ -1540,6 +1650,26 @@ def _measure(
         gb = max(min(wc, int(math.ceil(walls[1]))), sx + 1)
         window = ks[:, ga:gb]
         threshold = max(EXTENT_LEVEL * v, NOISE_K * sigma_sm)
+        if near:
+            inside = [(t[0], t[1] - ga) for t in tops or [] if ga <= t[1] < gb]  # the seed too
+            basin, band = _band_basins(window, inside, threshold)
+            seed = inside.index((sy, sx - ga))
+            heights = [float(window[t]) for t in inside]
+            at_limit = [saturated is not None and bool(saturated[y, x + ga]) for y, x in inside]
+            h = DETECT_K * sigma_sm
+            window = _apart_from_higher(window, basin, band, heights, seed, h, at_limit)
+            ln.apart = {
+                (y, x + ga): band[k] for k, (y, x) in enumerate(inside) if band[k] != band[seed]
+            }
+            rows[i] = (
+                sy + 0.5,
+                [
+                    (t[0] + 0.5, band[k] == band[seed])
+                    for k, t in enumerate(inside)
+                    if wa <= t[1] + ga < wb
+                ],
+                ks[:, wa:wb].max(axis=1),
+            )
         g = grow_region(window, (sx - ga, sy), threshold)
         if g is None:
             ln.present = False
@@ -1569,6 +1699,156 @@ def _measure(
     for ln in lanes:
         if ln.side:
             ln.present = False
+    # Two neighbouring lanes grown from bands on two rows: where the one's
+    # peak lies, moved by the step between the lanes' rows (_step), the other
+    # holds another band's top nearer it than any of its own band's, and the
+    # other way about.
+    grown = [i for i in sorted(rows) if lanes[i].present]
+    for i, j in itertools.pairwise(grown):
+        (yi, ti, pi), (yj, tj, pj) = rows[i], rows[j]
+        step = _step(pi, pj)
+        if _other_row(tj, yi + step) and _other_row(ti, yj - step):
+            lanes[i].crossed = lanes[j].crossed = True
+
+
+def _band_basins(
+    window: np.ndarray, tops: list[tuple[int, int]], threshold: float
+) -> tuple[np.ndarray | None, list[int]]:
+    """The basins of the separate peaks ``tops`` ``(y, x)`` of ``window``
+    (>= 0), and the band each top is in (#58). ``basin`` labels each pixel of
+    ``window > 0`` with 1 + the index of the top it drains to (a watershed of
+    the signal from the tops, 4-connected), 0 elsewhere; None for one top.
+    ``band[k]`` is the least index of a top in top ``k``'s band. ``threshold``
+    is the growth threshold (:func:`_measure`).
+
+    Tops of one band lie side by side, along the rows; a band above or below
+    another is another band. So two tops are of one band when their basins
+    meet along a valley that runs down the rows at least as much as along
+    them (of the pixel pairs across it, at least as many lie side by side as
+    one above the other), or, with no path above 0 between them (a burnt-out
+    centre below the noise splits a band along x), when the pieces above
+    ``threshold`` that hold them share their rows (:func:`_share_rows`): the
+    pieces :func:`_join_burnt_out` reads, by its rule (a top below
+    ``threshold`` has none: no growth reaches it across the gap, and it is
+    joined so to no other). A basin reaches far below the growth level, down
+    a smear or tail hanging from one half, and its rows say nothing of the
+    band's. A band's tops side by side (a
+    dumbbell's ends, a hollow band's halves, joined or not) are one band so,
+    whatever the band's slope; a band stacked above or below meets it along
+    the lane's width, or shares few of its rows. Tops so in a chain are one
+    band."""
+    k = len(tops)
+    if k == 1:
+        return None, [0]
+    markers = np.zeros(window.shape, np.int32)
+    for i, (y, x) in enumerate(tops):
+        markers[y, x] = i + 1
+    mask = window > 0.0
+    basin = watershed(-window, markers, connectivity=1, mask=mask)
+    beside = np.zeros((k + 1, k + 1), np.int64)  # pixel pairs across two basins' valley
+    stacked = np.zeros((k + 1, k + 1), np.int64)
+    for a, b, pairs in (
+        (basin[:, :-1], basin[:, 1:], beside),
+        (basin[:-1, :], basin[1:, :], stacked),
+    ):
+        meet = (a != b) & (a > 0) & (b > 0)
+        np.add.at(pairs, (np.minimum(a[meet], b[meet]), np.maximum(a[meet], b[meet])), 1)
+    band = list(range(k))
+
+    def root(i: int) -> int:
+        while band[i] != i:
+            i = band[i]
+        return i
+
+    def join(a: int, b: int) -> None:
+        ra, rb = root(a), root(b)
+        band[max(ra, rb)] = min(ra, rb)
+
+    for a, b in zip(*np.nonzero((beside > 0) & (beside >= stacked)), strict=True):
+        join(int(a) - 1, int(b) - 1)
+    parts, _ = label(mask)  # 4-connected, as the basins
+    pieces, _ = label(window > threshold)  # as grow_region and _join_burnt_out read them
+    spans = find_objects(pieces)
+    rows = [None if pieces[t] == 0 else spans[pieces[t] - 1][0] for t in tops]
+    for a, b in itertools.combinations(range(k), 2):
+        ra, rb = rows[a], rows[b]
+        if (
+            parts[tops[a]] != parts[tops[b]]
+            and ra is not None
+            and rb is not None
+            and _share_rows((ra.start, ra.stop), (rb.start, rb.stop))
+        ):
+            join(a, b)
+    return basin, [root(i) for i in range(k)]
+
+
+def _share_rows(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """Whether two things spanning the rows ``a`` and ``b`` (``[start, stop)``)
+    lie side by side: they share ``JOIN_ROWS`` of the rows the two span, as
+    the halves of a band split along x do. A band above or below another, and
+    a line or stroke crossing a band's rows, do not."""
+    return min(a[1], b[1]) - max(a[0], b[0]) >= JOIN_ROWS * (max(a[1], b[1]) - min(a[0], b[0]))
+
+
+def _apart_from_higher(
+    window: np.ndarray,
+    basin: np.ndarray | None,
+    band: list[int],
+    heights: list[float],
+    seed: int,
+    h: float,
+    at_limit: list[bool],
+) -> np.ndarray:
+    """The lane's growth window ``window`` for a band grown from its separate
+    peak ``seed`` (an index into the window's peaks, :func:`_band_basins`:
+    their ``basin`` and ``band``, ``heights``, and whether each lies at the
+    saturation level, ``at_limit``), with every band above or below it that
+    is not clearly lower taken out (#58): the window itself when there is none.
+
+    A band's height is its highest top's. A band is clearly lower than the
+    seed's when its height lies ``h`` (the dip that tells two peaks apart,
+    :func:`_peaks`) or more below that band's, and not both bands reach the
+    saturation level (a top of each at it): clipped there, their heights
+    differ by the background alone, and say nothing of which is stronger. The
+    pixels that drain to a band not clearly lower are set to 0: growth stops
+    at the valley to it and keeps its threshold, so the band's extent on its
+    other sides is as it would be alone, and that band stays outside it. The
+    seed's band's other tops (a dumbbell's other end, a hollow band's other
+    half), however high, are its own; a band clearly lower is left as it is,
+    as growth from a lane's strongest pixel leaves it."""
+    height: dict[int, float] = {}
+    limit: set[int] = set()
+    for b, v, sat in zip(band, heights, at_limit, strict=True):
+        height[b] = max(height.get(b, 0.0), v)
+        if sat:
+            limit.add(b)
+    mine = band[seed]
+    higher = [
+        k + 1
+        for k, b in enumerate(band)
+        if b != mine and (height[b] > height[mine] - h or {b, mine} <= limit)
+    ]
+    if not higher:
+        return window
+    return np.where(np.isin(basin, higher), 0.0, window)
+
+
+def _step(a: np.ndarray, b: np.ndarray) -> int:
+    """How many rows the bands of a lane whose rows' highest signal is ``b``
+    lie below those of one whose is ``a``: the shift of ``b`` that best
+    matches ``a`` (the greatest sum of their products), of shifts as good the
+    least. A row's smile or tilt moves every band of a lane alike, so the
+    step holds for each of its rows."""
+    corr = np.correlate(b, a, mode="full")
+    lags = np.arange(1 - a.size, b.size)
+    return int(lags[np.lexsort((np.abs(lags), -corr))[0]])
+
+
+def _other_row(tops: list[tuple[float, bool]], y: float) -> bool:
+    """Whether a lane's top nearest the row ``y`` is of another band than the
+    one it grew from: ``tops`` are its tops' rows, each with whether it is of
+    that band (which wins a tie)."""
+    return not min(tops, key=lambda t: (abs(t[0] - y), not t[1]))[1]
 
 
 def _join_burnt_out(
@@ -1610,7 +1890,7 @@ def _join_burnt_out(
             piece = pieces == k
             rows = np.flatnonzero(piece.any(axis=1))
             p0, p1 = int(rows[0]), int(rows[-1]) + 1
-            if min(y1, p1) - max(y0, p0) < JOIN_ROWS * (max(y1, p1) - min(y0, p0)):
+            if not _share_rows((y0, y1), (p0, p1)):
                 continue
             between = _between(band & saturated, piece & saturated)
             if not between.any():
@@ -1699,7 +1979,8 @@ def _one_top_per_band(
 
 def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
     """Each measured lane's components and peaks (:class:`Peak`), from the
-    :func:`_peaks` of the kept signal at ``DETECT_K`` sigma, and whether its
+    :func:`_peaks` of the kept signal at ``DETECT_K`` sigma (with a preferred
+    row, the pass's ``tops``: :func:`_clipped_peaks` too), and whether its
     band is hollow (#121, :func:`_hollow`). Run once, on the pass that gives
     the result.
 
@@ -1714,6 +1995,10 @@ def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
     Every peak in the span is listed; one that passes all but the band's rows
     reads as another band (``other_band``), since a band apart above or below
     is one, the highest of its tops side by side only (#58).
+    With ``prefer_y``, a band above or below the one grown (:func:`_band_basins`)
+    that the growth took in, clearly lower than it (:func:`_apart_from_higher`),
+    is a component too when its top reaches ``SECOND_SHARE`` of the lane's peak
+    (``within``): the box holds both. Its top stays the band's own.
     ``saturated``: the crop's pixels at the saturation level, or None where it
     is unknown (no band is then hollow)."""
     sig = res.sig
@@ -1725,7 +2010,7 @@ def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
     if not measured:
         return
     ks = np.where(res.cand.kept, sig.s_sm, 0.0)
-    tops = _peaks(ks, DETECT_K * sig.sigma_sm)
+    tops = res.tops if res.tops is not None else _peaks(ks, DETECT_K * sig.sigma_sm)
     comps, _ = label(ks > 0.0)
     thr = NOISE_K * sig.sigma_sm
     min_w = _min_width(ks.shape[1], len(res.lanes))
@@ -1749,7 +2034,13 @@ def _count_components(res: _Pass, saturated: np.ndarray | None) -> None:
             passed.append((p, region[0]))
             if (band & hill.any(axis=1)).any():  # not above or below the band
                 second += 1
-        ln.components = 1 + second
+        # With prefer_y, another band the growth took in, left in the window
+        # as clearly lower than the band's (_apart_from_higher): a component.
+        apart = ln.apart or {}
+        ln.within = len(
+            {apart[p] for p in spanned if p in apart and grown[p] and ks[p] >= SECOND_SHARE * peak}
+        )
+        ln.components = 1 + second + ln.within
         other_bands = _one_top_per_band(ks, passed)
         ln.peaks = tuple(
             (
@@ -1867,6 +2158,10 @@ class _Pass:
     notes: list[str]
     pieces: list[_Piece]  # the pieces the reading assigns (_reduce's), in order
     joined: list[_Joined]  # the pairs _reduce merged or dropped one of
+    # The kept signal's peaks (_peaks, and _clipped_peaks where the saturation
+    # level is known), found once where a preferred row seeds the lanes and
+    # reused to count the components; None: not found yet.
+    tops: list[tuple[int, int]] | None = None
 
 
 def _run_pass(
@@ -1875,10 +2170,13 @@ def _run_pass(
     x_offset: int,
     image_rows: tuple[bool, bool],
     saturated: np.ndarray | None,
+    prefer: float | None = None,
 ) -> _Pass:
     """Steps 3 to 6 of the pipeline on one signal; ``image_rows``: whether the
     box's top and bottom rows are the image's (:func:`_lines`); ``saturated``:
-    the crop's pixels at the saturation level, or None (:func:`_measure`)."""
+    the crop's pixels at the saturation level, or None (:func:`_measure`);
+    ``prefer``: the row the lanes are seeded nearest, in the crop's rows, or
+    None (:func:`_measure`)."""
     wc = sig.s_sm.shape[1]
     notes: list[str] = []
     cand = _candidates(sig, n, image_rows)
@@ -1887,8 +2185,16 @@ def _run_pass(
     if assign is None:
         return _Pass(sig, cand, None, math.inf, [_Lane() for _ in range(n)], notes, pieces, joined)
     lanes = _lanes_from(assign, pieces, n)
-    _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm, saturated)
-    return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined)
+    if prefer is None:
+        _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm, saturated)
+        return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined)
+    ks = np.where(cand.kept, sig.s_sm, 0.0)
+    h = DETECT_K * sig.sigma_sm
+    tops = _peaks(ks, h)
+    if saturated is not None:
+        tops += _clipped_peaks(sig.s_sm, cand.kept, h, saturated, tops)
+    _measure(lanes, sig.s_sm, cand.kept, sig.sigma_sm, saturated, tops, prefer)
+    return _Pass(sig, cand, assign, alt, lanes, notes, pieces, joined, tops)
 
 
 def _stage2_free(res: _Pass, shape: tuple[int, int]) -> np.ndarray:
@@ -2317,6 +2623,7 @@ def detect_row(
     size_rule: str = SIZE_RULE,
     right_to_left: bool = False,
     saturated_at: float | None = None,
+    prefer_y: float | None = None,
 ) -> RowDetection:
     """One slot per declared lane in ``row`` ``(x0, y0, x1, y1)``: a box of one
     shared size, or None for an empty lane (see the module docstring).
@@ -2334,8 +2641,25 @@ def detect_row(
     one (the detector limit, or near it where compression or colour moved
     saturated pixels off it); None where the image has no known limit, and no
     band is then called hollow (``hollow_band``).
+    ``prefer_y`` is the row, in the image's continuous rows (row r covers [r,
+    r+1)), where the caller expects the band (#58: its expected MW's): each
+    lane then grows from the peak in its seed range nearest it, not from its
+    strongest pixel, in both stages, so a stronger band nearby in the lane is
+    not boxed, nor taken for the membrane; ``snr`` is that peak's. Its growth
+    stops at the valley to a band above or below it that is not clearly lower
+    (within the noise of its height, or both at the saturation level), which
+    stays another band (a second component, ``multiple_components``, or a band
+    apart in ``peaks``): the box is the band's own, not over both; with
+    ``saturated_at``, two clipped bands whose clipped pixels lie apart are two
+    peaks across a valley of ``DETECT_K`` sigma, however near the valley comes
+    to their clipped height (:func:`_clipped_peaks`), but two whose clipped
+    pixels touch are one. A clearly weaker band the growth takes in is a
+    second component too. Lanes that grew so from bands on two rows refuse
+    the row (``off_row_line``, ``crossed``). With None, the default, the
+    result is as without it, bit for bit (``crossed`` empty).
     Raises :class:`RowDetectError` for a row it cannot use, and ValueError for
-    an unknown ``size_rule`` or a ``saturated_at`` that is not a finite number.
+    an unknown ``size_rule``, or a ``saturated_at`` or ``prefer_y`` that is not
+    a finite number.
     """
     if size_rule not in SIZE_RULES:
         raise ValueError(f"unknown size rule {size_rule!r}; expected one of {SIZE_RULES}")
@@ -2343,8 +2667,15 @@ def detect_row(
         isinstance(saturated_at, numbers.Real) and math.isfinite(saturated_at)
     ):
         raise ValueError(f"saturated_at must be a finite number or None, not {saturated_at!r}")
+    if prefer_y is not None and not (
+        isinstance(prefer_y, numbers.Real)
+        and not isinstance(prefer_y, bool)
+        and math.isfinite(prefer_y)
+    ):
+        raise ValueError(f"prefer_y must be a finite number or None, not {prefer_y!r}")
     gray = np.asarray(gray)
     x0, y0, x1, y1 = _check_row(gray, row, n_lanes, background)
+    prefer = None if prefer_y is None else float(prefer_y) - y0
     n = int(n_lanes)
     crop = np.asarray(gray[y0:y1, x0:x1], dtype=np.float64)
     if not np.isfinite(crop).all():
@@ -2367,7 +2698,12 @@ def detect_row(
     crop_ds = _despeckle(crop, _despeckle_width(wc, n))
     image_rows = (y0 == 0, y1 == gray.shape[0])
     res = _run_pass(
-        _signal(crop, crop_ds, plane, sign, sigma_px, floor, None), n, x0, image_rows, saturated
+        _signal(crop, crop_ds, plane, sign, sigma_px, floor, None),
+        n,
+        x0,
+        image_rows,
+        saturated,
+        prefer,
     )
 
     # Stage 2: the plane (or the stored background, the same choice) and the
@@ -2385,6 +2721,7 @@ def detect_row(
             x0,
             image_rows,
             saturated,
+            prefer,
         )
     sig, assign, lanes = res.sig, res.assign, res.lanes
     # The membrane's level in the signal, for bg_offset: stage 2 measured it on
@@ -2488,6 +2825,16 @@ def detect_row(
                     f" box height ({ROW_LINE_K * h:.0f} px) off the row's line through the"
                     " other boxes"
                 )
+    # Lanes grown from their peaks nearest the expected row, on two rows of
+    # bands: each of two neighbours holds a band on the other's row too.
+    crossed = [i for i in present if lanes[i].crossed]
+    if crossed:
+        flags.append("off_row_line")
+        notes.append(
+            f"{lanes_phrase(numbered(crossed))}: grown from bands on two rows, a lane's band"
+            " on one and its neighbour's on the other, each lane holding a band on both;"
+            " the bands nearest the expected row do not lie on one row"
+        )
 
     # The reading against the bands' own spacing: placed, its lane numbers to
     # be checked (#111).
@@ -2546,10 +2893,19 @@ def detect_row(
     multiple = [ld.lane for ld in result if ld.components > 1]
     if multiple:
         flags.append("multiple_components")
+        covers = (
+            "the one with the lane's strongest pixel"
+            if prefer is None
+            else "the one nearest the expected row"
+        )
+        within = numbered([i for i in present if lanes[i].within])
+        if within == multiple:  # with prefer_y: a weaker band grown into, inside the box
+            covers += " and a weaker one with it"
+        elif within:
+            covers += f", and in {lanes_phrase(within)} a weaker one with it"
         notes.append(
             f"{lanes_phrase(multiple)}: a second separate component reaches "
-            f"{SECOND_SHARE:.0%} of the lane's peak; the box covers the one with the lane's"
-            " strongest pixel"
+            f"{SECOND_SHARE:.0%} of the lane's peak; the box covers {covers}"
         )
     hollow = [ld.lane for ld in result if ld.hollow]
     if hollow:
@@ -2585,7 +2941,90 @@ def detect_row(
         cost=None if assign is None else float(assign.cost),
         margin=margin,
         membrane_shift=min(-ends, float(rows.max()) - ends) / sigma_px,
+        crossed=tuple(numbered(crossed)),
     )
+
+
+def detect_row_along(
+    gray: np.ndarray,
+    row: Sequence[int],
+    n_lanes: int,
+    shifts: Sequence[int],
+    *,
+    background: float,
+    **kwargs: Any,
+) -> RowDetection:
+    """:func:`detect_row` along a line that slopes across the row (#58, D11: the
+    protein line between two ladders).
+
+    ``shifts`` holds one whole-pixel shift per column of ``row`` as given, x0 to
+    x1 - 1: at column x the line lies ``shifts[x - x0]`` rows lower than the
+    row's own rows. Each column of the row box is moved up by its shift, so
+    the line lies level along the box's rows: a permutation of the image's own
+    pixels, with no value new or changed (the noise, the signal-to-noise and
+    the saturated pixels read as before). :func:`detect_row` then runs,
+    unchanged, on the image so levelled, with the other arguments as given
+    (``background``, ``dark_on_light``, ``prefer_y`` in the levelled rows, and
+    so on), so its checks, the row's line among them, see the row level. What
+    it found is moved back down: each rect, grown extent and empty lane's
+    window by the shift of its centre column (x0 + x1) // 2, each peak by the
+    shift of its own column. Boxes do not overlap along x, so they do not
+    overlap once moved; each keeps the shared size.
+
+    With every shift 0 the result is :func:`detect_row`'s, bit for bit. The
+    image outside the row box is never read, as by :func:`detect_row`.
+
+    Raises :class:`RowDetectError` as :func:`detect_row` does; ``invalid_row``
+    for ``shifts`` that are not one int per column of the row; and
+    ``row_outside_image`` for a row whose rows, shifted at any of its columns
+    inside the image, leave the image (the caller cuts the row to the rows
+    every column can be shifted in)."""
+    gray = np.asarray(gray)
+    cx0, cy0, cx1, cy1 = _check_row(gray, row, n_lanes, background)
+    x0 = int(tuple(row)[0])
+    width = int(tuple(row)[2]) - x0
+    if (
+        isinstance(shifts, str | bytes)
+        or len(shifts) != width
+        or not all(_is_int(s) for s in shifts)
+    ):
+        raise RowDetectError(
+            "invalid_row", f"shifts must be one int per column of the row ({width}), not {shifts!r}"
+        )
+    s = np.asarray(shifts[cx0 - x0 : cx1 - x0], dtype=np.int64)
+    if cy0 + int(s.min()) < 0 or cy1 + int(s.max()) > gray.shape[0]:
+        raise RowDetectError(
+            "row_outside_image",
+            f"row {tuple(int(v) for v in row)} shifted along its line by"
+            f" {int(s.min())} to {int(s.max())} rows leaves the image",
+        )
+    if not s.any():
+        return detect_row(gray, row, n_lanes, background=background, **kwargs)
+    levelled = gray.copy()
+    rows = np.arange(cy0, cy1)[:, None] + s[None, :]
+    levelled[cy0:cy1, cx0:cx1] = gray[rows, np.arange(cx0, cx1)[None, :]]
+    found = detect_row(levelled, row, n_lanes, background=background, **kwargs)
+
+    def shift(column: int) -> int:
+        return int(s[column - cx0])
+
+    def back(rect: Rect | None) -> Rect | None:
+        if rect is None:
+            return None
+        dy = shift((rect[0] + rect[2]) // 2)
+        return (rect[0], rect[1] + dy, rect[2], rect[3] + dy)
+
+    lanes = tuple(
+        replace(
+            lane,
+            rect=back(lane.rect),
+            extent=back(lane.extent),
+            window=back(lane.window),
+            peaks=tuple(p._replace(y=p.y + shift(math.floor(p.x))) for p in lane.peaks),
+        )
+        for lane in found.lanes
+    )
+    return replace(found, lanes=lanes)
 
 
 def settings() -> dict[str, JsonValue]:

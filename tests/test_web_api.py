@@ -67,9 +67,12 @@ from rowcases import RowCase, adversarial
 from test_operations import (
     CAL_H,
     CAL_KDA,
+    CAL_LANES,
     CAL_LEFT_X,
     CAL_RIGHT_X,
+    CAL_TILT,
     CAL_W,
+    cal_blot,
     cal_marker,
     cal_y,
     v1_folder,
@@ -1441,6 +1444,15 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     other = client.ok("POST", "/api/proteins", body)["protein_id"]
     body = {"protein_id": other, "rect": [15, ROW - 12, LANE_X[2] + 35, ROW + 12]}
     answers["POST /api/boxes/row"] = client.ok("POST", "/api/boxes/row", body)
+    # The same row placed by its MW (#58), on strip edges cut at 100 and 50 kDa
+    # on that image: the row at y = 30.5 reads 70 kDa.
+    edges = f"/api/images/{second['image_id']}/calibration/left/points"
+    edge = {"y": 10.0, "mw": 100, "source": "strip_edge", "x": 5.0, "snap": False}
+    client.ok("POST", edges, edge)
+    client.ok("POST", edges, {**edge, "y": 50.0, "mw": 50})
+    client.ok("PATCH", f"/api/proteins/{other}", {"expected_mw": 70})
+    body = {"protein_id": other, "span": [15, LANE_X[2] + 35]}
+    answers["POST /api/boxes/mw-row"] = client.ok("POST", "/api/boxes/mw-row", body)
     plant_records(client, protein, _record(1), bands=1)
     answers["DELETE /api/proteins/{protein_id}/boxes"] = client.ok(
         "DELETE", f"/api/proteins/{protein}/boxes"
@@ -6229,3 +6241,141 @@ def test_a_proposal_with_no_other_labelling_answers_strict_json(client, tmp_path
         {"x": CAL_LEFT_X, "points": ticks, "found_at": CAL_LEFT_X},
     )
     assert [p["placed"] for p in applied["points"]] == ["found", "found"]
+
+
+# --- Rows placed by their expected MW (#58, D11, D12) ---
+
+
+def two_ladder_project(client: Client, tmp_path: Path) -> str:
+    """The two-ladder blot of the operations tests (test_operations.cal_blot:
+    four lanes, one row at about 56 kDa, the protein line 6 px lower at the
+    right ladder) and its marker, linked, both ladders marked, four lanes;
+    the blot's id."""
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    blot = write_tiff(tmp_path / "blot β.tif", cal_blot()).read_bytes()
+    _, answer = upload(client, blot, "blot β.tif")
+    image_id = answer["image_id"]
+    membrane = answer["project"]["images"][0]["membrane_id"]
+    marker = write_tiff(tmp_path / "marker α.tif", cal_marker()).read_bytes()
+    _, answer = upload(client, marker, "marker α.tif", kind="visible_marker", membrane_id=membrane)
+    marker_id = answer["image_id"]
+    client.ok("PUT", f"/api/images/{image_id}/marker", {"marker_image_id": marker_id})
+    client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "pageruler_plus/tris_glycine"},
+    )
+    for side, x in (("left", CAL_LEFT_X), ("right", CAL_RIGHT_X)):
+        for kda in CAL_KDA:
+            point = {
+                "y": cal_y(kda, x),
+                "mw": kda,
+                "source": "visible_marker",
+                "x": x,
+                "snap": False,
+            }
+            client.ok("POST", f"/api/images/{marker_id}/calibration/{side}/points", point)
+    lanes = [{"condition": f"c{i}"} for i in range(len(CAL_LANES))]
+    client.ok("PUT", "/api/lanes", {"lanes": lanes})
+    return image_id
+
+
+MW_ROW_FIELDS = (
+    "row",
+    "shift_ends",
+    "expected_y",
+    "span",
+    "span_from",
+    "two_ladders",
+    "tilt_deg",
+    "slope_deg",
+    "span_hint",
+)
+
+
+def test_add_protein_place_by_mw(client, tmp_path):
+    # Added with an expected MW on an image with a curve, the protein's row is
+    # placed at once: a second change, taken back by its own undo step.
+    image_id = two_ladder_project(client, tmp_path)
+    body = {"name": "β-catenin", "role": "target", "image_id": image_id, "expected_mw": 55}
+    answer = client.ok("POST", "/api/proteins", {**body, "place_by_mw": True})
+    protein = answer["protein_id"]
+    placement = answer["placement"]
+    assert answer["placement_error"] is None
+    assert placement["span_from"] == "ladders" and placement["two_ladders"] is True
+    assert set(MW_ROW_FIELDS) <= set(placement)
+    placed = protein_of(answer, protein)["bands"]
+    assert [band["id"] for band in placed] == placement["band_ids"] and len(placed) == 4
+    assert {band["source"] for band in placed} == {"mw_guided"}
+    assert logged(client)[-2:] == ["add_protein", "detect_mw_row"]
+    assert answer["project"]["history"]["undo"]["action"] == "detect_mw_row"
+    # Undo takes the placement back, then the protein; redo makes both again.
+    undone = client.ok("POST", "/api/undo")
+    assert undone["action"] == "detect_mw_row" and protein_of(undone, protein)["bands"] == []
+    assert client.ok("POST", "/api/undo")["action"] == "add_protein"
+    assert client.ok("POST", "/api/redo")["action"] == "add_protein"
+    redone = client.ok("POST", "/api/redo")
+    assert redone["action"] == "detect_mw_row"
+    assert [band["id"] for band in protein_of(redone, protein)["bands"]] == placement["band_ids"]
+    # Placed again by the route: the same boxes, no change.
+    again = client.ok("POST", "/api/boxes/mw-row", {"protein_id": protein})
+    assert again["band_ids"] == placement["band_ids"]
+    assert again["project"]["revision"] == redone["project"]["revision"]
+    # Without an expected MW, nothing is placed and nothing refused.
+    plain = client.ok(
+        "POST",
+        "/api/proteins",
+        {"name": "GAPDH", "role": "loading control", "image_id": image_id, "place_by_mw": True},
+    )
+    assert (plain["placement"], plain["placement_error"]) == (None, None)
+    assert logged(client)[-1] == "add_protein"
+
+
+def test_placement_error_keeps_protein(client, tmp_path):
+    # A placement refused leaves the protein added: the answer says why.
+    image_id = two_ladder_project(client, tmp_path)
+    body = {"name": "LC3-II", "role": "target", "image_id": image_id, "expected_mw": 5}
+    answer = client.ok("POST", "/api/proteins", {**body, "place_by_mw": True})
+    assert answer["placement"] is None
+    error = answer["placement_error"]
+    assert (error["code"], error["ids"], error["detail"]) == (
+        "mw_outside_calibration",
+        [image_id],
+        None,
+    )
+    assert error["message"].startswith("5 kDa lies outside the calibrated range of")
+    assert protein_of(answer, answer["protein_id"])["expected_mw"] == 5
+    assert logged(client)[-1] == "add_protein"
+    assert answer["project"]["history"]["undo"]["action"] == "add_protein"
+
+
+def test_mw_row_route(client, tmp_path):
+    image_id = two_ladder_project(client, tmp_path)
+    body = {"name": "β-catenin", "role": "target", "image_id": image_id, "expected_mw": 55}
+    protein = client.ok("POST", "/api/proteins", body)["protein_id"]
+    before = client.ok("GET", "/api/project")
+    predicted = protein_of(before, protein)["predicted_row"]
+    assert predicted["span_from"] == "ladders" and predicted["bands"][0]["mw"] == 55
+    # Refused, changing nothing: a span that is not two whole pixels, a
+    # protein without an MW, an unknown protein.
+    for span in ([10], [10.5, 300], "10,300", [10, 300, 5]):
+        path, request = "/api/boxes/mw-row", {"protein_id": protein, "span": span}
+        assert unchanged_refusal(client, "POST", path, request) == ("invalid_input", [])
+    plain = client.ok("POST", "/api/proteins", {**body, "name": "GAPDH", "expected_mw": None})
+    code, ids = unchanged_refusal(
+        client, "POST", "/api/boxes/mw-row", {"protein_id": plain["protein_id"]}
+    )
+    assert (code, ids) == ("mw_required", [plain["protein_id"]])
+    code, _ = unchanged_refusal(client, "POST", "/api/boxes/mw-row", {"protein_id": "prot-99"})
+    assert code == "unknown_id"
+    # Placed across the span dragged: every field of the placement, in JSON.
+    status, answer = client.call(
+        "POST", "/api/boxes/mw-row", {"protein_id": protein, "span": [72, 408]}
+    )
+    assert status == 201, answer
+    assert (answer["span"], answer["span_from"], answer["span_hint"]) == ([72, 408], "given", None)
+    assert answer["row"][0::2] == [72, 408] and len(answer["expected_y"]) == 1
+    assert answer["shift_ends"][0] < 0 < answer["shift_ends"][1]  # lower to the right
+    assert math.isclose(answer["tilt_deg"], math.degrees(math.atan2(CAL_TILT, 420.0)))
+    assert len([band_id for band_id in answer["band_ids"] if band_id]) == 4
+    assert logged(client)[-1] == "detect_mw_row"
