@@ -10,12 +10,33 @@ const MAX_SCALE = 40; // screen pixels per image pixel
 const CLICK_SLOP = 4; // screen pixels a click may wander before it is a drag
 const MIDDLE_BUTTON = 1;
 
+// A ladder ruler and the ladder marks, in screen pixels (#58): a tick reaches
+// this far either side of its lane's x; a press this near a tick (or its
+// label) takes it; the grips that stretch the ruler sit this far past its end
+// ticks, and take a press within their radius; a press this near the ruler's
+// line between its ends takes the ruler.
+const TICK_HALF = 12;
+const TICK_HIT = 6;
+const GRIP_GAP = 16;
+const GRIP_RADIUS = 7;
+const BODY_HIT = 7;
+const LABEL_FONT = "12px system-ui, sans-serif";
+
 export const CLIPPED_COLOR = "#e0187a";
 export const MISSING_COLOR = "#8a8a8a";
+const EXTRA_PEAK_COLOR = "#bdbdbd";
 
 // Box geometry in image pixels.
 function inside(rect, x, y) {
   return x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3];
+}
+
+// A straight line on the canvas, in the stroke style set.
+function stroke(ctx, x0, y0, x1, y1) {
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
 }
 
 // Input types where Space is not typed.
@@ -69,6 +90,20 @@ export class ImageView {
   // Space held (whatever has the focus) or with the middle button always pans,
   // and so does a second finger on a touch screen. Esc cancels a drag, and so
   // does another image being shown.
+  //
+  // Molecular weights (#58) add: pick(x, y, {clientX, clientY}), a click on
+  // the image while a pick tool is set (setPickTool), in continuous image
+  // coordinates; ruler({phase, part, dx, dy, axis, alt, clientX, clientY}),
+  // a press on the ruler (setRuler) taken as a drag ("move" as it goes, then
+  // "drop", or "cancel") or a click ("click"), `part` being the ruler's line
+  // ({kind: "body"}), a grip ({kind: "grip", end: "top" or "bottom"}) or a
+  // tick ({kind: "tick", index, id}: its place in the ruler's ticks, and the
+  // id the ruler gave it), `dx` and `dy` how far it went in image
+  // pixels and `axis` ("x" or "y") the way a drag of the line goes; and
+  // ladderPoint({phase, tick, y, alt, clientX, clientY}), a ladder mark
+  // (setLadderTicks) dragged up or down ("drop", with its new y) or clicked
+  // ("click"). While a pick tool or a ruler is set, a click places no box and
+  // a drag moves no box and draws no row.
   constructor(canvas, handlers) {
     this.canvas = canvas;
     this.context = canvas.getContext("2d");
@@ -86,6 +121,16 @@ export class ImageView {
     this.gesture = null;
     this.rowTool = null; // {proteinId, color, lanes}: what a drag on the membrane boxes, or null
     this.sentRow = null; // {rect, color}: the row box sent, shown until its answer
+    // #58: the ladder marks of the shown image's register group ({x (null: the
+    // left edge), y, label, color, labelsLeft}); the ruler being adjusted
+    // ({x, labelsLeft, ticks: [{id, y, label, color, reference, solid,
+    // focused}], extra: [y]}) or null; and the pick tool (a click reports
+    // where it was) or null.
+    this.ladderTicks = [];
+    this.ruler = null;
+    this.pickTool = null;
+    this.rulerLabels = []; // per ruler tick, its label's [x0, x1] on the canvas, as last drawn
+    this.ladderSpans = new Map(); // ladder mark -> its label's [x0, x1], as last drawn
     this.spaceHeld = false; // Space is down: a drag pans
     this.spaceTaken = false; // ...and its default (a scroll, a button press) was prevented
     this.spaceTyped = null; // {field, value, start, end}: the text field it types into, before
@@ -132,6 +177,37 @@ export class ImageView {
   // lanes}), or pans (null). A drag under way keeps what it started with.
   setRowTool(tool) {
     this.rowTool = tool;
+  }
+
+  // The ladder marks drawn on the image (#58), each a tick at its x labelled
+  // with its MW; a mark can be dragged up or down, or clicked, while no ruler
+  // or pick tool is set. A drag of one under way keeps the mark it started on.
+  setLadderTicks(ticks) {
+    this.ladderTicks = ticks;
+    this.ladderSpans = new Map();
+    this.draw();
+  }
+
+  // The ruler being adjusted, or null. A drag of it under way goes on (its
+  // handler answers each step with the ruler as it now is).
+  setRuler(ruler) {
+    this.ruler = ruler;
+    this.draw();
+  }
+
+  // While set, a click on the image reports where it was (handlers.pick): a
+  // ladder lane to find, a band to mark. Drags pan.
+  setPickTool(tool) {
+    this.pickTool = tool;
+    this.showCursor();
+  }
+
+  // Where an image point lies on the screen (client coordinates): for a
+  // popup put beside a tick.
+  clientOf(x, y) {
+    const bounds = this.canvas.getBoundingClientRect();
+    const [sx, sy] = this.toScreen(x, y);
+    return { clientX: bounds.left + sx, clientY: bounds.top + sy };
   }
 
   // --- View transform ---
@@ -227,6 +303,13 @@ export class ImageView {
       }
     }
     const g = this.gesture;
+    for (const tick of this.ladderTicks) {
+      const dragged = g && g.kind === "point" && g.tick === tick;
+      this.drawLadderTick(tick, dragged ? tick.y + g.dy : tick.y, dragged);
+    }
+    if (this.ruler) {
+      this.drawRuler(this.ruler);
+    }
     if (g && g.kind === "row") {
       const label = `Row box → ${counted(g.row.lanes, "lane", "lanes")}`;
       this.drawRect(rowRect(g.start, g.end), g.row.color, { dashed: true, label });
@@ -298,6 +381,136 @@ export class ImageView {
     ctx.restore();
   }
 
+  // A tick's label in a dark box, beside `edge` (screen x) at height `sy`: on
+  // its left when `left`, else on its right; a reference band's (`color`) has
+  // a strip of that colour on the side towards the tick; a predicted tick's
+  // (`faint`) is grey. Gives the label's [x0, x1] on the canvas.
+  drawTickLabel(text, edge, sy, { left, color = null, bold = false, faint = false }) {
+    const ctx = this.context;
+    ctx.font = bold ? `600 ${LABEL_FONT}` : LABEL_FONT;
+    const strip = color ? 4 : 0;
+    const width = ctx.measureText(text).width + 8 + strip;
+    const x0 = left ? edge - 3 - width : edge + 3;
+    ctx.fillStyle = "rgba(0, 0, 0, 0.72)";
+    ctx.fillRect(x0, sy - 8, width, 16);
+    if (color) {
+      ctx.fillStyle = color;
+      ctx.fillRect(left ? x0 + width - strip : x0, sy - 8, strip, 16);
+    }
+    ctx.fillStyle = faint ? "#bdbdbd" : "#ffffff";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, x0 + 4 + (left ? 0 : strip), sy + 0.5);
+    return [x0, x0 + width];
+  }
+
+  // A ladder mark (#58): a tick across its lane at its x (the image's left
+  // edge when it has none), labelled on the side away from the lanes; a
+  // dragged one thicker. Gives its label's [x0, x1] on the canvas.
+  drawLadderTick(tick, y, dragged) {
+    const ctx = this.context;
+    const [sx, sy] = this.toScreen(tick.x === null ? 0 : tick.x, y);
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+    ctx.lineWidth = dragged ? 7 : 5;
+    stroke(ctx, sx - TICK_HALF, sy, sx + TICK_HALF, sy);
+    ctx.strokeStyle = tick.color;
+    ctx.lineWidth = dragged ? 4 : 2;
+    stroke(ctx, sx - TICK_HALF, sy, sx + TICK_HALF, sy);
+    const edge = tick.labelsLeft ? sx - TICK_HALF : sx + TICK_HALF;
+    const span = this.drawTickLabel(tick.label, edge, sy, { left: tick.labelsLeft });
+    ctx.restore();
+    this.ladderSpans.set(tick, span);
+  }
+
+  // The ruler being adjusted (#58): a line between its end ticks, a grip past
+  // each end that stretches it, a tick per ladder MW (solid on a band found,
+  // snapped to or placed, hollow where only predicted; a reference band's in
+  // its colour; the one with the keyboard focus haloed), each labelled, and a
+  // grey dot at each peak no label took.
+  drawRuler(ruler) {
+    const ctx = this.context;
+    this.rulerLabels = [];
+    if (!ruler.ticks.length) {
+      return;
+    }
+    const [sx] = this.toScreen(ruler.x, 0);
+    const ys = ruler.ticks.map((tick) => this.toScreen(0, tick.y)[1]);
+    const top = Math.min(...ys);
+    const bottom = Math.max(...ys);
+    ctx.save();
+    ctx.lineCap = "round";
+    // Over a dark edge, so it shows on a light and a dark membrane alike.
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+    ctx.lineWidth = 5;
+    stroke(ctx, sx, top, sx, bottom);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2;
+    stroke(ctx, sx, top, sx, bottom);
+    for (const [cy, sign] of [
+      [top - GRIP_GAP, -1],
+      [bottom + GRIP_GAP, 1],
+    ]) {
+      ctx.beginPath();
+      ctx.arc(sx, cy, GRIP_RADIUS, 0, 2 * Math.PI);
+      ctx.fillStyle = "#ffffff";
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+      ctx.stroke();
+      // An arrow along the ruler: the grip pulls its end up or down.
+      ctx.beginPath();
+      ctx.moveTo(sx - 3, cy - 2 * sign);
+      ctx.lineTo(sx, cy + 2 * sign);
+      ctx.lineTo(sx + 3, cy - 2 * sign);
+      ctx.strokeStyle = "#333333";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    for (const y of ruler.extra) {
+      const [, py] = this.toScreen(0, y);
+      ctx.beginPath();
+      ctx.arc(sx, py, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = EXTRA_PEAK_COLOR;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+      ctx.stroke();
+    }
+    ruler.ticks.forEach((tick, index) => {
+      const sy = ys[index];
+      if (tick.focused) {
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 10;
+        stroke(ctx, sx - TICK_HALF - 2, sy, sx + TICK_HALF + 2, sy);
+      }
+      if (tick.solid) {
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+        ctx.lineWidth = 6;
+        stroke(ctx, sx - TICK_HALF, sy, sx + TICK_HALF, sy);
+        ctx.strokeStyle = tick.color;
+        ctx.lineWidth = 3;
+        stroke(ctx, sx - TICK_HALF, sy, sx + TICK_HALF, sy);
+      } else {
+        // Hollow: an outline only, where the ladder's shape puts the band.
+        ctx.lineWidth = 3.5;
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+        ctx.strokeRect(sx - TICK_HALF, sy - 2.5, 2 * TICK_HALF, 5);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = tick.color;
+        ctx.strokeRect(sx - TICK_HALF, sy - 2.5, 2 * TICK_HALF, 5);
+      }
+      const edge = ruler.labelsLeft ? sx - TICK_HALF - 2 : sx + TICK_HALF + 2;
+      this.rulerLabels[index] = this.drawTickLabel(tick.label, edge, sy, {
+        left: ruler.labelsLeft,
+        color: tick.reference ? tick.color : null,
+        bold: tick.focused,
+        faint: !tick.solid,
+      });
+    });
+    ctx.restore();
+  }
+
   // --- Pointer input ---
 
   boxAt(point) {
@@ -307,6 +520,72 @@ export class ImageView {
       }
     }
     return null;
+  }
+
+  // Where a pointer event lies on the canvas, in screen pixels.
+  toCanvas(event) {
+    const bounds = this.canvas.getBoundingClientRect();
+    return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  }
+
+  // The part of the ruler under a canvas point (`at`, screen pixels): a grip,
+  // the tick nearest it (or whose label it is on), or the line; null for none.
+  rulerAt(at) {
+    const ruler = this.ruler;
+    if (!ruler || !ruler.ticks.length) {
+      return null;
+    }
+    const [sx] = this.toScreen(ruler.x, 0);
+    const ys = ruler.ticks.map((tick) => this.toScreen(0, tick.y)[1]);
+    const top = Math.min(...ys);
+    const bottom = Math.max(...ys);
+    if (Math.hypot(at.x - sx, at.y - (top - GRIP_GAP)) <= GRIP_RADIUS + 2) {
+      return { kind: "grip", end: "top" };
+    }
+    if (Math.hypot(at.x - sx, at.y - (bottom + GRIP_GAP)) <= GRIP_RADIUS + 2) {
+      return { kind: "grip", end: "bottom" };
+    }
+    let best = null;
+    ys.forEach((sy, index) => {
+      const [l0, l1] = this.rulerLabels[index] || [sx, sx];
+      const near = Math.abs(at.y - sy);
+      const across = at.x >= Math.min(sx - TICK_HALF, l0) && at.x <= Math.max(sx + TICK_HALF, l1);
+      if (near <= TICK_HIT && across && (best === null || near < best.near)) {
+        best = { index, near };
+      }
+    });
+    if (best !== null) {
+      return { kind: "tick", index: best.index, id: ruler.ticks[best.index].id };
+    }
+    if (Math.abs(at.x - sx) <= BODY_HIT && at.y >= top - TICK_HIT && at.y <= bottom + TICK_HIT) {
+      return { kind: "body" };
+    }
+    return null;
+  }
+
+  // The ladder mark under a canvas point (its tick or its label), or null.
+  ladderTickAt(at) {
+    let best = null;
+    for (const tick of this.ladderTicks) {
+      const [sx, sy] = this.toScreen(tick.x === null ? 0 : tick.x, tick.y);
+      const [l0, l1] = this.ladderSpans.get(tick) || [sx, sx];
+      const near = Math.abs(at.y - sy);
+      const across = at.x >= Math.min(sx - TICK_HALF, l0) && at.x <= Math.max(sx + TICK_HALF, l1);
+      if (near <= TICK_HIT && across && (best === null || near < best.near)) {
+        best = { tick, near };
+      }
+    }
+    return best && best.tick;
+  }
+
+  // What a press at this canvas point would take, for the cursor: part of the
+  // ruler, a ladder mark, or nothing ("").
+  overAt(at) {
+    const part = this.rulerAt(at);
+    if (part) {
+      return part.kind;
+    }
+    return !this.ruler && !this.pickTool && this.ladderTickAt(at) ? "mark" : "";
   }
 
   // The protein and lane under a point: a lane's placeholder, or an n.d. mark
@@ -357,14 +636,23 @@ export class ImageView {
       if (pan && !middle) {
         this.untype();
       }
-      const box = pan ? null : this.boxAt(point);
+      // A ladder being marked or adjusted (#58) takes the press before a box.
+      const at = this.toCanvas(event);
+      const calibrating = this.ruler !== null || this.pickTool !== null;
+      const part = pan ? null : this.rulerAt(at);
+      const tick = pan || calibrating ? null : this.ladderTickAt(at);
+      const box = pan || calibrating || tick ? null : this.boxAt(point);
       const onImage = point.x >= 0 && point.y >= 0 && point.x < this.width && point.y < this.height;
       this.gesture = {
         kind: pan ? "pan" : "press",
         pointerId: event.pointerId,
         boxId: box ? box.id : null,
+        part, // the part of the ruler pressed, or null
+        tick, // the ladder mark pressed, or null
+        axis: null, // the way a drag of the ruler's line goes, once it is a drag
+        calibrating, // a click here is a pick, or does nothing beside the ruler
         // What a drag from here boxes: a row, from the membrane only.
-        row: !pan && !box && onImage ? this.rowTool : null,
+        row: !pan && !box && !tick && !calibrating && onImage ? this.rowTool : null,
         startX: event.clientX,
         startY: event.clientY,
         lastX: event.clientX, // where the pointer is now
@@ -384,7 +672,12 @@ export class ImageView {
 
     canvas.addEventListener("pointermove", (event) => {
       const g = this.gesture;
-      if (!g || event.pointerId !== g.pointerId) {
+      if (!g) {
+        // What a press here would take, for the cursor (app.css).
+        canvas.dataset.over = this.spaceHeld ? "" : this.overAt(this.toCanvas(event));
+        return;
+      }
+      if (event.pointerId !== g.pointerId) {
         return; // another finger: the gesture follows the first one
       }
       g.lastX = event.clientX;
@@ -392,7 +685,9 @@ export class ImageView {
       const sx = event.clientX - g.startX;
       const sy = event.clientY - g.startY;
       if (g.kind === "press" && Math.hypot(sx, sy) > CLICK_SLOP) {
-        g.kind = g.boxId ? "move" : g.row ? "row" : "pan";
+        g.kind = g.part ? "ruler" : g.tick ? "point" : g.boxId ? "move" : g.row ? "row" : "pan";
+        // The ruler's line goes the way the drag first went: up and down, or sideways.
+        g.axis = Math.abs(sx) > Math.abs(sy) ? "x" : "y";
         this.showCursor();
       }
       if (g.kind === "pan") {
@@ -406,6 +701,13 @@ export class ImageView {
       } else if (g.kind === "row") {
         g.end = this.toImage(event);
         this.draw();
+      } else if (g.kind === "ruler") {
+        g.dx = sx / this.scale;
+        g.dy = sy / this.scale;
+        this.handlers.ruler(this.rulerStep(g, "move", event));
+      } else if (g.kind === "point") {
+        g.dy = sy / this.scale;
+        this.draw();
       }
     });
 
@@ -417,10 +719,35 @@ export class ImageView {
       this.gesture = null;
       this.showCursor();
       if (!g || cancelled) {
+        if (g) {
+          this.abandon(g);
+        }
         this.draw();
         return;
       }
-      if (g.kind === "move") {
+      const clicked = { clientX: event.clientX, clientY: event.clientY };
+      if (g.kind === "ruler") {
+        this.handlers.ruler(this.rulerStep(g, "drop", event));
+      } else if (g.kind === "point") {
+        const y = g.tick.y + g.dy;
+        const { tick } = g;
+        this.handlers.ladderPoint({ phase: "drop", tick, y, alt: event.altKey, ...clicked });
+      } else if (g.kind === "press" && g.part) {
+        if (g.part.kind === "tick") {
+          this.handlers.ruler(this.rulerStep(g, "click", event));
+        }
+      } else if (g.kind === "press" && g.tick) {
+        const { tick } = g;
+        const step = { phase: "click", tick, y: tick.y, alt: event.altKey };
+        this.handlers.ladderPoint({ ...step, ...clicked });
+      } else if (g.kind === "press" && g.calibrating) {
+        // A pick tool takes the click where it was, on the image; beside the
+        // ruler a click does nothing.
+        const { x, y } = g.start;
+        if (this.pickTool && x >= 0 && y >= 0 && x <= this.width && y <= this.height) {
+          this.handlers.pick(x, y, clicked);
+        }
+      } else if (g.kind === "move") {
         const box = this.boxes.find((b) => b.id === g.boxId);
         if (box && (g.dx || g.dy)) {
           const r = box.rect;
@@ -466,6 +793,9 @@ export class ImageView {
     const isSpace = (event) => event.code === "Space" || event.key === " ";
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && this.gesture) {
+        // Taken: the app's Esc then leaves the ruler being dragged as it was
+        // before the drag, and drops nothing more (#58).
+        event.preventDefault();
         this.cancelGesture();
         return;
       }
@@ -549,9 +879,12 @@ export class ImageView {
   // finger (a pinch); it moves no box and draws no row.
   secondPointer(g) {
     if (g.kind !== "pan") {
+      this.abandon(g);
       Object.assign(g, {
         kind: "pan",
         boxId: null,
+        part: null,
+        tick: null,
         row: null,
         startX: g.lastX,
         startY: g.lastY,
@@ -565,11 +898,38 @@ export class ImageView {
     }
   }
 
-  // An open hand while a drag would pan (Space held), a closed one while it does.
+  // An open hand while a drag would pan (Space held), a closed one while it
+  // does; while a pick tool is set, the pointer says a click picks (#58).
   showCursor() {
     const g = this.gesture;
     this.canvas.classList.toggle("grabbing", Boolean(g && g.kind === "pan"));
     this.canvas.classList.toggle("grab", this.spaceHeld && !g);
+    this.canvas.classList.toggle("picking", this.pickTool !== null && !this.spaceHeld);
+    if (this.spaceHeld || (g && g.kind === "pan")) {
+      this.canvas.dataset.over = "";
+    }
+  }
+
+  // What a drag or click of the ruler reports (handlers.ruler), in image pixels.
+  rulerStep(g, phase, event) {
+    return {
+      phase,
+      part: g.part,
+      dx: g.dx,
+      dy: g.dy,
+      axis: g.axis,
+      alt: event.altKey,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    };
+  }
+
+  // A drag given up (Esc, another finger, another image): the ruler goes back
+  // to how it was before it; a ladder mark or a box being dragged just stays.
+  abandon(g) {
+    if (g.kind === "ruler") {
+      this.handlers.ruler({ phase: "cancel", part: g.part, dx: 0, dy: 0, axis: g.axis });
+    }
   }
 
   // The drag under way, if any, does nothing more (a box being moved goes back).
@@ -582,6 +942,7 @@ export class ImageView {
     if (this.canvas.hasPointerCapture(g.pointerId)) {
       this.canvas.releasePointerCapture(g.pointerId);
     }
+    this.abandon(g);
     this.showCursor();
     this.draw();
   }

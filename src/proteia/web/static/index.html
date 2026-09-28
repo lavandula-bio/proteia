@@ -52,6 +52,14 @@
             <option value="light_on_dark">light on a dark background</option>
           </select>
         </label>
+        <!-- A chemiluminescence image only (calibration.js): the marker or merged
+          image of its membrane taken with it, the same size pixel for pixel; one
+          of another size is listed disabled, its tooltip says why. -->
+        <label id="marker-field" class="field" hidden>Marker image
+          <select id="marker-image" aria-describedby="marker-none"></select>
+        </label>
+        <p id="marker-none" class="hint note" hidden>No marker or merged image on this membrane
+          yet: import one onto it to link it.</p>
         <button id="remove-image" type="button">Remove this image</button>
       </div>
       <fieldset class="group">
@@ -80,6 +88,88 @@
           <input id="import-file" class="file-input" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" disabled>
         </label>
       </fieldset>
+    </section>
+
+    <!-- Molecular weights (#58) for the shown image's register group
+      (calibration.js): the membrane's ladder; Find ladder, then a ruler to
+      adjust on the image before Apply stores it (one undo step); marking bands
+      one by one where no ladder stands out; the fit and the marks. -->
+    <section id="calibration" hidden>
+      <h2>Molecular weight</h2>
+      <p id="cal-group" class="hint note" hidden></p>
+      <p id="cal-link-offer" class="note" hidden><span id="cal-link-text"></span>
+        <button id="cal-link" type="button">Link</button></p>
+      <label class="field">Ladder
+        <select id="cal-ladder" aria-describedby="cal-ladder-mws"></select>
+      </label>
+      <p id="cal-ladder-mws" class="hint note" hidden></p>
+      <form id="cal-custom" class="group" hidden>
+        <label class="field">Custom ladder name
+          <input id="cal-custom-name" type="text" required maxlength="100" autocomplete="off"
+            spellcheck="false">
+        </label>
+        <label class="field">Its MWs, top to bottom (kDa; optional)
+          <input id="cal-custom-kda" type="text" autocomplete="off" spellcheck="false"
+            placeholder="250, 130, 100, 70, 55">
+        </label>
+        <div class="actions">
+          <button type="submit">Set ladder</button>
+          <button id="cal-custom-cancel" type="button">Cancel</button>
+        </div>
+        <p id="cal-custom-error" class="error" role="alert"></p>
+      </form>
+      <div id="cal-find-tools" class="actions cal-tools">
+        <button id="cal-find" type="button" aria-pressed="false">Find ladder</button>
+        <button id="cal-find-right" type="button" aria-pressed="false">Find second ladder
+          (right)</button>
+      </div>
+      <!-- The ruler found (or reopened by Adjust), not stored until Apply: a
+        button per tick, top to bottom, is the keyboard's way to each. -->
+      <div id="cal-draft" class="group cal-draft" hidden>
+        <p id="cal-draft-head" class="subhead"></p>
+        <p id="cal-draft-doubt" class="note warning" role="status" hidden></p>
+        <!-- The marks of the ruler's side it does not hold (strip edges, marks
+          on another image of the group), which its Apply removes. -->
+        <p id="cal-draft-lost" class="note warning" hidden></p>
+        <p id="cal-draft-error" class="error" role="alert" hidden></p>
+        <div class="actions cal-tools">
+          <button id="cal-apply" type="button" aria-keyshortcuts="Enter"
+            aria-describedby="cal-draft-lost">Apply</button>
+          <button id="cal-drop" type="button" aria-keyshortcuts="Escape"
+            title="Drop the ruler: nothing is stored (Esc)">Drop</button>
+        </div>
+        <div class="actions cal-tools">
+          <button id="cal-up" type="button" aria-label="Move every label up one band"
+            title="Move every label up one band: each band then reads the next lighter MW">▲</button>
+          <button id="cal-down" type="button" aria-label="Move every label down one band"
+            title="Move every label down one band: each band then reads the next heavier MW">▼</button>
+          <button id="cal-snap" type="button"
+            title="Move each tick onto the band nearest it; a hollow tick that lands on a band is stored">Snap
+            all</button>
+        </div>
+        <ol id="cal-ticks" class="cal-ticks" aria-label="Ruler ticks, top to bottom"></ol>
+        <p class="hint note">Solid ticks are stored, hollow ones (predicted) are not. Tab: next
+          tick · ↑↓: move it 0.5 px (Shift: 5 px) · Space: relabel · Delete: not a ladder band</p>
+      </div>
+      <div id="cal-fit" class="cal-fit" role="status"></div>
+      <details id="cal-marks" class="cal-marks" hidden>
+        <summary id="cal-marks-count"></summary>
+        <ul id="cal-points" class="cal-points"></ul>
+        <div class="actions cal-tools">
+          <button id="cal-adjust" type="button"
+            title="Reopen the ruler from the ladder's marks to adjust them">Adjust ladder</button>
+          <button id="cal-adjust-right" type="button"
+            title="Reopen the ruler from the second ladder's marks to adjust them">Adjust second
+            ladder</button>
+          <!-- No confirmation: Undo brings the marks back. -->
+          <button id="cal-clear" type="button"
+            title="Remove every mark of both ladders (Undo brings them back)">Clear marks</button>
+        </div>
+      </details>
+      <div class="actions cal-tools">
+        <button id="cal-mark" type="button" aria-pressed="false">Mark ladder bands</button>
+        <button id="cal-mark-edges" type="button" aria-pressed="false">Mark strip edges</button>
+      </div>
     </section>
 
     <section>
@@ -211,6 +301,22 @@
         <p>Which lane is this box in?</p>
         <div id="lane-picker-buttons"></div>
         <button id="lane-picker-cancel" type="button">Cancel</button>
+      </div>
+      <!-- Beside a ruler tick or a band clicked (calibration.js): its MW, from the
+        ladder's; Esc or a click elsewhere closes it. -->
+      <div id="cal-menu" class="cal-menu" role="dialog" aria-labelledby="cal-menu-title" hidden>
+        <p id="cal-menu-title"></p>
+        <div id="cal-menu-choices" class="cal-menu-choices"></div>
+        <form id="cal-menu-other" class="cal-menu-other" hidden>
+          <label class="inline">Other MW (kDa)
+            <input id="cal-menu-mw" type="number" min="0" step="any">
+          </label>
+          <button type="submit">Mark</button>
+        </form>
+        <div class="actions">
+          <button id="cal-menu-extra" type="button" hidden></button>
+          <button id="cal-menu-cancel" type="button">Cancel</button>
+        </div>
       </div>
     </section>
 
