@@ -3193,3 +3193,245 @@ def test_prefer_y_grows_each_lane_at_the_expected_row(seed):
 def test_a_preferred_row_that_is_not_a_finite_number_is_refused(value):
     with pytest.raises(ValueError, match="prefer_y"):
         detect(BENCH["all_present"], prefer_y=value)
+
+
+def _row_beside(dy: float, rel: float, seed: int = 1000, **kwargs) -> RowCase:
+    """A row with another row ``dy`` px below it (above if negative), ``rel``
+    times as deep, the row box over both."""
+    adjust = (0, -30, 0, 0) if dy < 0 else (0, 0, 0, 30)
+    return adversarial_row(
+        "beside", seed, neighbour_dy=dy, neighbour_rel=rel, box_adjust=adjust, **kwargs
+    )
+
+
+def _target_row(case: RowCase) -> float:
+    """The row's own bands' mean row, continuous: where a caller expects them."""
+    return float(np.mean(case.lane_cy)) + 0.5
+
+
+@cache
+def _lone_height(seed: int) -> int:
+    """The shared height of the row alone, with nothing beside it."""
+    return detect(adversarial_row("lone", seed)).size.height
+
+
+def _holds(rect, y: float) -> bool:
+    return rect[1] <= y <= rect[3]
+
+
+def test_prefer_y_stops_at_the_valley_to_a_deeper_band():
+    # #58: a row three times as deep 14 px above the expected one. Grown from
+    # the band's own peak at EXTENT_LEVEL of it, growth used to climb the dip
+    # (above that level, below VALLEY_FRAC of the peak) into the deeper band:
+    # one extent over both, a 52 x 27 box in every lane, the deeper band's
+    # peak read as the band's own, no flag. It stops at the valley: each band
+    # boxed alone at a lone band's size, the deeper band another component.
+    case = _row_beside(-14.0, 3.0)
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    assert found.flags == ("multiple_components",)
+    assert any(
+        note.endswith("the box covers the one nearest the expected row") for note in found.notes
+    )
+    assert found.size.height <= _lone_height(1000) + 1
+    for lane, cy in zip(found.lanes, case.lane_cy, strict=True):
+        y, deeper_y = cy + 0.5, cy + 0.5 - 14.0
+        assert _holds(lane.extent, y) and not _holds(lane.extent, deeper_y)
+        assert _holds(lane.rect, y) and not _holds(lane.rect, deeper_y)
+        assert lane.components == 2
+        [deeper] = [peak for peak in lane.peaks if abs(peak.y - deeper_y) < 3.0]
+        assert (deeper.own, deeper.other_band) == (False, True)
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 2
+
+
+@pytest.mark.parametrize("rel", [1.5, 2.0, 3.0, 4.0])
+@pytest.mark.parametrize("side", [-1.0, 1.0])
+def test_prefer_y_never_boxes_a_deeper_band_with_the_target(side, rel):
+    # A row rel times as deep 10 to 24 px above or below the expected one.
+    # Where a lane's band is a separate peak, it is boxed alone, the deeper
+    # band reported (a second component, or another band apart from it), and
+    # the shared size is a lone band's; or the row is refused. A band that is
+    # no separate peak of its lane (a shoulder on the deeper band: 10 px, and
+    # 12 px from three times as deep) is not told from it here, with or
+    # without prefer_y.
+    lone = _lone_height(1000)
+    for dy in range(10, 26, 2):
+        case = _row_beside(side * dy, rel)
+        found = detect(case, prefer_y=_target_row(case))
+        check_invariants(case, found)
+        ys = [cy + 0.5 for cy in case.lane_cy]
+        separate = [
+            any(abs(peak.y - y) <= 2.5 for peak in lane.peaks)
+            for lane, y in zip(found.lanes, ys, strict=True)
+        ]
+        if dy >= 14:  # not vacuous: from 14 px on, every lane's band is a peak
+            assert all(separate), (dy, found)
+        if found.refused:
+            continue
+        for lane, y, alone in zip(found.lanes, ys, separate, strict=True):
+            if not alone:
+                continue
+            deeper_y = y + side * dy
+            assert _holds(lane.extent, y) and not _holds(lane.extent, deeper_y), (dy, lane)
+            assert _holds(lane.rect, y) and not _holds(lane.rect, deeper_y), (dy, lane)
+            assert lane.components > 1 or any(peak.other_band for peak in lane.peaks), (dy, lane)
+        if all(separate):
+            assert found.size.height <= lone + 1, (dy, found.size)
+
+
+_DUMBBELL = {"depths": {1: 24000.0}, "artefacts": [blob(1, 6.0, -16000.0, ry=5.0)]}
+
+
+def test_prefer_y_keeps_two_tops_side_by_side_one_band_beside_a_deeper_one():
+    # Lane 2's band lighter in its middle (a dumbbell: two tops side by side)
+    # with a row three times as deep 13 px above, the valley to it higher than
+    # the dumbbell's dip. Growth from the nearer top stops at the valley, not
+    # at the dip: both tops are the band's own, the deeper band another.
+    case = _row_beside(-13.0, 3.0, **_DUMBBELL)
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    lane = found.lanes[1]
+    y = case.lane_cy[1] + 0.5
+    tops = [peak for peak in lane.peaks if abs(peak.y - y) <= 2.5]
+    assert len(tops) == 2 and all(peak.own for peak in tops), lane.peaks
+    assert abs(tops[0].x - tops[1].x) > 15.0  # side by side, both in the extent
+    [deeper] = [peak for peak in lane.peaks if peak not in tops]
+    assert (deeper.own, deeper.other_band) == (False, True)
+    assert not _holds(lane.extent, deeper.y)
+    # And the other way: a deeper band with two tops of its own stays out whole.
+    light = blob(1, 6.0, -18000.0, ry=5.0, dy=14.0)  # half as deep across its middle
+    case = _row_beside(14.0, 3.0, depths={1: 12000.0}, artefacts=[light])
+    lane = detect(case, prefer_y=_target_row(case)).lanes[1]
+    y = case.lane_cy[1] + 0.5
+    deeper = [peak for peak in lane.peaks if abs(peak.y - y - 14.0) <= 2.5]
+    assert len(deeper) == 2 and not any(peak.own for peak in deeper), lane.peaks
+    assert _holds(lane.extent, y) and not _holds(lane.extent, y + 14.0)
+
+
+@pytest.mark.parametrize("key", ["dumbbell_band", "hollow_band"])
+def test_prefer_y_keeps_a_dumbbell_and_a_hollow_band_one_band(key):
+    # With nothing deeper beside them, a band's tops side by side stay its own
+    # wherever the preferred row lies about them.
+    case = _adversarial(key, 1000)
+    plain = detect(case, saturated_at=0.0)
+    for dy in (-1.5, 0.5, 2.5):
+        found = detect(case, saturated_at=0.0, prefer_y=case.lane_cy[1] + dy)
+        assert found.flags == plain.flags
+        lane = found.lanes[1]
+        assert len(lane.peaks) == 2 and all(peak.own for peak in lane.peaks), key
+        assert lane.extent == plain.lanes[1].extent
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1
+
+
+def _sloping_dumbbell(lane: int, h: float, slope: float):
+    """A band 60 x ``h`` px at 20% on ``lane``'s centre, 26000 deep, sloping
+    ``slope`` px down for each px right, half as deep in its middle as at its
+    ends (a dumbbell), its right end a tenth deeper than its left."""
+    w, ux4, ux2 = 60.0, (2.0 * math.log(5.0)) ** 0.25, math.sqrt(2.0 * math.log(5.0))
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        u = X - lcx[lane]
+        across = np.exp(-0.5 * np.abs(u / (w / (2.0 * ux4))) ** 4)
+        down = np.exp(-0.5 * ((Y - lcy[lane] - slope * u) / (h / (2.0 * ux2))) ** 2)
+        dip = 1.0 - 0.5 * np.exp(-0.5 * (u / (w / 6.0)) ** 2)
+        ends = 1.0 + 0.05 * np.clip(u / (w / 2.0), -1.0, 1.0)
+        return 26000.0 * across * down * dip * ends
+
+    return f
+
+
+@pytest.mark.parametrize(("h", "slope"), [(8.0, 0.08), (8.0, -0.08), (12.0, 0.12)])
+def test_prefer_y_keeps_a_sloping_dumbbell_one_band(h, slope):
+    # Lane 2's band half as deep in its middle as at its ends, sloping 4.6 to
+    # 6.8 degrees: on so thin a band its ends' rows lie 2.5 to 3.5 px apart,
+    # each outside the other's hill's rows. Grown from its weaker end, the other
+    # end was read as a band above or below it and the band cut in two at its
+    # middle: half of it boxed, the other half a second component. It is one
+    # band: grown whole, both ends its own, as without prefer_y.
+    artefacts = [_sloping_dumbbell(1, h, slope)]
+    case = adversarial_row(
+        "sloping", 1000, w=60.0, h=h, depths={1: 0.0}, artefacts=artefacts, my=10
+    )
+    plain = detect(case)
+    whole = plain.lanes[1].extent
+    ends = plain.lanes[1].peaks
+    assert len(ends) == 2 and all(peak.own for peak in ends)
+    weaker, stronger = sorted(ends, key=lambda peak: peak.snr)
+    assert abs(weaker.y - stronger.y) >= 1.5 and abs(weaker.x - stronger.x) >= 20.0
+    away = math.copysign(1.0, weaker.y - stronger.y)
+    for dy in (0.0, 1.0, 2.0):
+        found = detect(case, prefer_y=weaker.y + away * dy)
+        check_invariants(case, found)
+        assert found.flags == plain.flags
+        lane = found.lanes[1]
+        assert len(lane.peaks) == 2 and all(peak.own for peak in lane.peaks), lane
+        assert lane.snr == pytest.approx(min(peak.snr for peak in lane.peaks))  # the weaker end
+        assert lane.components == 1
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1
+        assert abs(lane.extent[0] - whole[0]) <= 1 and abs(lane.extent[2] - whole[2]) <= 1
+
+
+def _smiling_beside(dy: float, rel: float, seed: int = 1000) -> RowCase:
+    """A row smiling 8 px (its middle lanes lower than its end ones) with
+    another row ``dy`` px below it (above if negative), ``rel`` times as deep,
+    the row box over both."""
+    adjust = (0, -30, 0, 0) if dy < 0 else (0, 0, 0, 30)
+    return adversarial_row(
+        "smiling", seed, smile=8.0, neighbour_dy=dy, neighbour_rel=rel, box_adjust=adjust
+    )
+
+
+@pytest.mark.parametrize(("dy", "rel"), [(-16.0, 2.0), (-16.0, 3.0), (16.0, 2.0)])
+def test_prefer_y_refuses_lanes_grown_from_bands_on_two_rows(dy, rel):
+    # #58: the expected row level, 3.5 px off the row's bands in its end
+    # lanes towards the other row (above), or in its middle lanes (below).
+    # The smile puts the other row's peak nearer it in the middle lanes (or
+    # the end lanes): those lanes grew from the other row's bands, the rest
+    # from the row's own, and the boxes passed for a smile, only a second
+    # component flagged. Lanes 1 and 2, 5 and 6 grew from bands on two rows,
+    # each holding a band on both: refused.
+    case = _smiling_beside(dy, rel)
+    ys = [cy + 0.5 for cy in case.lane_cy]
+    prefer = min(ys) - 3.5 if dy < 0 else max(ys) + 3.5
+    found = detect(case, prefer_y=prefer)
+    check_invariants(case, found)
+    assert found.refused and "off_row_line" in found.flags
+    assert found.crossed == (0, 1, 4, 5)
+    assert any(
+        note.startswith("lanes 1, 2, 5, 6: grown from bands on two rows") for note in found.notes
+    )
+    # The row's own y: every lane grown from the row's band, not refused.
+    own = detect(case, prefer_y=float(np.mean(ys)))
+    assert not own.refused and own.crossed == ()
+    assert all(_holds(lane.rect, y) for lane, y in zip(own.lanes, ys, strict=True))
+
+
+@pytest.mark.parametrize("rel", [1.5, 2.0, 3.0, 4.0])
+@pytest.mark.parametrize("side", [-1.0, 1.0])
+def test_prefer_y_never_boxes_the_other_row(side, rel):
+    # A row smiling 8 px with another rel times as deep 12 to 24 px above or
+    # below it, the expected row level: at the row's bands in its end lanes
+    # (above) or its middle lanes (below), or up to a third of the way from
+    # them to the other row. Where every lane's band is a separate peak, the
+    # row is refused, or every lane boxed on its own band alone: never a box
+    # over both rows' bands, nor a lane boxed on the other row's.
+    refused = placed = 0
+    for dy in (12, 16, 20, 24):
+        case = _smiling_beside(side * dy, rel)
+        ys = [cy + 0.5 for cy in case.lane_cy]
+        start = min(ys) if side < 0 else max(ys)
+        for share in (0.0, 0.2, 0.35):
+            found = detect(case, prefer_y=start + share * side * dy)
+            check_invariants(case, found)
+            if found.refused:
+                refused += 1
+                continue
+            lanes = list(zip(found.lanes, ys, strict=True))
+            if not all(any(abs(peak.y - y) <= 2.5 for peak in lane.peaks) for lane, y in lanes):
+                continue  # a lane's band is no separate peak: a shoulder on the other row's
+            placed += 1
+            for lane, y in lanes:
+                assert lane.extent is not None, (dy, share, lane)
+                assert _holds(lane.extent, y), (dy, share, lane)
+                assert not _holds(lane.extent, y + side * dy), (dy, share, lane)
+    assert refused and placed  # not vacuous

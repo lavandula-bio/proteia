@@ -3823,7 +3823,9 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     (``ROW_OFF_LINE``, cause ``off_row_line``: a box more than
     :data:`~proteia.core.rowdetect.ROW_LINE_K` box heights off the row's
     line, as a box over two rows, or over a lane whose band lies off the row,
-    places one; every box off it, two rows and neither the row's), naming
+    places one; every box off it, two rows and neither the row's; or lanes
+    grown from their peaks nearest an expected row on two rows of bands,
+    :attr:`~proteia.core.rowdetect.RowDetection.crossed`, named first), naming
     those lanes unless another refusing flag leaves the reading unsettled;
     otherwise the first refusing flag (signal rising into
     the box's side elsewhere, as a dark image edge leaves, does not make the
@@ -3874,8 +3876,9 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
         settled = not any(
             flag in rowdetect.REFUSING_FLAGS and flag != "off_row_line" for flag in found.flags
         )
+        crossed = list(found.crossed)  # grown from their peaks nearest the expected row
         cut = any(lane.cut for lane in found.lanes)
-        if cut and not (off and settled):
+        if cut and not ((off or crossed) and settled):
             cause = "cut_by_row_box"
             message = (
                 "the row box cuts through the bands, so it does not show which lane each band"
@@ -3889,18 +3892,30 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
                 " which lane each band is in; draw it over the whole bands of every declared"
                 " lane, empty end lanes included"
             )
-        elif off:
+        elif off or crossed:
             code = ErrorCode.ROW_OFF_LINE
             cause = "off_row_line"
+            named = crossed or off
             if not settled:
                 which, lie, those, fix = "some bands found", "lie", "some bands", ""
-            elif len(off) == 1:
-                which, lie, those = f"the band found in {lanes_phrase(off)}", "lies", "that band"
+            elif len(named) == 1:
+                which, lie, those = f"the band found in {lanes_phrase(named)}", "lies", "that band"
                 fix = ", or box that lane by clicking its band"
             else:
-                which, lie, those = f"the bands found in {lanes_phrase(off)}", "lie", "those bands"
+                which, lie, those = (
+                    f"the bands found in {lanes_phrase(named)}",
+                    "lie",
+                    "those bands",
+                )
                 fix = ", or box those lanes by clicking their bands"
-            if settled and len(off) == sum(lane.rect is not None for lane in found.lanes):
+            if crossed:
+                # Neighbours grown from bands on two rows, each holding a band on both.
+                what = (
+                    f"{which} {lie} on two rows, a lane's on one and its neighbour's on the other,"
+                    " each lane holding a band on both: the row box covers more than one row,"
+                    " and the bands nearest the expected row do not lie on one"
+                )
+            elif settled and len(off) == sum(lane.rect is not None for lane in found.lanes):
                 # Every box off the line: two rows, neither the row's.
                 what = (
                     f"{which} {lie} on two rows, more than {rowdetect.ROW_SMILE:g} box heights"

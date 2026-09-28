@@ -71,7 +71,8 @@ LEFT, RIGHT = LadderSide.LEFT, LadderSide.RIGHT
 MEMBRANE = 52000.0
 NOISE = 300.0
 BAND_WIDTH = 92.0  # across a lane, at 20% of the peak
-# (kDa, depth, height at 20% of the peak) of each row of bands, one per lane.
+# (kDa, depth, height at 20% of the peak) of each row of bands, one per lane;
+# after them a row may give its bands' dip and asym (_darken).
 LOADING = (50.0, 14000.0, 18.0)  # α-tubulin
 TARGET = (92.0, 9000.0, 16.0)  # β-catenin
 ROWS = (LOADING, TARGET)
@@ -103,9 +104,20 @@ def truth(kda: float, x: float, degrees: float = 0.0) -> tuple[float, float]:
     return turn(x, law(kda, x), degrees)
 
 
-def _darken(darkening: np.ndarray, cx: float, kda: float, depth: float, height: float, degrees):
+def _darken(
+    darkening: np.ndarray,
+    cx: float,
+    kda: float,
+    depth: float,
+    height: float,
+    degrees,
+    dip: float = 0.0,
+    asym: float = 0.0,
+):
     """Add one band: flat-topped across the lane, Gaussian down it, following
-    the smile, drawn turned."""
+    the smile, drawn turned; ``dip`` of it lighter in its middle (a dumbbell,
+    its ends darker), and ``asym`` darker at its right end, lighter at its
+    left."""
     cy = law(kda, cx)
     tx, ty = turn(cx, cy, degrees)
     x0, x1 = max(0, int(tx - BAND_WIDTH)), min(WIDTH, int(tx + BAND_WIDTH) + 1)
@@ -113,6 +125,9 @@ def _darken(darkening: np.ndarray, cx: float, kda: float, depth: float, height: 
     ys, xs = np.mgrid[y0:y1, x0:x1]
     u, v = turn(xs + 0.5, ys + 0.5, -degrees)
     across = np.exp(-0.5 * np.abs((u - cx) / (BAND_WIDTH / (2.0 * _UX4))) ** 4)
+    if dip or asym:
+        across *= 1.0 - dip * np.exp(-0.5 * ((u - cx) / (BAND_WIDTH / 6.0)) ** 2)
+        across *= 1.0 + asym * np.clip((u - cx) / (BAND_WIDTH / 2.0), -1.0, 1.0)
     line = cy + SMILE * (1.0 - ((u - 653.0) / 448.0) ** 2) - smile(cx)
     down = np.exp(-0.5 * ((v - line) / (height / (2.0 * _UX2))) ** 2)
     darkening[y0:y1, x0:x1] += depth * across * down
@@ -129,9 +144,9 @@ def _image(darkening: np.ndarray, seed: int) -> np.ndarray:
 def blot_pixels(degrees: float = 0.0, rows: tuple = ROWS) -> np.ndarray:
     """The chemiluminescence blot: each row's band in every lane."""
     darkening = np.zeros((HEIGHT, WIDTH))
-    for kda, depth, height in rows:
+    for kda, depth, height, *shape in rows:
         for x in LANES:
-            _darken(darkening, x, kda, depth, height, degrees)
+            _darken(darkening, x, kda, depth, height, degrees, *shape)
     return _image(darkening, 58)
 
 
@@ -606,6 +621,84 @@ def test_prefer_y_picks_predicted_band(tmp_path):
     dragged = ops.add_protein(s, "β-catenin dragged", Role.TARGET, b.blot, expected_mw=92)
     ops.detect_row_boxes(s, dragged, placed.row)
     assert on_truth(s, dragged, STRONGER[0]) == list(range(8))
+
+
+FAINT_TARGET = (TARGET[0], 3000.0, 16.0)
+DEEPER_BELOW = (80.0, 9000.0, 16.0)  # three times as deep, 18 px below the target
+DEEPER_ABOVE = (106.0, 9000.0, 16.0)  # ... 18 px above it
+
+
+def test_a_deeper_band_below_is_not_boxed_with_the_target(tmp_path):
+    # Each lane grows from the target's own peak, at 30% of it: growth used to
+    # climb the dip into a band three times as deep 18 px below, one box over
+    # both (100 x 36) in every lane. It stops at the valley: each box on the
+    # target alone, of a lone target's size, its apparent MW the target's, and
+    # the deeper band reported as a second component.
+    lone = calibrated(tmp_path / "lone", rows=(FAINT_TARGET,))
+    alone = add(lone, FAINT_TARGET)
+    ops.detect_mw_row(lone.session, alone)
+    b = calibrated(tmp_path, rows=(FAINT_TARGET, DEEPER_BELOW))
+    s = b.session
+    target = add(b, FAINT_TARGET)
+    placed = ops.detect_mw_row(s, target)
+    assert on_truth(s, target, TARGET[0]) == list(range(8))
+    assert on_truth(s, target, DEEPER_BELOW[0]) == []
+    size, lone_size = protein_of(s, target).box_size, protein_of(lone.session, alone).box_size
+    assert size.height <= lone_size.height + 1 and size.width <= lone_size.width + 2
+    assert "multiple_components" in placed.flags
+    assert all(0.9 * TARGET[0] <= mw <= TARGET[0] for mw in mws(s, target))
+    assert all(band.bands_found == 1 for band in lane_bands(s, target).values())  # 18 px off
+    assert_mw_current(s)
+
+
+@pytest.mark.parametrize(
+    ("kda", "rel", "crossed"),
+    [(104.0, 2.0, True), (104.0, 3.0, True), (106.0, 3.0, False)],
+)
+def test_a_deeper_band_above_is_never_boxed_with_the_target(tmp_path, kda, rel, crossed):
+    # A band rel times as deep 16 px (104 kDa) or 18 px (106 kDa) above the
+    # target. In the middle lanes the smile puts the expected row 10 px above
+    # the target, nearer the deeper band's peak: those lanes grow from it, the
+    # others from the target's. At 104 kDa twice as deep, the growth from the
+    # deeper band's peak ran over the target: boxes 86 x 29 (a lone target's
+    # 86 x 15), the target its own in those lanes, apparent MWs 87-92 kDa.
+    # Three times as deep, lanes 3-6 boxed the deeper band alone, their
+    # apparent MWs 96-98 kDa, within 10%, as a smile. Neighbouring lanes grown
+    # from bands on two rows, each holding both, now refuse the row, and
+    # nothing is placed. (At 106 kDa the boxes lie too far apart for a smile.)
+    b = calibrated(tmp_path, rows=(FAINT_TARGET, (kda, rel * FAINT_TARGET[1], 16.0)))
+    s = b.session
+    target = add(b, FAINT_TARGET)
+    error = unchanged(s, lambda: ops.detect_mw_row(s, target))
+    assert error.code is ErrorCode.ROW_OFF_LINE
+    assert error.detail["cause"] == "off_row_line"
+    if crossed:  # lanes 2 and 3, 6 and 7 grew from bands on two rows
+        assert str(error).startswith("the bands found in lanes 2, 3, 6, 7 lie on two rows,")
+        assert "expected row" in str(error)
+
+
+DUMBBELL_TARGET = (TARGET[0], TARGET[1], 8.0, 0.5, 0.05)  # half as deep in its middle
+
+
+@pytest.mark.parametrize("degrees", [-1.0, -2.0])
+def test_a_sloping_dumbbell_band_is_boxed_whole(tmp_path, degrees):
+    # Thin bands half as deep in their middle as at their ends, the right end
+    # a little darker, on a blot turned 1 or 2 degrees with one ladder: each
+    # band's ends lie a pixel or two apart in rows. Grown from its weaker end,
+    # a band's other end was read as a band above or below it and cut off at
+    # the middle: the box 23 px off the band, over membrane, in lane 8 (at 2
+    # degrees lanes 6-8), two bands counted there. Each band is boxed whole.
+    b = calibrated(tmp_path, degrees=degrees, rows=(DUMBBELL_TARGET,), sides=(LEFT,))
+    s = b.session
+    target = add(b, DUMBBELL_TARGET)
+    placed = ops.detect_mw_row(s, target, span=(140, 1170))
+    assert on_truth(s, target, TARGET[0], degrees) == list(range(8))
+    size = protein_of(s, target).box_size
+    for lane, band in lane_bands(s, target).items():
+        x0, _, x1, _ = band.box.rect(size)
+        assert abs((x0 + x1) / 2 - truth(TARGET[0], LANES[lane], degrees)[0]) <= 3.0, lane
+        assert band.bands_found == 1, lane
+    assert "multiple_components" not in placed.flags
 
 
 def test_log_params(tmp_path):
