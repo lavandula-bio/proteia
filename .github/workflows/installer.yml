@@ -30,6 +30,18 @@ jobs:
       # setup-uv publishes only exact tags (no floating major), so pin one.
       - uses: astral-sh/setup-uv@v10.0.1
 
+      # A version tag must name the version being built: the installer is named
+      # from pyproject.toml, so a tag on an unbumped commit would ship the old one.
+      - name: Check the tag against the version
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = (uv run --no-project --python $env:PYTHON_VERSION python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "could not read the version from pyproject.toml" }
+          if ($env:TAG -ne "v$version") { throw "tag $env:TAG does not name the version $version in pyproject.toml" }
+
       # Inno Setup is not a Python package, so uv.lock cannot pin it: the build
       # pins 7.1.0 (proteia.iss refuses another version) and this step checks
       # the download against its SHA-256 before running it. Portable mode: no
@@ -77,9 +89,15 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: proteia-windows-build-logs
+          # The install check's Inno Setup logs and installed self-test report,
+          # and a frozen self-test's output when it wrote no report, are what
+          # say why a step failed.
           path: |
             build/windows/*.log
             build/windows/*.json
             build/windows/selftest-*/report.json
+            build/windows/selftest-*/output.txt
+            ${{ runner.temp }}/install-check/*.log
+            ${{ runner.temp }}/install-check/selftest.json
           retention-days: 1
           if-no-files-found: ignore
