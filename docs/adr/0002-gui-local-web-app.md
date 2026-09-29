@@ -264,7 +264,10 @@ becomes a path still holds: no HTTP client ever supplies a path.
   membrane. The images then go into a new project through the ordinary import,
   which stores them in the project folder as described above. The page sees a
   file id, a name and a size for each image, never a path.
-- A staged file is deleted after the page imports or discards it; at the first
+- A staged file is deleted once the page discards its hand-off or runs its
+  import, even if that file itself could not be imported (trying again would
+  fail again); an import refused before it starts, for example because the
+  project name is taken, leaves it waiting. It is also deleted at the first
   upload, room check or offer after it has waited 10 minutes without being
   offered for import; when the server stops; and at the next start if a crash
   left it behind. This cleanup deletes only
