@@ -1,0 +1,103 @@
+# Builds the Windows installer (#54, ADR 0003) on a Windows runner, apart from
+# the test jobs: the frozen self-test against an unfrozen run, the launch check
+# with a stand-in browser, and an install, launch and uninstall. The installer
+# and its SHA-256 are kept as a workflow artifact for one day. Run by hand, or
+# on a version tag.
+
+name: installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHON_VERSION: "3.13.14"
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-uv publishes only exact tags (no floating major), so pin one.
+      - uses: astral-sh/setup-uv@v10.0.1
+
+      # A version tag must name the version being built: the installer is named
+      # from pyproject.toml, so a tag on an unbumped commit would ship the old one.
+      - name: Check the tag against the version
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = (uv run --no-project --python $env:PYTHON_VERSION python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "could not read the version from pyproject.toml" }
+          if ($env:TAG -ne "v$version") { throw "tag $env:TAG does not name the version $version in pyproject.toml" }
+
+      # Inno Setup is not a Python package, so uv.lock cannot pin it: the build
+      # pins 7.1.0 (proteia.iss refuses another version) and this step checks
+      # the download against its SHA-256 before running it. Portable mode: no
+      # registry entries, no shortcuts, into the runner's temporary folder.
+      - name: Install Inno Setup 7.1.0
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP "innosetup-7.1.0-x64.exe"
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe" -OutFile $setup
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f") {
+            throw "Inno Setup download has SHA-256 $hash, not the expected one"
+          }
+          $dir = Join-Path $env:RUNNER_TEMP "InnoSetup7"
+          $process = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            "/PORTABLE=1", "/CURRENTUSER", "/VERYSILENT", "/SUPPRESSMSGBOXES",
+            "/NORESTART", "/NOICONS", "/DIR=$dir")
+          if ($process.ExitCode -ne 0) { throw "Inno Setup setup exited $($process.ExitCode)" }
+          "ISCC=$dir\ISCC.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The build environment comes from uv.lock (the build group, without
+      # napari's tree); the project environment is not needed.
+      - name: Build the installer (freeze, self-test, launch check, Inno Setup)
+        run: uv run --no-project --python ${{ env.PYTHON_VERSION }} python packaging/windows/build.py --work build/windows --out dist
+
+      - name: Install, check and uninstall
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter "Proteia-*-setup.exe" | Select-Object -First 1
+          uv run --no-project --python $env:PYTHON_VERSION python packaging/windows/install_check.py $setup.FullName "$env:RUNNER_TEMP\install-check" --expect-numbers build/windows/selftest-frozen/report.json --json build/windows/install-check.json
+          if ($LASTEXITCODE -ne 0) { throw "install check failed" }
+
+      - name: Keep the installer for one day
+        uses: actions/upload-artifact@v7
+        with:
+          name: proteia-windows-installer
+          path: |
+            dist/Proteia-*-setup.exe
+            dist/Proteia-*-setup.exe.sha256
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Keep the build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: proteia-windows-build-logs
+          # The install check's Inno Setup logs and installed self-test report,
+          # and a frozen self-test's output when it wrote no report, are what
+          # say why a step failed.
+          path: |
+            build/windows/*.log
+            build/windows/*.json
+            build/windows/selftest-*/report.json
+            build/windows/selftest-*/output.txt
+            ${{ runner.temp }}/install-check/*.log
+            ${{ runner.temp }}/install-check/selftest.json
+          retention-days: 1
+          if-no-files-found: ignore
