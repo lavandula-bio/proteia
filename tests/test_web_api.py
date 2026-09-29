@@ -12,6 +12,8 @@ import hashlib
 import http.client
 import io
 import json
+import logging
+import math
 import os
 import re
 import shutil
@@ -43,8 +45,9 @@ from conftest import (
     write_tiff,
 )
 from proteia import samples
+from proteia.core import ladders, storage
+from proteia.core import operations as ops
 from proteia.core import session as session_module
-from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
     BoxSize,
@@ -58,10 +61,20 @@ from proteia.core.model import (
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import compute_results
 from proteia.viz import render_svg
-from proteia.web import api, charts, launch, sample_project, server
+from proteia.web import api, charts, handoff, launch, sample_project, server
 from proteia.web.results_view import results_payload
 from proteia.web.state import project_state, revision
 from rowcases import RowCase, adversarial
+from test_operations import (
+    CAL_H,
+    CAL_KDA,
+    CAL_LEFT_X,
+    CAL_RIGHT_X,
+    CAL_W,
+    cal_marker,
+    cal_y,
+    v1_folder,
+)
 
 H, W = 60, 400
 ROW = 30
@@ -317,6 +330,33 @@ def test_an_import_answers_the_warnings_found_in_the_file(client, tmp_path):
     assert warning["code"] == "lossy_format"
     assert warning["message"].startswith("JPEG-type compression can change pixel values")
     assert client.ok("GET", "/api/project")["project"]["images"][1] == image  # and it stays
+
+
+def test_an_import_warns_of_an_image_that_looks_like_a_processed_figure(client):
+    # #127: a background levelled to pure white, as a figure's is. A warning
+    # only: the page lists it with the others, and the image imports as usual.
+    pixels = np.full((H, W), 255, dtype=np.uint8)
+    pixels[ROW - 6 : ROW + 6] = 90  # a dark row across it: a fifth of the image
+    figure = io.BytesIO()
+    Image.fromarray(pixels).save(figure, format="PNG")
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, figure.getvalue(), name="figure β.png")
+    assert status == 201, answer
+    (image,) = answer["project"]["images"]
+    (warning,) = image["warnings"]
+    assert warning["code"] == "looks_processed"
+    assert warning["message"].startswith(
+        "This looks like a processed figure rather than a raw scan: its median level,"
+        " the image-wide background, is pure white; 80% of its pixels are pure white."
+    )
+    assert image["bit_depth"] == 8
+    # Its background's end of the range comes from the polarity: light on dark,
+    # nothing is at 0, and the page gets the warning dropped.
+    path = f"/api/images/{image['id']}/polarity"
+    answer = client.ok("PUT", path, {"polarity": "light_on_dark"})
+    assert answer["project"]["images"][0]["warnings"] == []
+    answer = client.ok("PUT", path, {"polarity": "dark_on_light"})
+    assert answer["project"]["images"][0]["warnings"] == [warning]
 
 
 def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
@@ -873,6 +913,38 @@ def test_a_folder_that_cannot_be_written_answers_json(client):
     assert (status, code) == (500, "file_error")
 
 
+def test_an_older_project_whose_backup_cannot_be_kept_is_not_opened(client, monkeypatch):
+    # #140: a schema-1 project beside the open one; its project.json cannot be
+    # kept before the migration rewrites it.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    folder = v1_folder(client.root)
+    before = {path: path.read_bytes() for path in folder.rglob("*") if path.is_file()}
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if Path(path).name.startswith("project.schema"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.os, "open", refuse)
+        status, answer = client.call("POST", "/api/projects/open", {"name": folder.name})
+    # The page shows the message as it is, in the Projects dialog.
+    assert (status, answer["code"]) == (500, "file_error")
+    assert answer["message"] == (
+        f"{folder.name!r} was saved by an older Proteia (schema 1), and a copy of its"
+        " project.json could not be kept before updating it (Permission denied);"
+        " nothing was changed"
+    )
+    assert {path: path.read_bytes() for path in folder.rglob("*") if path.is_file()} == before
+    assert client.ok("GET", "/api/projects")["open"] == "Blot"  # still open
+
+    opened = client.ok("POST", "/api/projects/open", {"name": folder.name})
+    assert opened["project"]["name"] == folder.name
+    backup = folder / "project.schema1.json"
+    assert backup.read_bytes() == before[folder / storage.PROJECT_FILE]
+
+
 def test_readers_do_not_wait_for_a_project_switch(tmp_path):
     workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
     workspace.create("A")
@@ -1331,6 +1403,38 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["PUT /api/proteins/{protein_id}/box-size"] = client.ok(
         "PUT", f"/api/proteins/{protein}/box-size", {"width": 16, "height": 12}
     )
+    # The molecular-weight calibration (#58), on a marker image of the membrane.
+    membrane = answers["POST /api/images"]["project"]["images"][0]["membrane_id"]
+    _, marker = upload(
+        client, blot_bytes(tmp_path), "marker.tif", kind="visible_marker", membrane_id=membrane
+    )
+    answers["PUT /api/images/{image_id}/marker"] = client.ok(
+        "PUT", f"/api/images/{image_id}/marker", {"marker_image_id": marker["image_id"]}
+    )
+    answers["PUT /api/membranes/{membrane_id}/calibration/ladder"] = client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "pageruler_plus/tris_glycine"},
+    )
+    points = f"/api/images/{marker['image_id']}/calibration/left/points"
+    point = {"y": 20.0, "mw": 100, "source": "visible_marker", "x": 10.0, "snap": False}
+    answers["POST /api/images/{image_id}/calibration/{side}/points"] = client.ok(
+        "POST", points, point
+    )
+    client.ok("POST", points, {**point, "y": 40.0, "mw": 50})
+    answers["PATCH /api/images/{image_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "PATCH", f"/api/images/{image_id}/calibration/left/points/100", {"y": 21.5}
+    )
+    answers["DELETE /api/images/{image_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "DELETE", f"{points}/50"
+    )
+    answers["DELETE /api/images/{image_id}/calibration"] = client.ok(
+        "DELETE", f"/api/images/{image_id}/calibration"
+    )
+    ruler = {"x": 10.0, "points": [{"y": 20.0, "mw": 100}, {"y": 40.0, "mw": 50}]}
+    answers["PUT /api/images/{image_id}/calibration/{side}/ladder"] = client.ok(
+        "PUT", f"/api/images/{marker['image_id']}/calibration/left/ladder", ruler
+    )
     answers["POST /api/undo"] = client.ok("POST", "/api/undo")
     answers["POST /api/redo"] = client.ok("POST", "/api/redo")
     # A row box over the three declared lanes, on the image that kept the blot's polarity.
@@ -1355,6 +1459,9 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     answers["POST /api/projects/open"] = client.ok("POST", "/api/projects/open", {"name": "Blot"})
     # Another project, so another opening, whose revisions start again.
     answers["POST /api/projects/sample"] = client.ok("POST", "/api/projects/sample")
+    # And another: images handed to the app, imported into a new project.
+    handoff_id, files = handed_off(client, tmp_path, ["handed.tif"])
+    answers["POST /api/handoffs/{handoff_id}/accept"] = accept(client, handoff_id, files)
 
     revisions = []
     blot = answers["POST /api/projects"]["project"]["open_id"]
@@ -1367,7 +1474,7 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         assert {"lanes", "proteins", "sets", "settings"} <= set(results), route
         if project["open_id"] == blot:
             revisions.append(project["revision"])
-    assert len(revisions) == len(answers) - 1
+    assert len(revisions) == len(answers) - 2
     assert revisions == sorted(revisions)
     # Every route that answers with the project is exercised above.
     others = {
@@ -1376,6 +1483,19 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         "POST /api/project/reveal",
         "GET /api/images/{image_id}/preview",
         "GET /api/charts/{key}.svg",
+        "POST /api/incoming",
+        "GET /api/incoming/room",
+        "POST /api/handoffs",
+        "POST /api/handoffs/{handoff_id}/discard",
+        "GET /api/diagnostics",
+        "POST /api/diagnostics",
+        "POST /api/diagnostics/reveal",
+        "GET /api/notices",
+        "GET /api/ladders",
+        "POST /api/notices/cloud_sync/dismiss",
+        # Only read: they answer what they found, not the project.
+        "POST /api/images/{image_id}/ladder-proposal",
+        "POST /api/images/{image_id}/ladder-snap",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -1980,6 +2100,58 @@ def test_an_expected_mw_may_be_a_whole_number(client, tmp_path):
     assert protein_of(added, added["protein_id"])["expected_mw"] == 36.0
     edited = client.ok("PATCH", f"/api/proteins/{protein}", {"expected_mw": 92})
     assert protein_of(edited, protein)["expected_mw"] == 92.0
+
+
+def test_a_protein_carries_its_mw_tolerance(client, tmp_path):
+    # #58: the MW check's tolerance, a share, set on add and edit.
+    image_id, protein = ready(client, tmp_path)
+    assert protein_of(client.ok("GET", "/api/project"), protein)["mw_tolerance"] == 0.1
+    body = {"name": "GAPDH", "role": "loading control", "image_id": image_id}
+    added = client.ok("POST", "/api/proteins", {**body, "mw_tolerance": 0.15})
+    gapdh = added["protein_id"]
+    assert protein_of(added, gapdh)["mw_tolerance"] == 0.15
+    column = next(c for c in added["results"]["proteins"] if c["protein_id"] == gapdh)
+    assert (column["mw_tolerance"], column["expected_mws"], column["mw_not_run"]) == (
+        0.15,
+        [],
+        "no_expected_mw",
+    )
+    path = f"/api/proteins/{protein}"
+    edited = client.ok("PATCH", path, {"mw_tolerance": 0.2, "expected_mw": 42})
+    assert protein_of(edited, protein)["mw_tolerance"] == 0.2
+    assert logged(client)[-1] == "edit_protein"
+    for bad in (None, 0, 1, 1.5, -0.1, "0.1", True):
+        assert unchanged_refusal(client, "PATCH", path, {"mw_tolerance": bad}) == (
+            "invalid_input",
+            [],
+        ), bad
+    for bad in (0, 1, "0.1", True):
+        refused = {**body, "name": "α-actin", "mw_tolerance": bad}
+        assert unchanged_refusal(client, "POST", "/api/proteins", refused) == (
+            "invalid_input",
+            [],
+        ), bad
+
+
+def test_a_row_answers_its_band_counts_and_checks(client, tmp_path):
+    # #58, D10: each box the row places counts the bands in its lane; the
+    # results carry the counts, the checks, and the calibration (none here).
+    target, _, _ = live(client, tmp_path, DOSES, boxed=())
+    client.ok("PATCH", f"/api/proteins/{target}", {"expected_mw": 92})
+    answer = drag(client, target)
+    assert [band["bands_found"] for band in protein_of(answer, target)["bands"]] == [1] * 5
+    got = column(answer, target)
+    assert got["bands_found"] == [1] * 5 and got["count_check"] == ["passed"] * 5
+    assert (got["mw_check"], got["mw_not_run"], got["calibration"]) == (
+        ["not_run"] * 5,
+        "no_points",
+        None,
+    )
+    assert got["apparent_mw"] == [None] * 5 and got["expected_mws"] == [92.0]
+    notices = answer["results"]["sets"][0]["notices"]
+    [unchecked] = [n for n in notices if n["code"] == "mw_not_checked"]
+    assert (unchecked["level"], unchecked["protein_ids"]) == ("info", [target])
+    assert unchecked["image_ids"] == [answer["project"]["images"][0]["id"]]
 
 
 def test_removing_a_protein_answers_its_cascade_and_drops_its_series(client, tmp_path):
@@ -3105,6 +3277,22 @@ def test_a_row_box_answers_the_detectors_warnings_and_notes(client, tmp_path):
     assert answer["notes"] == params["notes"] != []
 
 
+def test_a_first_row_box_read_off_answers_its_lanes_doubtful(client, tmp_path):
+    # #111: a row box that also covers a neighbouring panel beside the row,
+    # with no lanes on the image to check it, is read two lanes off. It is
+    # placed, and the answer carries the warning and its note (the page asks
+    # to check the lane numbers, with an Undo of the row).
+    case, target = adversarial_project(client, tmp_path, "panel_beside")
+    answer = drag(client, target, list(case.row))
+    assert None not in answer["band_ids"]
+    params = storage.load_project(client.root / "Blot").log[-1].params
+    assert answer["flags"] == params["flags"] == ["doubtful_lanes"]
+    [note] = answer["notes"]
+    assert note == params["notes"][0]
+    assert note.startswith("lane numbers doubtful: the fitted pitch")
+    assert answer["project"]["history"]["undo"]["action"] == "detect_row_boxes"
+
+
 def test_a_row_box_answers_a_band_it_cuts_through(client, tmp_path):
     # The box's top edge 2 px above the target's band centres (#115).
     target, _, _ = live(client, tmp_path, DOSES, boxed=())
@@ -3754,7 +3942,7 @@ def test_a_sample_folder_that_cannot_be_removed_is_named_in_the_error(
 
     with monkeypatch.context() as patch:
         patch.setattr(sample_project.ops, "set_lanes", fail)
-        patch.setattr(sample_project, "shutil", SimpleNamespace(rmtree=rmtree_but_images))
+        patch.setattr(api.projects, "shutil", SimpleNamespace(rmtree=rmtree_but_images))
         status, answer = client.call("POST", "/api/projects/sample")
     # A file error whatever failed: the folder left needs deleting by hand.
     assert (status, answer["code"]) == (500, "file_error")
@@ -3817,6 +4005,20 @@ NEEDS_NO_OPENING = {
     ("POST", "/api/projects/open"): "opens the project the request names",
     ("POST", "/api/projects/sample"): "creates the sample project, and opens it",
     ("GET", "/api/workspace"): "says which opening is open: how a page finds it changed",
+    ("POST", "/api/incoming"): "stages a file a launch hands to the app",
+    ("GET", "/api/incoming/room"): "says whether a file a launch would hand over is taken",
+    ("POST", "/api/handoffs"): "hands off staged files, for the page to ask about",
+    (
+        "POST",
+        "/api/handoffs/{handoff_id}/discard",
+    ): "drops files handed off, as the page shows them",
+    ("POST", "/api/diagnostics/reveal"): "shows the diagnostics folder, in the state folder",
+    ("GET", "/api/notices"): "says whether the projects folder is synced: no project's",
+    ("GET", "/api/ladders"): "lists the ladder presets: no project's",
+    (
+        "POST",
+        "/api/notices/cloud_sync/dismiss",
+    ): "dismisses that notice, in the state folder",
 }
 
 
@@ -3971,7 +4173,7 @@ def test_two_openings_in_one_request_are_refused(client):
     assert (status, body["code"]) == (422, "invalid_input")
 
 
-def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
+def test_the_routes_that_need_no_opening_ignore_the_one_named(client, tmp_path):
     client.ok("POST", "/api/projects", {"name": "Blot"})
     stale = {OPENING: "7"}  # an opening that never was
     # The page shell, served without the token, holds no user data.
@@ -3986,8 +4188,37 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
         ("POST", "/api/projects/sample"): None,
         ("POST", "/api/quit"): None,  # last: it stops the server
     }
+    handoff_id, files = handed_off(client, tmp_path, ["dropped.tif"])
+    incoming = ("POST", "/api/incoming")
+    room = ("GET", "/api/incoming/room")
+    discard = ("POST", "/api/handoffs/{handoff_id}/discard")
+    bodies[incoming] = None
+    bodies[room] = None
+    bodies[discard] = {"files": [file["file_id"] for file in files]}
+    bodies[("POST", "/api/handoffs")] = {
+        "refused": [{"name": "a.bmp", "code": "x", "message": "y"}]
+    }
+    bodies[("POST", "/api/diagnostics/reveal")] = None
+    bodies[("GET", "/api/notices")] = None
+    bodies[("POST", "/api/notices/cloud_sync/dismiss")] = None
+    bodies[("GET", "/api/ladders")] = None
+    bodies[("POST", "/api/quit")] = bodies.pop(("POST", "/api/quit"))  # still last
+    paths = {
+        incoming: "/api/incoming?name=a.tif",
+        room: "/api/incoming/room?name=a.tif&size=1",
+        discard: f"/api/handoffs/{handoff_id}/discard",
+    }
     assert set(bodies) == set(NEEDS_NO_OPENING)
-    answers = {route: client.call(*route, body, headers=stale) for route, body in bodies.items()}
+    answers = {
+        route: client.call(
+            route[0],
+            paths.get(route, route[1]),
+            body,
+            raw=blot_bytes(tmp_path) if route == incoming else None,
+            headers=stale,
+        )
+        for route, body in bodies.items()
+    }
     assert {route: status for route, (status, _) in answers.items()} == {
         ("GET", "/api/status"): 200,
         ("GET", "/api/projects"): 200,
@@ -3995,6 +4226,14 @@ def test_the_routes_that_need_no_opening_ignore_the_one_named(client):
         ("POST", "/api/projects"): 201,
         ("POST", "/api/projects/open"): 200,
         ("POST", "/api/projects/sample"): 201,
+        incoming: 201,
+        room: 204,
+        discard: 204,
+        ("POST", "/api/handoffs"): 201,
+        ("POST", "/api/diagnostics/reveal"): 204,
+        ("GET", "/api/notices"): 200,
+        ("POST", "/api/notices/cloud_sync/dismiss"): 204,
+        ("GET", "/api/ladders"): 200,
         ("POST", "/api/quit"): 202,
     }
     opened = [
@@ -4007,13 +4246,29 @@ def test_the_workspace_says_which_opening_is_open_without_reading_it(client, mon
     calls: list = []
     _counting(monkeypatch, calls)
     root = str(client.root)
-    assert client.ok("GET", "/api/workspace") == {"root": root, "open": None, "open_id": None}
+    none: dict[str, Any] = {"handoffs": []}
+    assert client.ok("GET", "/api/workspace") == {
+        "root": root,
+        "open": None,
+        "open_id": None,
+        **none,
+    }
     client.ok("POST", "/api/projects", {"name": "Blot µ"})
     client.ok("POST", "/api/projects", {"name": "Other"})
     computed = len(calls)
-    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Other", "open_id": 2}
+    assert client.ok("GET", "/api/workspace") == {
+        "root": root,
+        "open": "Other",
+        "open_id": 2,
+        **none,
+    }
     client.ok("POST", "/api/projects/open", {"name": "Blot µ"})
-    assert client.ok("GET", "/api/workspace") == {"root": root, "open": "Blot µ", "open_id": 3}
+    assert client.ok("GET", "/api/workspace") == {
+        "root": root,
+        "open": "Blot µ",
+        "open_id": 3,
+        **none,
+    }
     assert len(calls) == computed + 1  # the open's answer only
 
 
@@ -4263,10 +4518,30 @@ def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_
 
 # The routes on the open project that check the opening their request names as
 # early as every other (before its path, query and body are), but take the
-# session in use only later, themselves, and why. Each has a test of its own
-# that it holds the session while it uses it.
+# session in use only later, or only for a while, themselves, and why. Each has
+# a test of its own that it holds the session while it uses it.
 USES_ITS_SESSION_LATER = {
     ("POST", "/api/images"): "reads its body first, which may take minutes: no reopen waits for it",
+    ("POST", "/api/diagnostics"): (
+        "writes its file after planning it, which with images may take minutes: no reopen"
+        " waits for it"
+    ),
+}
+# The routes on the open project that check the opening their request names as
+# early as every other, but never use its session: they close it, and open
+# another. Each checks it again once no other switch can run.
+REPLACES_ITS_SESSION = {
+    ("POST", "/api/handoffs/{handoff_id}/accept"): "imports images into a new project it opens",
+}
+# The routes that read the open project if one is open, and work with none (a
+# diagnostic file with no project, #138): they get the session, or None, from
+# _any_session, which checks the opening and keeps the session in use as
+# _open_session does; or, when they also use it later
+# (USES_ITS_SESSION_LATER), from _checked_any_session, which checks it and no
+# more, as _checked_session does.
+WORKS_WITH_NO_PROJECT = {
+    ("GET", "/api/diagnostics"): "lists the files of a diagnostic file",
+    ("POST", "/api/diagnostics"): "writes a diagnostic file",
 }
 
 
@@ -4275,8 +4550,10 @@ def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
     # finds them: each gets its session from _open_session, which keeps it in
     # use (Workspace.using) until the route returns, so no reopen reads the
     # project again while one runs. Those in USES_ITS_SESSION_LATER get it from
-    # _checked_session, which checks it and no more, and take it in use
-    # themselves (test_an_upload_holds_its_session_while_it_imports_and_answers).
+    # _checked_session (or _checked_any_session), which checks it and no more,
+    # and take it in use themselves
+    # (test_an_upload_holds_its_session_while_it_imports_and_answers,
+    # test_a_reopen_does_not_wait_for_a_file_being_written).
     workspace = api.Workspace(Path("unused"), reveal=lambda folder: None)
     app = server.create_app(
         token="t" * 43, port=8000, on_quit=lambda: None, workspace=workspace
@@ -4289,20 +4566,32 @@ def test_every_route_on_the_open_project_holds_its_session_until_it_returns():
             yield from given(sub, call)
 
     guarded = api_routes() - set(NEEDS_NO_OPENING)
-    assert set(USES_ITS_SESSION_LATER) <= guarded
+    special = set(USES_ITS_SESSION_LATER) | set(REPLACES_ITS_SESSION) | set(WORKS_WITH_NO_PROJECT)
+    assert special <= guarded
     found = {
         (method, route.path): (
             [sub.scope for sub in given(route.dependant, api._open_session)],
             [sub.scope for sub in given(route.dependant, api._checked_session)],
+            [sub.scope for sub in given(route.dependant, api._no_other_opening)],
+            [sub.scope for sub in given(route.dependant, api._any_session)],
+            [sub.scope for sub in given(route.dependant, api._checked_any_session)],
         )
         for route in _declared(app.routes)
         for method in route.methods
         if (method, route.path) in guarded
     }
-    assert found == {
-        route: ([], [None]) if route in USES_ITS_SESSION_LATER else (["function"], [])
-        for route in guarded
-    }
+
+    def expected(route: tuple[str, str]) -> tuple[list, list, list, list, list]:
+        later = route in USES_ITS_SESSION_LATER
+        if route in WORKS_WITH_NO_PROJECT:
+            return [], [], [], ([] if later else ["function"]), ([None] if later else [])
+        if later:
+            return [], [None], [], [], []
+        if route in REPLACES_ITS_SESSION:
+            return [], [], [None], [], []
+        return ["function"], [], [], [], []
+
+    assert found == {route: expected(route) for route in guarded}
 
 
 # --- An upload holds its session only once its body is stored (#134's review) ---
@@ -4499,3 +4788,1871 @@ def test_an_upload_holds_its_session_while_it_imports_and_answers(
         assert (after["open_id"], after["revision"]) == (shown["open_id"], project["revision"])
     else:
         assert (after["open_id"], after["lanes"], after["images"]) == (shown["open_id"] + 1, [], [])
+
+
+# --- Images handed to the app (#57, N3) ---
+
+
+class Ticks:
+    """A monotonic clock for the inbox that moves only when told."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def ticks(client, monkeypatch) -> Ticks:
+    """The inbox's clock, stopped: hand-offs stay young until it is advanced."""
+    clock = Ticks()
+    monkeypatch.setattr(client.workspace.inbox, "_clock", clock)
+    return clock
+
+
+def incoming(name: str) -> str:
+    return f"/api/incoming?name={quote(name, safe='')}"
+
+
+def staged(client: Client, data: bytes, name: str = "blot.tif") -> dict:
+    """One file staged as a launch hands it to the app: the answer."""
+    status, answer = client.call("POST", incoming(name), raw=data)
+    assert status == 201, answer
+    return answer
+
+
+def listed(client: Client, handoff_id: str) -> dict:
+    """The hand-off as GET /api/workspace lists it."""
+    (entry,) = [h for h in client.ok("GET", "/api/workspace")["handoffs"] if h["id"] == handoff_id]
+    return entry
+
+
+def handed_off(
+    client: Client, tmp_path: Path, names: list[str], *, refused: list[dict] | None = None
+) -> tuple[str, list[dict]]:
+    """A synthetic blot staged under each name, offered at once: the hand-off's
+    id and its files as listed."""
+    ids = [staged(client, blot_bytes(tmp_path), name)["file_id"] for name in names]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids, "refused": refused or []})
+    return offered["handoff_id"], listed(client, offered["handoff_id"])["files"]
+
+
+def choices(
+    files: list[dict],
+    *,
+    kinds: dict[int, str] | None = None,
+    membranes: dict[int, int] | None = None,
+    polarity: str = "dark_on_light",
+) -> list[dict]:
+    """An accept's files: chemiluminescence unless ``kinds`` says, each on a new
+    membrane unless ``membranes`` names an earlier file's."""
+    return [
+        {
+            "file_id": file["file_id"],
+            "kind": (kinds or {}).get(index, "chemiluminescence"),
+            "polarity": polarity,
+            "membrane": (membranes or {}).get(index, "new"),
+        }
+        for index, file in enumerate(files)
+    ]
+
+
+def accept(
+    client: Client,
+    handoff_id: str,
+    files: list[dict],
+    *,
+    name: str | None = None,
+    headers: dict[str, str] | None = None,
+    **chosen: Any,
+) -> dict:
+    body = {"name": name, "files": choices(files, **chosen)}
+    return client.ok("POST", f"/api/handoffs/{handoff_id}/accept", body, headers=headers)
+
+
+def staging(client: Client) -> list[str]:
+    """The names of the files in the staging folder."""
+    folder = client.workspace.inbox.folder
+    assert folder is not None
+    return sorted(path.name for path in folder.iterdir()) if folder.is_dir() else []
+
+
+def in_root(client: Client) -> list[str]:
+    return sorted(path.name for path in client.root.iterdir()) if client.root.is_dir() else []
+
+
+def test_an_incoming_file_is_staged_under_a_name_the_server_makes(client, tmp_path):
+    data = blot_bytes(tmp_path)
+    answer = staged(client, data, NAME)
+    assert (answer["name"], answer["size"]) == (NAME, len(data))
+    folder = client.workspace.inbox.folder
+    assert folder == tmp_path / "state" / "incoming"
+    (stored,) = folder.iterdir()
+    assert re.fullmatch(r"[0-9a-f]{32}", stored.name) and stored.read_bytes() == data
+    assert answer["file_id"] not in stored.name
+    # Nothing in the projects root, and nothing listed until it is offered.
+    assert not client.root.exists()
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "status", "code"),
+    [
+        ("notes.txt", b"x", 422, "unsupported_image_type"),
+        ("blot.bmp", b"x", 422, "unsupported_image_type"),
+        ("C:\\x\\a.tif", b"x", 422, "invalid_image"),
+        ("../a.tif", b"x", 422, "invalid_image"),
+        ("a/b.tif", b"x", 422, "invalid_image"),
+        ("x" * 252 + ".tif", b"x", 422, "invalid_image"),  # 256 characters
+        ("blot.tif", b"", 422, "invalid_image"),
+    ],
+    ids=["txt", "bmp", "windows path", "parent", "folder", "256 characters", "empty"],
+)
+def test_an_incoming_file_that_cannot_be_an_image_is_refused_and_leaves_nothing(
+    client, name, data, status, code
+):
+    assert client.refused("POST", incoming(name), raw=data)[:2] == (status, code)
+    assert staging(client) == []
+    assert not client.root.exists()
+
+
+def _stage_chunked(client: Client, chunks: list[bytes], name: str = "a.tif") -> tuple[int, Any]:
+    """A file staged in chunks, with no size declared (Transfer-Encoding: chunked)."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        conn.request(
+            "POST",
+            incoming(name),
+            body=iter(chunks),
+            headers={
+                "Authorization": f"Bearer {client.token}",
+                "Content-Type": "application/octet-stream",
+            },
+            encode_chunked=True,
+        )
+        response = conn.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        conn.close()
+
+
+def test_an_incoming_file_over_the_size_limit_is_refused(client, monkeypatch):
+    monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 100)
+    assert client.refused("POST", incoming("a.tif"), raw=b"x" * 101)[:2] == (
+        413,
+        "image_too_large",
+    )
+    status, answer = _stage_chunked(client, [b"x" * 60, b"x" * 60])  # no size declared
+    assert (status, answer["code"]) == (413, "image_too_large")
+    assert staging(client) == []
+    assert staged(client, b"x" * 100)["size"] == 100
+
+
+def test_an_incoming_file_that_cannot_be_stored_is_refused_naming_no_path(client, tmp_path):
+    # The launch passes the message on to the page, which sees no path: the
+    # staging folder's is in the per-user state folder.
+    folder = client.workspace.inbox.folder
+    assert folder is not None
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    folder.write_bytes(b"")  # the staging folder cannot be made
+    status, payload = client.call("POST", incoming("a µ.tif"), raw=b"x" * 10)
+    assert (status, payload["code"]) == (500, "file_error")
+    assert payload["message"].startswith("'a µ.tif' could not be stored: ")
+    for path in (str(tmp_path), str(folder), folder.name):
+        assert path not in payload["message"]
+    folder.unlink()
+    assert staged(client, b"x" * 10)["size"] == 10
+
+
+def test_uploads_beyond_the_pending_limits_are_refused(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 2)
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    staged(client, b"x" * 10, "b.tif")  # not offered: waiting too
+    status, code, _ = client.refused("POST", incoming("c.tif"), raw=b"x" * 10)
+    assert (status, code) == (409, "too_many_pending")
+    assert len(staging(client)) == 2
+    body = {"files": [file["file_id"] for file in files]}
+    assert client.call("POST", f"/api/handoffs/{handoff_id}/discard", body)[0] == 204
+    staged(client, b"x" * 10, "c.tif")  # room again
+
+    # The bytes staged: those waiting, and those an upload declares or has sent.
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 32)
+    monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 50)
+    status, code, _ = client.refused("POST", incoming("d.tif"), raw=b"x" * 31)
+    assert (status, code) == (409, "too_many_pending")
+    monkeypatch.setattr(api, "_WRITE_BYTES", 10)  # written, and counted, 10 bytes at a time
+    status, answer = _stage_chunked(client, [b"x" * 20, b"x" * 20])
+    assert (status, answer["code"]) == (409, "too_many_pending")
+    assert len(staging(client)) == 2
+    assert staged(client, b"x" * 30, "e.tif")["size"] == 30
+
+
+def room(name: str, size: int | str) -> str:
+    return f"/api/incoming/room?name={quote(name, safe='')}&size={size}"
+
+
+def test_the_room_for_an_incoming_file_is_checked_without_holding_any(
+    client, tmp_path, ticks, monkeypatch
+):
+    # A launch asks before it sends a file's bytes, so that it sends none an
+    # upload would refuse. The check refuses as the upload would before its
+    # body is read, and holds nothing.
+    assert client.call("GET", room("a µ.tif", 10)) == (204, ("", b""))
+    assert staging(client) == [] and client.ok("GET", "/api/workspace")["handoffs"] == []
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 1)
+    for _ in range(2):
+        assert client.call("GET", room("a.tif", 10))[0] == 204  # held nothing
+    staged(client, b"x" * 10, "a.tif")
+    status, payload = client.call("GET", room("b.tif", 10))
+    assert (status, payload["code"]) == (409, "too_many_pending")
+    assert payload["message"] == "1 images are waiting in Proteia: import or discard them first"
+    assert client.refused("POST", incoming("b.tif"), raw=b"x" * 10)[:2] == (409, "too_many_pending")
+    # An upload no offer took expires as an upload's check finds it.
+    ticks.advance(handoff.UPLOAD_EXPIRY_S)
+    assert client.call("GET", room("b.tif", 10))[0] == 204
+    assert staging(client) == []
+
+    # The bytes: those staged and held, and the file's size.
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 32)
+    monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 50)
+    staged(client, b"x" * 20, "c.tif")
+    assert client.call("GET", room("d.tif", 30))[0] == 204
+    assert client.refused("GET", room("d.tif", 31))[:2] == (409, "too_many_pending")
+    # The name and the size, as an upload's are checked before its body.
+    monkeypatch.setattr(api, "MAX_UPLOAD_BYTES", 25)
+    assert client.refused("GET", room("d.tif", 26))[:2] == (413, "image_too_large")
+    assert client.refused("GET", room("notes.txt", 1))[:2] == (422, "unsupported_image_type")
+    assert client.refused("GET", room("../d.tif", 1))[:2] == (422, "invalid_image")
+    for path in (room("d.tif", -1), room("d.tif", "x"), "/api/incoming/room?name=d.tif"):
+        assert client.refused("GET", path)[:2] == (422, "invalid_input"), path
+    client.workspace.inbox.stop()
+    assert client.refused("GET", room("d.tif", 1))[:2] == (409, "stopping")
+    assert len(staging(client)) == 1
+
+
+def test_nothing_is_staged_offered_or_imported_once_proteia_is_stopping(client, tmp_path):
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    waiting = staged(client, blot_bytes(tmp_path), "b.tif")
+    client.workspace.inbox.stop()
+    assert client.refused("POST", incoming("c.tif"), raw=b"x")[:2] == (409, "stopping")
+    body: dict[str, Any] = {"files": [waiting["file_id"]]}
+    assert client.refused("POST", "/api/handoffs", body)[:2] == (409, "stopping")
+    body = {"files": choices(files)}
+    assert client.refused("POST", f"/api/handoffs/{handoff_id}/accept", body)[:2] == (
+        409,
+        "stopping",
+    )
+    assert not client.root.exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "code"),
+    [
+        ({"files": ["0" * 16]}, 404, "unknown_id"),
+        ({"files": ["A", "A"]}, 422, "invalid_input"),
+        ({}, 422, "invalid_input"),
+        ({"files": ["A"], "more": 1}, 422, "invalid_input"),
+        ({"files": ["A"], "refused": [{"name": 1, "code": "x", "message": "y"}]}, 422, None),
+        ({"files": ["A"], "refused": [{"name": "a.bmp", "code": "x"}]}, 422, None),
+        ({"files": "A"}, 422, "invalid_input"),
+    ],
+    ids=[
+        "unknown id",
+        "an id twice",
+        "nothing",
+        "unknown key",
+        "a name not text",
+        "no message",
+        "files not a list",
+    ],
+)
+def test_an_offer_that_cannot_be_taken_hands_off_nothing(client, tmp_path, body, status, code):
+    staged_id = staged(client, blot_bytes(tmp_path), "a.tif")["file_id"]
+    body = json.loads(json.dumps(body).replace('"A"', json.dumps(staged_id)))
+    assert client.refused("POST", "/api/handoffs", body)[:2] == (status, code or "invalid_input")
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+    assert client.ok("POST", "/api/handoffs", {"files": [staged_id]})["files"] == 1  # still waiting
+
+
+def test_an_offer_hands_off_uploaded_files_once(client, tmp_path, ticks):
+    a = staged(client, blot_bytes(tmp_path), "a.tif")
+    b = staged(client, b"x" * 7, "b µ.png")
+    offered = client.ok("POST", "/api/handoffs", {"files": [a["file_id"], b["file_id"]]})
+    assert offered == {
+        "handoff_id": offered["handoff_id"],
+        "merged": False,
+        "files": 2,
+        "refused": 0,
+    }
+    body = {"files": [a["file_id"]]}
+    assert client.refused("POST", "/api/handoffs", body)[:2] == (409, "file_claimed")
+    assert client.ok("GET", "/api/workspace")["handoffs"] == [
+        {
+            "id": offered["handoff_id"],
+            "kind": "images",
+            "files": [
+                {"file_id": a["file_id"], "name": "a.tif", "size": a["size"]},
+                {"file_id": b["file_id"], "name": "b µ.png", "size": 7},
+            ],
+            "suggested_name": "a",
+            "refused": [],
+            "more_refused": 0,
+            "more_may_arrive": True,
+            "claimed": False,
+        }
+    ]
+
+
+def test_refused_arguments_are_kept_bounded_and_never_refuse_the_offer(client, tmp_path):
+    file_id = staged(client, blot_bytes(tmp_path), "a.tif")["file_id"]
+    refused = [
+        {"name": "β" * 300 + ".tif", "code": "missing", "message": "no such file or folder"},
+        {"name": "bad\x07name\u202e.tif", "code": "made_up", "message": "m" * 500},
+        {"name": "half\ud800.tif", "code": "unreadable", "message": "cannot be read: \udfff"},
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"files": [file_id], "refused": refused})
+    assert (offered["files"], offered["refused"]) == (1, 3)
+    entry = listed(client, offered["handoff_id"])
+    assert [file["file_id"] for file in entry["files"]] == [file_id]
+    first, second, third = entry["refused"]
+    assert first == {
+        "name": "β" * 119 + "…",
+        "code": "missing",
+        "message": "no such file or folder",
+    }
+    assert second == {
+        "name": "bad\ufffdname\ufffd.tif",
+        "code": "other",
+        "message": "m" * 199 + "…",
+    }
+    assert third == {
+        "name": "half\ufffd.tif",
+        "code": "unreadable",
+        "message": "cannot be read: \ufffd",
+    }
+
+
+def test_only_the_first_hundred_refused_entries_are_kept(client):
+    refused = [
+        {"name": f"{i}.bmp", "code": "unsupported_type", "message": "not an image type"}
+        for i in range(150)
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"refused": refused})
+    assert (offered["merged"], offered["files"], offered["refused"]) == (False, 0, 150)
+    entry = listed(client, offered["handoff_id"])
+    assert (entry["kind"], entry["files"], entry["suggested_name"]) == ("notice", [], None)
+    assert [r["name"] for r in entry["refused"]] == [f"{i}.bmp" for i in range(100)]
+    assert entry["more_refused"] == 50
+
+
+def test_offers_whose_uploads_began_within_the_window_join_one_hand_off(
+    client, tmp_path, ticks, monkeypatch
+):
+    def offer(name: str) -> dict:
+        file_id = staged(client, blot_bytes(tmp_path), name)["file_id"]
+        return client.ok("POST", "/api/handoffs", {"files": [file_id]})
+
+    first = offer("a.tif")
+    ticks.advance(handoff.MERGE_WINDOW_S - 1)
+    second = offer("b.tif")
+    assert (second["handoff_id"], second["merged"], second["files"]) == (
+        first["handoff_id"],
+        True,
+        2,
+    )
+    ticks.advance(handoff.MERGE_WINDOW_S)  # from b.tif's start
+    third = offer("c.tif")
+    assert third["handoff_id"] != first["handoff_id"] and not third["merged"]
+    monkeypatch.setattr(handoff, "MAX_HANDOFF_FILES", 2)
+    fourth = offer("d.tif")
+    assert fourth["handoff_id"] == third["handoff_id"]
+    fifth = offer("e.tif")  # within the window, but the hand-off is full
+    assert fifth["handoff_id"] not in (first["handoff_id"], third["handoff_id"])
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [[file["name"] for file in h["files"]] for h in handoffs] == [
+        ["a.tif", "b.tif"],
+        ["c.tif", "d.tif"],
+        ["e.tif"],
+    ]
+
+
+def _staging_begun(client: Client, name: str, size: int) -> http.client.HTTPConnection:
+    """A file staged with its request line and headers sent, and none of its
+    body (as :func:`_upload_begun`)."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    conn.putrequest("POST", incoming(name))
+    for header, value in {
+        "Authorization": f"Bearer {client.token}",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(size),
+    }.items():
+        conn.putheader(header, value)
+    conn.endheaders()
+    return conn
+
+
+def test_a_slow_upload_joins_the_hand_off_its_start_was_near(client, tmp_path, ticks, monkeypatch):
+    # An Explorer selection of a large file and a small one: the small one is
+    # offered first; the large one, begun as early, arrives a minute later and
+    # still joins it, so the selection gives one project. Meanwhile the
+    # hand-off says more may arrive.
+    inbox = client.workspace.inbox
+    began = threading.Event()
+    begin = inbox.begin_upload
+
+    def beginning(*args: Any, **kwargs: Any) -> Any:
+        upload = begin(*args, **kwargs)
+        began.set()
+        return upload
+
+    monkeypatch.setattr(inbox, "begin_upload", beginning)
+    data = blot_bytes(tmp_path)
+    conn = _staging_begun(client, "slow.tif", len(data))
+    try:
+        conn.send(data[:1000])
+        assert began.wait(20)
+        ticks.advance(2)
+        quick = staged(client, data, "quick.tif")["file_id"]
+        offered = client.ok("POST", "/api/handoffs", {"files": [quick]})
+        ticks.advance(60)  # the slow file takes a minute more
+        assert listed(client, offered["handoff_id"])["more_may_arrive"]
+        conn.send(data[1000:])
+        status, slow = _answered(conn)
+    finally:
+        conn.close()
+    assert status == 201, slow
+    assert listed(client, offered["handoff_id"])["more_may_arrive"]  # staged, not offered
+    joined = client.ok("POST", "/api/handoffs", {"files": [slow["file_id"]]})
+    assert (joined["handoff_id"], joined["merged"]) == (offered["handoff_id"], True)
+    entry = listed(client, offered["handoff_id"])
+    assert [file["name"] for file in entry["files"]] == ["quick.tif", "slow.tif"]
+    assert not entry["more_may_arrive"]
+
+
+def test_the_workspace_lists_each_hand_off_with_the_name_its_project_would_take(
+    client, tmp_path, ticks, monkeypatch
+):
+    client.ok("POST", "/api/projects", {"name": "blot"})
+    first, _ = handed_off(client, tmp_path, ["Blot.TIF"])
+    ticks.advance(handoff.MERGE_WINDOW_S)
+    second, _ = handed_off(client, tmp_path, [NAME, "marker α.tif"])
+    listings: list[Path] = []
+    iterdir = Path.iterdir
+
+    def counting(self: Path) -> Any:
+        if self == client.root:
+            listings.append(self)
+        return iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", counting)
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [(h["id"], h["suggested_name"]) for h in handoffs] == [
+        (first, "Blot (2)"),  # blot is taken, ignoring case
+        (second, "β-actin 10 µM"),
+    ]
+    assert len(listings) == 1  # the root, once for both
+    assert [h["more_may_arrive"] for h in handoffs] == [False, True]  # the first is older
+    ticks.advance(handoff.MERGE_WINDOW_S)
+    assert [h["more_may_arrive"] for h in client.ok("GET", "/api/workspace")["handoffs"]] == [
+        False,
+        False,
+    ]
+
+    # A hand-off an accept has claimed is listed as claimed, as it was: the
+    # accept may be refused and release it.
+    inbox = client.workspace.inbox
+    before = listed(client, first)
+    claimed = inbox.claim(first, [file["file_id"] for file in before["files"]])
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [(h["id"], h["claimed"]) for h in handoffs] == [(first, True), (second, False)]
+    assert handoffs[0] == {**before, "claimed": True}
+    inbox.release(claimed)
+    assert client.ok("GET", "/api/workspace")["handoffs"][0] == before
+
+
+def test_an_accept_imports_the_images_into_a_new_project_named_after_the_first(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    before = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    old = client.workspace.current()
+    handoff_id, files = handed_off(client, tmp_path, [NAME, "marker α.tif"])
+    answer = accept(client, handoff_id, files, kinds={1: "visible_marker"}, membranes={1: 0})
+
+    project = answer["project"]
+    assert project["name"] == "β-actin 10 µM" and project["open_id"] == before["open_id"] + 1
+    images = project["images"]
+    assert [(i["original_name"], i["kind"], i["polarity"]) for i in images] == [
+        (NAME, "chemiluminescence", "dark_on_light"),
+        ("marker α.tif", "visible_marker", "dark_on_light"),
+    ]
+    membrane = images[0]["membrane_id"]
+    assert images[1]["membrane_id"] == membrane
+    assert answer["handoff"] == {
+        "imported": [
+            {
+                "file_id": files[0]["file_id"],
+                "name": NAME,
+                "image_id": images[0]["id"],
+                "membrane_id": membrane,
+                "new_membrane": True,
+            },
+            {
+                "file_id": files[1]["file_id"],
+                "name": "marker α.tif",
+                "image_id": images[1]["id"],
+                "membrane_id": membrane,
+                "new_membrane": False,
+            },
+        ],
+        "refused": [],
+        "launch_refused": [],
+        "more_refused": 0,
+        "notes": [],
+    }
+    saved = storage.load_project(client.root / "β-actin 10 µM")
+    assert [entry.action for entry in saved.log] == ["new_project", "import_image", "import_image"]
+    assert staging(client) == []
+    workspace = client.ok("GET", "/api/workspace")
+    assert (workspace["open"], workspace["handoffs"]) == ("β-actin 10 µM", [])
+    # The project open before is saved and closed.
+    assert (old.undo_step, old.redo_step) == (None, None)
+    assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["vehicle"]
+
+
+def test_an_accept_says_what_the_launches_refused(client, tmp_path, ticks):
+    refused = [{"name": "photo.bmp", "code": "unsupported_type", "message": "not an image type"}]
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"], refused=refused)
+    late = [{"name": "gone.tif", "code": "missing", "message": "no such file or folder"}]
+    assert client.ok("POST", "/api/handoffs", {"refused": late})["merged"]  # a notice, merged
+    handed = accept(client, handoff_id, files)["handoff"]
+    assert (handed["launch_refused"], handed["more_refused"]) == (refused + late, 0)
+
+
+def test_an_accept_takes_the_name_typed_or_refuses_it_changing_nothing(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Taken"})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    path = f"/api/handoffs/{handoff_id}/accept"
+    for name, refused in (
+        ("taken", (409, "project_exists")),
+        ("a/b", (422, "invalid_project_name")),
+    ):
+        assert client.refused("POST", path, {"name": name, "files": choices(files)})[:2] == refused
+        assert in_root(client) == ["Taken"] and listed(client, handoff_id)["files"] == files
+    assert accept(client, handoff_id, files, name="  My  blot ")["project"]["name"] == "My blot"
+
+
+def test_a_hand_off_listed_as_claimed_is_pending_again_once_its_accept_is_refused(
+    client, tmp_path, monkeypatch, ticks
+):
+    # Another tab's accept claims the hand-off a page shows: the listing keeps
+    # it, claimed, so the page keeps its rows and choices; no second accept or
+    # discard takes it meanwhile; and once that accept is refused (a name
+    # taken), it is listed as it was, to import.
+    client.ok("POST", "/api/projects", {"name": "Taken"})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif", "b.tif"])
+    before = listed(client, handoff_id)
+    assert (before["claimed"], before["more_may_arrive"]) == (False, True)  # young
+    entered, release = _held_until_released(monkeypatch, api.projects, "create_set_up")
+    path = f"/api/handoffs/{handoff_id}"
+    accepting, accepted = _in_thread(
+        lambda: client.call("POST", f"{path}/accept", {"name": "taken", "files": choices(files)})
+    )
+    try:
+        assert entered.wait(20)
+        assert listed(client, handoff_id) == {**before, "claimed": True, "more_may_arrive": False}
+        ids = [file["file_id"] for file in files]
+        for route, body in (("accept", {"files": choices(files)}), ("discard", {"files": ids})):
+            assert client.refused("POST", f"{path}/{route}", body)[:2] == (409, "handoff_claimed")
+    finally:
+        release.set()
+        accepting.join(30)
+    status, answer = accepted[0]
+    assert (status, answer["code"]) == (409, "project_exists")
+    assert listed(client, handoff_id) == before
+    assert accept(client, handoff_id, files)["project"]["name"] == "a"
+
+
+def _missing_polarity(body: dict) -> None:
+    del body["files"][1]["polarity"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        _missing_polarity,
+        lambda body: body["files"][0].update(kind="photo"),
+        lambda body: body["files"][1].update(polarity="dark"),
+        lambda body: body["files"][1].update(polarity=None),
+        lambda body: body["files"][0].update(membrane=0),  # itself
+        lambda body: body["files"][0].update(membrane=1),  # a later file
+        lambda body: body["files"][1].update(membrane=-1),
+        lambda body: body["files"][1].update(membrane="same"),
+        lambda body: body["files"][1].update(membrane=True),
+        lambda body: body.update(files="all"),
+        lambda body: body.update(extra=1),
+    ],
+    ids=[
+        "no polarity",
+        "unknown kind",
+        "unknown polarity",
+        "null polarity",
+        "membrane of itself",
+        "membrane of a later file",
+        "negative membrane",
+        "membrane text",
+        "membrane true",
+        "files not a list",
+        "unknown key",
+    ],
+)
+def test_an_accept_that_cannot_be_read_changes_nothing(client, tmp_path, change):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif", "b.tif"])
+    body: dict[str, Any] = {"name": None, "files": choices(files)}
+    change(body)
+    path = f"/api/handoffs/{handoff_id}/accept"
+    assert client.refused("POST", path, body)[:2] == (422, "invalid_input")
+    assert in_root(client) == ["Blot"]
+    assert client.ok("GET", "/api/workspace")["open"] == "Blot"
+    assert listed(client, handoff_id)["files"] == files
+    assert len(staging(client)) == 2
+
+
+def test_an_accept_of_other_files_than_those_waiting_is_refused_with_them(client, tmp_path, ticks):
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    late = staged(client, blot_bytes(tmp_path), "b.tif")["file_id"]
+    assert client.ok("POST", "/api/handoffs", {"files": [late]})["merged"]
+    path = f"/api/handoffs/{handoff_id}/accept"
+    status, payload = client.call("POST", path, {"files": choices(files)})
+    assert (status, payload["code"]) == (409, "handoff_changed")
+    assert payload["detail"] == listed(client, handoff_id)
+    now = payload["detail"]["files"]
+    assert [file["name"] for file in now] == ["a.tif", "b.tif"]
+    assert not client.root.exists()
+    assert client.refused("POST", "/api/handoffs/nothing/accept", {"files": []})[:2] == (
+        404,
+        "handoff_not_found",
+    )
+    project = accept(client, handoff_id, now)["project"]
+    assert [image["original_name"] for image in project["images"]] == ["a.tif", "b.tif"]
+
+
+def test_a_notice_has_nothing_to_accept(client):
+    refused = [{"name": "photo.bmp", "code": "unsupported_type", "message": "not an image type"}]
+    handoff_id = client.ok("POST", "/api/handoffs", {"refused": refused})["handoff_id"]
+    path = f"/api/handoffs/{handoff_id}/accept"
+    assert client.refused("POST", path, {"files": []})[:2] == (422, "invalid_input")
+    assert client.call("POST", f"/api/handoffs/{handoff_id}/discard", {"files": [], "refused": 1})[
+        0
+    ] == (204)
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+
+
+def test_a_file_that_cannot_be_imported_is_left_out_and_said(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    ids = [
+        staged(client, b"not an image" * 100, "bad.tif")["file_id"],
+        staged(client, blot_bytes(tmp_path), "blot.tif")["file_id"],
+        staged(client, blot_bytes(tmp_path), "marker α.tif")["file_id"],
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids})
+    files = listed(client, offered["handoff_id"])["files"]
+    # blot.tif to join bad.tif's membrane, the marker to join blot.tif's.
+    answer = accept(client, offered["handoff_id"], files, membranes={1: 0, 2: 1})
+    handed = answer["handoff"]
+    assert [(f["name"], f["new_membrane"]) for f in handed["imported"]] == [
+        ("blot.tif", True),
+        ("marker α.tif", False),
+    ]
+    assert handed["imported"][0]["membrane_id"] == handed["imported"][1]["membrane_id"]
+    (refused,) = handed["refused"]
+    assert (refused["file_id"], refused["name"], refused["code"]) == (
+        ids[0],
+        "bad.tif",
+        "unreadable_image",
+    )
+    assert handed["notes"] == [
+        "blot.tif was put on a new membrane because bad.tif was not imported"
+    ]
+    # Named after the first file, though it was left out: the name is chosen first.
+    assert answer["project"]["name"] == "bad"
+    assert [image["original_name"] for image in answer["project"]["images"]] == [
+        "blot.tif",
+        "marker α.tif",
+    ]
+    assert staging(client) == []
+
+
+def test_an_accept_with_nothing_importable_leaves_no_project(client):
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    ids = [staged(client, b"not an image", name)["file_id"] for name in ("a.tif", "b.png")]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids})
+    files = listed(client, offered["handoff_id"])["files"]
+    path = f"/api/handoffs/{offered['handoff_id']}/accept"
+    status, payload = client.call("POST", path, {"files": choices(files)})
+    assert (status, payload["code"]) == (422, "nothing_imported")
+    assert [(r["file_id"], r["name"], r["code"]) for r in payload["detail"]["refused"]] == [
+        (ids[0], "a.tif", "unreadable_image"),
+        (ids[1], "b.png", "unreadable_image"),
+    ]
+    assert in_root(client) == ["Blot"]
+    workspace = client.ok("GET", "/api/workspace")
+    # Discarded: an accept again would fail again.
+    assert (workspace["open"], workspace["handoffs"]) == ("Blot", [])
+    assert staging(client) == []
+
+
+def test_an_accept_while_the_open_project_cannot_be_saved_changes_nothing(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    project_file = client.root / "Blot" / storage.PROJECT_FILE
+    project_file.unlink()
+    project_file.mkdir()  # the autosave cannot replace it
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    path = f"/api/handoffs/{handoff_id}/accept"
+    status, payload = client.call("POST", path, {"files": choices(files)})
+    assert (status, payload["code"]) == (409, "unsaved_changes") and "detail" not in payload
+    assert in_root(client) == ["Blot"]
+    assert listed(client, handoff_id)["files"] == files and len(staging(client)) == 1
+
+    project_file.rmdir()
+    assert accept(client, handoff_id, files)["project"]["name"] == "a"
+    saved = storage.load_project(client.root / "Blot")
+    assert [lane.label for lane in saved.batch.lanes] == ["vehicle"]
+
+
+@pytest.mark.parametrize("switch", ["create", "accept"])
+def test_an_edit_made_while_a_switch_runs_is_saved_before_the_old_project_closes(
+    client, tmp_path, monkeypatch, switch
+):
+    # While a switch creates its project (for an accept: and imports into it)
+    # the old project is still open, and another page may edit it. If that
+    # edit's autosave fails, the old project is saved again before it is
+    # closed; if that fails too, the switch is abandoned: the old project stays
+    # open with the edit, and the answer names the project created.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    old = client.workspace.current()
+    project_file = old.folder / storage.PROJECT_FILE
+    edits: list[str] = []
+    fixed = threading.Event()  # the file can be written again once the edit is made
+    create_project = api.projects.create_project
+
+    def edited_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        project_file.unlink()
+        project_file.mkdir()  # the edit's autosave fails
+        edits.append(f"c{len(edits) + 1}")
+        api.ops.set_lanes(old, [api.ops.LaneInput(condition) for condition in edits])
+        assert old.dirty
+        if fixed.is_set():
+            project_file.rmdir()
+        return create_project(*args, **kwargs)
+
+    monkeypatch.setattr(api.projects, "create_project", edited_meanwhile)
+
+    def switch_to(name: str) -> tuple[int, Any]:
+        if switch == "create":
+            return client.call("POST", "/api/projects", {"name": name})
+        handoff_id, files = handed_off(client, tmp_path, [f"{name}.tif"])
+        return client.call("POST", f"/api/handoffs/{handoff_id}/accept", {"files": choices(files)})
+
+    status, payload = switch_to("First")
+    assert (status, payload["code"], payload["detail"]) == (
+        409,
+        "unsaved_changes",
+        {"created": "First"},
+    )
+    assert "'First'" in payload["message"] and "'Blot'" in payload["message"]
+    assert client.workspace.current() is old and old.dirty
+    assert [lane.label for lane in old.project.batch.lanes] == ["c1"]
+    assert client.ok("GET", "/api/workspace")["open"] == "Blot"
+    created = storage.load_project(client.root / "First")  # complete, and closed
+    assert len(list(created.batch.iter_images())) == (1 if switch == "accept" else 0)
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []  # its images are in First
+    assert staging(client) == []
+
+    project_file.rmdir()  # saved again before the switch, then while it runs
+    fixed.set()
+    status, payload = switch_to("Second")
+    assert status == 201, payload
+    assert payload["project"]["name"] == "Second"
+    saved = storage.load_project(old.folder)
+    assert [lane.label for lane in saved.batch.lanes] == ["c1", "c2"]
+    assert not old.dirty
+
+
+def test_an_open_whose_old_project_cannot_be_saved_after_it_names_nothing_created(
+    client, monkeypatch
+):
+    # An open makes no project: if an edit made while it runs cannot be saved,
+    # it is refused as when the open project cannot be saved first. Nothing is
+    # named as created, and the old project stays open with the edit.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    other = (client.root / "Other" / storage.PROJECT_FILE).read_bytes()
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    old = client.workspace.current()
+    project_file = old.folder / storage.PROJECT_FILE
+    open_project = api.ops.open_project
+
+    def edited_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        project_file.unlink()
+        project_file.mkdir()  # the edit's autosave fails
+        api.ops.set_lanes(old, [api.ops.LaneInput("c1")])
+        assert old.dirty
+        return open_project(*args, **kwargs)
+
+    monkeypatch.setattr(api.ops, "open_project", edited_meanwhile)
+    status, payload = client.call("POST", "/api/projects/open", {"name": "Other"})
+    assert (status, payload["code"]) == (409, "unsaved_changes")
+    assert "detail" not in payload and "created" not in payload["message"]
+    assert payload["message"].startswith("the open project could not be saved: ")
+    assert client.workspace.current() is old and old.dirty
+    assert client.ok("GET", "/api/workspace")["open"] == "Blot"
+    assert (client.root / "Other" / storage.PROJECT_FILE).read_bytes() == other
+
+    monkeypatch.setattr(api.ops, "open_project", open_project)
+    project_file.rmdir()
+    assert client.ok("POST", "/api/projects/open", {"name": "Other"})["project"]["name"] == "Other"
+    assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["c1"]
+
+
+def test_a_switch_waits_for_an_edit_running_on_the_old_project(tmp_path, monkeypatch):
+    # An edit running on the open project when a create has made its project
+    # holds that project's lock and has not changed it yet. The switch waits
+    # for it before replacing the project, so an edit whose autosave fails is
+    # saved again, or stays open, never left only in a closed session. Here the
+    # save fails again: the switch is abandoned, and the edit stays open.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    old = workspace.create("Blot")
+    project_file = old.folder / storage.PROJECT_FILE
+    project_file.unlink()
+    project_file.mkdir()  # every save of Blot fails
+    made = threading.Event()
+    create_project = api.projects.create_project
+
+    def creating(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return create_project(*args, **kwargs)
+        finally:
+            made.set()
+
+    monkeypatch.setattr(api.projects, "create_project", creating)
+    holding, go = threading.Event(), threading.Event()
+
+    def editing() -> None:  # a request's operation on Blot, e.g. a slow detection
+        with old.lock:
+            holding.set()
+            assert go.wait(20)
+            api.ops.set_lanes(old, [api.ops.LaneInput("vehicle")])  # its autosave fails
+
+    def switching() -> None:
+        with pytest.raises(api.UnsavedChangesError) as refused:
+            workspace.create("New")
+        errors.append(refused.value)
+
+    errors: list[api.UnsavedChangesError] = []
+    edit = threading.Thread(target=editing)
+    edit.start()
+    assert holding.wait(20)
+    switch = threading.Thread(target=switching)
+    switch.start()
+    assert made.wait(20)
+    deadline = time.monotonic() + 0.5  # time enough for a switch that does not wait
+    while workspace.current() is old and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert workspace.current() is old  # waiting for the edit
+    go.set()
+    for thread in (edit, switch):
+        thread.join(20)
+        assert not thread.is_alive()
+
+    (error,) = errors
+    assert error.created == "New"
+    assert workspace.current() is old and old.dirty
+    assert [lane.label for lane in old.project.batch.lanes] == ["vehicle"]
+    assert storage.load_project(tmp_path / "root" / "New").batch.lanes == []  # created, closed
+
+
+@pytest.mark.parametrize("saves", [True, False], ids=["saved", "logged"])
+def test_an_edit_made_on_the_old_project_once_replaced_is_saved_after_the_close(
+    tmp_path, monkeypatch, caplog, saves
+):
+    # A request that took the open project before a switch replaced it may
+    # edit it after, before the close. If that edit's autosave fails, the old
+    # project is saved once more after the close; a failure then is logged.
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    old = workspace.create("Blot")
+    project_file = old.folder / storage.PROJECT_FILE
+    close = old.close
+
+    def edited_then_closed(**kwargs: Any) -> None:
+        assert workspace.current() is not old  # replaced
+        project_file.unlink()
+        project_file.mkdir()  # the edit's autosave fails
+        api.ops.set_lanes(old, [api.ops.LaneInput("vehicle")])
+        assert old.dirty
+        if saves:
+            project_file.rmdir()
+        close(**kwargs)
+
+    monkeypatch.setattr(old, "close", edited_then_closed)
+    with caplog.at_level(logging.WARNING, logger=api.__name__):
+        new = workspace.create("New")
+    assert workspace.current() is new
+    logged = [record.getMessage() for record in caplog.records if record.name == api.__name__]
+    if saves:
+        assert not old.dirty and logged == []
+        assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["vehicle"]
+    else:
+        assert old.dirty
+        (message,) = logged
+        assert message.startswith("'Blot' was closed with changes that could not be saved: ")
+
+
+def test_an_accept_from_a_page_showing_another_opening_changes_nothing(client, tmp_path):
+    shown = client.ok("POST", "/api/projects", {"name": "Blot"})["project"]["open_id"]
+    now = client.ok("POST", "/api/projects", {"name": "Other"})["project"]["open_id"]
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    path = f"/api/handoffs/{handoff_id}/accept"
+    status, payload = client.call(
+        "POST", path, {"files": choices(files)}, headers={OPENING: str(shown)}
+    )
+    assert (status, payload["code"], payload["detail"]) == (
+        409,
+        "project_changed",
+        {"open": "Other", "open_id": now},
+    )
+    assert in_root(client) == ["Blot", "Other"] and listed(client, handoff_id)["files"] == files
+    answer = accept(client, handoff_id, files, headers={OPENING: str(now)})
+    assert (answer["project"]["name"], answer["project"]["open_id"]) == ("a", now + 1)
+
+
+def test_files_offered_while_an_accept_runs_start_another_hand_off(
+    client, tmp_path, monkeypatch, ticks
+):
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
+    ids = [file["file_id"] for file in files]
+    entered, release = _held_until_released(monkeypatch, api.ops, "import_image")
+    path = f"/api/handoffs/{handoff_id}"
+    accepting, accepted = _in_thread(
+        lambda: client.call("POST", f"{path}/accept", {"files": choices(files)})
+    )
+    try:
+        assert entered.wait(20)
+        (entry,) = client.ok("GET", "/api/workspace")["handoffs"]
+        assert (entry["id"], entry["files"], entry["claimed"]) == (handoff_id, files, True)
+        late = staged(client, blot_bytes(tmp_path), "late.tif")["file_id"]
+        offered = client.ok("POST", "/api/handoffs", {"files": [late]})
+        assert not offered["merged"] and offered["handoff_id"] != handoff_id
+        for route, body in (("accept", {"files": choices(files)}), ("discard", {"files": ids})):
+            assert client.refused("POST", f"{path}/{route}", body)[:2] == (409, "handoff_claimed")
+    finally:
+        release.set()
+        accepting.join(30)
+    status, answer = accepted[0]
+    assert status == 201, answer
+    assert [image["original_name"] for image in answer["project"]["images"]] == ["a.tif"]
+    handoffs = client.ok("GET", "/api/workspace")["handoffs"]
+    assert [(h["id"], [f["name"] for f in h["files"]]) for h in handoffs] == [
+        (offered["handoff_id"], ["late.tif"])
+    ]
+
+
+def test_a_discard_drops_only_what_the_page_shows(client, tmp_path, ticks):
+    refused = [{"name": "photo.bmp", "code": "unsupported_type", "message": "not an image type"}]
+    handoff_id, files = handed_off(client, tmp_path, ["a.tif"], refused=refused)
+    shown = [file["file_id"] for file in files]
+    late = staged(client, blot_bytes(tmp_path), "b.tif")["file_id"]
+    assert client.ok("POST", "/api/handoffs", {"files": [late]})["merged"]
+    path = f"/api/handoffs/{handoff_id}/discard"
+    status, payload = client.call("POST", path, {"files": shown, "refused": 1})
+    assert (status, payload["code"]) == (409, "handoff_changed")
+    assert payload["detail"] == listed(client, handoff_id)
+    assert len(staging(client)) == 2
+    now = [file["file_id"] for file in payload["detail"]["files"]]
+    status, payload = client.call("POST", path, {"files": now, "refused": 0})  # it holds 1
+    assert (status, payload["code"]) == (409, "handoff_changed")
+
+    assert client.call("POST", path, {"files": list(reversed(now)), "refused": 1})[0] == 204
+    assert staging(client) == []
+    assert client.ok("GET", "/api/workspace")["handoffs"] == []
+    assert client.refused("POST", path, {"files": now, "refused": 1})[:2] == (
+        404,
+        "handoff_not_found",
+    )
+    assert not client.root.exists()
+
+
+def test_files_named_on_the_servers_command_line_are_read_where_they_are_never_deleted(
+    client, tmp_path
+):
+    # The first launch registers the files on its own command line: read
+    # where they are when imported, never copied into the staging folder, and
+    # never deleted, whether imported, discarded, or dropped when Proteia stops.
+    originals = tmp_path / "originals α"
+    blot = synthetic_blot((H, W), [(50, ROW, 5.0, 3.0, 30000.0)])
+    gone = write_tiff(originals / "gone β.tif", blot)
+    kept = write_tiff(originals / "kept µ.tif", blot)
+
+    def unchanged() -> tuple[bytes, int]:
+        return kept.read_bytes(), kept.stat().st_mtime_ns
+
+    before = unchanged()
+    inbox = client.workspace.inbox
+    offered = inbox.add_local([(gone, gone.name), (kept, kept.name)])
+    assert offered is not None and staging(client) == []
+    files = listed(client, offered.handoff_id)["files"]
+    assert [(f["name"], f["size"]) for f in files] == [
+        (gone.name, gone.stat().st_size),
+        (kept.name, kept.stat().st_size),
+    ]
+    gone.unlink()  # removed before Import is pressed
+    handed = accept(client, offered.handoff_id, files)["handoff"]
+    assert [f["name"] for f in handed["imported"]] == ["kept µ.tif"]
+    (refused,) = handed["refused"]
+    assert (refused["name"], refused["code"]) == ("gone β.tif", "file_error")
+    assert str(originals) not in json.dumps(handed, ensure_ascii=False)  # no path
+    assert unchanged() == before
+
+    offered = inbox.add_local([(kept, kept.name)])
+    ids = [f["file_id"] for f in listed(client, offered.handoff_id)["files"]]
+    path = f"/api/handoffs/{offered.handoff_id}/discard"
+    assert client.call("POST", path, {"files": ids})[0] == 204
+    assert unchanged() == before
+    inbox.add_local([(kept, kept.name)])
+    inbox.close()  # as when Proteia stops
+    assert unchanged() == before
+
+
+def _stage_in(inbox: handoff.Inbox, name: str, data: bytes) -> str:
+    """``data`` staged as ``name`` straight into ``inbox``: its file id."""
+    upload = inbox.begin_upload(name, len(data))
+    with upload.open() as out:
+        out.write(data)
+    return inbox.upload_stored(upload, len(data)).file_id
+
+
+def _placed_workspace(tmp_path: Path) -> tuple[api.Workspace, handoff.Inbox]:
+    inbox = handoff.Inbox()
+    inbox.place(tmp_path / "incoming")
+    workspace = api.Workspace(
+        tmp_path / "root", reveal=lambda folder: None, clock=FakeClock(), inbox=inbox
+    )
+    return workspace, inbox
+
+
+def _chosen(file_ids: list[str]) -> list[api.FileChoice]:
+    return [
+        api.FileChoice(file_id, api.ImageKind.CHEMILUMINESCENCE, api.Polarity.DARK_ON_LIGHT)
+        for file_id in file_ids
+    ]
+
+
+def test_a_stop_during_an_accept_waits_for_the_file_being_imported(tmp_path, monkeypatch):
+    # Stopping waits for the accept (it holds the switch lock), but no longer
+    # than the file being imported: the rest are not imported, the project is
+    # saved with what was, and the staged files are deleted once the accept
+    # no longer reads them.
+    workspace, inbox = _placed_workspace(tmp_path)
+    workspace.create("Blot")
+    data = blot_bytes(tmp_path)
+    ids = [_stage_in(inbox, name, data) for name in ("a.tif", "b.tif")]
+    offered = inbox.offer(ids)
+    entered, release = _held_until_released(monkeypatch, api.ops, "import_image")
+    accepting, accepted = _in_thread(
+        lambda: workspace.accept(offered.handoff_id, None, _chosen(ids))
+    )
+    try:
+        assert entered.wait(20)
+        stopping, _ = _in_thread(workspace.close)
+        deadline = time.monotonic() + 10
+        while not inbox.stopping:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        stopping.join(0.3)
+        assert stopping.is_alive()  # it waits for the accept
+        assert len(list((tmp_path / "incoming").iterdir())) == 2
+    finally:
+        release.set()
+    for thread in (accepting, stopping):
+        thread.join(30)
+        assert not thread.is_alive()
+    session, done = accepted[0]
+    assert [file.name for file in done.imported] == ["a.tif"]
+    assert [(file.name, file.code) for file in done.refused] == [("b.tif", "stopping")]
+    saved = storage.load_project(session.folder)
+    assert [image.original_name for image in saved.batch.iter_images()] == ["a.tif"]
+    assert list((tmp_path / "incoming").iterdir()) == []
+
+
+def test_an_accept_checks_the_opening_again_once_no_other_switch_runs(tmp_path):
+    workspace, inbox = _placed_workspace(tmp_path)
+    workspace.create("Blot")  # opening 1, as a page shows it
+    ids = [_stage_in(inbox, "a.tif", blot_bytes(tmp_path))]
+    offered = inbox.offer(ids)
+    workspace.create("Other")  # another page's switch, after the route's first check
+    with pytest.raises(api.ProjectChangedError):
+        workspace.accept(offered.handoff_id, None, _chosen(ids), opening=1)
+    assert [view.id for view in inbox.listing()] == [offered.handoff_id]  # pending again
+    assert workspace.current().folder.name == "Other"
+    session, _ = workspace.accept(offered.handoff_id, None, _chosen(ids), opening=2)
+    assert session.folder.name == "a"
+
+
+def test_the_status_says_proteia_takes_handed_off_files(client):
+    assert client.ok("GET", "/api/status")["handoff"] == server.HANDOFF == 1
+
+
+# --- Molecular-weight calibration (#58) ---
+
+
+def test_ladders_route(client):
+    # No project needs to be open: the presets are the build's.
+    answer = client.ok("GET", "/api/ladders")
+    assert answer == {
+        "ladders": [
+            {
+                "key": preset.key,
+                "product": preset.product,
+                "catalog_numbers": list(preset.catalog_numbers),
+                "system": preset.system,
+                "kda": list(preset.kda),
+                "reference": [{"kda": b.kda, "colour": b.colour} for b in preset.reference],
+                "source": preset.source,
+            }
+            for preset in ladders.PRESETS
+        ]
+    }
+    assert answer["ladders"][0]["key"] == "pageruler_plus/tris_glycine"
+
+
+def test_calibration_routes(client, tmp_path):
+    image_id, protein = ready(client, tmp_path)
+    project = client.ok("GET", "/api/project")["project"]
+    membrane = project["images"][0]["membrane_id"]
+    assert project["images"][0]["marker_image_id"] is None
+    assert project["membranes"] == [
+        {
+            "id": membrane,
+            "image_ids": [image_id],
+            "ladder": None,
+            "ladder_kda": [],
+            "groups": [{"image_ids": [image_id], "points": [], "fit": None}],
+        }
+    ]
+    _, marker = upload(
+        client, blot_bytes(tmp_path), "marker α.tif", kind="visible_marker", membrane_id=membrane
+    )
+    marker_id = marker["image_id"]
+    small = write_tiff(tmp_path / "small.tif", synthetic_blot((H - 1, W), [])).read_bytes()
+    _, other = upload(client, small, "small.tif", kind="visible_marker", membrane_id=membrane)
+    link = f"/api/images/{image_id}/marker"
+    assert client.refused("PUT", link, {"marker_image_id": other["image_id"]})[:2] == (
+        422,
+        "marker_size_mismatch",
+    )
+    answer = client.ok("PUT", link, {"marker_image_id": marker_id})
+    assert {key: answer[key] for key in ("point", "fit", "curves_changed")} == {
+        "point": None,
+        "fit": None,
+        "curves_changed": [],
+    }
+    images = {image["id"]: image for image in answer["project"]["images"]}
+    assert images[image_id]["marker_image_id"] == marker_id
+    answer = client.ok(
+        "PUT", f"/api/membranes/{membrane}/calibration/ladder", {"ladder": "Ours", "kda": [100, 50]}
+    )
+    [state] = answer["project"]["membranes"]
+    assert (state["ladder"], state["ladder_kda"]) == ("Ours", [100.0, 50.0])
+
+    points = f"/api/images/{marker_id}/calibration/left/points"
+    point = {"y": 10.0, "mw": 100, "source": "visible_marker", "x": 10.0, "snap": False}
+    first = client.call("POST", points, point)
+    assert first[0] == 201
+    assert first[1]["point"] == {
+        "image_id": marker_id,
+        "y": 10.0,
+        "mw": 100.0,
+        "source": "visible_marker",
+        "x": 10.0,
+        "side": "left",
+        "snapped": False,
+    }
+    body = client.ok("POST", points, {**point, "y": 50.0, "mw": 50})
+    assert body["curves_changed"] == [image_id, marker_id]
+    fit = body["fit"]
+    assert (fit["image_ids"], fit["method"], fit["disagreement_infinite"]) == (
+        [image_id, marker_id],
+        "log_linear_piecewise",
+        False,
+    )
+    assert fit["ladders"][0]["points"] == 2
+    # The blot's group, and the small marker's, a group of its own.
+    group, alone = body["project"]["membranes"][0]["groups"]
+    assert (group["image_ids"], group["fit"], len(group["points"])) == (
+        [image_id, marker_id],
+        fit,
+        2,
+    )
+    assert alone == {"image_ids": [other["image_id"]], "points": [], "fit": None}
+    # A box on the blot reads its MW from the curve at its centre.
+    placed = client.ok(
+        "POST", "/api/boxes", {"protein_id": protein, "x": LANE_X[0], "y": ROW, "lane_index": 0}
+    )
+    band = bands(placed)[placed["band_id"]]
+    x0, y0, x1, y1 = band["rect"]
+    centre = (y0 + y1) / 2
+    assert math.isclose(band["apparent_mw"], 100.0 * 0.5 ** ((centre - 10.0) / 40.0), rel_tol=1e-12)
+
+    # A point is its group's (any image names it), side and MW, the MW spelled
+    # as Python writes it.
+    edited = client.ok(
+        "PATCH", f"/api/images/{image_id}/calibration/left/points/100", {"y": 12.0, "mw": 90}
+    )
+    assert (edited["point"]["y"], edited["point"]["mw"]) == (12.0, 90.0)
+    assert client.refused("PATCH", f"{points}/1e2", {"y": 1.0})[:2] == (422, "invalid_input")
+    assert client.refused("PATCH", f"{points}/90.0", {"y": 1.0, "snap": "no"})[:2] == (
+        422,
+        "invalid_input",
+    )
+    assert client.refused("DELETE", f"{points}/70")[:2] == (404, "unknown_id")
+    assert client.refused("POST", f"/api/images/{marker_id}/calibration/up/points", point)[:2] == (
+        404,
+        "unknown_id",
+    )
+    # 90 kDa, the label the point at 100 took.
+    duplicate = {**point, "mw": 90, "y": 60.0}
+    assert client.refused("POST", points, duplicate)[:2] == (422, "duplicate_mw")
+    refused = client.refused("POST", points, {**point, "mw": 40, "y": 5.0})
+    assert refused[:2] == (422, "calibration_order")
+    right = f"/api/images/{marker_id}/calibration/right/points"
+    assert client.refused("POST", right, {**point, "x": 5.0, "mw": 70, "y": 30.0})[:2] == (
+        422,
+        "ladder_sides",
+    )
+    no_x = {key: value for key, value in point.items() if key != "x"}
+    assert client.refused("POST", points, {**no_x, "mw": 70, "y": 30.0})[:2] == (
+        422,
+        "invalid_input",
+    )
+    removed = client.ok("DELETE", f"{points}/50")
+    assert removed["fit"] is None and removed["curves_changed"] == [image_id, marker_id]
+    assert bands(removed)[placed["band_id"]]["apparent_mw"] is None
+    assert client.refused("DELETE", f"/api/images/{image_id}/calibration?side=up")[:2] == (
+        422,
+        "invalid_input",
+    )
+    cleared = client.ok("DELETE", f"/api/images/{image_id}/calibration?side=left")
+    assert cleared["project"]["membranes"][0]["groups"][0]["points"] == []
+    unlinked = client.ok("PUT", link, {"marker_image_id": None})
+    assert len(unlinked["project"]["membranes"][0]["groups"]) == 3
+    assert client.ok("POST", "/api/undo")["action"] == "set_marker_image"
+
+
+def _ladder_marker(client: Client, tmp_path: Path, image_id: str) -> tuple[str, str]:
+    """The two-ladder test marker (test_operations' cal_marker) uploaded on the
+    blot's membrane, and its own MWs chosen as a custom ladder: (marker image
+    id, membrane id)."""
+    membrane = client.ok("GET", "/api/project")["project"]["images"][0]["membrane_id"]
+    data = write_tiff(tmp_path / "ladder α.tif", cal_marker()).read_bytes()
+    _, marker = upload(client, data, "ladder α.tif", kind="visible_marker", membrane_id=membrane)
+    client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "ladder µ", "kda": list(CAL_KDA)},
+    )
+    return marker["image_id"], membrane
+
+
+def test_proposal_routes_change_nothing(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    session = client.workspace.current()
+    shown = client.ok("GET", "/api/project")["project"]
+    folder = client.root / "Blot"
+    files, entries, committed = files_of(folder), len(session.project.log), session.project
+    digest = storage.content_hash(committed)
+
+    answer = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
+    )
+    # No project, nothing changed to show: the proposal and the ladder MWs
+    # its labels are.
+    assert set(answer) == {"proposal", "ladder_kda"}
+    proposal = answer["proposal"]
+    assert [(tick["mw"], tick["found"]) for tick in proposal["ticks"]] == [
+        (float(mw), True) for mw in CAL_KDA
+    ]
+    assert all(abs(t["y"] - cal_y(t["mw"], CAL_LEFT_X)) < 0.05 for t in proposal["ticks"])
+    assert (proposal["x"], proposal["extra"], proposal["doubtful"]) == (CAL_LEFT_X, [], False)
+    assert (proposal["gap_infinite"], proposal["gap"] > 5.0) == (False, True)
+    right = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_RIGHT_X, "side": "right"}
+    )["proposal"]
+    assert len(right["ticks"]) == len(CAL_KDA)
+    # Where no ladder stands out: null.
+    empty = client.ok("POST", f"/api/images/{marker}/ladder-proposal", {"x": 240.0})
+    assert empty == {"proposal": None, "ladder_kda": [float(mw) for mw in CAL_KDA]}
+    ys = [cal_y(70, CAL_LEFT_X) + 3.0, 190.0]
+    snapped = client.ok("POST", f"/api/images/{marker}/ladder-snap", {"x": CAL_LEFT_X, "ys": ys})
+    assert set(snapped) == {"points"}
+    [first, second] = snapped["points"]
+    assert first["snapped"] and abs(first["y"] - cal_y(70, CAL_LEFT_X)) < 0.2
+    assert second == {"y": 190.0, "snapped": False}
+
+    # Nothing changed, logged or saved: the same project, hash, log and files.
+    assert session.project is committed and len(session.project.log) == entries
+    assert storage.content_hash(session.project) == digest
+    assert files_of(folder) == files
+    now = client.ok("GET", "/api/project")["project"]
+    assert (now["open_id"], now["revision"]) == (shown["open_id"], shown["revision"])
+
+
+def test_ladder_route_applies_a_ruler_in_one_step(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    proposal = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
+    )["proposal"]
+    ticks = [{"y": tick["y"], "mw": tick["mw"]} for tick in proposal["ticks"]]
+    body = {"x": CAL_LEFT_X, "points": ticks, "found_at": CAL_LEFT_X}
+    answer = client.ok("PUT", f"/api/images/{marker}/calibration/left/ladder", body)
+    assert answer["sides_swapped"] is False and answer["point"] is None
+    assert [(p["mw"], p["placed"], p["relabelled"]) for p in answer["points"]] == [
+        (float(mw), "found", False) for mw in CAL_KDA
+    ]
+    assert answer["fit"]["ladders"][0]["points"] == len(CAL_KDA)
+    assert answer["curves_changed"] == [marker]
+    [state] = answer["project"]["membranes"]
+    group = next(g for g in state["groups"] if g["image_ids"] == [marker])
+    assert [(p["y"], p["mw"], p["x"], p["side"]) for p in group["points"]] == [
+        (t["y"], t["mw"], CAL_LEFT_X, "left") for t in ticks
+    ]
+    # One step back.
+    undone = client.ok("POST", "/api/undo")
+    assert undone["action"] == "set_ladder_points"
+    [state] = undone["project"]["membranes"]
+    assert all(g["points"] == [] for g in state["groups"]) and state["id"] == membrane
+    # A second ladder, given as the right one but left of the only one: the
+    # sides swap in the same change.
+    client.ok("POST", "/api/redo")
+    right = client.ok(
+        "PUT",
+        f"/api/images/{marker}/calibration/right/ladder",
+        {"x": 10.0, "points": ticks[:3]},
+    )
+    assert right["sides_swapped"] is True
+    assert {p["side"] for p in right["points"]} == {"left"}
+
+
+def _opened_ruler(client: Client, marker: str) -> dict[str, Any]:
+    """A ruler as a page opens it on ``marker``: the proposal's ticks and the
+    ladder MWs they are labelled with, as the proposal names them, and the
+    register group's image ids as they are now."""
+    found = client.ok(
+        "POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X, "side": "left"}
+    )
+    [membrane] = client.ok("GET", "/api/project")["project"]["membranes"]
+    [group] = [g["image_ids"] for g in membrane["groups"] if marker in g["image_ids"]]
+    return {
+        "x": CAL_LEFT_X,
+        "points": [{"y": tick["y"], "mw": tick["mw"]} for tick in found["proposal"]["ticks"]],
+        "found_at": CAL_LEFT_X,
+        "ladder_kda": found["ladder_kda"],
+        "group": group,
+    }
+
+
+DUAL_COLOR = "precision_plus_dual_color/tris_glycine"
+
+
+def test_a_proposal_names_the_ladder_it_is_labelled_with(client, tmp_path):
+    # A proposal is labelled with the membrane's ladder MWs as the server holds
+    # them when it is made, which a page's copy of the project may no longer
+    # be (another tab chose another ladder since the page read it). The answer
+    # names them: a page opens a ruler of those labels only while they are the
+    # ladder it shows, and names them when it applies the ruler.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    path = f"/api/images/{marker}/ladder-proposal"
+    answer = client.ok("POST", path, {"x": CAL_LEFT_X, "side": "left"})
+    assert answer["ladder_kda"] == [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0]
+    # Another ladder chosen (in another tab, say): labelled with it, and named.
+    client.ok("PUT", f"/api/membranes/{membrane}/calibration/ladder", {"ladder": DUAL_COLOR})
+    dual = [250.0, 150.0, 100.0, 75.0, 50.0, 37.0, 25.0, 20.0, 15.0, 10.0]
+    answer = client.ok("POST", path, {"x": CAL_LEFT_X})
+    assert answer["ladder_kda"] == dual
+    assert answer["proposal"] is not None
+    assert {tick["mw"] for tick in answer["proposal"]["ticks"]} <= set(dual)
+    # Where no ladder stands out, the answer names the ladder all the same.
+    assert client.ok("POST", path, {"x": 240.0}) == {"proposal": None, "ladder_kda": dual}
+    # A ruler of those labels names that ladder when applied: the membrane's
+    # ladder chosen back since (A, B, A), it is refused, storing nothing.
+    found = {"x": CAL_LEFT_X, "points": [], "found_at": CAL_LEFT_X, "group": [marker]}
+    found["points"] = [{"y": t["y"], "mw": t["mw"]} for t in answer["proposal"]["ticks"]]
+    found["ladder_kda"] = answer["ladder_kda"]
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": list(CAL_KDA)})
+    refused = _refused_unchanged(client, f"/api/images/{marker}/calibration/left/ladder", found)
+    assert refused["detail"] == {"changed": "ladder_kda"}
+
+
+def test_a_proposal_and_its_ladder_are_read_with_no_change_between(client, tmp_path, monkeypatch):
+    # The ladder a proposal names is read under the session's lock with the
+    # proposal: another tab's choice of ladder waits until both are read, so
+    # the answer never names a ladder its labels are not.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    session = client.workspace.current()
+    proposed = ops.propose_ladder
+    other: list[tuple[threading.Thread, bool]] = []
+
+    def propose_then_change(*args: Any, **kwargs: Any) -> Any:
+        proposal = proposed(*args, **kwargs)
+        change = threading.Thread(target=ops.set_ladder, args=(session, membrane, DUAL_COLOR))
+        change.start()
+        change.join(0.3)
+        other.append((change, change.is_alive()))  # still waiting: the lock is held
+        return proposal
+
+    monkeypatch.setattr(ops, "propose_ladder", propose_then_change)
+    answer = client.ok("POST", f"/api/images/{marker}/ladder-proposal", {"x": CAL_LEFT_X})
+    [(change, waited)] = other
+    assert waited, "another tab's ladder fell between the proposal and the ladder it names"
+    change.join(10)
+    assert not change.is_alive()
+    assert answer["ladder_kda"] == [float(mw) for mw in CAL_KDA]
+    assert {tick["mw"] for tick in answer["proposal"]["ticks"]} == set(answer["ladder_kda"])
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    assert state["ladder"] == DUAL_COLOR  # made after, in order
+
+
+def _refused_unchanged(
+    client: Client, path: str, body: dict[str, Any], method: str = "PUT"
+) -> dict[str, Any]:
+    """``body`` sent to ``path`` (PUT, or ``method``), refused as
+    calibration_changed with nothing changed, logged or saved; the refusal."""
+    session = client.workspace.current()
+    folder = client.root / "Blot"
+    files, entries, committed = files_of(folder), len(session.project.log), session.project
+    status, answer = client.call(method, path, body)
+    assert (status, answer["code"], answer["ids"]) == (409, "calibration_changed", []), answer
+    # Said without the ids or coordinates a user never sees.
+    assert not re.search(r"\b(img|mem|prot|band)-\d|y=|x=", answer["message"]), answer
+    assert session.project is committed and len(session.project.log) == entries
+    assert files_of(folder) == files
+    return answer
+
+
+def test_a_ruler_labelled_with_a_ladder_changed_since_is_refused(client, tmp_path):
+    # A page's ruler is labelled with the membrane's ladder as it was when the
+    # ruler opened. Another tab chooses another ladder meanwhile: Apply names
+    # the MWs its labels are, and is refused, storing nothing, rather than
+    # store 130, 70, 55 kDa marks on a membrane whose ladder has none of them.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    body = _opened_ruler(client, marker)
+    assert body["ladder_kda"] == [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0]
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    client.ok("PUT", ladder, {"ladder": "precision_plus_dual_color/tris_glycine"})
+    refused = _refused_unchanged(client, path, body)
+    assert refused["detail"] == {"changed": "ladder_kda"}
+    assert "ladder" in refused["message"]
+    # One MW more, or one less, is another ladder too.
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": [*CAL_KDA, 10]})
+    assert _refused_unchanged(client, path, body)["detail"] == {"changed": "ladder_kda"}
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": list(CAL_KDA[:-1])})
+    assert _refused_unchanged(client, path, body)["detail"] == {"changed": "ladder_kda"}
+    # The same MWs under another name: the labels are still the ladder's; the
+    # MWs named in another order are not the ladder's list.
+    client.ok("PUT", ladder, {"ladder": "renamed ν", "kda": list(CAL_KDA)})
+    backwards = {**body, "ladder_kda": body["ladder_kda"][::-1]}
+    assert _refused_unchanged(client, path, backwards)["detail"] == {"changed": "ladder_kda"}
+    applied = client.ok("PUT", path, body)
+    assert [p["mw"] for p in applied["points"]] == [float(mw) for mw in CAL_KDA]
+
+
+def test_a_ruler_is_checked_and_applied_with_no_change_between(client, tmp_path, monkeypatch):
+    # The check of what the ruler was opened with and its Apply run under the
+    # session's lock: another request's change (the ladder chosen in another
+    # tab) waits until the ruler is applied, never falls between the two.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    body = _opened_ruler(client, marker)
+    session = client.workspace.current()
+    checked = api._check_ruler_scope
+    other: list[tuple[threading.Thread, bool]] = []
+
+    def check_then_change(*args: Any) -> None:
+        checked(*args)
+        chosen = "precision_plus_dual_color/tris_glycine"
+        change = threading.Thread(target=ops.set_ladder, args=(session, membrane, chosen))
+        change.start()
+        change.join(0.3)
+        other.append((change, change.is_alive()))  # still waiting: the lock is held
+
+    monkeypatch.setattr(api, "_check_ruler_scope", check_then_change)
+    applied = client.ok("PUT", f"/api/images/{marker}/calibration/left/ladder", body)
+    assert len(applied["points"]) == len(CAL_KDA)
+    [(change, waited)] = other
+    assert waited, "the other tab's change fell between the check and the Apply"
+    change.join(10)
+    assert not change.is_alive()
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    assert state["ladder"] == "precision_plus_dual_color/tris_glycine"  # made after, in order
+    history = [entry.action for entry in session.project.log[-2:]]
+    assert history == ["set_ladder_points", "set_ladder"]
+
+
+def test_a_ruler_opened_on_a_register_group_changed_since_is_refused(client, tmp_path):
+    # Apply replaces the marks of the register group the ruler was opened on.
+    # Another tab links an image to the marker meanwhile (or unlinks one): the
+    # marks Apply would replace are no longer those, and it is refused.
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    data = write_tiff(tmp_path / "chemi γ.tif", synthetic_blot((CAL_H, CAL_W), [])).read_bytes()
+    membrane = client.ok("GET", "/api/project")["project"]["images"][0]["membrane_id"]
+    _, chemi = upload(client, data, "chemi γ.tif", membrane_id=membrane)
+    body = _opened_ruler(client, marker)
+    assert body["group"] == [marker]
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    link = f"/api/images/{chemi['image_id']}/marker"
+    client.ok("PUT", link, {"marker_image_id": marker})
+    refused = _refused_unchanged(client, path, body)
+    assert refused["detail"] == {"changed": "group"}
+    assert "marker link" in refused["message"]
+    # Opened on the linked group (listed in any order), unlinked since.
+    linked = _opened_ruler(client, marker)
+    assert sorted(linked["group"]) == sorted([chemi["image_id"], marker])
+    linked["group"].reverse()
+    assert linked["group"] != sorted(linked["group"])
+    client.ok("PUT", link, {"marker_image_id": None})
+    assert _refused_unchanged(client, path, linked)["detail"] == {"changed": "group"}
+    # Linked again: the same group, in another order, is applied.
+    client.ok("PUT", link, {"marker_image_id": marker})
+    assert len(client.ok("PUT", path, linked)["points"]) == len(CAL_KDA)
+    client.ok("POST", "/api/undo")
+    # An image of the group removed since: another group as well.
+    client.ok("DELETE", f"/api/images/{chemi['image_id']}")
+    assert _refused_unchanged(client, path, linked)["detail"] == {"changed": "group"}
+
+
+def test_a_ruler_opened_as_things_are_is_applied(client, tmp_path):
+    # The ladder and the group as the ruler names them (the group in any
+    # order): applied. A page that names neither (an older one) is applied
+    # as before, and so is one that names only one of them.
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    body = _opened_ruler(client, marker)
+    applied = client.ok("PUT", path, body)
+    assert [p["mw"] for p in applied["points"]] == [float(mw) for mw in CAL_KDA]
+    client.ok("POST", "/api/undo")
+    for left_out in (("ladder_kda", "group"), ("ladder_kda",), ("group",)):
+        older = {key: value for key, value in body.items() if key not in left_out}
+        applied = client.ok("PUT", path, older)
+        assert len(applied["points"]) == len(CAL_KDA), left_out
+        client.ok("POST", "/api/undo")
+    # A custom ladder with no MWs listed: a ruler adjusted from its marks.
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    client.ok("PUT", f"/api/membranes/{state['id']}/calibration/ladder", {"ladder": "none µ"})
+    bare = {**body, "found_at": None, "ladder_kda": []}
+    assert len(client.ok("PUT", path, bare)["points"]) == len(CAL_KDA)
+
+
+def test_a_ruler_precondition_that_cannot_be_read_is_invalid_input(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    path = f"/api/images/{marker}/calibration/left/ladder"
+    body = _opened_ruler(client, marker)
+    for field, value in (
+        ("ladder_kda", [250.0, 0.0]),
+        ("ladder_kda", [-250.0]),
+        ("ladder_kda", ["250"]),
+        ("ladder_kda", 250.0),
+        ("group", [marker, 3]),
+        ("group", marker),
+    ):
+        refused = client.refused("PUT", path, {**body, field: value})
+        assert refused[:2] == (422, "invalid_input"), (field, value)
+    for text in (b"NaN", b"Infinity"):
+        raw = json.dumps({**body, "ladder_kda": [123.25]}).encode()
+        assert raw.count(b"123.25") == 1
+        raw = raw.replace(b"123.25", text)
+        assert _raw_json(client, "PUT", path, raw) == (422, "invalid_input"), text
+
+
+DUAL_KDA = [250.0, 150.0, 100.0, 75.0, 50.0, 37.0, 25.0, 20.0, 15.0, 10.0]
+
+
+def _mark_body(mw: float, y: float, **more: Any) -> dict[str, Any]:
+    """A band of the test marker's left ladder marked at ``y`` as ``mw``, not snapped."""
+    return {"y": y, "mw": mw, "source": "visible_marker", "x": CAL_LEFT_X, "snap": False, **more}
+
+
+def test_a_mark_chosen_from_a_ladder_changed_since_is_refused(client, tmp_path):
+    # A page offers a band's MWs from the membrane's ladder as it read it.
+    # Another tab chooses another ladder meanwhile: the mark names the list
+    # its MW was chosen from, and is refused, storing nothing, rather than
+    # store a 70 kDa mark on a membrane whose ladder has no 70.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    listed = [float(mw) for mw in CAL_KDA]
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    points = f"/api/images/{marker}/calibration/left/points"
+    y70 = cal_y(70, CAL_LEFT_X)
+    mark = _mark_body(70.0, y70, ladder_kda=listed)
+    client.ok("PUT", ladder, {"ladder": DUAL_COLOR})
+    refused = _refused_unchanged(client, points, mark, method="POST")
+    assert refused["detail"] == {"changed": "ladder_kda"}
+    assert "ladder" in refused["message"] and "ruler" not in refused["message"]
+    # The second ladder's marks too.
+    right = f"/api/images/{marker}/calibration/right/points"
+    body = {**mark, "x": CAL_RIGHT_X, "y": cal_y(70, CAL_RIGHT_X)}
+    assert _refused_unchanged(client, right, body, method="POST")["detail"] == {
+        "changed": "ladder_kda"
+    }
+    # One MW more, or one less, is another ladder too; the MWs named in
+    # another order are not the ladder's list.
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": [*CAL_KDA, 10]})
+    assert _refused_unchanged(client, points, mark, method="POST")["detail"] == {
+        "changed": "ladder_kda"
+    }
+    client.ok("PUT", ladder, {"ladder": "ladder µ", "kda": list(CAL_KDA[:-1])})
+    _refused_unchanged(client, points, mark, method="POST")
+    client.ok("PUT", ladder, {"ladder": "renamed ν", "kda": list(CAL_KDA)})
+    _refused_unchanged(client, points, {**mark, "ladder_kda": listed[::-1]}, method="POST")
+    # The same MWs under another name: the MW is still the ladder's.
+    status, answer = client.call("POST", points, mark)
+    assert (status, answer["point"]["mw"], answer["point"]["y"]) == (201, 70.0, y70)
+    # Checked first: under another ladder, a mark that would also be refused
+    # for itself (70 kDa held twice) is refused as the ladder's change.
+    client.ok("PUT", ladder, {"ladder": DUAL_COLOR})
+    _refused_unchanged(client, points, _mark_body(70.0, y70 + 30.0, ladder_kda=listed), "POST")
+    # A typed MW names no ladder: marked, whatever the ladder is now; and one
+    # chosen from the ladder as it is now is marked.
+    typed = client.call("POST", points, _mark_body(60.0, y70 + 10.0))
+    assert (typed[0], typed[1]["point"]["mw"]) == (201, 60.0)
+    chosen = client.call(
+        "POST", points, _mark_body(37.0, cal_y(35, CAL_LEFT_X), ladder_kda=DUAL_KDA)
+    )
+    assert (chosen[0], chosen[1]["point"]["mw"]) == (201, 37.0)
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    [group] = [g for g in state["groups"] if marker in g["image_ids"]]
+    assert sorted(p["mw"] for p in group["points"]) == [37.0, 60.0, 70.0]
+    # An empty list names a ladder that listed no MWs: checked as any list is.
+    empty = _mark_body(20.0, cal_y(20, CAL_LEFT_X), ladder_kda=[])
+    assert _refused_unchanged(client, points, empty, "POST")["detail"] == {"changed": "ladder_kda"}
+
+
+def test_a_relabel_chosen_from_a_ladder_changed_since_is_refused(client, tmp_path):
+    # A stored mark relabelled from the ladder's MWs as the page read them:
+    # another tab's ladder chosen since, it is refused and the mark stays.
+    # A mark moved, or relabelled with a typed MW, names no ladder.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    listed = [float(mw) for mw in CAL_KDA]
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    points = f"/api/images/{marker}/calibration/left/points"
+    y70 = cal_y(70, CAL_LEFT_X)
+    client.ok("POST", points, _mark_body(70.0, y70))
+    client.ok("PUT", ladder, {"ladder": DUAL_COLOR})
+    body = {"mw": 55.0, "ladder_kda": listed}
+    refused = _refused_unchanged(client, f"{points}/70", body, method="PATCH")
+    assert refused["detail"] == {"changed": "ladder_kda"}
+    # Checked first: a mark no longer there is refused as the ladder's change.
+    _refused_unchanged(client, f"{points}/130", body, method="PATCH")
+    moved = client.ok("PATCH", f"{points}/70", {"y": y70 + 1.0})
+    assert (moved["point"]["mw"], moved["point"]["y"]) == (70.0, y70 + 1.0)
+    typed = client.ok("PATCH", f"{points}/70", {"mw": 72.5})
+    assert typed["point"]["mw"] == 72.5
+    chosen = client.ok("PATCH", f"{points}/72.5", {"mw": 75.0, "ladder_kda": DUAL_KDA})
+    assert chosen["point"]["mw"] == 75.0
+    history = [entry.action for entry in client.workspace.current().project.log[-3:]]
+    assert history == ["edit_calibration_point"] * 3
+
+
+def test_a_mark_is_checked_and_stored_with_no_change_between(client, tmp_path, monkeypatch):
+    # The check of the ladder a mark's MW was chosen from and the mark itself
+    # run under the session's lock: another tab's choice of ladder waits until
+    # the mark is stored, never falls between the two.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    session = client.workspace.current()
+    checked = api._check_ladder_kda
+    # The other tab's ladders, one per check: the dual colour, then back.
+    ladders_chosen = [(DUAL_COLOR, None), ("ladder µ", list(CAL_KDA))]
+    other: list[tuple[threading.Thread, bool]] = []
+
+    def check_then_change(*args: Any, **kwargs: Any) -> None:
+        checked(*args, **kwargs)
+        name, kda = ladders_chosen[len(other)]
+        change = threading.Thread(
+            target=ops.set_ladder, args=(session, membrane, name), kwargs={"kda": kda}
+        )
+        change.start()
+        change.join(0.3)
+        other.append((change, change.is_alive()))  # still waiting: the lock is held
+
+    monkeypatch.setattr(api, "_check_ladder_kda", check_then_change)
+    listed = [float(mw) for mw in CAL_KDA]
+    points = f"/api/images/{marker}/calibration/left/points"
+    added = client.ok("POST", points, _mark_body(70.0, cal_y(70, CAL_LEFT_X), ladder_kda=listed))
+    assert added["point"]["mw"] == 70.0
+    [state] = client.ok("GET", "/api/project")["project"]["membranes"]
+    assert state["ladder"] == DUAL_COLOR  # made after the mark, in order
+    edited = client.ok("PATCH", f"{points}/70", {"mw": 75.0, "ladder_kda": DUAL_KDA})
+    assert edited["point"]["mw"] == 75.0
+    assert len(other) == 2
+    for change, waited in other:
+        assert waited, "the other tab's ladder fell between the check and the change"
+        change.join(10)
+        assert not change.is_alive()
+    history = [entry.action for entry in session.project.log[-4:]]
+    assert history == [
+        "add_calibration_point",
+        "set_ladder",
+        "edit_calibration_point",
+        "set_ladder",
+    ]
+
+
+def test_a_point_precondition_that_cannot_be_read_is_invalid_input(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, _ = _ladder_marker(client, tmp_path, image_id)
+    listed = [float(mw) for mw in CAL_KDA]
+    points = f"/api/images/{marker}/calibration/left/points"
+    y70 = cal_y(70, CAL_LEFT_X)
+    for value in ([250.0, 0.0], [-250.0], ["250"], 250.0, [math.inf]):
+        mark = _mark_body(70.0, y70, ladder_kda=value)
+        assert client.refused("POST", points, mark)[:2] == (422, "invalid_input"), value
+    raw = json.dumps(_mark_body(70.0, y70, ladder_kda=[123.25])).encode().replace(b"123.25", b"NaN")
+    assert _raw_json(client, "POST", points, raw) == (422, "invalid_input")
+    # The ladder's list as it is: read, and marked.
+    assert client.call("POST", points, _mark_body(70.0, y70, ladder_kda=listed))[0] == 201
+    for value in ([70.0, 0.0], ["70"], 70.0):
+        body = {"mw": 55.0, "ladder_kda": value}
+        assert client.refused("PATCH", f"{points}/70", body)[:2] == (422, "invalid_input"), value
+    assert (
+        client.ok("PATCH", f"{points}/70", {"mw": 55.0, "ladder_kda": listed})["point"]["mw"] == 55
+    )
+
+
+def test_a_proposal_on_a_ladder_listing_no_mws_names_that_list(client, tmp_path):
+    # Another tab chose a ladder that lists no MWs (or took the ladder back):
+    # nothing can be found on it. The refusal names the ladder's MWs, none,
+    # as an answer names them, so a page still showing the ladder before
+    # knows the ladder changed and reads it again.
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    proposal = f"/api/images/{marker}/ladder-proposal"
+    ladder = f"/api/membranes/{membrane}/calibration/ladder"
+    for chosen in ({"ladder": "Lab mix"}, {"ladder": None}):
+        client.ok("PUT", ladder, chosen)
+        for side in ("left", "right"):
+            status, answer = client.call("POST", proposal, {"x": CAL_LEFT_X, "side": side})
+            assert (status, answer["code"]) == (422, "invalid_input"), chosen
+            assert answer["detail"] == {"ladder_kda": []}, chosen
+        # What cannot be read is refused first, as before, naming no ladder.
+        status, answer = client.call("POST", proposal, {"x": CAL_LEFT_X, "side": "middle"})
+        assert (status, answer["code"], "detail" in answer) == (422, "invalid_input", False)
+        status, answer = client.call("POST", proposal, {"x": CAL_W + 1.0})
+        assert (status, answer["code"], "detail" in answer) == (422, "out_of_image", False)
+
+
+def test_ladder_routes_refuse_what_they_cannot_read(client, tmp_path):
+    image_id, _ = ready(client, tmp_path)
+    marker, membrane = _ladder_marker(client, tmp_path, image_id)
+    ladder = f"/api/images/{marker}/calibration/left/ladder"
+    proposal = f"/api/images/{marker}/ladder-proposal"
+    snap = f"/api/images/{marker}/ladder-snap"
+    point = {"y": 20.0, "mw": 250}
+    # A side the path names that is neither: no such ladder.
+    up = f"/api/images/{marker}/calibration/up/ladder"
+    assert client.refused("PUT", up, {"x": 5.0, "points": [point]})[:2] == (404, "unknown_id")
+    assert client.refused("POST", "/api/images/img-99/ladder-proposal", {"x": 5.0})[:2] == (
+        404,
+        "unknown_id",
+    )
+    too_many = {"x": 5.0, "points": [point] * (api.MAX_RULER_TICKS + 1)}
+    refusals = [
+        ("PUT", ladder, too_many),
+        ("PUT", ladder, {"x": 5.0, "points": [{"y": 20.0}]}),
+        ("PUT", ladder, {"x": "5", "points": [point]}),
+        ("PUT", ladder, {"x": 5.0, "points": [point], "extra": 1}),
+        ("POST", snap, {"x": 5.0, "ys": [20.0] * (api.MAX_RULER_TICKS + 1)}),
+        ("POST", snap, {"x": 5.0, "ys": ["20"]}),
+        ("POST", proposal, {"x": 5.0, "side": "middle"}),
+        ("POST", proposal, {"side": "left"}),
+    ]
+    for method, path, body in refusals:
+        assert client.refused(method, path, body)[:2] == (422, "invalid_input"), body
+    assert client.refused("POST", proposal, {"x": CAL_W + 1.0})[:2] == (422, "out_of_image")
+    assert client.refused("PUT", ladder, {"x": 5.0, "points": [point, point]})[:2] == (
+        422,
+        "duplicate_mw",
+    )
+    # What a page words a refusal with: the ladder and the MWs, in ``detail``.
+    crossed = [{"y": 20.0, "mw": 130}, {"y": 30.0, "mw": 250}]
+    status, answer = client.call("PUT", ladder, {"x": 5.0, "points": crossed})
+    assert (status, answer["code"], answer["detail"]) == (
+        422,
+        "calibration_order",
+        {"side": "left", "reason": "order", "upper": 130.0, "lower": 250.0},
+    )
+    # JSON's non-numbers, which Python's reader takes, are no positions either.
+    for path, body in ((proposal, b'{"x": NaN}'), (ladder, b'{"x": Infinity, "points": []}')):
+        assert _raw_json(client, "PUT" if path == ladder else "POST", path, body) == (
+            422,
+            "invalid_input",
+        )
+    # A ladder must be chosen before one is found.
+    client.ok("PUT", f"/api/membranes/{membrane}/calibration/ladder", {"ladder": None})
+    assert client.refused("POST", proposal, {"x": CAL_LEFT_X})[:2] == (422, "invalid_input")
+
+
+def _raw_json(client: Client, method: str, path: str, body: bytes) -> tuple[int, str]:
+    """A request whose body is sent as JSON as it is; its status and code."""
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=30)
+    try:
+        headers = {"Authorization": f"Bearer {client.token}", "Content-Type": "application/json"}
+        conn.request(method, path, body=body, headers=headers)
+        response = conn.getresponse()
+        return response.status, json.loads(response.read())["code"]
+    finally:
+        conn.close()
+
+
+def test_a_proposal_with_no_other_labelling_answers_strict_json(client, tmp_path):
+    # Two bands, a ladder of two MWs: one labelling, so its gap is infinite,
+    # which JSON cannot hold (the client parses strictly).
+    image_id, _ = ready(client, tmp_path)
+    membrane = client.ok("GET", "/api/project")["project"]["images"][0]["membrane_id"]
+    bands = [(CAL_LEFT_X, cal_y(kda, CAL_LEFT_X) - 0.5, 10.0, 2.0, 20000.0) for kda in (250, 15)]
+    data = write_tiff(tmp_path / "two.tif", synthetic_blot((CAL_H, CAL_W), bands)).read_bytes()
+    _, marker = upload(client, data, "two β.tif", kind="visible_marker", membrane_id=membrane)
+    client.ok(
+        "PUT",
+        f"/api/membranes/{membrane}/calibration/ladder",
+        {"ladder": "two", "kda": [250, 15]},
+    )
+    path = f"/api/images/{marker['image_id']}/ladder-proposal"
+    proposal = client.ok("POST", path, {"x": CAL_LEFT_X})["proposal"]
+    assert (proposal["gap"], proposal["gap_infinite"], proposal["doubtful"]) == (None, True, False)
+    ticks = [{"y": t["y"], "mw": t["mw"]} for t in proposal["ticks"]]
+    applied = client.ok(
+        "PUT",
+        f"/api/images/{marker['image_id']}/calibration/left/ladder",
+        {"x": CAL_LEFT_X, "points": ticks, "found_at": CAL_LEFT_X},
+    )
+    assert [p["placed"] for p in applied["points"]] == ["found", "found"]

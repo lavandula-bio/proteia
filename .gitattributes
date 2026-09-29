@@ -1,0 +1,19 @@
+# Every text file is stored and checked out with LF, whatever the platform
+# or its git settings (the CI Windows runner would otherwise write CRLF).
+* text=auto eol=lf
+
+# Binary files are never converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.bmp binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.npy binary
+*.npz binary

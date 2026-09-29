@@ -1,0 +1,576 @@
+{
+ "note": "rowdetect.detect_row on the rows of tests/rowcases.py, written before #58 added LaneDetection.peaks: flags, notes, and per lane rect, reason, components (exact) and snr (rel_tol 1e-9). Detection changes that keep what it finds leave it as is.",
+ "cases": {
+  "bench/all_present": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [72, 55, 116, 67], "reason": "band", "components": 1, "snr": 152.11159244091147},
+    {"rect": [139, 55, 183, 67], "reason": "band", "components": 1, "snr": 177.78877454470538},
+    {"rect": [209, 54, 253, 66], "reason": "band", "components": 1, "snr": 153.10583083021643},
+    {"rect": [279, 54, 323, 66], "reason": "band", "components": 1, "snr": 160.3789265297431},
+    {"rect": [351, 55, 395, 67], "reason": "band", "components": 1, "snr": 190.12500768587557},
+    {"rect": [419, 55, 463, 67], "reason": "band", "components": 1, "snr": 175.9502889714505}
+   ]
+  },
+  "bench/missing_first": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 3.1984990622328944},
+    {"rect": [139, 55, 183, 66], "reason": "band", "components": 1, "snr": 188.06163583602523},
+    {"rect": [209, 55, 253, 66], "reason": "band", "components": 1, "snr": 161.90234531811365},
+    {"rect": [279, 55, 323, 66], "reason": "band", "components": 1, "snr": 169.48830202593822},
+    {"rect": [351, 56, 395, 67], "reason": "band", "components": 1, "snr": 200.7795785683218},
+    {"rect": [419, 56, 463, 67], "reason": "band", "components": 1, "snr": 185.71920573977422}
+   ]
+  },
+  "bench/missing_middle": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [72, 55, 116, 67], "reason": "band", "components": 1, "snr": 160.33261795325353},
+    {"rect": [139, 55, 183, 67], "reason": "band", "components": 1, "snr": 187.36506136230014},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 2.8929705694645818},
+    {"rect": [279, 54, 323, 66], "reason": "band", "components": 1, "snr": 169.00100276737152},
+    {"rect": [351, 55, 395, 67], "reason": "band", "components": 1, "snr": 200.32047742258848},
+    {"rect": [419, 55, 463, 67], "reason": "band", "components": 1, "snr": 185.37709495234458}
+   ]
+  },
+  "bench/missing_last": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [72, 55, 116, 67], "reason": "band", "components": 1, "snr": 161.02803228784182},
+    {"rect": [139, 55, 183, 67], "reason": "band", "components": 1, "snr": 188.18886364277907},
+    {"rect": [209, 54, 253, 66], "reason": "band", "components": 1, "snr": 162.05782064600916},
+    {"rect": [279, 54, 323, 66], "reason": "band", "components": 1, "snr": 169.74654545679508},
+    {"rect": [351, 55, 395, 67], "reason": "band", "components": 1, "snr": 201.22184642767417},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 3.6714583024891714}
+   ]
+  },
+  "bench/missing_two": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 3.2862804085541266},
+    {"rect": [140, 55, 183, 66], "reason": "band", "components": 1, "snr": 192.15565549165132},
+    {"rect": [210, 55, 253, 66], "reason": "band", "components": 1, "snr": 165.44252565488603},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 2.867862492409049},
+    {"rect": [352, 56, 395, 67], "reason": "band", "components": 1, "snr": 205.18739076173017},
+    {"rect": [420, 56, 463, 67], "reason": "band", "components": 1, "snr": 189.8127878718266}
+   ]
+  },
+  "bench/touching": {
+   "flags": [],
+   "notes": ["stage 2 skipped: too few band-free pixels"],
+   "lanes": [
+    {"rect": [73, 54, 122, 66], "reason": "band", "components": 1, "snr": 142.75289548686234},
+    {"rect": [122, 54, 171, 66], "reason": "band", "components": 1, "snr": 132.54159635036208},
+    {"rect": [171, 54, 220, 66], "reason": "band", "components": 1, "snr": 145.57445745988764},
+    {"rect": [220, 55, 269, 67], "reason": "band", "components": 1, "snr": 135.8281195494256},
+    {"rect": [269, 55, 318, 67], "reason": "band", "components": 1, "snr": 142.79896008031307},
+    {"rect": [319, 54, 368, 66], "reason": "band", "components": 1, "snr": 135.79913766738898}
+   ]
+  },
+  "bench/smile": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [68, 51, 112, 63], "reason": "band", "components": 1, "snr": 234.6222632979742},
+    {"rect": [141, 56, 185, 68], "reason": "band", "components": 1, "snr": 227.6599636518895},
+    {"rect": [209, 59, 253, 71], "reason": "band", "components": 1, "snr": 198.14772871638317},
+    {"rect": [282, 59, 326, 71], "reason": "band", "components": 1, "snr": 234.20821431890914},
+    {"rect": [349, 55, 393, 67], "reason": "band", "components": 1, "snr": 244.8858813405241},
+    {"rect": [421, 50, 465, 62], "reason": "band", "components": 1, "snr": 182.14852572881523}
+   ]
+  },
+  "bench/uneven_spacing": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 56, 110, 67], "reason": "band", "components": 1, "snr": 168.37041353628535},
+    {"rect": [126, 54, 166, 65], "reason": "band", "components": 1, "snr": 199.70038695753624},
+    {"rect": [210, 56, 250, 67], "reason": "band", "components": 1, "snr": 233.71406161597542},
+    {"rect": [273, 56, 313, 67], "reason": "band", "components": 1, "snr": 232.09200685651197},
+    {"rect": [354, 55, 394, 66], "reason": "band", "components": 1, "snr": 167.04340521210094},
+    {"rect": [414, 56, 454, 67], "reason": "band", "components": 1, "snr": 143.6862715094263}
+   ]
+  },
+  "bench/faint_band": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [73, 55, 116, 67], "reason": "band", "components": 1, "snr": 176.69735524047178},
+    {"rect": [143, 55, 186, 67], "reason": "band", "components": 1, "snr": 204.67283521634846},
+    {"rect": [210, 53, 253, 65], "reason": "band", "components": 1, "snr": 204.95773206644074},
+    {"rect": [280, 54, 323, 66], "reason": "band", "components": 1, "snr": 20.89830270823744},
+    {"rect": [351, 54, 394, 66], "reason": "band", "components": 1, "snr": 177.0490409724504},
+    {"rect": [422, 55, 465, 67], "reason": "band", "components": 1, "snr": 221.08269732073927}
+   ]
+  },
+  "bench/overexposed": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 55, 117, 67], "reason": "band", "components": 1, "snr": 193.48502594655668},
+    {"rect": [137, 54, 184, 66], "reason": "band", "components": 1, "snr": 205.70395408604995},
+    {"rect": [211, 55, 258, 67], "reason": "band", "components": 1, "snr": 397.81291951494796},
+    {"rect": [280, 54, 327, 66], "reason": "band", "components": 1, "snr": 207.89671225289572},
+    {"rect": [350, 53, 397, 65], "reason": "band", "components": 1, "snr": 216.96501365510048},
+    {"rect": [418, 55, 465, 67], "reason": "band", "components": 1, "snr": 213.95795411401218}
+   ]
+  },
+  "bench/uneven_background": {
+   "flags": ["background_mismatch"],
+   "notes": [],
+   "lanes": [
+    {"rect": [71, 54, 115, 66], "reason": "band", "components": 1, "snr": 190.5588014172118},
+    {"rect": [140, 55, 184, 67], "reason": "band", "components": 1, "snr": 203.00023105967946},
+    {"rect": [212, 54, 256, 66], "reason": "band", "components": 1, "snr": 162.31178134751727},
+    {"rect": [280, 54, 324, 66], "reason": "band", "components": 1, "snr": 224.90424502127786},
+    {"rect": [350, 54, 394, 66], "reason": "band", "components": 1, "snr": 221.77211888442696},
+    {"rect": [419, 54, 463, 66], "reason": "band", "components": 1, "snr": 212.29419478965877}
+   ]
+  },
+  "bench/light_on_dark": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 55, 114, 66], "reason": "band", "components": 1, "snr": 154.95895635701905},
+    {"rect": [142, 55, 186, 66], "reason": "band", "components": 1, "snr": 218.40680468134448},
+    {"rect": [209, 55, 253, 66], "reason": "band", "components": 1, "snr": 154.90355242855452},
+    {"rect": [279, 56, 323, 67], "reason": "band", "components": 1, "snr": 183.02452977179234},
+    {"rect": [352, 55, 396, 66], "reason": "band", "components": 1, "snr": 145.36109292187066},
+    {"rect": [419, 55, 463, 66], "reason": "band", "components": 1, "snr": 176.21812889576358}
+   ]
+  },
+  "bench/loose_box": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [72, 53, 115, 65], "reason": "band", "components": 1, "snr": 222.57668427927348},
+    {"rect": [142, 55, 185, 67], "reason": "band", "components": 1, "snr": 180.2895878736871},
+    {"rect": [210, 54, 253, 66], "reason": "band", "components": 1, "snr": 161.24605388941902},
+    {"rect": [281, 55, 324, 67], "reason": "band", "components": 1, "snr": 220.27290968945863},
+    {"rect": [350, 54, 393, 66], "reason": "band", "components": 1, "snr": 254.8408415871263},
+    {"rect": [420, 55, 463, 67], "reason": "band", "components": 1, "snr": 253.11740519668263}
+   ]
+  },
+  "bench/tight_box": {
+   "flags": [],
+   "notes": ["stage 2 skipped: too few band-free pixels"],
+   "lanes": [
+    {"rect": [74, 56, 117, 67], "reason": "band", "components": 1, "snr": 206.35263791293673},
+    {"rect": [139, 56, 182, 67], "reason": "band", "components": 1, "snr": 200.0748575699796},
+    {"rect": [209, 55, 252, 66], "reason": "band", "components": 1, "snr": 206.66147112634823},
+    {"rect": [283, 55, 326, 66], "reason": "band", "components": 1, "snr": 203.20088666881216},
+    {"rect": [352, 56, 395, 67], "reason": "band", "components": 1, "snr": 163.1558490950214},
+    {"rect": [417, 54, 460, 65], "reason": "band", "components": 1, "snr": 174.18499032805514}
+   ]
+  },
+  "bench/twelve_lanes": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 55, 104, 65], "reason": "band", "components": 1, "snr": 200.28616803409977},
+    {"rect": [122, 56, 156, 66], "reason": "band", "components": 1, "snr": 188.92878039875382},
+    {"rect": [171, 55, 205, 65], "reason": "band", "components": 1, "snr": 142.40631721759718},
+    {"rect": [221, 55, 255, 65], "reason": "band", "components": 1, "snr": 205.29258797197195},
+    {"rect": [270, 54, 304, 64], "reason": "band", "components": 1, "snr": 145.29050444683605},
+    {"rect": [322, 56, 356, 66], "reason": "band", "components": 1, "snr": 187.82437861574627},
+    {"rect": [372, 54, 406, 64], "reason": "band", "components": 1, "snr": 165.64976799982617},
+    {"rect": [422, 54, 456, 64], "reason": "band", "components": 1, "snr": 212.04315757761313},
+    {"rect": [469, 56, 503, 66], "reason": "band", "components": 1, "snr": 221.12465336182825},
+    {"rect": [521, 56, 555, 66], "reason": "band", "components": 1, "snr": 157.62978473343804},
+    {"rect": [571, 56, 605, 66], "reason": "band", "components": 1, "snr": 217.5585309456949},
+    {"rect": [621, 56, 655, 66], "reason": "band", "components": 1, "snr": 212.7043799937339}
+   ]
+  },
+  "adversarial/nbr_above_miss/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 141.11507329021768},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 167.12112149073883},
+    {"rect": null, "reason": "edge_signal", "components": 0, "snr": 2.329826917483066},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 169.20266370475898},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 227.25331591193955},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 204.2709347560364}
+   ]
+  },
+  "adversarial/blotch_empty/1000": {
+   "flags": [],
+   "notes": ["stage 2 skipped: too few band-free pixels"],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 56.85993183105655},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 67.50746110984832},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 71.95085622496055},
+    {"rect": [280, 75, 324, 87], "reason": "band", "components": 1, "snr": 72.79580104409416},
+    {"rect": null, "reason": "artefact", "components": 0, "snr": 0.0},
+    {"rect": [418, 74, 462, 86], "reason": "band", "components": 1, "snr": 87.57511923528969}
+   ]
+  },
+  "adversarial/vstreak_empty/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 140.75727797231264},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 166.6898989770775},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 177.36644512657307},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 168.71195907482635},
+    {"rect": null, "reason": "edge_signal", "components": 0, "snr": 2.983351192276711},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 203.64054554218245}
+   ]
+  },
+  "adversarial/box_omits_empty_first/1000": {
+   "flags": ["ambiguous_lanes"],
+   "notes": [],
+   "lanes": [
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 160.72819294869484},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 171.04259521722307},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 162.7090711899558},
+    {"rect": null, "reason": "unassigned", "components": 0, "snr": 88.77520519144572},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 218.56800597758556},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 196.4292238502038}
+   ]
+  },
+  "adversarial/doublet_two/1001": {
+   "flags": ["multiple_components"],
+   "notes": ["lane 2: a second separate component reaches 25% of the lane's peak; the box covers the one with the lane's strongest pixel"],
+   "lanes": [
+    {"rect": [71, 73, 115, 89], "reason": "band", "components": 1, "snr": 227.9405617126533},
+    {"rect": [138, 67, 182, 83], "reason": "band", "components": 2, "snr": 172.78291825064235},
+    {"rect": [209, 72, 253, 88], "reason": "band", "components": 1, "snr": 174.5570746858066},
+    {"rect": [282, 72, 326, 88], "reason": "band", "components": 1, "snr": 151.29738062963156},
+    {"rect": [349, 71, 393, 87], "reason": "band", "components": 1, "snr": 175.7927882232678},
+    {"rect": [419, 73, 463, 89], "reason": "band", "components": 1, "snr": 237.97710432047333}
+   ]
+  },
+  "adversarial/gauss_tails_miss/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [72, 74, 113, 86], "reason": "band", "components": 1, "snr": 146.49908997197122},
+    {"rect": [128, 75, 169, 87], "reason": "band", "components": 1, "snr": 174.87061116254276},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 2.6486851375748417},
+    {"rect": [239, 75, 280, 87], "reason": "band", "components": 1, "snr": 176.36129628635464},
+    {"rect": [296, 75, 337, 87], "reason": "band", "components": 1, "snr": 238.3756913999376},
+    {"rect": [351, 74, 392, 86], "reason": "band", "components": 1, "snr": 213.18019712184207}
+   ]
+  },
+  "adversarial/twenty_lanes/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 2.46323978257659},
+    {"rect": [106, 74, 130, 84], "reason": "band", "components": 1, "snr": 213.87620696566273},
+    {"rect": [142, 75, 166, 85], "reason": "band", "components": 1, "snr": 217.9634873801961},
+    {"rect": [177, 75, 201, 85], "reason": "band", "components": 1, "snr": 153.50989650441585},
+    {"rect": [214, 74, 238, 84], "reason": "band", "components": 1, "snr": 219.78532200980806},
+    {"rect": [249, 75, 273, 85], "reason": "band", "components": 1, "snr": 195.41419573137645},
+    {"rect": [285, 75, 309, 85], "reason": "band", "components": 1, "snr": 201.65395718825056},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 1.620183836584948},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 1.9553362869847517},
+    {"rect": [396, 75, 420, 85], "reason": "band", "components": 1, "snr": 179.81901826734133},
+    {"rect": [431, 74, 455, 84], "reason": "band", "components": 1, "snr": 194.7420966066629},
+    {"rect": [465, 75, 489, 85], "reason": "band", "components": 1, "snr": 204.92763893921742},
+    {"rect": [501, 76, 525, 86], "reason": "band", "components": 1, "snr": 145.1660089954742},
+    {"rect": [540, 75, 564, 85], "reason": "band", "components": 1, "snr": 210.01437816037526},
+    {"rect": [575, 74, 599, 84], "reason": "band", "components": 1, "snr": 197.02322681242504},
+    {"rect": [609, 75, 633, 85], "reason": "band", "components": 1, "snr": 165.19715354487175},
+    {"rect": [645, 75, 669, 85], "reason": "band", "components": 1, "snr": 173.2663476897195},
+    {"rect": [683, 76, 707, 86], "reason": "band", "components": 1, "snr": 158.57930166352224},
+    {"rect": [719, 74, 743, 84], "reason": "band", "components": 1, "snr": 176.38902519979348},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 1.8744597823677598}
+   ]
+  },
+  "adversarial/blob_gap/1000": {
+   "flags": ["multiple_components"],
+   "notes": ["merged pieces at x=257..321", "lane 4: a second separate component reaches 25% of the lane's peak; the box covers the one with the lane's strongest pixel"],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 135.43236138723782},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 160.39116401840488},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 170.6727076973655},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 2, "snr": 162.3414197866401},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 218.07185350601043},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 195.96745041181077}
+   ]
+  },
+  "adversarial/bubble_band/1000": {
+   "flags": ["multiple_components"],
+   "notes": ["merged pieces at x=139..187", "lane 2: a second separate component reaches 25% of the lane's peak; the box covers the one with the lane's strongest pixel"],
+   "lanes": [
+    {"rect": [71, 74, 113, 86], "reason": "band", "components": 1, "snr": 134.80406702490615},
+    {"rect": [156, 75, 198, 87], "reason": "band", "components": 2, "snr": 111.4564433988805},
+    {"rect": [211, 74, 253, 86], "reason": "band", "components": 1, "snr": 170.2784698724276},
+    {"rect": [280, 75, 322, 87], "reason": "band", "components": 1, "snr": 162.12845876560215},
+    {"rect": [351, 75, 393, 87], "reason": "band", "components": 1, "snr": 217.8837040360785},
+    {"rect": [420, 74, 462, 86], "reason": "band", "components": 1, "snr": 195.9729497623734}
+   ]
+  },
+  "adversarial/tall_band/1000": {
+   "flags": ["size_outlier"],
+   "notes": ["lane 4: extent above 2x the median of the other extents, left out of the shared size"],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 147.9078718573468},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 175.15298221056122},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 186.40580139512716},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 183.14687451869855},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 238.15596569970896},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 214.07942050330357}
+   ]
+  },
+  "adversarial/doublet_deep/1000": {
+   "flags": ["multiple_components"],
+   "notes": ["lane 3: a second separate component reaches 25% of the lane's peak; the box covers the one with the lane's strongest pixel"],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 144.08040951113162},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 170.71242592798563},
+    {"rect": [210, 67, 254, 79], "reason": "band", "components": 2, "snr": 176.63583036661996},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 172.93012932980085},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 232.30913619353962},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 208.85910540278672}
+   ]
+  },
+  "adversarial/smile_tall_tight/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 66, 114, 87], "reason": "band", "components": 1, "snr": 144.51538979009058},
+    {"rect": [141, 72, 185, 93], "reason": "band", "components": 1, "snr": 170.1575329748367},
+    {"rect": [210, 75, 254, 96], "reason": "band", "components": 1, "snr": 178.11851931767316},
+    {"rect": [279, 76, 323, 97], "reason": "band", "components": 1, "snr": 170.24449068923357},
+    {"rect": [350, 72, 394, 93], "reason": "band", "components": 1, "snr": 235.90853281166125},
+    {"rect": [419, 66, 463, 87], "reason": "band", "components": 1, "snr": 206.64540376756491}
+   ]
+  },
+  "adversarial/wide_row/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 103, 202, 137], "reason": "band", "components": 1, "snr": 172.64964118737277},
+    {"rect": [281, 104, 413, 138], "reason": "band", "components": 1, "snr": 201.9437362978157},
+    {"rect": null, "reason": "no_band", "components": 0, "snr": 3.0816430076102397},
+    {"rect": [699, 104, 831, 138], "reason": "band", "components": 1, "snr": 204.58310106357126},
+    {"rect": [910, 104, 1042, 138], "reason": "band", "components": 1, "snr": 275.1038572657195},
+    {"rect": [1119, 102, 1251, 136], "reason": "band", "components": 1, "snr": 247.0538295968466}
+   ]
+  },
+  "adversarial/touching_weak_end/1000": {
+   "flags": [],
+   "notes": ["stage 2 skipped: too few band-free pixels"],
+   "lanes": [
+    {"rect": [75, 74, 123, 88], "reason": "band", "components": 1, "snr": 30.81727435666087},
+    {"rect": [123, 74, 171, 88], "reason": "band", "components": 1, "snr": 98.01903582235396},
+    {"rect": [172, 74, 220, 88], "reason": "band", "components": 1, "snr": 105.83061625492144},
+    {"rect": [221, 74, 269, 88], "reason": "band", "components": 1, "snr": 97.12657036513808},
+    {"rect": [270, 74, 318, 88], "reason": "band", "components": 1, "snr": 131.18022016385112},
+    {"rect": [319, 73, 367, 87], "reason": "band", "components": 1, "snr": 116.9603433491978}
+   ]
+  },
+  "adversarial/wide_next_empty/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [62, 74, 130, 86], "reason": "band", "components": 1, "snr": 145.9866927955799},
+    {"rect": [136, 75, 204, 87], "reason": "band", "components": 1, "snr": 174.61440913439944},
+    {"rect": [205, 74, 273, 86], "reason": "band", "components": 1, "snr": 183.86262821343684},
+    {"rect": null, "reason": "unassigned", "components": 0, "snr": 36.48637394532557},
+    {"rect": [338, 75, 406, 87], "reason": "band", "components": 1, "snr": 234.8168009093831},
+    {"rect": [406, 74, 474, 86], "reason": "band", "components": 1, "snr": 210.99165146366494}
+   ]
+  },
+  "adversarial/tilt_cut/1000": {
+   "flags": ["cut_by_row_box"],
+   "notes": ["lanes 1, 2: the row box's top or bottom edge cuts through the band (the box's edge row holds at least 30% of its peak)"],
+   "lanes": [
+    {"rect": [70, 72, 114, 84], "reason": "band", "components": 1, "snr": 142.88657135715255},
+    {"rect": [141, 72, 185, 84], "reason": "band", "components": 1, "snr": 166.37876146336805},
+    {"rect": [210, 73, 254, 85], "reason": "band", "components": 1, "snr": 177.41055295447768},
+    {"rect": [279, 76, 323, 88], "reason": "band", "components": 1, "snr": 168.58606374205473},
+    {"rect": [350, 78, 394, 90], "reason": "band", "components": 1, "snr": 227.14653632791905},
+    {"rect": [419, 79, 463, 91], "reason": "band", "components": 1, "snr": 204.63335560716604}
+   ]
+  },
+  "adversarial/ladder_beside/1000": {
+   "flags": ["doubtful_lanes"],
+   "notes": ["lane numbers doubtful: the fitted pitch (92.7 px) is 33% off the bands' own spacing (69.6 px); at that spacing the bands read as lanes 1 to 6 lie 5.8 lanes apart"],
+   "lanes": [
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 174.2931282594389},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 184.75442870756143},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 177.17680075540628},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 238.95846268120766},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 213.00364912133415},
+    {"rect": [543, 74, 587, 86], "reason": "band", "components": 1, "snr": 113.03049735308277}
+   ]
+  },
+  "adversarial/ladder_before/1000": {
+   "flags": ["doubtful_lanes"],
+   "notes": ["lane numbers doubtful: the fitted pitch (93.7 px) is 34% off the bands' own spacing (70.0 px); at that spacing the bands read as lanes 1 to 6 lie 5.8 lanes apart"],
+   "lanes": [
+    {"rect": [74, 74, 118, 86], "reason": "band", "components": 1, "snr": 114.20698539750983},
+    {"rect": [200, 74, 244, 86], "reason": "band", "components": 1, "snr": 151.49962833231763},
+    {"rect": [271, 75, 315, 87], "reason": "band", "components": 1, "snr": 178.25949496714392},
+    {"rect": [340, 74, 384, 86], "reason": "band", "components": 1, "snr": 189.51642133736502},
+    {"rect": [409, 75, 453, 87], "reason": "band", "components": 1, "snr": 178.95454986297108},
+    {"rect": [480, 75, 524, 87], "reason": "band", "components": 1, "snr": 242.1760764856732}
+   ]
+  },
+  "adversarial/label_beside/1000": {
+   "flags": ["doubtful_lanes"],
+   "notes": ["merged pieces at x=525..578", "lane numbers doubtful: at the bands' own spacing (69.6 px), the bands read as lanes 1 to 6 lie 5.6 lanes apart"],
+   "lanes": [
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 167.44999731074734},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 177.48581885003784},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 170.19673355179586},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 229.53857568517938},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 204.58997939560567},
+    {"rect": [508, 75, 552, 87], "reason": "band", "components": 1, "snr": 155.6701809278037}
+   ]
+  },
+  "adversarial/panel_beside/1000": {
+   "flags": ["doubtful_lanes"],
+   "notes": ["lane numbers doubtful: the fitted pitch (134.8 px) is 93% off the bands' own spacing (70.0 px); at that spacing the row box reaches 2.5 lanes past lane 1's centre"],
+   "lanes": [
+    {"rect": [210, 75, 254, 87], "reason": "band", "components": 1, "snr": 223.36507469559103},
+    {"rect": [279, 74, 323, 86], "reason": "band", "components": 1, "snr": 198.9901413956867},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 154.03469740256244},
+    {"rect": [407, 75, 451, 87], "reason": "band", "components": 1, "snr": 115.3742418214476},
+    {"rect": [507, 74, 551, 86], "reason": "band", "components": 1, "snr": 212.4905102031807}
+   ]
+  },
+  "adversarial/dumbbell_band/1000": {
+   "flags": [],
+   "notes": ["merged pieces at x=140..186"],
+   "lanes": [
+    {"rect": [69, 74, 115, 86], "reason": "band", "components": 1, "snr": 134.0948298140945},
+    {"rect": [140, 75, 186, 87], "reason": "band", "components": 1, "snr": 146.5157910028588},
+    {"rect": [209, 74, 255, 86], "reason": "band", "components": 1, "snr": 168.69885274241582},
+    {"rect": [278, 75, 324, 87], "reason": "band", "components": 1, "snr": 160.36507995477797},
+    {"rect": [349, 75, 395, 87], "reason": "band", "components": 1, "snr": 215.31535877211357},
+    {"rect": [418, 74, 464, 86], "reason": "band", "components": 1, "snr": 193.38509783755688}
+   ]
+  },
+  "adversarial/hollow_band/1000": {
+   "flags": [],
+   "notes": ["merged pieces at x=139..187"],
+   "lanes": [
+    {"rect": [68, 74, 116, 86], "reason": "band", "components": 1, "snr": 129.9288140820098},
+    {"rect": [139, 75, 187, 87], "reason": "band", "components": 1, "snr": 368.6406387398828},
+    {"rect": [208, 74, 256, 86], "reason": "band", "components": 1, "snr": 163.60815583120532},
+    {"rect": [277, 75, 325, 87], "reason": "band", "components": 1, "snr": 155.5826385048405},
+    {"rect": [348, 75, 396, 87], "reason": "band", "components": 1, "snr": 208.93867743400827},
+    {"rect": [417, 74, 465, 86], "reason": "band", "components": 1, "snr": 187.7192057988909}
+   ]
+  },
+  "adversarial/hollow_ring/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [67, 72, 118, 88], "reason": "band", "components": 1, "snr": 144.51221679103455},
+    {"rect": [137, 73, 188, 89], "reason": "band", "components": 1, "snr": 410.3785005830013},
+    {"rect": [207, 72, 258, 88], "reason": "band", "components": 1, "snr": 182.20487880667477},
+    {"rect": [276, 73, 327, 89], "reason": "band", "components": 1, "snr": 173.36508573331605},
+    {"rect": [347, 73, 398, 89], "reason": "band", "components": 1, "snr": 232.85801095074603},
+    {"rect": [416, 72, 467, 88], "reason": "band", "components": 1, "snr": 209.33747636779424}
+   ]
+  },
+  "adversarial/notched_band/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [68, 70, 116, 90], "reason": "band", "components": 1, "snr": 142.59342658586505},
+    {"rect": [139, 68, 187, 88], "reason": "band", "components": 1, "snr": 404.957027242675},
+    {"rect": [208, 70, 256, 90], "reason": "band", "components": 1, "snr": 179.79954168529454},
+    {"rect": [277, 71, 325, 91], "reason": "band", "components": 1, "snr": 171.08061690427868},
+    {"rect": [348, 71, 396, 91], "reason": "band", "components": 1, "snr": 229.79504748531699},
+    {"rect": [417, 70, 465, 90], "reason": "band", "components": 1, "snr": 206.588980081338}
+   ]
+  },
+  "bench/overexposed saturated_at=0": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 55, 117, 67], "reason": "band", "components": 1, "snr": 193.48502594655668},
+    {"rect": [137, 54, 184, 66], "reason": "band", "components": 1, "snr": 205.70395408604995},
+    {"rect": [211, 55, 258, 67], "reason": "band", "components": 1, "snr": 397.81291951494796},
+    {"rect": [280, 54, 327, 66], "reason": "band", "components": 1, "snr": 207.89671225289572},
+    {"rect": [350, 53, 397, 65], "reason": "band", "components": 1, "snr": 216.96501365510048},
+    {"rect": [418, 55, 465, 67], "reason": "band", "components": 1, "snr": 213.95795411401218}
+   ]
+  },
+  "adversarial/dumbbell_band/1000 saturated_at=0": {
+   "flags": [],
+   "notes": ["merged pieces at x=140..186"],
+   "lanes": [
+    {"rect": [69, 74, 115, 86], "reason": "band", "components": 1, "snr": 134.0948298140945},
+    {"rect": [140, 75, 186, 87], "reason": "band", "components": 1, "snr": 146.5157910028588},
+    {"rect": [209, 74, 255, 86], "reason": "band", "components": 1, "snr": 168.69885274241582},
+    {"rect": [278, 75, 324, 87], "reason": "band", "components": 1, "snr": 160.36507995477797},
+    {"rect": [349, 75, 395, 87], "reason": "band", "components": 1, "snr": 215.31535877211357},
+    {"rect": [418, 74, 464, 86], "reason": "band", "components": 1, "snr": 193.38509783755688}
+   ]
+  },
+  "adversarial/hollow_band/1000 saturated_at=0": {
+   "flags": ["hollow_band"],
+   "notes": ["merged pieces at x=139..187", "lane 2: a hollow band, lighter in its centre than the saturated pixels on either side of it: a sign of over-exposure"],
+   "lanes": [
+    {"rect": [68, 74, 116, 86], "reason": "band", "components": 1, "snr": 129.9288140820098},
+    {"rect": [139, 75, 187, 87], "reason": "band", "components": 1, "snr": 368.6406387398828},
+    {"rect": [208, 74, 256, 86], "reason": "band", "components": 1, "snr": 163.60815583120532},
+    {"rect": [277, 75, 325, 87], "reason": "band", "components": 1, "snr": 155.5826385048405},
+    {"rect": [348, 75, 396, 87], "reason": "band", "components": 1, "snr": 208.93867743400827},
+    {"rect": [417, 74, 465, 86], "reason": "band", "components": 1, "snr": 187.7192057988909}
+   ]
+  },
+  "adversarial/hollow_ring/1000 saturated_at=0": {
+   "flags": ["hollow_band"],
+   "notes": ["lane 2: a hollow band, lighter in its centre than the saturated pixels on either side of it: a sign of over-exposure"],
+   "lanes": [
+    {"rect": [67, 72, 118, 88], "reason": "band", "components": 1, "snr": 144.51221679103455},
+    {"rect": [137, 73, 188, 89], "reason": "band", "components": 1, "snr": 410.3785005830013},
+    {"rect": [207, 72, 258, 88], "reason": "band", "components": 1, "snr": 182.20487880667477},
+    {"rect": [276, 73, 327, 89], "reason": "band", "components": 1, "snr": 173.36508573331605},
+    {"rect": [347, 73, 398, 89], "reason": "band", "components": 1, "snr": 232.85801095074603},
+    {"rect": [416, 72, 467, 88], "reason": "band", "components": 1, "snr": 209.33747636779424}
+   ]
+  },
+  "adversarial/notched_band/1000 saturated_at=0": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [68, 70, 116, 90], "reason": "band", "components": 1, "snr": 142.59342658586505},
+    {"rect": [139, 68, 187, 88], "reason": "band", "components": 1, "snr": 404.957027242675},
+    {"rect": [208, 70, 256, 90], "reason": "band", "components": 1, "snr": 179.79954168529454},
+    {"rect": [277, 71, 325, 91], "reason": "band", "components": 1, "snr": 171.08061690427868},
+    {"rect": [348, 71, 396, 91], "reason": "band", "components": 1, "snr": 229.79504748531699},
+    {"rect": [417, 70, 465, 90], "reason": "band", "components": 1, "snr": 206.588980081338}
+   ]
+  },
+  "jpeg/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 947.1983952689096},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 1118.0339887498947},
+    {"rect": [210, 74, 254, 86], "reason": "band", "components": 1, "snr": 1181.5383193108876},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 1130.5559694238923},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 1524.9983606548553},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 1359.5293303198719}
+   ]
+  },
+  "bench/all_present right_to_left": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [419, 55, 463, 67], "reason": "band", "components": 1, "snr": 175.9502889714505},
+    {"rect": [351, 55, 395, 67], "reason": "band", "components": 1, "snr": 190.12500768587557},
+    {"rect": [279, 54, 323, 66], "reason": "band", "components": 1, "snr": 160.3789265297431},
+    {"rect": [209, 54, 253, 66], "reason": "band", "components": 1, "snr": 153.10583083021643},
+    {"rect": [139, 55, 183, 67], "reason": "band", "components": 1, "snr": 177.78877454470538},
+    {"rect": [72, 55, 116, 67], "reason": "band", "components": 1, "snr": 152.11159244091147}
+   ]
+  }
+ }
+}

@@ -18,15 +18,18 @@ the empty ones included, plus a margin.
   generator and the recipes the tests use (neighbouring rows, doublets,
   streaks, stains, dust between lanes, bubbles), plus rows of the tests' own
   (a row large enough for the fits' subsample, guards that bind).
+* :func:`jpeg`: a row as an 8-bit JPEG export, read back (block artefacts).
 * :func:`fuzz_row`: seeded random geometry for the invariant checks.
 """
 
 import dataclasses
+import io
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image
 
 from proteia.core.model import Rect
 
@@ -267,6 +270,8 @@ def adversarial_row(
     img_h: int = 160,
     x_jitter: float = 2.0,
     y_jitter: float = 1.0,
+    margin_left: int = 70,
+    margin_right: int = 70,
 ) -> RowCase:
     """A row from the accuracy judge's generator (acc_adv), the same draws.
 
@@ -281,11 +286,12 @@ def adversarial_row(
     spanning them;
     ``artefacts`` add darkening maps ``f(X, Y, lane_cx, lane_cy)``; ``widths``,
     ``heights`` and ``depths`` override single bands; ``box_adjust`` moves the
-    row box's edges."""
+    row box's edges; ``margin_left`` and ``margin_right`` are the membrane
+    left of the first band and right of the last (room for what lies beside
+    the row, :func:`beside`)."""
     rng = np.random.default_rng(seed)
     steps = list(pitches) if pitches is not None else [pitch] * (n - 1)
-    margin = 70
-    lane_cx = (margin + w / 2 + np.concatenate([[0.0], np.cumsum(steps)])) + rng.uniform(
+    lane_cx = (margin_left + w / 2 + np.concatenate([[0.0], np.cumsum(steps)])) + rng.uniform(
         -x_jitter, x_jitter, n
     )
     row_cy = img_h / 2
@@ -304,7 +310,7 @@ def adversarial_row(
     dps = rng.uniform(*depth_range, n)
     for k, v in (depths or {}).items():
         dps[k] = v
-    width_img = int(math.ceil(lane_cx[-1] + ws[-1] / 2 + margin))
+    width_img = int(math.ceil(lane_cx[-1] + ws[-1] / 2 + margin_right))
     xs = np.arange(width_img, dtype=float)
     ys = np.arange(img_h, dtype=float)
     base = np.full((img_h, width_img), MEMBRANE)
@@ -368,16 +374,22 @@ def adversarial_row(
 
 
 def blob(
-    lane: int, r: float, depth: float, *, ry: float | None = None, dy: float = 0.0
+    lane: int,
+    r: float,
+    depth: float,
+    *,
+    ry: float | None = None,
+    dy: float = 0.0,
+    dx: float = 0.0,
 ) -> Artefact:
     """A round dark blob (dust, a stain) of radius ``r`` on ``lane``'s band centre
-    (``dy`` px below it); a negative depth is a light spot. ``ry`` makes it an
-    ellipse, ``r`` px across and ``ry`` px high."""
+    (``dy`` px below it, ``dx`` px right of it); a negative depth is a light
+    spot. ``ry`` makes it an ellipse, ``r`` px across and ``ry`` px high."""
     ry = r if ry is None else ry
 
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
-        cy = lcy[lane] + dy
-        return depth * np.exp(-0.5 * (((X - lcx[lane]) / r) ** 2 + ((Y - cy) / ry) ** 2))
+        cx, cy = lcx[lane] + dx, lcy[lane] + dy
+        return depth * np.exp(-0.5 * (((X - cx) / r) ** 2 + ((Y - cy) / ry) ** 2))
 
     return f
 
@@ -401,6 +413,37 @@ def band_between(left: int, w: float, h: float, depth: float, dy: float = 0.0) -
     def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
         cx = 0.5 * (lcx[left] + lcx[left + 1])
         return _band(X[0], Y[:, 0], cx, lcy[left] + dy, w, h, depth, "super")
+
+    return f
+
+
+def beside(
+    lanes: float,
+    w: float,
+    h: float,
+    depth: float,
+    *,
+    marks: int = 1,
+    gap: float = 0.0,
+    dy: float = 0.0,
+) -> Artefact:
+    """What lies beside the row and is no lane of it: ``marks`` flat-topped
+    marks ``w`` x ``h`` px at 20%, ``gap`` px apart, the first centred
+    ``lanes`` lane steps past the last lane's centre (before the first lane's
+    if negative, the marks then running left), at the row's mean band height
+    (``dy`` px below it). A ladder's band or a tick mark is one narrow mark, a
+    label's text a few thin strokes, a neighbouring panel's lane a band."""
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        if lanes >= 0:
+            x0, step = lcx[-1] + lanes * (lcx[-1] - lcx[-2]), w + gap
+        else:
+            x0, step = lcx[0] + lanes * (lcx[1] - lcx[0]), -(w + gap)
+        cy = float(np.mean(lcy)) + dy
+        out = np.zeros((Y.shape[0], X.shape[1]))
+        for k in range(marks):
+            out += _band(X[0], Y[:, 0], x0 + k * step, cy, w, h, depth, "super")
+        return out
 
     return f
 
@@ -548,12 +591,81 @@ ADVERSARIAL: dict[str, dict] = {
     # A tilted row (lane 1 highest) whose box's top edge runs 3 px above the
     # highest band's centre: it cuts the bands of lanes 1 and 2 only.
     "tilt_cut": {"tilt": 10.0, "box_adjust": (0, 9, 0, 0)},
+    # #111: a first row box that also covers what lies beside the row, read a
+    # lane or more off. A ladder's band 1.8 lane steps past the last lane,
+    # lane 0 empty: read as the last lane, each band a lane early.
+    "ladder_beside": {
+        "missing": [0],
+        "artefacts": [beside(1.8, 26, 12, 14000)],
+        "margin_right": 200,
+        "box_adjust": (0, 0, 150, 0),
+    },
+    # The same before the first lane, the last lane empty.
+    "ladder_before": {
+        "missing": [5],
+        "artefacts": [beside(-1.8, 26, 12, 14000)],
+        "margin_left": 200,
+        "box_adjust": (-150, 0, 0, 0),
+    },
+    # A label's text, four strokes 1.3 lane steps past the last lane, lane 0 empty.
+    "label_beside": {
+        "missing": [0],
+        "artefacts": [beside(1.3, 10, 14, 20000, marks=4, gap=4)],
+        "margin_right": 200,
+        "box_adjust": (0, 0, 150, 0),
+    },
+    # Five lanes, the first two empty; an arrow 0.8 lane steps past the last
+    # and a neighbouring panel's band 2.2 past it.
+    "panel_beside": {
+        "n": 5,
+        "missing": [0, 1],
+        "artefacts": [beside(0.8, 20, 6, 15000), beside(2.2, 44, 12, 25000)],
+        "margin_right": 240,
+        "box_adjust": (0, 0, 190, 0),
+    },
+    # #121: lane 1's band pale across its middle, its two ends about 1.7x as
+    # dark (a dumbbell); the same band over-exposed, clipped flat at 0 around
+    # its lighter centre (a hollow band).
+    "dumbbell_band": {"depths": {1: 24000.0}, "artefacts": [blob(1, 6.0, -11000.0, ry=12.0)]},
+    "hollow_band": {
+        "depths": {1: 1.5 * MEMBRANE},
+        "artefacts": [blob(1, 6.0, -45000.0, ry=12.0)],
+    },
+    # #121: lane 1's band 2.5x as deep as the membrane, clipped at 0 all around
+    # a lighter centre, back to 40000 there (a ring: burnt out in its middle);
+    # the band of hollow_band with dark spots at its two ends, 6 px above its
+    # middle (a notch in its top edge, as a band whose ends curve up shows).
+    "hollow_ring": {
+        "depths": {1: 2.5 * MEMBRANE},
+        "artefacts": [blob(1, 7.0, -2.3 * MEMBRANE, ry=2.0)],
+        "my": 10,
+    },
+    "notched_band": {
+        "depths": {1: 1.5 * MEMBRANE},
+        "artefacts": [blob(1, 4.0, 60000.0, dx=x, dy=-6.0) for x in (-13.0, 13.0)],
+        "my": 10,
+    },
 }
 
 
 def adversarial(key: str, seed: int) -> RowCase:
     """The recipe ``key`` of :data:`ADVERSARIAL` at ``seed``."""
     return adversarial_row(key, seed, **ADVERSARIAL[key])
+
+
+def jpeg(case: RowCase, quality: int = 75, membrane: float = 200.0) -> RowCase:
+    """A dark-on-light ``case`` as an 8-bit JPEG export of that quality, read
+    back: the membrane at ``membrane`` grey levels and the bands scaled with it
+    (about 70 to 120 levels deep), rounded, then compressed. On a smooth
+    membrane the compression leaves 8x8 block artefacts a few levels deep, as
+    a JPEG blot shows them (#121)."""
+    scaled = np.clip(np.round(case.image * membrane / MEMBRANE), 0.0, 255.0).astype(np.uint8)
+    encoded = io.BytesIO()
+    Image.fromarray(scaled).save(encoded, format="JPEG", quality=quality)
+    encoded.seek(0)
+    with Image.open(encoded) as decoded:
+        image = np.asarray(decoded, dtype=np.float64)
+    return dataclasses.replace(case, image=image)
 
 
 def fuzz_row(seed: int) -> RowCase:

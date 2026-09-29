@@ -27,6 +27,13 @@
     aria-keyshortcuts="Control+Shift+Z Control+Y Meta+Shift+Z">Redo</button>
   <span id="save-state" class="save-state" role="status"></span>
   <span class="spacer"></span>
+  <!-- Images handed to Proteia that the Import dialog does not show (closed with
+    Esc or Later, or found while another dialog was up): it shows them (app.js). -->
+  <button id="handoffs-waiting" class="waiting" type="button" hidden
+    title="Images handed to Proteia wait for you to import or discard them"></button>
+  <!-- A zip file to attach to a bug report (diagnostics.js); Proteia sends nothing. -->
+  <button id="diagnostics" type="button" hidden aria-haspopup="dialog"
+    title="Write a file to attach to a bug report: the session log, the versions and the open project's records. Proteia sends nothing.">Diagnostics…</button>
   <button id="quit" type="button" hidden>Quit Proteia</button>
 </header>
 
@@ -45,6 +52,14 @@
             <option value="light_on_dark">light on a dark background</option>
           </select>
         </label>
+        <!-- A chemiluminescence image only (calibration.js): the marker or merged
+          image of its membrane taken with it, the same size pixel for pixel; one
+          of another size is listed disabled, its tooltip says why. -->
+        <label id="marker-field" class="field" hidden>Marker image
+          <select id="marker-image" aria-describedby="marker-none"></select>
+        </label>
+        <p id="marker-none" class="hint note" hidden>No marker or merged image on this membrane
+          yet: import one onto it to link it.</p>
         <button id="remove-image" type="button">Remove this image</button>
       </div>
       <fieldset class="group">
@@ -73,6 +88,92 @@
           <input id="import-file" class="file-input" type="file" accept=".tif,.tiff,.png,.jpg,.jpeg" disabled>
         </label>
       </fieldset>
+    </section>
+
+    <!-- Molecular weights (#58) for the shown image's register group
+      (calibration.js): the membrane's ladder; Find ladder, then a ruler to
+      adjust on the image before Apply stores it (one undo step); marking bands
+      one by one where no ladder stands out; the fit and the marks. -->
+    <section id="calibration" hidden>
+      <h2>Molecular weight</h2>
+      <p id="cal-group" class="hint note" hidden></p>
+      <p id="cal-link-offer" class="note" hidden><span id="cal-link-text"></span>
+        <button id="cal-link" type="button">Link</button></p>
+      <label class="field">Ladder
+        <select id="cal-ladder" aria-describedby="cal-ladder-mws"></select>
+      </label>
+      <p id="cal-ladder-mws" class="hint note" hidden></p>
+      <form id="cal-custom" class="group" hidden>
+        <label class="field">Custom ladder name
+          <input id="cal-custom-name" type="text" required maxlength="100" autocomplete="off"
+            spellcheck="false">
+        </label>
+        <label class="field">Its MWs, top to bottom (kDa; optional)
+          <input id="cal-custom-kda" type="text" autocomplete="off" spellcheck="false"
+            placeholder="250, 130, 100, 70, 55">
+        </label>
+        <div class="actions">
+          <button type="submit">Set ladder</button>
+          <button id="cal-custom-cancel" type="button">Cancel</button>
+        </div>
+        <p id="cal-custom-error" class="error" role="alert"></p>
+      </form>
+      <div id="cal-find-tools" class="actions cal-tools">
+        <button id="cal-find" type="button" aria-pressed="false">Find ladder</button>
+        <button id="cal-find-right" type="button" aria-pressed="false">Find second ladder
+          (right)</button>
+      </div>
+      <!-- The ruler found (or reopened by Adjust), not stored until Apply: a
+        button per tick, top to bottom, is the keyboard's way to each. -->
+      <div id="cal-draft" class="group cal-draft" hidden>
+        <p id="cal-draft-head" class="subhead"></p>
+        <p id="cal-draft-doubt" class="note warning" role="status" hidden></p>
+        <!-- The marks of the ruler's side it does not hold (strip edges, marks
+          on another image of the group), which its Apply removes. -->
+        <p id="cal-draft-lost" class="note warning" hidden></p>
+        <p id="cal-draft-error" class="error" role="alert" hidden></p>
+        <div class="actions cal-tools">
+          <button id="cal-apply" type="button" aria-keyshortcuts="Enter"
+            aria-describedby="cal-draft-lost">Apply</button>
+          <button id="cal-drop" type="button" aria-keyshortcuts="Escape"
+            title="Drop the ruler: nothing is stored (Esc)">Drop</button>
+        </div>
+        <div class="actions cal-tools">
+          <button id="cal-up" type="button" aria-label="Move every label up one band"
+            aria-describedby="cal-shift-why"
+            title="Move every label up one band: each band then reads the next lighter MW">▲</button>
+          <button id="cal-down" type="button" aria-label="Move every label down one band"
+            aria-describedby="cal-shift-why"
+            title="Move every label down one band: each band then reads the next heavier MW">▼</button>
+          <button id="cal-snap" type="button"
+            title="Move each tick onto the band nearest it; a hollow tick that lands on a band is stored">Snap
+            all</button>
+        </div>
+        <!-- Why ▲▼ are disabled, when a label has no band to move to. -->
+        <p id="cal-shift-why" class="hint note" hidden></p>
+        <ol id="cal-ticks" class="cal-ticks" aria-label="Ruler ticks, top to bottom" data-space-presses></ol>
+        <p class="hint note">Solid ticks are stored, hollow ones (predicted) are not. Tab: next
+          tick · ↑↓: move it 0.5 px (Shift: 5 px) · Space: relabel · Delete: not a ladder band</p>
+      </div>
+      <div id="cal-fit" class="cal-fit" role="status"></div>
+      <details id="cal-marks" class="cal-marks" hidden>
+        <summary id="cal-marks-count"></summary>
+        <ul id="cal-points" class="cal-points"></ul>
+        <div class="actions cal-tools">
+          <button id="cal-adjust" type="button"
+            title="Reopen the ruler from the ladder's marks to adjust them">Adjust ladder</button>
+          <button id="cal-adjust-right" type="button"
+            title="Reopen the ruler from the second ladder's marks to adjust them">Adjust second
+            ladder</button>
+          <!-- No confirmation: Undo brings the marks back. -->
+          <button id="cal-clear" type="button"
+            title="Remove every mark of both ladders (Undo brings them back)">Clear marks</button>
+        </div>
+      </details>
+      <div class="actions cal-tools">
+        <button id="cal-mark" type="button" aria-pressed="false">Mark ladder bands</button>
+        <button id="cal-mark-edges" type="button" aria-pressed="false">Mark strip edges</button>
+      </div>
     </section>
 
     <section>
@@ -205,6 +306,23 @@
         <div id="lane-picker-buttons"></div>
         <button id="lane-picker-cancel" type="button">Cancel</button>
       </div>
+      <!-- Beside a ruler tick or a band clicked (calibration.js): its MW, from the
+        ladder's; Esc or a click elsewhere closes it. Opened from a tick's button,
+        it is marked data-space-presses (openMenu). -->
+      <div id="cal-menu" class="cal-menu" role="dialog" aria-labelledby="cal-menu-title" hidden>
+        <p id="cal-menu-title"></p>
+        <div id="cal-menu-choices" class="cal-menu-choices"></div>
+        <form id="cal-menu-other" class="cal-menu-other" hidden>
+          <label class="inline">Other MW (kDa)
+            <input id="cal-menu-mw" type="number" min="0" step="any">
+          </label>
+          <button type="submit">Mark</button>
+        </form>
+        <div class="actions">
+          <button id="cal-menu-extra" type="button" hidden></button>
+          <button id="cal-menu-cancel" type="button">Cancel</button>
+        </div>
+      </div>
     </section>
 
     <!-- Drag to resize the results; Enter or a double click hides or shows them. -->
@@ -283,6 +401,8 @@
   <p id="projects-empty" hidden>No projects yet. Create one, or open the sample project to
     try Proteia on a synthetic blot first.</p>
   <ul id="project-list" class="choices"></ul>
+  <!-- As in the header: images handed to Proteia, waiting (app.js renderWaiting). -->
+  <button id="projects-handoffs" class="waiting" type="button" hidden></button>
   <form id="new-project" class="new-project">
     <label class="field">New project
       <input id="new-project-name" type="text" maxlength="100" required>
@@ -299,7 +419,70 @@
   </div>
   <p id="projects-state" class="hint" role="status" hidden></p>
   <p id="projects-error" class="error" role="alert"></p>
-  <button id="projects-close" type="button">Close</button>
+  <div class="projects-foot">
+    <!-- The header's Diagnostics… cannot be reached while this dialog is open. -->
+    <button id="projects-diagnostics" type="button" aria-haspopup="dialog"
+      title="Write a file to attach to a bug report: the session log, the versions and the open project's records. Proteia sends nothing.">Diagnostics…</button>
+    <span class="spacer"></span>
+    <button id="projects-close" type="button">Close</button>
+  </div>
+</dialog>
+
+<!-- The diagnostic file for a bug report (#138): diagnostics.js fills it. Before
+  the file is written it lists what the file will hold; the images only when
+  ticked. -->
+<dialog id="diagnostics-dialog" class="diagnostics-dialog" aria-labelledby="diagnostics-title">
+  <h2 id="diagnostics-title">Diagnostic file for a bug report</h2>
+  <p>Proteia writes one zip file for you to attach to your bug report, so the problem can be
+    traced. Proteia sends nothing anywhere: you attach the file yourself.</p>
+  <div id="diagnostics-content">
+    <p id="diagnostics-state" class="hint" role="status"></p>
+    <p class="subhead">The file will hold</p>
+    <ul id="diagnostics-summary" class="diagnostics-summary"></ul>
+    <label class="check"><input id="diagnostics-images" type="checkbox">
+      <span id="diagnostics-images-label">Include the project's images</span></label>
+    <div class="diagnostics-files">
+      <table class="diagnostics-table">
+        <caption class="sr-only">Every file the diagnostic file will hold, with its size</caption>
+        <thead><tr><th scope="col">File</th><th scope="col" class="size">Size</th></tr></thead>
+        <tbody id="diagnostics-files"></tbody>
+      </table>
+    </div>
+    <p id="diagnostics-total"></p>
+    <p id="diagnostics-left-out" class="hint"></p>
+  </div>
+  <div id="diagnostics-result" hidden>
+    <p id="diagnostics-written" role="status"></p>
+    <button id="diagnostics-reveal" type="button">Show in folder</button>
+  </div>
+  <p id="diagnostics-error" class="error" role="alert"></p>
+  <div class="actions diagnostics-actions">
+    <button id="diagnostics-write" type="button" disabled>Write file</button>
+    <button id="diagnostics-close" type="button">Cancel</button>
+  </div>
+</dialog>
+
+<!-- Once per user (#139): the projects folder lies in a folder a sync service
+  uploads. app.js showSyncNotice names the service in each sync-service span;
+  closed however it is, the notice is dismissed for good. It shows no path: the
+  Projects dialog shows where projects are saved. -->
+<dialog id="sync-notice" class="sync-notice" aria-labelledby="sync-notice-title">
+  <h2 id="sync-notice-title">Your projects folder is synced to <span class="sync-service"></span></h2>
+  <p>Proteia keeps your projects in a folder that <span class="sync-service"></span> syncs, so
+    <span class="sync-service"></span> uploads every project's files, the images you import
+    included, to its cloud storage. Proteia itself sends nothing.</p>
+  <p>Unpublished data in your projects is then kept on that service's servers too, under its
+    terms. If your lab or institution has rules on where unpublished research data may be kept,
+    check that they allow this.</p>
+  <p>To keep projects off the cloud, change which folders <span class="sync-service"></span>
+    syncs in its own settings; Proteia does not change them. That can move your projects, or
+    leave them only in the cloud: afterwards, check that they are where the Projects dialog says
+    they are saved. A setting to choose another projects folder is planned for a later
+    version.</p>
+  <p class="hint">This notice is not shown again.</p>
+  <div class="actions sync-notice-actions">
+    <button id="sync-notice-ok" type="button" autofocus>OK</button>
+  </div>
 </dialog>
 
 <!-- A chart card enlarged (Enlarge on a card); charts.js fills it. -->
@@ -310,5 +493,83 @@
   </div>
   <div id="chart-dialog-body"></div>
 </dialog>
+
+<!-- Images a launch handed to Proteia (proteia a.tif, or Open with), waiting to be
+  imported into a new project or discarded (handoffs.js fills it, app.js sends
+  it). Nothing is imported until Import. Esc or Later closes it: the images keep
+  waiting, and the header's "N images waiting…" shows them again. -->
+<dialog id="handoff-dialog" class="handoff-dialog" aria-labelledby="handoff-title"
+  aria-describedby="handoff-intro">
+  <form id="handoff-form">
+    <h2 id="handoff-title">Import images into a new project</h2>
+    <p id="handoff-intro" class="hint">Proteia was given these images. Nothing is imported until
+      you press Import; Discard leaves the original files as they are.</p>
+    <fieldset id="handoff-fields" class="handoff-fields">
+      <label class="field">New project name
+        <input id="handoff-name" type="text" maxlength="100" autocomplete="off" spellcheck="false"
+          placeholder="named after the first image" aria-describedby="handoff-name-error">
+      </label>
+      <p id="handoff-name-error" class="error" role="alert" hidden></p>
+      <!-- Fills the images listed when it is pressed, never one that arrives later. -->
+      <div id="handoff-set-all" class="handoff-set-all">
+        <label class="inline">Bands in every image listed are
+          <select id="handoff-set-all-polarity">
+            <option value="" selected disabled>choose…</option>
+            <option value="dark_on_light">dark on a light background</option>
+            <option value="light_on_dark">light on a dark background</option>
+          </select>
+        </label>
+        <button id="handoff-set-all-apply" type="button" disabled>Set all</button>
+      </div>
+      <ul id="handoff-files" class="handoff-files"></ul>
+    </fieldset>
+    <p id="handoff-arriving" class="hint" hidden>More images may still arrive…</p>
+    <p id="handoff-news" class="hint" role="status"></p>
+    <section id="handoff-refused" class="handoff-refused" aria-labelledby="handoff-refused-title"
+      hidden>
+      <h3 id="handoff-refused-title">Not opened</h3>
+      <ul id="handoff-refused-list" class="notices"></ul>
+    </section>
+    <p id="handoff-closes" class="hint" hidden></p>
+    <p id="handoff-state" class="hint" role="status" hidden></p>
+    <p id="handoff-error" class="error" role="alert"></p>
+    <div class="actions handoff-actions">
+      <button id="handoff-import" type="submit" disabled aria-describedby="handoff-needs">Import</button>
+      <button id="handoff-discard" type="button">Discard</button>
+      <button id="handoff-later" type="button"
+        title="Close; the images keep waiting (the header's “images waiting” shows them again)">Later</button>
+      <span id="handoff-needs" class="hint"></span>
+    </div>
+  </form>
+</dialog>
+
+<!-- One image of the Import dialog. Whether its bands are dark or light starts
+  unchosen: the model has no silent default, so Import waits for it. -->
+<template id="handoff-row">
+  <li>
+    <fieldset class="handoff-file">
+      <legend><bdi class="handoff-file-name"></bdi> <span class="handoff-file-size hint"></span></legend>
+      <label class="field">Import as
+        <select class="handoff-kind">
+          <option value="chemiluminescence">Chemiluminescence</option>
+          <option value="visible_marker">Marker (visible light)</option>
+          <option value="merged">Merged</option>
+        </select>
+      </label>
+      <label class="field">Membrane
+        <select class="handoff-membrane">
+          <option value="new">New membrane</option>
+        </select>
+      </label>
+      <label class="field">Bands are
+        <select class="handoff-polarity" required>
+          <option value="" selected disabled>choose…</option>
+          <option value="dark_on_light">dark on a light background</option>
+          <option value="light_on_dark">light on a dark background</option>
+        </select>
+      </label>
+    </fieldset>
+  </li>
+</template>
 </body>
 </html>

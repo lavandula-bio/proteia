@@ -7,7 +7,9 @@ saving, loading and the content hash live in :mod:`proteia.core.storage`.
 Hierarchy. A :class:`Project` holds one :class:`Batch` (one run): its lane table,
 the reference condition, its membranes and its proteins. A :class:`Membrane` is one
 physical blot: its images (chemiluminescence exposures, reprobes, the visible-light
-marker, merged overlays) and one molecular-weight calibration. A :class:`Protein`
+marker, merged overlays) and one molecular-weight calibration, fitted per register
+group (the images linked to one marker image) from one or two ladders
+(:mod:`proteia.core.mwcal`). A :class:`Protein`
 is one protein quantified on one image: per lane and expected band, it has a
 :class:`Band` (a box), an :class:`UndetectedBand` (a detector measured the lane
 and the band stayed below its detection limit), or neither (not measured). A
@@ -48,6 +50,7 @@ protein share its box size, so they have equal area; only their positions vary.
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -189,8 +192,20 @@ class CalibrationPointSource(StrEnum):
     STRIP_EDGE = "strip_edge"  # known-MW edge of a cut membrane strip
 
 
+class LadderSide(StrEnum):
+    """Which ladder of its register group a calibration point belongs to (#58)."""
+
+    LEFT = "left"  # the only ladder, or the left one of two; strip edges
+    RIGHT = "right"  # the optional second ladder, right of the first
+
+
 class FitMethod(StrEnum):
-    LOG_LINEAR = "log_linear"  # log(MW) fitted linearly against vertical position (#58)
+    # The default: no #58 fit stored yet. (The issue first asked for one
+    # least-squares line; no build ever wrote a calibration point under it.)
+    LOG_LINEAR = "log_linear"
+    # Per ladder, log10(MW) linear in y between neighbouring points (#58, D1);
+    # with a right ladder, each MW's y linear in x between the two ladders.
+    LOG_LINEAR_PIECEWISE = "log_linear_piecewise"
 
 
 # How a band's background level was measured: a ring_median mode
@@ -348,38 +363,116 @@ class ImageRef(_Model):
 
 
 class CalibrationPoint(_Model):
-    """One known molecular weight at a vertical position."""
+    """One known molecular weight at a position on an image of the membrane.
 
-    image_id: ImageId  # the image whose pixel rows y is measured in (same membrane)
-    y: NonNegative  # pixels from the top of that image; sub-pixel allowed
+    x and y are continuous coordinates of the image's analysis array (pixel
+    column c covers [c, c+1), row r covers [r, r+1)), as box centres are,
+    whatever produced that array."""
+
+    image_id: ImageId  # the image whose analysis array x and y are measured in (same membrane)
+    y: NonNegative  # from the top of that image; sub-pixel allowed
     mw: Kda
     source: CalibrationPointSource
+    # Where the point was marked across the image: the ladder lane's x, or where
+    # a strip edge was clicked. Every point an operation adds records it (#58);
+    # files written before #58 hold none, so it is optional here. Left out of the
+    # saved form while None, and ``side`` while left (see "Canonical form" in storage).
+    x: NonNegative | None = Field(default=None, exclude_if=lambda v: v is None)
+    side: LadderSide = Field(default=LadderSide.LEFT, exclude_if=lambda v: v == LadderSide.LEFT)
+
+    @model_validator(mode="after")
+    def _check_side(self) -> CalibrationPoint:
+        if self.side == LadderSide.RIGHT:
+            if self.source is CalibrationPointSource.STRIP_EDGE:
+                raise ValueError("calibration point: a strip edge belongs to the left ladder")
+            if self.x is None:
+                raise ValueError("calibration point: a point of the right ladder needs its x")
+        return self
 
 
 class MwCalibration(_Model):
-    """A membrane's molecular-weight calibration: ladder points and the fit (#58)."""
+    """A membrane's molecular-weight calibration (#58): its ladder product and
+    points, fitted per register group and ladder side (:mod:`proteia.core.mwcal`)."""
 
-    ladder: str | None = None  # ladder product: a preset key or a custom name
+    ladder: str | None = None  # a preset key (proteia.core.ladders) or a custom name
+    # The ladder's MWs, top to bottom: the preset's when it was chosen, or the
+    # custom list. Left out of the saved form while empty.
+    ladder_kda: list[Kda] = Field(default_factory=list, exclude_if=lambda v: not v)
     points: list[CalibrationPoint] = Field(default_factory=list)
+    # How the stored fit_quality and apparent MWs were computed. log_linear, the
+    # default, stays on a calibration no #58 build has fitted, so such membranes
+    # keep their bytes.
     fit_method: FitMethod = FitMethod.LOG_LINEAR
-    fit_quality: Finite | None = None  # set by #58; None = no curve fitted
+    fit_quality: Finite | None = None  # the worst ladder's quality; None: none measurable
 
     @model_validator(mode="after")
     def _canonical_points(self) -> MwCalibration:
         # Point order carries no meaning: sort so equal calibrations give equal bytes.
-        self.points.sort(key=lambda p: (p.y, p.mw, p.source.value, p.image_id))
+        # Left points sort first, so a file with no right ladder keeps its order.
+        self.points.sort(key=lambda p: (p.side.value, p.y, p.mw, p.source.value, p.image_id))
         if self.fit_quality is not None and len(self.points) < 2:
             raise ValueError("a calibration fit needs at least two points")
+        # On log10(MW), as the points are (Membrane._check_ladders).
+        for above, below in itertools.pairwise(self.ladder_kda):
+            if not math.log10(above) > math.log10(below):
+                raise ValueError(
+                    "ladder MWs must decrease strictly from top to bottom"
+                    f" ({above:g}, {below:g} kDa)"
+                )
+        if self.ladder_kda and self.ladder is None:
+            raise ValueError("ladder MWs need a ladder name")
         return self
+
+
+# The image kinds a chemiluminescence image may be linked to as its marker (D4).
+_MARKER_KINDS: Final = frozenset({ImageKind.VISIBLE_MARKER, ImageKind.MERGED})
 
 
 class Membrane(_Model):
     """One physical blot: its images (exposures, reprobes, marker, merged) and one
-    molecular-weight calibration, which applies to every image of the membrane."""
+    molecular-weight calibration, fitted per register group (the images linked to
+    one marker image) from one or two ladders.
+
+    A register group is a set of images whose pixel rows line up: a
+    chemiluminescence image and the marker image it was taken with. Linked
+    images match pixel for pixel (D5), so a point marked on one of them holds
+    for all of them.
+    """
 
     id: MembraneId
     images: list[ImageRef] = Field(default_factory=list)
     calibration: MwCalibration = Field(default_factory=MwCalibration)
+
+    def register_groups(self) -> list[frozenset[str]]:
+        """The images whose pixel rows line up: the connected components of the
+        links from each chemiluminescence image to its marker image (a
+        visible-light marker or merged image). An unlinked image is its own
+        group. Groups come in the order of their first image."""
+        parent = {image.id: image.id for image in self.images}
+
+        def root(image_id: str) -> str:
+            while parent[image_id] != image_id:
+                image_id = parent[image_id]
+            return image_id
+
+        for image in self.images:
+            marker = image.marker_image_id
+            if marker in parent:
+                a, b = root(image.id), root(marker)
+                if a != b:
+                    parent[a] = b
+        groups: dict[str, set[str]] = {}
+        for image in self.images:
+            groups.setdefault(root(image.id), set()).add(image.id)
+        return [frozenset(members) for members in groups.values()]
+
+    def group_of(self, image_id: str) -> frozenset[str]:
+        """The register group holding ``image_id``; UnknownIdError if it is not
+        on the membrane."""
+        for group in self.register_groups():
+            if image_id in group:
+                return group
+        raise UnknownIdError(f"unknown image {image_id!r} on membrane {self.id}")
 
     @model_validator(mode="after")
     def _check_references(self) -> Membrane:
@@ -388,10 +481,16 @@ class Membrane(_Model):
             if image.marker_image_id is None:
                 continue
             marker = images.get(image.marker_image_id)
-            if marker is None or marker.kind is not ImageKind.VISIBLE_MARKER:
+            if marker is None or marker.kind not in _MARKER_KINDS:
                 raise ValueError(
                     f"image {image.id}: marker image {image.marker_image_id!r} is not"
-                    f" a visible-light marker image of membrane {self.id}"
+                    f" a visible-light marker or merged image of membrane {self.id}"
+                )
+            if (marker.width, marker.height) != (image.width, image.height):
+                raise ValueError(
+                    f"image {image.id} ({image.width}x{image.height}) and its marker image"
+                    f" {marker.id} ({marker.width}x{marker.height}) differ in size;"
+                    " linked images must match pixel for pixel"
                 )
         for point in self.calibration.points:
             image = images.get(point.image_id)
@@ -405,7 +504,67 @@ class Membrane(_Model):
                     f"membrane {self.id}: calibration point at y={point.y}"
                     f" is below the bottom of {image.id}"
                 )
+            if point.x is not None and point.x > image.width:
+                raise ValueError(
+                    f"membrane {self.id}: calibration point at x={point.x}"
+                    f" is right of the edge of {image.id}"
+                )
+        for group in self.register_groups():
+            self._check_ladders(group)
         return self
+
+    def _check_ladders(self, group: frozenset[str]) -> None:
+        """The points of one register group: per ladder side, one point per MW and
+        per position, MWs decreasing down the image; a right ladder only beside
+        ladder bands with x, and right of the left one.
+
+        MWs are compared on log10(MW), which :mod:`proteia.core.mwcal` fits: two
+        MWs a float step apart (100 and 100.00000000000001) share one log10, and
+        would give its curve a flat segment."""
+        names = ", ".join(image.id for image in self.images if image.id in group)
+        points = [point for point in self.calibration.points if point.image_id in group]
+        for side in LadderSide:
+            ladder = sorted((p for p in points if p.side == side), key=lambda p: (p.y, p.mw))
+            where = f"on the {side.value} ladder of {names}"
+            zs: set[float] = set()
+            for point in ladder:
+                z = math.log10(point.mw)
+                if z in zs:
+                    raise ValueError(
+                        f"membrane {self.id}: two calibration points at {point.mw:g} kDa {where}"
+                    )
+                zs.add(z)
+            for above, below in itertools.pairwise(ladder):
+                if above.y == below.y:
+                    raise ValueError(
+                        f"membrane {self.id}: two calibration points at y={below.y} {where}"
+                    )
+            for above, below in itertools.pairwise(ladder):
+                if not math.log10(below.mw) < math.log10(above.mw):
+                    raise ValueError(
+                        f"membrane {self.id}: calibration points out of order {where}:"
+                        f" {below.mw:g} kDa at y={below.y} lies below"
+                        f" {above.mw:g} kDa at y={above.y}"
+                    )
+        right = [p for p in points if p.side == LadderSide.RIGHT]
+        if not right:
+            return
+        for point in points:
+            strip_edge = point.source is CalibrationPointSource.STRIP_EDGE
+            if strip_edge or point.x is None:
+                what = "is a strip edge" if strip_edge else "has none"
+                raise ValueError(
+                    f"membrane {self.id}: {names} {'has' if len(group) == 1 else 'have'}"
+                    " a right ladder, so every calibration point there needs a ladder"
+                    f" band's x ({point.mw:g} kDa {what})"
+                )
+        left_x = [p.x for p in points if p.side == LadderSide.LEFT and p.x is not None]
+        right_x = min(p.x for p in right if p.x is not None)
+        if left_x and not max(left_x) < right_x:
+            raise ValueError(
+                f"membrane {self.id}: the right ladder of {names} (x={right_x}) is not"
+                f" right of its left ladder (x={max(left_x)})"
+            )
 
 
 # --- Proteins and their bands ---
@@ -425,6 +584,12 @@ class Band(_Model):
     the heuristic that stands in for it where it cannot run (#112,
     :func:`~proteia.core.quantify.is_possibly_clipped`): a band has at most one
     of them, the other None.
+
+    ``bands_found`` is how many bands the detector that placed the box found in
+    its lane within the count window around it (#58, D10): the band itself,
+    and each other peak there that reads as a band. Only a detector's band
+    that nobody edited has one; an edit by hand, or a change to what the window
+    came from, clears it.
     """
 
     id: BandId
@@ -435,7 +600,13 @@ class Band(_Model):
     background_level: Finite
     background_mode: BackgroundMode
     background_spread: NonNegative
-    apparent_mw: Kda | None = None  # from the calibration (#58); None = not computed
+    # Its image's calibration at the box's centre (#58); None = no curve there, or the centre
+    # lies outside its range.
+    apparent_mw: Kda | None = None
+    # #58: the bands a detector found in the count window; None = not counted (placed
+    # or edited by hand, or cleared). Left out of the saved form while None, so a
+    # project without a count keeps its bytes and hash (see "Canonical form" in storage).
+    bands_found: int | None = Field(default=None, ge=1, exclude_if=lambda v: v is None)
     clipped: bool | None = None  # #44; None = not checked (not "passed")
     # #112; None = not assessed: the exact check ran, the image has no known
     # range, or the project was saved before #112 (requantify assesses it).
@@ -452,6 +623,20 @@ class Band(_Model):
             raise ValueError(
                 f"band {self.id}: checked for over-exposure (clipped) and assessed"
                 " for it (possibly_clipped); only one of the checks runs on an image"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _counted_by_a_detector(self) -> Band:
+        # A count belongs to the detector's box: a box edited by hand, or placed
+        # without a detector, holds none, so a count cannot outlive its box.
+        if self.bands_found is not None and (
+            self.source not in DETECTING_SOURCES or self.manually_edited
+        ):
+            how = "edited by hand" if self.manually_edited else f"placed by {self.source.value}"
+            raise ValueError(
+                f"band {self.id}: a band count (bands_found) comes from a detector's box"
+                f" that nobody edited, and this one was {how}"
             )
         return self
 
@@ -552,7 +737,8 @@ class Protein(_Model):
     @model_validator(mode="after")
     def _check_bands_and_loading_controls(self) -> Protein:
         # Band order carries no meaning: sort so equal proteins give equal bytes.
-        # No band_index < expected_band_count check: #58 stores extra bands to flag them.
+        # #58 counts extra bands (Band.bands_found) instead of boxing them; a box at band
+        # index > 0 stays loadable for files that hold one.
         self.bands.sort(key=lambda band: (band.lane_index, band.band_index))
         for a, b in itertools.pairwise(self.bands):
             if (a.lane_index, a.band_index) == (b.lane_index, b.band_index):

@@ -11,6 +11,7 @@ import math
 import re
 import time
 from functools import cache
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -31,20 +32,26 @@ from proteia.core.model import BoxSize, lanes_phrase, overlaps
 from proteia.core.quantify import estimate_background
 from proteia.core.rowdetect import (
     AMBIGUITY_MARGIN,
+    APART_DOUBT,
     BG_GUARD,
     BG_GUARD_MIN,
     CUT_LEVEL,
     DETECT_K,
     EMPTY_WINDOW,
+    END_DOUBT,
     EXTENT_LEVEL,
     FIT_MAX_PIXELS,
+    HOLLOW_PIXELS,
+    LANES_DOUBT,
     MEMBRANE_SHIFT_K,
+    PITCH_DOUBT,
     REFUSING_FLAGS,
     ROW_LINE_K,
     ROW_LINE_MIN,
     ROW_LINE_TOL,
     ROW_LINE_TOL_PX,
     ROW_SMILE,
+    SECOND_SHARE,
     SIZE_GUARD,
     SMOOTH,
     WARNING_FLAGS,
@@ -54,6 +61,7 @@ from proteia.core.rowdetect import (
     settings,
 )
 from rowcases import (
+    ADVERSARIAL,
     FULL_SCALE,
     MEMBRANE,
     NOISE_SIGMA,
@@ -62,6 +70,7 @@ from rowcases import (
     adversarial_row,
     band_between,
     bench_cases,
+    beside,
     blob,
     bottom_strip,
     dark_edge,
@@ -69,6 +78,7 @@ from rowcases import (
     fuzz_row,
     hstripe,
     image_cut,
+    jpeg,
     shade_above,
     synthetic_row,
 )
@@ -86,6 +96,10 @@ ADVERSARIAL_KEYS = [
     ("bubble_band", 1000),  # a band split in two along x
     ("tall_band", 1000),  # size_outlier
     ("doublet_deep", 1000),  # multiple_components
+    ("dumbbell_band", 1000),  # a dip inside one grown extent
+    ("hollow_band", 1000),  # the same, clipped flat at 0 around it
+    ("hollow_ring", 1000),  # a ring: saturated all around a lighter centre
+    ("notched_band", 1000),  # a saturated band's ends rising above its middle
     ("smile_tall_tight", 1000),  # the vertical placement clamp binds
     ("wide_row", 1000),  # above FIT_MAX_PIXELS: every fit subsamples
 ]
@@ -946,19 +960,281 @@ def test_doublet_boxes_the_strongest_component_and_flags_the_lane():
     assert not found.refused
 
 
-@pytest.mark.parametrize(("dy", "frac"), [(14, 0.2), (14, 0.25), (20, 0.2), (20, 0.3)])
-def test_a_weaker_second_component_is_flagged_and_counted_once(dy, frac):
-    # Lane 2's second band is dy px below the first and a fifth to 0.3 as deep:
-    # under the extent level of the box, yet tens of sigmas above its saddle.
-    # The pair is centred on the row, so the box on the first lies dy / 2 px
-    # above the other boxes' line: 10 px apart, more than ROW_LINE_K of the
-    # 12 px box's height (#114).
-    case = adversarial_row("doublet", 1000, doublet={2: (dy, frac)}, my=12)
+@pytest.mark.parametrize(("frac", "counted"), [(0.2, False), (0.25, True), (0.3, True)])
+def test_a_doublet_s_weaker_band_counts_from_a_quarter_of_the_peak(frac, counted):
+    # #121: lane 2's second band is 14 px below the first and 0.2 to 0.3 as
+    # deep, joined to it by signal above the noise (a doublet not fully
+    # apart): under the extent level of the box, tens of sigmas above its
+    # saddle, and wide as a band. It counts only from SECOND_SHARE of the
+    # lane's peak.
+    case = adversarial_row("doublet", 1000, doublet={2: (14, frac)}, my=12)
     found = detect(case)
-    off = ("off_row_line",) if dy / 2 > ROW_LINE_K * found.size.height else ()
-    assert found.flags == (*off, "multiple_components")
-    assert bool(off) is (dy == 20)
-    assert components(found) == [1, 1, 2, 1, 1, 1]
+    assert found.flags == (("multiple_components",) if counted else ())
+    assert components(found) == [1, 1, 1 + counted, 1, 1, 1]
+    assert (frac >= SECOND_SHARE) is counted
+    if counted:
+        assert found.notes == (
+            "lane 3: a second separate component reaches 25% of the lane's peak;"
+            " the box covers the one with the lane's strongest pixel",
+        )
+
+
+@pytest.mark.parametrize("frac", [0.3, 0.7])
+def test_a_band_apart_from_the_band_s_rows_is_no_second_component(frac):
+    # #121: 20 px apart, with membrane between them, the second band lies
+    # below the band's rows (its signal above the noise): no part of the
+    # band, however deep, as JPEG blocks and specks at the box's edge are not.
+    # The pair is centred on the row, so the box on the first lies 10 px above
+    # the other boxes' line, more than ROW_LINE_K of the 12 px box (#114).
+    case = adversarial_row("doublet", 1000, doublet={2: (20, frac)}, my=12)
+    found = detect(case)
+    assert 10 > ROW_LINE_K * found.size.height
+    assert found.flags == ("off_row_line",)
+    assert components(found) == [1] * 6
+
+
+@pytest.mark.parametrize("seed", [1000, 1002, 1003, 1006, 1007])
+def test_jpeg_block_noise_is_no_second_component(seed):
+    # #121: an 8-bit JPEG export of a row (quality 75, membrane 200, bands 70
+    # to 120 levels deep) on a smooth membrane: its 8x8 block artefacts, a
+    # level or so deep, reach DETECT_K sigma of the smooth membrane beside
+    # the bands and at the box's edges, and were counted as second bands in
+    # lanes of each of these rows. They reach about 1% of the lane's peak.
+    case = jpeg(adversarial_row("jpeg", seed, noise=100.0, my=10))
+    found = detect(case)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_dumbbell_band_is_one_band(seed):
+    # #121: lane 1's band pale across its middle, its ends about 1.7x as dark:
+    # two peaks, but the dip between them stays inside the band's grown
+    # extent. One band, boxed whole, and not hollow: nothing is saturated.
+    case = _adversarial("dumbbell_band", seed)
+    found = detect(case, saturated_at=0.0)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+    assert not any(lane.hollow for lane in found.lanes)
+    x0, _, x1, _ = found.lanes[1].extent
+    ref = case.reference[1]
+    assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2  # both ends
+
+
+HOLLOW_NOTE = (
+    ": a hollow band, lighter in its centre than the saturated pixels on either side of it:"
+    " a sign of over-exposure"
+)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("light_on_dark", [False, True])
+def test_a_hollow_saturated_band_is_over_exposed_not_two_bands(seed, light_on_dark):
+    # #121: lane 1's band over-exposed, clipped flat at the limit around its
+    # lighter centre (a burnt-out band): one band, reported as hollow, a sign
+    # of over-exposure, where the saturation level is known.
+    case = _adversarial("hollow_band", seed)
+    limit = 0.0
+    if light_on_dark:
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    # Its halves, split along x by the lighter centre, are merged into one piece.
+    assert len(found.notes) == 2 and found.notes[0].startswith("merged pieces at x=")
+    assert found.notes[1] == f"lane 2{HOLLOW_NOTE}"
+    # With no known saturation level it is one band, not hollow.
+    unknown = detect(case)
+    assert unknown.flags == ()
+    assert not any(lane.hollow for lane in unknown.lanes)
+    assert unknown.slots == found.slots
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("stored", ["16-bit", "light_on_dark", "jpeg"])
+def test_a_band_burnt_out_in_its_middle_is_hollow(seed, stored):
+    # #121: lane 1's band over-exposed all around a lighter centre (a ring),
+    # clipped at the limit on every side of it: one connected peak, no dip
+    # between two peaks, yet hollow. An 8-bit JPEG export's saturated pixels
+    # lie within 2 levels of 0 (quantify.saturation_level).
+    case = _adversarial("hollow_ring", seed)
+    limit = 0.0
+    if stored == "light_on_dark":
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    elif stored == "jpeg":
+        case, limit = jpeg(case), 2.0
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    assert found.notes[-1] == f"lane 2{HOLLOW_NOTE}"
+    unknown = detect(case)
+    assert unknown.flags == ()
+    assert unknown.slots == found.slots
+
+
+def burnt_out(depth: float, light: float, seed: int) -> RowCase:
+    """Lane 1's band ``depth`` times as deep as the membrane (clipped at 0),
+    its centre lightened by ``light`` through its whole height and more: the
+    band of hollow_band, lightened 45000 there."""
+    blobs = [blob(1, 6.0, -light, ry=12.0)]
+    return adversarial_row("burnt_out", seed, depths={1: depth * MEMBRANE}, artefacts=blobs)
+
+
+# #121: 1.5x as deep lightened by 45000 to 120000, 2x by 60000 to 120000. From
+# 60000 (1.5x) or 90000 (2x) on, the centre falls below the extent level and
+# splits the band along x. Left out: 2x lightened by 45000, its centre still
+# at the limit, and seed 1001's band 1.5x deep lightened by 90000 or more,
+# which reaches the limit at fewer than HOLLOW_PIXELS pixels (both below).
+BURNT_OUT = [
+    (depth, light, seed)
+    for depth, lights in ((1.5, range(45000, 120001, 15000)), (2.0, range(60000, 120001, 15000)))
+    for light in lights
+    for seed in (1000, 1001)
+    if not (depth == 1.5 and seed == 1001 and light >= 90000)
+]
+
+
+@pytest.mark.parametrize("light_on_dark", [False, True])
+@pytest.mark.parametrize(("depth", "light", "seed"), BURNT_OUT)
+def test_a_band_split_by_its_burnt_out_centre_is_one_hollow_band(depth, light, seed, light_on_dark):
+    # #121: lane 1's band clipped at the limit on both sides of a centre
+    # lighter through its whole height, however light: split along x where
+    # the centre falls below the extent level, its halves in the same rows,
+    # saturated on either side of the centre. One band, hollow, not two, and
+    # its extent and box over both halves: a box over one of them, as over
+    # the stronger of two bands, would measure half the band.
+    case = burnt_out(depth, light, seed)
+    limit = 0.0
+    if light_on_dark:
+        case = dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+        limit = FULL_SCALE
+    found = detect(case, saturated_at=limit)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ("hollow_band",)
+    assert components(found) == [1] * 6
+    assert [lane.hollow for lane in found.lanes] == [False, True, False, False, False, False]
+    assert found.notes[-1] == f"lane 2{HOLLOW_NOTE}"
+    ref = case.reference[1]
+    for x0, _, x1, _ in (found.lanes[1].extent, found.slots[1]):
+        assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2  # both halves
+
+
+def test_a_stroke_across_a_burnt_out_band_s_rows_does_not_join_it():
+    # #121: the halves of a saturated band split by a lighter centre (rows 15
+    # to 24), and a stroke drawn through the centre from row 2 to 37, at the
+    # limit too, as a pen line on a blot. The band's other half shares its
+    # rows and joins it; the stroke shares fewer than JOIN_ROWS of the rows it
+    # and the band span, and does not. (On a real drag, strokes joined in a
+    # chain gave one band a 77 x 37 px extent.)
+    s = np.zeros((40, 60))
+    saturated = np.zeros(s.shape, bool)
+    for c0, c1 in ((5, 25), (36, 56)):
+        s[15:25, c0:c1] = 100.0
+        saturated[17:23, c0 + 3 : c1 - 3] = True
+    s[15:25, 25:36] = 10.0  # the lighter centre
+    s[2:38, 30:32] = 100.0
+    saturated[2:38, 30:32] = True
+    pieces, count = label(s > 30.0)
+    assert count == 3
+    grown = pieces == pieces[20, 10]
+    joined = rowdetect._join_burnt_out(pieces, grown, s, saturated, 6.0, (0, 60))
+    assert joined is not None and joined[20, 45]  # the other half
+    assert np.flatnonzero(joined.any(axis=1)).tolist() == list(range(15, 25))
+    assert np.flatnonzero(joined.any(axis=0)).tolist() == list(range(5, 56))
+
+
+@pytest.mark.parametrize("seed", [1000, 1001])
+def test_a_band_at_the_limit_through_its_centre_is_not_hollow(seed):
+    # 2x as deep, lightened by 45000, lane 1's centre still reaches the limit:
+    # saturated across, no lighter centre. One band, boxed whole.
+    case = burnt_out(2.0, 45000.0, seed)
+    found = detect(case, saturated_at=0.0)
+    assert_hits_own_lanes(case, found)
+    assert found.flags == ()
+    assert components(found) == [1] * 6
+    ref = case.reference[1]
+    x0, _, x1, _ = found.slots[1]
+    assert x0 <= ref[0] + 2 and x1 >= ref[2] - 2
+
+
+@pytest.mark.parametrize("light", [90000.0, 105000.0, 120000.0])
+def test_a_band_split_where_it_hardly_reaches_the_limit_is_two_peaks(light):
+    # Seed 1001's band, 1.5x as deep, lightened by 90000 or more, reaches the
+    # limit at fewer than HOLLOW_PIXELS pixels: not over-exposed by the
+    # quantification's count (#112), no saturated pixels to enclose a centre.
+    # Its halves are two peaks, as a band's split by a bubble.
+    case = burnt_out(1.5, light, 1001)
+    assert np.count_nonzero(case.image <= 0.0) < HOLLOW_PIXELS
+    found = detect(case, saturated_at=0.0)
+    assert found.flags == ("multiple_components",)
+    assert components(found) == [1, 2, 1, 1, 1, 1]
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize(
+    ("left", "right"), [(24000.0, 24000.0), (1.5 * MEMBRANE, 24000.0), (24000.0, 1.5 * MEMBRANE)]
+)
+def test_two_bands_side_by_side_not_both_saturated_count_as_two(seed, left, right):
+    # #121: lane 1 holds two bands side by side, 28 px apart, membrane between
+    # them: neither saturated, or one only. No centre with saturated pixels on
+    # either side of it: two bands where the saturation level is known too.
+    blobs = [blob(1, 5.0, left, ry=3.5, dx=-14.0), blob(1, 5.0, right, ry=3.5, dx=14.0)]
+    case = adversarial_row("pair", seed, depths={1: 0.0}, artefacts=blobs)
+    found = detect(case, saturated_at=0.0)
+    assert found.flags == ("multiple_components",)
+    assert components(found) == [1, 2, 1, 1, 1, 1]
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize(("frac", "depth"), [(0.5, 1.3 * MEMBRANE), (1.0, 1.6 * MEMBRANE)])
+def test_an_over_exposed_close_doublet_is_not_a_hollow_band(seed, frac, depth):
+    # #121: lane 5 holds two bands 9 px apart, the upper clipped at 0, the
+    # lower half as deep (not saturated) or as deep (saturated too). The
+    # lighter rows between them hold no saturated pixel on either side: two
+    # bands stacked, not a band lighter in its centre, whatever one grown
+    # extent holds (R5). The saturation level changes nothing.
+    case = adversarial_row("doublet", seed, doublet={4: (9, frac)}, depths={4: depth})
+    assert np.count_nonzero(case.image <= 0.0) >= HOLLOW_PIXELS  # over-exposed
+    found = detect(case, saturated_at=0.0)
+    assert not any(lane.hollow for lane in found.lanes)
+    unknown = detect(case)
+    assert (found.flags, found.notes, found.slots) == (unknown.flags, unknown.notes, unknown.slots)
+    assert components(found) == components(unknown)
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_notch_in_a_saturated_band_s_edge_is_not_hollow(seed):
+    # Lane 2's band clipped flat at 0, its two ends rising 6 px above its
+    # middle: along the rows above the middle, its lighter edge lies between
+    # saturated pixels, but the band is saturated across below it only. A
+    # notch in its top edge, not a lighter centre.
+    found = detect(_adversarial("notched_band", seed), saturated_at=0.0)
+    assert found.flags == ()
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+def test_a_saturated_band_without_a_dip_is_not_hollow():
+    # Lane 2 of the bench row is clipped flat at 0: saturated, one peak, no
+    # lighter centre. Over-exposure is the quantification's to flag.
+    found = detect(BENCH["overexposed"], saturated_at=0.0)
+    assert found.flags == ()
+    assert not any(lane.hollow for lane in found.lanes)
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, "0"])
+def test_a_saturation_level_that_is_not_a_finite_number_is_refused(value):
+    with pytest.raises(ValueError, match="saturated_at"):
+        detect(BENCH["all_present"], saturated_at=value)
 
 
 def test_a_band_split_by_a_bubble_is_flagged():
@@ -1658,6 +1934,11 @@ def check_invariants(case: RowCase, found: RowDetection) -> None:
             assert lane.reason == "edge_signal"
         assert math.isfinite(lane.snr) and math.isfinite(lane.expected_x)
     assert ("cut_by_row_box" in found.flags) == any(lane.cut for lane in found.lanes)
+    assert ("multiple_components" in found.flags) == any(
+        lane.components > 1 for lane in found.lanes
+    )
+    assert ("hollow_band" in found.flags) == any(lane.hollow for lane in found.lanes)
+    assert all(lane.rect is not None for lane in found.lanes if lane.hollow)
     assert math.isfinite(found.membrane_shift)
 
 
@@ -1705,13 +1986,20 @@ def test_translation_is_exact(name):
 
     for after, before in zip(moved.lanes, found.lanes, strict=True):
         assert after.expected_x - dx == pytest.approx(before.expected_x)
-        assert dataclasses.replace(after, expected_x=0.0) == dataclasses.replace(
+        assert dataclasses.replace(after, expected_x=0.0, peaks=()) == dataclasses.replace(
             before,
             rect=move(before.rect),
             extent=move(before.extent),
             window=move(before.window),
             expected_x=0.0,
+            peaks=(),
         )
+        # The peaks' continuous positions move by the same, up to the last bit
+        # of a float that holds a larger coordinate (#58).
+        assert len(after.peaks) == len(before.peaks)
+        for a, b in zip(after.peaks, before.peaks, strict=True):
+            assert (a.y - dy, a.x - dx) == pytest.approx((b.y, b.x), rel=0, abs=1e-9)
+            assert a[2:] == b[2:]
     assert dataclasses.replace(moved, lanes=(), notes=()) == dataclasses.replace(
         found, lanes=(), notes=()
     )
@@ -2266,3 +2554,463 @@ def test_each_row_line_setting_takes_part(monkeypatch, name, value, case):
 
 def test_box_size_is_the_model_type():
     assert isinstance(_detected("all_present").size, BoxSize)
+
+
+# --- #111: a first row box over a ladder, a label or a neighbouring panel ---
+
+# The rows whose box also covers what lies beside the row (rowcases).
+BESIDE = ("ladder_beside", "ladder_before", "label_beside", "panel_beside")
+DOUBT_NOTE = "lane numbers doubtful: "
+
+
+def lanes_off(case: RowCase, found: RowDetection) -> list[int]:
+    """The lanes whose band's extent is centred more than half a lane step
+    off the lane's own centre: read into another lane."""
+    step = float(np.median(np.diff(case.lane_cx)))
+    return [
+        lane.lane
+        for lane in found.lanes
+        if lane.extent is not None
+        and abs((lane.extent[0] + lane.extent[2]) / 2 - case.lane_cx[lane.lane]) > step / 2
+    ]
+
+
+def doubts(found: RowDetection) -> str:
+    """The doubtful_lanes note ("" without the flag), flag and note checked
+    together."""
+    note = found.doubt_note
+    assert ("doubtful_lanes" in found.flags) == (note is not None)
+    assert [n for n in found.notes if n.startswith(DOUBT_NOTE)] == ([note] if note else [])
+    return note or ""
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", BESIDE)
+def test_a_row_box_over_what_lies_beside_the_row_is_placed_with_its_lanes_doubtful(key, seed):
+    # With no lanes on the image to check it, the reading takes the ladder's
+    # band, the label or the neighbouring panel for a lane and numbers the
+    # bands a lane or more off, with no refusing flag. The row is placed, its
+    # lane numbers doubtful (the maintainer's decision on #111: flag first).
+    case = _adversarial(key, seed)
+    found = detect(case)
+    assert not found.refused and found.size is not None
+    assert lanes_off(case, found)  # what the flag is there for
+    assert doubts(found).startswith(DOUBT_NOTE)
+
+
+@pytest.mark.parametrize("key", BESIDE)
+def test_the_same_rows_boxed_over_their_lanes_only_are_not_doubtful(key):
+    recipe = {name: value for name, value in ADVERSARIAL[key].items() if name != "box_adjust"}
+    for seed in (1000, 1001, 1002):
+        case = adversarial_row(key, seed, **recipe)
+        found = detect(case)
+        assert_hits_own_lanes(case, found)
+        assert doubts(found) == ""
+
+
+# The accuracy judge's loose boxes and uneven spacings (acc_adv), which
+# stretch the fitted pitch, or the steps between the bands, the most while the
+# reading fits.
+JUDGE_HONEST = {
+    "very_loose_box": {"mx": 70},
+    "very_loose_miss0": {"mx": 70, "missing": [0]},
+    "very_loose_miss5": {"mx": 70, "missing": [5]},
+    "uneven35_miss": {
+        "pitches": [46, 95, 52, 92, 49],
+        "w": 36.0,
+        "x_jitter": 0.0,
+        "missing": [3],
+    },
+    "drift_uneven_miss": {
+        "n": 12,
+        "pitch": 50.0,
+        "w": 32.0,
+        "h": 10.0,
+        "pitches": [60, 60, 60, 60, 60, 50, 40, 40, 40, 40, 40],
+        "x_jitter": 0.0,
+        "missing": [3, 9],
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        *BENCH,
+        *(
+            f"{key}/{seed}"
+            for key in ADVERSARIAL
+            if key not in (*BESIDE, "box_omits_empty_first")  # that one is refused
+            for seed in (1000, 1001, 1002)
+        ),
+    ],
+)
+def test_honest_rows_are_not_doubtful(name):
+    found = _detected(name)
+    assert not found.refused
+    assert doubts(found) == ""
+
+
+@pytest.mark.parametrize("key", JUDGE_HONEST)
+def test_loose_boxes_and_uneven_spacing_are_not_doubtful(key):
+    for seed in range(1000, 1010):
+        case = adversarial_row(key, seed, **JUDGE_HONEST[key])
+        found = detect(case)
+        assert not lanes_off(case, found)
+        assert doubts(found) == "", seed
+
+
+def test_pieces_merged_or_dropped_within_a_lane_are_no_doubt():
+    # Dust midway between two lanes, merged with a band or dropped, and a
+    # band's halves split by a bubble, merged again: pieces half a lane apart
+    # at most, not two bands.
+    for key, seeds in (("blob_gap", (1000, 1003, 1006)), ("bubble_band", (1000, 1001, 1002))):
+        for seed in seeds:
+            found = _detected(f"{key}/{seed}")
+            assert any(note.startswith(("merged", "dropped")) for note in found.notes)
+            assert doubts(found) == "", (key, seed)
+
+
+# A weak speck 0.8 lane steps past the last band.
+SPECK = beside(0.8, 12, 10, 10000)
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        {"mx": 40},  # in a loose box's margin
+        {"mx": 60},
+        {"margin_right": 120, "box_adjust": (0, 0, 50, 0)},  # a box dragged past the row
+    ],
+)
+def test_a_weak_speck_dropped_past_the_end_lane_is_no_doubt(recipe):
+    # The weaker of the closest pair, the speck is dropped: past the pieces
+    # read, it leaves each of their lanes as it was, and the reading is right.
+    dropped = 0
+    for seed in range(1000, 1010):
+        case = adversarial_row("speck", seed, artefacts=[SPECK], **recipe)
+        found = detect(case)
+        assert not found.refused and not lanes_off(case, found)
+        dropped += any(note.startswith("dropped") for note in found.notes)
+        assert doubts(found) == "", seed
+    assert dropped >= 5
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_weak_band_dropped_between_the_pieces_read_is_doubtful(seed):
+    # Seven bands, six lanes declared, the weak fourth band 60 px from the
+    # fifth: dropped between the others to fit, the only doubt.
+    case = adversarial_row("seven", seed, n=7, pitches=[70, 70, 70, 60, 70, 70], depths={3: 4000})
+    note = doubts(detect(dataclasses.replace(case, n_lanes=6)))
+    dropped = (
+        r"two pieces 0\.7 lanes apart, one dropped at x=2\d\d\.\.3\d\d to fit the declared lanes"
+    )
+    assert re.fullmatch(DOUBT_NOTE + dropped, note)
+
+
+@pytest.mark.parametrize("seed", [1000, 1004, 1006])
+def test_more_bands_than_declared_lanes_are_doubtful(seed):
+    # Six bands, five lanes declared: two bands a lane apart are merged to fit.
+    case = dataclasses.replace(adversarial_row("six", seed), n_lanes=5)
+    note = doubts(detect(case))
+    assert re.search(r"two pieces \d\.\d lanes apart, merged at x=\d+\.\.\d+ to fit", note)
+
+
+def test_a_box_with_room_for_another_lane_is_doubtful():
+    # Two lane steps of bare membrane past the last lane and lane 0 empty:
+    # the empty lane is read at the box's right end, every band a lane early,
+    # the pitch stretched by less than PITCH_DOUBT.
+    case = adversarial_row("room", 1000, missing=[0], margin_right=200, box_adjust=(0, 0, 150, 0))
+    found = detect(case)
+    assert lanes_off(case, found) == [0, 1, 2, 3, 4]
+    assert abs(found.pitch / 70.0 - 1.0) < PITCH_DOUBT
+    assert "the row box reaches 1.6 lanes past lane 6's centre" in doubts(found)
+
+
+# Eight lanes 48 px apart, the first three bands 64 px wide and touching: one
+# run the reading cuts into cells.
+TOUCHING_RUN = {
+    "n": 8,
+    "pitch": 48.0,
+    "w": 30.0,
+    "widths": {0: 64.0, 1: 64.0, 2: 64.0},
+    "x_jitter": 0.0,
+}
+
+
+def test_a_touching_run_cut_into_too_few_cells_is_doubtful():
+    # The box reaches past the lanes on both sides: the run of three is read
+    # as two, the lanes after it numbered a lane late.
+    case = adversarial_row(
+        "run", 1000, margin_left=150, margin_right=150, box_adjust=(-60, 0, 60, 0), **TOUCHING_RUN
+    )
+    found = detect(case)
+    assert lanes_off(case, found)
+    assert "the touching bands read as lanes 2 to 3 span 3.2 lanes" in doubts(found)
+    honest = detect(adversarial_row("run", 1000, **TOUCHING_RUN))
+    assert doubts(honest) == ""  # three wide bands in three cells
+
+
+def test_the_doubtful_lanes_are_numbered_as_the_caller_numbers_them():
+    case = _adversarial("panel_beside", 1000)
+    note = doubts(detect(case))
+    back = doubts(detect(case, right_to_left=True))
+    assert "past lane 1's centre" in note
+    assert back == note.replace("past lane 1's centre", "past lane 5's centre")
+
+
+def test_the_doubt_is_a_warning_listed_with_its_settings():
+    assert "doubtful_lanes" in WARNING_FLAGS and "doubtful_lanes" not in REFUSING_FLAGS
+    found = settings()
+    keys = ("pitch_doubt", "lanes_doubt", "end_doubt", "apart_doubt")
+    assert (
+        tuple(found[key] for key in keys)
+        == (PITCH_DOUBT, LANES_DOUBT, END_DOUBT, APART_DOUBT)
+        == (0.3, 0.5, 1.5, 0.6)
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "row"),
+    [
+        ("PITCH_DOUBT", 0.0, "all_present"),
+        ("LANES_DOUBT", 0.0, "uneven_spacing"),
+        ("END_DOUBT", 0.0, "all_present"),
+        ("APART_DOUBT", 0.0, "blob_gap/1000"),
+    ],
+)
+def test_each_doubt_setting_takes_part(monkeypatch, name, value, row):
+    assert doubts(_detected(row)) == ""  # cached before the setting changes
+    monkeypatch.setattr(rowdetect, name, value)
+    assert settings()[name.lower()] == value
+    assert doubts(detect(_case(row))) != ""
+
+
+# --- #58: what the detector finds stays what it found ---
+
+GOLDEN = Path(__file__).parent / "data" / "rowdetect_golden.json"
+# The saturated rows are also read with their saturation level (#121), and one
+# row from its right end.
+_GOLDEN_SATURATED = ("dumbbell_band", "hollow_band", "hollow_ring", "notched_band")
+
+
+def _golden_cases() -> dict[str, tuple[RowCase, dict]]:
+    """The rows the golden file pins, by name: every bench row, every
+    adversarial recipe (at the seed the invariant checks use, else 1000), the
+    saturated rows with their saturation level, a JPEG export and a row read
+    from its right end."""
+    seeds = dict(ADVERSARIAL_KEYS)
+    cases: dict[str, tuple[RowCase, dict]] = {f"bench/{name}": (BENCH[name], {}) for name in BENCH}
+    for key in ADVERSARIAL:
+        seed = seeds.get(key, 1000)
+        cases[f"adversarial/{key}/{seed}"] = (_adversarial(key, seed), {})
+    cases["bench/overexposed saturated_at=0"] = (BENCH["overexposed"], {"saturated_at": 0.0})
+    for key in _GOLDEN_SATURATED:
+        case = _adversarial(key, 1000)
+        cases[f"adversarial/{key}/1000 saturated_at=0"] = (case, {"saturated_at": 0.0})
+    cases["jpeg/1000"] = (jpeg(adversarial_row("jpeg", 1000, noise=100.0, my=10)), {})
+    cases["bench/all_present right_to_left"] = (BENCH["all_present"], {"right_to_left": True})
+    return cases
+
+
+def _golden_entry(found: RowDetection) -> dict:
+    """What the golden file keeps of a result: its flags and notes, and per
+    lane its rect, reason, components and SNR."""
+    return {
+        "flags": list(found.flags),
+        "notes": list(found.notes),
+        "lanes": [
+            {
+                "rect": None if lane.rect is None else list(lane.rect),
+                "reason": lane.reason,
+                "components": lane.components,
+                "snr": lane.snr,
+            }
+            for lane in found.lanes
+        ],
+    }
+
+
+@cache
+def _golden() -> dict:
+    return json.loads(GOLDEN.read_text(encoding="utf-8"))
+
+
+def test_the_golden_file_covers_every_golden_row():
+    assert sorted(_golden()["cases"]) == sorted(_golden_cases())
+
+
+@pytest.mark.parametrize("name", list(_golden_cases()))
+def test_rowdetect_matches_golden(name):
+    # The file was written by the detector as it was before #58 added peaks:
+    # flags, notes, rects, reasons and components exactly, the SNR within
+    # rel_tol (the last bits of numpy and scipy may differ between platforms).
+    case, kwargs = _golden_cases()[name]
+    expected = _golden()["cases"][name]
+    found = _golden_entry(detect(case, **kwargs))
+    assert found["flags"] == expected["flags"]
+    assert found["notes"] == expected["notes"]
+    assert len(found["lanes"]) == len(expected["lanes"])
+    for got, want in zip(found["lanes"], expected["lanes"], strict=True):
+        assert {k: got[k] for k in ("rect", "reason", "components")} == {
+            k: want[k] for k in ("rect", "reason", "components")
+        }
+        assert math.isclose(got["snr"], want["snr"], rel_tol=1e-9, abs_tol=1e-12)
+
+
+# --- #58: the lane's peaks, for a count of its bands ---
+
+
+@pytest.mark.parametrize("name", [*INVARIANT_CASES, "hollow_band/1000 saturated"])
+def test_peaks_are_the_component_tops(name, monkeypatch):
+    # Every top _count_components reads, each in the lane whose span holds it,
+    # top to bottom, at its pixel's centre (y moved at most half a row).
+    if name.endswith(" saturated"):
+        case, kwargs = _case(name.removesuffix(" saturated")), {"saturated_at": 0.0}
+    else:
+        case, kwargs = _case(name), {}
+    tops: list[list[tuple[int, int]]] = []
+    real = rowdetect._peaks
+
+    def spy(ks, h):
+        found = real(ks, h)
+        tops.append(found)
+        return found
+
+    monkeypatch.setattr(rowdetect, "_peaks", spy)
+    found = detect(case, **kwargs)
+    assert len(tops) <= 1  # read once, on the pass that gives the result
+    x0, y0 = max(0, case.row[0]), max(0, case.row[1])
+    listed = []
+    for lane in found.lanes:
+        if lane.rect is None:
+            assert lane.peaks == ()
+            continue
+        # Top to bottom by their pixel rows; a refined y may cross a row's by less than one.
+        assert all(b.y > a.y - 1.0 for a, b in itertools.pairwise(lane.peaks))
+        for peak in lane.peaks:
+            assert isinstance(peak, rowdetect.Peak) and peak[:3] == (peak.y, peak.x, peak.snr)
+            column, row = peak.x - 0.5 - x0, math.floor(peak.y - y0)
+            assert column == int(column)
+            assert (row, int(column)) in tops[0] or (row - 1, int(column)) in tops[0], peak
+            assert peak.snr >= DETECT_K
+            listed.append((round(peak.y, 6), peak.x))
+            if peak.own:  # the band's own lies in its grown extent
+                ex0, ey0, ex1, ey1 = lane.extent
+                assert ex0 <= peak.x <= ex1 and ey0 <= peak.y <= ey1
+        # A second component is a peak of another band; not every such peak is one.
+        assert lane.components - 1 <= sum(peak.other_band for peak in lane.peaks)
+        assert not any(peak.own and peak.other_band for peak in lane.peaks)
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) >= lane.components
+    assert len(listed) == len(set(listed))  # no top in two lanes
+
+
+def test_a_band_whose_top_is_no_separate_peak_still_counts_itself():
+    # Touching bands: a lane's highest pixel may rise from its neighbour's hill
+    # without a saddle deep enough to be a peak of its own.
+    found = _detected("touching")
+    assert any(lane.rect is not None and lane.peaks == () for lane in found.lanes)
+    assert [rowdetect.bands_in(lane, -math.inf, math.inf) for lane in found.lanes] == [1] * 6
+
+
+def test_a_doublet_s_peaks_hold_both_bands():
+    case = _adversarial("doublet_deep", 1000)
+    lane = detect(case).lanes[2]
+    assert lane.components == 2
+    own, other = lane.peaks
+    assert (own.own, own.other_band, other.own, other.other_band) == (True, False, False, True)
+    assert abs((other.y - own.y) - 14.0) < 1.5  # 14 px apart
+    assert other.snr >= SECOND_SHARE * own.snr
+    # A dumbbell and a hollow band are one band: both their tops are their own.
+    for key in ("dumbbell_band", "hollow_band"):
+        lane = detect(_adversarial(key, 1000), saturated_at=0.0).lanes[1]
+        assert len(lane.peaks) == 2 and all(peak.own for peak in lane.peaks), key
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1, key
+
+
+_JPEG_SEEDS = [1000, 1002, 1003, 1006, 1007]
+
+
+def _jpeg_detected(seed: int) -> RowDetection:
+    return detect(jpeg(adversarial_row("jpeg", seed, noise=100.0, my=10)))
+
+
+@pytest.mark.parametrize("seed", _JPEG_SEEDS)
+def test_jpeg_block_noise_is_no_other_band(seed):
+    # Block artefacts reach DETECT_K beside the bands, but only about 1% of the
+    # lane's peak: peaks of no band.
+    found = _jpeg_detected(seed)
+    assert [rowdetect.bands_in(lane, -math.inf, math.inf) for lane in found.lanes] == [1] * 6
+
+
+def test_jpeg_block_noise_reaches_detect_k():
+    # The test above is not vacuous: its artefacts do make extra peaks. Which
+    # seeds do depends on the platform's JPEG encoder, so the seeds are pooled.
+    assert any(len(lane.peaks) > 1 for seed in _JPEG_SEEDS for lane in _jpeg_detected(seed).lanes)
+
+
+@pytest.mark.parametrize(("frac", "counted"), [(0.2, False), (0.3, True), (0.7, True)])
+def test_bands_found_uses_second_share(frac, counted, monkeypatch):
+    # #58, D10: a band 20 px below lane 3's, with membrane between, is no
+    # second component (#121), but it is another band in the lane: a count
+    # reads it from SECOND_SHARE of the lane's peak, where it lies in the window.
+    case = adversarial_row("doublet", 1000, doublet={2: (20, frac)}, my=12)
+    lane = detect(case).lanes[2]
+    assert lane.components == 1
+    [own] = [peak for peak in lane.peaks if peak.own]
+    others = [peak for peak in lane.peaks if not peak.own]
+    assert len(others) == 1 and abs(others[0].y - own.y - 20.0) < 1.5
+    assert others[0].other_band is counted
+    assert (others[0].snr >= SECOND_SHARE * own.snr) is counted
+    assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1 + counted
+    # A window around the band that stops short of the other holds one band.
+    assert rowdetect.bands_in(lane, own.y - 12.0, own.y + 12.0) == 1
+    assert rowdetect.bands_in(lane, own.y - 12.0, others[0].y) == 1 + counted
+    if counted:  # the share decides it
+        monkeypatch.setattr(rowdetect, "SECOND_SHARE", frac + 0.05)
+        lane = detect(case).lanes[2]
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1
+    # An empty lane holds no band.
+    empty = detect(BENCH["missing_middle"]).lanes[2]
+    assert (empty.peaks, rowdetect.bands_in(empty, -math.inf, math.inf)) == ((), 0)
+
+
+# Lane 3's band with another 20 px below it, 0.8 as deep and 10 px to the right.
+_PARTNER = {"doublet": {2: (20, 0.8)}, "shifts": {2: 10}, "my": 12, "box_adjust": (0, 0, 0, 14)}
+
+
+def two_topped_partner(seed: int, *, saturated: bool = False) -> RowCase:
+    """The row of :data:`_PARTNER` with the lower band lighter across its
+    middle than at its ends: a dumbbell, or over-exposed (clipped flat at 0)
+    around a lighter centre, a hollow band."""
+    if saturated:
+        light = blob(2, 6.0, -45000.0, ry=12.0, dy=10)
+        return adversarial_row(
+            "doublet", seed, **_PARTNER, depths={2: 1.5 * MEMBRANE}, artefacts=[light]
+        )
+    light = blob(2, 6.0, -11000.0, ry=12.0, dy=10)
+    return adversarial_row("doublet", seed, **_PARTNER, artefacts=[light])
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002, 1003])
+@pytest.mark.parametrize("saturated", [False, True])
+def test_another_band_with_two_tops_side_by_side_is_one_band(seed, saturated):
+    # #58: the band below lane 3's has two tops side by side, one per end:
+    # one band, the count's second, as its own tops are the band's one (a
+    # dumbbell or a hollow band is one band).
+    plain = detect(adversarial_row("doublet", seed, **_PARTNER)).lanes[2]
+    assert rowdetect.bands_in(plain, -math.inf, math.inf) == 2
+    kwargs = {"saturated_at": 0.0} if saturated else {}
+    lane = detect(two_topped_partner(seed, saturated=saturated), **kwargs).lanes[2]
+    assert lane.components == 1
+    tops = [peak for peak in lane.peaks if not peak.own]
+    assert len(tops) == 2, lane.peaks
+    left, right = sorted(tops, key=lambda peak: peak.x)
+    assert abs(left.y - right.y) < 1.0 and right.x - left.x > 15.0  # side by side
+    # The higher of the two stands for the band.
+    [counted] = [peak for peak in tops if peak.other_band]
+    assert counted.snr == max(peak.snr for peak in tops)
+    assert rowdetect.bands_in(lane, -math.inf, math.inf) == 2
+    # Two bands stacked in a lane stay two (a doublet's).
+    doublet = detect(_adversarial("doublet_deep", 1000)).lanes[2]
+    assert rowdetect.bands_in(doublet, -math.inf, math.inf) == 2

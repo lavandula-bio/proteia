@@ -5,6 +5,9 @@ GUI-independent: the standard library plus the model (and pydantic, through its
 types). A project folder, which may have any name, holds::
 
     project.json                    the model (see "Canonical form" below)
+    project.schema1.json            project.json as it was before a migration from schema 1
+                                    rewrote it (keep_backup; numbered if taken:
+                                    project.schema1 (2).json)
     images/img-2.tif                byte-identical copies of the imported files, named by id
     exports/                        created by save_project, for exported results:
     exports/lane-table.csv          the per-lane table
@@ -19,7 +22,9 @@ file, or an image no saved project references) but never a dangling reference:
 an image is stored before the model references it, and a file is deleted only
 after a saved ``project.json`` no longer references it. An orphan image can hold
 an id that a failed or unsaved import gave back, so importing removes
-:func:`orphan_files` before storing a new image.
+:func:`orphan_files` before storing a new image: all but those the session
+keeps (:class:`~proteia.core.session.ProjectSession`), none of which holds the
+id the import takes.
 
 Canonical form. ``project.json`` is ``json.dumps`` of the re-validated model's
 JSON-mode dump with sorted keys, ``indent=1``, ``ensure_ascii=False`` and
@@ -45,7 +50,11 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   is saved without it. The second is ``Protein.box_padding``, left out while it is
   ``{"across": 0, "along": 0}``, likewise. The third is ``Band.possibly_clipped``
   (#112), left out while it is ``null``: only bands on a lossy, colour or CMYK
-  image of known bit depth have it. Writing the empty value instead would
+  image of known bit depth have it. The fourth is in the molecular-weight
+  calibration (#58): ``CalibrationPoint.x`` is left out while ``null``,
+  ``CalibrationPoint.side`` while ``"left"`` and ``MwCalibration.ladder_kda``
+  while empty, and in the band count (#58): ``Band.bands_found`` while
+  ``null``. Writing the empty value instead would
   move every existing project's hash, so every export would report
   ``content_changed_outside_log``.
 * The hash covers ``schema_version``, the background method, every id, the lane
@@ -60,7 +69,12 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   migrated as it loads (:func:`migrate`, :data:`MIGRATIONS`), in memory, and
   gets one ``migrate`` log entry; it is written in the new schema at its next
   save (which :func:`~proteia.core.session.open_project` runs at once, through
-  the session's autosave hook).
+  the session's autosave hook). Before that, opening it keeps the file as it
+  was read in a backup beside it (:func:`keep_backup`, #140), which the entry
+  names: renamed back to ``project.json``, it is the project as it was. The
+  files of a backup's images are never deleted as orphans
+  (:func:`backup_references`), so a migration that lost an image reference
+  cannot lose the image.
 
 The canonical form follows Python's float repr, not RFC 8785 (JSON
 Canonicalization Scheme); switch, with a schema bump, before hashes must be
@@ -74,6 +88,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -99,6 +114,8 @@ from proteia.core.model import (
 )
 
 PROJECT_FILE: Final = "project.json"
+# project.schema<N>.json: a project.json of schema N kept before its migration.
+BACKUP_PREFIX: Final = "project.schema"
 IMAGES_DIR: Final = "images"
 EXPORTS_DIR: Final = "exports"
 # Top-level keys left out of the content hash: bookkeeping and history, not content.
@@ -118,6 +135,14 @@ _CHUNK: Final = 1 << 20  # store_image copies 1 MiB at a time
 
 _IMAGE_ID = TypeAdapter(ImageId)
 _ORIGINAL_NAME = TypeAdapter(OriginalName)
+# A stored image's name (img-N and an image suffix) anywhere in a file's bytes,
+# in any case, ending where the suffix does (img-3.tiff names img-3.tiff, not img-3.tif).
+_IMAGE_NAME = re.compile(
+    rb"img-[0-9]+\.(?:"
+    + b"|".join(re.escape(suffix.removeprefix(".").encode()) for suffix in IMAGE_SUFFIXES)
+    + rb")(?![a-z0-9])",
+    re.IGNORECASE,
+)
 
 
 class ProjectError(Exception):
@@ -144,6 +169,13 @@ class MissingImageError(ProjectError):
     def __init__(self, image_ids: list[str]) -> None:
         super().__init__(f"missing image files for {', '.join(image_ids)}")
         self.image_ids = list(image_ids)
+
+
+class BackupError(OSError):
+    """An older-schema ``project.json`` could not be kept in a backup before its
+    migration (:func:`keep_backup`; the ``OSError`` is ``__cause__``), so it was
+    not migrated and nothing was written. The message names the project by its
+    folder's name, never its path, and says why."""
 
 
 class ImageTooLargeError(ValueError):
@@ -261,6 +293,16 @@ def project_from_json(data: bytes, *, clock: Callable[[], datetime] = _utc_now) 
 
 def _read_json(data: bytes, clock: Callable[[], datetime]) -> tuple[Project, bool]:
     """:func:`project_from_json`, and whether it migrated the project."""
+    project, found = _parse(data)
+    if found == SCHEMA_VERSION:
+        return project, False
+    return _migrated(project, found, clock), True
+
+
+def _parse(data: bytes) -> tuple[Project, int]:
+    """The project ``project.json``'s bytes ``data`` hold, its content migrated
+    to the latest schema (without the ``migrate`` entry :func:`_migrated` adds),
+    and the schema the file had."""
     try:
         raw = json.loads(
             data.decode("utf-8-sig"),
@@ -297,9 +339,7 @@ def _read_json(data: bytes, clock: Callable[[], datetime]) -> tuple[Project, boo
         project = Project.model_validate_json(json.dumps(raw, ensure_ascii=False), strict=True)
     except ValidationError as exc:
         raise ProjectFormatError(f"project.json is not a valid project: {exc}") from exc
-    if version == SCHEMA_VERSION:
-        return project, False
-    return _migrated(project, version, clock), True
+    return project, version
 
 
 # --- Schema versions and migrations ---
@@ -380,26 +420,32 @@ MIGRATIONS: Mapping[int, Migration] = {1: _v1_to_v2}
 _EARLIER_CONTENT: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {1: _v1_content}
 
 
-def _migrated(project: Project, found: int, clock: Callable[[], datetime]) -> Project:
+def _migrated(
+    project: Project, found: int, clock: Callable[[], datetime], *, backup: str | None = None
+) -> Project:
     """``project``, migrated from schema ``found``, with a ``migrate`` log entry
     appended. Its params name the schemas it went from and to and the hash the
     content it started from had under schema ``found`` (``from_content_hash``:
     the old log's last hash, unless the file was changed outside it, which
-    :func:`proteia.core.record.history_issues` reports); its ``content_hash`` is,
-    as for every entry, that of the content it left. The log is not content, so
-    appending the entry does not change that hash.
+    :func:`proteia.core.record.history_issues` reports), and, when given, the
+    ``backup`` that holds the file it was read from (:func:`keep_backup`); its
+    ``content_hash`` is, as for every entry, that of the content it left. The
+    log is not content, so appending the entry does not change that hash.
     """
     content = content_document(project)
+    params: dict[str, Any] = {
+        "from_schema": found,
+        "to_schema": SCHEMA_VERSION,
+        "from_content_hash": document_hash(_EARLIER_CONTENT[found](content)),
+    }
+    if backup is not None:
+        params["backup"] = backup
     entry = LogEntry(
         seq=len(project.log) + 1,
         time=format_timestamp(clock()),
         action="migrate",
         version=proteia.__version__,
-        params={
-            "from_schema": found,
-            "to_schema": SCHEMA_VERSION,
-            "from_content_hash": document_hash(_EARLIER_CONTENT[found](content)),
-        },
+        params=params,
         content_hash=document_hash(content),
     )
     return project.model_copy(update={"log": (*project.log, entry)})
@@ -583,16 +629,142 @@ def read_project(
     *,
     require_images: bool = True,
     clock: Callable[[], datetime] = _utc_now,
+    backup: bool = False,
 ) -> tuple[Project, bool]:
     """:func:`load_project`, and whether the project was migrated: then
     ``project.json``, of an older schema, does not hold it (nor its ``migrate``
-    entry) until it is saved."""
-    project, migrated = _read_json((Path(folder) / PROJECT_FILE).read_bytes(), clock)
+    entry) until it is saved.
+
+    With ``backup``, a project is migrated only once the bytes of the
+    ``project.json`` it was read from are kept in a backup beside it
+    (:func:`keep_backup`), which its ``migrate`` entry names (its ``backup``
+    param): what opening a project does before it saves the migration. A
+    backup that cannot be written raises :class:`BackupError`; a missing image
+    file raises before it is written. Nothing else is written."""
+    folder = Path(folder)
+    data = (folder / PROJECT_FILE).read_bytes()
+    project, found = _parse(data)
     if require_images:
         missing = _missing_images(project, folder)
         if missing:
             raise MissingImageError(missing)
-    return project, migrated
+    if found == SCHEMA_VERSION:
+        return project, False
+    kept = keep_backup(folder, data, found) if backup else None
+    return _migrated(project, found, clock, backup=kept), True
+
+
+def backup_name(schema: int, number: int = 1) -> str:
+    """The name of the ``number``-th backup of a ``project.json`` of schema
+    ``schema``: ``project.schema1.json``, then ``project.schema1 (2).json`` and
+    so on, numbered as export folders are."""
+    stem = f"{BACKUP_PREFIX}{schema}"
+    return f"{stem}.json" if number == 1 else f"{stem} ({number}).json"
+
+
+def is_backup(name: str) -> bool:
+    """Whether a file named ``name`` in a project folder is taken for a backup
+    of an older ``project.json`` (``project.schema*.json``, in any case, as
+    Windows compares names): more than :func:`backup_name` gives, so that no
+    backup is missed."""
+    lower = name.lower()
+    return lower.startswith(BACKUP_PREFIX) and lower.endswith(".json")
+
+
+def keep_backup(folder: str | os.PathLike[str], data: bytes, schema: int) -> str:
+    """Keep ``data``, the bytes of ``folder``'s ``project.json`` of schema
+    ``schema``, in a backup beside it before a migration rewrites the file;
+    return the backup's name.
+
+    The backup is the first :func:`backup_name` whose file holds ``data``
+    already, or that nothing has, where ``data`` is then written: a file is
+    never replaced, so a backup kept at an earlier open stays as it was. The
+    bytes are written as they were read (a BOM and CRLF included, which loading
+    tolerates), and made durable before this returns, so a migrated
+    ``project.json`` never replaces the only copy of the file. An ``OSError``
+    raises :class:`BackupError` and leaves no file behind (one it began to
+    write is removed).
+    """
+    folder = Path(folder)
+    mode = _file_mode(folder / PROJECT_FILE)  # the copy is as readable as the original
+    number = 1
+    try:
+        while True:
+            name = backup_name(schema, number)
+            path = folder / name
+            if _write_new(path, data, mode) or _holds(path, data):
+                return name
+            number += 1
+    except OSError as exc:
+        why = exc.strerror or type(exc).__name__
+        raise BackupError(
+            f"{folder.name!r} was saved by an older Proteia (schema {schema}), and a copy"
+            f" of its {PROJECT_FILE} could not be kept before updating it ({why});"
+            " nothing was changed"
+        ) from exc
+
+
+def _write_new(path: Path, data: bytes, mode: int | None = None) -> bool:
+    """Write ``data`` into a new file ``path``, durably, with the permission bits
+    ``mode`` on POSIX (:func:`_file_mode`; the default for new files without
+    it); False, writing nothing, if something of that name exists. An
+    ``OSError`` removes what was written."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags, 0o666)  # the default mode for new files, under the umask
+    except FileExistsError:
+        return False
+    except PermissionError:
+        if path.exists():  # Windows refuses so where a folder has the name
+            return False
+        raise
+    try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+    _fsync_dir(path.parent)
+    return True
+
+
+def _holds(path: Path, data: bytes) -> bool:
+    """Whether ``path`` is a file that holds ``data`` (False if it cannot be read)."""
+    try:
+        return path.is_file() and path.stat().st_size == len(data) and path.read_bytes() == data
+    except OSError:
+        return False
+
+
+def backup_references(folder: str | os.PathLike[str]) -> frozenset[str] | None:
+    """The names of the stored image files (``img-N`` and an image suffix, in
+    the case found) that the backups in ``folder`` (:func:`is_backup`) name
+    anywhere in their bytes, whatever their schema, even one that no longer
+    loads: the files a restored backup would need. None when the folder cannot
+    be listed or a backup cannot be read, as what they name is then unknown.
+
+    The orphan cleanup deletes none of them whose id is below the project's
+    ``next_id``, and while this is None it keeps every such file
+    (:class:`~proteia.core.session.ProjectSession`). A backup's images hold
+    only such ids, so a migration that lost an image reference cannot lose the
+    image while the backup is kept; and a name found elsewhere in a backup (an
+    image's original name, say) never keeps the file of the id an import takes
+    next.
+    """
+    names: set[str] = set()
+    try:
+        for path in Path(folder).iterdir():
+            if is_backup(path.name) and path.is_file():
+                data = path.read_bytes()
+                names.update(match.decode("ascii") for match in _IMAGE_NAME.findall(data))
+    except OSError:
+        return None
+    return frozenset(names)
 
 
 def store_image(
@@ -659,9 +831,12 @@ def orphan_files(project: Project, folder: str | os.PathLike[str]) -> list[Path]
     Some are left by a crash or by an import that was never saved: stale
     ``.part``/``.tmp`` files, and images whose id the project may hand out again.
     Others are the files of images removed or undone in the open session, which
-    it keeps while its undo history can bring them back, or files the saved
-    ``project.json`` still references. The session deletes only the rest, before
-    an import and after a save (:class:`~proteia.core.session.ProjectSession`).
+    it keeps while its undo history can bring them back, files the saved
+    ``project.json`` still references, or files with an id below ``next_id``
+    that a backup of an older ``project.json`` names
+    (:func:`backup_references`). The session deletes
+    only the rest, before an import and after a save
+    (:class:`~proteia.core.session.ProjectSession`).
     """
     images = Path(folder) / IMAGES_DIR
     if not images.is_dir():

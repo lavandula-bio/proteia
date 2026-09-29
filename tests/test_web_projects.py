@@ -134,3 +134,95 @@ def test_no_free_name_is_refused_as_existing(tmp_path, monkeypatch):
         projects.create_project(root, name, clock=FakeClock())
     with pytest.raises(projects.ProjectExistsError):
         projects.free_name(root, "Blot")
+
+
+# --- A project named after a file (#57, N3) ---
+
+
+@pytest.mark.parametrize(
+    ("file", "name"),
+    [
+        ("β-actin 10 µM.tif", "β-actin 10 µM"),
+        ("blot..tif", "blot"),
+        ("a:b.png", "a b"),
+        ('a<b>"c|d?e*f\\g.jpg', "a b c d e f g"),
+        ("  lots   of  space .TIF", "lots of space"),
+        ("實驗 2026-09.tiff", "實驗 2026-09"),
+        ("CON.tif", projects.FALLBACK_NAME),
+        ("lpt1.tif", projects.FALLBACK_NAME),
+        ("....tif", projects.FALLBACK_NAME),
+        (" .tif", projects.FALLBACK_NAME),
+        ("a\u0007b.tif", projects.FALLBACK_NAME),  # a control character
+        ("half\ud800.tif", projects.FALLBACK_NAME),
+        ("x" * 120 + ".tif", "x" * 93),
+        ("x" * 92 + " .....y.tif", "x" * 92),  # cut to 93, then its end trimmed
+    ],
+)
+def test_a_project_is_named_after_a_file(file, name):
+    assert projects.name_from_file(file) == name
+    assert projects.project_name(name) == name
+
+
+def test_a_name_from_a_file_can_always_be_numbered(tmp_path):
+    root = tmp_path / "root"
+    name = projects.name_from_file("x" * 120 + ".tif")
+    projects.create_project(root, name, clock=FakeClock())
+    numbered = projects.free_name(root, name)
+    assert numbered == "x" * 93 + " (2)" and len(numbered) == 97
+    assert projects.MAX_FILE_NAME + len(f" ({projects.MAX_NUMBERED})") == projects.MAX_NAME
+
+
+def test_a_free_name_can_be_found_from_a_listing_read_once(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    for name in ("Blot", "blot (2)", "ＢＬＯＴ (3)"):  # any case; full-width look-alikes
+        projects.create_project(root, name, clock=FakeClock())
+    listed = []
+    iterdir = type(root).iterdir
+
+    def counting(self):
+        listed.append(self)
+        return iterdir(self)
+
+    monkeypatch.setattr(type(root), "iterdir", counting)
+    assert projects.free_name(root, "BLOT") == "BLOT (4)"
+    assert listed == [root]  # once, not once per number tried
+    existing = projects.names_in(root)
+    listed.clear()
+    assert projects.free_name(root, "blot", existing=existing) == "blot (4)"
+    assert projects.free_name(tmp_path / "none", "blot", existing=["BLOT"]) == "blot (2)"
+    assert listed == []
+    assert projects.names_in(tmp_path / "none") == []
+
+
+def test_a_project_set_up_as_it_is_created_is_saved_or_leaves_no_folder(tmp_path):
+    root = tmp_path / "root"
+    seen = []
+    session = projects.create_set_up(root, "Set up µ", seen.append, clock=FakeClock())
+    assert seen == [session] and (root / "Set up µ" / storage.PROJECT_FILE).is_file()
+
+    def fail(session):
+        (session.folder / "notes.txt").write_text("written", encoding="utf-8")
+        raise OSError(28, "No space left on device")
+
+    with pytest.raises(OSError, match="No space left"):
+        projects.create_set_up(root, "Failed", fail, clock=FakeClock())
+    assert sorted(p.name for p in root.iterdir()) == ["Set up µ"]
+    with pytest.raises(projects.ProjectExistsError):
+        projects.create_set_up(root, "set up µ", seen.append, clock=FakeClock())
+    assert len(seen) == 1  # never set up
+
+
+def test_a_folder_that_cannot_be_removed_after_a_failed_set_up_is_named(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+
+    def fail(session):
+        raise ValueError("refused")
+
+    monkeypatch.setattr(projects.shutil, "rmtree", lambda path, ignore_errors=False: None)
+    with pytest.raises(projects.FolderLeftError) as left:
+        projects.create_set_up(root, "Left", fail, clock=FakeClock(), what="the imported images")
+    assert str(left.value) == (
+        "the imported images could not be set up (refused), and its unfinished folder 'Left'"
+        " could not be removed: delete it from the projects folder"
+    )
+    assert isinstance(left.value, OSError)

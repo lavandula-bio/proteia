@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // The page: keeps this launch's access token, talks to the local server, and
-// shows the open project's images, proteins, boxes and checks. Every edit, and
+// shows the open project's images, proteins, boxes, molecular-weight
+// calibration and checks. Every edit, and
 // every undo and redo, goes to the server, which answers with the stored
 // project and its results; the page only draws what it is given.
+import { CalibrationPanel } from "/static/calibration.js";
 import { ChartCards } from "/static/charts.js";
+import { DiagnosticsDialog } from "/static/diagnostics.js";
 import { Dock } from "/static/dock.js";
 import {
   $,
@@ -17,6 +20,7 @@ import {
   sentence,
   span,
 } from "/static/dom.js";
+import { ImportDialog, refusedText } from "/static/handoffs.js";
 import { LaneTable } from "/static/lanes.js";
 import { colorOf, ProteinPanel } from "/static/proteins.js";
 import { ImageView, MISSING_COLOR } from "/static/view.js";
@@ -81,17 +85,35 @@ class NotSent extends Error {
 // now), never shown as a newer state of the project shown, as applyAnswer
 // would show it (keeping what showOpened drops: previews, typed values, queued
 // edits). The server answers each request within the opening it names; the
-// page does not rely on it. An aborted `signal` cancels it; `priority` orders
-// it among those waiting for a connection (the browser's fetch priority).
+// page does not rely on it. `closes`: with `anyProject`, the opening a request
+// that opens another project closes (an import of images handed to Proteia),
+// named all the same, so the server refuses it if another project is open now;
+// its answer is of the opening it makes. An aborted `signal` cancels it;
+// `priority` orders it among those waiting for a connection (the browser's
+// fetch priority). `read`: a request that changes nothing whatever its method
+// (a ladder proposal, a snap), so a project_changed refusal of it says nothing
+// was left undone (projectChanged).
 async function request(
   method,
   path,
-  { json, body, contentType, signal, priority, anyProject = false, answer = false } = {},
+  {
+    json,
+    body,
+    contentType,
+    signal,
+    priority,
+    anyProject = false,
+    closes = null,
+    answer = false,
+    read = false,
+  } = {},
 ) {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
   const named = anyProject ? null : shownOpening();
   if (named) {
     headers.set(OPENING_HEADER, String(named));
+  } else if (closes) {
+    headers.set(OPENING_HEADER, String(closes));
   }
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
@@ -120,7 +142,7 @@ async function request(
     }
     const error = new ApiError(response.status, detail);
     if (error.code === PROJECT_CHANGED) {
-      projectChanged(error, method, path);
+      projectChanged(error, method, path, { read });
     }
     throw error;
   }
@@ -276,11 +298,13 @@ function saidElsewhere(error) {
   );
 }
 
-function report(error) {
+// Show a refusal in the status line: the server's message, or `text` (the
+// refusal as the control that was refused words it).
+function report(error, text = null) {
   if (saidElsewhere(error)) {
     return;
   }
-  showStatus(error.message);
+  showStatus(text || error.message);
 }
 
 // Answers can arrive out of order: one is shown only if it is not older than
@@ -378,10 +402,17 @@ function pending() {
 
 // Send an edit and show a refusal in the status line (unless another project
 // is shown by then): the server's reason, or as `refused(error)` shows it.
-async function edit(method, path, json, { refused = report } = {}) {
+// `sent(project)` is given the state shown when it is sent, which its answer
+// can be compared with: the same revision, and it changed nothing.
+async function edit(method, path, json, { refused = report, sent = null } = {}) {
   const opened = shownOpening();
   try {
-    return await ordered(() => send(method, path, json));
+    return await ordered(() => {
+      if (sent) {
+        sent(state.project);
+      }
+      return send(method, path, json);
+    });
   } catch (error) {
     if (opened === shownOpening()) {
       refused(error);
@@ -407,6 +438,10 @@ const view = new ImageView($("view"), {
     state.boxId = boxId;
     render();
   },
+  // A ladder found, adjusted or marked (#58): the calibration section's.
+  pick: (x, y, where) => calibration.pick(x, y, where),
+  ruler: (step) => calibration.ruler(step),
+  ladderPoint: (step) => calibration.ladderPoint(step),
 });
 
 const proteinPanel = new ProteinPanel({
@@ -421,6 +456,31 @@ const proteinPanel = new ProteinPanel({
   pending,
   laneName: (index) => laneName(state.project, index),
   remeasured: (answer) => remeasuredText(answer),
+});
+
+// The "Molecular weight" section (#58). A proposal, a snap and the presets
+// change nothing: read as the diagnostics dialog reads, not awaited as an edit
+// ("Updating…"), and a refusal of them as project_changed says nothing was
+// left undone. Its changes are edits, in order with the others.
+const calibration = new CalibrationPanel(view, {
+  read: (method, path, json, { anyProject = false } = {}) =>
+    request(method, path, { json, answer: true, anyProject, read: true }),
+  edit: (method, path, json, options) => edit(method, path, json, options),
+  status: showStatus,
+  report,
+  undo: (seq) => takeStep("undo", { seq }),
+  reread: () => reread().catch(report),
+  showImage: (imageId) => {
+    state.imageId = imageId;
+    state.boxId = null;
+    select();
+    render();
+  },
+  changed: () => {
+    if (state.project) {
+      render();
+    }
+  },
 });
 
 // Its edits run in the panel's queue: in order with the protein edits, the
@@ -513,6 +573,7 @@ function showOpened(answer) {
   state.originalColours.clear();
   proteinPanel.forgetTyped();
   laneTable.forgetTyped();
+  calibration.forget(); // a ruler or a tool belongs to the image it was on
   charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
   $("lane-picker").hidden = true; // its retry places a box in the project it asked about
   applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
@@ -521,11 +582,14 @@ function showOpened(answer) {
 
 // Create or open a project: POST `json` (no body if undefined) to `path`,
 // then show the project answered in place of the one shown (showOpened).
-// `name` is what "Opening …" says meanwhile. Gives the answer once the
-// project is shown; null if a create or open is already running here, or if
-// the answer is older than the project shown by then. Rejects with the
-// server's refusal, the project shown unchanged.
-async function switchTo(path, name, json) {
+// `name` is what "Opening …" says meanwhile. With `closes`, the request names
+// that opening, which it closes (request()): refused if another project is
+// open now (an import of images handed to Proteia, whose dialog says what it
+// closes). Gives the answer once the project is shown; null if a create or
+// open is already running here, or if the answer is older than the project
+// shown by then. Rejects with the server's refusal, the project shown
+// unchanged.
+async function switchTo(path, name, json, { closes = null } = {}) {
   if (opening !== null) {
     return null;
   }
@@ -540,8 +604,9 @@ async function switchTo(path, name, json) {
     // change of that project.
     await Promise.all([proteinPanel.settled(), pending()]);
     proteinPanel.invalidateEdits();
-    // It names no opening: its answer is of the one it makes.
-    const answer = await call("POST", path, json, { anyProject: true });
+    // Its answer is of the opening it makes: not taken for a newer one than
+    // the request named (request()).
+    const answer = await call("POST", path, json, { anyProject: true, closes });
     if (!isCurrent(answer.project)) {
       return null;
     }
@@ -586,11 +651,12 @@ async function openProject(path, name, json) {
 // this page's own switch, say), the page follows: it shows the project open
 // now. The edits queued meanwhile are dropped, and with them what they would
 // say: each would be refused. `method` and `path`: the request's, which says
-// what was not done (NOT_DONE): nothing for a read, or a reveal (a folder not
-// shown); otherwise by its path (REFUSED_AS), or a change. Nothing either if
+// what was not done (NOT_DONE): nothing for a read (a GET, or one sent as a
+// `read`: a ladder proposal or a snap), or a reveal (a folder not shown);
+// otherwise by its path (REFUSED_AS), or a change. Nothing either if
 // `answered`: the request was answered, about an opening newer than the one
 // it named (request()), so it was not refused.
-function projectChanged(error, method, path, { answered = false } = {}) {
+function projectChanged(error, method, path, { answered = false, read = false } = {}) {
   const now = error.detail && error.detail.open_id;
   const shown = shownOpening();
   if (opening !== null || !shown || !(now > shown)) {
@@ -598,7 +664,7 @@ function projectChanged(error, method, path, { answered = false } = {}) {
   }
   proteinPanel.invalidateEdits();
   const refused =
-    answered || method === "GET" || path === "/api/project/reveal"
+    answered || read || method === "GET" || path === "/api/project/reveal"
       ? null
       : REFUSED_AS[path] || "change";
   followOpening({ refused });
@@ -612,6 +678,7 @@ const NOT_DONE = {
   undo: "Nothing was undone.",
   redo: "Nothing was redone.",
   export: "Nothing was exported.",
+  diagnostics: "No diagnostic file was written.",
 };
 
 // The requests other than a change, by path: what their refusal did not do (a
@@ -620,26 +687,35 @@ const REFUSED_AS = {
   "/api/undo": "undo",
   "/api/redo": "redo",
   "/api/export": "export",
+  "/api/diagnostics": "diagnostics",
 };
 
-let following = null; // the follow under way: {refused, done}, or null
+let following = null; // the follow under way: {refused, notes, done}, or null
 
 // Show the project open now in place of the one shown, which is no longer
 // open, and say why in the status line, and what the refused requests did not
-// do (`refused`: a key of NOT_DONE, or null). First every edit made before has
-// its answer (each is refused: none is made in the project open now); then
-// the project is read, whichever it is, and shown with nothing kept of the one
-// before (showOpened), unless this page has meanwhile started its own create
-// or open (it shows that one) or the answer is no newer than what it shows. A
-// call while one runs joins it. Settles once done, and never rejects.
-function followOpening({ refused = null } = {}) {
+// do (`refused`: a key of NOT_DONE, or null), then `note` (what else the page
+// found, or null). First every edit made before has its answer (each is
+// refused: none is made in the project open now); then the project is read,
+// whichever it is, and shown with nothing kept of the one before
+// (showOpened), unless this page has meanwhile started its own create or open
+// (it shows that one) or the answer is no newer than what it shows. A call
+// while one runs joins it. Settles once done, and never rejects.
+function followOpening({ refused = null, note = null } = {}) {
   if (following) {
     if (refused) {
       following.refused.add(refused);
     }
+    if (note) {
+      following.notes.push(note);
+    }
     return following.done;
   }
-  const follow = { refused: new Set(refused ? [refused] : []), done: null };
+  const follow = {
+    refused: new Set(refused ? [refused] : []),
+    notes: note ? [note] : [],
+    done: null,
+  };
   following = follow;
   follow.done = (async () => {
     try {
@@ -652,7 +728,7 @@ function followOpening({ refused = null } = {}) {
         return;
       }
       showOpened(answer);
-      showStatus(followedText(before, answer.project, follow.refused));
+      showStatus([followedText(before, answer.project, follow.refused), ...follow.notes].join(" "));
     } catch (error) {
       report(error);
     } finally {
@@ -675,22 +751,39 @@ function followedText(before, project, refused) {
 }
 
 let checking = null; // the check under way (checkOpening), or null
+let started = false; // the page has taken its first listing (start)
+
+// Which project is open, and the images handed to Proteia waiting (GET
+// /api/workspace): read by request(), as every answer is; about no project.
+function readWorkspace() {
+  return request("GET", "/api/workspace", { anyProject: true, answer: true });
+}
 
 // A page shown again (its tab chosen, its window focused) checks which project
 // is open, and follows another opening (followOpening), so the user sees the
 // project open now before editing. The header is what guarantees it: an edit
-// sent before this answer is refused, not made in another project. One check
-// at a time; none while this page creates or opens a project itself.
-function checkOpening() {
-  if (checking || quitting || opening !== null || !shownOpening()) {
-    return;
+// sent before this answer is refused, not made in another project. It takes
+// the images waiting too (takeListing): the Import dialog shows those found
+// meanwhile, waits while another tab imports the ones it shows, or closes
+// once another tab imported or discarded them. What the listing gives to say
+// follows `note` (what the page just said, still in the status line) there,
+// and both stay should it follow. One check at a time (a call meanwhile gives
+// the one under way); none while this page creates or opens a project itself,
+// its own import included. Settles once done, and never rejects.
+function checkOpening({ note = null } = {}) {
+  if (checking || !started || quitting || opening !== null) {
+    return checking;
   }
-  checking = request("GET", "/api/workspace")
-    .then((response) => response.json())
+  checking = readWorkspace()
     .then((workspace) => {
+      const found = takeListing(workspace);
+      const said = [note, found].filter(Boolean).join(" ") || null;
+      if (found) {
+        showStatus(said); // kept should the follow not show another project
+      }
       const shown = shownOpening();
       if (opening === null && shown && workspace.open_id > shown) {
-        return followOpening();
+        return followOpening({ note: said });
       }
       return null;
     })
@@ -698,6 +791,13 @@ function checkOpening() {
     .finally(() => {
       checking = null;
     });
+  return checking;
+}
+
+// Check again once the check under way (if any) is done: it may have been
+// asked before what this page just did, whose answer it would not reflect.
+function checkAgain(note = null) {
+  return Promise.resolve(checking).then(() => checkOpening({ note }));
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -706,6 +806,446 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 window.addEventListener("focus", () => checkOpening());
+
+// --- Images handed to Proteia (#57) ---
+
+// A launch given image files (`proteia a.tif b.tif`, or "Open with Proteia")
+// hands them to the running Proteia, where they wait (a hand-off) until a
+// page imports them into a new project or discards them: kind, membrane and
+// polarity have no default, so the page asks, in the Import dialog
+// (handoffs.js). The page finds them at start, on each check (a page shown
+// again), and before Quit, and shows one at a time.
+
+// How often the listing is read again while the hand-off shown may still grow.
+const SETTLE_MS = 2000;
+const GONE = "These images were imported or discarded in another tab.";
+const WAITING_AT_QUIT = "Import or discard the images waiting in Proteia before quitting.";
+const NOT_RESPONDING = "Proteia is not responding. Start it again to reopen this page.";
+
+// The image hand-offs waiting, as last listed (takeListing): not those another
+// tab's import holds.
+let handoffs = [];
+// Hand-offs closed here with Esc or Later: not shown again unasked ("N
+// images waiting…" shows them).
+const setAside = new Set();
+// Hand-offs this page imported or discarded, and notices it said: a listing
+// asked for before that answer may still list them.
+const finished = new Set();
+let settling = null; // the timer of the next read while the hand-off shown may grow
+// The project open as last listed ({name, open_id}), or null for none: what an
+// import closes while this page shows no project (importCloses).
+let listedOpen = null;
+
+const importDialog = new ImportDialog({
+  accept: () => importHandoff(),
+  discard: () => discardHandoff(),
+  closed: (handoff) => {
+    setAside.add(handoff.id);
+    stopSettling();
+    renderWaiting();
+    showOpenOrProjects();
+  },
+});
+
+// Whether a dialog is up: Projects, a chart enlarged, or Import.
+function dialogUp() {
+  return [...document.getElementsByTagName("dialog")].some((dialog) => dialog.open);
+}
+
+// What an import of images waiting closes, as the Import dialog says and its
+// request names: the project shown; with none shown, the project open as last
+// listed (another tab opened it), or null for none.
+function importCloses() {
+  if (state.project) {
+    return { name: state.project.name, open_id: shownOpening() };
+  }
+  return listedOpen;
+}
+
+// Take a listing of the workspace (GET /api/workspace). The hand-off the
+// Import dialog shows is refreshed as listed now: while another tab's import
+// holds it (claimed), the dialog keeps its rows and choices and waits, since
+// that import may be refused and let it go as it was. No longer listed
+// (another tab imported or discarded it), it is gone: the dialog closes, and
+// this gives that to say. Neither while this page's own import or discard of
+// it is awaited (its own claim lists it claimed). Its line saying what an
+// import closes follows the project open (importCloses). Then, with no dialog
+// up, the first hand-off waiting (none another tab's import holds) and not
+// set aside is shown (`show` "auto"); asked for (Quit, "N images waiting…"),
+// the first even if set aside, over another dialog ("asked"). With no project
+// shown and no dialog up, the page shows the project open, or the Projects
+// dialog. Gives what to say, or null: the dialog closed, then the notices
+// (sayNotices); the caller says it with its own message, never over it.
+// Notices wait while this page's own import or discard is awaited, whose
+// answer the status line says next: the check after it says them.
+function takeListing(workspace, { show = "auto" } = {}) {
+  const listed = workspace.handoffs.filter((handoff) => !finished.has(handoff.id));
+  const notices = importDialog.busy ? [] : listed.filter((handoff) => handoff.kind === "notice");
+  const images = listed.filter((handoff) => handoff.kind === "images");
+  handoffs = images.filter((handoff) => !handoff.claimed);
+  listedOpen =
+    workspace.open_id === null ? null : { name: workspace.open, open_id: workspace.open_id };
+  for (const id of [...setAside]) {
+    if (!images.some((handoff) => handoff.id === id)) {
+      setAside.delete(id);
+    }
+  }
+  const shown = importDialog.handoff;
+  let gone = null;
+  if (shown && !importDialog.busy) {
+    const now = images.find((handoff) => handoff.id === shown.id);
+    if (now) {
+      importDialog.refresh(now);
+    } else {
+      // Gone for good: a listing asked for before, and answered late, does not bring it back.
+      finished.add(shown.id);
+      importDialog.hide();
+      gone = GONE;
+    }
+  }
+  if (importDialog.handoff) {
+    importDialog.renderCloses(importCloses());
+  }
+  if (!importDialog.handoff && (show === "asked" || !dialogUp())) {
+    const next = handoffs.find((handoff) => show === "asked" || !setAside.has(handoff.id));
+    if (next) {
+      setAside.delete(next.id);
+      importDialog.show(next, importCloses());
+    }
+  }
+  renderWaiting();
+  keepSettling();
+  if (!state.project && !dialogUp()) {
+    showOpenOrProjects(workspace);
+  }
+  return [gone, sayNotices(notices)].filter(Boolean).join(" ") || null;
+}
+
+// Notices: the arguments launches could not open, and no image. Gives what
+// they say, for the status line (null for none), and discards each as said
+// (its count of entries), so no other page says it again: one that grew
+// meanwhile is refused (handoff_changed) and said whole at the next check; one
+// another page discarded first was said there.
+function sayNotices(notices) {
+  if (!notices.length) {
+    return null;
+  }
+  const said = notices.map((notice) => refusedText(notice.refused, notice.more_refused));
+  for (const notice of notices) {
+    finished.add(notice.id); // said: not again, whatever the next listing
+    request("POST", `/api/handoffs/${notice.id}/discard`, {
+      anyProject: true,
+      json: { files: [], refused: notice.refused.length + notice.more_refused },
+    }).catch((error) => {
+      if (error.code === "handoff_changed") {
+        finished.delete(notice.id);
+        checkAgain();
+      }
+    });
+  }
+  return `Not opened: ${said.join("; ")}.`;
+}
+
+// "N images waiting…", in the header and in the Projects dialog, while images
+// wait that the Import dialog does not show; either shows them.
+function renderWaiting() {
+  const shown = importDialog.handoff;
+  const count = handoffs
+    .filter((handoff) => !shown || handoff.id !== shown.id)
+    .reduce((sum, handoff) => sum + handoff.files.length, 0);
+  for (const id of ["handoffs-waiting", "projects-handoffs"]) {
+    const button = $(id);
+    button.hidden = !count || quitting;
+    button.textContent = `${counted(count, "image", "images")} waiting…`;
+  }
+}
+
+// Show the images waiting, asked for: the listing is read again first.
+async function showWaiting() {
+  try {
+    const found = takeListing(await readWorkspace(), { show: "asked" });
+    if (found) {
+      showStatus(found);
+    }
+  } catch (error) {
+    report(error);
+  }
+}
+
+$("handoffs-waiting").addEventListener("click", () => showWaiting());
+$("projects-handoffs").addEventListener("click", () => showWaiting());
+
+// While the hand-off shown may still grow (more_may_arrive: the launches of a
+// selection opened with Proteia, one per file, are still handing theirs off),
+// or another tab's import holds it (claimed: refused, it waits here again;
+// done, it is gone), the listing is read again every SETTLE_MS until neither;
+// not while this page's own import or discard of it is awaited.
+function keepSettling() {
+  const shown = importDialog.handoff;
+  if (
+    settling !== null ||
+    !shown ||
+    !(shown.more_may_arrive || shown.claimed) ||
+    importDialog.busy
+  ) {
+    return;
+  }
+  settling = window.setTimeout(() => {
+    settling = null;
+    checkOpening();
+  }, SETTLE_MS);
+}
+
+function stopSettling() {
+  window.clearTimeout(settling);
+  settling = null;
+}
+
+// With no project shown and no dialog up (the Import dialog closed, its
+// images imported in another tab, say), show the project open now, as a
+// start does, or the Projects dialog to open one. `workspace`: a listing just
+// read, or null to read one.
+async function showOpenOrProjects(workspace = null) {
+  if (state.project || dialogUp() || opening !== null || quitting) {
+    return;
+  }
+  try {
+    const now = workspace || (await readWorkspace());
+    if (state.project || dialogUp() || opening !== null) {
+      return;
+    }
+    if (now.open) {
+      applyAnswer(await call("GET", "/api/project"));
+    } else {
+      await showProjects();
+    }
+  } catch (error) {
+    report(error);
+  }
+}
+
+// "the image", "the 3 images": a hand-off's files, in a sentence.
+function theImages(handoff) {
+  const count = handoff.files.length;
+  return count === 1 ? "the image" : `the ${count} images`;
+}
+
+// Whether the Import dialog still shows `handoff`.
+function showsHandoff(handoff) {
+  return importDialog.handoff !== null && importDialog.handoff.id === handoff.id;
+}
+
+// Import the hand-off the dialog shows (its Import): a new project with its
+// images, shown in place of the project shown, as this page's own switch
+// (switchTo: no word of another tab). The request names the opening the
+// dialog says the import closes (importCloses): refused if another tab opened
+// a project since, and the page follows before the user presses Import again.
+// A page showing no project knows the project open only from its last
+// listing, so it reads the listing again first, and asks again should a
+// project be open that the dialog did not name. (With none open then, the
+// request names none: only a project another tab opens between that read and
+// the import is closed unnamed.)
+async function importHandoff() {
+  const handoff = importDialog.handoff;
+  if (!handoff || !importDialog.ready() || opening !== null || exporting || quitting) {
+    return;
+  }
+  const choices = importDialog.choices();
+  const images = counted(handoff.files.length, "image", "images");
+  stopSettling();
+  importDialog.setBusy(`Importing ${images}…`);
+  if (!state.project) {
+    const named = importDialog.closes;
+    await checkAgain();
+    const now = importDialog.closes;
+    if (now && (!named || now.open_id !== named.open_id)) {
+      importDialog.setBusy(null);
+      askAgain(now.name);
+      return;
+    }
+  }
+  const closes = importDialog.closes;
+  let answer;
+  try {
+    const name = choices.name || handoff.suggested_name || "the new project";
+    answer = await switchTo(`/api/handoffs/${handoff.id}/accept`, name, choices, {
+      closes: closes ? closes.open_id : null,
+    });
+  } catch (error) {
+    importDialog.setBusy(null);
+    await importRefused(error, handoff);
+    return;
+  }
+  finished.add(handoff.id);
+  if (showsHandoff(handoff)) {
+    importDialog.hide();
+  }
+  const projects = $("projects-dialog");
+  if (projects.open) {
+    projects.close();
+  }
+  const said = answer
+    ? importedText(answer)
+    : `Imported ${images} into a new project, but another project was opened meanwhile.`;
+  showStatus(said);
+  checkAgain(said); // the next images waiting, if any
+}
+
+// The Import dialog asks again: another tab opened `name`, which an import
+// closes now (as its line says).
+function askAgain(name) {
+  importDialog.say(`Another tab opened ${isolate(name)}: check, then press Import again.`);
+  keepSettling();
+  if (focusLost()) {
+    importDialog.focusBack();
+  }
+}
+
+// What an import of a hand-off did, for the status line: the images imported
+// and into which project; what each import found about its file, as a page
+// import says it; the files not imported, and why; the arguments the launches
+// could not open; and the notes (an image put on a new membrane because the
+// one it was to join was not imported).
+function importedText(answer) {
+  const done = answer.handoff;
+  const images = counted(done.imported.length, "image", "images");
+  const parts = [`Imported ${images} into ${isolate(answer.project.name)}.`];
+  for (const file of done.imported) {
+    const image = answer.project.images.find((each) => each.id === file.image_id);
+    const found = image ? image.warnings.map((warning) => warning.message) : [];
+    if (found.length) {
+      parts.push(`${isolate(file.name)}: ${found.join(" ")}`);
+    }
+  }
+  if (done.refused.length) {
+    parts.push(`Not imported: ${refusedText(done.refused)}.`);
+  }
+  if (done.launch_refused.length || done.more_refused) {
+    parts.push(`Not opened: ${refusedText(done.launch_refused, done.more_refused)}.`);
+  }
+  parts.push(...done.notes.map((note) => `${note}.`)); // each starts with a file name, as it is
+  return parts.join(" ");
+}
+
+// An import refused (`error`). The server changed nothing, unless the images
+// went into a project after all, or none could be imported: then the
+// hand-off is gone, the dialog closes, and the status line says what came of
+// it. Otherwise the dialog stays up and says what to do (handoffRefused).
+async function importRefused(error, handoff) {
+  const detail = error.detail || {};
+  if (error.code === "nothing_imported" || (error.code === "unsaved_changes" && detail.created)) {
+    finished.add(handoff.id);
+    if (showsHandoff(handoff)) {
+      importDialog.hide();
+    }
+    const said =
+      error.code === "nothing_imported"
+        ? `Nothing was imported: ${refusedText(detail.refused || [])}.`
+        : sentence(error.message);
+    showStatus(said);
+    checkAgain(said);
+    return;
+  }
+  if (error.code === PROJECT_CHANGED) {
+    // Another tab opened a project, maybe by importing these very images. The
+    // page checks (checkOpening; this page's switch had ended, so the refusal
+    // started no follow): it shows the project open now, and closes the
+    // dialog if these images are gone. If they still wait, the dialog says
+    // what an import closes now.
+    await checkAgain();
+    if (showsHandoff(handoff)) {
+      askAgain(detail.open);
+    }
+    return;
+  }
+  if (error.code === "project_exists" || error.code === "invalid_project_name") {
+    if (showsHandoff(handoff)) {
+      importDialog.sayName(sentence(error.message));
+      keepSettling();
+      $("handoff-name").focus();
+      return;
+    }
+  }
+  handoffRefused(error, handoff, "Import");
+}
+
+// Discard the hand-off the dialog shows (its Discard): the server drops its
+// copies of the images; the original files are never touched. It sends the
+// files and refused entries shown, so one that grew since is refused
+// (handoff_changed), and the dialog shows it grown.
+async function discardHandoff() {
+  const handoff = importDialog.handoff;
+  if (!handoff || importDialog.busy) {
+    return;
+  }
+  const images = counted(handoff.files.length, "image", "images");
+  stopSettling();
+  importDialog.setBusy(`Discarding ${images}…`);
+  try {
+    await request("POST", `/api/handoffs/${handoff.id}/discard`, {
+      anyProject: true,
+      json: importDialog.shownParts(),
+    });
+  } catch (error) {
+    importDialog.setBusy(null);
+    handoffRefused(error, handoff, "Discard");
+    return;
+  }
+  finished.add(handoff.id);
+  if (showsHandoff(handoff)) {
+    importDialog.hide();
+  }
+  const said = `Discarded ${theImages(handoff)} waiting; the original files are unchanged.`;
+  showStatus(said);
+  checkAgain(said); // the next images waiting, if any
+}
+
+// An import or discard (`press`: its button) refused, nothing changed. Once
+// another tab imported or discarded the hand-off (handoff_not_found), the
+// dialog closes, says so, and the page checks again: the next images waiting,
+// or the project that import opened. While another tab's import holds it
+// (handoff_claimed), the dialog keeps its rows and choices and waits, as
+// takeListing has it while the listing says claimed: that import may be
+// refused, and the images wait here again, or be done, and they are gone.
+// Once more joined it (handoff_changed), the dialog shows it as it is now,
+// each new image with its bands unchosen, and says what joined (images, or
+// only files a launch could not open), to press again. Anything else is said
+// in the dialog, which stays up.
+function handoffRefused(error, handoff, press) {
+  if (error.code === "handoff_not_found") {
+    finished.add(handoff.id);
+    if (showsHandoff(handoff)) {
+      importDialog.hide();
+    }
+    showStatus(GONE);
+    checkAgain(GONE);
+    return;
+  }
+  if (!showsHandoff(handoff)) {
+    report(error); // closed meanwhile
+    return;
+  }
+  if (error.code === "handoff_claimed") {
+    importDialog.refresh({ ...importDialog.handoff, claimed: true, more_may_arrive: false });
+    checkAgain();
+  } else if (error.code === "handoff_changed") {
+    const joined = importDialog.refresh(error.detail);
+    const what = joined.images
+      ? "More images arrived: check them"
+      : joined.refused
+        ? "More files could not be opened: check the list"
+        : "These images changed: check them";
+    importDialog.say(`${what}, then press ${press} again.`);
+  } else if (error instanceof ApiError) {
+    importDialog.say(error.status === 401 ? NEEDS_LAUNCH : sentence(error.message));
+  } else {
+    importDialog.say(NOT_RESPONDING);
+  }
+  keepSettling();
+  if (focusLost()) {
+    importDialog.focusBack();
+  }
+}
 
 // "Open sample project": a new project on the synthetic sample blot, with its
 // lanes and proteins set up and each protein's row left to drag
@@ -744,6 +1284,20 @@ $("projects-dialog").addEventListener("cancel", (event) => {
   }
 });
 $("switch-project").addEventListener("click", () => showProjects().catch(report));
+
+// --- The diagnostic file for a bug report ---
+
+// Diagnostics… in the header, and in the Projects dialog, which is all a page
+// with no project open can reach (it is modal). Its requests are sent as every
+// other, naming the opening shown; a refusal as project_changed makes the page
+// follow first (request()), and the dialog waits for that before it lists
+// what the file would hold now. Neither an edit nor awaited as one.
+const diagnostics = new DiagnosticsDialog({
+  ask: (method, path, json) => request(method, path, { json, answer: true }),
+  settled: () => (following ? following.done : Promise.resolve()),
+});
+$("diagnostics").addEventListener("click", () => diagnostics.show());
+$("projects-diagnostics").addEventListener("click", () => diagnostics.show());
 $("reveal").addEventListener("click", () => call("POST", "/api/project/reveal").catch(report));
 
 // --- Applying the server's state ---
@@ -789,6 +1343,7 @@ function imageNames(ids) {
 function render() {
   $("lane-picker").hidden = true; // its question was about the state before
   const project = state.project;
+  importDialog.renderCloses(importCloses()); // what an import of images waiting closes
   $("workspace").hidden = !project;
   $("switch-project").hidden = false;
   $("reveal").hidden = !project;
@@ -809,6 +1364,7 @@ function render() {
       : "Saving…";
   const image = project.images.find((i) => i.id === state.imageId) || null;
   renderImages(project, image);
+  calibration.render(project, image);
   proteinPanel.render(project, image, state.proteinId, state.results);
   renderBox(project);
   renderNotices(project);
@@ -1013,6 +1569,9 @@ function renderNotices(project) {
 // this signal image and the lanes are declared ({proteinId, color, lanes});
 // otherwise null, and the drag pans.
 function rowTool(project, image) {
+  if (calibration.busy()) {
+    return null; // a ladder is being found, marked or adjusted: a drag pans
+  }
   const protein = image
     ? project.proteins.find((p) => p.id === state.proteinId && p.image_id === image.id)
     : null;
@@ -1031,8 +1590,13 @@ function renderHint(project, image) {
   }
   const protein = project.proteins.find((p) => p.id === state.proteinId);
   const lanes = project.lanes.length;
-  if (image.kind === "visible_marker") {
-    hint.textContent = "A marker image: boxes are placed on signal images.";
+  const calibrating = calibration.hint();
+  hint.classList.toggle("away", calibration.hintAway());
+  if (calibrating) {
+    hint.textContent = calibrating;
+  } else if (image.kind === "visible_marker") {
+    hint.textContent =
+      "A marker image: boxes are placed on signal images; find its ladder under Molecular weight";
   } else if (!protein) {
     hint.textContent = "Add a protein to place boxes on this image.";
   } else if (!lanes) {
@@ -1337,6 +1901,10 @@ const NOT_MEASURED = {
 // core/rowdetect.py), in words. `note`: words of the detector's note on it,
 // which names its lanes first ("lane 5: …", "lanes 3, 7: …").
 const ROW_WARNINGS = {
+  doubtful_lanes: {
+    note: null,
+    words: () => "the bands' spacing does not fit the lanes read",
+  },
   background_mismatch: {
     note: null,
     words: () => "uneven background under some boxes: check their nets",
@@ -1349,6 +1917,14 @@ const ROW_WARNINGS = {
   multiple_components: {
     note: "second separate component",
     words: (lanes) => `two bands in ${lanes || "a lane"}: the box covers the stronger one`,
+  },
+  hollow_band: {
+    note: "a hollow band",
+    words: (lanes) => {
+      const bands = lanes && lanes.startsWith("lanes") ? "hollow bands" : "a hollow band";
+      const where = lanes ? `${bands} in ${lanes}` : bands;
+      return `${where}: lighter in the centre and saturated around it, likely over-exposed`;
+    },
   },
   cut_by_row_box: {
     note: "cuts through the band",
@@ -1404,7 +1980,10 @@ function remeasuredText(answer) {
 // Gives {text, check, unchanged}: `unchanged` when the row changed nothing (the
 // same drag again), `check` when it changed the project and left signal that
 // fits no lane, the mark of a row box over part of the row (its bands then
-// read as several lanes each): the text asks to check the lane numbers.
+// read as several lanes each), or read lanes that do not fit the bands'
+// spacing (doubtful_lanes, #111: a first row box that also covers a ladder,
+// labels or another panel reads its lanes off by one or more): the text asks
+// to check the lane numbers.
 function rowReport(answer, name, before) {
   const empty = new Map(answer.empty.map((lane) => [lane.lane_index, lane]));
   const kept = new Set(answer.kept_lanes);
@@ -1476,12 +2055,16 @@ function rowReport(answer, name, before) {
   if (remeasured) {
     parts.push(remeasured);
   }
-  const check = !unchanged && unmeasured.has("unassigned");
+  const partRow = unmeasured.has("unassigned");
+  const check = !unchanged && (partRow || answer.flags.includes("doubtful_lanes"));
   if (check) {
     const all = answer.band_ids.length;
     parts.push(
-      "check the boxes' lane numbers: a row box over part of the row misreads the lanes" +
-        ` (Undo, then drag across all ${all})`,
+      partRow
+        ? "check the boxes' lane numbers: a row box over part of the row misreads the lanes" +
+            ` (Undo, then drag across all ${all})`
+        : "check the boxes' lane numbers: a row box that also covers a ladder, labels or" +
+            ` another panel misreads the lanes (Undo, then drag over the ${all} lanes only)`,
     );
   } else if (unmeasured.size) {
     parts.push("click a dashed placeholder to box a lane by hand");
@@ -1759,7 +2342,19 @@ $("import-file").addEventListener("change", async (event) => {
     $("import-membrane").value = "";
     // What the import found about the file, until it is dismissed by the next action.
     const found = image ? image.warnings.map((warning) => warning.message) : [];
-    showStatus(found.length ? `Imported ${name}. ${found.join(" ")}` : "");
+    // A marker image whose membrane has one chemiluminescence image of its size
+    // not linked yet (#58): the status line offers to link the two.
+    const offer = image ? calibration.linkOffer(answer.project, image.id) : null;
+    if (offer) {
+      const said = [`Imported ${name}.`, ...found].join(" ");
+      showStatus(said, {
+        label: `Link as the marker of ${offer.name}`,
+        name: `Link ${name} as the marker image of ${offer.name}`,
+        run: () => calibration.link(offer.imageId, image.id),
+      });
+    } else {
+      showStatus(found.length ? `Imported ${name}. ${found.join(" ")}` : "");
+    }
   } catch (error) {
     if (opened === shownOpening()) {
       report(error);
@@ -2128,6 +2723,13 @@ const ACTION_WORDS = {
   clear_boxes: "clear boxes",
   detect_row_boxes: "detect row boxes",
   remove_undetected: "remove n.d. mark",
+  set_marker_image: "link marker image",
+  set_ladder: "choose ladder",
+  add_calibration_point: "mark ladder band",
+  edit_calibration_point: "move ladder mark",
+  remove_calibration_point: "remove ladder mark",
+  clear_calibration: "clear ladder marks",
+  set_ladder_points: "apply ladder",
   requantify: "requantify",
   undo: "undo",
   redo: "redo",
@@ -2241,12 +2843,16 @@ function takeStep(direction, { seq = null, back = () => $("clear-boxes") } = {})
       }
       const before = state.project;
       const opened = shownOpening();
+      calibration.takeDropped(); // said already: only a ruler this step drops is said with it
       try {
         const answer = await send("POST", `/api/${direction}`);
         if (!answer || !current()) {
           return null;
         }
-        showStatus(stepText(direction, answer, before));
+        // A ruler open on the ladder or the marker link the step changed is
+        // dropped as the answer is drawn: said after the step's own words.
+        const dropped = calibration.takeDropped();
+        showStatus([stepText(direction, answer, before), dropped].filter(Boolean).join(" "));
         keepFocus(had, direction, from);
         return answer;
       } catch (error) {
@@ -2358,9 +2964,21 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     deleteSelected();
   } else if (event.key === "Escape") {
+    // First a ladder's popup, tool or ruler (#58); the view took the key
+    // already if it cancelled a drag, which then drops nothing more.
+    if (calibration.escape({ gestureCancelled: event.defaultPrevented })) {
+      return;
+    }
     state.boxId = null;
     $("lane-picker").hidden = true;
     render();
+  } else if (event.key === "Enter") {
+    // Not on a control, whose Enter is its own (a ruler tick's applies too:
+    // calibration.js); on the page, it applies the ruler.
+    const control = target instanceof Element && target.closest("button, summary, a");
+    if (!control && calibration.enter()) {
+      event.preventDefault(); // the ruler applied
+    }
   } else if (event.key === "f" || event.key === "F") {
     view.fit();
   } else if (event.key === "+" || event.key === "=") {
@@ -2379,13 +2997,19 @@ let quitting = false; // pressed: its answer is awaited, or Proteia has stopped
 // Quit waits for an export: stopping the server under it would cut it off, and
 // its answer would come after "Proteia has stopped" (the page shown again, or
 // "Not exported" for a folder written in full). Disabled while one runs, its
-// tooltip says why; once pressed, no export starts (renderExport).
+// tooltip says why; once pressed, no export starts (renderExport). So does an
+// import of images handed to Proteia, which closes the project shown.
 function renderQuit() {
   const button = $("quit");
   button.disabled = quitting || exporting;
   button.title = exporting ? "Quit once the export is written" : "";
+  importDialog.block(exporting ? "Import once the export is written." : null);
 }
 
+// Before it stops Proteia, Quit reads which images wait (not those another
+// tab's import holds): a stop would drop them, so it shows them instead, to
+// import or discard, and Proteia keeps running. One that cannot be read
+// (Proteia stopped, say) is left to the quit to say.
 $("quit").addEventListener("click", async () => {
   if (quitting || exporting) {
     return;
@@ -2395,14 +3019,33 @@ $("quit").addEventListener("click", async () => {
   if (state.project) {
     renderExport(state.project);
   }
+  const workspace = await readWorkspace().catch(() => null);
+  const waiting = workspace
+    ? workspace.handoffs.filter(
+        (handoff) => handoff.kind === "images" && !handoff.claimed && !finished.has(handoff.id),
+      )
+    : [];
+  if (waiting.length) {
+    quitting = false;
+    renderQuit();
+    if (state.project) {
+      renderExport(state.project);
+    }
+    const found = takeListing(workspace, { show: "asked" });
+    importDialog.say(WAITING_AT_QUIT);
+    showStatus([WAITING_AT_QUIT, found].filter(Boolean).join(" "));
+    return;
+  }
   try {
     await request("POST", "/api/quit");
     showStatus("Proteia has stopped. You can close this tab.");
     $("workspace").hidden = true;
     $("quit").hidden = true;
+    $("diagnostics").hidden = true;
     $("export").hidden = true;
     $("undo").hidden = true;
     $("redo").hidden = true;
+    renderWaiting();
   } catch (error) {
     quitting = false;
     if (error instanceof ApiError && error.status === 401) {
@@ -2417,6 +3060,51 @@ $("quit").addEventListener("click", async () => {
   }
 });
 
+// --- The notice that the projects folder is synced (#139) ---
+
+// Once per user: when the projects folder lies in a folder a sync service
+// uploads, the notice says so, and how to change it. Closed however it is
+// (OK, Escape), it is dismissed for good: the server records that in the
+// per-user state folder, not in a project. It names the service only; the
+// Projects dialog shows where projects are saved. Gives true once it is
+// closed, or false at once when there is none to show. Shown at start before
+// the Import or Projects dialog, never with one (start): two modal dialogs
+// opened without a click close together on one Escape, which would leave a
+// page with no project and no dialog to open one.
+async function showSyncNotice() {
+  const notices = await request("GET", "/api/notices", { anyProject: true, answer: true });
+  const notice = notices.cloud_sync;
+  if (!notice) {
+    return false;
+  }
+  for (const name of document.querySelectorAll(".sync-service")) {
+    name.textContent = notice.service;
+  }
+  const dialog = $("sync-notice");
+  const closed = new Promise((resolve) => {
+    dialog.addEventListener(
+      "close",
+      () => {
+        request("POST", "/api/notices/cloud_sync/dismiss", { anyProject: true }).catch((error) => {
+          if (!saidElsewhere(error)) {
+            showStatus(
+              `Proteia could not remember that the notice about ${notice.service} was read,` +
+                ` so it shows it again at the next start: ${error.message}`,
+            );
+          }
+        });
+        resolve();
+      },
+      { once: true },
+    );
+  });
+  dialog.showModal();
+  await closed;
+  return true;
+}
+
+$("sync-notice-ok").addEventListener("click", () => $("sync-notice").close());
+
 // --- Start ---
 
 async function start() {
@@ -2424,18 +3112,35 @@ async function start() {
     showStatus(NEEDS_LAUNCH);
     return;
   }
+  // The project open, if one is, then the images waiting on top of it
+  // (takeListing: the first in the Import dialog); with neither, the Projects
+  // dialog. The notice that the projects folder is synced comes before either
+  // dialog, over the project open if one is, and is closed first
+  // (showSyncNotice); one that cannot be asked for now is asked for at the
+  // next start. No check takes a listing while it is up (not started), and
+  // once it is closed the page checks (checkOpening): what was listed before
+  // it may have changed meanwhile.
   try {
-    const listing = await call("GET", "/api/projects");
+    const workspace = await readWorkspace();
     $("quit").hidden = false;
+    $("diagnostics").hidden = false;
     showStatus("");
-    if (listing.open) {
+    if (workspace.open) {
       applyAnswer(await call("GET", "/api/project"));
-    } else {
-      await showProjects();
+    }
+    const noticed = await showSyncNotice().catch(() => false);
+    started = true;
+    if (noticed) {
+      await checkOpening();
+      return;
+    }
+    const found = takeListing(workspace);
+    if (found) {
+      showStatus(found);
     }
   } catch (error) {
     if (!(error instanceof ApiError && error.status === 401)) {
-      showStatus("Proteia is not responding. Start it again to reopen this page.");
+      showStatus(NOT_RESPONDING);
     }
   }
 }

@@ -22,7 +22,7 @@ from conftest import (
     synthetic_blot,
     write_tiff,
 )
-from proteia.core import analyze, quantify, rowdetect
+from proteia.core import analyze, ladders, mwcal, quantify, rowdetect
 from proteia.core import operations as ops
 from proteia.core.analyze import ReduceMethod, StatisticsSetting
 from proteia.core.export import CHART_PNG_DPI, LANE_TABLE_DECIMALS, LANE_TABLE_RATIO_DECIMALS
@@ -239,7 +239,48 @@ def test_settings_are_the_code_constants():
         "lane_table_ratio_decimals": LANE_TABLE_RATIO_DECIMALS,
         "lane_table_first_lane": 1,  # the lane column numbers lanes as the app does
         "chart_png_dpi": CHART_PNG_DPI,
-        "detect_row": rowdetect.settings(),  # every row-box detection constant
+        "detect_row": {
+            **rowdetect.settings(),  # every row-box detection constant
+            # How the row commit chooses the saturation level for an image (#121).
+            "saturated_at": (
+                "quantify.saturation_level: the detector limit where the exact over-exposure"
+                " check runs (clipped_pixels_threshold), else that limit moved in by"
+                " possibly_clipped's near_limit_levels (a lossy, colour or CMYK-converted"
+                " image); none for an image of unknown bit depth (float), and then no band"
+                " is called hollow (hollow_band)"
+            ),
+        },
+        # How molecular weights are calibrated and checked (#58), with the ladder
+        # presets' version.
+        "mw": {
+            **mwcal.settings(),
+            "check": {
+                "apparent_mw": "the image's calibration at the box's centre, padding included",
+                "deviation": "apparent / expected - 1",
+                "passes": "(1 - tolerance) * expected <= apparent <= (1 + tolerance) * expected",
+                "default_tolerance": 0.1,
+                "count_window": (
+                    "the box's centre +/- log10(1 + tolerance) decades on the image's"
+                    " calibration there; the row box's rows without a curve"
+                ),
+                "count": (
+                    "the band, and each other peak of the lane in the window that reaches the"
+                    " detector's second_share of the lane's peak and is as wide as a band;"
+                    " tops side by side in one band count once"
+                ),
+                "count_passes": "at most the expected band count",
+                "tilt": (
+                    "per protein with tilt_min_lanes detector boxes nobody edited, the"
+                    " least-squares slope across the lanes of each box centre's offset from"
+                    " the protein line at its expected MW where the calibration reaches it"
+                    " (else the boxes' median apparent MW); the median slope over the lanes'"
+                    " span, as an MW drift at the middle lane"
+                ),
+                "tilt_warn": 0.05,
+                "tilt_min_lanes": 4,
+            },
+            "presets_version": ladders.PRESETS_VERSION,
+        },
         "statistics": {
             "alpha": 0.05,
             "dunnett_rng_seed": 0,

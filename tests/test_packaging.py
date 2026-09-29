@@ -24,7 +24,7 @@ import pytest
 import proteia
 from proteia import selftest
 from proteia.core import record
-from proteia.web import launch, server
+from proteia.web import launch, logs, server
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = ROOT / "packaging" / "windows"
@@ -258,6 +258,7 @@ def test_an_uninstall_deletes_only_the_launcher_files():
     deleted = re.findall(r"DeleteFile\(Folder \+ '\\' \+ (\w+)\);", ISS)
     assert sorted(deleted) == ["InstanceFileName", "LockFileName", "RedirectFileName"]
     assert "[UninstallDelete]" not in ISS  # nothing else of the state folder goes
+    assert "DelTree" not in ISS  # the session log's folder among it
     assert "RemoveDir(Folder)" in ISS  # which removes it only when empty
     code = [line.lower() for line in ISS.splitlines() if not line.startswith(";")]
     assert not [line for line in code if "userdocs" in line or "documents" in line]
@@ -884,6 +885,41 @@ def test_the_stand_in_browser_records_the_address_and_never_fails(tmp_path):
     assert smoke.main([smoke.STAND_IN_FLAG, str(log), "file:///x/open-proteia.html"]) == 0
     assert log.read_text(encoding="utf-8") == "file:///x/open-proteia.html\n"
     assert smoke.main([smoke.STAND_IN_FLAG, str(tmp_path / "no" / "such" / "log"), "u"]) == 0
+
+
+def test_the_launch_check_reads_the_session_log_the_launcher_writes(tmp_path, monkeypatch):
+    assert (smoke.LOG_DIR, smoke.LOG_FILE) == (logs.LOG_DIR, logs.LOG_FILE)
+    state = tmp_path / "state µ"
+    monkeypatch.setattr(launch, "state_dir", lambda: state)
+    token = "t" * 43
+
+    class Served:  # the first launch, which serves until Quit
+        port = 1234
+        redirect_path = state / launch.REDIRECT_FILE
+        taken = 0
+        unread = ()
+
+        def serve(self) -> None:
+            pass
+
+    monkeypatch.setattr(launch, "start", lambda **kwargs: Served())
+    assert launch.main([]) == 0
+    # the second opens the first
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
+    assert launch.main([]) == 0
+    assert [path.name for path in state.iterdir()] == [smoke.LOG_DIR]
+    assert smoke.session_log_problems(state, token, sessions=2) == []
+    assert smoke.session_log_problems(state, token, sessions=3) == [
+        "the session log records 'session started' 2 times, not 3",
+        "the session log records 'session ended' 2 times, not 3",
+    ]
+    with (state / smoke.LOG_DIR / smoke.LOG_FILE).open("a", encoding="utf-8") as f:
+        f.write(f"#token={token}\n")
+    assert smoke.session_log_problems(state, token, sessions=2) == [
+        "the session log holds the access token"
+    ]
+    [missing] = smoke.session_log_problems(tmp_path / "no state", token, sessions=2)
+    assert missing.startswith("the session log cannot be read: FileNotFoundError")
 
 
 def test_a_launch_gets_a_restricted_environment(tmp_path):

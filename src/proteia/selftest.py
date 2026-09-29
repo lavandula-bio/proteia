@@ -10,10 +10,11 @@ its ``numbers`` with an unfrozen run (``packaging/windows/build.py``).
 
 It writes only in the temporary folder (and where the libraries keep their
 caches, such as matplotlib's font list): no project in ``Documents/Proteia``, no
-file in the per-user state folder, no browser (the launcher is given an opener
-that only records the address), and no connection but to its own loopback
-port. The names it gives folders, projects and files include µ, α and β, as
-users' names may.
+file in the per-user state folder, no session log (:mod:`proteia.web.logs`: the
+launcher runs the self-test before it would set one up), no browser (the
+launcher is given an opener that only records the address), and no connection
+but to its own loopback port. The names it gives folders, projects and files
+include µ, α and β, as users' names may.
 
 The steps, each run even when an earlier one failed:
 
@@ -119,6 +120,7 @@ MODULES: Final = (
     "proteia.web.api",
     "proteia.web.charts",
     "proteia.web.launch",
+    "proteia.web.logs",
     "proteia.web.projects",
     "proteia.web.results_view",
     "proteia.web.sample_project",
@@ -410,8 +412,8 @@ def _web_app(folder: Path, report: Report) -> None:
     state = folder / "state α"
     workspace = api.Workspace(root, reveal=revealed.append)
     instance = launch.start(folder=state, opener=opened.append, workspace=workspace)
-    check(instance is not None, "another instance holds the lock in a new folder")
-    assert instance is not None
+    check(isinstance(instance, launch.Instance), "another instance holds the lock in a new folder")
+    assert isinstance(instance, launch.Instance)
     thread = threading.Thread(target=instance.serve, name="proteia self-test", daemon=True)
     thread.start()
     try:
@@ -440,7 +442,9 @@ def _web_checks(client: _Client, report: Report) -> None:
     from proteia.web.launch import InstanceInfo, probe
 
     status = client.json("GET", "/api/status")
-    check(status == {"app": "proteia", "version": proteia.__version__}, f"status {status}")
+    # The fields that name the app; the status may carry others (``handoff``).
+    named = {key: status.get(key) for key in ("app", "version")}
+    check(named == {"app": "proteia", "version": proteia.__version__}, f"status {status}")
     client.request("GET", "/api/status", token=False, expect=401)
     check(probe(InstanceInfo(0, client.port, client.token)), "the launcher's probe failed")
     shell, kind = client.request("GET", "/", token=False)

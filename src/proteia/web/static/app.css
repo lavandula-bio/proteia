@@ -476,6 +476,12 @@ button:disabled {
   font-weight: 600;
 }
 
+/* Away from a ruler in the image's left half (#58): top right. */
+.view-hint.away {
+  right: 0.75rem;
+  left: auto;
+}
+
 .view-tools {
   position: absolute;
   right: 0.75rem;
@@ -508,6 +514,172 @@ button:disabled {
 
 .lane-picker p {
   margin: 0 0 0.4rem;
+}
+
+/* --- Molecular weight (#58): the ladder, the ruler, the marks --- */
+
+/* While a pick tool is armed, a click picks: a cell cursor, not the crosshair
+   that places a box. Over the ruler or a mark, what a drag there does. */
+.view.picking {
+  cursor: cell;
+}
+
+.view[data-over="body"] {
+  cursor: move;
+}
+
+.view[data-over="grip"],
+.view[data-over="tick"],
+.view[data-over="mark"] {
+  cursor: ns-resize;
+}
+
+.cal-tools {
+  flex-wrap: wrap;
+  margin: 0.4rem 0;
+}
+
+/* An armed tool (Find ladder, Mark ladder bands) reads as pressed: filled and
+   outlined, not told by a hue alone. */
+.cal-tools button[aria-pressed="true"] {
+  border-color: Highlight;
+  background: var(--chosen);
+  color: CanvasText;
+  font-weight: 600;
+}
+
+.cal-draft .subhead {
+  margin-top: 0.2rem;
+  font-weight: 600;
+}
+
+.cal-ticks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin: 0.3rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cal-ticks button {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.15rem 0.5rem;
+  text-align: left;
+}
+
+.cal-ticks button:focus-visible {
+  outline: 2px solid Highlight;
+  outline-offset: 1px;
+}
+
+/* A predicted tick: dashed, like its hollow tick on the image. */
+.cal-ticks button.hollow {
+  border-style: dashed;
+  background: transparent;
+}
+
+.cal-tick-mw {
+  min-width: 4.5rem;
+  font-weight: 600;
+}
+
+.cal-ticks .hollow .cal-tick-mw {
+  font-weight: 400;
+}
+
+.cal-tick-state {
+  font-size: 0.85rem;
+}
+
+.cal-fit {
+  margin: 0.4rem 0;
+}
+
+.cal-marks summary {
+  cursor: pointer;
+}
+
+.cal-points {
+  margin: 0.3rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cal-points li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-bottom: 0.2rem;
+}
+
+.cal-points button {
+  flex: none;
+}
+
+.cal-points .cal-points-head {
+  margin-top: 0.3rem;
+  color: var(--muted);
+}
+
+/* The popup beside a tick or a band clicked: which MW it is. */
+.cal-menu {
+  position: absolute;
+  z-index: 2;
+  max-width: 20rem;
+  padding: 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: Canvas;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.cal-menu p {
+  margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
+}
+
+.cal-menu-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 0.4rem;
+}
+
+.cal-menu-choices button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 3.2rem;
+  padding: 0.2rem 0.5rem;
+}
+
+.cal-menu-choices button[aria-pressed="true"] {
+  border-color: Highlight;
+  background: var(--chosen);
+  font-weight: 600;
+}
+
+/* The MW the marks already made put there: offered first. */
+.cal-menu-choices button.proposed {
+  outline: 2px dashed Highlight;
+  outline-offset: 1px;
+}
+
+.cal-menu-other {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.4rem;
+}
+
+.cal-menu-other input {
+  width: 4.5rem;
 }
 
 #lane-picker-buttons {
@@ -551,12 +723,209 @@ button:disabled {
   flex: 1 1 12rem;
 }
 
+.projects-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+}
+
+.diagnostics-dialog {
+  width: min(38rem, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.diagnostics-dialog h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.diagnostics-summary {
+  margin: 0.3rem 0 0.5rem;
+  padding-left: 1.2rem;
+}
+
+.diagnostics-summary li,
+.diagnostics-dialog p {
+  overflow-wrap: anywhere;
+}
+
+/* Every file listed, however many: the list scrolls, the dialog keeps its size. */
+.diagnostics-files {
+  max-height: 11rem;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.diagnostics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.diagnostics-table th {
+  position: sticky;
+  top: 0;
+  background: Canvas;
+  text-align: left;
+  font-weight: 600;
+}
+
+.diagnostics-table th,
+.diagnostics-table td {
+  padding: 0.15rem 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-table .size {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.diagnostics-actions {
+  justify-content: flex-end;
+  margin-top: 0.6rem;
+}
+
+.sync-notice {
+  width: min(34rem, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.sync-notice h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+}
+
+.sync-notice-actions {
+  justify-content: flex-end;
+}
+
 .error {
   color: var(--error);
 }
 
 .group .error {
   margin: 0.3rem 0 0;
+}
+
+/* "N images waiting…": images handed to Proteia, not shown in the Import
+   dialog; outlined so it is seen among the header's buttons. */
+.waiting {
+  border-color: Highlight;
+  font-weight: 600;
+}
+
+.projects-dialog .waiting {
+  margin-bottom: 0.6rem;
+}
+
+/* The Import dialog: images handed to Proteia, one row per image with its
+   three choices side by side where the width allows, stacked where not. The
+   dialog scrolls if it must; its buttons stay at the end. */
+.handoff-dialog {
+  width: min(46rem, 94vw);
+  max-height: 94dvh;
+  padding: 0.75rem 1rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.handoff-dialog[aria-busy="true"] button {
+  cursor: progress;
+}
+
+.handoff-dialog h2 {
+  margin: 0 0 0.3rem;
+  font-size: 1.1rem;
+}
+
+.handoff-dialog h3 {
+  margin: 0.6rem 0 0.2rem;
+  font-size: 0.95rem;
+}
+
+.handoff-dialog p {
+  margin: 0.3rem 0;
+  overflow-wrap: anywhere;
+}
+
+.handoff-dialog p:empty {
+  margin: 0;
+}
+
+.handoff-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.handoff-set-all {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.6rem;
+  margin: 0.5rem 0;
+}
+
+.handoff-files {
+  list-style: none;
+  margin: 0.4rem 0;
+  padding: 0;
+}
+
+.handoff-file {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0 0.75rem;
+  min-width: 0;
+  margin: 0 0 0.5rem;
+  padding: 0.2rem 0.6rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.handoff-file legend {
+  padding: 0 0.3rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.handoff-file legend .hint {
+  font-weight: 400;
+}
+
+.handoff-file .field {
+  margin: 0.2rem 0;
+}
+
+/* Whether the bands are dark or light, still to choose: marked by its border
+   and weight, not by a hue alone. */
+.handoff-polarity:invalid {
+  border: 2px solid var(--warn);
+  font-weight: 600;
+}
+
+.handoff-refused .notices li {
+  overflow-wrap: anywhere;
+}
+
+.handoff-actions {
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 0.75rem;
+}
+
+.handoff-actions .hint {
+  flex: 1 1 12rem;
+}
+
+#handoff-import {
+  font-weight: 600;
 }
 
 /* Read by screen readers only. */

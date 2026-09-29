@@ -27,11 +27,12 @@ every band, to check the lane tables an export writes against. It lies outside
 ``exports/``, under its own name, so it is never taken for an export, and it is
 not part of the project: no operation logs it and undo leaves it. If any step
 fails, the new project's folder is removed with everything written into it,
-and the error propagates. If some of it cannot be removed (a file in it held
-open by another program, which Windows refuses to delete), the folder stays,
-without a ``project.json``: the Projects dialog does not list it, but its name
-is taken. :class:`SampleFolderLeftError` then says so, naming the folder, in
-place of the error.
+and the error propagates (:func:`~proteia.web.projects.create_set_up`). If
+some of it cannot be removed (a file in it held open by another program, which
+Windows refuses to delete), the folder stays, without a ``project.json``: the
+Projects dialog does not list it, but its name is taken.
+:class:`~proteia.web.projects.FolderLeftError` then says so, naming the folder,
+in place of the error.
 
 A hook for the first-use tour to come: ``POST /api/projects/sample`` answers
 :func:`sample_payload` as ``sample``: each protein's row, top to bottom, as a
@@ -41,7 +42,6 @@ drag over it that boxes its eight bands.
 from __future__ import annotations
 
 import io
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -59,11 +59,6 @@ SAMPLE_NAME: Final = "Sample blot"
 # How far a row's drag reaches above the row in the end lanes, and below it in
 # the middle lanes (which ran SMILE_PX further), px.
 ROW_MARGIN_PX: Final = 25
-
-
-class SampleFolderLeftError(OSError):
-    """The sample project's setup failed, and its folder could not all be
-    removed after: it is left in the projects root, unfinished."""
 
 
 @dataclass(frozen=True)
@@ -108,26 +103,19 @@ def sample_payload(project: Project) -> dict[str, JsonValue]:
 
 def create_sample_project(root: Path, *, clock: Clock = utc_now) -> ProjectSession:
     """Create the sample project in ``root`` and open it (see the module
-    docstring); saved before it is answered, so an ``OSError`` or
+    docstring), through :func:`~proteia.web.projects.create_set_up`: saved
+    before it is answered, so an ``OSError`` or
     :class:`~proteia.core.storage.ProjectError` while saving propagates too,
     after its folder is removed; or, if the folder cannot all be removed,
-    :class:`SampleFolderLeftError` in place of any error."""
+    :class:`~proteia.web.projects.FolderLeftError` in place of any error."""
     files = samples.sample_files()
-    session = projects.create_project(root, projects.free_name(root, SAMPLE_NAME), clock=clock)
-    try:
-        _set_up(session, files)
-        if session.dirty:  # an autosave failed: fail now, not when it is next edited
-            ops.save(session)
-    except BaseException as exc:
-        shutil.rmtree(session.folder, ignore_errors=True)
-        if isinstance(exc, Exception) and session.folder.exists():
-            raise SampleFolderLeftError(
-                f"the sample project could not be set up ({exc}), and its unfinished folder"
-                f" {session.folder.name!r} could not be removed: delete it from the projects"
-                " folder"
-            ) from exc
-        raise
-    return session
+    return projects.create_set_up(
+        root,
+        projects.free_name(root, SAMPLE_NAME),
+        lambda session: _set_up(session, files),
+        clock=clock,
+        what="the sample project",
+    )
 
 
 def _set_up(session: ProjectSession, files: dict[str, bytes]) -> None:

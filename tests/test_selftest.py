@@ -9,13 +9,26 @@ import pytest
 
 import proteia
 from proteia import selftest
-from proteia.web import launch
+from proteia.web import launch, logs
+
+
+def _no_state_folder_and_no_session_log(patch: pytest.MonkeyPatch) -> None:
+    """Make any use of the per-user state folder, or a session log set up (in
+    it or anywhere), fail: the self-test writes only in its temporary folder."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the self-test used the state folder or set up a session log")
+
+    patch.setattr(launch, "state_dir", refuse)
+    patch.setattr(logs, "setup", refuse)
 
 
 @pytest.fixture(scope="module")
 def report(tmp_path_factory) -> dict:
     """One run of every step, shared by the tests that only read it."""
-    return selftest.run(tmp_path_factory.mktemp("self test"))
+    with pytest.MonkeyPatch.context() as patch:
+        _no_state_folder_and_no_session_log(patch)
+        return selftest.run(tmp_path_factory.mktemp("self test"))
 
 
 def test_every_step_passes_here(report):
@@ -61,6 +74,14 @@ def test_the_web_step_loads_every_static_file_the_page_needs(report):
     assert served <= {f"/static/{path.name}" for path in STATIC_DIR.iterdir()}
 
 
+def test_the_web_step_names_another_instance_that_answered_in_its_folder(tmp_path, monkeypatch):
+    _no_state_folder_and_no_session_log(monkeypatch)
+    # A launch that found an instance answering opened it: it started none.
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
+    with pytest.raises(selftest.CheckError, match="another instance holds the lock"):
+        selftest._web_app(tmp_path, {})
+
+
 def test_a_failing_step_is_named_and_the_others_still_run(tmp_path, monkeypatch):
     def broken(folder, report):
         raise selftest.CheckError("left out of the bundle")
@@ -99,5 +120,6 @@ def test_the_console_command_runs_it_with_self_test(monkeypatch):
     calls = []
     monkeypatch.setattr(selftest, "main", lambda argv: calls.append(argv) or 7)
     monkeypatch.setattr(launch, "start", lambda: pytest.fail("the app must not start"))
+    _no_state_folder_and_no_session_log(monkeypatch)
     assert launch.main(["--self-test", "--json", "r.json"]) == 7
     assert calls == [["--json", "r.json"]]
