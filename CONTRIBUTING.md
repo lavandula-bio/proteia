@@ -94,5 +94,6 @@ Apache License 2.0. New source files should carry the header:
 # SPDX-License-Identifier: Apache-2.0
 ```
 
-Prefer permissively licensed dependencies (MIT/BSD/Apache/LGPL); avoid
-GPL/AGPL or non-commercial licenses.
+Prefer permissively licensed dependencies (MIT, BSD, Apache-2.0, ISC). Ask
+before adding an LGPL, MPL or dual-licensed one; avoid GPL, AGPL, SSPL and
+non-commercial licenses.
