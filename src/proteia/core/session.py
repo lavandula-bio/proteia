@@ -17,7 +17,9 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   change and its entry together; refusals and no-ops append nothing. Times come
   from the session's injectable clock (UTC; the offline system clock by default).
   The one entry made elsewhere is a ``migrate`` entry, appended as a file of an
-  older schema loads; :func:`open_project` then autosaves it like a change.
+  older schema loads, once the file is kept in a backup beside it (#140:
+  :func:`~proteia.core.storage.keep_backup`, which the entry names);
+  :func:`open_project` then autosaves it like a change.
   Every entry is also logged (Python's :mod:`logging`, at INFO: the session log
   of #137), with its params as the entry holds them and the project named by
   its folder's name, never its path; and so are opening, reading again and
@@ -37,13 +39,19 @@ works on; create one with :func:`new_project` or :func:`open_project`.
 * Files in ``images/`` that no project references (an image removed, an import
   that was never saved, a temp file left by a crash) are deleted after a
   successful save and before an import, but only if the ``project.json`` on
-  disk does not reference them, no state in the undo history does, and they
-  carry Proteia's ``img-N`` name: a saved project never points at a missing
-  file, an undo never needs one, and a stray user file is never deleted. So a
-  removed or undone image's file stays while the history can bring it back, and
-  goes at the first save or import after no state references it: once the undo
-  limit drops the last such state, a new change clears the redo that held it,
-  or the session is closed or reloads; or else at the next session's first save.
+  disk does not reference them, no state in the undo history does, no backup
+  of an older ``project.json`` names them with an id below ``next_id``
+  (:func:`~proteia.core.storage.backup_references`; while one cannot be read,
+  it is taken to name every such file), and they carry Proteia's ``img-N``
+  name: a saved project never points at a missing file, an undo never needs
+  one, a restored backup finds its images even if a migration lost one (they
+  hold ids below ``next_id``, which a migration keeps and the project only
+  raises, so no backup keeps the file of the id an import takes next), and a
+  stray user file is never deleted. So a removed or undone image's file stays
+  while the history can bring it back, and goes at the first save or import
+  after no state references it: once the undo limit drops the last such state,
+  a new change clears the redo that held it, or the session is closed or
+  reloads; or else at the next session's first save.
 
 Refusals raise :class:`OperationError`, whose :class:`ErrorCode` is stable for
 clients (e.g. to map onto HTTP statuses).
@@ -103,6 +111,9 @@ _ORPHAN_NAME = re.compile(
     rf"^\.?img-[1-9][0-9]{{0,8}}\.(?:{_SUFFIXES})(?:\.[a-z0-9_]+\.(?:part|tmp))?$",
     re.IGNORECASE,
 )
+# Of those, a stored image's file (no temp file), with its id's number: the only
+# orphans a backup of an older project.json may keep.
+_IMAGE_FILE = re.compile(rf"^img-([1-9][0-9]{{0,8}})\.(?:{_SUFFIXES})$", re.IGNORECASE)
 
 
 class ErrorCode(StrEnum):
@@ -147,6 +158,14 @@ class ErrorCode(StrEnum):
     LEFTOVER_FILE = "leftover_file"  # an orphan holding the next image id could not be deleted
     NOTHING_TO_UNDO = "nothing_to_undo"
     NOTHING_TO_REDO = "nothing_to_redo"
+    # Molecular-weight calibration (#58). A calibration point would be out of
+    # order on its ladder (or share another's position there).
+    CALIBRATION_ORDER = "calibration_order"
+    DUPLICATE_MW = "duplicate_mw"  # that ladder already has a point at this MW
+    # The right ladder would not lie right of the left one, or a strip edge (or
+    # a point with no x) would share a register group with a right ladder.
+    LADDER_SIDES = "ladder_sides"
+    MARKER_SIZE_MISMATCH = "marker_size_mismatch"  # a marker and its image differ in size
 
 
 class OperationError(ValueError):
@@ -210,6 +229,19 @@ def _log_entry(folder: Path, entry: LogEntry) -> None:
     if _log.isEnabledFor(logging.INFO):
         params = json.dumps(entry.params, ensure_ascii=False)
         _log.info("committed #%d %s in %r: %s", entry.seq, entry.action, folder.name, params)
+
+
+def _log_migrated(folder: Path, entry: LogEntry) -> None:
+    """Log a ``migrate`` entry: the backup it names first, then the entry."""
+    params = entry.params
+    _log.info(
+        "in %r: kept its schema-%s %s as %r before migrating it",
+        folder.name,
+        params.get("from_schema"),
+        storage.PROJECT_FILE,
+        params.get("backup"),
+    )
+    _log_entry(folder, entry)
 
 
 def _log_opened(folder: Path, project: Project, *, again: bool = False) -> None:
@@ -749,14 +781,17 @@ class ProjectSession:
         project writes, as when it was replaced outside Proteia (a synced or
         restored copy); return whether it did. The session then holds what
         :func:`open_project` reads from the folder (a file of an older schema
-        is migrated and saved, as there), with no cached pixels and no undo
-        history, whose states led to a project the file no longer holds; the
-        files only that history kept go at the next save or import.
+        is migrated and saved, as there, once it is kept in a backup), with no
+        cached pixels and no undo history, whose states led to a project the
+        file no longer holds; the files only that history kept go at the next
+        save or import.
 
         With unsaved changes (``dirty``) the file is not read: it is older than
         the committed project, not changed outside Proteia. ``OSError`` (a
-        missing file too) and the :class:`~proteia.core.storage.ProjectError`
-        family propagate, with the session as it was.
+        missing file too, or a backup of a file of an older schema that cannot
+        be kept: :class:`~proteia.core.storage.BackupError`) and the
+        :class:`~proteia.core.storage.ProjectError` family propagate, with the
+        session as it was.
         """
         with self.lock:
             if self.dirty:
@@ -764,7 +799,7 @@ class ProjectSession:
             saved = (self._folder / storage.PROJECT_FILE).read_bytes()
             if saved == storage.project_to_json(self._project):
                 return False
-            project, migrated = storage.read_project(self._folder, clock=self.clock)
+            project, migrated = storage.read_project(self._folder, clock=self.clock, backup=True)
             self._project = project
             self._saved_files = _referenced_files(project)
             self._pixels = {}
@@ -773,7 +808,7 @@ class ProjectSession:
             self.last_action = None
             _log_opened(self._folder, project, again=True)
             if migrated:
-                _log_entry(self._folder, project.log[-1])
+                _log_migrated(self._folder, project.log[-1])
                 self._changed("migrate")
             return True
 
@@ -799,16 +834,38 @@ class ProjectSession:
 
     def _remove_orphans(self) -> None:
         """Delete unreferenced Proteia files in ``images/`` that neither the saved
-        ``project.json`` nor a state in the undo history references (best effort:
-        a file held open on Windows stays). Names compare ignoring case, as
-        Windows does."""
+        ``project.json``, nor a state in the undo history, nor a backup of an
+        older ``project.json`` references (best effort: a file held open on
+        Windows stays). Names compare ignoring case, as Windows does.
+
+        A backup keeps only an image file whose id is below ``next_id``: a
+        backup's images hold no other id (a migration keeps ``next_id``, and the
+        project only raises it). So the file of the id an import takes next is
+        never kept for a backup, even where a backup's text names it (as an
+        original name) or a backup cannot be read, which keeps every image file
+        below ``next_id``, as what it names is unknown."""
         referenced = self._saved_files | _referenced_files(self._project) | self._retained_files()
         keep = {name.lower() for name in referenced}
-        for path in storage.orphan_files(self._project, self._folder):
-            if path.name.lower() in keep or not _ORPHAN_NAME.match(path.name):
-                continue
-            with contextlib.suppress(OSError):
-                path.unlink()
+        orphans = [
+            path
+            for path in storage.orphan_files(self._project, self._folder)
+            if path.name.lower() not in keep and _ORPHAN_NAME.match(path.name)
+        ]
+        next_id = self._project.next_id
+        below = [
+            path
+            for path in orphans
+            if (match := _IMAGE_FILE.match(path.name)) and int(match[1]) < next_id
+        ]
+        spared: set[Path] = set()
+        if below:  # the backups are read only then: most saves leave no orphan
+            backed_up = storage.backup_references(self._folder)
+            named = None if backed_up is None else {name.lower() for name in backed_up}
+            spared = {path for path in below if named is None or path.name.lower() in named}
+        for path in orphans:
+            if path not in spared:
+                with contextlib.suppress(OSError):
+                    path.unlink()
 
 
 def save_to_folder(session: ProjectSession) -> None:
@@ -857,21 +914,25 @@ def open_project(
 
     ``FileNotFoundError`` and the :class:`~proteia.core.storage.ProjectError` family
     propagate. Opening deletes nothing, rewrites nothing, reads no pixels and
-    logs nothing, except for a file of an older schema. That is migrated with a
-    ``migrate`` entry timed by ``clock`` (:func:`~proteia.core.storage.read_project`):
+    logs nothing, except for a file of an older schema. That is first kept, as
+    it was read, in a backup beside it (:func:`~proteia.core.storage.keep_backup`,
+    which never replaces a file), then migrated with a ``migrate`` entry timed
+    by ``clock`` that names the backup (:func:`~proteia.core.storage.read_project`):
     a logged change like any other, so the session starts dirty and runs the
-    autosave hook at once (whose save also deletes orphans; a failed save is
-    recorded in ``save_error``, as after any change). A record exported before
-    any edit then cites the log ``project.json`` holds. The undo history begins
-    from the migrated state.
+    autosave hook at once (whose save also deletes orphans, never the file of
+    an image a backup holds; a failed save is recorded in ``save_error``, as after any
+    change). A backup that cannot be written refuses the open
+    (:class:`~proteia.core.storage.BackupError`, an ``OSError``), and nothing is
+    written. A record exported before any edit then cites the log
+    ``project.json`` holds. The undo history begins from the migrated state.
     """
-    project, migrated = storage.read_project(folder, clock=clock)
+    project, migrated = storage.read_project(folder, clock=clock, backup=True)
     session = ProjectSession(
         project, folder, autosave=autosave, saved_files=_referenced_files(project), clock=clock
     )
     _log_opened(session.folder, project)
     if migrated:
         with session.lock:
-            _log_entry(session.folder, project.log[-1])
+            _log_migrated(session.folder, project.log[-1])
             session._changed("migrate")
     return session

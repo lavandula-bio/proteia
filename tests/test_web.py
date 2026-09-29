@@ -19,18 +19,20 @@ import stat
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import get_args
+from typing import BinaryIO, get_args
 
 import pytest
 
 import proteia
+from proteia import samples
+from proteia.core import mwcal, results, rowdetect
 from proteia.core import operations as ops
-from proteia.core import results, rowdetect
 from proteia.core.model import ImageKind, Polarity
-from proteia.web import api, launch, server
+from proteia.web import api, cli, handoff, launch, projects, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
 
 OMIT = object()  # send no Host header
@@ -74,7 +76,7 @@ def wait_until_started(instance: launch.Instance, thread: threading.Thread | Non
 def running(tmp_path):
     opener = Opener()
     instance = launch.start(folder=tmp_path, opener=opener)
-    assert instance is not None
+    assert isinstance(instance, launch.Instance)
     thread = threading.Thread(target=instance.serve, daemon=True)
     thread.start()
     wait_until_started(instance, thread)
@@ -121,7 +123,7 @@ def names(folder: Path) -> list[str]:
 def test_start_binds_loopback_and_opens_the_redirect_page(tmp_path):
     opener = Opener()
     instance = launch.start(folder=tmp_path, opener=opener)
-    assert instance is not None
+    assert isinstance(instance, launch.Instance)
     try:
         host, port = instance.sock.getsockname()
         assert (host, port) == ("127.0.0.1", instance.port) and port > 0
@@ -202,7 +204,7 @@ def test_files_left_by_a_crashed_instance_are_replaced(tmp_path, leftover):
     (tmp_path / INSTANCE_FILE).write_text(leftover(), encoding="utf-8")
     (tmp_path / REDIRECT_FILE).write_text("old", encoding="utf-8")
     instance = launch.start(folder=tmp_path, opener=Opener())  # the lock is free
-    assert instance is not None
+    assert isinstance(instance, launch.Instance)
     try:
         info = json.loads((tmp_path / INSTANCE_FILE).read_text(encoding="utf-8"))
         assert info["token"] == instance.token
@@ -214,7 +216,7 @@ def test_files_left_by_a_crashed_instance_are_replaced(tmp_path, leftover):
 def test_a_second_launch_opens_the_running_instance(running, tmp_path):
     info = (tmp_path / INSTANCE_FILE).read_bytes()
     opener = Opener()
-    assert launch.start(folder=tmp_path, opener=opener) is None
+    assert launch.start(folder=tmp_path, opener=opener) == launch.Opened()
     assert opener.urls == [(tmp_path / REDIRECT_FILE).as_uri()]
     page = (tmp_path / REDIRECT_FILE).read_text(encoding="utf-8")
     assert launch.app_url(running.port, running.token) in page
@@ -229,7 +231,7 @@ def test_a_second_launch_waits_for_a_starting_instance(running, tmp_path):
     timer.start()
     opener = Opener()
     try:
-        assert launch.start(folder=tmp_path, opener=opener, wait=10) is None
+        assert launch.start(folder=tmp_path, opener=opener, wait=10) == launch.Opened()
     finally:
         timer.join()
     assert opener.urls == [(tmp_path / REDIRECT_FILE).as_uri()]
@@ -259,7 +261,7 @@ def test_a_launch_starts_when_the_waited_for_instance_stops(tmp_path):
         instance = launch.start(folder=tmp_path, opener=opener, wait=10)
     finally:
         timer.join()
-    assert instance is not None
+    assert isinstance(instance, launch.Instance)
     try:
         assert opener.urls == [(tmp_path / REDIRECT_FILE).as_uri()]
         assert launch.InstanceLock.acquire(tmp_path) is None  # the new instance holds it
@@ -323,6 +325,8 @@ class _FakeInstance:
     port = 1234
     redirect_path = Path("µ α β") / "open-proteia.html"
     token = "s" * 43
+    taken = 0
+    unread = ()
 
     def __init__(self) -> None:
         self.served = False
@@ -333,23 +337,23 @@ class _FakeInstance:
 
 def test_main_serves_without_printing_the_token(state, monkeypatch, capsys):
     fake = _FakeInstance()
-    monkeypatch.setattr(launch, "start", lambda: fake)
-    assert launch.main() == 0
+    monkeypatch.setattr(launch, "start", lambda **kwargs: fake)
+    assert launch.main([]) == 0
     assert fake.served
     out = capsys.readouterr().out
     assert "http://127.0.0.1:1234/" in out and fake.token not in out
 
-    monkeypatch.setattr(launch, "start", lambda: None)
-    assert launch.main() == 0
+    monkeypatch.setattr(launch, "start", lambda **kwargs: launch.Opened())
+    assert launch.main([]) == 0
     assert "already running" in capsys.readouterr().out
 
 
 def test_main_reports_an_instance_that_does_not_respond(state, monkeypatch, capsys):
-    def refuse():
+    def refuse(**kwargs):
         raise launch.NotRespondingError("no answer")
 
     monkeypatch.setattr(launch, "start", refuse)
-    assert launch.main() == 1
+    assert launch.main([]) == 1
     console = capsys.readouterr()
     assert "does not respond" in console.out and not console.err  # printed once
     log = (state / "logs" / "proteia.log").read_text(encoding="utf-8")
@@ -359,8 +363,8 @@ def test_main_reports_an_instance_that_does_not_respond(state, monkeypatch, caps
 def test_main_prints_a_non_ascii_path_to_a_narrow_console(state, monkeypatch):
     stdout = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
     monkeypatch.setattr(sys, "stdout", stdout)
-    monkeypatch.setattr(launch, "start", _FakeInstance)
-    assert launch.main() == 0
+    monkeypatch.setattr(launch, "start", lambda **kwargs: _FakeInstance())
+    assert launch.main([]) == 0
     stdout.flush()
     assert b"\\xb5" in stdout.buffer.getvalue()  # the micro sign, escaped
 
@@ -413,6 +417,984 @@ def test_a_server_error_carries_the_security_headers():
     assert headers[b"cache-control"] == b"no-store"
 
 
+# --- Images named on the command line (#57, N3) ---
+
+START = launch.start  # the real one: tests put wrappers of it in its place
+
+
+@pytest.fixture
+def served(tmp_path):
+    """A running instance with its state folder and projects root in ``tmp_path``."""
+    workspace = api.Workspace(tmp_path / "projects", reveal=lambda folder: None)
+    opener = Opener()
+    instance = launch.start(folder=tmp_path / "state", opener=opener, workspace=workspace)
+    thread = threading.Thread(target=instance.serve, daemon=True)
+    thread.start()
+    wait_until_started(instance, thread)
+    yield Running(instance, opener, thread)
+    instance.stop()
+    thread.join(10)
+
+
+def scans(folder: Path, *names: str) -> list[Path]:
+    """Files that pass for images (the launcher never decodes one), each with
+    bytes of its own."""
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = [folder / name for name in names]
+    for path in paths:
+        path.write_bytes(f"pixels of {path.name}".encode())
+    return paths
+
+
+def command(*paths: Path | str) -> cli.CommandLine:
+    return cli.parse([str(path) for path in paths])
+
+
+def waiting(instance: launch.Instance) -> list[list[str]]:
+    """The names of the files in each pending hand-off."""
+    return [[file.name for file in view.files] for view in instance.workspace.inbox.listing()]
+
+
+def staged_bytes(instance: launch.Instance) -> list[bytes]:
+    """What the staging folder holds, each under a name the server made."""
+    folder = instance.workspace.inbox.folder
+    assert folder is not None
+    paths = list(folder.iterdir()) if folder.is_dir() else []
+    assert all(re.fullmatch(r"[0-9a-f]{32}", path.name) for path in paths)
+    return sorted(path.read_bytes() for path in paths)
+
+
+def call(running: Running, method: str, path: str, body: object = None) -> tuple[int, object]:
+    """One request with the token (and a JSON body, if given): the status and the
+    answer's JSON, if any."""
+    conn = http.client.HTTPConnection("127.0.0.1", running.port, timeout=30)
+    headers = {"Authorization": f"Bearer {running.token}"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    try:
+        conn.request(method, path, body=data, headers=headers)
+        response = conn.getresponse()
+        payload = response.read()
+    finally:
+        conn.close()
+    return response.status, json.loads(payload) if payload else None
+
+
+def workspace_of(running: Running) -> dict:
+    status, answer = call(running, "GET", "/api/workspace")
+    assert status == 200 and isinstance(answer, dict)
+    return answer
+
+
+def test_a_first_launch_hands_its_own_files_to_its_page_before_the_browser_opens(tmp_path):
+    blot, marker = scans(tmp_path / "scans µ", "β-actin 10 µM.tif", "marker α.tif")
+    workspace = api.Workspace(tmp_path / "projects", reveal=lambda folder: None)
+    seen: list[list[list[str]]] = []
+
+    def opener(url: str) -> bool:
+        seen.append([[f.name for f in view.files] for view in workspace.inbox.listing()])
+        return True
+
+    instance = launch.start(
+        folder=tmp_path / "state",
+        opener=opener,
+        workspace=workspace,
+        command_line=command(blot, marker, tmp_path / "missing.tif"),
+    )
+    thread = threading.Thread(target=instance.serve, daemon=True)
+    thread.start()
+    try:
+        wait_until_started(instance, thread)
+        assert seen == [[["β-actin 10 µM.tif", "marker α.tif"]]]  # before the browser opened
+        assert instance.taken == 2
+        (listed,) = workspace_of(Running(instance, Opener(), thread))["handoffs"]
+        files = [(file["name"], file["size"]) for file in listed["files"]]
+        assert files == [(path.name, path.stat().st_size) for path in (blot, marker)]
+        assert listed["suggested_name"] == "β-actin 10 µM"
+        assert listed["refused"] == [
+            {"name": "missing.tif", "code": "missing", "message": "no such file or folder"}
+        ]
+        # Nothing is created before the page imports, and nothing is copied.
+        assert not (tmp_path / "projects").exists()
+        assert not (tmp_path / "state" / "incoming").exists()
+    finally:
+        instance.stop()
+        thread.join(10)
+    assert blot.read_bytes() == f"pixels of {blot.name}".encode()
+
+
+def test_a_first_launch_whose_paths_are_all_refused_shows_a_notice(tmp_path):
+    folder = tmp_path / "Blot"
+    folder.mkdir()
+    workspace = api.Workspace(tmp_path / "projects", reveal=lambda folder: None)
+    instance = launch.start(
+        folder=tmp_path / "state",
+        opener=Opener(),
+        workspace=workspace,
+        command_line=command(folder, tmp_path / "photo.bmp"),
+    )
+    try:
+        (view,) = workspace.inbox.listing()
+        assert view.kind == "notice" and view.files == ()
+        assert [(r.name, r.code) for r in view.refused] == [
+            ("Blot", "folder"),
+            ("photo.bmp", "missing"),
+        ]
+        assert instance.taken == 0
+    finally:
+        instance.close()
+
+
+def test_a_second_launch_uploads_its_files_then_opens_a_tab(served, tmp_path, monkeypatch):
+    served.instance.workspace.create("Open µ")
+    before = workspace_of(served)
+    paths = scans(tmp_path / "scans α β", "blot 1 µ.tif", "marker α.png")
+    monkeypatch.chdir(tmp_path / "scans α β")
+    command_line = cli.parse(["blot 1 µ.tif", "marker α.png"])  # resolved here, now
+    monkeypatch.chdir(tmp_path)
+    seen: list[list[list[str]]] = []
+
+    def opener(url: str) -> bool:
+        seen.append(waiting(served.instance))
+        return True
+
+    opened = launch.start(folder=tmp_path / "state", opener=opener, command_line=command_line)
+    assert isinstance(opened, launch.Opened)
+    assert [file.name for file in opened.files] == ["blot 1 µ.tif", "marker α.png"]
+    assert (opened.refused, opened.merged, opened.waiting) == ((), False, 2)
+    assert seen == [[["blot 1 µ.tif", "marker α.png"]]]  # the tab opened after the offer
+    assert staged_bytes(served.instance) == sorted(path.read_bytes() for path in paths)
+    after = workspace_of(served)
+    assert (after["open"], after["open_id"]) == (before["open"], before["open_id"]) == ("Open µ", 1)
+    assert served.opener.urls == [(tmp_path / "state" / REDIRECT_FILE).as_uri()]  # its own
+
+
+def test_a_launch_whose_files_join_a_young_hand_off_opens_no_tab(served, tmp_path):
+    a, b = scans(tmp_path, "a.tif", "b.tif")
+    first, second = Opener(), Opener()
+    state = tmp_path / "state"
+    assert not launch.start(folder=state, opener=first, command_line=command(a)).merged
+    opened = launch.start(folder=state, opener=second, command_line=command(b))
+    assert (opened.merged, opened.waiting) == (True, 2)
+    assert (len(first.urls), second.urls) == (1, [])
+    assert waiting(served.instance) == [["a.tif", "b.tif"]]
+
+
+def _at_once(count: int, run: Callable[[int], object], timeout: float = 60) -> list[object]:
+    """``run(n)`` in ``count`` threads that start together: what each returned
+    (or raised), by ``n``."""
+    barrier = threading.Barrier(count)
+    results: dict[int, object] = {}
+
+    def one(n: int) -> None:
+        barrier.wait()
+        try:
+            results[n] = run(n)
+        except BaseException as exc:
+            results[n] = exc
+
+    threads = [threading.Thread(target=one, args=(n,), daemon=True) for n in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout)
+    assert len(results) == count, "a launch did not end"
+    return [results[n] for n in range(count)]
+
+
+def test_launches_at_once_join_one_hand_off_and_open_one_tab(served, tmp_path):
+    paths = scans(tmp_path / "selection", *(f"blot {n}.tif" for n in range(5)))
+    opener = Opener()
+    results = _at_once(
+        5,
+        lambda n: launch.start(
+            folder=tmp_path / "state", opener=opener, command_line=command(paths[n])
+        ),
+    )
+    assert all(isinstance(result, launch.Opened) for result in results), results
+    assert sorted(result.merged for result in results) == [False, True, True, True, True]
+    assert len(opener.urls) == 1
+    (names,) = waiting(served.instance)
+    assert sorted(names) == [path.name for path in paths]
+
+
+def test_launches_at_once_with_none_running_start_one_instance_and_one_hand_off(tmp_path):
+    # Explorer may run one process per file of a selection opened with Proteia.
+    paths = scans(tmp_path / "selection", *(f"blot {n}.tif" for n in range(4)))
+    workspace = api.Workspace(tmp_path / "projects", reveal=lambda folder: None)
+    opener = Opener()
+    serving: list[tuple[launch.Instance, threading.Thread]] = []
+
+    def run(n: int) -> object:
+        result = launch.start(
+            folder=tmp_path / "state",
+            opener=opener,
+            workspace=workspace,
+            command_line=command(paths[n]),
+        )
+        if isinstance(result, launch.Instance):
+            thread = threading.Thread(target=result.serve, daemon=True)
+            serving.append((result, thread))
+            thread.start()
+        return result
+
+    try:
+        results = _at_once(4, run)
+        listed = [[file.name for file in view.files] for view in workspace.inbox.listing()]
+    finally:
+        for instance, thread in serving:
+            instance.stop()
+            thread.join(10)
+    kinds = sorted(type(result).__name__ for result in results)
+    assert kinds == ["Instance", "Opened", "Opened", "Opened"], results
+    assert all(result.merged for result in results if isinstance(result, launch.Opened))
+    assert len(opener.urls) == 1
+    (names,) = listed
+    assert sorted(names) == [path.name for path in paths]
+
+
+class _Read:
+    """A file as a launch reads it to upload it, counting the bytes read
+    (``read_bytes``). Its first read waits ``pause`` seconds (an upload that takes
+    long), and each later one ``stall`` seconds (a file on a slow network
+    share)."""
+
+    def __init__(self, stream: BinaryIO, *, pause: float = 0.0, stall: float = 0.0) -> None:
+        self._stream = stream
+        self._pause = pause
+        self._stall = stall
+        self._reads = 0
+        self.read_bytes = 0
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def read(self, size: int = -1) -> bytes:
+        wait = self._stall if self._reads else self._pause
+        if wait:
+            time.sleep(wait)
+        self._reads += 1
+        data = self._stream.read(size)
+        self.read_bytes += len(data)
+        return data
+
+    def __enter__(self) -> _Read:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stream.close()
+
+
+def reading(monkeypatch, **waits: dict[str, float]) -> dict[str, _Read]:
+    """Make each file a launch opens a :class:`_Read`, with the waits given by
+    its name (``pause={"b.tif": 2.5}``): the files opened, by name."""
+    opened: dict[str, _Read] = {}
+    plain = cli.ImageFile.open
+
+    def open_read(file: cli.ImageFile) -> _Read:
+        chosen = {kind: by_name.get(file.name, 0.0) for kind, by_name in waits.items()}
+        opened[file.name] = _Read(plain(file), **chosen)
+        return opened[file.name]
+
+    monkeypatch.setattr(cli.ImageFile, "open", open_read)
+    return opened
+
+
+def test_a_file_whose_upload_began_in_the_window_joins_however_long_it_took(
+    served, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(handoff, "MERGE_WINDOW_S", 2.0)
+    a, b = scans(tmp_path, "a.tif", "b.tif")
+    state = tmp_path / "state"
+    assert not launch.start(folder=state, opener=Opener(), command_line=command(a)).merged
+    reading(monkeypatch, pause={"b.tif": 2.5})
+    began = time.monotonic()
+    late = launch.start(folder=state, opener=Opener(), command_line=command(b))
+    assert time.monotonic() - began > 2.0  # offered once the window had passed
+    assert late.merged and waiting(served.instance) == [["a.tif", "b.tif"]]
+
+
+def test_a_second_launch_hands_off_to_an_instance_still_starting(served, tmp_path):
+    path = tmp_path / "state" / INSTANCE_FILE
+    info = path.read_bytes()
+    path.unlink()  # as if the running instance had not written it yet
+    timer = threading.Timer(0.5, path.write_bytes, args=(info,))
+    timer.start()
+    (blot,) = scans(tmp_path, "blot.tif")
+    opener = Opener()
+    try:
+        opened = launch.start(
+            folder=tmp_path / "state", opener=opener, wait=10, command_line=command(blot)
+        )
+    finally:
+        timer.join()
+    assert [file.name for file in opened.files] == ["blot.tif"] and len(opener.urls) == 1
+    assert waiting(served.instance) == [["blot.tif"]]
+
+
+def test_a_launch_hands_nothing_to_an_instance_that_does_not_answer(tmp_path):
+    held = launch.InstanceLock.acquire(tmp_path)
+    info = {"pid": 1, "port": _closed_port(), "token": "x" * 43}
+    (tmp_path / INSTANCE_FILE).write_text(json.dumps(info), encoding="utf-8")
+    (blot,) = scans(tmp_path / "scans", "blot.tif")
+    opener = Opener()
+    try:
+        with pytest.raises(launch.NotRespondingError):
+            launch.start(folder=tmp_path, opener=opener, wait=0.5, command_line=command(blot))
+    finally:
+        held.release()
+    assert opener.urls == [] and not (tmp_path / "incoming").exists()
+
+
+def _older(monkeypatch, version: object = OMIT) -> None:
+    """Make the running instance answer as a Proteia that takes no files (no
+    ``handoff`` in its status), or takes them another way (``handoff`` is
+    ``version``)."""
+    probe = launch.probe
+
+    def older(info: launch.InstanceInfo, **kwargs: float) -> dict | None:
+        status = probe(info, **kwargs)
+        if status is None:
+            return None
+        status = {k: v for k, v in status.items() if k != "handoff"}
+        return status if version is OMIT else {**status, "handoff": version}
+
+    monkeypatch.setattr(launch, "probe", older)
+
+
+@pytest.mark.parametrize(
+    ("version", "which"), [(OMIT, "an older"), (2, "another"), ("1", "another")]
+)
+def test_an_older_running_proteia_is_opened_and_handed_nothing(
+    served, tmp_path, monkeypatch, version, which
+):
+    _older(monkeypatch, version)
+    (blot,) = scans(tmp_path, "blot.tif")
+    opener = Opener()
+    with pytest.raises(
+        launch.HandoffError, match=f"^The running Proteia is {which} version"
+    ) as refused:
+        launch.start(folder=tmp_path / "state", opener=opener, command_line=command(blot))
+    assert refused.value.opened and len(opener.urls) == 1  # the user sees the running app
+    assert waiting(served.instance) == [] and staged_bytes(served.instance) == []
+    # With no paths to hand over, it is opened as ever.
+    assert launch.start(folder=tmp_path / "state", opener=opener) == launch.Opened()
+
+
+def test_a_refused_path_reaches_the_page_as_a_bounded_name(served, tmp_path):
+    name = "x" * 100 + "\x01" + "y" * 100 + ".tif"  # a control character, 205 characters
+    long = tmp_path / ("d" * 150) / name
+    surrogate = tmp_path / "\udc80gone.tif"  # an undecodable name, as argv may hold one
+    (blot,) = scans(tmp_path, "blot.tif")
+    opened = launch.start(
+        folder=tmp_path / "state", opener=Opener(), command_line=command(blot, long, surrogate)
+    )
+    assert [path.shown for path in opened.refused] == [
+        str(long.resolve()),
+        str(surrogate.resolve()),
+    ]
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["blot.tif"]
+    bounded, replaced = (entry["name"] for entry in listed["refused"])
+    assert len(bounded) == handoff.MAX_REFUSED_NAME and bounded.endswith("…")
+    assert bounded.startswith("x" * 100 + "�")
+    assert replaced == "�gone.tif"
+
+
+def _second(monkeypatch, tmp_path: Path, opener: Opener) -> None:
+    """:func:`launch.main` launches with the state folder in ``tmp_path``, where
+    ``served`` runs, the projects root there too, and ``opener`` for a browser."""
+    monkeypatch.setattr(launch, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(projects, "projects_root", lambda: tmp_path / "projects")
+    monkeypatch.setattr(launch, "start", lambda **kwargs: START(opener=opener, **kwargs))
+
+
+def test_a_file_the_running_proteia_refuses_is_reported_and_the_rest_handed_off(
+    served, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 1)
+    a, b = scans(tmp_path / "scans µ", "a.tif", "b.tif")
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    assert launch.main([str(a), str(b)]) == 3
+    console = capsys.readouterr()
+    assert console.out.splitlines() == [
+        "Proteia is already running; it has been opened in your browser.",
+        "1 image is waiting there: choose how to import them.",
+    ]
+    message = "1 images are waiting in Proteia: import or discard them first"
+    assert console.err.splitlines() == [f"Not opened: {b.resolve()} ({message})"]
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["a.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [("b.tif", "too_many_pending")]
+    assert len(opener.urls) == 1 and served.token not in console.out + console.err
+
+
+MIB = 1024 * 1024
+
+
+def large_scans(folder: Path, *names: str, size: int) -> list[Path]:
+    """Files of ``size`` bytes, each with bytes of its own: more than a
+    connection's buffers hold, so an upload is sent while the server reads it."""
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = [folder / name for name in names]
+    for path in paths:
+        mark = f"pixels of {path.name} ".encode()
+        path.write_bytes((mark * (size // len(mark) + 1))[:size])
+    return paths
+
+
+def test_files_the_running_proteia_has_no_room_for_are_refused_before_their_bytes_are_sent(
+    served, tmp_path, monkeypatch, capsys
+):
+    # Images waiting in Proteia, and more opened than it has room for (20 and
+    # 16 of at most 32, in small): the launch asks before it sends each file's
+    # bytes (GET /api/incoming/room), so those it has no room for are refused
+    # without being read, however large, and the others are handed off.
+    monkeypatch.setattr(handoff, "MAX_PENDING_FILES", 3)
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    earlier = scans(tmp_path / "earlier", "w1.tif", "w2.tif")
+    assert launch.main([str(path) for path in earlier]) == 0
+    capsys.readouterr()
+    a, b, c = large_scans(tmp_path / "scans µ", "a.tif", "b.tif", "c.tif", size=8 * MIB)
+    opened = reading(monkeypatch)
+    assert launch.main([str(a), str(b), str(c)]) == 3
+    message = "3 images are waiting in Proteia: import or discard them first"
+    assert capsys.readouterr().err.splitlines() == [
+        f"Not opened: {path.resolve()} ({message})" for path in (b, c)
+    ]
+    assert {name: file.read_bytes for name, file in opened.items()} == {
+        "a.tif": 8 * MIB,
+        "b.tif": 0,
+        "c.tif": 0,
+    }
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["w1.tif", "w2.tif", "a.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [
+        ("b.tif", "too_many_pending"),
+        ("c.tif", "too_many_pending"),
+    ]
+    # Nothing is staged but the files handed off.
+    assert staged_bytes(served.instance) == sorted(path.read_bytes() for path in (*earlier, a))
+    assert len(opener.urls) == 1  # the first launch's: the second joined its hand-off
+
+
+def test_an_upload_cut_short_refuses_that_file_and_the_others_are_handed_off(
+    served, tmp_path, monkeypatch, capsys
+):
+    # Proteia refuses b.tif while its bytes arrive (the room ran out after the
+    # launch asked), then closes the connection, as uvicorn does once no more
+    # of a body it has answered arrives for its keep-alive time: 5 s, here 0.1
+    # s, with b.tif on a share whose reads stall 0.5 s. The launch may find the
+    # connection reset before it can read the answer. It reports b.tif not
+    # taken, with the reason Proteia gives when asked again, hands off the
+    # others, and leaves nothing staged but them.
+    monkeypatch.setattr(served.instance.server.config, "timeout_keep_alive", 0.1)
+    a, b = large_scans(tmp_path / "scans µ", "a.tif", "b.tif", size=4 * MIB)
+    (c,) = scans(tmp_path / "scans µ", "c.tif")
+    inbox = served.instance.workspace.inbox
+    make_room = inbox.make_room
+    no_room = (
+        "the images waiting in Proteia take all the room it keeps for them: import or discard"
+        " them first"
+    )
+
+    def room_runs_out(upload: handoff.Upload, size: int) -> None:
+        if upload.name == "b.tif":  # room left for c.tif, not for b.tif
+            monkeypatch.setattr(handoff, "MAX_STAGED_BYTES", 4 * MIB + 1024)
+            raise handoff.TooManyPendingError(no_room)
+        make_room(upload, size)
+
+    monkeypatch.setattr(inbox, "make_room", room_runs_out)
+    reading(monkeypatch, stall={"b.tif": 0.5})
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    assert launch.main([str(a), str(b), str(c)]) == 3
+    console = capsys.readouterr()
+    assert "2 images are waiting there: choose how to import them." in console.out
+    assert console.err.splitlines() == [f"Not opened: {b.resolve()} ({no_room})"]
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["a.tif", "c.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [("b.tif", "too_many_pending")]
+    assert staged_bytes(served.instance) == sorted(path.read_bytes() for path in (a, c))
+    assert len(opener.urls) == 1
+
+
+def test_a_launch_that_joined_a_hand_off_says_so(served, tmp_path, monkeypatch, capsys):
+    a, b, c = scans(tmp_path, "a.tif", "b.tif", "c.tif")
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    assert launch.main([str(a)]) == 0
+    capsys.readouterr()
+    assert launch.main([str(b), str(c)]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "Proteia is already running, and open in your browser.",
+        "Added b.tif and c.tif to the images waiting there: choose how to import them.",
+    ]
+    assert len(opener.urls) == 1
+    log = (tmp_path / "state" / "logs" / "proteia.log").read_text(encoding="utf-8")
+    assert "2 images joined those another launch handed to it" in log
+    assert "b.tif" not in log  # no path, nor name
+
+
+def test_main_exits_1_when_an_older_proteia_runs(served, tmp_path, monkeypatch, capsys):
+    _older(monkeypatch)
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    missing = tmp_path / "missing.tif"
+    assert launch.main([str(missing)]) == 1
+    console = capsys.readouterr()
+    assert console.out.splitlines() == [
+        "Proteia is already running; it has been opened in your browser."
+    ]
+    assert console.err.splitlines() == [
+        "The running Proteia is an older version and cannot take files; quit it and try again.",
+        f"Not opened: {missing.resolve()} (no such file or folder)",
+    ]
+    assert len(opener.urls) == 1 and workspace_of(served)["handoffs"] == []
+
+
+@pytest.mark.parametrize("where", ["upload", "offer"])
+def test_main_exits_1_when_the_hand_off_fails(served, tmp_path, monkeypatch, capsys, where):
+    def stopping(*args: object, **kwargs: object) -> None:
+        raise handoff.StoppingError("Proteia is stopping")
+
+    inbox = served.instance.workspace.inbox
+    monkeypatch.setattr(inbox, "begin_upload" if where == "upload" else "offer", stopping)
+    (blot,) = scans(tmp_path, "blot.tif")
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    assert launch.main([str(blot)]) == 1
+    console = capsys.readouterr()
+    said = {
+        "upload": "Proteia is stopping; the files were not handed to it.",
+        "offer": "Proteia did not take the files: Proteia is stopping",
+    }[where]
+    assert (console.out, console.err.splitlines()) == ("", [said])
+    assert opener.urls == [] and waiting(served.instance) == []
+    log = (tmp_path / "state" / "logs" / "proteia.log").read_text(encoding="utf-8")
+    assert f"ERROR proteia.web.launch: {said}" in log
+
+
+def test_a_connection_that_fails_ends_the_hand_off():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def hang_up() -> None:
+        conn, _ = listener.accept()
+        conn.close()
+
+    thread = threading.Thread(target=hang_up, daemon=True)
+    thread.start()
+    info = launch.InstanceInfo(pid=1, port=listener.getsockname()[1], token="x" * 43)
+    try:
+        with pytest.raises(launch.HandoffError, match="The connection to the running Proteia"):
+            launch._send(info, "POST", "/api/handoffs", b"{}", {})
+    finally:
+        thread.join(10)
+        listener.close()
+    with pytest.raises(launch.HandoffError):  # nothing listens there now
+        launch._send(info, "POST", "/api/handoffs", b"{}", {})
+
+
+@dataclass
+class _Answer:
+    status: int
+    body: bytes
+
+    def read(self, size: int = -1) -> bytes:
+        return self.body if size < 0 else self.body[:size]
+
+
+class _CutShort:
+    """Stands in for ``http.client.HTTPConnection``: a request that connects,
+    then fails as one fails whose server answered it and closed the connection
+    before its body was sent whole; that answer can still be read (``answer``),
+    or cannot (None)."""
+
+    def __init__(self, answer: _Answer | None) -> None:
+        self.answer = answer
+        self.sock: object = None
+
+    def __call__(self, host: str, port: int, **kwargs: object) -> _CutShort:
+        return self
+
+    def request(self, method: str, path: str, **kwargs: object) -> None:
+        self.sock = object()  # connected
+        raise ConnectionResetError("the body was cut short")
+
+    def getresponse(self) -> _Answer:
+        if self.answer is None:
+            raise ConnectionResetError("no answer to read")
+        return self.answer
+
+    def close(self) -> None:
+        pass
+
+
+def test_an_answer_sent_before_the_body_was_read_is_taken_as_the_answer(monkeypatch):
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    body = b"pixels" * 1000
+    refused = {"code": "too_large", "message": "the file is too large"}
+    answered = _CutShort(_Answer(413, json.dumps(refused).encode()))
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", answered)
+    assert launch._send(info, "POST", "/api/incoming?name=a.tif", body, {}) == (413, refused)
+    # With no answer to read, the connection failed as the request said.
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", _CutShort(None))
+    with pytest.raises(launch.HandoffError, match="failed.*: the body was cut short$") as failed:
+        launch._send(info, "POST", "/api/incoming?name=a.tif", body, {})
+    assert isinstance(failed.value.__cause__, ConnectionResetError)
+
+
+class _Played:
+    """Stands in for ``http.client.HTTPConnection``: each connection made plays
+    the next of ``plays``: an answer (:class:`_Answer`); ``"cut"``, a request
+    that connects, then is reset while its body is sent, with no answer to
+    read; or ``"refused"``, one that finds nothing listening. ``requests``
+    holds each request's method and path, and whether it had a body."""
+
+    def __init__(self, *plays: _Answer | str) -> None:
+        self.plays = list(plays)
+        self.requests: list[tuple[str, str, bool]] = []
+        self.sock: object = None
+        self._play: _Answer | str = "refused"
+
+    def __call__(self, host: str, port: int, **kwargs: object) -> _Played:
+        self._play = self.plays.pop(0)
+        self.sock = None
+        return self
+
+    def request(self, method: str, path: str, body: object = None, **kwargs: object) -> None:
+        self.requests.append((method, path, body is not None))
+        if self._play == "refused":
+            raise ConnectionRefusedError("nothing listens there")
+        self.sock = object()  # connected
+        if self._play == "cut":
+            raise ConnectionAbortedError("the connection was reset")
+
+    def getresponse(self) -> _Answer:
+        if isinstance(self._play, str):
+            raise ConnectionAbortedError("no answer to read")
+        return self._play
+
+    def close(self) -> None:
+        pass
+
+
+def _json(status: int, **answer: str) -> _Answer:
+    return _Answer(status, json.dumps(answer).encode() if answer else b"")
+
+
+@pytest.mark.parametrize(
+    ("again", "refused"),
+    [
+        (
+            _json(409, code="too_many_pending", message="32 images are waiting in Proteia"),
+            ("too_many_pending", "32 images are waiting in Proteia"),
+        ),
+        (_json(204), ("other", "the upload was cut short: the connection was reset")),
+    ],
+    ids=["no room now", "room"],
+)
+def test_an_upload_cut_short_is_refused_with_the_reason_proteia_gives_when_asked_again(
+    tmp_path, monkeypatch, caplog, again, refused
+):
+    (blot,) = scans(tmp_path / "scans µ", "blot µ.tif")
+    (file,) = command(blot).files
+    played = _Played(_json(204), "cut", again)
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", played)
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    caplog.set_level("INFO", logger=launch.__name__)
+    uploaded = launch._upload(info, file)
+    assert "an upload was cut short: the connection was reset" in caplog.text
+    assert "blot" not in caplog.text  # no path, nor name
+    assert isinstance(uploaded, cli.RefusedPath)
+    assert (uploaded.shown, uploaded.name) == (str(blot.resolve()), "blot µ.tif")
+    assert (uploaded.code, uploaded.message) == refused
+    room = f"/api/incoming/room?name=blot%20%C2%B5.tif&size={blot.stat().st_size}"
+    assert played.requests == [
+        ("GET", room, False),
+        ("POST", "/api/incoming?name=blot%20%C2%B5.tif", True),
+        ("GET", room, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("again", "said"),
+    [
+        (_json(409, code="stopping", message="Proteia is stopping"), "^Proteia is stopping;"),
+        ("refused", "^The connection to the running Proteia failed"),
+    ],
+    ids=["stopping", "gone"],
+)
+def test_an_upload_cut_short_by_a_proteia_that_stopped_ends_the_hand_off(
+    tmp_path, monkeypatch, again, said
+):
+    (blot,) = scans(tmp_path, "blot.tif")
+    (file,) = command(blot).files
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", _Played(_json(204), "cut", again))
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    with pytest.raises(launch.HandoffError, match=said):
+        launch._upload(info, file)
+
+
+def test_a_file_proteia_has_no_room_for_is_refused_unread(tmp_path, monkeypatch):
+    (blot,) = scans(tmp_path, "blot.tif")
+    (file,) = command(blot).files
+    no_room = _json(409, code="too_many_pending", message="no room")
+    played = _Played(no_room)
+    monkeypatch.setattr(launch.http.client, "HTTPConnection", played)
+    opened = reading(monkeypatch)
+    info = launch.InstanceInfo(pid=1, port=9, token="x" * 43)
+    uploaded = launch._upload(info, file)
+    assert isinstance(uploaded, cli.RefusedPath)
+    assert (uploaded.code, uploaded.message) == ("too_many_pending", "no room")
+    assert [method for method, _, _ in played.requests] == ["GET"]
+    assert opened["blot.tif"].read_bytes == 0
+
+
+def _first(
+    monkeypatch, tmp_path: Path, argv: list[str], look: Callable[[Running], None]
+) -> tuple[int, list[str]]:
+    """Run :func:`launch.main` with ``argv`` as a first launch, with its state
+    folder and projects root in ``tmp_path``, serving in this thread until
+    ``look`` (in another) has looked and the page quits: its exit status, and
+    the URLs the browser was given."""
+    workspace = api.Workspace(tmp_path / "projects", reveal=lambda folder: None)
+    opener = Opener()
+    started: list[launch.Instance] = []
+    failed: list[BaseException] = []
+
+    def start_here(**kwargs: object) -> launch.Instance | launch.Opened:
+        result = START(opener=opener, workspace=workspace, **kwargs)
+        if isinstance(result, launch.Instance):
+            started.append(result)
+        return result
+
+    def look_then_quit() -> None:
+        deadline = time.monotonic() + 10
+        while not started or not started[0].server.started:
+            if time.monotonic() > deadline:
+                return
+            time.sleep(0.01)
+        instance = started[0]
+        try:
+            look(Running(instance, opener, threading.main_thread()))
+        except BaseException as exc:
+            failed.append(exc)
+        if send(instance.port, "POST", "/api/quit", token=instance.token)[0] != 202:
+            instance.stop()
+
+    monkeypatch.setattr(launch, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(projects, "projects_root", lambda: tmp_path / "projects")
+    monkeypatch.setattr(launch, "start", start_here)
+    helper = threading.Thread(target=look_then_quit, daemon=True)
+    helper.start()
+    code = launch.main(argv)
+    helper.join(10)
+    assert not failed, failed
+    return code, opener.urls
+
+
+def test_main_exit_codes_of_a_first_launch(tmp_path, monkeypatch, capsys):
+    blot, marker = scans(tmp_path / "scans µ", "blot µ.tif", "marker α.tif")
+    photo = tmp_path / "scans µ" / "photo.bmp"
+    photo.write_bytes(b"BM")
+    seen: list[dict] = []
+
+    def look(running: Running) -> None:
+        seen.append(workspace_of(running))
+
+    code, urls = _first(monkeypatch, tmp_path, [str(blot), str(marker)], look)
+    console = capsys.readouterr()
+    assert (code, len(urls)) == (0, 1)
+    assert "2 images are waiting there: choose how to import them." in console.out
+    assert console.err == ""
+    (listed,) = seen.pop()["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["blot µ.tif", "marker α.tif"]
+
+    code, urls = _first(monkeypatch, tmp_path, [str(photo), str(blot), str(photo.parent)], look)
+    console = capsys.readouterr()
+    assert (code, len(urls)) == (3, 1)
+    assert "1 image is waiting there: choose how to import them." in console.out
+    assert console.err.splitlines() == [
+        f"Not opened: {photo.resolve()} (not an image type Proteia imports"
+        " (.tif, .tiff, .png, .jpg, .jpeg))",
+        f"Not opened: {photo.parent.resolve()} (a folder; open projects from Proteia's"
+        " Projects dialog)",
+    ]
+    (listed,) = seen.pop()["handoffs"]
+    assert [r["code"] for r in listed["refused"]] == ["unsupported_type", "folder"]
+    # Nothing was copied, and the originals are there.
+    assert blot.read_bytes() == f"pixels of {blot.name}".encode()
+    assert not (tmp_path / "state" / "incoming").exists()
+
+
+def _gone_after_its_checks(monkeypatch, path: Path) -> str:
+    """Make ``path`` vanish once the command line has checked it, before it is
+    handed over: the path the console shows for it."""
+    shown = str(path.resolve())
+    parse = cli.parse
+
+    def parse_then_delete(argv: list[str]) -> cli.CommandLine:
+        command_line = parse(argv)
+        path.unlink()
+        return command_line
+
+    monkeypatch.setattr(cli, "parse", parse_then_delete)
+    return shown
+
+
+def test_a_first_launch_names_a_file_gone_before_its_page_took_it(tmp_path, monkeypatch, capsys):
+    a, b = scans(tmp_path / "scans µ", "a.tif", "b α.tif")
+    shown = _gone_after_its_checks(monkeypatch, b)
+    seen: list[dict] = []
+    code, urls = _first(
+        monkeypatch, tmp_path, [str(a), str(b)], lambda running: seen.append(workspace_of(running))
+    )
+    console = capsys.readouterr()
+    assert (code, len(urls)) == (3, 1)
+    assert "1 image is waiting there: choose how to import them." in console.out
+    (line,) = console.err.splitlines()  # the path in full, and why
+    assert line.startswith(f"Not opened: {shown} (cannot be read: ") and line.endswith(")")
+    (listed,) = seen.pop()["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["a.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [("b α.tif", "unreadable")]
+    log = (tmp_path / "state" / "logs" / "proteia.log").read_text(encoding="utf-8")
+    assert "1 paths not taken (unreadable)" in log and "b α.tif" not in log
+
+
+def test_a_second_launch_names_a_file_gone_before_its_upload(served, tmp_path, monkeypatch, capsys):
+    a, c = scans(tmp_path / "scans µ", "a.tif", "c α.tif")
+    shown = _gone_after_its_checks(monkeypatch, c)
+    opener = Opener()
+    _second(monkeypatch, tmp_path, opener)
+    assert launch.main([str(a), str(c)]) == 3
+    console = capsys.readouterr()
+    assert "1 image is waiting there: choose how to import them." in console.out
+    (line,) = console.err.splitlines()
+    assert line.startswith(f"Not opened: {shown} (cannot be read: ") and line.endswith(")")
+    (listed,) = workspace_of(served)["handoffs"]
+    assert [file["name"] for file in listed["files"]] == ["a.tif"]
+    assert [(r["name"], r["code"]) for r in listed["refused"]] == [("c α.tif", "unreadable")]
+    assert len(opener.urls) == 1
+
+
+def test_a_new_instance_removes_what_a_crashed_one_left_before_it_binds(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    incoming = state / "incoming"
+    incoming.mkdir(parents=True)
+    (incoming / ("0123456789abcdef" * 2)).write_bytes(b"a staged copy")
+    (incoming / "notes.txt").write_bytes(b"not one")
+    info = {"pid": 1, "port": _closed_port(), "token": "x" * 43}
+    (state / INSTANCE_FILE).write_text(json.dumps(info), encoding="utf-8")
+    (state / REDIRECT_FILE).write_text("old", encoding="utf-8")
+    seen: list[list[str]] = []
+    bind = launch.bind_loopback
+
+    def bind_after_looking() -> socket.socket:
+        seen.append(names(state))
+        return bind()
+
+    monkeypatch.setattr(launch, "bind_loopback", bind_after_looking)
+    instance = launch.start(folder=state, opener=Opener())
+    try:
+        assert seen == [["incoming", LOCK_FILE]]
+        assert names(incoming) == ["notes.txt"]
+    finally:
+        instance.close()
+
+
+def test_stop_removes_the_instance_files_while_the_server_still_listens(tmp_path):
+    instance = launch.start(folder=tmp_path, opener=Opener())
+    try:
+        instance.stop()
+        assert names(tmp_path) == [LOCK_FILE] and instance.server.should_exit
+        # A launch now finds no instance file, and waits for the lock.
+        with socket.create_connection(("127.0.0.1", instance.port), timeout=5):
+            pass
+    finally:
+        instance.close()
+
+
+def test_a_stop_signal_removes_the_instance_files_first(tmp_path):
+    instance = launch.start(folder=tmp_path, opener=Opener())
+    try:
+        instance.server.handle_exit(signal.SIGINT, None)  # as uvicorn's handler runs it
+        assert names(tmp_path) == [LOCK_FILE] and instance.server.should_exit
+    finally:
+        instance.close()
+
+
+def test_the_originals_are_never_deleted_or_changed(tmp_path):
+    data = samples.sample_files()[samples.BLOT_FILE]
+    original, other = tmp_path / "scans µ" / "β-actin blot.tif", tmp_path / "scans µ" / "b.tif"
+    original.parent.mkdir()
+    original.write_bytes(data)
+    other.write_bytes(data)
+    written = original.stat().st_mtime_ns
+
+    def unchanged() -> None:
+        assert original.read_bytes() == data and original.stat().st_mtime_ns == written
+
+    state = tmp_path / "state"
+
+    def serve(command_line: cli.CommandLine) -> Running:
+        workspace = api.Workspace(tmp_path / "projects", reveal=lambda folder: None)
+        instance = START(
+            folder=state, opener=Opener(), workspace=workspace, command_line=command_line
+        )
+        thread = threading.Thread(target=instance.serve, daemon=True)
+        thread.start()
+        wait_until_started(instance, thread)
+        return Running(instance, Opener(), thread)
+
+    def choose(files: list[dict]) -> list[dict]:
+        return [
+            {
+                "file_id": file["file_id"],
+                "kind": "chemiluminescence",
+                "polarity": "dark_on_light",
+                "membrane": "new",
+            }
+            for file in files
+        ]
+
+    # (a) The first launch's own files, imported.
+    running = serve(command(original, other))
+    (listed,) = workspace_of(running)["handoffs"]
+    body = {"name": None, "files": choose(listed["files"])}
+    status, answer = call(running, "POST", f"/api/handoffs/{listed['id']}/accept", body)
+    assert status == 201, answer
+    assert answer["project"]["name"] == "β-actin blot" and len(answer["handoff"]["imported"]) == 2
+    unchanged()
+    # (b) A second launch's copy, discarded.
+    START(folder=state, opener=Opener(), command_line=command(original))
+    (listed,) = workspace_of(running)["handoffs"]
+    body = {"files": [file["file_id"] for file in listed["files"]], "refused": 0}
+    assert call(running, "POST", f"/api/handoffs/{listed['id']}/discard", body)[0] == 204
+    assert staged_bytes(running.instance) == []
+    unchanged()
+    # (c) Stopped with a copy waiting.
+    START(folder=state, opener=Opener(), command_line=command(original))
+    assert staged_bytes(running.instance) == [data]
+    running.instance.stop()
+    running.thread.join(10)
+    assert not list((state / "incoming").iterdir())
+    unchanged()
+    # (d) Started again with it named, and stopped before it is imported.
+    running = serve(command(original))
+    assert waiting(running.instance) == [["β-actin blot.tif"]]
+    running.instance.stop()
+    running.thread.join(10)
+    unchanged()
+    assert other.read_bytes() == data
+
+
 # --- The guard ---
 
 
@@ -425,6 +1407,7 @@ def test_a_server_error_carries_the_security_headers():
         ("GET", "/api/nothing"),
         ("GET", "/docs"),
         ("POST", "/api/incoming?name=a.tif"),
+        ("GET", "/api/incoming/room?name=a.tif&size=1"),
         ("POST", "/api/handoffs"),
         ("POST", "/api/handoffs/0/accept"),
         ("POST", "/api/handoffs/0/discard"),
@@ -563,6 +1546,7 @@ def test_every_module_the_page_imports_is_served(running):
                 pending.append(target)
     assert seen == {
         "/static/app.js",
+        "/static/calibration.js",
         "/static/charts.js",
         "/static/diagnostics.js",
         "/static/dock.js",
@@ -1351,3 +2335,469 @@ def test_a_box_at_the_image_edge_shows_no_fitted_outline():
     block = block[: block.index("color,")]
     assert "x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height" in block
     assert "inset && !atEdge ?" in block
+
+
+# --- Molecular weights: finding, adjusting and marking ladders (#58) ---
+
+
+def _constants(script: str) -> dict[str, float]:
+    """The numbers of a script's top-level ``const NAME = <number>;`` lines."""
+    found = re.findall(r"^const (\w+) = (-?[\d.]+);", script, re.MULTILINE)
+    return {name: float(value) for name, value in found}
+
+
+def test_the_fit_line_warns_where_the_core_does():
+    # The page words a group's fit with the core's own thresholds: a ladder
+    # whose leave-one-out check (D2) is above FIT_WARN, two ladders that
+    # disagree beyond LADDERS_WARN, a side with too few marks or shared MWs.
+    panel = _code("calibration.js")
+    constants = _constants(panel)
+    names = ("FIT_WARN", "LADDERS_WARN", "MIN_LADDER_POINTS", "MIN_SHARED_MWS")
+    assert {name: constants[name] for name in names} == {
+        name: getattr(mwcal, name) for name in names
+    }
+    lines = _method(panel, "fitLines(")
+    assert "take one ladder band away and predict it from the bands above and below it" in lines
+    assert "left and right differ by" in lines and '"the ladders agree"' in lines
+    assert "2 points · less reliable" in lines
+    assert "the bands above and below it put it at" in lines and "check its label" in lines
+    assert "not used;" in lines and "mark at least ${MIN_LADDER_POINTS}" in lines
+
+
+def test_a_ruler_stores_its_solid_labelled_ticks_in_one_step():
+    # Apply sends the ticks on a band (found, snapped to, placed by hand or
+    # as stored), never one only predicted (hollow) nor a band ▲▼ left with
+    # no label, at the ruler's x with the x it was found at, in one PUT: one
+    # change, one undo step.
+    panel = _code("calibration.js")
+    assert re.search(r'function solid\(tick\) \{\s*return tick.state !== "predicted";', panel)
+    assert re.search(r"function kept\(tick\) \{\s*return solid\(tick\) && labelled\(tick\);", panel)
+    apply = _method(panel, "async apply(")
+    assert "draft.ticks.filter(kept)" in apply
+    assert "/calibration/${draft.side}/ladder`" in apply
+    assert "x: draft.x," in apply and "found_at: draft.foundAt," in apply
+    # A tick's snap under way lands first; a tick snapped before the ruler
+    # moved sideways is snapped again at the x it is stored at, so the server
+    # finds it where a snap there puts it.
+    moved = apply.index("tick.snappedX !== draft.x")
+    sent = apply.index('this.handlers.edit("PUT", path, body,')
+    assert apply.index("await this.snapping") < moved < apply.index("this.snapAgain(draft)") < sent
+    # A predicted tick moved with the whole ruler (a shift, a stretch) stays
+    # predicted: only a tick dragged, nudged or snapped onto a band is stored.
+    assert '(state === "predicted" ? state : "hand")' in _method(panel, "moved(")
+    # Esc while it is being stored drops nothing: the answer closes it.
+    escape = _method(panel, "escape(")
+    assert escape.index("if (this.applying)") < escape.index("this.closeDraft();")
+
+
+def test_a_proposal_is_worded_as_labels_to_check():
+    # A proposal is the best labelling of the peaks down the lane clicked, and
+    # a lane of samples has one too: the status line never says a ladder was
+    # found, and asks to check that the lane is the ladder. A doubtful one says
+    # the labels may be one band off, and how to check and move them. Where
+    # no ladder stands out, the page marks by clicks instead.
+    panel = _code("calibration.js")
+    text = _method(panel, "proposalText(")
+    assert "Check that this lane is the ladder" in text
+    assert text.index("if (proposal.doubtful)") < text.index("this.doubtText()")
+    doubt = _method(panel, "doubtText(")
+    assert "The labels may be one band off: check the coloured reference bands" in doubt
+    assert doubt.count(" move them with ▲▼.") == 1
+    find = _method(panel, "async find(")
+    fallback = find.index("if (!proposal)")
+    assert fallback < find.index('this.tool = this.newTool({ kind: "mark", side, edges: false });')
+
+
+def test_the_ruler_moves_as_its_parts_are_dragged():
+    # D8: the line moves every tick up or down (or the ruler sideways), a grip
+    # stretches it (every tick linear in y between the fixed end and the
+    # dragged one), a tick moves alone and snaps unless Alt is held. The view
+    # draws predicted ticks hollow and the peaks no label took as grey dots.
+    panel = _code("calibration.js")
+    moved = _method(panel, "moved(")
+    assert 'part.kind === "body" && axis === "x"' in moved
+    assert "(dragged - fixed) / (end - fixed)" in moved
+    assert "fixed + (tick.y - fixed) * factor" in moved
+    ruler = _method(panel, "ruler(")
+    assert 'step.part.kind === "tick" && !step.alt' in ruler and "this.snapTick(" in ruler
+    view = _code("view.js")
+    drawn = _method(view, "drawRuler(")
+    assert "if (tick.solid)" in drawn and "strokeRect(" in drawn and "EXTRA_PEAK_COLOR" in drawn
+    # ▲▼ move every label one ladder position, and back again.
+    shift = _method(panel, "shiftLabels(")
+    assert "const index = tick.index + step;" in shift
+    # A tick clicked offers its relabel and "Not a ladder band".
+    menu = _method(panel, "relabelMenu(")
+    assert 'extra: { label: "Not a ladder band", run: () => this.notABand(id) }' in menu
+
+
+def test_the_ruler_keys():
+    # Tab goes tick to tick (a button each, top to bottom); ↑↓ move the
+    # focused one 0.5 px, Shift+↑↓ 5 px; Enter applies, on a tick or on the
+    # page; Esc drops the ruler, once no popup or tool takes it, and only the
+    # drag when it cancels one.
+    panel = _code("calibration.js")
+    constants = _constants(panel)
+    assert (constants["NUDGE"], constants["NUDGE_FAR"]) == (0.5, 5.0)
+    keys = _method(panel, "tickKey(")
+    for key in ('"ArrowUp"', '"ArrowDown"', '"Enter"', '"Delete"'):
+        assert key in keys
+    assert "event.shiftKey ? NUDGE_FAR : NUDGE" in keys
+    escape = _method(panel, "escape(")
+    order = ["if (this.menu)", "if (gestureCancelled)", "if (this.tool)", "if (this.draft)"]
+    assert [escape.index(step) for step in order] == sorted(escape.index(step) for step in order)
+    app = _code("app.js")
+    assert "calibration.escape({ gestureCancelled: event.defaultPrevented })" in app
+    assert "calibration.enter()" in app
+    # The view takes Esc when it cancels a drag, so the page's Esc drops nothing more.
+    view = _code("view.js")
+    assert re.search(
+        r'event.key === "Escape" && this.gesture\) \{\s*event.preventDefault\(\);', view
+    )
+    parser = _Tags()
+    parser.feed((server.STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    assert parser.by_id["cal-apply"]["aria-keyshortcuts"] == "Enter"
+    assert parser.by_id["cal-drop"]["aria-keyshortcuts"] == "Escape"
+    assert parser.by_id["cal-ticks"]["aria-label"] == "Ruler ticks, top to bottom"
+
+
+def test_a_stored_mark_dragged_or_clicked_is_one_edit():
+    # After Apply, a mark dragged up or down is moved (snapped unless Alt is
+    # held) and a mark clicked relabelled or removed: each its own change and
+    # undo step.
+    panel = _code("calibration.js")
+    point = _method(panel, "ladderPoint(")
+    assert "this.movePoint(tick.point, y, !alt)" in point and "this.pointMenu(" in point
+    edit = _method(panel, "async editPoint(")
+    assert 'this.handlers.edit("PATCH", this.pointPath(point), body, {' in edit
+    assert '"edit_calibration_point"' in edit
+    remove = _method(panel, "async removePoint(")
+    assert 'this.handlers.edit("DELETE", this.pointPath(point))' in remove
+
+
+def test_click_marking_marks_the_ladder_the_click_is_on():
+    # Marking by clicks (where no ladder stands out, or a custom ladder with no
+    # MWs listed): a strip edge is the left ladder's; a band nearer the image's
+    # right edge than the first ladder's lane is the second ladder's, as Find
+    # second ladder would take it, never a far lane of the first.
+    side = _method(_code("calibration.js"), "markSide(")
+    assert 'point.source !== "strip_edge"' in side
+    assert 'x > lane + (this.image.width - lane) / 2 ? "right" : "left"' in side
+
+
+def test_the_ladder_section_is_labelled():
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    controls = _Controls()
+    controls.feed(_markup(html, '<section id="calibration"', "</section>"))
+    labelled = [labelled for tag, _, labelled in controls.controls if tag != "button"]
+    assert labelled and all(labelled)
+    parser = _Tags()
+    parser.feed(html)
+    for tool in ("cal-find", "cal-find-right", "cal-mark", "cal-mark-edges"):
+        assert parser.by_id[tool]["aria-pressed"] == "false"
+    marker = _Controls()
+    marker.feed(_markup(html, '<label id="marker-field"', "</select>"))
+    assert [(tag, labelled) for tag, _, labelled in marker.controls] == [("select", True)]
+
+
+def test_a_marker_imported_beside_one_unlinked_image_offers_the_link():
+    # After a marker is imported into a membrane with exactly one unlinked
+    # chemiluminescence image of its size, the status line offers the link.
+    app = _code("app.js")
+    block = app[app.index('$("import-file").addEventListener("change"') :]
+    block = block[: block.index("\n});\n")]
+    assert "calibration.linkOffer(answer.project, image.id)" in block
+    assert "label: `Link as the marker of ${offer.name}`" in block
+    offer = _method(_code("calibration.js"), "linkOffer(")
+    assert 'image.kind === "chemiluminescence"' in offer
+    assert "image.marker_image_id === null" in offer
+    assert "image.width === marker.width" in offer and "unlinked.length === 1" in offer
+
+
+def test_an_apply_that_changes_nothing_offers_no_undo():
+    # Adjust, then Apply with nothing moved, stores the marks as they are: the
+    # server logs nothing, so the last undo step is an earlier change (the
+    # other ladder's Apply, say), which an Undo offered here would take back.
+    # The page compares the answer with the state the edit was sent against:
+    # the same revision, and it says there was no change, with no Undo.
+    panel = _code("calibration.js")
+    apply = _method(panel, "async apply(")
+    assert "sent: (project) => {" in apply
+    same = apply.index("before.revision === answer.project.revision")
+    block = apply.index("if (unchanged) {")
+    undo = apply.index('this.undoOf(answer, "set_ladder_points"')
+    assert same < block < apply.index("return;", block) < undo
+    assert "No change: the ruler holds the ${which} marks as they are stored." in apply
+    app = _code("app.js")
+    _, edit = _function(app, "async function edit(")
+    assert edit.index("sent(state.project);") < edit.index("return send(method, path, json);")
+
+
+def test_a_ruler_goes_with_the_ladder_and_the_images_it_was_opened_for():
+    # A ruler's labels are the membrane's ladder as it was when it opened, and
+    # its Apply replaces a ladder of its register group's marks. While it is
+    # open (or a ladder is being found) the ladder and the marker link are
+    # disabled; changed all the same (Undo, Redo, another tab), the ruler is
+    # dropped, never applied with another ladder's labels or over the marks of
+    # images it did not show.
+    panel = _code("calibration.js")
+    opened = _method(panel, "openDraft(")
+    assert "ladder: this.ladderScope()," in opened and "group: this.groupScope()," in opened
+    stale = _method(panel, "staleRuler(")
+    assert "draft.ladder !== this.ladderScope()" in stale
+    assert "draft.group !== this.groupScope()" in stale
+    assert "const stale = draft ? this.staleRuler(draft) : null;" in _method(panel, "render(")
+    locks = _method(panel, "renderLocks(")
+    assert "const locked = Boolean(this.draft) || this.finding;" in locks
+    for control in ('$("cal-ladder")', '$("marker-image")', '$("cal-link")', 'type="submit"'):
+        assert control in locks
+    assert "this.renderLocks();" in _method(panel, "refresh(")
+    # A proposal answered once the ladder or the link changed is not shown.
+    find = _method(panel, "async find(")
+    scope = find.index("this.ladderScope() !== scope[0] || this.groupScope() !== scope[1]")
+    assert scope < find.index("this.openDraft(")
+
+
+def test_a_tool_is_put_away_on_another_register_group():
+    # Find ladder or a marking tool armed on one image acts on its register
+    # group only: shown another membrane's image (or its button disabled since,
+    # the ladder taken back), it is put away, never sent there.
+    panel = _code("calibration.js")
+    fits = _method(panel, "toolFits(")
+    assert "tool.group !== this.groupScope()" in fits
+    assert "this.findRefusal(tool.side) : this.markRefusal()" in fits
+    assert "if (this.tool && !this.toolFits(this.tool))" in _method(panel, "render(")
+    assert "this.tool = same ? null : this.newTool(tool);" in _method(panel, "arm(")
+    assert "group: this.groupScope()" in _method(panel, "newTool(")
+
+
+def test_a_ruler_holds_only_the_marks_its_apply_keeps():
+    # Apply stores the ruler's ticks as band marks of its image at its x, in
+    # place of all the marks of its side. Adjust puts only such marks on the
+    # ruler (and takes its x from them): never a strip edge, nor a mark on
+    # another image of the group, which Apply would turn into a band of this
+    # image. Those Apply removes are named before (the ruler's panel, Apply's
+    # description) and after (the status line, with Undo).
+    panel = _code("calibration.js")
+    adjust = _method(panel, "adjust(")
+    assert "const bands = this.bandPoints(side);" in adjust
+    marks = adjust.index("const marks = bands.filter((mark) => mark.image_id === imageId);")
+    assert marks < adjust.index("const xs = marks.map((mark) => mark.x)")
+    assert 'point.source !== "strip_edge"' in _method(panel, "bandPoints(")
+    lost = _method(panel, "lostPoints(")
+    assert 'point.source === "strip_edge" || point.image_id !== draft.imageId' in lost
+    assert "Apply replaces this ladder's marks: it removes" in _method(panel, "renderDraft(")
+    assert "which the ruler did not hold." in _method(panel, "appliedText(")
+    marks_list = _method(panel, "renderMarks(")
+    assert '$("cal-adjust").hidden = !this.bandPoints("left").length;' in marks_list
+    parser = _Tags()
+    parser.feed((server.STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    assert parser.by_id["cal-apply"]["aria-describedby"] == "cal-draft-lost"
+    assert "hidden" in parser.by_id["cal-draft-lost"]
+
+
+def test_the_keyboard_focus_never_stays_on_a_hidden_control():
+    # Enter or Esc on a ruler tick, or Drop, hides the ruler's panel with the
+    # focus still on that button: a hidden control has lost the focus too, so
+    # it goes on (to Apply's Undo, or to Find ladder).
+    panel = _code("calibration.js")
+    lost = _method(panel, "focusLost(")
+    assert "!active.getClientRects().length" in lost and "Boolean(active.disabled)" in lost
+    escape = _method(panel, "escape(")
+    assert escape.index("this.closeDraft();") < escape.index("this.keepFocus();")
+    keep = _method(panel, "keepFocus(")
+    assert '["cal-find", "cal-mark", "cal-ladder"]' in keep
+    assert "button.getClientRects().length" in keep
+
+
+def test_snap_all_names_the_ticks_it_left_where_they_are():
+    # A solid tick no band took stays where it is, and Apply stores it there:
+    # the status line names it, as it names the hollow ones not stored.
+    snap = _method(_code("calibration.js"), "async snapAll(")
+    assert snap.index("if (!result.snapped) {") < snap.index("stayed.push(tick);")
+    assert '"stays where it is" : "stay where they are"' in snap
+    assert 'and Apply stores ${one ? "it" : "them"} there' in snap
+
+
+def test_a_read_refused_as_project_changed_says_nothing_was_left_undone():
+    # A ladder proposal and a snap are POSTs that change nothing: refused
+    # because another project was opened, they are no change "not made".
+    app = _code("app.js")
+    _, changed = _function(app, "function projectChanged(")
+    assert 'answered || read || method === "GET"' in changed
+    _, sent = _function(app, "async function request(")
+    assert "projectChanged(error, method, path, { read });" in sent
+    assert "request(method, path, { json, answer: true, anyProject, read: true })" in app
+
+
+def test_a_dropped_ticks_snap_lands_by_its_id():
+    # The ruler may change while a dropped tick's snap is asked for (another
+    # tick dragged, a nudge, ▲▼): the snap lands on that tick by its id while
+    # it is still where it was dropped, and a later move of it stands.
+    snap = _method(_code("calibration.js"), "snapTick(")
+    assert "ruler.ticks.find((tick) => tick.id === id)" in snap
+    assert "now.y === dropped.y && now.state === dropped.state" in snap
+    assert "this.draft = onBand(this.draft);" in snap and "this.base = onBand(this.base);" in snap
+    assert "this.draft !== draft" not in snap
+
+
+def test_nothing_opens_a_ruler_or_a_popup_while_a_ladder_is_found():
+    # The proposal's answer opens a ruler: until it comes, Adjust, the marking
+    # tools, Remove and Clear are disabled, as Find is.
+    panel = _code("calibration.js")
+    busy = "const busy = Boolean(this.draft) || this.applying || this.finding;"
+    assert busy in _method(panel, "renderMarks(")
+    marking = _method(panel, "renderMarking(")
+    assert "Boolean(this.draft) || this.applying || this.finding;" in marking
+    assert "this.draft || this.applying || this.finding" in _method(panel, "adjust(")
+    assert "if (this.finding || this.applying)" in _method(panel, "arm(")
+
+
+def test_apply_names_what_its_ruler_was_opened_with():
+    # The server refuses a ruler whose ladder or register group changed since
+    # it was opened (calibration_changed, another tab's change this page does
+    # not know of), but only when the page names them: a page that stopped
+    # sending them would lose the check without a sign. Apply sends every
+    # field the route reads, as the ruler was opened; such a refusal drops
+    # the ruler, says why and reads the project again.
+    panel = _code("calibration.js")
+    apply = _method(panel, "async apply(")
+    start = apply.index("const body = {")
+    fields = re.findall(r"^\s*(\w+):", apply[start : apply.index("};", start)], re.MULTILINE)
+    assert sorted(fields) == sorted(api.LadderPointsBody.model_fields)
+    assert "ladder_kda: draft.ladderKda," in apply and "group: draft.groupIds," in apply
+    opened = _method(panel, "openDraft(")
+    assert "ladderKda: [...this.ladderKda()]," in opened
+    assert "groupIds: [...this.group.image_ids]," in opened
+    # A found ruler's labels are the ladder the proposal names (the server's
+    # when it labelled them), opened only while it is the ladder shown.
+    find = _method(panel, "async find(")
+    same = find.index("if (!sameLadder(labels, this.ladderKda())) {")
+    assert find.index("const labels = answer.ladder_kda;") < same < find.index("this.openDraft(")
+    assert find.index("this.handlers.reread();", same) < find.index("this.openDraft(")
+    assert "ladderKda: [...labels]," in find
+    refused = _method(panel, "applyRefused(")
+    changed = refused.index('error.code === "calibration_changed"')
+    assert changed < refused.index("this.closeDraft();") < refused.index("this.sayOnceRead(")
+    # Its words, by the field the refusal names.
+    start = panel.index("const CHANGED_WORDS = {")
+    words = set(re.findall(r"^  (\w+):", panel[start : panel.index("};", start)], re.MULTILINE))
+    assert words == {"ladder_kda", "group"} <= set(api.LadderPointsBody.model_fields)
+    assert "reread: () => reread().catch(report)," in _code("app.js")
+
+
+def test_a_mark_or_relabel_names_the_ladder_its_mw_was_chosen_from():
+    # The server refuses a mark, or a relabel, whose MW was chosen from a
+    # ladder list that is no longer the membrane's (calibration_changed:
+    # another tab chose another ladder), but only when the page names that
+    # list: a page that stopped sending it would lose the check without a
+    # sign. The popup's list is sent with an MW chosen from it, never with a
+    # typed one; such a refusal is said and the project read again.
+    panel = _code("calibration.js")
+    mark = _method(panel, "async mark(")
+    body = mark[mark.index("const body = {") :]
+    body = body[: body.index(";")]
+    sent = set(re.findall(r"[{,] (?:\.\.\.\(kda \? \{ )?(\w+)", body))
+    assert sent == set(api.PointBody.model_fields)
+    assert "...(kda ? { ladder_kda: kda } : {})" in body
+    ask = _method(panel, "askMark(")
+    chosen = "choose: (mw, listed) => this.mark(tool, side, image, x, y, mw, listed ? kda : null),"
+    assert chosen in ask
+    menu = _method(panel, "pointMenu(")
+    assert "this.editPoint(point, listed ? { mw, ladder_kda: kda } : { mw }, said, image);" in menu
+    assert "ladder_kda" in api.PointEditBody.model_fields
+    opened = _method(panel, "openMenu(")
+    assert "choose(choice.mw, true);" in opened and "choose(mw, false);" in opened
+    for method in ("async mark(", "async editPoint("):
+        refused = _method(panel, method)
+        assert 'error.code === "calibration_changed"' in refused, method
+        assert "this.ladderChanged(" in refused, method
+    assert "this.sayOnceRead(image, openId, (shown) => {" in _method(panel, "ladderChanged(")
+    once = _method(panel, "async sayOnceRead(")
+    assert once.index("await this.handlers.reread();") < once.index(
+        "this.handlers.status(words(this.shows(image, openId) && Boolean(this.membrane)));"
+    )
+
+
+def test_a_refusal_read_again_says_what_to_do_only_on_its_image():
+    # A refusal said once the project is read again (the ladder changed in
+    # another tab) says what to do next from the membrane shown then (its
+    # ladder, findAgain), so only while the image refused is still shown:
+    # another image shown meanwhile, by keyboard say, may be another
+    # membrane's. Then what was refused is said, with no next step. Apply,
+    # Find ladder, and a mark or relabel pass the image refused.
+    panel = _code("calibration.js")
+    once = _method(panel, "async sayOnceRead(")
+    assert once.startswith("  async sayOnceRead(image, openId, words, refocus = false) {")
+    assert "words(this.shows(image, openId) && Boolean(this.membrane))" in once
+    assert re.findall(r"this\.sayOnceRead\(\s*(\w+),", panel) == ["image", "image", "image"]
+    refused = _method(panel, "applyRefused(")
+    ruler = refused.index("const image = this.image;")
+    assert ruler < refused.index("this.closeDraft();") < refused.index("this.sayOnceRead(")
+    for words in (refused, _method(panel, "async find(")):
+        said = words[words.index("this.sayOnceRead(") :]
+        said = said[: said.index(");\n")]
+        then, *otherwise = said[said.index("shown\n") :].splitlines()[1:]
+        assert then.lstrip().startswith("? `") and "${this.findAgain()}" in then
+        assert otherwise[0].lstrip().startswith(": ")
+        assert not any("findAgain" in line for line in otherwise)
+    assert "if (!shown) {\n        return `${said}.`;" in _method(panel, "ladderChanged(")
+
+
+def test_a_ladder_refusal_is_worded_from_its_code_and_detail():
+    # A refusal of the ladder's order, of an MW held twice or of the ladders'
+    # sides is worded from its code and detail (the ladder side and the MWs
+    # the server gives), never shown as the server's message, which names ids
+    # and positions; any other keeps that message. Apply, a mark, a mark moved
+    # or relabelled and a link say it so.
+    panel = _code("calibration.js")
+    _, words = _function(panel, "function ladderRefusalWords(")
+    for code in ("calibration_order", "duplicate_mw", "ladder_sides"):
+        assert f'error.code === "{code}"' in words
+    for field in ("detail.upper", "detail.lower", "detail.mw", "detail.side"):
+        assert field in words
+    for reason in ("same_height", "strip_edge", "no_x", "not_right"):
+        assert f'detail.reason === "{reason}"' in words
+    assert "return null;" in words
+    _, text = _function(panel, "function refusalText(")
+    assert "sentence(error.message)" in text
+    for method, verb in (
+        ("applyRefused(", '"Not applied"'),
+        ("async mark(", '"Not marked"'),
+        ("async editPoint(", '"Not moved"'),
+        ("async link(", '"Not linked"'),
+    ):
+        assert verb in _method(panel, method), method
+    _, report = _function(_code("app.js"), "function report(")
+    assert "showStatus(text || error.message);" in report
+
+
+def test_space_presses_only_a_tick_or_its_popup_over_the_image():
+    # Space held pans the image, with the pointer over it, and a tap of it
+    # there presses no focused control (the status line's Undo, Clear marks,
+    # Remove): it was meant to pan. Only a ruler tick's button (its relabel
+    # popup) and the controls of the popup opened from it, which sit over the
+    # image, are pressed by it; not those of a popup opened by a click on the
+    # image (a band marked, a stored mark, a tick there), which the click left
+    # the keyboard in. And a drag it panned makes its release press nothing.
+    view = _code("view.js")
+    _, over = _function(view, "function pressedOverImage(")
+    assert "pressedBySpace(element)" in over and '.closest("[data-space-presses]")' in over
+    keydown = view[view.index('document.addEventListener("keydown"') :]
+    keydown = keydown[: keydown.index('document.addEventListener("keyup"')]
+    assert "!typesSpace(target) &&\n        !pressedOverImage(target) &&" in keydown
+    assert "pressedBySpace(target)" not in keydown
+    assert "if (this.spaceTaken || this.spacePanned) {" in view
+    assert "this.untype();\n        this.spacePanned = true;" in view
+    page = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    marked = re.findall(r'<\w+ id="([\w-]+)"[^>]*\bdata-space-presses\b', page)
+    assert marked == ["cal-ticks"]
+    assert re.search(r'<div id="cal-menu"[^>]*>', page).group().count("data-space-presses") == 0
+    panel = _code("calibration.js")
+    opened = _method(panel, "openMenu(")
+    assert 'menu.toggleAttribute("data-space-presses", Boolean(back));' in opened
+    assert opened.index("this.closeMenu(false);") < opened.index("menu.toggleAttribute(")
+    # Only a tick's button opens one with somewhere to go back to.
+    assert "this.relabelMenu(tick.id, button)" in panel
+    assert "this.relabelMenu(step.part.id, null, step);" in panel
+    assert re.findall(r"\bback(?:: (\w+))?,\n", panel) == ["", "null", "null", ""]

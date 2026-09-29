@@ -31,8 +31,11 @@ from proteia.core.model import (
     Band,
     Box,
     BoxPadding,
+    CalibrationPoint,
+    FitMethod,
     ImageKind,
     ImageRef,
+    LadderSide,
     LogEntry,
     Polarity,
     Project,
@@ -49,12 +52,14 @@ from proteia.core.storage import (
     MissingImageError,
     ProjectFormatError,
     SchemaVersionError,
+    backup_references,
     canonical_json,
     content_document,
     content_hash,
     document_bytes,
     document_hash,
     image_path,
+    keep_backup,
     load_project,
     migrate,
     orphan_files,
@@ -67,6 +72,7 @@ from proteia.core.storage import (
 )
 
 GOLDEN = Path(__file__).parent / "data" / "regression_baseline.json"
+BACKUP = "project.schema1.json"
 
 
 @pytest.fixture
@@ -499,6 +505,113 @@ def test_an_unset_possible_flag_is_never_written():
     assert document_hash(written) != content_hash(project)
 
 
+# --- The molecular-weight calibration's fields (#58) in the saved form ---
+
+
+def test_explicit_defaults_keep_the_bytes_and_hash():
+    project = make_project()
+    doc = _doc(project)
+    for membrane in doc["batch"]["membranes"]:
+        calibration = membrane["calibration"]
+        assert "ladder_kda" not in calibration
+        # A hand-edited file: loads, hashes as if the keys were absent, and is saved without them.
+        calibration["ladder_kda"] = []
+        for point in calibration["points"]:
+            assert "x" not in point and "side" not in point
+            point.update(side="left", x=None)
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)  # pinned: test_content_hash_is_pinned
+    assert project_to_json(loaded) == project_to_json(project)
+    # Writing the defaults would have moved the hash of every existing project.
+    written = {key: value for key, value in doc.items() if key not in HASH_EXCLUDE}
+    assert document_hash(written) != content_hash(project)
+
+
+def test_a_null_band_count_keeps_the_bytes_and_hash():
+    # #58: a band with no count holds no bands_found key, so no project saved
+    # before the count, and none without one, moves its bytes or hash.
+    project = make_project()
+    doc = _doc(project)
+    for protein in doc["batch"]["proteins"]:
+        for band in protein["bands"]:
+            assert "bands_found" not in band
+            band["bands_found"] = None  # a hand-edited file
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)  # pinned: test_content_hash_is_pinned
+    assert project_to_json(loaded) == project_to_json(project)
+
+
+def test_a_band_count_round_trips(tmp_path):
+    def count(p: Project) -> None:
+        p.batch.find_band("band-11")[1].bands_found = 2  # a row box nobody edited
+
+    project = apply_change(make_project(), count)[0]
+    data = _saved(tmp_path / "a", project).read_bytes()
+    [band] = [
+        band
+        for protein in json.loads(data)["batch"]["proteins"]
+        for band in protein["bands"]
+        if band["id"] == "band-11"
+    ]
+    assert band["bands_found"] == 2
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project and content_hash(loaded) != content_hash(make_project())
+    assert _saved(tmp_path / "b", loaded).read_bytes() == data
+
+
+def _calibrated() -> Project:
+    """The sample project with a right ladder on mem-1's marker (every point of
+    mem-1 at its x), the ladder's MW list and the piecewise method, and mem-5's
+    strip edges clicked at an x."""
+
+    def change(p: Project) -> None:
+        mem_1, mem_5 = p.batch.membranes
+        calibration = mem_1.calibration
+        for point in calibration.points:
+            point.x = 77.0
+        calibration.points += [
+            CalibrationPoint(
+                image_id="img-3",
+                y=y,
+                mw=mw,
+                source="visible_marker",
+                x=x,
+                side=LadderSide.RIGHT,
+            )
+            for y, mw, x in ((22.0, 250, 301.5), (63.25, 100, 302.0))
+        ]
+        calibration.ladder_kda = [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0, 10.0]
+        calibration.fit_method = FitMethod.LOG_LINEAR_PIECEWISE
+        for point, x in zip(mem_5.calibration.points, (12.5, 180.25), strict=True):
+            point.x = x
+
+    return apply_change(make_project(), change)[0]
+
+
+def test_new_calibration_fields_round_trip(tmp_path):
+    project = _calibrated()
+    first = _saved(tmp_path / "a", project)
+    data = first.read_bytes()
+    mem_1, mem_5 = json.loads(data)["batch"]["membranes"]
+    assert [(point.get("side"), point["x"]) for point in mem_1["calibration"]["points"]] == [
+        (None, 77.0),  # left: no side key
+        (None, 77.0),
+        (None, 77.0),
+        ("right", 301.5),
+        ("right", 302.0),
+    ]
+    assert [point["x"] for point in mem_5["calibration"]["points"]] == [12.5, 180.25]
+    assert mem_1["calibration"]["ladder_kda"][0] == 250.0
+    assert mem_1["calibration"]["fit_method"] == "log_linear_piecewise"
+    assert "ladder_kda" not in mem_5["calibration"]
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project) != content_hash(make_project())
+    assert _saved(tmp_path / "b", loaded).read_bytes() == data
+
+
 # --- The action log in project.json ---
 
 
@@ -788,6 +901,96 @@ def test_a_migrated_project_is_saved_in_the_new_schema_once(tmp_path):
     assert project_to_json(again) == path.read_bytes()
 
 
+def test_reading_with_a_backup_keeps_an_older_file_before_migrating_it(tmp_path):
+    folder = tmp_path / "v1 µ"
+    write_image_files(folder, make_project())
+    v1 = document_bytes(_v1_file())
+    (folder / storage.PROJECT_FILE).write_bytes(v1)
+    # Without a backup asked for, reading writes nothing, and the entry names none.
+    loaded, migrated = read_project(folder, clock=FakeClock())
+    assert migrated and "backup" not in loaded.log[-1].params
+    assert sorted(path.name for path in folder.iterdir()) == ["images", storage.PROJECT_FILE]
+
+    kept, migrated = read_project(folder, clock=FakeClock(), backup=True)
+    assert migrated and kept.log[-1].params == {**loaded.log[-1].params, "backup": BACKUP}
+    assert (folder / BACKUP).read_bytes() == v1
+    assert (folder / storage.PROJECT_FILE).read_bytes() == v1  # still unmigrated
+    # A later read of the same file names the same backup, left as it was.
+    assert read_project(folder, clock=FakeClock(), backup=True)[0] == kept
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "images",
+        storage.PROJECT_FILE,
+        BACKUP,
+    ]
+
+    # A file of the current schema is not migrated: no backup.
+    current = tmp_path / "current α"
+    _saved(current, make_project())
+    assert not read_project(current, backup=True)[1]
+    assert sorted(path.name for path in current.iterdir()) == [
+        "exports",
+        "images",
+        storage.PROJECT_FILE,
+    ]
+
+
+def test_a_missing_image_refuses_the_read_before_any_backup(tmp_path):
+    folder = tmp_path / "v1 β"
+    write_image_files(folder, make_project())
+    (folder / storage.PROJECT_FILE).write_bytes(document_bytes(_v1_file()))
+    (folder / "images" / "img-6.jpg").unlink()
+    with pytest.raises(MissingImageError):
+        read_project(folder, backup=True)
+    assert not (folder / BACKUP).exists()
+
+
+def test_keep_backup_never_replaces_a_file(tmp_path):
+    assert keep_backup(tmp_path, b"first", 1) == BACKUP
+    assert keep_backup(tmp_path, b"first", 1) == BACKUP  # the one holding it already
+    assert keep_backup(tmp_path, b"second", 1) == "project.schema1 (2).json"
+    (tmp_path / "project.schema1 (3).json").mkdir()  # not a file: passed over
+    assert keep_backup(tmp_path, b"third", 1) == "project.schema1 (4).json"
+    assert keep_backup(tmp_path, b"second", 1) == "project.schema1 (2).json"
+    assert keep_backup(tmp_path, b"first", 3) == "project.schema3.json"
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == {
+        BACKUP: b"first",
+        "project.schema1 (2).json": b"second",
+        "project.schema1 (4).json": b"third",
+        "project.schema3.json": b"first",
+    }
+
+
+def test_backup_references_are_the_image_names_in_any_backup(tmp_path):
+    assert backup_references(tmp_path / "missing") is None  # unknown
+    assert backup_references(tmp_path) == frozenset()
+    (tmp_path / BACKUP).write_bytes(document_bytes(_v1_file()))
+    # Read as bytes, whatever the schema, even when it no longer loads; a
+    # backup's name is compared ignoring case.
+    (tmp_path / "PROJECT.SCHEMA7 (2).JSON").write_bytes(
+        b"not json: IMG-7.TIFF, img-8.tif.bak, img-9.tiffx, img-10.jpgx, img-11.jpeg"
+    )
+    (tmp_path / storage.PROJECT_FILE).write_bytes(b'"img-50.tif"')  # not a backup
+    (tmp_path / "notes.json").write_bytes(b'"img-60.tif"')
+    (tmp_path / "project.schema9.json").mkdir()  # not a file
+    assert backup_references(tmp_path) == frozenset(
+        {"img-2.tif", "img-3.png", "img-4.tif", "img-6.jpg"}
+        | {"IMG-7.TIFF", "img-8.tif", "img-11.jpeg"}
+    )
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root ignores"
+)
+def test_the_references_of_a_backup_that_cannot_be_read_are_unknown(tmp_path):
+    backup = tmp_path / BACKUP
+    backup.write_bytes(b'"img-2.tif"')
+    backup.chmod(0)
+    try:
+        assert backup_references(tmp_path) is None
+    finally:
+        backup.chmod(0o644)
+
+
 def test_a_file_changed_before_its_migration_is_reported():
     doc = _v1_file()
     doc["batch"]["proteins"][0]["bands"][0]["net"] += 1.0  # by hand, outside the log
@@ -1048,6 +1251,17 @@ def test_orphan_files_lists_unreferenced_files(tmp_path):
     stale = tmp_path / "images" / ".img-20.tif.abc.part"
     stale.write_bytes(b"partial")
     assert orphan_files(project, tmp_path) == [stale, tmp_path / "images" / "img-19.tif"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_backup_is_as_readable_as_the_project_file_it_copies(tmp_path):
+    # A project.json the user kept to themself (0600): its copy is not left
+    # readable by others.
+    original = tmp_path / "project.json"
+    original.write_bytes(b"{}")
+    original.chmod(0o600)
+    name = keep_backup(tmp_path, b"{}", 1)
+    assert (tmp_path / name).stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")

@@ -24,7 +24,8 @@ then autosaves. So an edit is all or nothing:
 * Every committed change appends one log entry (see
   :class:`~proteia.core.model.LogEntry`); a refusal or a no-op appends none, and
   so do :func:`compute_view`, :func:`compute`, :func:`export_lane_table`,
-  :func:`export_bundle` and :func:`save`, which change no state. The params
+  :func:`export_bundle`, :func:`save`, :func:`propose_ladder` and
+  :func:`snap_ladder`, which change no state. The params
   record the inputs as they took effect (cleaned text, the stored spelling, the
   proposed lane, the snapped rect, the size used) and the ids created or
   removed; objects are named by id, never by path or typed text.
@@ -38,8 +39,9 @@ then autosaves. So an edit is all or nothing:
 Stored values that depend on pixels or geometry are recomputed by the operation
 that invalidates them, in the same change, so the logged content hash covers
 them: :func:`_quantify_image` is the one writer of a band's net, background
-fields and ``clipped`` and ``possibly_clipped`` flags, and :func:`_set_box` the
-one place a box moves (it clears the position-derived ``apparent_mw``). The
+fields and ``clipped`` and ``possibly_clipped`` flags, :func:`_refresh_mw` the
+one writer of a band's ``apparent_mw`` and a membrane's ``fit_method`` and
+``fit_quality`` (see below), and :func:`_set_box` the one place a box moves. The
 invariant: for every image, every band's stored net, ``background_level``,
 ``background_mode``, ``background_spread``, ``clipped`` and ``possibly_clipped``
 equal :func:`~proteia.core.quantify.band_backgrounds`,
@@ -66,16 +68,58 @@ check assesses (a lossy, colour or CMYK image of known bit depth): the one
 exception to the invariant, until an edit re-quantifies the image or
 :func:`requantify` does (:func:`unassessed_images`).
 
+Molecular weights (#58). A band's ``apparent_mw`` is its image's calibration
+(:func:`~proteia.core.mwcal.calibration_for`: the image's register group,
+fitted from its points) at the centre of its box, at the protein's box size,
+padding included; None where the image has no curve or the centre lies outside
+its range. A membrane's ``fit_method`` and ``fit_quality`` are
+:func:`~proteia.core.mwcal.fit_method` and :func:`~proteia.core.mwcal.fit_quality`
+of its points. Like nets, they are recomputed by the operation that
+invalidates them, in the same change, and loading never recomputes them:
+:func:`_refresh_mw` refits a membrane whose calibration points or marker links
+changed, and rewrites a band's MW exactly when the band is new, its box moved
+or was resized, or its image's curve changed; a band left where it was keeps
+what it holds. The operations that place, move or resize boxes
+(:func:`place_box`, :func:`move_box`, :func:`set_box_size`,
+:func:`set_box_padding`, :func:`detect_row_boxes`), change a calibration or a
+marker link (:func:`set_marker_image`, :func:`set_ladder`,
+:func:`add_calibration_point`, :func:`edit_calibration_point`,
+:func:`remove_calibration_point`, :func:`clear_calibration`,
+:func:`set_ladder_points`) or remove an image call it. A calibration that
+no #58 build has fitted (a project saved before #58) keeps its stored fit
+and MWs until one of them refits it; that refit counts as a change to the
+curve of every image of its membrane, so it rewrites every MW on the
+membrane and drops the MW-guided records there. An
+operation on calibration points or a marker link logs its register group's
+fit after the change (:class:`CalibrationFit`), the images whose curve changed
+and the records it dropped.
+
+Band counts (#58, D10). A band a row commit places (:func:`detect_row_boxes`)
+stores ``bands_found``: the bands its lane holds in the count window around its
+box (:func:`~proteia.core.results.count_window`: its protein's MW tolerance
+either way on its image's calibration, or the row box's rows without a
+curve), read from the detector's peaks (:func:`~proteia.core.rowdetect.bands_in`).
+It belongs to that detection and cannot be redone from the model, so an edit
+that invalidates it clears it in the same change: the box moved or given
+another lane by hand (:func:`move_box`, :func:`set_box_lane`), its image's
+polarity (:func:`set_polarity`) or curve (:func:`_refresh_mw`) changed, its
+protein's MW tolerance changed where the window came from it (its image has a
+curve), or an MW-guided band's expected MW changed (:func:`edit_protein`).
+Resizing or padding the boxes keeps it. Like nets, a cleared count is a field
+of a band with an id and is not logged: a calibration operation's
+``curves_changed`` names the images whose counts went.
+
 A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
 detector's measurement that cannot be redone from the model alone, so an edit
 that invalidates one drops it, in the same change, and logs it in full: a box
 placed or moved into its lane replaces it (``replaced_undetected``), and a
 polarity change or a lane table that cuts its lane drops it
 (``dropped_undetected``). An MW-guided record searched a slot placed from the
-protein's expected MW and its membrane's calibration, so a change to the
-expected MW drops that protein's MW-guided records, and a change to the
-calibration (points removed with their image) drops those of every protein on
-the membrane (``dropped_undetected``). A removed protein or image takes its
+protein's expected MW and its image's calibration, so a change to the
+expected MW drops that protein's MW-guided records, and a change to the curve
+of an image (its register group's calibration points, or the marker links
+that make the group) drops those of every protein on it
+(``dropped_undetected``). A removed protein or image takes its
 proteins' records along, and the log lists them whole (``removed_undetected``),
 since they have no ids; clearing a protein's boxes (:func:`clear_boxes`)
 drops its records too. Removing a box never creates a record: the lane becomes
@@ -92,19 +136,23 @@ committed change took, as it first took them: a band whose background was
 measured another way (``asymmetric`` or ``image``: its ring cut short), a band
 whose over-exposure could not be checked (its image's warnings or unknown bit
 depth say why, and whether it is assessed near the limit instead), an image
-imported with warnings, and a row box whose detector warned or left lanes it
-could not locate; and the exports written. None of it changes what they do.
+imported with warnings, a row box whose detector warned or left lanes it
+could not locate, a calibration point whose click found nothing to snap
+to (the clicked position was kept), and a ladder ruler applied from a
+proposal whose labels may be one band off (its gap is low); and the exports
+written. None of it changes what they do.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import logging
 import math
 import shutil
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Concatenate, Final
@@ -112,7 +160,7 @@ from typing import Any, BinaryIO, Concatenate, Final
 import numpy as np
 from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, export, record, results, rowdetect, storage
+from proteia.core import boxes, export, ladders, mwcal, record, results, rowdetect, storage
 from proteia.core.analyze import ReduceMethod, StatisticsSetting, statistics_setting
 from proteia.core.export import (
     BUNDLE_RECORD_FILE,
@@ -141,9 +189,13 @@ from proteia.core.model import (
     Box,
     BoxPadding,
     BoxSize,
+    CalibrationPoint,
+    CalibrationPointSource,
+    FitMethod,
     ImageKind,
     ImageRef,
     ImageWarning,
+    LadderSide,
     Lane,
     Membrane,
     Polarity,
@@ -205,12 +257,15 @@ __all__ = [
     "KEEP",
     "LANE_TABLE_FILE",
     "LANE_TABLE_RECORD_FILE",
+    "CalibrationFit",
+    "CalibrationUpdate",
     "Cascade",
     "ClearedBoxes",
     "ComputedView",
     "ErrorCode",
     "ExportBundle",
     "Keep",
+    "LadderFit",
     "LaneInput",
     "LanesUpdate",
     "OperationError",
@@ -218,11 +273,15 @@ __all__ = [
     "ProjectSession",
     "Restored",
     "RowPlacement",
+    "add_calibration_point",
     "add_protein",
+    "calibration_fit",
     "clear_boxes",
+    "clear_calibration",
     "compute",
     "compute_view",
     "detect_row_boxes",
+    "edit_calibration_point",
     "edit_protein",
     "export_bundle",
     "export_lane_table",
@@ -231,8 +290,11 @@ __all__ = [
     "new_project",
     "open_project",
     "place_box",
+    "proposal_json",
+    "propose_ladder",
     "redo",
     "remove_box",
+    "remove_calibration_point",
     "remove_image",
     "remove_protein",
     "remove_undetected",
@@ -241,9 +303,13 @@ __all__ = [
     "set_box_lane",
     "set_box_padding",
     "set_box_size",
+    "set_ladder",
+    "set_ladder_points",
     "set_lanes",
+    "set_marker_image",
     "set_polarity",
     "set_reference_condition",
+    "snap_ladder",
     "unassessed_images",
     "undo",
 ]
@@ -286,7 +352,8 @@ class Cascade:
     removed: tuple[str, ...]  # every removed id: the object, then proteins, bands, membrane
     detached_targets: tuple[str, ...]  # targets that lost a loading control
     unpaired_images: tuple[str, ...]  # images whose marker_image_id was cleared
-    unfitted_membranes: tuple[str, ...]  # lost calibration points: fit and apparent MWs cleared
+    # calibration lost points: refitted, or left without a curve
+    unfitted_membranes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -412,6 +479,113 @@ class PaddingChange:
     overlapping: tuple[str, ...]  # other proteins' boxes on the image its boxes newly overlap
     remeasured: tuple[tuple[str, float, float], ...] = ()  # other proteins' nets it changed
     largest_change: tuple[str, float] | None = None  # (band id, share of its net before)
+
+
+def _finite(value: float | None) -> float | None:
+    """``value`` for JSON, which has no infinity: None when it is not finite."""
+    return value if value is not None and math.isfinite(value) else None
+
+
+def _display_mw(z: float) -> float:
+    """``10 ** z``, a range end for display; inf past the largest float (only a
+    ladder labelled near it reaches that)."""
+    try:
+        return 10.0**z
+    except OverflowError:
+        return math.inf
+
+
+@dataclass(frozen=True)
+class LadderFit:
+    """One ladder of a register group as fitted (:class:`~proteia.core.mwcal.Ladder`)."""
+
+    side: str  # "left" or "right"
+    x: float | None  # the median of its points' x; None when none has one
+    points: int
+    # D2: the largest relative MW disagreement of an interior point with the line
+    # between its neighbours; None with two points; inf past the largest float
+    quality: float | None
+    worst_mw: float | None  # the point it names, as labelled
+    predicted_mw: float | None  # where its neighbours put it
+    two_point: bool
+    range: tuple[float, float]  # the lowest and highest MW in range, for display
+
+    def as_json(self) -> dict[str, JsonValue]:
+        """JSON-plain: an infinite quality is null, with ``quality_infinite``."""
+        return {
+            "side": self.side,
+            "x": self.x,
+            "points": self.points,
+            "quality": _finite(self.quality),
+            "quality_infinite": self.quality is not None and not math.isfinite(self.quality),
+            "worst_mw": self.worst_mw,
+            "predicted_mw": self.predicted_mw,
+            "two_point": self.two_point,
+            "range": [_finite(end) for end in self.range],
+        }
+
+
+@dataclass(frozen=True)
+class CalibrationFit:
+    """A register group's calibration as fitted
+    (:class:`~proteia.core.mwcal.Calibration`): what a calibration operation
+    logs and the page shows.
+
+    ``offset_px`` is how much lower the right ladder runs than the left one
+    and ``tilt_deg`` the slope that gives across the blot; ``disagreement`` is
+    how far the two ladders disagree once that offset is taken out, at the MW
+    ``disagreement_mw``. All three are None with one ladder. ``ignored`` lists
+    the sides not used and why (``one_point``, ``few_shared_mws``)."""
+
+    image_ids: tuple[str, ...]  # the register group, in membrane order
+    method: str
+    ladders: tuple[LadderFit, ...]  # 1 or 2, left first
+    range: tuple[float, float]  # the MWs in range (both ladders' with two), for display
+    offset_px: float | None
+    tilt_deg: float | None
+    disagreement: float | None  # inf past the largest float (degenerate ladders only)
+    disagreement_mw: float | None
+    ignored: tuple[tuple[str, str], ...]  # (side, reason)
+
+    def as_json(self) -> dict[str, JsonValue]:
+        """JSON-plain (it has no infinity): an infinite quality or disagreement
+        is null, with ``quality_infinite`` or ``disagreement_infinite`` true."""
+        disagreement = self.disagreement
+        return {
+            "image_ids": list(self.image_ids),
+            "method": self.method,
+            "ladders": [ladder.as_json() for ladder in self.ladders],
+            "range": [_finite(end) for end in self.range],
+            "offset_px": self.offset_px,
+            "tilt_deg": self.tilt_deg,
+            "disagreement": _finite(disagreement),
+            "disagreement_infinite": disagreement is not None and not math.isfinite(disagreement),
+            "disagreement_mw": self.disagreement_mw,
+            "ignored": [[side, reason] for side, reason in self.ignored],
+        }
+
+
+@dataclass(frozen=True)
+class CalibrationUpdate:
+    """What a calibration operation did.
+
+    ``point`` is the point as stored, with ``snapped`` (whether the given y
+    was moved onto a band or edge), for an operation that adds or edits one;
+    ``fit`` the register group's calibration after (None without a curve);
+    ``curves_changed`` the images whose curve appeared, went or moved (every
+    image of a membrane whose fit from before #58 was replaced), in
+    membrane order; and ``dropped_undetected`` the MW-guided not-detected
+    records dropped from the proteins on them, as (protein id, lane index,
+    band index)."""
+
+    point: dict[str, JsonValue] | None
+    fit: CalibrationFit | None
+    curves_changed: tuple[str, ...]
+    dropped_undetected: tuple[tuple[str, int, int], ...]
+    # set_ladder_points: the points applied, as stored, each with how it was
+    # placed; and whether they went to the other side than the one given.
+    points: tuple[dict[str, JsonValue], ...] = ()
+    sides_swapped: bool = False
 
 
 # --- Common machinery ---
@@ -566,8 +740,9 @@ def _drop_undetected_where(
 
 def _drop_mw_guided(protein: Protein) -> list[dict[str, JsonValue]]:
     """Remove a draft protein's MW-guided records: the slot each one examined was
-    placed from the expected MW and the membrane's calibration, so a change to
-    either leaves the record about a slot nobody looked in."""
+    placed from the expected MW and its image's calibration curve (its register
+    group's), so a change to either leaves the record about a slot nobody
+    looked in."""
     return _drop_undetected_where(protein, lambda record: record.source is ProposalSource.MW_GUIDED)
 
 
@@ -671,8 +846,157 @@ def _pixels_left(
 
 
 def _set_box(band: Band, rect: Rect) -> None:
+    # Its apparent MW follows in the same change (_refresh_mw).
     band.box = Box(x=rect[0], y=rect[1])
-    band.apparent_mw = None  # position-derived (#58); stale once the box changes
+
+
+# --- Molecular weights: the one writer ---
+
+_Fitted = mwcal.Calibration | mwcal.NoCalibration
+
+
+def _fits(project: Project) -> dict[str, _Fitted]:
+    """Each image's register group, fitted, by image id."""
+    fits: dict[str, _Fitted] = {}
+    for membrane in project.batch.membranes:
+        for group, fitted in mwcal.calibrations(membrane).items():
+            fits.update(dict.fromkeys(group, fitted))
+    return fits
+
+
+def _curve(fitted: _Fitted | None) -> object:
+    """What an image's curve depends on, to tell whether it changed: the
+    method, the ladders as marked (their x, points and sources) and the sides
+    not used; None without a curve. The group itself is left out: an image
+    joining another's group changes neither's curve unless its points do."""
+    if isinstance(fitted, mwcal.Calibration):
+        return fitted.method, fitted.ladders, fitted.ignored
+    return None
+
+
+def _point_key(point: CalibrationPoint) -> tuple:
+    return point.side.value, point.y, point.mw, point.source.value, point.image_id, point.x
+
+
+def _calibration_inputs(membrane: Membrane) -> tuple:
+    """What a membrane's fit depends on: its points and its marker links."""
+    return (
+        sorted(_point_key(point) for point in membrane.calibration.points),
+        [(image.id, image.marker_image_id) for image in membrane.images if image.marker_image_id],
+    )
+
+
+def _fitted_before_58(membrane: Membrane, batch: Batch) -> bool:
+    """Whether a membrane holds a fit or apparent MWs no #58 build computed
+    (a project saved before #58, or a hand-made file): a stored ``log_linear``
+    beside a curve, a fit quality or an MW. A #58 build stores ``log_linear``
+    only while no image of the membrane has a curve, and then no fit quality
+    and no MW."""
+    calibration = membrane.calibration
+    if calibration.fit_method is not FitMethod.LOG_LINEAR:
+        return False
+    if (
+        calibration.fit_quality is not None
+        or mwcal.fit_method(membrane) is not FitMethod.LOG_LINEAR
+    ):
+        return True
+    images = {image.id for image in membrane.images}
+    return any(
+        band.apparent_mw is not None
+        for protein in batch.proteins
+        if protein.image_id in images
+        for band in protein.bands
+    )
+
+
+def _apparent_mw(fitted: _Fitted, box: Box, size: BoxSize) -> float | None:
+    """The MW at a box's centre (at the size it is quantified at, padding
+    included); None without a curve or outside its range."""
+    if not isinstance(fitted, mwcal.Calibration):
+        return None
+    try:
+        mw = fitted.mw_at(box.x + size.width / 2, box.y + size.height / 2)
+    except OverflowError:  # past the largest float: only a ladder labelled near it
+        return None
+    return mw if mw is not None and 0.0 < mw < math.inf else None
+
+
+@dataclass(frozen=True)
+class _MwRefresh:
+    """What :func:`_refresh_mw` did beyond the values it wrote."""
+
+    curves_changed: tuple[str, ...]  # images whose curve changed, as its steps 2 and 3 say
+    dropped: tuple[dict[str, JsonValue], ...]  # the MW-guided records dropped, whole
+
+
+def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
+    """The one writer of the molecular-weight values (#58), at the end of a
+    change: diff ``draft`` against ``committed`` and
+
+    1. refit each membrane whose calibration points or marker links changed:
+       its ``fit_method`` (:func:`~proteia.core.mwcal.fit_method`), then its
+       ``fit_quality`` (:func:`~proteia.core.mwcal.fit_quality`);
+    2. recompute the ``apparent_mw`` of every band that is new, whose box
+       moved or was resized, or whose image's curve changed (appeared, went,
+       or its ladders changed);
+    3. drop the MW-guided not-detected records of every protein on an image
+       whose curve changed, and clear the band counts (``bands_found``) of
+       every band there: their slot and count window came from the old curve.
+
+    A refit of a fit no #58 build computed (:func:`_fitted_before_58`)
+    changes the curve of every image of its membrane: their stored MWs came
+    from that older fit, not from the curve they are read with now.
+
+    A calibration whose fit quality would be infinite (points labelled
+    hundreds of decades apart) is refused (``INVALID_INPUT``): no file can
+    store it."""
+    before = {membrane.id: membrane for membrane in committed.batch.membranes}
+    refitted_older: set[str] = set()  # the images of membranes whose older fit was replaced
+    for membrane in draft.batch.membranes:
+        stored = before.get(membrane.id)
+        if stored is not None and _calibration_inputs(stored) == _calibration_inputs(membrane):
+            continue
+        if stored is not None and _fitted_before_58(stored, committed.batch):
+            refitted_older.update(image.id for image in membrane.images)
+        calibration = membrane.calibration
+        calibration.fit_method = mwcal.fit_method(membrane)
+        quality = mwcal.fit_quality(membrane)
+        if quality is not None and not math.isfinite(quality):
+            raise _invalid(
+                f"membrane {membrane.id}: its calibration points' MWs are too far apart for"
+                " their positions to be fitted; check their labels"
+            )
+        calibration.fit_quality = quality
+    old, new = _fits(committed), _fits(draft)
+    changed = [
+        image.id
+        for image in draft.batch.iter_images()
+        if image.id in refitted_older or _curve(new[image.id]) != _curve(old.get(image.id))
+    ]
+    moved_curves = set(changed)
+    boxes_before = {
+        band.id: (band.box, protein.box_size)
+        for protein in committed.batch.proteins
+        for band in protein.bands
+    }
+    dropped: list[dict[str, JsonValue]] = []
+    for protein in draft.batch.proteins:
+        fitted, size = new[protein.image_id], protein.box_size
+        for band in protein.bands:
+            if protein.image_id in moved_curves or boxes_before.get(band.id) != (band.box, size):
+                band.apparent_mw = _apparent_mw(fitted, band.box, size)
+        if protein.image_id in moved_curves:
+            dropped.extend(_drop_mw_guided(protein))
+            for band in protein.bands:
+                band.bands_found = None
+    return _MwRefresh(curves_changed=tuple(changed), dropped=tuple(dropped))
+
+
+def _refresh_box_mws(committed: Project, draft: Project) -> None:
+    """:func:`_refresh_mw` after an edit of boxes, which changes no
+    calibration: the MWs of the bands it placed, moved or resized."""
+    if _refresh_mw(committed, draft).curves_changed:  # unreachable: no point or link changed
+        raise RuntimeError("an edit of boxes changed a calibration curve")
 
 
 def _remeasured(
@@ -799,6 +1123,30 @@ def _expected_mw(value: object) -> float | None:
     if number is None or not math.isfinite(number) or number <= 0:
         raise _invalid(f"expected molecular weight must be a positive number of kDa, not {value!r}")
     return number
+
+
+def _mw_tolerance(value: object) -> float:
+    """An MW tolerance as a share: a number above 0 and below 1 (0.1 is ±10%)."""
+    number: float | None = None
+    if not isinstance(value, bool) and isinstance(value, int | float):
+        try:
+            number = float(value)
+        except OverflowError:
+            number = None
+    if number is None or not 0.0 < number < 1.0:  # NaN fails both
+        raise _invalid(
+            f"MW tolerance must be a share above 0 and below 1 (0.1 is ±10%), not {value!r}"
+        )
+    return number
+
+
+def _count_cleared_by_tolerance(batch: Batch, protein: Protein) -> bool:
+    """Whether a new MW tolerance clears the protein's band counts: their count
+    window was sized from it, as it is wherever its image has a curve (a curve
+    change clears them, so a count there was made with that curve); without
+    one, the window is the row box's rows."""
+    membrane = batch.membrane_of(protein.image_id)
+    return isinstance(mwcal.calibration_for(membrane, protein.image_id), mwcal.Calibration)
 
 
 def _loading_controls(batch: Batch, protein_id: str | None, role: Role, ids: object) -> list[str]:
@@ -1137,16 +1485,19 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
     """Remove an image with the proteins, bands and not-detected records on it.
 
     Targets using a removed loading control, by name or as the batch's only
-    one, are detached and reported, marker pairings to the image are cleared, and calibration
-    points on it are dropped, which clears the membrane's fit, its bands'
-    apparent MWs and its proteins' MW-guided records. A membrane left with no
-    image is removed. The file is deleted once the removal can no longer be
-    undone, at the next save or import after that (see
-    :mod:`proteia.core.session`). The log lists the removed records
+    one, are detached and reported, marker pairings to the image are cleared,
+    and calibration points on it are dropped (``unfitted_membranes``). The
+    membrane is refitted from what is left (:func:`_refresh_mw`): each image
+    whose curve changed, a marker's group split or a ladder's points gone, gets
+    its bands' apparent MWs recomputed and loses its proteins' MW-guided
+    records. A membrane left with no image is removed. The file is deleted once
+    the removal can no longer be undone, at the next save or import after that
+    (see :mod:`proteia.core.session`). The log lists the removed records
     (``removed_undetected``) and the MW-guided ones dropped
     (``dropped_undetected``) in full.
     """
-    session.project.batch.find_image(image_id)
+    committed = session.project
+    committed.batch.find_image(image_id)
 
     def change(draft: Project) -> tuple[Cascade, list[JsonValue], list[JsonValue]]:
         batch = draft.batch
@@ -1176,23 +1527,16 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
         membrane = batch.membrane_of(image_id)
         membrane.images = [image for image in membrane.images if image.id != image_id]
         unfitted = []
-        dropped: list[JsonValue] = []
         calibration = membrane.calibration
         points = [point for point in calibration.points if point.image_id != image_id]
         if len(points) != len(calibration.points):
             calibration.points = points
-            calibration.fit_quality = None  # the fit no longer matches its points (#58 refits)
-            on_membrane = {image.id for image in membrane.images}
-            for protein in batch.proteins:
-                if protein.image_id in on_membrane:
-                    for band in protein.bands:
-                        band.apparent_mw = None
-                    dropped.extend(_drop_mw_guided(protein))
             if membrane.images:
                 unfitted.append(membrane.id)
         if not membrane.images:
             batch.membranes = [m for m in batch.membranes if m.id != membrane.id]
             removed.append(membrane.id)
+        dropped: list[JsonValue] = list(_refresh_mw(committed, draft).dropped)
         cascade = Cascade(
             removed=tuple(removed),
             detached_targets=tuple(detached),
@@ -1225,7 +1569,8 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     The not-detected records of every protein on the image are dropped and
     logged: their SNR was measured with the other signal direction, against the
     row's fitted background, so it cannot be recomputed here. A later detection
-    run writes them again.
+    run writes them again. The band counts there (#58) go too, for the same
+    reason.
     """
     polarity = _member(Polarity, polarity, "polarity")
     batch = session.project.batch
@@ -1241,6 +1586,10 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
         drafted.import_warnings = warnings
         if array is not None:
             _quantify_image(draft, image_id, array)
+        for protein in draft.batch.proteins:
+            if protein.image_id == image_id:
+                for band in protein.bands:
+                    band.bands_found = None
         return [
             dropped
             for protein in draft.batch.proteins
@@ -1285,6 +1634,1100 @@ def _processed_again(
         background=image.background,
         palette=palette,
     )
+
+
+# --- Molecular-weight calibration (#58) ---
+
+# The image kinds each calibration point source may be marked on.
+_SOURCE_KINDS: Final = {
+    CalibrationPointSource.VISIBLE_MARKER: frozenset({ImageKind.VISIBLE_MARKER, ImageKind.MERGED}),
+    CalibrationPointSource.CHEMILUMINESCENCE_MARKER: frozenset(
+        {ImageKind.CHEMILUMINESCENCE, ImageKind.MERGED}
+    ),
+    CalibrationPointSource.STRIP_EDGE: frozenset(ImageKind),
+}
+# The image kinds a chemiluminescence image may take as its marker image (D4).
+_MARKER_KINDS: Final = frozenset({ImageKind.VISIBLE_MARKER, ImageKind.MERGED})
+
+
+def calibration_fit(membrane: Membrane, image_id: str) -> CalibrationFit | None:
+    """The calibration of the register group holding ``image_id`` on
+    ``membrane`` (:func:`~proteia.core.mwcal.calibration_for`), as the page
+    shows it and the calibration operations log it; None without a curve."""
+    fitted = mwcal.calibration_for(membrane, image_id)
+    if not isinstance(fitted, mwcal.Calibration):
+        return None
+    ladder_fits = []
+    for ladder in fitted.ladders:
+        quality = ladder.quality
+        ladder_fits.append(
+            LadderFit(
+                side=ladder.side.value,
+                x=ladder.x,
+                points=len(ladder.ys),
+                quality=None if quality is None else quality.value,
+                worst_mw=None if quality is None else quality.mw,
+                predicted_mw=None if quality is None else quality.predicted_mw,
+                two_point=len(ladder.ys) == 2,
+                range=(_display_mw(ladder.curve.z_lo), _display_mw(ladder.curve.z_hi)),
+            )
+        )
+    disagreement = fitted.disagreement
+    return CalibrationFit(
+        image_ids=tuple(image.id for image in membrane.images if image.id in fitted.group),
+        method=fitted.method.value,
+        ladders=tuple(ladder_fits),
+        range=(_display_mw(fitted.z_lo), _display_mw(fitted.z_hi)),
+        offset_px=fitted.offset_px,
+        tilt_deg=fitted.tilt_deg,
+        disagreement=None if disagreement is None else disagreement.value,
+        disagreement_mw=None if disagreement is None else disagreement.mw,
+        ignored=tuple((side.value, reason) for side, reason in fitted.ignored),
+    )
+
+
+def _point_json(point: CalibrationPoint) -> dict[str, JsonValue]:
+    """A calibration point as a log entry names it: whole, since it has no id."""
+    return {
+        "image_id": point.image_id,
+        "y": point.y,
+        "mw": point.mw,
+        "source": point.source.value,
+        "x": point.x,
+        "side": point.side.value,
+    }
+
+
+def _number(value: object, what: str) -> float:
+    """A finite number as a float (not True or False), else ``INVALID_INPUT``."""
+    number: float | None = None
+    if not isinstance(value, bool) and isinstance(value, int | float):
+        try:
+            number = float(value) + 0.0  # an int too large for a float raises OverflowError
+        except OverflowError:
+            number = None
+    if number is None or not math.isfinite(number):
+        raise _invalid(f"{what} must be a finite number, not {value!r}")
+    return number
+
+
+def _kda(value: object, what: str = "molecular weight") -> float:
+    """A positive, finite number of kDa, else ``INVALID_INPUT``."""
+    try:
+        number = _number(value, what)
+    except OperationError:
+        number = 0.0
+    if number <= 0:
+        raise _invalid(f"{what} must be a positive number of kDa, not {value!r}")
+    return number
+
+
+def _bool(value: object, what: str) -> bool:
+    if not isinstance(value, bool):
+        raise _invalid(f"{what} must be True or False, not {value!r}")
+    return value
+
+
+def _within_image(image: ImageRef, *, x: float | None, y: float | None) -> None:
+    """``OUT_OF_IMAGE`` for a position past the image's edges (a calibration
+    point's continuous coordinates run from 0 to the width and height)."""
+    for value, name, extent in ((x, "x", image.width), (y, "y", image.height)):
+        if value is not None and not 0 <= value <= extent:
+            raise OperationError(
+                ErrorCode.OUT_OF_IMAGE,
+                f"{name}={value:g} is outside the {image.width}x{image.height} image {image.id}",
+                ids=(image.id,),
+            )
+
+
+def _group_names(membrane: Membrane, group: frozenset[str]) -> str:
+    """A register group's images, in membrane order, as refusals name them."""
+    return ", ".join(image.id for image in membrane.images if image.id in group)
+
+
+def _ladder_refusal(
+    membrane: Membrane,
+    group: frozenset[str],
+    points: Sequence[CalibrationPoint],
+    new: CalibrationPoint | None = None,
+) -> OperationError | None:
+    """The refusal of the calibration points ``points`` of one register group,
+    as a change would leave them, or None: the rules the model checks, in its
+    order, each with its code. Per ladder side, two points at one MW
+    (``DUPLICATE_MW``), two at one y or MWs out of order down the image
+    (``CALIBRATION_ORDER``); then a right ladder beside a strip edge or a point
+    with no x, or not right of the left one (``LADDER_SIDES``). ``new`` is the
+    point added or edited, whose neighbours an order refusal names; otherwise
+    it names the two points in conflict (points joined by a marker link).
+
+    Each refusal's ``detail`` holds what a page words it with, never an id or
+    a position: the ladder ``side`` and the ``mw`` held twice; the ``side``,
+    the ``reason`` (``order`` or ``same_height``) and the MWs of the two points
+    in conflict, the ``upper`` one's (the smaller y) and the ``lower`` one's;
+    or the ``reason`` the sides are refused (``strip_edge``, ``no_x`` with the
+    ``side`` and ``mw`` of the point without its x, or ``not_right``)."""
+    names = _group_names(membrane, group)
+    head = f"membrane {membrane.id}:"
+
+    def at(point: CalibrationPoint) -> str:
+        return f"{point.mw:g} kDa at y={point.y:g} on {point.image_id}"
+
+    def conflict(
+        reason: str, upper: CalibrationPoint, lower: CalibrationPoint
+    ) -> dict[str, JsonValue]:
+        return {"side": upper.side.value, "reason": reason, "upper": upper.mw, "lower": lower.mw}
+
+    for side in LadderSide:
+        ladder = sorted((p for p in points if p.side == side), key=lambda p: (p.y, p.mw))
+        where = f"the {side.value} ladder of {names}"
+        # On log10(MW), as the model compares them: 100 and 100.00000000000001 are one.
+        held: dict[float, CalibrationPoint] = {}
+        for point in ladder:
+            z = math.log10(point.mw)
+            other = held.get(z)
+            if other is not None:
+                if new is not None and (point is new or other is new):
+                    kept = other if point is new else point
+                    message = f"{head} {where} already has a point at {kept.mw:g} kDa ({at(kept)})"
+                else:
+                    message = (
+                        f"{head} {where} would hold {point.mw:g} kDa twice:"
+                        f" {at(other)} and {at(point)}"
+                    )
+                detail = {"side": side.value, "mw": point.mw}
+                return OperationError(ErrorCode.DUPLICATE_MW, message, detail=detail)
+            held[z] = point
+        for above, below in itertools.pairwise(ladder):
+            if above.y == below.y:
+                return OperationError(
+                    ErrorCode.CALIBRATION_ORDER,
+                    f"{head} two points at y={above.y:g} on {where}: {at(above)} and {at(below)};"
+                    " each ladder band lies at its own height",
+                    detail=conflict("same_height", above, below),
+                )
+        for above, below in itertools.pairwise(ladder):
+            if math.log10(below.mw) < math.log10(above.mw):
+                continue
+            if new is not None:
+                others = [p for p in ladder if p is not new]
+                heavier = [p for p in others if p.mw > new.mw]
+                lighter = [p for p in others if p.mw < new.mw]
+                bounds = []
+                if heavier:
+                    bounds.append(f"below {at(min(heavier, key=lambda p: p.mw))}")
+                if lighter:
+                    bounds.append(f"above {at(max(lighter, key=lambda p: p.mw))}")
+                message = (
+                    f"{head} {new.mw:g} kDa at y={new.y:g} is out of order on {where}: it"
+                    f" belongs {' and '.join(bounds)}, since lighter bands run further down"
+                )
+            else:
+                message = (
+                    f"{head} calibration points out of order on {where}: {at(below)} lies"
+                    f" below {at(above)}"
+                )
+            return OperationError(
+                ErrorCode.CALIBRATION_ORDER, message, detail=conflict("order", above, below)
+            )
+    right = [p for p in points if p.side == LadderSide.RIGHT]
+    if not right:
+        return None
+    for point in points:
+        if point.source is CalibrationPointSource.STRIP_EDGE:
+            return OperationError(
+                ErrorCode.LADDER_SIDES,
+                f"{head} {names} would have a right ladder and a strip edge"
+                f" ({at(point)}); a strip edge calibrates a group with one ladder only",
+                detail={"reason": "strip_edge"},
+            )
+        if point.x is None:
+            return OperationError(
+                ErrorCode.LADDER_SIDES,
+                f"{head} {names} would have a right ladder, so every point there needs the x it"
+                f" was marked at, and {at(point)} has none (it was saved before points recorded"
+                " their x): remove it and mark it again",
+                detail={"reason": "no_x", "side": point.side.value, "mw": point.mw},
+            )
+    left_x = [p.x for p in points if p.side == LadderSide.LEFT and p.x is not None]
+    right_x = min(p.x for p in right if p.x is not None)
+    if left_x and not max(left_x) < right_x:
+        return OperationError(
+            ErrorCode.LADDER_SIDES,
+            f"{head} the right ladder of {names} (x={right_x:g}) would not lie right of its left"
+            f" ladder (x={max(left_x):g}); the second ladder is the one right of the first",
+            detail={"reason": "not_right"},
+        )
+    return None
+
+
+def _calibration_target(batch: Batch, image_id: str) -> tuple[Membrane, ImageRef, frozenset[str]]:
+    """The membrane, the image and the register group a calibration request
+    names by any of the group's images (``UnknownIdError`` if none)."""
+    image = batch.find_image(image_id)
+    membrane = batch.membrane_of(image_id)
+    return membrane, image, membrane.group_of(image_id)
+
+
+def _find_point(membrane: Membrane, group: frozenset[str], side: LadderSide, mw: float) -> int:
+    """The index in the membrane's points of the point at ``mw`` on ``side`` of
+    the group (a point's identity: its group, side and MW, compared on
+    log10(MW) as the model does); ``UnknownIdError`` if there is none."""
+    z = math.log10(mw)
+    for index, point in enumerate(membrane.calibration.points):
+        if point.image_id in group and point.side == side and math.log10(point.mw) == z:
+            return index
+    raise UnknownIdError(
+        f"no calibration point at {mw:g} kDa on the {side.value} ladder of"
+        f" {_group_names(membrane, group)}"
+    )
+
+
+def _snapped(
+    session: ProjectSession,
+    point: CalibrationPoint,
+    image: ImageRef,
+    marked: Sequence[CalibrationPoint],
+) -> float | None:
+    """Where the point's click meant (:func:`~proteia.core.mwcal.refine_point`),
+    within the gaps between the points ``marked`` on its ladder; None when
+    nothing stands out there."""
+    if point.x is None:  # unreachable: snapping asks for the point's x first
+        raise RuntimeError("a calibration point without x cannot be snapped")
+    return mwcal.refine_point(
+        session.pixels(image.id),
+        point.x,
+        point.y,
+        source=point.source,
+        polarity=image.polarity,
+        marked_ys=[p.y for p in marked],
+    )
+
+
+_Calibrated = tuple[CalibrationFit | None, _MwRefresh]
+
+
+def _calibration_change(
+    session: ProjectSession,
+    image_id: str,
+    edit: Callable[[Project], None],
+    params: Mapping[str, JsonValue],
+) -> tuple[Callable[[Project], _Calibrated], Callable[[_Calibrated], _Params]]:
+    """The change and the log params of a calibration operation, for
+    :func:`_apply`: ``edit`` on the draft, then the one writer
+    (:func:`_refresh_mw`). The log entry holds ``params``, then the register
+    group's fit after (``fit``: :class:`CalibrationFit`, or None), the images
+    whose curve changed (``curves_changed``) and the MW-guided records dropped
+    from the proteins on them, in full (``dropped_undetected``). A change that
+    leaves the project as it was commits nothing."""
+    committed = session.project
+
+    def change(draft: Project) -> _Calibrated:
+        edit(draft)
+        refresh = _refresh_mw(committed, draft)
+        return calibration_fit(draft.batch.membrane_of(image_id), image_id), refresh
+
+    def logged(result: _Calibrated) -> _Params:
+        fit, refresh = result
+        return {
+            **params,
+            "fit": None if fit is None else fit.as_json(),
+            "curves_changed": list(refresh.curves_changed),
+            "dropped_undetected": list(refresh.dropped),
+        }
+
+    return change, logged
+
+
+def _calibration_update(
+    result: _Calibrated, point: dict[str, JsonValue] | None = None
+) -> CalibrationUpdate:
+    """The :class:`CalibrationUpdate` of a calibration change's result."""
+    fit, refresh = result
+    return CalibrationUpdate(
+        point=point,
+        fit=fit,
+        curves_changed=refresh.curves_changed,
+        dropped_undetected=tuple(
+            (record["protein_id"], record["lane_index"], record["band_index"])
+            for record in refresh.dropped
+        ),
+    )
+
+
+def _log_unsnapped(session: ProjectSession, before: Project, image_id: str, y: float) -> None:
+    """Log, once committed, a click that found no band or edge to snap to."""
+    if session.project is not before:
+        _log.info(
+            "in %r: no ladder band or edge stands out near y=%g on %s; the clicked position"
+            " is kept",
+            session.folder.name,
+            y,
+            image_id,
+        )
+
+
+@_locked
+def set_marker_image(
+    session: ProjectSession, image_id: str, marker_image_id: str | None
+) -> CalibrationUpdate:
+    """Link a chemiluminescence image to the marker image taken with it (a
+    visible-light marker or merged image of the same membrane, the same size
+    pixel for pixel: D4, D5), or unlink it with None. Linked images form one
+    register group, calibrated from all its points; unlinking splits a group.
+
+    Refused, changing nothing: an unknown id (``UnknownIdError``); an image
+    that is not a chemiluminescence image, or a marker that is not a
+    visible-light marker or merged image of its membrane (``INVALID_INPUT``);
+    images of other sizes (``MARKER_SIZE_MISMATCH``); groups whose points
+    conflict once joined (``DUPLICATE_MW``, ``CALIBRATION_ORDER`` or
+    ``LADDER_SIDES``, naming both points). The same link is a no-op.
+
+    The log entry holds ``membrane_id``, ``image_id``, ``marker_image_id``,
+    the link it replaced (``previous``), the image's group after (``group``),
+    and what :func:`_calibration_change` adds."""
+    batch = session.project.batch
+    image = batch.find_image(image_id)
+    membrane = batch.membrane_of(image_id)
+    marker = None
+    if marker_image_id is not None:
+        if not isinstance(marker_image_id, str):
+            raise _invalid(f"marker image id must be text or None, not {marker_image_id!r}")
+        marker = batch.find_image(marker_image_id)
+    if image.kind is not ImageKind.CHEMILUMINESCENCE:
+        raise _invalid(
+            f"{image_id} is a {image.kind.value} image: only a chemiluminescence image is linked"
+            " to a marker image",
+            ids=(image_id,),
+        )
+    if marker is not None:
+        if marker.kind not in _MARKER_KINDS or all(i.id != marker.id for i in membrane.images):
+            raise _invalid(
+                f"{marker.id} is not a visible-light marker or merged image of membrane"
+                f" {membrane.id}",
+                ids=(marker.id,),
+            )
+        if (marker.width, marker.height) != (image.width, image.height):
+            raise OperationError(
+                ErrorCode.MARKER_SIZE_MISMATCH,
+                f"{image_id} ({image.width}x{image.height}) and {marker.id}"
+                f" ({marker.width}x{marker.height}) differ in size; a marker image must match"
+                " its image pixel for pixel",
+                ids=(image_id, marker.id),
+            )
+    linked = membrane.model_copy(deep=True)
+    next(i for i in linked.images if i.id == image_id).marker_image_id = marker_image_id
+    for group in linked.register_groups():
+        points = [p for p in linked.calibration.points if p.image_id in group]
+        refusal = _ladder_refusal(linked, group, points)
+        if refusal is not None:
+            raise refusal
+    previous = image.marker_image_id
+
+    def edit(draft: Project) -> None:
+        draft.batch.find_image(image_id).marker_image_id = marker_image_id
+
+    group = linked.group_of(image_id)
+    params = {
+        "membrane_id": membrane.id,
+        "image_id": image_id,
+        "marker_image_id": marker_image_id,
+        "previous": previous,
+        "group": [i.id for i in linked.images if i.id in group],
+    }
+    change, logged = _calibration_change(session, image_id, edit, params)
+    return _calibration_update(_apply(session, "set_marker_image", change, logged))
+
+
+def _ladder_kda(kda: object) -> list[float]:
+    """A ladder's MWs as given: positive numbers of kDa, strictly decreasing
+    from top to bottom (on log10, as the model compares them)."""
+    if isinstance(kda, str | bytes) or not isinstance(kda, Sequence):
+        raise _invalid(f"ladder MWs must be a list of numbers of kDa, not {kda!r}")
+    values = [_kda(value, "a ladder MW") for value in kda]
+    for above, below in itertools.pairwise(values):
+        if not math.log10(above) > math.log10(below):
+            raise _invalid(
+                f"ladder MWs must decrease strictly from top to bottom ({above:g}, {below:g} kDa)"
+            )
+    return values
+
+
+@_locked
+def set_ladder(
+    session: ProjectSession,
+    membrane_id: str,
+    ladder: str | None,
+    *,
+    kda: Sequence[float] | None = None,
+) -> None:
+    """Choose a membrane's ladder: a preset key (:mod:`proteia.core.ladders`),
+    whose MWs are copied into the calibration (``kda`` may repeat them), so the
+    project keeps the values it was calibrated with, or a custom name (cleaned
+    text without ``/``) with its MWs top to bottom, if known; None clears it.
+    The points, the fit and every curve stay as they are.
+
+    Refused, changing nothing: an unknown membrane (``UnknownIdError``); a
+    name with ``/`` that is no preset key, MWs other than a preset's, MWs not
+    positive or not strictly decreasing, or MWs without a name
+    (``INVALID_INPUT``). The same ladder is a no-op. The log entry holds
+    ``membrane_id``, the ladder and its MWs (``kda``) as stored."""
+    batch = session.project.batch
+    membrane = next((m for m in batch.membranes if m.id == membrane_id), None)
+    if membrane is None:
+        raise UnknownIdError(f"unknown membrane {membrane_id!r}")
+    name = None if ladder is None else _clean(ladder, "ladder name")
+    chosen = None
+    if name is not None and "/" in name:
+        chosen = ladders.preset(name)
+        if chosen is None:
+            raise _invalid(f"no ladder preset {name!r}; a custom ladder's name holds no '/'")
+    given = None if kda is None else _ladder_kda(kda)
+    if chosen is not None:
+        values = list(chosen.kda)
+        if given is not None and given != values:
+            raise _invalid(
+                f"the MWs given differ from those of the preset {name!r}"
+                f" ({', '.join(f'{v:g}' for v in values)} kDa); name a custom ladder for"
+                " other MWs"
+            )
+    elif name is None and given:
+        raise _invalid("ladder MWs need a ladder name")
+    else:
+        values = [] if given is None else given
+    committed = session.project
+
+    def change(draft: Project) -> None:
+        calibration = next(m for m in draft.batch.membranes if m.id == membrane_id).calibration
+        calibration.ladder = name
+        calibration.ladder_kda = list(values)
+        # The one writer, as after every calibration change: no point or link
+        # changed, so it refits nothing.
+        _refresh_mw(committed, draft)
+
+    params = {"membrane_id": membrane_id, "ladder": name, "kda": list(values)}
+    _apply(session, "set_ladder", change, lambda _: params)
+
+
+def _source(source: object, image: ImageRef) -> CalibrationPointSource:
+    source = _member(CalibrationPointSource, source, "calibration point source")
+    if image.kind not in _SOURCE_KINDS[source]:
+        kinds = " or ".join(sorted(kind.value for kind in _SOURCE_KINDS[source]))
+        raise _invalid(
+            f"a {source.value} point is marked on a {kinds} image, not on {image.id}"
+            f" ({image.kind.value})",
+            ids=(image.id,),
+        )
+    return source
+
+
+@_locked
+def add_calibration_point(
+    session: ProjectSession,
+    image_id: str,
+    y: float,
+    mw: float,
+    source: CalibrationPointSource,
+    *,
+    x: float | None = None,
+    side: LadderSide = LadderSide.LEFT,
+    snap: bool = True,
+) -> CalibrationUpdate:
+    """Mark a known MW at ``(x, y)`` on an image (continuous coordinates of its
+    analysis array): a band of the ladder on ``side`` of its register group
+    (``visible_marker`` on a marker or merged image,
+    ``chemiluminescence_marker`` on a chemiluminescence or merged one), or the
+    edge of a cut strip (``strip_edge``, on any image, always on the left
+    ladder). A point is identified by its register group, side and MW. With
+    ``snap`` the given y is moved to the band's peak, or the edge, nearest it
+    (:func:`~proteia.core.mwcal.refine_point`); where nothing stands out, the
+    given y is kept, and the session log says so.
+
+    Refused, in this order, changing nothing: an unknown image
+    (``UnknownIdError``); a source that is not marked on this kind of image;
+    no ``x`` (every new point records where across the image it was marked,
+    a strip edge's too); a strip edge on the right ladder (all
+    ``INVALID_INPUT``); a position outside the image (``OUT_OF_IMAGE``); an MW
+    that is not a positive number (``INVALID_INPUT``); after the snap, a
+    point at that MW on that ladder already (``DUPLICATE_MW``), a point out of
+    order down the ladder, or at the height of another (``CALIBRATION_ORDER``,
+    naming its neighbours), or a right ladder not right of the left one, or
+    beside a strip edge (``LADDER_SIDES``); an image file changed or
+    unreadable, when snapping.
+
+    The log entry holds ``membrane_id``, ``group``, ``side``, ``image_id``
+    (the image of the group it is marked on), ``mw``, ``source``, ``y`` (as
+    stored), ``y_given``, ``x``, ``snapped``, and what
+    :func:`_calibration_change` adds."""
+    batch = session.project.batch
+    membrane, image, group = _calibration_target(batch, image_id)
+    source = _source(source, image)
+    if x is None:
+        raise _invalid(
+            "a calibration point needs its x: where across the image it was marked (the ladder"
+            " lane's, or where the strip edge was clicked)"
+        )
+    side = _member(LadderSide, side, "ladder side")
+    if side is LadderSide.RIGHT and source is CalibrationPointSource.STRIP_EDGE:
+        raise _invalid("a strip edge belongs to the left ladder")
+    given_y, x = _number(y, "y"), _number(x, "x")
+    _within_image(image, x=x, y=given_y)
+    mw = _kda(mw)
+    snap = _bool(snap, "snap")
+    points = [p for p in membrane.calibration.points if p.image_id in group]
+    marked = [p for p in points if p.side == side]
+    new = CalibrationPoint(image_id=image_id, y=given_y, mw=mw, source=source, x=x, side=side)
+    found = _snapped(session, new, image, marked) if snap else None
+    if found is not None:
+        new = new.model_copy(update={"y": found})
+    refusal = _ladder_refusal(membrane, group, [*points, new], new)
+    if refusal is not None:
+        raise refusal
+
+    def edit(draft: Project) -> None:
+        draft.batch.membrane_of(image_id).calibration.points.append(new.model_copy())
+
+    snapped = found is not None
+    params = {
+        "membrane_id": membrane.id,
+        "group": [i.id for i in membrane.images if i.id in group],
+        "side": side.value,
+        "image_id": image_id,
+        "mw": mw,
+        "source": source.value,
+        "y": new.y,
+        "y_given": given_y,
+        "x": x,
+        "snapped": snapped,
+    }
+    before = session.project
+    change, logged = _calibration_change(session, image_id, edit, params)
+    result = _apply(session, "add_calibration_point", change, logged)
+    update = _calibration_update(result, {**_point_json(new), "snapped": snapped})
+    if snap and not snapped:
+        _log_unsnapped(session, before, image_id, given_y)
+    return update
+
+
+@_locked
+def edit_calibration_point(
+    session: ProjectSession,
+    image_id: str,
+    mw: float,
+    *,
+    side: LadderSide = LadderSide.LEFT,
+    y: float | Keep = KEEP,
+    new_mw: float | Keep = KEEP,
+    snap: bool = False,
+) -> CalibrationUpdate:
+    """Move and/or relabel the point at ``mw`` on ``side`` of the register
+    group ``image_id`` belongs to, in one change: ``y`` where it was dragged
+    (exact, unless ``snap``: then moved to the band or edge nearest it, as
+    :func:`add_calibration_point` does, within the gaps to the ladder's other
+    points), ``new_mw`` its new label; ``KEEP`` leaves one as it is. The point
+    stays on its image and its x. The same y and MW are a no-op.
+
+    Refused, changing nothing: an unknown image, or no point at ``mw`` on
+    that side of the group (``UnknownIdError``); a y outside the image
+    (``OUT_OF_IMAGE``); an MW that is not a positive number, or a snap of a
+    point saved without its x (``INVALID_INPUT``); after the edit, the rules
+    of :func:`add_calibration_point` (``DUPLICATE_MW``,
+    ``CALIBRATION_ORDER``, ``LADDER_SIDES``).
+
+    The log entry holds ``membrane_id``, ``group``, ``side``, ``mw`` and
+    ``new_mw`` (the label before and after), ``from_y``, ``y`` (as stored),
+    ``y_given`` (null when kept), ``snapped``, and what :func:`_calibration_change`
+    adds."""
+    batch = session.project.batch
+    membrane, image, group = _calibration_target(batch, image_id)
+    side = _member(LadderSide, side, "ladder side")
+    mw = _kda(mw)
+    index = _find_point(membrane, group, side, mw)
+    old = membrane.calibration.points[index]
+    point_image = batch.find_image(old.image_id)
+    given_y = None if y is KEEP else _number(y, "y")
+    if given_y is not None:
+        _within_image(point_image, x=None, y=given_y)
+    label = old.mw if new_mw is KEEP else _kda(new_mw, "new molecular weight")
+    snap = _bool(snap, "snap")
+    if snap and old.x is None:
+        raise _invalid(
+            f"the point at {old.mw:g} kDa was saved without its x, so it cannot be snapped:"
+            " remove it and mark it again"
+        )
+    moved = old.model_copy(update={"y": old.y if given_y is None else given_y, "mw": label})
+    points = [p for p in membrane.calibration.points if p.image_id in group]
+    found = None
+    if snap:
+        marked = [p for p in points if p.side == side and p is not old]
+        found = _snapped(session, moved, point_image, marked)
+        if found is not None:
+            moved = moved.model_copy(update={"y": found})
+    refusal = _ladder_refusal(membrane, group, [moved if p is old else p for p in points], moved)
+    if refusal is not None:
+        raise refusal
+
+    def edit(draft: Project) -> None:
+        draft.batch.membrane_of(image_id).calibration.points[index] = moved.model_copy()
+
+    snapped = found is not None
+    params = {
+        "membrane_id": membrane.id,
+        "group": [i.id for i in membrane.images if i.id in group],
+        "side": side.value,
+        "mw": old.mw,
+        "new_mw": moved.mw,
+        "from_y": old.y,
+        "y": moved.y,
+        "y_given": given_y,
+        "snapped": snapped,
+    }
+    before = session.project
+    change, logged = _calibration_change(session, image_id, edit, params)
+    result = _apply(session, "edit_calibration_point", change, logged)
+    update = _calibration_update(result, {**_point_json(moved), "snapped": snapped})
+    if snap and not snapped:
+        _log_unsnapped(session, before, old.image_id, moved.y)
+    return update
+
+
+@_locked
+def remove_calibration_point(
+    session: ProjectSession, image_id: str, mw: float, *, side: LadderSide = LadderSide.LEFT
+) -> CalibrationUpdate:
+    """Remove the point at ``mw`` on ``side`` of the register group
+    ``image_id`` belongs to. Refused: an unknown image or no such point
+    (``UnknownIdError``), an MW that is not a positive number
+    (``INVALID_INPUT``). The log entry holds ``membrane_id``, ``group``,
+    ``side``, the point whole (``removed``), and what :func:`_calibration_change`
+    adds."""
+    batch = session.project.batch
+    membrane, _, group = _calibration_target(batch, image_id)
+    side = _member(LadderSide, side, "ladder side")
+    index = _find_point(membrane, group, side, _kda(mw))
+    removed = membrane.calibration.points[index]
+
+    def edit(draft: Project) -> None:
+        del draft.batch.membrane_of(image_id).calibration.points[index]
+
+    params = {
+        "membrane_id": membrane.id,
+        "group": [i.id for i in membrane.images if i.id in group],
+        "side": side.value,
+        "removed": _point_json(removed),
+    }
+    change, logged = _calibration_change(session, image_id, edit, params)
+    return _calibration_update(_apply(session, "remove_calibration_point", change, logged))
+
+
+@_locked
+def clear_calibration(
+    session: ProjectSession, image_id: str, *, side: LadderSide | None = None
+) -> CalibrationUpdate:
+    """Remove every point on ``side`` of the register group ``image_id``
+    belongs to, or on both sides with None; the ladder chosen stays. A group
+    with no such point is a no-op. The log entry holds ``membrane_id``,
+    ``group``, ``side`` (null: both), the points removed, whole (``removed``),
+    and what :func:`_calibration_change` adds."""
+    batch = session.project.batch
+    membrane, _, group = _calibration_target(batch, image_id)
+    chosen = None if side is None else _member(LadderSide, side, "ladder side")
+
+    def cleared(point: CalibrationPoint) -> bool:
+        return point.image_id in group and (chosen is None or point.side == chosen)
+
+    removed = [_point_json(p) for p in membrane.calibration.points if cleared(p)]
+
+    def edit(draft: Project) -> None:
+        calibration = draft.batch.membrane_of(image_id).calibration
+        calibration.points = [p for p in calibration.points if not cleared(p)]
+
+    params = {
+        "membrane_id": membrane.id,
+        "group": [i.id for i in membrane.images if i.id in group],
+        "side": None if chosen is None else chosen.value,
+        "removed": list(removed),
+    }
+    change, logged = _calibration_change(session, image_id, edit, params)
+    return _calibration_update(_apply(session, "clear_calibration", change, logged))
+
+
+# --- Finding a ladder and applying it (#58, D8) ---
+
+# How close, in px, an applied point must lie to a position the server finds
+# again (a found tick, a peak, a snap) to count as placed there.
+PLACED_TOLERANCE: Final = 0.01
+
+
+def _band_source(image: ImageRef) -> CalibrationPointSource:
+    """The source of a ladder band marked on ``image``: a band of a visible-light
+    marker on a marker or merged image, a faint marker on a chemiluminescence
+    image."""
+    if image.kind is ImageKind.CHEMILUMINESCENCE:
+        return CalibrationPointSource.CHEMILUMINESCENCE_MARKER
+    return CalibrationPointSource.VISIBLE_MARKER
+
+
+def _lane_x(image: ImageRef, x: object, what: str = "x") -> float:
+    """A ladder lane's x across ``image``: a finite number (``INVALID_INPUT``)
+    on the image (``OUT_OF_IMAGE``)."""
+    number = _number(x, what)
+    _within_image(image, x=number, y=None)
+    return number
+
+
+def _proposal(
+    session: ProjectSession,
+    membrane: Membrane,
+    image: ImageRef,
+    x: float,
+    side: LadderSide,
+) -> mwcal.LadderProposal | None:
+    """:func:`~proteia.core.mwcal.find_ladder` on the committed project: at
+    ``x`` on ``image``, with the membrane's ladder MWs and its preset's
+    reference bands (none for a custom ladder), and, for the right ladder, the
+    register group's left ladder as the other one. ``INVALID_INPUT`` while the
+    membrane has no ladder MWs (choose its ladder first), whose ``detail``
+    names them, none (``ladder_kda``): a client that listed others knows the
+    ladder changed."""
+    calibration = membrane.calibration
+    if not calibration.ladder_kda:
+        raise OperationError(
+            ErrorCode.INVALID_INPUT,
+            f"membrane {membrane.id} has no ladder MWs to find: choose its ladder first",
+            ids=(membrane.id,),
+            detail={"ladder_kda": []},
+        )
+    preset = None if calibration.ladder is None else ladders.preset(calibration.ladder)
+    reference = () if preset is None else tuple(band.kda for band in preset.reference)
+    other = None
+    if side is LadderSide.RIGHT:
+        fitted = mwcal.calibration_for(membrane, image.id)
+        if isinstance(fitted, mwcal.Calibration):
+            other = next(
+                (ladder.curve for ladder in fitted.ladders if ladder.side is LadderSide.LEFT), None
+            )
+    return mwcal.find_ladder(
+        session.pixels(image.id),
+        x,
+        kda=calibration.ladder_kda,
+        reference_kda=reference,
+        source=_band_source(image),
+        polarity=image.polarity,
+        other=other,
+    )
+
+
+def proposal_json(proposal: mwcal.LadderProposal) -> dict[str, JsonValue]:
+    """A ladder proposal JSON-plain, as its route answers it and a log entry
+    holds it: ``x``, the ``ticks`` (``{mw, y, found, strength}``, top to
+    bottom), the ``extra`` peaks' ys, ``score``, ``gap`` and ``doubtful``. JSON
+    has no infinity: a gap with no other labelling to measure it by is null,
+    with ``gap_infinite`` true."""
+    return {
+        "x": proposal.x,
+        "ticks": [
+            {"mw": tick.mw, "y": tick.y, "found": tick.found, "strength": tick.strength}
+            for tick in proposal.ticks
+        ],
+        "extra": list(proposal.extra),
+        "score": proposal.score,
+        "gap": _finite(proposal.gap),
+        "gap_infinite": not math.isfinite(proposal.gap),
+        "doubtful": proposal.doubtful,
+    }
+
+
+@_locked
+def propose_ladder(
+    session: ProjectSession, image_id: str, x: float, side: LadderSide = LadderSide.LEFT
+) -> mwcal.LadderProposal | None:
+    """Find the ladder whose lane was clicked at ``x`` on an image, and propose
+    its labels (:func:`~proteia.core.mwcal.find_ladder`) with the membrane's
+    ladder MWs and its preset's reference bands; for the ``right`` ladder, with
+    the register group's left ladder as the other one. None where fewer than
+    two bands stand out. Reads only: nothing is changed or logged.
+
+    Refused, in this order: an unknown image (``UnknownIdError``); an unknown
+    side, or an ``x`` that is not a finite number (``INVALID_INPUT``); an ``x``
+    off the image (``OUT_OF_IMAGE``); a membrane with no ladder MWs chosen
+    (``INVALID_INPUT``, with ``detail`` ``{"ladder_kda": []}``); an image file
+    changed or unreadable."""
+    batch = session.project.batch
+    membrane, image, _ = _calibration_target(batch, image_id)
+    side = _member(LadderSide, side, "ladder side")
+    return _proposal(session, membrane, image, _lane_x(image, x), side)
+
+
+@_locked
+def snap_ladder(
+    session: ProjectSession, image_id: str, x: float, ys: Sequence[float]
+) -> tuple[tuple[float, bool], ...]:
+    """Snap each of the ticks ``ys`` of a ruler drawn at ``x`` on an image to
+    the ladder band nearest it (:func:`~proteia.core.mwcal.refine_point`, a band
+    of the image's marker source), each within the gaps to the other ticks, so
+    no tick snaps onto a neighbour's band. Gives ``(y, snapped)`` per tick, in
+    the order given: the y snapped to, or the one given where nothing stands
+    out. Reads only: nothing is changed or logged.
+
+    Refused: an unknown image (``UnknownIdError``); an ``x`` or a y that is
+    not a finite number, or ``ys`` not a list (``INVALID_INPUT``); a position
+    off the image (``OUT_OF_IMAGE``); an image file changed or unreadable."""
+    batch = session.project.batch
+    _, image, _ = _calibration_target(batch, image_id)
+    x = _lane_x(image, x)
+    if isinstance(ys, str | bytes) or not isinstance(ys, Sequence):
+        raise _invalid(f"the ticks' ys must be a list of numbers, not {ys!r}")
+    given = [_number(y, "y") for y in ys]
+    for y in given:
+        _within_image(image, x=None, y=y)
+    if not given:
+        return ()
+    array = session.pixels(image.id)
+    source = _band_source(image)
+    snapped = []
+    for index, y in enumerate(given):
+        others = given[:index] + given[index + 1 :]
+        found = mwcal.refine_point(
+            array, x, y, source=source, polarity=image.polarity, marked_ys=others
+        )
+        snapped.append((y, False) if found is None else (found, True))
+    return tuple(snapped)
+
+
+def _ladder_pairs(image: ImageRef, points: object) -> list[tuple[float, float]]:
+    """The ``(y, mw)`` of each point of a ruler, checked as
+    :func:`add_calibration_point` checks one: a y that is a finite number
+    (``INVALID_INPUT``) on the image (``OUT_OF_IMAGE``), an MW that is a positive
+    number of kDa (``INVALID_INPUT``)."""
+    if isinstance(points, str | bytes) or not isinstance(points, Sequence):
+        raise _invalid(f"a ladder's points must be a list of (y, MW) pairs, not {points!r}")
+    pairs = []
+    for point in points:
+        if isinstance(point, str | bytes) or not isinstance(point, Sequence) or len(point) != 2:
+            raise _invalid(f"a ladder point must be a (y, MW) pair, not {point!r}")
+        y = _number(point[0], "y")
+        _within_image(image, x=None, y=y)
+        pairs.append((y, _kda(point[1])))
+    return pairs
+
+
+def _placed(
+    session: ProjectSession,
+    image: ImageRef,
+    applied: Sequence[CalibrationPoint],
+    replaced: Sequence[CalibrationPoint],
+    proposal: mwcal.LadderProposal | None,
+    proposed: bool,
+) -> list[dict[str, JsonValue]]:
+    """Each applied point as stored, with how it was placed, derived here and
+    not taken from the client: ``found`` where it is a found tick of the
+    proposal (the same MW, within :data:`PLACED_TOLERANCE` px); ``snapped``
+    where its y is where a snap at its x puts the band its row lies on
+    (:func:`~proteia.core.mwcal.is_snap_position`: a snap puts a band there
+    to the bit, however it was clicked and whichever ticks cut its window in
+    :func:`snap_ladder`), or where a snap put a point it ``replaced`` at the
+    same y (judged at that point's x, on its image, as its source: a band
+    clicked and snapped where it was clicked, then applied unchanged in a
+    ruler at the lane's x, whose columns put the band a hair elsewhere), or
+    where it sits on a peak the proposal found (a label moved by one band
+    keeps its band's y); ``hand`` otherwise. With a proposal asked for
+    (``proposed``), also ``relabelled``: whether its MW differs from that of
+    the proposal's tick at its y."""
+    if not applied:
+        return []
+    batch = session.project.batch
+    array = session.pixels(image.id)
+    source = _band_source(image)
+    peaks = [] if proposal is None else [t.y for t in proposal.ticks if t.found]
+    peaks += [] if proposal is None else list(proposal.extra)
+    ticks = () if proposal is None else proposal.ticks
+
+    def near(a: float, b: float) -> bool:
+        return abs(a - b) <= PLACED_TOLERANCE
+
+    def snapped_where(old: CalibrationPoint) -> bool:
+        # Where a replaced point was snapped, on its own image: another image
+        # of the group, whose stored file may no longer read. The ruler reads
+        # only its own image, so it is not refused for that one: a point it
+        # cannot check is not taken as snapped.
+        try:
+            pixels = session.pixels(old.image_id)
+        except OperationError:
+            return False
+        return mwcal.is_snap_position(
+            pixels,
+            old.x,
+            old.y,
+            source=old.source,
+            polarity=batch.find_image(old.image_id).polarity,
+        )
+
+    placed = []
+    for point in applied:
+        if point.x is None:  # unreachable: every applied point is marked at x
+            raise RuntimeError("an applied ladder point has no x")
+        on_tick = next((t for t in ticks if near(t.y, point.y)), None)
+        if on_tick is not None and on_tick.found and math.log10(on_tick.mw) == math.log10(point.mw):
+            how = "found"
+        else:
+            on_peak = any(near(peak, point.y) for peak in peaks)
+            snapped = (
+                on_peak
+                or mwcal.is_snap_position(
+                    array, point.x, point.y, source=source, polarity=image.polarity
+                )
+                or any(
+                    snapped_where(old) for old in replaced if old.y == point.y and old.x is not None
+                )
+            )
+            how = "snapped" if snapped else "hand"
+        entry = {**_point_json(point), "placed": how}
+        if proposed:
+            entry["relabelled"] = on_tick is not None and math.log10(on_tick.mw) != math.log10(
+                point.mw
+            )
+        placed.append(entry)
+    return placed
+
+
+@_locked
+def set_ladder_points(
+    session: ProjectSession,
+    image_id: str,
+    side: LadderSide,
+    points: Sequence[tuple[float, float]],
+    *,
+    x: float,
+    found_at: float | None = None,
+) -> CalibrationUpdate:
+    """Apply a ruler: replace every point of the ``side`` ladder of the register
+    group ``image_id`` belongs to with ``points``, each ``(y, MW)``, all marked
+    on ``image_id`` at ``x`` (the source follows the image kind: a marker band
+    on a marker or merged image, a faint marker on a chemiluminescence one), in
+    one change, one log entry and one undo step. An empty list clears the side.
+    ``found_at`` is the x the ruler was found at (:func:`propose_ladder`), if it
+    was.
+
+    Sides follow x. A lone ladder is the left one, whichever side was given.
+    A second ladder given as ``right`` but left of the only one (or as ``left``
+    but right of it) makes that one the right (left) ladder and the new points
+    the other, in the same change; the side given holds no ladder then when it
+    has fewer than :data:`~proteia.core.mwcal.MIN_LADDER_POINTS` points, which
+    the new points replace. Either way ``sides_swapped`` says the points went
+    to the other side than the one given. Any other crossing is refused.
+
+    Refused, changing nothing: an unknown image (``UnknownIdError``); an
+    unknown side, an ``x`` or ``found_at`` that is not a finite number, points
+    that are not ``(y, MW)`` pairs, or a found ruler on a membrane with no
+    ladder MWs (``INVALID_INPUT``); then per point, as
+    :func:`add_calibration_point` refuses one, a position off the image
+    (``OUT_OF_IMAGE``) or an MW that is not a positive number
+    (``INVALID_INPUT``); then on the group's points as they would be: two at one
+    MW on a ladder (``DUPLICATE_MW``), two at one y or MWs out of order down it
+    (``CALIBRATION_ORDER``), or the ladders crossing, a right ladder beside a
+    strip edge or a point saved without its x (``LADDER_SIDES``); an image file
+    changed or unreadable.
+
+    The log entry holds ``membrane_id``, ``group``, ``side`` (where the points
+    were stored), ``image_id``, ``x``, ``found_at``, ``sides_swapped``, the
+    points of that side it replaced, whole (``removed``), the points applied as
+    stored, each with ``placed`` (``found``, ``snapped`` or ``hand``, derived
+    here: :func:`_placed`) and, with ``found_at``, ``relabelled``; with
+    ``found_at``, the ``proposal`` found there again from the same pixels
+    (:func:`proposal_json`, null where none is found); and what
+    :func:`_calibration_change` adds. A proposal found there that is doubtful
+    (its labels may be one band off) is also logged at INFO once committed.
+    The update's ``points`` are those applied points."""
+    batch = session.project.batch
+    membrane, image, group = _calibration_target(batch, image_id)
+    side = _member(LadderSide, side, "ladder side")
+    x = _lane_x(image, x)
+    found_x = None if found_at is None else _lane_x(image, found_at, "found_at")
+    if found_x is not None and not membrane.calibration.ladder_kda:
+        raise _invalid(
+            f"membrane {membrane.id} has no ladder MWs, so no ruler was found on it: choose its"
+            " ladder first",
+            ids=(membrane.id,),
+        )
+    pairs = _ladder_pairs(image, points)
+    source = _band_source(image)
+    held = [p for p in membrane.calibration.points if p.image_id in group]
+    replaced = [p for p in held if p.side == side]
+    opposite = [p for p in held if p.side != side]
+    stored, swapped = side, False
+    if pairs:
+        opposite_xs = [p.x for p in opposite if p.x is not None]
+        if not opposite:
+            # A lone ladder is the left one.
+            stored, swapped = LadderSide.LEFT, side is LadderSide.RIGHT
+        elif len(replaced) < mwcal.MIN_LADDER_POINTS and opposite_xs:
+            # The side given holds no ladder (too few points to be used: a
+            # stray point is replaced as well), so the other side's is the
+            # only one.
+            beyond = x < min(opposite_xs) if side is LadderSide.RIGHT else x > max(opposite_xs)
+            if beyond:  # the second ladder is on the other side of the only one
+                stored, swapped = _other_side(side), True
+    moved = _other_side(stored) if swapped else None
+    applied = [
+        CalibrationPoint(image_id=image_id, y=y, mw=mw, source=source, x=x, side=stored)
+        for y, mw in sorted(pairs)
+    ]
+    kept = [p.model_copy(update={"side": moved}) if moved is not None else p for p in opposite]
+    refusal = _ladder_refusal(membrane, group, [*kept, *applied])
+    if refusal is not None:
+        raise refusal
+    proposal = None if found_x is None else _proposal(session, membrane, image, found_x, side)
+    placed = _placed(session, image, applied, replaced, proposal, found_x is not None)
+
+    def edit(draft: Project) -> None:
+        calibration = draft.batch.membrane_of(image_id).calibration
+        others = [p for p in calibration.points if p.image_id not in group]
+        calibration.points = [
+            *others,
+            *(p.model_copy() for p in kept),
+            *(p.model_copy() for p in applied),
+        ]
+
+    params: dict[str, JsonValue] = {
+        "membrane_id": membrane.id,
+        "group": [i.id for i in membrane.images if i.id in group],
+        "side": stored.value,
+        "image_id": image_id,
+        "x": x,
+        "found_at": found_x,
+        "sides_swapped": swapped,
+        "removed": [_point_json(p) for p in replaced],
+        "points": list(placed),
+    }
+    if found_x is not None:
+        params["proposal"] = None if proposal is None else proposal_json(proposal)
+    before = session.project
+    change, logged = _calibration_change(session, image_id, edit, params)
+    update = _calibration_update(_apply(session, "set_ladder_points", change, logged))
+    if proposal is not None and proposal.doubtful:
+        _log_doubtful(session, before, image_id, proposal)
+    return replace(update, points=tuple(placed), sides_swapped=swapped)
+
+
+def _log_doubtful(
+    session: ProjectSession, before: Project, image_id: str, proposal: mwcal.LadderProposal
+) -> None:
+    """Log, once committed, a ruler applied from a proposal whose labels may be
+    one band off (its gap is below :data:`~proteia.core.mwcal.GAP_WARN`)."""
+    if session.project is not before:
+        _log.info(
+            "in %r: the ladder found at x=%g on %s may be one band off (gap %.3g to the"
+            " next-best labelling, below %g); the ruler is applied as given",
+            session.folder.name,
+            proposal.x,
+            image_id,
+            proposal.gap,
+            mwcal.GAP_WARN,
+        )
+
+
+def _other_side(side: LadderSide) -> LadderSide:
+    return LadderSide.RIGHT if side is LadderSide.LEFT else LadderSide.LEFT
 
 
 # --- Lanes and the reference ---
@@ -1426,15 +2869,19 @@ def add_protein(
     expected_mw: float | None = None,
     loading_control_ids: Sequence[str] = (),
     box_size: BoxSize | None = None,
+    mw_tolerance: float | None = None,
 ) -> str:
     """Add a protein on a signal image, last in the protein order; return its id.
 
     The name is stored cleaned and must be unique ignoring case and look-alike
     characters. ``loading_control_ids`` (targets only) keeps its order, the series
     order. ``box_size`` defaults to :func:`~proteia.core.boxes.initial_box_size`;
-    the first grown box replaces it. The image cannot be changed later. Adding a
-    second loading control writes the first into the targets that used it
-    without naming it, so their results do not change.
+    the first grown box replaces it. ``mw_tolerance`` is how far, as a share,
+    an apparent MW may lie from the expected one and pass (#58; None: the
+    model's default, 0.1, ±10%); it also sizes the band count's window. The
+    image cannot be changed later. Adding a second loading control writes the
+    first into the targets that used it without naming it, so their results
+    do not change.
     """
     batch = session.project.batch
     role = _member(Role, role, "role")
@@ -1447,6 +2894,7 @@ def add_protein(
             ids=(image_id,),
         )
     mw = _expected_mw(expected_mw)
+    tolerance = None if mw_tolerance is None else _mw_tolerance(mw_tolerance)
     controls = _loading_controls(batch, None, role, loading_control_ids)
     if box_size is None:
         size = boxes.initial_box_size(image.width, image.height)
@@ -1456,17 +2904,18 @@ def add_protein(
     def change(draft: Project) -> tuple[str, list[str]]:
         pinned = _pin_single_loading_control(draft.batch) if role is Role.LOADING_CONTROL else []
         protein_id = draft.new_id("prot")
-        draft.batch.proteins.append(
-            Protein(
-                id=protein_id,
-                name=name,
-                role=role,
-                image_id=image_id,
-                loading_control_ids=controls,
-                expected_mw=mw,
-                box_size=size,
-            )
+        added = Protein(
+            id=protein_id,
+            name=name,
+            role=role,
+            image_id=image_id,
+            loading_control_ids=controls,
+            expected_mw=mw,
+            box_size=size,
         )
+        if tolerance is not None:
+            added.mw_tolerance = tolerance
+        draft.batch.proteins.append(added)
         return protein_id, pinned
 
     def params(result: tuple[str, list[str]]) -> _Params:
@@ -1477,6 +2926,9 @@ def add_protein(
             "role": role.value,
             "image_id": image_id,
             "expected_mw": mw,
+            "mw_tolerance": Protein.model_fields["mw_tolerance"].default
+            if tolerance is None
+            else tolerance,
             "loading_control_ids": list(controls),
             "box_size": _size(size),
             "pinned_targets": pinned,
@@ -1495,6 +2947,7 @@ def edit_protein(
     role: Role | Keep = KEEP,
     expected_mw: float | None | Keep = KEEP,
     loading_control_ids: Sequence[str] | Keep = KEEP,
+    mw_tolerance: float | Keep = KEEP,
 ) -> None:
     """Edit a protein's fields; ``KEEP`` leaves one unchanged. No net changes.
 
@@ -1504,13 +2957,19 @@ def edit_protein(
     batch's only one, cannot become a target (``LOADING_CONTROL_IN_USE``, with
     those targets): choose other loading controls for them first. A changed
     expected MW drops the protein's MW-guided not-detected records, whose slot
-    came from the old one (``dropped_undetected``, logged in full).
+    came from the old one (``dropped_undetected``, logged in full), and clears
+    the band counts of its MW-guided bands. A changed MW tolerance (#58) is
+    read by the MW check at once; it clears the band counts of the protein's
+    detector bands where their window came from it (its image has a curve),
+    and drops no record.
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     new_name = protein.name if name is KEEP else _protein_name(batch, name, protein_id=protein_id)
     new_role = protein.role if role is KEEP else _member(Role, role, "role")
     mw = protein.expected_mw if expected_mw is KEEP else _expected_mw(expected_mw)
+    tolerance = protein.mw_tolerance if mw_tolerance is KEEP else _mw_tolerance(mw_tolerance)
+    recount = tolerance != protein.mw_tolerance and _count_cleared_by_tolerance(batch, protein)
     if protein.role is Role.LOADING_CONTROL and new_role is Role.TARGET:
         users = _users(batch, protein_id)
         if users:
@@ -1533,10 +2992,15 @@ def edit_protein(
         edited.name = new_name
         edited.role = new_role
         edited.expected_mw = mw
+        edited.mw_tolerance = tolerance
         edited.loading_control_ids = controls
         dropped: list[JsonValue] = []
         if mw != protein.expected_mw:
             dropped.extend(_drop_mw_guided(edited))
+        for band in edited.bands:  # counts whose window or slot the edit moved
+            guided = mw != protein.expected_mw and band.source is ProposalSource.MW_GUIDED
+            if recount or guided:
+                band.bands_found = None
         pinned = [target for target in pinned if target != protein_id]  # its own is cleared
         return pinned, dropped
 
@@ -1555,6 +3019,8 @@ def edit_protein(
             edits["role"] = new_role.value
         if mw != protein.expected_mw:
             edits["expected_mw"] = mw
+        if tolerance != protein.mw_tolerance:
+            edits["mw_tolerance"] = tolerance
         if controls != protein.loading_control_ids:
             edits["loading_control_ids"] = list(controls)
         return edits
@@ -1753,6 +3219,7 @@ def place_box(
         )
         edited.bands.append(band)
         _quantify_image(draft, edited.image_id, array)
+        _refresh_box_mws(session.project, draft)
         return band.id, _drop_undetected(edited, lane_index, 0)
 
     def params(result: tuple[str, dict[str, JsonValue] | None]) -> _Params:
@@ -1784,7 +3251,8 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
     smaller box's area (``OVERLAP``, as :func:`place_box`). Every band on the
     image is
     re-quantified, since the box leaves one ring and may cut another; its lane
-    never changes. Marks the band as manually edited.
+    never changes. Marks the band as manually edited, which clears its band
+    count (#58): the detector counted around the box it placed.
     """
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
@@ -1810,7 +3278,9 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         edited, moved = draft.batch.find_band(band_id)
         _set_box(moved, new)
         moved.manually_edited = True
+        moved.bands_found = None
         _quantify_image(draft, edited.image_id, array)
+        _refresh_box_mws(session.project, draft)
 
     _apply(session, "move_box", change, lambda _: {"band_id": band_id, "rect": list(new)})
 
@@ -1840,9 +3310,9 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
 
     The lane must be one of the declared lanes (``LANE_OUT_OF_RANGE``) where the
     protein has no box for the same band yet (``LANE_OCCUPIED``). The box counts
-    as edited by the user. The same lane is a no-op. A not-detected record for
-    the same band in the new lane is replaced (``replaced_undetected``); the lane
-    the box leaves gets no record.
+    as edited by the user, so it loses its band count (#58). The same lane is a
+    no-op. A not-detected record for the same band in the new lane is replaced
+    (``replaced_undetected``); the lane the box leaves gets no record.
     """
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
@@ -1866,6 +3336,7 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
         edited_protein, edited = draft.batch.find_band(band_id)
         edited.lane_index = lane
         edited.manually_edited = True
+        edited.bands_found = None
         return _drop_undetected(edited_protein, lane, edited.band_index)
 
     _apply(
@@ -1946,6 +3417,7 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
                 _set_box(band, new)
         if array is not None:
             _quantify_image(draft, edited.image_id, array)
+        _refresh_box_mws(session.project, draft)
 
     _apply(
         session,
@@ -2103,6 +3575,7 @@ def set_box_padding(
             if after != before:
                 _set_box(band, after)
         _quantify_image(draft, edited.image_id, array)
+        _refresh_box_mws(session.project, draft)
 
     params = {
         "protein_id": protein_id,
@@ -2504,6 +3977,23 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     return OperationError(code, message, detail=detail)
 
 
+def _bands_found(
+    lane: rowdetect.LaneDetection,
+    rect: Rect,
+    fitted: mwcal.Calibration | mwcal.NoCalibration,
+    tolerance: float,
+    row: Rect,
+    height: int,
+) -> int:
+    """A placed band's count (#58, D10): its lane's bands in the count window
+    around ``rect`` (:func:`~proteia.core.results.count_window`), or in the rows
+    of the row box ``row`` (clipped to the image's ``height``) where the image
+    has no curve there."""
+    window = results.count_window(fitted, rect, tolerance)
+    top, bottom = window if window is not None else (max(0, row[1]), min(height, row[3]))
+    return rowdetect.bands_in(lane, top, bottom)
+
+
 def _row(row: object) -> Rect:
     """A row box as given: four ints ``(x0, y0, x1, y1)`` with ``x0 < x1`` and
     ``y0 < y1``, else ``INVALID_INPUT``. Text and bytes are sequences, but not
@@ -2561,6 +4051,13 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     over a band the detector finds takes that band until it is edited by hand.
 
     Boxes and records of another band index are left alone.
+
+    Each band placed or replaced in place gets its band count (#58, D10,
+    ``bands_found``): the band and the other bands its lane holds in the count
+    window around its box (:func:`~proteia.core.results.count_window`: the
+    protein's MW tolerance either way on the image's calibration at the box's
+    centre, or the row box's rows without a curve there), as the detector's
+    peaks show them (:func:`~proteia.core.rowdetect.bands_in`).
 
     The detector's size is the fitted size; the protein's padding
     (:func:`set_box_padding`) is added to it, on each side. If a box of the
@@ -2836,6 +4333,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     unlocated = () if located else tuple(lane.lane for lane in measured)
     replaced = [yielding[lane] for lane in rects if lane in yielding]
     removed = [yielding[lane] for lane in sorted(yielding) if lane not in rects]
+    # Each band's count, in the window around the box it gets (#58, D10).
+    fitted = mwcal.calibration_for(batch.membrane_of(image.id), image.id)
+    counts = {
+        lane.lane: _bands_found(lane, rects[lane.lane], fitted, protein.mw_tolerance, given, height)
+        for lane in placed
+    }
     warnings = [flag for flag in found.flags if flag in rowdetect.WARNING_FLAGS]
     notes = found.notes
     # The lanes on the image checked the lane numbers of the bands between
@@ -2872,9 +4375,11 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                     source=ProposalSource.ROW_BOX,
                     **_UNQUANTIFIED,
                 )
+            band.bands_found = counts[lane]
             edited.bands.append(band)
         # The boxes placed, moved and removed change every ring on the image.
         _quantify_image(draft, edited.image_id, array)
+        _refresh_box_mws(session.project, draft)
         # Every band-index-0 record gives way to this run's outcome in its lane (a
         # kept box's lane holds none).
         dropped: list[JsonValue] = list(

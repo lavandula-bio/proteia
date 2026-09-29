@@ -39,6 +39,62 @@ along}``, ``net_change`` as ``[smallest, largest]`` (or null), the band ids in
 ``edge_shifted`` and ``overlapping``, and the other proteins' bands it
 re-measured and the largest change as a row box answers them.
 
+Molecular-weight calibration (#58). ``GET /api/ladders`` lists the ladder
+presets (:mod:`proteia.core.ladders`), each as ``{key, product,
+catalog_numbers, system, kda, reference: [{kda, colour}], source}``; it reads no
+project. ``PUT /api/images/{image_id}/marker`` links a chemiluminescence image
+to its marker image, ``{marker_image_id}``, or unlinks it with null
+(:func:`~proteia.core.operations.set_marker_image`); ``PUT
+/api/membranes/{membrane_id}/calibration/ladder`` chooses the membrane's ladder,
+``{ladder, kda?}`` (:func:`~proteia.core.operations.set_ladder`). A calibration
+point is named by the register group of the image in the path, its ladder
+``side`` (``left`` or ``right``; any other word answers 404 ``unknown_id``) and
+its MW, written in the path as Python writes the number (``100``, ``61.5``):
+``POST /api/images/{image_id}/calibration/{side}/points`` marks one, ``{y, mw,
+source, x, snap?, ladder_kda?}`` (:func:`~proteia.core.operations.add_calibration_point`),
+``PATCH .../points/{mw}`` moves or relabels it, ``{y?, mw?, snap?, ladder_kda?}``,
+a field left out kept (:func:`~proteia.core.operations.edit_calibration_point`),
+and ``DELETE .../points/{mw}`` removes it. ``ladder_kda``, when given, is the
+membrane's ladder MWs the MW (the new label) was chosen from, as the page
+listed them; a list that is no longer the membrane's (another tab chose
+another ladder since) is refused first, storing nothing, as
+``calibration_changed`` 409, ``detail.changed`` ``ladder_kda``. An MW typed
+names none, and is not checked. ``DELETE
+/api/images/{image_id}/calibration`` removes every point of the image's group,
+or those of one side with ``?side=``. These answer, besides the state, what the
+change did (:class:`~proteia.core.operations.CalibrationUpdate`): the ``point``
+as stored with ``snapped``, the group's ``fit`` (null without a curve; an
+infinite quality or disagreement, which JSON cannot hold, is null with
+``quality_infinite`` or ``disagreement_infinite`` true), the images whose curve
+changed (``curves_changed``) and the not-detected records dropped
+(``dropped_undetected``, as ``[protein id, lane index, band index]``).
+
+Finding a ladder (#58). ``POST /api/images/{image_id}/ladder-proposal``,
+``{x, side?}``, finds the ladder whose lane was clicked at ``x`` and answers
+``{proposal, ladder_kda}``: its ticks, extra peaks, score, gap and whether it
+is doubtful (:func:`~proteia.core.operations.proposal_json`), or null where no
+ladder stands out; and the membrane's ladder MWs its labels are, read with it
+(a page's copy of the project may be older: another tab chose another ladder
+since). A membrane whose ladder lists no MWs (none chosen, or a custom one
+without them) is refused as ``invalid_input``, after what the request names is
+checked, with ``detail`` ``{ladder_kda: []}``, the MWs it lists: for a page
+that listed others to know the ladder changed. ``POST
+/api/images/{image_id}/ladder-snap``, ``{x, ys}``, snaps
+each tick of a ruler to its band and answers ``{points: [{y, snapped}]}``, in
+the order given. Both only read: nothing is changed, logged or saved, and
+they answer no project. ``PUT /api/images/{image_id}/calibration/{side}/ladder``,
+``{x, points: [{y, mw}], found_at?, ladder_kda?, group?}``, applies a ruler in
+one change and one undo step (:func:`~proteia.core.operations.set_ladder_points`),
+and answers as the other calibration routes do, with the ``points`` applied,
+each with how it was ``placed`` (and, with ``found_at``, whether it was
+``relabelled``), and ``sides_swapped``. A ruler holds at most
+:data:`MAX_RULER_TICKS` ticks. ``ladder_kda`` and ``group``, when given, are
+what the ruler was opened with: the membrane's ladder MWs its labels are, and
+the image ids of the register group whose marks it replaces; either one
+changed since (another tab chose another ladder, or linked or unlinked an
+image) is refused, storing nothing, as ``calibration_changed`` 409, whose
+``detail.changed`` names the field (``ladder_kda`` or ``group``).
+
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
 ``?colour=original``, its stored file in its own colours, for display only.
@@ -72,6 +128,13 @@ file's ``name``, ``path`` and ``size``, how many files it holds and how many
 were left out. ``POST /api/diagnostics/reveal`` shows the folder it is written
 in. These read the open project if one is open, and work with none.
 
+``GET /api/notices`` answers the notices the page shows once per user:
+``cloud_sync``, ``{service}``, while the projects folder lies in a folder that
+sync service uploads (:mod:`proteia.web.cloudsync`) and the notice is not
+dismissed, else null. ``POST /api/notices/cloud_sync/dismiss`` dismisses it for
+good, recorded in the per-user state folder. Without a state folder the notice
+is never offered, and a dismissal answers ``no_state_folder``.
+
 Every route that reads or edits the open project takes an optional
 ``Proteia-Opening`` header (:data:`OPENING_HEADER`): the open id of the project
 the page shows, as its answers carry it. A request that names another opening
@@ -92,14 +155,16 @@ then written once the session is released: one that takes minutes (with the
 images) holds up no reopen either. ``GET
 /api/workspace`` answers which project is open, and its open id, without
 reading it: for a page to find out. The routes that list, create or open
-projects, the status and quit routes, and the one that shows the diagnostics
-folder, need no opening.
+projects, the status and quit routes, the one that shows the diagnostics
+folder, and the notices', need no opening.
 
 Images handed to the running app by a launch wait in the workspace's inbox
 (:mod:`proteia.web.handoff`) until the page imports or discards them. ``POST
 /api/incoming?name=<name>`` takes one file's bytes, as ``POST /api/images``
 does, into the private staging folder under a name the server makes, and
-answers ``{file_id, name, size}``; ``POST /api/handoffs`` offers uploaded files
+answers ``{file_id, name, size}``; ``GET /api/incoming/room?name=<name>&size=<bytes>``
+answers 204 if it would take that file now, or the refusal it would get before
+its body is read, holding nothing; ``POST /api/handoffs`` offers uploaded files
 (``files``, their ids) with the arguments the launch refused (``refused``,
 ``{name, code, message}`` each, bounded, never refusing the offer), and answers
 ``{handoff_id, merged, files, refused}``: the hand-off they went to, whether it
@@ -121,11 +186,17 @@ shows another.
 
 Errors answer JSON ``{"code", "message", "ids"}``: an operation's refusal is 422
 with its :class:`~proteia.core.session.ErrorCode` value, and ``detail`` when the
-refusal carries one (a row box's: what the detector saw); an unknown id 404, and
+refusal carries one (a row box's: what the detector saw; a calibration point's
+``calibration_order``, ``duplicate_mw`` or ``ladder_sides``: the ladder side,
+the MWs in conflict and why, never an id or a position); an unknown id 404, and
 an export folder to reveal that does not exist 404 ``folder_not_found``;
 ``no_project`` 409 before a project is open; ``no_state_folder`` 409 for a
-diagnostic file when Proteia was served without its state folder, and
+diagnostic file, or a notice's dismissal, when Proteia was served without its
+state folder, and
 ``files_changed`` 409 for one whose project files are not those listed;
+``calibration_changed`` 409 for a ruler whose ladder or register group changed
+since it was opened, or a mark whose MW was chosen from a ladder list changed
+since;
 ``project_changed`` 409 for a
 request that names an opening no longer open, with ``detail`` ``{open,
 open_id}``: the open project's name and open id; ``invalid_input`` 422 for a
@@ -151,6 +222,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -179,16 +251,23 @@ from pydantic import (
 )
 from starlette.exceptions import HTTPException
 
+from proteia.core import ladders, storage
 from proteia.core import operations as ops
-from proteia.core import storage
 from proteia.core.analyze import ReduceMethod
 from proteia.core.export import DEFAULT_CHART_FORMATS
-from proteia.core.model import BoxSize, ImageKind, Polarity, UnknownIdError
+from proteia.core.model import (
+    BoxSize,
+    ImageKind,
+    LadderSide,
+    Membrane,
+    Polarity,
+    UnknownIdError,
+)
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
 from proteia.core.storage import ProjectError
-from proteia.web import diagnostics, handoff, logs, projects, sample_project
+from proteia.web import cloudsync, diagnostics, handoff, logs, projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.handoff import HandoffView, Inbox, Refusal
 from proteia.web.results_view import results_payload
@@ -327,6 +406,34 @@ class FilesChangedError(RuntimeError):
     the same opening."""
 
 
+class CalibrationChangedError(RuntimeError):
+    """A ruler applied (#58) names what it was opened with, or a mark (a new
+    one, or one relabelled) the ladder list its MW was chosen from, and that
+    changed since, in the same opening (another tab, say): ``changed`` is the
+    field that no longer holds, ``ladder_kda`` (the membrane's ladder MWs,
+    which its labels are) or ``group`` (the register group whose marks it
+    replaces); ``mark`` for a mark's."""
+
+    def __init__(self, changed: Literal["ladder_kda", "group"], *, mark: bool = False) -> None:
+        if mark:
+            message = (
+                "the membrane's ladder changed since this MW was chosen from its list, so it is"
+                " an MW of the ladder before: nothing was stored; choose the MW again"
+            )
+        elif changed == "ladder_kda":
+            message = (
+                "the membrane's ladder changed since this ruler was labelled, so its labels are"
+                " those of the ladder before: nothing was stored; find the ladder again"
+            )
+        else:
+            message = (
+                "the image's marker link changed since this ruler was opened, and with it the"
+                " marks the ruler replaces: nothing was stored; find the ladder again"
+            )
+        super().__init__(message)
+        self.changed = changed
+
+
 @dataclass(frozen=True)
 class ResultSettings:
     """How the results are computed: the keyword arguments of
@@ -373,6 +480,8 @@ class Workspace:
     charts of the answers about the latest opening (:class:`ChartStore`).
     Images handed to the app wait in :attr:`inbox` until an accept imports
     them into a new project (:meth:`accept`), a switch like any other.
+    Whether the projects root lies in a folder a sync service uploads is
+    checked once, when first asked (:meth:`synced_folder`).
 
     The locks, in the order they are taken: the switch lock (a create or an
     open holds it throughout), a session's lock (an operation holds it while it
@@ -384,8 +493,9 @@ class Workspace:
     it takes any of them, on this lock's condition, which releases it
     meanwhile; a reopen waits for the requests using the session holding only
     the switch lock, which no request takes, and at most :data:`REOPEN_WAIT_S`.
-    The inbox's lock is taken with none of these held, and none is taken
-    while it is.
+    The inbox's lock, and the lock of the check whether the projects root is
+    synced (:meth:`synced_folder`), are taken with none of these held, and none
+    is taken while either is.
     """
 
     def __init__(
@@ -396,15 +506,22 @@ class Workspace:
         clock: Clock = utc_now,
         inbox: Inbox | None = None,
         state: Path | None = None,
+        sync_check: Callable[[Path], cloudsync.SyncedFolder | None] = cloudsync.check,
     ) -> None:
         self.root = root
         self.reveal = reveal
         self.clock = clock
         # Images handed to the app; a launch gives it its staging folder.
         self.inbox = Inbox() if inbox is None else inbox
-        # The per-user state folder, which holds the session log and the
-        # diagnostics folder; a launch gives it (proteia.web.launch).
+        # The per-user state folder, which holds the session log, the
+        # diagnostics folder and the notices dismissed; a launch gives it
+        # (proteia.web.launch).
         self.state = state
+        # Whether the projects root lies in a folder a sync service uploads:
+        # checked once, when first asked (synced_folder), under its own lock.
+        self._sync_check = sync_check
+        self._sync_lock = threading.Lock()
+        self._synced: tuple[cloudsync.SyncedFolder | None] | None = None  # None: not checked
         # Guards the open session, the open ids, the sessions in use, the reopen
         # under way, the settings, the previews and the results; never held while
         # computing. Taken before the chart store's own lock, never while holding it.
@@ -507,6 +624,38 @@ class Workspace:
                 " nowhere to write a diagnostic file"
             )
         return self.state
+
+    def synced_folder(self) -> cloudsync.SyncedFolder | None:
+        """The folder a sync service uploads that the projects root lies in
+        (:func:`~proteia.web.cloudsync.check`, or the check this workspace was
+        given), or None: checked once, when first asked, and logged by the
+        service's name and where it was found, never by path. A check that
+        fails is logged, with its stack trace in the log file, and taken as
+        none."""
+        with self._sync_lock:
+            if self._synced is None:
+                try:
+                    synced = self._sync_check(self.root)
+                except Exception:
+                    synced = None
+                    _log.warning(
+                        "could not check whether the projects folder is synced to the cloud",
+                        exc_info=True,
+                        extra=logs.FILE_ONLY,
+                    )
+                else:
+                    if synced is None:
+                        _log.info(
+                            "the projects folder is in no folder a sync service Proteia recognises"
+                        )
+                    else:
+                        _log.info(
+                            "the projects folder is in a folder %s uploads (found from %s)",
+                            synced.service,
+                            synced.source,
+                        )
+                self._synced = (synced,)
+            return self._synced[0]
 
     @contextlib.contextmanager
     def answering(self, session: ProjectSession) -> Iterator[None]:
@@ -962,6 +1111,42 @@ def _url_index(value: object) -> object:
 UrlIndex = Annotated[int, BeforeValidator(_url_index)]
 
 
+def _plain_int(value: str) -> bool:
+    try:
+        return str(int(value)) == value
+    except ValueError:
+        return False
+
+
+def _url_kda(value: object) -> object:
+    """A molecular weight in a URL as a float, only if it is written as Python
+    writes the number: ``100``, ``61.5`` or ``100.0``, not ``1e2``, ``+100``,
+    ``0100`` or ``61.50``, so one MW has one spelling. Whether it is a positive
+    MW is the operation's to check."""
+    if not isinstance(value, str):
+        return value
+    try:
+        number = float(value)
+    except ValueError:
+        number = math.nan
+    if not math.isfinite(number) or not (repr(number) == value or _plain_int(value)):
+        raise ValueError(
+            f"must be a molecular weight in kDa as plain digits, such as 100 or 61.5, not {value!r}"
+        )
+    return number
+
+
+UrlKda = Annotated[float, BeforeValidator(_url_kda)]
+
+
+def _side(side: str) -> LadderSide:
+    """The ladder side a path names; any other word is no such side (404)."""
+    try:
+        return LadderSide(side)
+    except ValueError:
+        raise UnknownIdError(f"no ladder side {side!r}: left or right") from None
+
+
 class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1000,6 +1185,8 @@ class ProteinBody(_Body):
     expected_mw: ExpectedMw = None
     loading_control_ids: list[str] = []
     box_size: tuple[PositiveInt, PositiveInt] | None = None  # width, height
+    # The MW check's tolerance, a share (0.1: ±10%, #58); absent or null: the default.
+    mw_tolerance: StrictFloat | None = None
 
 
 class ProteinEditBody(_Body):
@@ -1011,11 +1198,90 @@ class ProteinEditBody(_Body):
     role: str = ""
     expected_mw: ExpectedMw = None
     loading_control_ids: list[str] = []
+    mw_tolerance: StrictFloat = 0.1  # a share (0.1: ±10%, #58); never null
 
 
 class BoxSizeBody(_Body):
     width: PositiveInt
     height: PositiveInt
+
+
+class MarkerBody(_Body):
+    marker_image_id: str | None  # required: null unlinks
+
+
+class LadderBody(_Body):
+    ladder: str | None  # required: a preset key or a custom name; null clears it
+    kda: list[StrictFloat] | None = None  # the ladder's MWs, top to bottom
+
+
+# A ladder MW as a page names it (a ruler's labels, the list a mark's MW was
+# chosen from): a positive, finite number of kDa.
+RulerKda = Annotated[StrictFloat, Field(gt=0, allow_inf_nan=False)]
+
+
+class PointBody(_Body):
+    """A calibration point, in continuous coordinates of the image's analysis
+    array; ``x`` is required: every new point records where it was marked.
+    ``ladder_kda``, when the page names it, is the membrane's ladder MWs the
+    MW was chosen from (none for an MW typed)."""
+
+    y: StrictFloat
+    mw: StrictFloat
+    source: str
+    x: StrictFloat
+    snap: StrictBool = True
+    ladder_kda: list[RulerKda] | None = None
+
+
+class PointEditBody(_Body):
+    """A calibration point's new position (``y``) or label (``mw``). A field
+    left out keeps its value: only the fields the request set are passed on,
+    so these defaults are never used. ``ladder_kda``, when the page names it,
+    is the membrane's ladder MWs the new label was chosen from."""
+
+    y: StrictFloat = 0.0
+    mw: StrictFloat = 0.0
+    snap: StrictBool = False
+    ladder_kda: list[RulerKda] | None = None
+
+
+# At most this many ticks in a ruler sent to snap or apply: a ladder has a
+# dozen bands, and a list is checked tick by tick.
+MAX_RULER_TICKS: Final = 200
+
+
+class LadderProposalBody(_Body):
+    """Where a ladder lane was clicked, and which ladder of the register group
+    it is (``left`` or ``right``)."""
+
+    x: StrictFloat
+    side: str = "left"
+
+
+class LadderSnapBody(_Body):
+    """A ruler's ticks, drawn at ``x``, to snap each to its band."""
+
+    x: StrictFloat
+    ys: Annotated[list[StrictFloat], Field(max_length=MAX_RULER_TICKS)]
+
+
+class RulerTickBody(_Body):
+    y: StrictFloat
+    mw: StrictFloat
+
+
+class LadderPointsBody(_Body):
+    """A ruler applied: its ticks at ``x``, and the x it was found at, if it
+    was; and, when the page names them, what the ruler was opened with: the
+    membrane's ladder MWs its labels are (``ladder_kda``) and the image ids of
+    the register group whose marks it replaces (``group``, in any order)."""
+
+    x: StrictFloat
+    points: Annotated[list[RulerTickBody], Field(max_length=MAX_RULER_TICKS)]
+    found_at: StrictFloat | None = None
+    ladder_kda: list[RulerKda] | None = None
+    group: list[str] | None = None
 
 
 class BoxPaddingBody(_Body):
@@ -1271,6 +1537,19 @@ def _row_placement(placement: ops.RowPlacement) -> dict[str, Any]:
     }
 
 
+def _calibration_update(update: ops.CalibrationUpdate) -> dict[str, Any]:
+    """What a calibration change did
+    (:class:`~proteia.core.operations.CalibrationUpdate`): the point as stored
+    with ``snapped`` (or None), the group's fit as JSON (or None), and lists
+    for tuples."""
+    return {
+        "point": update.point,
+        "fit": None if update.fit is None else update.fit.as_json(),
+        "curves_changed": list(update.curves_changed),
+        "dropped_undetected": [list(key) for key in update.dropped_undetected],
+    }
+
+
 def _padding_change(change: ops.PaddingChange) -> dict[str, Any]:
     """Every field of what a padding change did
     (:class:`~proteia.core.operations.PaddingChange`): the sizes as ``{width,
@@ -1365,14 +1644,13 @@ async def receive_file(
     :data:`~proteia.web.handoff.UPLOAD_EXPIRY_S`. Answers ``{file_id, name,
     size}``. The name is checked before any of the body is read
     (:func:`~proteia.web.handoff.check_name`), and so are the size the request
-    declares and the limits; an empty body is ``invalid_image``. One that
-    cannot be stored is ``file_error``, with a message that names no path: the
-    launch passes it on to the page. A refused upload leaves no file."""
-    handoff.check_name(name)
+    declares and the limits (as ``GET /api/incoming/room`` checks them); an
+    empty body is ``invalid_image``. One that cannot be stored is
+    ``file_error``, with a message that names no path: the launch passes it on
+    to the page. A refused upload leaves no file."""
     given = request.headers.get("content-length")
     declared = int(given) if given is not None and given.isdigit() else None
-    if declared is not None and declared > MAX_UPLOAD_BYTES:
-        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
+    _check_incoming(name, declared)
     inbox = workspace.inbox
     upload = await run_in_threadpool(inbox.begin_upload, name, declared)
     try:
@@ -1400,6 +1678,36 @@ async def receive_file(
             raise OSError(f"{name!r} could not be stored: {_reason(exc)}") from exc
         raise
     return {"file_id": stored.file_id, "name": stored.name, "size": stored.size}
+
+
+@router.get("/incoming/room", status_code=204)
+def incoming_room(
+    workspace: WorkspaceDep,
+    name: Annotated[str, Query(min_length=1)],
+    size: Annotated[int, Query(ge=0)],
+) -> Response:
+    """Whether ``POST /api/incoming`` would take a file named ``name`` of
+    ``size`` bytes now: 204 if so, else the refusal that upload would get
+    before reading any of its body (the name, the size, ``stopping``,
+    ``too_many_pending``). Nothing is held or stored
+    (:meth:`~proteia.web.handoff.Inbox.check_room`). A launch asks before it
+    sends a file's bytes. An upload refused before its body is read is still
+    sent whole, for nothing: the server answers at once, then reads the rest
+    and throws it away; and if the rest stops arriving for a while (the
+    server's keep-alive time), it closes the connection, which the launch may
+    find reset before it can read the answer."""
+    _check_incoming(name, size)
+    workspace.inbox.check_room(size)
+    return Response(status_code=204)
+
+
+def _check_incoming(name: str, size: int | None) -> None:
+    """The checks of a file a launch hands over, before any of its bytes are
+    read: its name (:func:`~proteia.web.handoff.check_name`), and its size, if
+    known, against :data:`MAX_UPLOAD_BYTES`."""
+    handoff.check_name(name)
+    if size is not None and size > MAX_UPLOAD_BYTES:
+        raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
 
 
 @router.post("/handoffs", status_code=201)
@@ -1613,6 +1921,217 @@ def set_polarity(
     return _answer(workspace, session)
 
 
+@router.get("/ladders")
+def list_ladders() -> dict[str, Any]:
+    """The ladder presets, as :mod:`proteia.core.ladders` holds them; no
+    project is read."""
+    return {
+        "ladders": [
+            {
+                "key": preset.key,
+                "product": preset.product,
+                "catalog_numbers": list(preset.catalog_numbers),
+                "system": preset.system,
+                "kda": list(preset.kda),
+                "reference": [
+                    {"kda": band.kda, "colour": band.colour} for band in preset.reference
+                ],
+                "source": preset.source,
+            }
+            for preset in ladders.PRESETS
+        ]
+    }
+
+
+@router.put("/images/{image_id}/marker")
+def set_marker_image(
+    image_id: str, body: MarkerBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Link the chemiluminescence image to its marker image, or unlink it with
+    null (:func:`~proteia.core.operations.set_marker_image`)."""
+    update = ops.set_marker_image(session, image_id, body.marker_image_id)
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.put("/membranes/{membrane_id}/calibration/ladder")
+def set_ladder(
+    membrane_id: str, body: LadderBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Choose the membrane's ladder (:func:`~proteia.core.operations.set_ladder`)."""
+    ops.set_ladder(session, membrane_id, body.ladder, kda=body.kda)
+    return _answer(workspace, session)
+
+
+@router.post("/images/{image_id}/calibration/{side}/points", status_code=201)
+def add_calibration_point(
+    image_id: str, side: str, body: PointBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Mark a calibration point on the ladder ``side`` of the image's register
+    group (:func:`~proteia.core.operations.add_calibration_point`), unless the
+    ladder list its MW was chosen from, as the body names it, is no longer the
+    membrane's (:func:`_check_ladder_kda`): checked first, and marked, under
+    the session lock, so no change falls between the two."""
+    ladder_side = _side(side)
+    with session.transaction():
+        _check_ladder_kda(session, image_id, body.ladder_kda)
+        update = ops.add_calibration_point(
+            session,
+            image_id,
+            body.y,
+            body.mw,
+            body.source,
+            x=body.x,
+            side=ladder_side,
+            snap=body.snap,
+        )
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.patch("/images/{image_id}/calibration/{side}/points/{mw}")
+def edit_calibration_point(
+    image_id: str,
+    side: str,
+    mw: UrlKda,
+    body: PointEditBody,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+) -> dict[str, Any]:
+    """Move or relabel the point at ``mw``, in one change
+    (:func:`~proteia.core.operations.edit_calibration_point`), unless the
+    ladder list its new label was chosen from, as the body names it, is no
+    longer the membrane's: checked first, under the session lock, as a new
+    mark's is."""
+    ladder_side = _side(side)
+    given = body.model_dump(exclude_unset=True)
+    with session.transaction():
+        _check_ladder_kda(session, image_id, body.ladder_kda)
+        update = ops.edit_calibration_point(
+            session,
+            image_id,
+            mw,
+            side=ladder_side,
+            y=given.get("y", ops.KEEP),
+            new_mw=given.get("mw", ops.KEEP),
+            snap=body.snap,
+        )
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.delete("/images/{image_id}/calibration/{side}/points/{mw}")
+def remove_calibration_point(
+    image_id: str, side: str, mw: UrlKda, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Remove the point at ``mw`` (:func:`~proteia.core.operations.remove_calibration_point`)."""
+    update = ops.remove_calibration_point(session, image_id, mw, side=_side(side))
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.delete("/images/{image_id}/calibration")
+def clear_calibration(
+    image_id: str,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+    side: Literal["left", "right"] | None = None,
+) -> dict[str, Any]:
+    """Remove every point of the image's register group, or those of one
+    ``side`` (:func:`~proteia.core.operations.clear_calibration`); none there is
+    a no-op."""
+    chosen = None if side is None else LadderSide(side)
+    update = ops.clear_calibration(session, image_id, side=chosen)
+    return _answer(workspace, session, **_calibration_update(update))
+
+
+@router.post("/images/{image_id}/ladder-proposal")
+def propose_ladder(image_id: str, body: LadderProposalBody, session: OpenSession) -> dict[str, Any]:
+    """Find the ladder clicked at ``x`` and propose its labels
+    (:func:`~proteia.core.operations.propose_ladder`); changes nothing. The
+    answer names the membrane's ladder MWs the labels are (``ladder_kda``),
+    read under the session lock with the proposal, so no change falls between
+    the two: a page's copy of the project may be older."""
+    with session.transaction():
+        proposal = ops.propose_ladder(session, image_id, body.x, body.side)
+        kda = session.project.batch.membrane_of(image_id).calibration.ladder_kda
+    return {
+        "proposal": None if proposal is None else ops.proposal_json(proposal),
+        "ladder_kda": list(kda),
+    }
+
+
+@router.post("/images/{image_id}/ladder-snap")
+def snap_ladder(image_id: str, body: LadderSnapBody, session: OpenSession) -> dict[str, Any]:
+    """Snap each tick of a ruler to its band
+    (:func:`~proteia.core.operations.snap_ladder`); changes nothing."""
+    snapped = ops.snap_ladder(session, image_id, body.x, body.ys)
+    return {"points": [{"y": y, "snapped": moved} for y, moved in snapped]}
+
+
+def _same_ladder(membrane: Membrane, ladder_kda: Sequence[float]) -> bool:
+    """Whether ``ladder_kda`` is the membrane's ladder MWs: compared on log10,
+    as the model compares MWs, and in order."""
+    now = [math.log10(mw) for mw in membrane.calibration.ladder_kda]
+    return [math.log10(mw) for mw in ladder_kda] == now
+
+
+def _check_ladder_kda(
+    session: ProjectSession, image_id: str, ladder_kda: Sequence[float] | None
+) -> None:
+    """Refuse a mark, new or relabelled, whose MW was chosen from the ladder
+    list ``ladder_kda`` (None: none named, as for an MW typed, not checked)
+    that is no longer the membrane's (another tab chose another ladder since
+    the page listed it): :class:`CalibrationChangedError`. An unknown image is
+    ``UnknownIdError``."""
+    if ladder_kda is None:
+        return
+    if not _same_ladder(session.project.batch.membrane_of(image_id), ladder_kda):
+        raise CalibrationChangedError("ladder_kda", mark=True)
+
+
+def _check_ruler_scope(session: ProjectSession, image_id: str, body: LadderPointsBody) -> None:
+    """Refuse a ruler whose ladder MWs or register group, as its body names
+    them, are no longer the membrane's and the image's (a field left out is
+    not checked): MWs as :func:`_same_ladder` compares them; the group as a
+    set. An unknown image is ``UnknownIdError``."""
+    batch = session.project.batch
+    membrane = batch.membrane_of(image_id)
+    if body.ladder_kda is not None and not _same_ladder(membrane, body.ladder_kda):
+        raise CalibrationChangedError("ladder_kda")
+    if body.group is not None and set(body.group) != membrane.group_of(image_id):
+        raise CalibrationChangedError("group")
+
+
+@router.put("/images/{image_id}/calibration/{side}/ladder")
+def set_ladder_points(
+    image_id: str,
+    side: str,
+    body: LadderPointsBody,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+) -> dict[str, Any]:
+    """Apply a ruler to the ladder ``side`` of the image's register group, in
+    one step (:func:`~proteia.core.operations.set_ladder_points`), unless the
+    ladder or the group the ruler names changed since it was opened
+    (:class:`CalibrationChangedError`): checked and applied under the session
+    lock, so no change falls between the two."""
+    ladder_side = _side(side)
+    with session.transaction():
+        _check_ruler_scope(session, image_id, body)
+        update = ops.set_ladder_points(
+            session,
+            image_id,
+            ladder_side,
+            [(point.y, point.mw) for point in body.points],
+            x=body.x,
+            found_at=body.found_at,
+        )
+    return _answer(
+        workspace,
+        session,
+        **_calibration_update(update),
+        points=list(update.points),
+        sides_swapped=update.sides_swapped,
+    )
+
+
 @router.get("/images/{image_id}/preview")
 def image_preview(
     image_id: str,
@@ -1673,6 +2192,7 @@ def add_protein(body: ProteinBody, session: OpenSession, workspace: WorkspaceDep
         expected_mw=body.expected_mw,
         loading_control_ids=body.loading_control_ids,
         box_size=size,
+        mw_tolerance=body.mw_tolerance,
     )
     return _answer(workspace, session, protein_id=protein_id)
 
@@ -1924,6 +2444,37 @@ def reveal_diagnostics(workspace: WorkspaceDep) -> Response:
     return Response(status_code=204)
 
 
+@router.get("/notices")
+def get_notices(workspace: WorkspaceDep) -> dict[str, Any]:
+    """The notices the page shows once per user: ``cloud_sync``, the service
+    that uploads the projects folder as ``{service}`` (no path), while it lies
+    in a folder a sync service uploads (:meth:`Workspace.synced_folder`) and
+    the notice is not dismissed (:mod:`proteia.web.cloudsync`); else null. Null
+    too without a state folder: its dismissal could not be remembered, and it
+    would be shown at every start."""
+    synced = workspace.synced_folder()
+    state = workspace.state
+    shown = (
+        synced is not None
+        and state is not None
+        and cloudsync.CLOUD_SYNC not in cloudsync.dismissed(state)
+    )
+    return {"cloud_sync": {"service": synced.service} if shown else None}
+
+
+@router.post("/notices/cloud_sync/dismiss", status_code=204)
+def dismiss_cloud_sync(workspace: WorkspaceDep) -> Response:
+    """Dismiss the ``cloud_sync`` notice for good: recorded in the per-user
+    state folder (:func:`~proteia.web.cloudsync.dismiss`), never in a project.
+    A folder that cannot be written is answered as a file error naming no path."""
+    try:
+        cloudsync.dismiss(workspace.state_folder(), cloudsync.CLOUD_SYNC)
+    except OSError as exc:  # the page shows the message: no path
+        raise OSError(f"the notice could not be dismissed: {_reason(exc)}") from exc
+    _log.info("the notice that the projects folder is synced to the cloud was dismissed for good")
+    return Response(status_code=204)
+
+
 @router.post("/undo")
 def undo(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
     return _answer(workspace, session, **_restored(ops.undo(session)))
@@ -1962,6 +2513,9 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
         NoStateFolderError: lambda e: _error(409, "no_state_folder", str(e)),
         FilesChangedError: lambda e: _error(409, "files_changed", str(e)),
+        CalibrationChangedError: lambda e: _error(
+            409, "calibration_changed", str(e), detail={"changed": e.changed}
+        ),
         ProjectChangedError: lambda e: _error(
             409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
         ),

@@ -42,7 +42,7 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
-from proteia.core import boxes, imaging, record, results, rowdetect, storage
+from proteia.core import boxes, imaging, mwcal, record, results, rowdetect, storage
 from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
@@ -53,7 +53,10 @@ from proteia.core.model import (
     Box,
     BoxPadding,
     BoxSize,
+    CalibrationPointSource,
+    FitMethod,
     ImageKind,
+    LadderSide,
     Polarity,
     Project,
     ProposalSource,
@@ -239,6 +242,35 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
         assert [band.net for _, band in placed] == nets, image.id
 
 
+def expected_mw(session: ProjectSession, band_id: str) -> float | None:
+    """A band's apparent MW recomputed (#58): its image's calibration at its
+    box's centre, at its protein's box size; None without a curve or outside
+    its range."""
+    batch = session.project.batch
+    protein, band = batch.find_band(band_id)
+    fitted = mwcal.calibration_for(batch.membrane_of(protein.image_id), protein.image_id)
+    if not isinstance(fitted, mwcal.Calibration):
+        return None
+    size = protein.box_size
+    return fitted.mw_at(band.box.x + size.width / 2, band.box.y + size.height / 2)
+
+
+def assert_mw_current(session: ProjectSession) -> None:
+    """The operations' molecular-weight invariant (#58): every membrane's
+    ``fit_method`` and ``fit_quality`` are those of its points
+    (:func:`~proteia.core.mwcal.fit_method`, :func:`~proteia.core.mwcal.fit_quality`),
+    and every band's apparent MW is, exactly, its image's calibration at the
+    centre of its box (:func:`expected_mw`)."""
+    batch = session.project.batch
+    for membrane in batch.membranes:
+        calibration = membrane.calibration
+        assert calibration.fit_method is mwcal.fit_method(membrane), membrane.id
+        assert calibration.fit_quality == mwcal.fit_quality(membrane), membrane.id
+    for protein in batch.proteins:
+        for band in protein.bands:
+            assert band.apparent_mw == expected_mw(session, band.id), band.id
+
+
 def open_sample(
     tmp_path: Path, hook=save_to_folder, project: Project | None = None
 ) -> ProjectSession:
@@ -281,6 +313,25 @@ def plant(session: ProjectSession, change) -> None:
     """Commit a change no operation makes yet (e.g. an apparent MW from #58)."""
     project, _ = apply_change(session.project, change)
     session._commit(project, action="plant", params={})
+
+
+def plant_58_fit(session: ProjectSession, membrane_id: str) -> None:
+    """Store a membrane's fit and its bands' apparent MWs as a #58 build
+    computes them: the sample's mem-1 holds a fit from before #58, whose refit
+    counts as a change to the curve of every image of it."""
+
+    def change(draft: Project) -> None:
+        membrane = next(m for m in draft.batch.membranes if m.id == membrane_id)
+        membrane.calibration.fit_method = mwcal.fit_method(membrane)
+        membrane.calibration.fit_quality = mwcal.fit_quality(membrane)
+        images = {image.id for image in membrane.images}
+        for protein in draft.batch.proteins:
+            if protein.image_id in images:
+                fitted = mwcal.calibration_for(membrane, protein.image_id)
+                for band in protein.bands:
+                    band.apparent_mw = ops._apparent_mw(fitted, band.box, protein.box_size)
+
+    plant(session, change)
 
 
 def plant_legacy(session: ProjectSession) -> None:
@@ -640,6 +691,293 @@ def test_reload_migrates_and_saves_a_file_of_an_older_schema(tmp_path):
     assert [entry.action for entry in s.project.log] == ["new_project", "migrate"]
     assert (s.dirty, s.last_action, s.undo_step) == (False, "migrate", None)
     assert load_project(folder) == s.project
+
+
+# --- #140: an older project.json is kept before its migration ---
+
+BACKUP = "project.schema1.json"
+
+
+def backups(folder: Path) -> list[str]:
+    """The backups of an older project.json in ``folder``, by name."""
+    return sorted(path.name for path in folder.iterdir() if path.name.startswith("project.schema"))
+
+
+def files_in(folder: Path) -> dict[str, bytes]:
+    """Every file under ``folder``, by its path relative to it, with its bytes."""
+    return {
+        path.relative_to(folder).as_posix(): path.read_bytes()
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_opening_a_schema_1_project_keeps_its_project_json_first(tmp_path):
+    folder = v1_folder(tmp_path)
+    v1 = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved
+    assert backups(folder) == [BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1  # byte for byte
+    migrated = s.project.log[-1]
+    assert migrated.params == {
+        "from_schema": 1,
+        "to_schema": 2,
+        "from_content_hash": V1_CONTENT_HASH,
+        "backup": BACKUP,
+    }
+    assert load_project(folder) == s.project  # project.json names it too
+    assert history_issues(s.project) == []
+
+    # The migrated project opens as it was saved, and keeps no other backup.
+    s.close()
+    reopened = ops.open_project(folder, clock=FakeClock())
+    assert reopened.project == s.project and not reopened.dirty
+    ops.set_reference_condition(reopened, None)
+    reopened.close()
+    assert backups(folder) == [BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1
+
+    # Renamed back, the backup is the project as it was: migrated again, to
+    # the same content, and kept again.
+    (folder / BACKUP).replace(folder / storage.PROJECT_FILE)
+    restored = ops.open_project(folder, clock=FakeClock())
+    assert restored.project.log[-1].content_hash == migrated.content_hash
+    assert (folder / BACKUP).read_bytes() == v1
+
+
+def test_a_project_of_the_current_schema_gets_no_backup(tmp_path):
+    folder = tmp_path / FOLDER
+    project = make_project()
+    write_image_files(folder, project)
+    storage.save_project(project, folder)
+    s = ops.open_project(folder)
+    ops.set_reference_condition(s, None)
+    assert backups(folder) == []
+    assert "backup" not in json.dumps([entry.params for entry in s.project.log])
+
+
+def test_a_second_migrating_open_never_replaces_a_backup(tmp_path):
+    folder = v1_folder(tmp_path)
+    path = folder / storage.PROJECT_FILE
+    v1 = path.read_bytes()
+    ops.open_project(folder, clock=FakeClock()).close()
+
+    # The same file restored: the backup holding it already is the one named.
+    path.write_bytes(v1)
+    again = ops.open_project(folder, clock=FakeClock())
+    assert again.project.log[-1].params["backup"] == BACKUP
+    assert backups(folder) == [BACKUP]
+    again.close()
+
+    # Other bytes of schema 1 (a BOM and CRLF, as a Windows editor saves them):
+    # a backup of their own, numbered as export folders are; the first stays.
+    edited = codecs.BOM_UTF8 + v1.replace(b"\n", b"\r\n")
+    path.write_bytes(edited)
+    s = ops.open_project(folder, clock=FakeClock())
+    second = "project.schema1 (2).json"
+    assert s.project.log[-1].params["backup"] == second
+    assert backups(folder) == [second, BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1
+    assert (folder / second).read_bytes() == edited
+
+    # Read again while open, the first file names the first backup.
+    ops.set_reference_condition(s, None)
+    path.write_bytes(v1)
+    assert s.reload()
+    assert s.project.log[-1].params["backup"] == BACKUP
+    assert backups(folder) == [second, BACKUP]
+    assert (folder / BACKUP).read_bytes() == v1
+
+
+def _refuse_backups(monkeypatch, failure: str) -> None:
+    """Make writing a backup fail: its file cannot be created (``create``, as in
+    a folder that cannot be written), or fails once created (``write``, as on a
+    full disk)."""
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if Path(path).name.startswith("project.schema"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    def fail(fd):
+        raise OSError(28, "No space left on device")
+
+    if failure == "create":
+        monkeypatch.setattr(storage.os, "open", refuse)
+    else:
+        monkeypatch.setattr(storage.os, "fsync", fail)
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason"), [("create", "Permission denied"), ("write", "No space left on device")]
+)
+def test_an_open_that_cannot_keep_the_backup_changes_nothing(
+    tmp_path, monkeypatch, failure, reason
+):
+    folder = v1_folder(tmp_path)
+    before = files_in(folder)
+    recorder = Recorder()
+    with monkeypatch.context() as patch:
+        _refuse_backups(patch, failure)
+        with pytest.raises(storage.BackupError) as info:
+            ops.open_project(folder, autosave=recorder, clock=FakeClock())
+    assert isinstance(info.value, OSError)  # answered as a file error
+    assert str(info.value) == (
+        f"{FOLDER!r} was saved by an older Proteia (schema 1), and a copy of its"
+        f" project.json could not be kept before updating it ({reason}); nothing was changed"
+    )
+    assert str(tmp_path) not in str(info.value)  # the folder by name, never its path
+    assert recorder.actions == []
+    assert files_in(folder) == before  # no backup, not even a partial one
+
+    # Once it can be written, the project opens.
+    s = ops.open_project(folder, clock=FakeClock())
+    assert s.project.log[-1].params["backup"] == BACKUP
+
+
+@pytest.mark.parametrize("failure", ["create", "write"])
+def test_a_reload_that_cannot_keep_the_backup_keeps_the_session(tmp_path, monkeypatch, failure):
+    folder = v1_folder(tmp_path)
+    v1 = (folder / storage.PROJECT_FILE).read_bytes()
+    s = ops.open_project(folder, clock=FakeClock())
+    ops.set_reference_condition(s, None)
+    (folder / BACKUP).unlink()  # deleted by hand
+    (folder / storage.PROJECT_FILE).write_bytes(v1)  # an old copy restored
+    before, project, steps = files_in(folder), s.project, s.history_steps
+    with monkeypatch.context() as patch:
+        _refuse_backups(patch, failure)
+        with pytest.raises(storage.BackupError):
+            s.reload()
+    assert (s.project, s.history_steps, s.dirty, s.save_error) == (project, steps, False, None)
+    assert files_in(folder) == before
+    assert s.reload() and (folder / BACKUP).read_bytes() == v1
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root ignores"
+)
+def test_a_folder_that_cannot_be_written_refuses_to_open_an_older_project(tmp_path):
+    folder = v1_folder(tmp_path)
+    before = files_in(folder)
+    folder.chmod(0o555)
+    try:
+        with pytest.raises(storage.BackupError, match="could not be kept"):
+            ops.open_project(folder, clock=FakeClock())
+    finally:
+        folder.chmod(0o755)
+    assert files_in(folder) == before
+
+
+def _dropping_img_4(doc: dict) -> dict:
+    """A faulty schema 1 to 2 step: it loses the reprobe (img-4) and GAPDH on it."""
+    doc = storage._v1_to_v2(doc)
+    batch = doc["batch"]
+    for membrane in batch["membranes"]:
+        membrane["images"] = [image for image in membrane["images"] if image["id"] != "img-4"]
+    batch["proteins"] = [protein for protein in batch["proteins"] if protein["image_id"] != "img-4"]
+    return doc
+
+
+def test_the_cleanup_keeps_every_image_file_a_backup_names(tmp_path, monkeypatch):
+    # A migration that dropped an image reference would leave its file to the
+    # cleanup of the save that follows: the backup could not be restored.
+    monkeypatch.setitem(storage.MIGRATIONS, 1, _dropping_img_4)
+    folder = v1_folder(tmp_path)
+    reprobe = folder / "images" / "img-4.tif"
+    s = ops.open_project(folder, clock=FakeClock())  # migrated, saved and cleaned up
+    assert "img-4" not in {image.id for image in s.project.batch.iter_images()}
+    assert reprobe.exists()
+    # Nor at the saves and imports that follow, in this session or the next.
+    ops.set_reference_condition(s, None)
+    import_blot(s, blot(), "β.tif")
+    s.close()
+    assert reprobe.exists()
+    reopened = ops.open_project(folder, clock=FakeClock())
+    ops.set_reference_condition(reopened, "vehicle")
+    assert reprobe.exists()
+
+    # Once the backup is deleted, the file is an orphan like any other.
+    (folder / BACKUP).unlink()
+    ops.set_reference_condition(reopened, None)
+    assert not reprobe.exists()
+
+
+def test_the_cleanup_keeps_an_image_file_named_in_any_backup(tmp_path):
+    folder = v1_folder(tmp_path)
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved: next_id 19
+    images = folder / "images"
+    for name in ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-19.tif", "img-25.tif"):
+        (images / name).write_bytes(b"an image no project.json references")
+    # A backup is read as bytes, whatever its schema, even one that no longer
+    # loads; its name is compared ignoring case, as Windows does. Only an id
+    # below next_id is kept: a backup's images hold no other (a migration keeps
+    # next_id, and the project only raises it), and the next import takes 19.
+    (folder / "Project.Schema3 (2).json").write_bytes(
+        b'{"broken": "img-7.tif", img-8.tiff, img-19.tif, img-25.tif'
+    )
+    ops.set_reference_condition(s, None)  # saved, then cleaned up
+    assert listing(s) == [
+        "IMG-8.TIFF",
+        "img-2.tif",
+        "img-3.png",
+        "img-4.tif",
+        "img-6.jpg",
+        "img-7.tif",
+    ]
+
+
+def _crash_after_an_import(folder: Path) -> None:
+    """Import into the project in ``folder`` and never save, as a crash leaves
+    it: the image's file stays in images/, at the id the next import takes."""
+    crashed = ops.open_project(folder, autosave=None, clock=FakeClock())
+    import_blot(crashed, blot(), "lost.tif")
+
+
+def test_a_stored_name_in_a_backup_s_text_never_blocks_the_next_import(tmp_path):
+    # An original name kept in a backup reads as a stored name too, here the
+    # name of the id the next import takes: the leftover file of that id goes
+    # all the same, as no backup's image can hold that id.
+    folder = v1_folder(tmp_path)
+    path = folder / storage.PROJECT_FILE
+    doc = json.loads(path.read_bytes())
+    doc["batch"]["membranes"][0]["images"][0]["original_name"] = "Blot IMG-19.TIF"
+    path.write_bytes(storage.document_bytes(doc))
+    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 19
+    assert b"IMG-19.TIF" in (folder / BACKUP).read_bytes()
+    _crash_after_an_import(folder)
+    leftover = folder / "images" / "img-19.tif"
+    assert leftover.exists()
+
+    s = ops.open_project(folder, clock=FakeClock())
+    assert import_blot(s, blot(), "β.tif") == "img-19"
+    assert load_project(folder) == s.project
+    assert leftover.read_bytes() == (folder.parent / "sources" / "β.tif").read_bytes()
+
+
+def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, monkeypatch):
+    # What such a backup names is unknown, so the cleanup keeps every file it
+    # could name: none at or above next_id, which no backup's image holds.
+    folder = v1_folder(tmp_path)
+    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 19
+    _crash_after_an_import(folder)  # img-19.tif left behind
+    below = folder / "images" / "img-5.tif"
+    below.write_bytes(b"an image no project.json references")
+    read_bytes = Path.read_bytes
+
+    def locked(path: Path) -> bytes:
+        if storage.is_backup(path.name):  # as while another program holds it
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_bytes(path)
+
+    s = ops.open_project(folder, clock=FakeClock())
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", locked)
+        assert import_blot(s, blot(), "β.tif") == "img-19"  # saved, then cleaned up
+        assert below.exists()
+    # Once the backup can be read, it does not name img-5: the file goes.
+    ops.set_reference_condition(s, None)
+    assert not below.exists()
 
 
 # --- refused operations change nothing ---
@@ -1829,7 +2167,7 @@ def test_move_box_reads_the_rect_by_its_centre(tmp_path):
     a = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     b = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
 
-    def calibrate(draft: Project) -> None:  # #58 will compute apparent MWs
+    def calibrate(draft: Project) -> None:  # MWs where the image has no curve
         for protein in draft.batch.proteins:
             for band in protein.bands:
                 band.apparent_mw = 55.0
@@ -1843,7 +2181,7 @@ def test_move_box_reads_the_rect_by_its_centre(tmp_path):
     assert moved.box.rect(size) == boxes.centered_rect(20, 32, size, W, H)
     assert moved.manually_edited
     assert moved.lane_index == 0  # never derived from x
-    assert moved.apparent_mw is None  # position-derived: stale
+    assert moved.apparent_mw is None  # recomputed at its new centre: no curve there
     assert band_of(s, b) == untouched  # bit-identical, apparent MW kept
     assert protein_of(s, protein).box_size == size
     assert_nets_current(s)
@@ -3255,14 +3593,16 @@ def _size_of(s: ProjectSession, protein_id: str) -> dict[str, int]:
 
 
 def _protein(protein_id: str, name: str, role: str, image_id: str, **fields) -> dict:
-    """add_protein's params with its defaults (no expected MW, no loading
-    controls, the initial box size of the blot, nothing pinned)."""
+    """add_protein's params with its defaults (no expected MW, the default MW
+    tolerance, no loading controls, the initial box size of the blot, nothing
+    pinned)."""
     return {
         "protein_id": protein_id,
         "name": name,
         "role": role,
         "image_id": image_id,
         "expected_mw": None,
+        "mw_tolerance": 0.1,
         "loading_control_ids": [],
         "box_size": {"width": 20, "height": 5},  # boxes.initial_box_size(W, H)
         "pinned_targets": [],
@@ -4279,26 +4619,45 @@ def test_edit_protein_drops_mw_guided_records_when_the_expected_mw_changes(tmp_p
 
 
 def test_a_calibration_change_drops_the_membranes_mw_guided_records(tmp_path):
+    # Only on the images whose curve changed (#58): the reprobe img-4, a register
+    # group of its own with no points, keeps its curve (none) and GAPDH its records.
     s = open_sample(tmp_path / "marker", project=make_project_with_undetected())
+    plant_58_fit(s, "mem-1")  # as a #58 build leaves it
     # GAPDH (img-4, mem-1): a row-box record in lane 2, an MW-guided one in lane 3.
-    [_, gapdh_guided] = _records_json(s, "prot-9")
+    gapdh = _records_json(s, "prot-9")
+    # β-catenin (img-2, linked to the marker img-3): its lane-2 record, MW-guided.
+
+    def guided(draft: Project) -> None:
+        draft.batch.find_protein("prot-7").undetected[0].source = ProposalSource.MW_GUIDED
+
+    plant(s, guided)
+    [beta_guided] = _records_json(s, "prot-7")
     # α-tubulin is on mem-5, whose calibration does not change.
     tubulin = _record(0, band_index=1, region=(0, 10, 20, 30), source=ProposalSource.MW_GUIDED)
     plant_records(s, "prot-8", tubulin, bands=2)
 
     cascade = ops.remove_image(s, "img-3")  # the marker, with two calibration points
     assert cascade.unfitted_membranes == ("mem-1",)
-    assert _keys(s, "prot-9") == [(2, 0)]
-    assert _keys(s, "prot-7") == [(2, 0)]  # a row-box record stays
+    assert _keys(s, "prot-7") == []  # img-2 is left with one point: its curve went
+    assert _records_json(s, "prot-9") == gapdh  # img-4's curve did not change
     assert _keys(s, "prot-8") == [(0, 1)]  # another membrane's stays
     entry = s.project.log[-1]
     assert entry.params == {
         "image_id": "img-3",
         **_listed(cascade),
         "removed_undetected": [],
-        "dropped_undetected": [gapdh_guided],
+        "dropped_undetected": [beta_guided],
     }
     assert entry.content_hash == content_hash(s.project)
+
+    # Stored as before #58 (fitted over the whole membrane, img-4 included), the
+    # refit changes the curve of every image of it: GAPDH's MW-guided record goes too.
+    s = open_sample(tmp_path / "legacy", project=make_project_with_undetected())
+    [_, gapdh_guided] = _records_json(s, "prot-9")
+    plant(s, guided)
+    ops.remove_image(s, "img-3")
+    assert (_keys(s, "prot-7"), _keys(s, "prot-9")) == ([], [(2, 0)])  # the row-box record stays
+    assert s.project.log[-1].params["dropped_undetected"] == [beta_guided, gapdh_guided]
 
     # An image without calibration points leaves the calibration, and the MW-guided
     # records of the membrane's other proteins, as they were.
@@ -7670,3 +8029,432 @@ def test_random_edits_keep_the_padding_and_the_nets(tmp_path, seed):
         assert_nets_current(s)
     padded = [e for e in s.project.log if e.action == "set_box_padding"]
     assert any(e.params["box_padding"] != {"across": 0, "along": 0} for e in padded)
+
+
+# --- Molecular weights (#58): the one writer ---
+
+# A two-ladder blot: a visible-light marker with a ladder by each side, and a
+# chemiluminescence image of the same membrane with one row of four lanes, both
+# 16-bit, CAL_H x CAL_W, with seeded noise. A band of m kDa lies at cal_y(m, x):
+# log-linear in the MW, and CAL_TILT px lower at the right ladder than at the
+# left one (a tilted blot), so the protein line slopes across the lanes.
+CAL_H, CAL_W = 200, 480
+CAL_LEFT_X, CAL_RIGHT_X = 30.0, 450.0
+CAL_KDA = (250, 130, 100, 70, 55, 35, 25, 15)
+CAL_TILT = 6.0
+CAL_LANES = (120, 200, 280, 360)
+CAL_ROW = 100  # the row's bands peak on this row: at y = 100.5
+CAL_ROW_BOX = (80, 85, 400, 116)
+MARKER_BAND = CalibrationPointSource.VISIBLE_MARKER
+LEFT, RIGHT = LadderSide.LEFT, LadderSide.RIGHT
+
+
+def cal_x(side: LadderSide) -> float:
+    return CAL_LEFT_X if side is LEFT else CAL_RIGHT_X
+
+
+def cal_y(kda: float, x: float) -> float:
+    """Where a band of ``kda`` kDa lies at column ``x``, in continuous y."""
+    t = (x - CAL_LEFT_X) / (CAL_RIGHT_X - CAL_LEFT_X)
+    return 20.0 + 120.0 * math.log10(250.0 / kda) + CAL_TILT * t
+
+
+def cal_mw(x: float, y: float) -> float:
+    """The MW the blot's law puts at ``(x, y)``: what its two ladders read there."""
+    t = (x - CAL_LEFT_X) / (CAL_RIGHT_X - CAL_LEFT_X)
+    return 250.0 / 10 ** ((y - 20.0 - CAL_TILT * t) / 120.0)
+
+
+def noisy16(image: np.ndarray, seed: int) -> np.ndarray:
+    """``image`` with seeded Gaussian noise of 60 counts, as 16-bit pixels."""
+    noisy = image + np.random.default_rng(seed).normal(0.0, 60.0, image.shape)
+    return np.clip(np.round(noisy), 0, 65535).astype(np.uint16)
+
+
+def cal_marker(kda: Sequence[float] = CAL_KDA) -> np.ndarray:
+    """The marker: each ladder's bands at ``cal_y`` (a band on row r's centre
+    lies at r + 0.5, so its index centre is half a row higher)."""
+    bands = [
+        (x, cal_y(m, x) - 0.5, 10.0, 2.0, 20000.0) for x in (CAL_LEFT_X, CAL_RIGHT_X) for m in kda
+    ]
+    return noisy16(synthetic_blot((CAL_H, CAL_W), bands, dtype=np.float64), 58)
+
+
+def cal_blot() -> np.ndarray:
+    """The chemiluminescence image: one row of bands, one in each lane."""
+    bands = [(x, CAL_ROW, 8.0, 3.0, 30000.0) for x in CAL_LANES]
+    return noisy16(synthetic_blot((CAL_H, CAL_W), bands, dtype=np.float64), 59)
+
+
+@dataclasses.dataclass(frozen=True)
+class Calibrated:
+    session: ProjectSession
+    membrane: str
+    blot: str
+    marker: str
+    protein: str
+
+
+def calibrated(tmp_path: Path, hook=None, *, sides=(LEFT, RIGHT)) -> Calibrated:
+    """The two-ladder blot imported (the blot, then its marker on the same
+    membrane) and linked, the PageRuler Plus preset chosen, every CAL_KDA band
+    of the ladders ``sides`` marked where it lies (not snapped), four lanes
+    declared and one target without boxes."""
+    s = session_on(tmp_path, hook)
+    blot_id = import_blot(s, cal_blot(), "blot β.tif")
+    membrane = s.project.batch.membrane_of(blot_id).id
+    marker = import_blot(
+        s, cal_marker(), "marker α.tif", kind=ImageKind.VISIBLE_MARKER, membrane_id=membrane
+    )
+    ops.set_marker_image(s, blot_id, marker)
+    ops.set_ladder(s, membrane, "pageruler_plus/tris_glycine")
+    for side in sides:
+        x = cal_x(side)
+        for kda in CAL_KDA:
+            ops.add_calibration_point(
+                s, marker, cal_y(kda, x), kda, MARKER_BAND, x=x, side=side, snap=False
+            )
+    ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(len(CAL_LANES))])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, blot_id, expected_mw=50)
+    return Calibrated(s, membrane, blot_id, marker, protein)
+
+
+# The operations that can change an apparent MW or a membrane's fit, each of
+# which calls the one writer (_refresh_mw). Every other function of
+# ops.__all__ reads, or changes nothing an MW or a fit depends on: a box removed
+# takes its MW along, and a lane, a name, a polarity or a record is not read.
+MW_WRITERS = frozenset(
+    {
+        "place_box",
+        "move_box",
+        "set_box_size",
+        "set_box_padding",
+        "detect_row_boxes",
+        "remove_image",
+        "set_marker_image",
+        "set_ladder",
+        "add_calibration_point",
+        "edit_calibration_point",
+        "remove_calibration_point",
+        "clear_calibration",
+        "set_ladder_points",
+    }
+)
+MW_NEUTRAL = frozenset(
+    {
+        "add_protein",
+        "calibration_fit",
+        "clear_boxes",
+        "compute",
+        "compute_view",
+        "edit_protein",
+        "export_bundle",
+        "export_lane_table",
+        "import_image",
+        "new_project",
+        "open_project",
+        "proposal_json",
+        "propose_ladder",
+        "redo",
+        "remove_box",
+        "remove_protein",
+        "remove_undetected",
+        "requantify",
+        "save",
+        "set_box_lane",
+        "set_lanes",
+        "set_polarity",
+        "set_reference_condition",
+        "snap_ladder",
+        "unassessed_images",
+        "undo",
+    }
+)
+
+
+def test_every_operation_is_classified_for_the_mw_writer():
+    # A new operation must be classified: if it can move a box or change a
+    # calibration, it calls the writer and joins test_mw_current_after_each_operation.
+    functions = {name for name in ops.__all__ if inspect.isfunction(getattr(ops, name))}
+    assert MW_WRITERS | MW_NEUTRAL == functions
+    assert not MW_WRITERS & MW_NEUTRAL
+    for name in MW_WRITERS:
+        source = inspect.getsource(getattr(ops, name))
+        assert any(
+            call in source for call in ("_refresh_mw(", "_refresh_box_mws(", "_calibration_change(")
+        ), name
+
+
+def test_mw_current_after_each_operation(tmp_path):
+    c = calibrated(tmp_path)
+    s = c.session
+    assert_mw_current(s)
+    ran: set[str] = set()
+
+    def step(name: str, call) -> None:
+        before = s.project
+        call()
+        assert s.project is not before, name  # each step commits a change
+        ran.add(name)
+        assert_mw_current(s)
+        assert_nets_current(s)
+
+    lanes = CAL_LANES
+    step(
+        "place_box", lambda: ops.place_box(s, c.protein, lanes[0], CAL_ROW, lane_index=0, grow=True)
+    )
+    step(
+        "place_box",
+        lambda: ops.place_box(s, c.protein, lanes[1], CAL_ROW, lane_index=1, grow=False),
+    )
+    step("detect_row_boxes", lambda: ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX))
+    assert all(band.apparent_mw is not None for band in protein_of(s, c.protein).bands)
+    moved = lane_bands(s, c.protein)[2]
+    x0, y0, x1, y1 = moved.box.rect(protein_of(s, c.protein).box_size)
+    step("move_box", lambda: ops.move_box(s, moved.id, (x0 + 2, y0 + 3, x1 + 2, y1 + 3)))
+    fitted = protein_of(s, c.protein).fitted_size
+    size = BoxSize(width=fitted.width + 2, height=fitted.height + 3)
+    step("set_box_size", lambda: ops.set_box_size(s, c.protein, size))
+    step("set_box_padding", lambda: ops.set_box_padding(s, c.protein, across=1, along=2))
+    ten = cal_y(10, CAL_LEFT_X)
+    step(
+        "add_calibration_point",
+        lambda: ops.add_calibration_point(
+            s, c.marker, ten, 10, MARKER_BAND, x=CAL_LEFT_X, snap=False
+        ),
+    )
+    # Named by the other image of its register group.
+    step(
+        "edit_calibration_point",
+        lambda: ops.edit_calibration_point(s, c.blot, 100, y=cal_y(100, CAL_LEFT_X) + 1.5),
+    )
+    step("remove_calibration_point", lambda: ops.remove_calibration_point(s, c.marker, 10))
+    step("set_ladder", lambda: ops.set_ladder(s, c.membrane, "our ladder", kda=[250, 100, 15]))
+    step("set_marker_image", lambda: ops.set_marker_image(s, c.blot, None))
+    assert all(band.apparent_mw is None for band in protein_of(s, c.protein).bands)
+    step("set_marker_image", lambda: ops.set_marker_image(s, c.blot, c.marker))
+    step("clear_calibration", lambda: ops.clear_calibration(s, c.marker, side=RIGHT))
+    right = [(cal_y(kda, CAL_RIGHT_X), kda) for kda in CAL_KDA[:5]]
+    step(
+        "set_ladder_points",
+        lambda: ops.set_ladder_points(s, c.marker, RIGHT, right, x=CAL_RIGHT_X),
+    )
+    step("remove_image", lambda: ops.remove_image(s, c.marker))
+    assert ran == MW_WRITERS
+    calibration = s.project.batch.membranes[0].calibration
+    assert (calibration.points, calibration.fit_method, calibration.fit_quality) == (
+        [],
+        FitMethod.LOG_LINEAR,
+        None,
+    )
+
+
+def test_two_ladder_apparent_mw_uses_box_x(tmp_path):
+    c = calibrated(tmp_path)
+    s = c.session
+    ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
+    size = protein_of(s, c.protein).box_size
+    mws = []
+    for _, band in sorted(lane_bands(s, c.protein).items()):
+        cx, cy = band.box.x + size.width / 2, band.box.y + size.height / 2
+        # Two ladders read the blot's law exactly: log-linear, linear in x.
+        assert math.isclose(band.apparent_mw, cal_mw(cx, cy), rel_tol=1e-9), band.id
+        mws.append(band.apparent_mw)
+    # The row lies level while the protein line slopes down to the right, so at
+    # one height a lane further right reads heavier.
+    assert mws == sorted(mws) and len(set(mws)) == len(mws)
+    fit = ops.calibration_fit(s.project.batch.membranes[0], c.blot)
+    assert fit is not None and fit.image_ids == (c.blot, c.marker)
+    assert [ladder.side for ladder in fit.ladders] == ["left", "right"]
+    assert math.isclose(fit.offset_px, CAL_TILT, rel_tol=1e-9)
+    assert math.isclose(fit.tilt_deg, math.degrees(math.atan2(CAL_TILT, 420.0)), rel_tol=1e-9)
+    # One ladder: the line is level, and every lane reads one MW at one height.
+    ops.clear_calibration(s, c.blot, side=RIGHT)
+    assert len({band.apparent_mw for band in protein_of(s, c.protein).bands}) == 1
+    assert_mw_current(s)
+
+
+def test_set_box_padding_refreshes_mw(tmp_path):
+    c = calibrated(tmp_path)
+    s = c.session
+    ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
+    band = lane_bands(s, c.protein)[1].id
+    plant(s, lambda draft: setattr(draft.batch.find_band(band)[1], "apparent_mw", 1.0))
+    ops.set_box_padding(s, c.protein, across=2, along=3)
+    assert band_of(s, band).apparent_mw == expected_mw(s, band) != 1.0
+    assert_mw_current(s)
+    # A box the image's edge keeps from growing evenly reads the MW at its
+    # centre, which moved (edge_shifted): at the top of the image, y 0 to 20,
+    # inside the range (which ends a tenth of a decade above 250 kDa, at y 8).
+    top = ops.add_protein(
+        s, "GAPDH", Role.LOADING_CONTROL, c.blot, box_size=BoxSize(width=10, height=20)
+    )
+    edge = ops.place_box(s, top, CAL_LANES[0], 10, lane_index=0, grow=False)
+    before = band_of(s, edge).apparent_mw
+    assert before is not None
+    change = ops.set_box_padding(s, top, along=2)
+    assert change.edge_shifted == (edge,)
+    assert band_of(s, edge).box.y == 0  # 24 px high from the top: its centre 2 px lower
+    assert band_of(s, edge).apparent_mw == expected_mw(s, edge) < before
+    assert_mw_current(s)
+
+
+def test_set_box_size_keeps_apparent_mw(tmp_path):
+    c = calibrated(tmp_path)
+    s = c.session
+    ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
+    before = {b.id: b.apparent_mw for b in protein_of(s, c.protein).bands}
+    fitted = protein_of(s, c.protein).fitted_size
+    # Each box grows by 2 px each way around its centre: the same centre, the same MW.
+    ops.set_box_size(s, c.protein, BoxSize(width=fitted.width + 4, height=fitted.height + 4))
+    assert {b.id: b.apparent_mw for b in protein_of(s, c.protein).bands} == before
+    # One more row of height moves each centre by half a pixel: recomputed.
+    ops.set_box_size(s, c.protein, BoxSize(width=fitted.width + 4, height=fitted.height + 5))
+    after = {b.id: b.apparent_mw for b in protein_of(s, c.protein).bands}
+    assert all(after[band_id] != mw for band_id, mw in before.items())
+    assert_mw_current(s)
+
+
+def reprobe_on(c: Calibrated, name: str = "reprobe α.tif") -> str:
+    """Another chemiluminescence image of the blot's membrane, unlinked: a
+    register group of its own."""
+    return import_blot(c.session, cal_blot(), name, membrane_id=c.membrane)
+
+
+def test_curve_change_drops_that_images_mw_guided_records_only(tmp_path):
+    c = calibrated(tmp_path)
+    s = c.session
+    reprobe = reprobe_on(c)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, reprobe)
+    guided = _record(1, region=(180, 90, 220, 110), source=ProposalSource.MW_GUIDED)
+    boxed_row = _record(2, region=(260, 90, 300, 110))
+    plant_records(s, c.protein, guided, boxed_row)
+    plant_records(s, gapdh, guided)
+
+    update = ops.edit_calibration_point(s, c.marker, 55, y=cal_y(55, CAL_LEFT_X) + 1.0)
+    assert update.curves_changed == (c.blot, c.marker)  # not the reprobe: its own group
+    assert update.dropped_undetected == ((c.protein, 1, 0),)
+    assert _keys(s, c.protein) == [(2, 0)]  # a row-box record stays
+    assert _keys(s, gapdh) == [(1, 0)]  # the reprobe's curve (none) did not change
+    entry = s.project.log[-1]
+    assert entry.params["curves_changed"] == [c.blot, c.marker]
+    assert entry.params["dropped_undetected"] == [_record_json(c.protein, guided)]
+    assert entry.content_hash == content_hash(s.project)
+
+    # A change that leaves the curve as it was, a ladder chosen, drops nothing.
+    plant_records(s, c.protein, guided)
+    ops.set_ladder(s, c.membrane, None)
+    assert _keys(s, c.protein) == [(1, 0), (2, 0)]
+
+
+def test_remove_image_refits_remaining_groups(tmp_path):
+    # Removing an image with points refits what is left (#58); before, the
+    # fit was cleared and every MW on the membrane dropped.
+    c = calibrated(tmp_path, sides=(LEFT,))
+    s = c.session
+    reprobe = reprobe_on(c)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, reprobe)
+    ops.place_box(s, gapdh, CAL_LANES[0], CAL_ROW, lane_index=0, grow=True)
+    # The reprobe's own marks, log-linear: a quarter of the MW every 70 px.
+    for kda, y in ((160, 30.0), (40, 100.0), (10, 170.0)):
+        ops.add_calibration_point(
+            s, reprobe, y, kda, CalibrationPointSource.STRIP_EDGE, x=5.0, snap=False
+        )
+    ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
+    # A faint marker band on the blot, 3 px off the law: the worst point.
+    y10 = cal_y(10, CAL_LEFT_X) + 3.0
+    ops.add_calibration_point(
+        s,
+        c.blot,
+        y10,
+        10,
+        CalibrationPointSource.CHEMILUMINESCENCE_MARKER,
+        x=CAL_LEFT_X,
+        snap=False,
+    )
+    reprobe_mw = band_of(s, protein_of(s, gapdh).bands[0].id).apparent_mw
+    before = s.project.batch.membranes[0].calibration.fit_quality
+
+    cascade = ops.remove_image(s, c.blot)
+    assert cascade.unfitted_membranes == (c.membrane,)
+    calibration = s.project.batch.membranes[0].calibration
+    assert calibration.fit_method is FitMethod.LOG_LINEAR_PIECEWISE
+    assert calibration.fit_quality == mwcal.fit_quality(s.project.batch.membranes[0]) != before
+    assert len(calibration.points) == len(CAL_KDA) + 3  # the marker's and the reprobe's
+    # The reprobe's curve did not change: its MW is the one it had.
+    assert band_of(s, protein_of(s, gapdh).bands[0].id).apparent_mw == reprobe_mw
+    assert s.project.log[-1].params["dropped_undetected"] == []
+    assert_mw_current(s)
+
+
+def test_refitting_a_pre_58_calibration_rewrites_every_mw_on_its_membrane(tmp_path):
+    # mem-1 of the sample is stored as no #58 build fits (log_linear, a fit
+    # quality and band-12's MW from an older fit). A point on the reprobe, a
+    # register group of its own, refits the membrane; the curve of img-2 (read
+    # piecewise all along) does not change, but its stored MW was not computed
+    # from it, so every image of the membrane counts as changed.
+    s = open_sample(tmp_path, hook=None)
+    guided = _record(2, source=ProposalSource.MW_GUIDED)
+    plant_records(s, "prot-7", guided)
+    legacy = s.project
+    stored = band_of(s, "band-12").apparent_mw
+    assert stored == 90.5 != expected_mw(s, "band-12")
+
+    first = ops.add_calibration_point(
+        s, "img-4", 5.0, 200, CalibrationPointSource.STRIP_EDGE, x=10.0, snap=False
+    )
+    assert first.curves_changed == ("img-2", "img-3", "img-4")  # not img-6: mem-5
+    assert first.dropped_undetected == (("prot-7", 2, 0),)
+    mem_1, mem_5 = s.project.batch.membranes
+    assert mem_1.calibration.fit_method is FitMethod.LOG_LINEAR_PIECEWISE
+    assert mem_1.calibration.fit_quality == mwcal.fit_quality(mem_1)
+    assert band_of(s, "band-12").apparent_mw == expected_mw(s, "band-12") != stored
+    assert _keys(s, "prot-7") == []
+    # mem-5, untouched, keeps what it holds.
+    assert mem_5 == legacy.batch.membranes[1]
+
+    # Refitted by #58 now: the next point changes only the curve it makes.
+    second = ops.add_calibration_point(
+        s, "img-4", 140.0, 20, CalibrationPointSource.STRIP_EDGE, x=10.0, snap=False
+    )
+    assert second.curves_changed == ("img-4",)
+    assert band_of(s, "band-12").apparent_mw == expected_mw(s, "band-12")
+    ops.undo(s)
+    ops.undo(s)
+    assert s.project.batch == legacy.batch
+
+
+def test_a_first_curve_changes_only_its_group(tmp_path):
+    # A membrane a #58 build fitted holds log_linear only while no image of it
+    # has a curve (one point, here): its first curve is no refit of an older fit.
+    c = calibrated(tmp_path, sides=())
+    s = c.session
+    reprobe_on(c)
+    ops.add_calibration_point(
+        s, c.marker, cal_y(100, CAL_LEFT_X), 100, MARKER_BAND, x=CAL_LEFT_X, snap=False
+    )
+    update = ops.add_calibration_point(
+        s, c.marker, cal_y(35, CAL_LEFT_X), 35, MARKER_BAND, x=CAL_LEFT_X, snap=False
+    )
+    assert update.curves_changed == (c.blot, c.marker)
+    assert_mw_current(s)
+
+
+def test_undo_restores_calibration_and_mws(tmp_path):
+    c = calibrated(tmp_path, save_to_folder)
+    s = c.session
+    ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
+    before = s.project
+    ops.edit_calibration_point(s, c.marker, 70, side=RIGHT, y=cal_y(70, CAL_RIGHT_X) + 2.0)
+    after = s.project
+    assert after.batch.membranes != before.batch.membranes
+    assert [b.apparent_mw for b in protein_of(s, c.protein).bands] != [
+        b.apparent_mw for b in before.batch.find_protein(c.protein).bands
+    ]
+    done = ops.undo(s)
+    assert (done.action, s.project.batch) == ("edit_calibration_point", before.batch)
+    assert_mw_current(s)
+    ops.redo(s)
+    assert s.project.batch == after.batch
+    assert load_project(s.folder) == s.project
+    assert_mw_current(s)
