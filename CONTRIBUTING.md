@@ -32,6 +32,10 @@ This starts a local server on `127.0.0.1` and opens Proteia in your default
 browser. Quit Proteia on the page, or press Ctrl+C in the terminal, to stop
 it. Running the command again while Proteia runs opens the running app.
 
+With image files, `uv run proteia PATH...` opens Proteia with those images
+offered for import into a new project (the page asks each image's kind,
+membrane and polarity), and works while Proteia is already running.
+
 ## Project layout
 
 ```
