@@ -11,18 +11,17 @@ it fails:
 
 1. **Versions.** ``pyproject.toml``'s version must be ``proteia.__version__``;
    the installer is named after it.
-2. **Build environment.** ``uv export --locked --no-dev --group build --prune
-   napari`` writes the locked requirements without napari's tree (until #57
-   removes it) and with the ``build`` group (PyInstaller, pinned); a new virtual
-   environment ``WORK/env`` gets exactly those (``--no-deps``) and then Proteia
-   itself, not editable. The default ``uv sync`` never installs the ``build``
-   group. ``--python`` chooses the interpreter the bundle carries (default: the
-   one running this script). Once those requirements are installed, a stamp
-   (``WORK/env/build-env.json``) records their hash and the interpreter (real
-   path and version); ``--reuse-env`` keeps ``WORK/env`` only when that stamp
-   matches the requirements just exported and the interpreter ``--python``
-   names, so an install that stopped halfway, or another interpreter, makes it
-   anew.
+2. **Build environment.** ``uv export --locked --no-dev --group build`` writes
+   the locked requirements with the ``build`` group (PyInstaller, pinned); a new
+   virtual environment ``WORK/env`` gets exactly those (``--no-deps``) and then
+   Proteia itself, not editable, and may hold no napari and no Qt. The default
+   ``uv sync`` never installs the ``build`` group. ``--python`` chooses the
+   interpreter the bundle carries (default: the one running this script). Once
+   those requirements are installed, a stamp (``WORK/env/build-env.json``)
+   records their hash and the interpreter (real path and version);
+   ``--reuse-env`` keeps ``WORK/env`` only when that stamp matches the
+   requirements just exported and the interpreter ``--python`` names, so an
+   install that stopped halfway, or another interpreter, makes it anew.
 3. **Bundle.** PyInstaller runs ``proteia.spec`` into ``WORK/dist/Proteia``
    (log: ``WORK/pyinstaller.log``). The bundle may hold no napari, Qt or Tcl
    file and no Universal CRT DLL, and must hold the web client and the
@@ -80,9 +79,9 @@ SPEC = HERE / "proteia.spec"
 ISS = HERE / "proteia.iss"
 NOTICES = HERE / "notices.py"
 INNO_SETUP_VERSION = "7.1.0"  # proteia.iss refuses another
-# Excluded from the build environment with everything only it requires (#57
-# removes it from the dependencies).
-PRUNED = ("napari",)
+# Modules the build environment may not hold: napari left the dependencies in
+# #57, and Qt would bring the duties of conveying it (ADR 0002).
+ABSENT = ("napari", "PySide6", "qtpy")
 # In WORK/env, written once its locked requirements are installed.
 ENV_STAMP = "build-env.json"
 # Prints which interpreter runs it, or which one a virtual environment's comes
@@ -361,11 +360,10 @@ class Build:
 
     def environment(self, python: str, reuse: bool) -> None:
         requirements = self.work / "requirements.txt"
-        prune = [arg for name in PRUNED for arg in ("--prune", name)]
         self.run(
             "uv-export",
             [self.uv, "export", "--locked", "--no-dev", "--group", "build", "--no-emit-project",
-             *prune, "--format", "requirements.txt", "--output-file", requirements],
+             "--format", "requirements.txt", "--output-file", requirements],
             cwd=ROOT,
         )  # fmt: skip
         self.summary["environment"] = self.make_environment(python, requirements, reuse)
@@ -376,10 +374,10 @@ class Build:
         )  # fmt: skip
         check = (
             "import importlib.util, sys; sys.exit(any(importlib.util.find_spec(n)"
-            f" for n in {list(PRUNED) + ['PySide6', 'qtpy']!r}))"
+            f" for n in {list(ABSENT)!r}))"
         )
         if subprocess.run([self.env_python, "-c", check], creationflags=_NO_WINDOW).returncode:
-            raise BuildError(f"the build environment holds {PRUNED} or Qt")
+            raise BuildError("the build environment holds napari or Qt")
         self.summary["python"] = self.run(
             "python-version", [self.env_python, "-c", "import sys; print(sys.version)"]
         ).strip()

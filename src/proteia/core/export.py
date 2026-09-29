@@ -43,7 +43,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from pathlib import Path
 from typing import Final, NamedTuple
 
 import proteia
@@ -179,21 +178,6 @@ def lane_table_bytes(
         row += [_cell(values[i], LANE_TABLE_RATIO_DECIMALS) for _, values in series]
         writer.writerow(row)
     return text.getvalue().encode(CSV_ENCODING)
-
-
-def write_lane_table(
-    path: str | Path,
-    conditions: Sequence[str],
-    samples: Sequence[str | None],
-    included: Sequence[bool],
-    proteins: Sequence[tuple[str, LaneNets]],
-    *,
-    clipped: Mapping[str, Sequence[bool | None]] | None = None,
-) -> None:
-    """Write :func:`lane_table_bytes` to ``path``. Every check runs before the
-    file is opened."""
-    data = lane_table_bytes(conditions, samples, included, proteins, clipped=clipped)
-    Path(path).write_bytes(data)
 
 
 # --- Column names ---

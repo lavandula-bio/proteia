@@ -472,9 +472,3 @@ def render_pdf(spec: PlotSpec, *, style: str = DEFAULT_STYLE, statement: bool = 
         buffer = io.BytesIO()
         _figure(spec, style, statement).savefig(buffer, format="pdf", metadata=_PDF_METADATA)
     return buffer.getvalue()
-
-
-def save_figure(spec: PlotSpec, path: str, *, dpi: int = 150, statement: bool = True) -> None:
-    """Render and write the figure to ``path``, by default with its statement
-    under it: a file saved on its own states its statistics."""
-    render_figure(spec, statement=statement).savefig(path, dpi=dpi)

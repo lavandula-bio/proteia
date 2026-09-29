@@ -22,31 +22,36 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-`uv run proteia` starts the local web app in your browser. With image files,
-`uv run proteia PATH...` opens Proteia with those images offered for import
-into a new project (the page asks each image's kind, membrane and polarity),
-and works while Proteia is already running.
-
-To launch napari locally (requires a display):
+To run the app locally:
 
 ```bash
-uv run napari
+uv run proteia
 ```
+
+This starts a local server on `127.0.0.1` and opens Proteia in your default
+browser. Quit Proteia on the page, or press Ctrl+C in the terminal, to stop
+it. Running the command again while Proteia runs opens the running app.
+
+With image files, `uv run proteia PATH...` opens Proteia with those images
+offered for import into a new project (the page asks each image's kind,
+membrane and polarity), and works while Proteia is already running.
 
 ## Project layout
 
 ```
 src/proteia/        Python package
   core/             GUI-independent data model, quantification, QC
-  gui/              napari GUI layer (calls into core; never the reverse)
+  viz/              chart rendering (PNG, SVG, PDF)
+  web/              local web app: server and browser client (calls into core;
+                    never the reverse)
 tests/              test suite
 docs/adr/           architecture decision records
 ```
 
-The separation between `core` and `gui` is intentional (see
-[ADR 0001](docs/adr/0001-gui-foundation-napari.md)): the core must not depend
-on the GUI, so an alternative front-end can be added later without rewriting
-the analysis code.
+The separation between `core` and `web` is intentional (see
+[ADR 0002](docs/adr/0002-gui-local-web-app.md)): the core must not depend on
+the front end, so another front end can be added later without rewriting the
+analysis code.
 
 ## Workflow
 
@@ -93,5 +98,6 @@ Apache License 2.0. New source files should carry the header:
 # SPDX-License-Identifier: Apache-2.0
 ```
 
-Prefer permissively licensed dependencies (MIT/BSD/Apache/LGPL); avoid
-GPL/AGPL or non-commercial licenses.
+Prefer permissively licensed dependencies (MIT, BSD, Apache-2.0, ISC). Ask
+before adding an LGPL, MPL or dual-licensed one; avoid GPL, AGPL, SSPL and
+non-commercial licenses.

@@ -7,7 +7,7 @@ changes only this package. The chart styles are a registry
 (:data:`~proteia.viz.styles.CHART_STYLES`).
 """
 
-from proteia.viz.render import render_figure, render_pdf, render_png, render_svg, save_figure
+from proteia.viz.render import render_figure, render_pdf, render_png, render_svg
 from proteia.viz.styles import CHART_STYLES, DEFAULT_STYLE, ChartStyle, chart_style
 
 __all__ = [
@@ -19,5 +19,4 @@ __all__ = [
     "render_pdf",
     "render_png",
     "render_svg",
-    "save_figure",
 ]

@@ -14,7 +14,6 @@ from proteia.core.boxes import (
     grow_to_fit,
     grow_to_fit_all,
     initial_box_size,
-    normalize_corners,
     overlaps_any,
     padding_words,
     place_in_row,
@@ -25,12 +24,6 @@ from proteia.core.boxes import (
 from proteia.core.model import BoxPadding, BoxSize, overlaps
 
 SIZE = BoxSize(width=10, height=4)
-
-
-def test_normalize_corners_orders_and_rounds():
-    # napari vertices are (y, x) and may be in any order.
-    corners = [(5.4, 20.6), (5.4, 10.2), (8.7, 10.2), (8.7, 20.6)]
-    assert normalize_corners(corners) == (10, 5, 21, 9)
 
 
 def test_resize_all_grows_around_each_center():
@@ -59,7 +52,7 @@ def test_resize_all_rejects_when_it_forces_overlap():
     assert resize_all(rects, bigger) is None
 
 
-# --- placement rules lifted from the napari app ---
+# --- placement rules ---
 
 W, H = 100, 60  # image size
 
@@ -109,26 +102,7 @@ def test_initial_box_size_is_clamped_to_the_image():
     assert initial_box_size(3, 2) == BoxSize(width=3, height=2)  # but never past the image
 
 
-def test_box_rules_match_the_napari_app():
-    # The app module imports headlessly (napari and Qt are imported inside launch).
-    # #57 removes the app's private helpers, and these parity cases with them.
-    from proteia.gui import app
-
-    dims = [(4, 4), (7, 5), (40, 30), (340, 150), (1000, 800)]
-    for iw, ih in dims:
-        expected = app._initial_size(np.zeros((ih, iw)))
-        assert initial_box_size(iw, ih) == expected, (iw, ih)
-
-    sizes = [BoxSize(width=w, height=h) for w, h in [(1, 1), (4, 3), (10, 4), (25, 18)]]
-    corners = [-5, 0, 3, 17, 48, 95, 120]
-    for size, (x0, x1), (y0, y1) in itertools.product(
-        sizes, itertools.combinations(corners, 2), itertools.combinations(corners, 2)
-    ):
-        rect = (x0, y0, x1, y1)
-        assert center_snap(rect, size, W, H) == app._center_snap(rect, size, W, H), rect
-
-
-# --- grow_to_fit: napari's seed-grow sizing ---
+# --- grow_to_fit: seed-grow sizing ---
 
 
 def test_grow_to_fit_first_box_takes_the_grown_size():

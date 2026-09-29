@@ -4016,11 +4016,11 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     protein's row (:func:`~proteia.core.rowdetect.detect_row`) and commit the
     outcome for the protein's band index 0.
 
-    ``row`` is ``(x0, y0, x1, y1)`` in image pixels, end-exclusive (a client
-    normalizes drag corners with :func:`~proteia.core.boxes.normalize_corners`);
-    it is clipped to the image. It must span every declared lane, include=no
-    lanes and empty end lanes too: the lanes are read from the bands, and
-    detection runs in every lane. In each lane:
+    ``row`` is ``(x0, y0, x1, y1)`` in image pixels, end-exclusive, with
+    ``x0 < x1`` and ``y0 < y1`` (a client orders the corners of a drag); it is
+    clipped to the image. It must span every declared lane, include=no lanes
+    and empty end lanes too: the lanes are read from the bands, and detection
+    runs in every lane. In each lane:
 
     * a box edited by hand (moved, or given another lane) is kept as it is,
       whatever was found there, and so is a box the user placed (source

@@ -33,50 +33,29 @@ PACKAGE_DATA: Final = ("web/static/**/*",)
 RECORD_DISTRIBUTIONS: Final = ("numpy", "scipy", "scikit-image", "pillow", "tifffile")
 # The matplotlib backends the app draws with: PNG previews through Agg, SVG
 # charts, PDF exports. Without this PyInstaller's hook picks an interactive
-# backend (QtAgg while PySide6 is installed) and takes Qt along.
+# backend and takes its toolkit along (QtAgg took Qt while PySide6 was installed).
 MATPLOTLIB_BACKENDS: Final = ("Agg", "SVG", "PDF")
 
-# Modules the bundle leaves out although something may import them. The napari
-# GUI and what only it needs go until #57 removes napari from the dependencies;
-# the build environment already comes without them (build.py), so this list is a
-# second guard. setuptools and pkg_resources are PyInstaller's build
-# requirements, which nothing the app runs needs.
+# Modules the bundle leaves out although something may import them. napari
+# left the dependencies in #57 and no locked package needs Qt, so the build
+# environment comes without them (build.py checks); naming them here is a second
+# guard. tkinter comes with Python, and setuptools and pkg_resources are
+# PyInstaller's build requirements: nothing the app runs needs them.
 EXCLUDES: Final = (
-    "proteia.gui",
     "napari",
-    "napari_builtins",
-    "napari_console",
-    "napari_plugin_engine",
-    "napari_svg",
-    "npe2",
     "PySide6",
     "shiboken6",
     "PyQt5",
     "PyQt6",
     "qtpy",
-    "superqt",
-    "magicgui",
-    "app_model",
-    "in_n_out",
-    "vispy",
-    "qtconsole",
-    "IPython",
-    "ipykernel",
-    "jupyter_client",
-    "jupyter_core",
-    "OpenGL",
-    "dask",
-    "pandas",
-    "zarr",
-    "pint",
     "tkinter",
     "_tkinter",
     "setuptools",
     "pkg_resources",
     "_distutils_hack",
 )
-# Names no file in a finished bundle may have: the napari GUI and Qt (ADR 0002's
-# LGPL duties arise only when Qt ships). Matched case-insensitively against each
+# Names no file in a finished bundle may have: napari and Qt (ADR 0002's LGPL
+# duties arise only when Qt ships). Matched case-insensitively against each
 # part of every path in the bundle.
 FORBIDDEN_NAMES: Final = re.compile(
     r"^(napari.*|pyside6.*|shiboken6.*|pyqt[56].*|qt[56].*|vispy.*|_?tcl.*|_?tk\d.*|_tk_data)$",
