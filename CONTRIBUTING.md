@@ -22,6 +22,11 @@ uv run ruff check .
 uv run ruff format .
 ```
 
+`uv run proteia` starts the local web app in your browser. With image files,
+`uv run proteia PATH...` opens Proteia with those images offered for import
+into a new project (the page asks each image's kind, membrane and polarity),
+and works while Proteia is already running.
+
 To launch napari locally (requires a display):
 
 ```bash
