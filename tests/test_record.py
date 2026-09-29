@@ -250,8 +250,37 @@ def test_settings_are_the_code_constants():
                 " is called hollow (hollow_band)"
             ),
         },
-        # How molecular weights are calibrated (#58), with the ladder presets' version.
-        "mw": {**mwcal.settings(), "presets_version": ladders.PRESETS_VERSION},
+        # How molecular weights are calibrated and checked (#58), with the ladder
+        # presets' version.
+        "mw": {
+            **mwcal.settings(),
+            "check": {
+                "apparent_mw": "the image's calibration at the box's centre, padding included",
+                "deviation": "apparent / expected - 1",
+                "passes": "(1 - tolerance) * expected <= apparent <= (1 + tolerance) * expected",
+                "default_tolerance": 0.1,
+                "count_window": (
+                    "the box's centre +/- log10(1 + tolerance) decades on the image's"
+                    " calibration there; the row box's rows without a curve"
+                ),
+                "count": (
+                    "the band, and each other peak of the lane in the window that reaches the"
+                    " detector's second_share of the lane's peak and is as wide as a band;"
+                    " tops side by side in one band count once"
+                ),
+                "count_passes": "at most the expected band count",
+                "tilt": (
+                    "per protein with tilt_min_lanes detector boxes nobody edited, the"
+                    " least-squares slope across the lanes of each box centre's offset from"
+                    " the protein line at its expected MW where the calibration reaches it"
+                    " (else the boxes' median apparent MW); the median slope over the lanes'"
+                    " span, as an MW drift at the middle lane"
+                ),
+                "tilt_warn": 0.05,
+                "tilt_min_lanes": 4,
+            },
+            "presets_version": ladders.PRESETS_VERSION,
+        },
         "statistics": {
             "alpha": 0.05,
             "dunnett_rng_seed": 0,

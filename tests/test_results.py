@@ -142,8 +142,12 @@ def test_columns_carry_the_joined_nets_and_band_ids():
     assert [lane.condition for lane in res.lanes] == ["vehicle", "vehicle", "10 µM", "10 µM"]
     assert [lane.included for lane in res.lanes] == [True, True, True, False]
     # The sample project is clean but for its unchecked bands (#112): its JPEG
-    # loading control, and flags its 16-bit images leave out.
-    assert {notice.code for notice in res.notices} == {NoticeCode.CLIPPING_NOT_CHECKED}
+    # loading control, and flags its 16-bit images leave out; and that loading
+    # control's strip, calibrated from its two edges (#58, D7).
+    assert {notice.code for notice in res.notices} == {
+        NoticeCode.CLIPPING_NOT_CHECKED,
+        NoticeCode.CALIBRATION_TWO_POINTS,
+    }
 
 
 # --- which loading control a series uses ---
@@ -1800,7 +1804,8 @@ def test_the_sample_projects_jpeg_loading_control_is_reported():
     # α-tubulin is on a JPEG with no recorded bit depth; nothing else in the
     # sample is unchecked once β-catenin's and GAPDH's bands are checked.
     res = compute_results(_batch(_checked(False, *BETA_BANDS, "band-17", "band-18")))
-    assert _codes(res) == [NoticeCode.CLIPPING_NOT_CHECKED]
+    # Its strip's two-point calibration (#58, D7) is the same in both sets.
+    assert _codes(res) == [NoticeCode.CLIPPING_NOT_CHECKED, NoticeCode.CALIBRATION_TWO_POINTS]
     assert _codes(res.all_lanes) == [NoticeCode.CLIPPING_NOT_CHECKED]
     assert "lossy (JPEG-type) compression and an unknown bit depth" in res.notices[0].message
 

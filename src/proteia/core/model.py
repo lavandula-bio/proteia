@@ -584,6 +584,12 @@ class Band(_Model):
     the heuristic that stands in for it where it cannot run (#112,
     :func:`~proteia.core.quantify.is_possibly_clipped`): a band has at most one
     of them, the other None.
+
+    ``bands_found`` is how many bands the detector that placed the box found in
+    its lane within the count window around it (#58, D10): the band itself,
+    and each other peak there that reads as a band. Only a detector's band
+    that nobody edited has one; an edit by hand, or a change to what the window
+    came from, clears it.
     """
 
     id: BandId
@@ -594,7 +600,13 @@ class Band(_Model):
     background_level: Finite
     background_mode: BackgroundMode
     background_spread: NonNegative
-    apparent_mw: Kda | None = None  # from the calibration (#58); None = not computed
+    # Its image's calibration at the box's centre (#58); None = no curve there, or the centre
+    # lies outside its range.
+    apparent_mw: Kda | None = None
+    # #58: the bands a detector found in the count window; None = not counted (placed
+    # or edited by hand, or cleared). Left out of the saved form while None, so a
+    # project without a count keeps its bytes and hash (see "Canonical form" in storage).
+    bands_found: int | None = Field(default=None, ge=1, exclude_if=lambda v: v is None)
     clipped: bool | None = None  # #44; None = not checked (not "passed")
     # #112; None = not assessed: the exact check ran, the image has no known
     # range, or the project was saved before #112 (requantify assesses it).
@@ -611,6 +623,20 @@ class Band(_Model):
             raise ValueError(
                 f"band {self.id}: checked for over-exposure (clipped) and assessed"
                 " for it (possibly_clipped); only one of the checks runs on an image"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _counted_by_a_detector(self) -> Band:
+        # A count belongs to the detector's box: a box edited by hand, or placed
+        # without a detector, holds none, so a count cannot outlive its box.
+        if self.bands_found is not None and (
+            self.source not in DETECTING_SOURCES or self.manually_edited
+        ):
+            how = "edited by hand" if self.manually_edited else f"placed by {self.source.value}"
+            raise ValueError(
+                f"band {self.id}: a band count (bands_found) comes from a detector's box"
+                f" that nobody edited, and this one was {how}"
             )
         return self
 
@@ -711,7 +737,8 @@ class Protein(_Model):
     @model_validator(mode="after")
     def _check_bands_and_loading_controls(self) -> Protein:
         # Band order carries no meaning: sort so equal proteins give equal bytes.
-        # No band_index < expected_band_count check: #58 stores extra bands to flag them.
+        # #58 counts extra bands (Band.bands_found) instead of boxing them; a box at band
+        # index > 0 stays loadable for files that hold one.
         self.bands.sort(key=lambda band: (band.lane_index, band.band_index))
         for a, b in itertools.pairwise(self.bands):
             if (a.lane_index, a.band_index) == (b.lane_index, b.band_index):

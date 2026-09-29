@@ -528,6 +528,39 @@ def test_explicit_defaults_keep_the_bytes_and_hash():
     assert document_hash(written) != content_hash(project)
 
 
+def test_a_null_band_count_keeps_the_bytes_and_hash():
+    # #58: a band with no count holds no bands_found key, so no project saved
+    # before the count, and none without one, moves its bytes or hash.
+    project = make_project()
+    doc = _doc(project)
+    for protein in doc["batch"]["proteins"]:
+        for band in protein["bands"]:
+            assert "bands_found" not in band
+            band["bands_found"] = None  # a hand-edited file
+    loaded = project_from_json(_encode(doc))
+    assert loaded == project
+    assert content_hash(loaded) == content_hash(project)  # pinned: test_content_hash_is_pinned
+    assert project_to_json(loaded) == project_to_json(project)
+
+
+def test_a_band_count_round_trips(tmp_path):
+    def count(p: Project) -> None:
+        p.batch.find_band("band-11")[1].bands_found = 2  # a row box nobody edited
+
+    project = apply_change(make_project(), count)[0]
+    data = _saved(tmp_path / "a", project).read_bytes()
+    [band] = [
+        band
+        for protein in json.loads(data)["batch"]["proteins"]
+        for band in protein["bands"]
+        if band["id"] == "band-11"
+    ]
+    assert band["bands_found"] == 2
+    loaded = load_project(tmp_path / "a")
+    assert loaded == project and content_hash(loaded) != content_hash(make_project())
+    assert _saved(tmp_path / "b", loaded).read_bytes() == data
+
+
 def _calibrated() -> Project:
     """The sample project with a right ladder on mem-1's marker (every point of
     mem-1 at its x), the ladder's MW list and the piecewise method, and mem-5's

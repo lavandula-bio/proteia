@@ -11,6 +11,7 @@ import math
 import re
 import time
 from functools import cache
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -1985,13 +1986,20 @@ def test_translation_is_exact(name):
 
     for after, before in zip(moved.lanes, found.lanes, strict=True):
         assert after.expected_x - dx == pytest.approx(before.expected_x)
-        assert dataclasses.replace(after, expected_x=0.0) == dataclasses.replace(
+        assert dataclasses.replace(after, expected_x=0.0, peaks=()) == dataclasses.replace(
             before,
             rect=move(before.rect),
             extent=move(before.extent),
             window=move(before.window),
             expected_x=0.0,
+            peaks=(),
         )
+        # The peaks' continuous positions move by the same, up to the last bit
+        # of a float that holds a larger coordinate (#58).
+        assert len(after.peaks) == len(before.peaks)
+        for a, b in zip(after.peaks, before.peaks, strict=True):
+            assert (a.y - dy, a.x - dx) == pytest.approx((b.y, b.x), rel=0, abs=1e-9)
+            assert a[2:] == b[2:]
     assert dataclasses.replace(moved, lanes=(), notes=()) == dataclasses.replace(
         found, lanes=(), notes=()
     )
@@ -2776,3 +2784,233 @@ def test_each_doubt_setting_takes_part(monkeypatch, name, value, row):
     monkeypatch.setattr(rowdetect, name, value)
     assert settings()[name.lower()] == value
     assert doubts(detect(_case(row))) != ""
+
+
+# --- #58: what the detector finds stays what it found ---
+
+GOLDEN = Path(__file__).parent / "data" / "rowdetect_golden.json"
+# The saturated rows are also read with their saturation level (#121), and one
+# row from its right end.
+_GOLDEN_SATURATED = ("dumbbell_band", "hollow_band", "hollow_ring", "notched_band")
+
+
+def _golden_cases() -> dict[str, tuple[RowCase, dict]]:
+    """The rows the golden file pins, by name: every bench row, every
+    adversarial recipe (at the seed the invariant checks use, else 1000), the
+    saturated rows with their saturation level, a JPEG export and a row read
+    from its right end."""
+    seeds = dict(ADVERSARIAL_KEYS)
+    cases: dict[str, tuple[RowCase, dict]] = {f"bench/{name}": (BENCH[name], {}) for name in BENCH}
+    for key in ADVERSARIAL:
+        seed = seeds.get(key, 1000)
+        cases[f"adversarial/{key}/{seed}"] = (_adversarial(key, seed), {})
+    cases["bench/overexposed saturated_at=0"] = (BENCH["overexposed"], {"saturated_at": 0.0})
+    for key in _GOLDEN_SATURATED:
+        case = _adversarial(key, 1000)
+        cases[f"adversarial/{key}/1000 saturated_at=0"] = (case, {"saturated_at": 0.0})
+    cases["jpeg/1000"] = (jpeg(adversarial_row("jpeg", 1000, noise=100.0, my=10)), {})
+    cases["bench/all_present right_to_left"] = (BENCH["all_present"], {"right_to_left": True})
+    return cases
+
+
+def _golden_entry(found: RowDetection) -> dict:
+    """What the golden file keeps of a result: its flags and notes, and per
+    lane its rect, reason, components and SNR."""
+    return {
+        "flags": list(found.flags),
+        "notes": list(found.notes),
+        "lanes": [
+            {
+                "rect": None if lane.rect is None else list(lane.rect),
+                "reason": lane.reason,
+                "components": lane.components,
+                "snr": lane.snr,
+            }
+            for lane in found.lanes
+        ],
+    }
+
+
+@cache
+def _golden() -> dict:
+    return json.loads(GOLDEN.read_text(encoding="utf-8"))
+
+
+def test_the_golden_file_covers_every_golden_row():
+    assert sorted(_golden()["cases"]) == sorted(_golden_cases())
+
+
+@pytest.mark.parametrize("name", list(_golden_cases()))
+def test_rowdetect_matches_golden(name):
+    # The file was written by the detector as it was before #58 added peaks:
+    # flags, notes, rects, reasons and components exactly, the SNR within
+    # rel_tol (the last bits of numpy and scipy may differ between platforms).
+    case, kwargs = _golden_cases()[name]
+    expected = _golden()["cases"][name]
+    found = _golden_entry(detect(case, **kwargs))
+    assert found["flags"] == expected["flags"]
+    assert found["notes"] == expected["notes"]
+    assert len(found["lanes"]) == len(expected["lanes"])
+    for got, want in zip(found["lanes"], expected["lanes"], strict=True):
+        assert {k: got[k] for k in ("rect", "reason", "components")} == {
+            k: want[k] for k in ("rect", "reason", "components")
+        }
+        assert math.isclose(got["snr"], want["snr"], rel_tol=1e-9, abs_tol=1e-12)
+
+
+# --- #58: the lane's peaks, for a count of its bands ---
+
+
+@pytest.mark.parametrize("name", [*INVARIANT_CASES, "hollow_band/1000 saturated"])
+def test_peaks_are_the_component_tops(name, monkeypatch):
+    # Every top _count_components reads, each in the lane whose span holds it,
+    # top to bottom, at its pixel's centre (y moved at most half a row).
+    if name.endswith(" saturated"):
+        case, kwargs = _case(name.removesuffix(" saturated")), {"saturated_at": 0.0}
+    else:
+        case, kwargs = _case(name), {}
+    tops: list[list[tuple[int, int]]] = []
+    real = rowdetect._peaks
+
+    def spy(ks, h):
+        found = real(ks, h)
+        tops.append(found)
+        return found
+
+    monkeypatch.setattr(rowdetect, "_peaks", spy)
+    found = detect(case, **kwargs)
+    assert len(tops) <= 1  # read once, on the pass that gives the result
+    x0, y0 = max(0, case.row[0]), max(0, case.row[1])
+    listed = []
+    for lane in found.lanes:
+        if lane.rect is None:
+            assert lane.peaks == ()
+            continue
+        # Top to bottom by their pixel rows; a refined y may cross a row's by less than one.
+        assert all(b.y > a.y - 1.0 for a, b in itertools.pairwise(lane.peaks))
+        for peak in lane.peaks:
+            assert isinstance(peak, rowdetect.Peak) and peak[:3] == (peak.y, peak.x, peak.snr)
+            column, row = peak.x - 0.5 - x0, math.floor(peak.y - y0)
+            assert column == int(column)
+            assert (row, int(column)) in tops[0] or (row - 1, int(column)) in tops[0], peak
+            assert peak.snr >= DETECT_K
+            listed.append((round(peak.y, 6), peak.x))
+            if peak.own:  # the band's own lies in its grown extent
+                ex0, ey0, ex1, ey1 = lane.extent
+                assert ex0 <= peak.x <= ex1 and ey0 <= peak.y <= ey1
+        # A second component is a peak of another band; not every such peak is one.
+        assert lane.components - 1 <= sum(peak.other_band for peak in lane.peaks)
+        assert not any(peak.own and peak.other_band for peak in lane.peaks)
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) >= lane.components
+    assert len(listed) == len(set(listed))  # no top in two lanes
+
+
+def test_a_band_whose_top_is_no_separate_peak_still_counts_itself():
+    # Touching bands: a lane's highest pixel may rise from its neighbour's hill
+    # without a saddle deep enough to be a peak of its own.
+    found = _detected("touching")
+    assert any(lane.rect is not None and lane.peaks == () for lane in found.lanes)
+    assert [rowdetect.bands_in(lane, -math.inf, math.inf) for lane in found.lanes] == [1] * 6
+
+
+def test_a_doublet_s_peaks_hold_both_bands():
+    case = _adversarial("doublet_deep", 1000)
+    lane = detect(case).lanes[2]
+    assert lane.components == 2
+    own, other = lane.peaks
+    assert (own.own, own.other_band, other.own, other.other_band) == (True, False, False, True)
+    assert abs((other.y - own.y) - 14.0) < 1.5  # 14 px apart
+    assert other.snr >= SECOND_SHARE * own.snr
+    # A dumbbell and a hollow band are one band: both their tops are their own.
+    for key in ("dumbbell_band", "hollow_band"):
+        lane = detect(_adversarial(key, 1000), saturated_at=0.0).lanes[1]
+        assert len(lane.peaks) == 2 and all(peak.own for peak in lane.peaks), key
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1, key
+
+
+_JPEG_SEEDS = [1000, 1002, 1003, 1006, 1007]
+
+
+def _jpeg_detected(seed: int) -> RowDetection:
+    return detect(jpeg(adversarial_row("jpeg", seed, noise=100.0, my=10)))
+
+
+@pytest.mark.parametrize("seed", _JPEG_SEEDS)
+def test_jpeg_block_noise_is_no_other_band(seed):
+    # Block artefacts reach DETECT_K beside the bands, but only about 1% of the
+    # lane's peak: peaks of no band.
+    found = _jpeg_detected(seed)
+    assert [rowdetect.bands_in(lane, -math.inf, math.inf) for lane in found.lanes] == [1] * 6
+
+
+def test_jpeg_block_noise_reaches_detect_k():
+    # The test above is not vacuous: its artefacts do make extra peaks. Which
+    # seeds do depends on the platform's JPEG encoder, so the seeds are pooled.
+    assert any(len(lane.peaks) > 1 for seed in _JPEG_SEEDS for lane in _jpeg_detected(seed).lanes)
+
+
+@pytest.mark.parametrize(("frac", "counted"), [(0.2, False), (0.3, True), (0.7, True)])
+def test_bands_found_uses_second_share(frac, counted, monkeypatch):
+    # #58, D10: a band 20 px below lane 3's, with membrane between, is no
+    # second component (#121), but it is another band in the lane: a count
+    # reads it from SECOND_SHARE of the lane's peak, where it lies in the window.
+    case = adversarial_row("doublet", 1000, doublet={2: (20, frac)}, my=12)
+    lane = detect(case).lanes[2]
+    assert lane.components == 1
+    [own] = [peak for peak in lane.peaks if peak.own]
+    others = [peak for peak in lane.peaks if not peak.own]
+    assert len(others) == 1 and abs(others[0].y - own.y - 20.0) < 1.5
+    assert others[0].other_band is counted
+    assert (others[0].snr >= SECOND_SHARE * own.snr) is counted
+    assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1 + counted
+    # A window around the band that stops short of the other holds one band.
+    assert rowdetect.bands_in(lane, own.y - 12.0, own.y + 12.0) == 1
+    assert rowdetect.bands_in(lane, own.y - 12.0, others[0].y) == 1 + counted
+    if counted:  # the share decides it
+        monkeypatch.setattr(rowdetect, "SECOND_SHARE", frac + 0.05)
+        lane = detect(case).lanes[2]
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 1
+    # An empty lane holds no band.
+    empty = detect(BENCH["missing_middle"]).lanes[2]
+    assert (empty.peaks, rowdetect.bands_in(empty, -math.inf, math.inf)) == ((), 0)
+
+
+# Lane 3's band with another 20 px below it, 0.8 as deep and 10 px to the right.
+_PARTNER = {"doublet": {2: (20, 0.8)}, "shifts": {2: 10}, "my": 12, "box_adjust": (0, 0, 0, 14)}
+
+
+def two_topped_partner(seed: int, *, saturated: bool = False) -> RowCase:
+    """The row of :data:`_PARTNER` with the lower band lighter across its
+    middle than at its ends: a dumbbell, or over-exposed (clipped flat at 0)
+    around a lighter centre, a hollow band."""
+    if saturated:
+        light = blob(2, 6.0, -45000.0, ry=12.0, dy=10)
+        return adversarial_row(
+            "doublet", seed, **_PARTNER, depths={2: 1.5 * MEMBRANE}, artefacts=[light]
+        )
+    light = blob(2, 6.0, -11000.0, ry=12.0, dy=10)
+    return adversarial_row("doublet", seed, **_PARTNER, artefacts=[light])
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002, 1003])
+@pytest.mark.parametrize("saturated", [False, True])
+def test_another_band_with_two_tops_side_by_side_is_one_band(seed, saturated):
+    # #58: the band below lane 3's has two tops side by side, one per end:
+    # one band, the count's second, as its own tops are the band's one (a
+    # dumbbell or a hollow band is one band).
+    plain = detect(adversarial_row("doublet", seed, **_PARTNER)).lanes[2]
+    assert rowdetect.bands_in(plain, -math.inf, math.inf) == 2
+    kwargs = {"saturated_at": 0.0} if saturated else {}
+    lane = detect(two_topped_partner(seed, saturated=saturated), **kwargs).lanes[2]
+    assert lane.components == 1
+    tops = [peak for peak in lane.peaks if not peak.own]
+    assert len(tops) == 2, lane.peaks
+    left, right = sorted(tops, key=lambda peak: peak.x)
+    assert abs(left.y - right.y) < 1.0 and right.x - left.x > 15.0  # side by side
+    # The higher of the two stands for the band.
+    [counted] = [peak for peak in tops if peak.other_band]
+    assert counted.snr == max(peak.snr for peak in tops)
+    assert rowdetect.bands_in(lane, -math.inf, math.inf) == 2
+    # Two bands stacked in a lane stay two (a doublet's).
+    doublet = detect(_adversarial("doublet_deep", 1000)).lanes[2]
+    assert rowdetect.bands_in(doublet, -math.inf, math.inf) == 2

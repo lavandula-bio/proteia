@@ -48,6 +48,21 @@ Each image's ``colour`` says whether its stored file has colour that its gray
 analysis view does not show (:func:`has_colour`): then the page offers a view of
 it in its original colours (:func:`original_png`), for display only. Only that
 reads a stored file here: a header, once per image (TIFF, or a colour file).
+
+Molecular weights (#58). Each image's ``marker_image_id`` names the marker image
+a chemiluminescence image is linked to (null: none), and each band's
+``apparent_mw`` its MW read from its image's calibration at the box's centre
+(null: no curve there, or outside its range) and ``bands_found`` how many
+bands the detector that placed it found in the count window around it (null:
+not counted); each protein's ``mw_tolerance`` is its MW check's tolerance, a
+share (0.1: ±10%). ``membranes`` lists each membrane's ``id``, its
+``image_ids``, its ``ladder`` (a preset key or a custom name, or null) and
+``ladder_kda`` (the ladder's MWs, top to bottom), and its register groups
+(``groups``), in the order of their first image: each group's
+``image_ids``, its calibration ``points`` (``image_id``, ``y``, ``mw``,
+``source``, ``x`` and ``side``, in continuous coordinates of the analysis
+array) and its ``fit`` (:meth:`~proteia.core.operations.CalibrationFit.as_json`,
+null without a curve).
 """
 
 from __future__ import annotations
@@ -60,8 +75,8 @@ from PIL import Image
 from pydantic import JsonValue
 
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
-from proteia.core.model import Batch, ImageRef, Project, Protein
-from proteia.core.operations import unassessed_images
+from proteia.core.model import Batch, ImageRef, Membrane, Project, Protein
+from proteia.core.operations import calibration_fit, unassessed_images
 from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import HistoryStep, ProjectSession
 
@@ -85,6 +100,41 @@ def _missing_lanes(
     centres = [band.box.y + protein.box_size.height / 2 for band in first]
     y = statistics.median(centres) if centres else None
     return [{"lane_index": lane, "x": xs.get(lane), "y": y} for lane in lanes]
+
+
+def _membrane(membrane: Membrane) -> JsonValue:
+    """A membrane's ladder and its register groups, each with its calibration
+    points and its fit."""
+    calibration = membrane.calibration
+    groups: list[JsonValue] = []
+    for group in membrane.register_groups():
+        image_ids = [image.id for image in membrane.images if image.id in group]
+        fit = calibration_fit(membrane, image_ids[0])
+        groups.append(
+            {
+                "image_ids": list(image_ids),
+                "points": [
+                    {
+                        "image_id": point.image_id,
+                        "y": point.y,
+                        "mw": point.mw,
+                        "source": point.source.value,
+                        "x": point.x,
+                        "side": point.side.value,
+                    }
+                    for point in calibration.points
+                    if point.image_id in group
+                ],
+                "fit": None if fit is None else fit.as_json(),
+            }
+        )
+    return {
+        "id": membrane.id,
+        "image_ids": [image.id for image in membrane.images],
+        "ladder": calibration.ladder,
+        "ladder_kda": list(calibration.ladder_kda),
+        "groups": groups,
+    }
 
 
 def revision(project: Project) -> int:
@@ -115,6 +165,7 @@ def project_state(
             "original_name": image.original_name,
             "kind": image.kind.value,
             "polarity": image.polarity.value,
+            "marker_image_id": image.marker_image_id,
             "width": image.width,
             "height": image.height,
             "bit_depth": image.bit_depth,
@@ -139,6 +190,7 @@ def project_state(
                 "image_id": protein.image_id,
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
+                "mw_tolerance": protein.mw_tolerance,
                 "box_size": {"width": size.width, "height": size.height},
                 "fitted_size": {"width": fitted.width, "height": fitted.height},
                 "box_padding": {"across": padding.across, "along": padding.along},
@@ -148,6 +200,8 @@ def project_state(
                         "lane_index": band.lane_index,
                         "band_index": band.band_index,
                         "rect": list(band.box.rect(size)),
+                        "apparent_mw": band.apparent_mw,
+                        "bands_found": band.bands_found,
                         "clipped": band.clipped,
                         "possibly_clipped": band.possibly_clipped,
                         "background_mode": band.background_mode,
@@ -189,6 +243,7 @@ def project_state(
         ],
         "reference_condition": batch.reference_condition,
         "images": images,
+        "membranes": [_membrane(membrane) for membrane in batch.membranes],
         "proteins": proteins,
         "saved": not session.dirty,
         "save_error": None if session.save_error is None else str(session.save_error),
