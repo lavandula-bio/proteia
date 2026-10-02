@@ -1068,11 +1068,11 @@ class LaneTruth:
 
 def _column(case: RowCase, lane: int, width: int) -> tuple[int, int]:
     """The image columns ``[c0, c1)`` of a lane: one pitch (the median step
-    between the true centres) about its true centre; every column for a
-    single lane."""
+    between the true centres, whichever way the lanes run) about its true
+    centre; every column for a single lane."""
     if len(case.lane_cx) < 2:
         return 0, width
-    pitch = float(np.median(np.diff(case.lane_cx)))
+    pitch = float(np.median(np.abs(np.diff(case.lane_cx))))
     cx = case.lane_cx[lane]
     return max(0, math.floor(cx - pitch / 2)), min(width, math.ceil(cx + pitch / 2))
 

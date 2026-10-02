@@ -904,22 +904,32 @@ def test_a_centre_on_a_grid_box_edge_is_held(below, kind):
 # --- What the score is measured against ---
 
 
-def test_the_truth_is_read_from_the_bands_alone():
-    # A hand-made band of 1000 over 10 x 10 px in lane 0's column (lanes 20
-    # px apart), the row box over its top 7 rows: 30% cut off; its smoothed
-    # peak 1000 over noise 400 / sqrt(15).
+def hand_made_row(*, mirrored: bool = False) -> tuple[RowCase, np.ndarray]:
+    """A hand-made row and its bands: two lanes 20 px apart, centred at x 15
+    and 35; a band of 1000 over 10 x 10 px in the first, one of 5 over 2 x 20
+    px (x 30 to 32) in the second; the row box over the top 12 of 20 rows.
+    Mirrored, the lanes are numbered right to left (lane 0 at x 35)."""
     own = np.zeros((20, 40))
     own[5:15, 10:20] = 1000.0
-    own[0:20, 30:32] = 5.0  # lane 1's band: outside lane 0's column
+    own[0:20, 30:32] = 5.0  # the second band: outside the first lane's column
+    left, right = (10, 5, 20, 15), (30, 0, 32, 20)
     case = dataclasses.replace(
         _base_case(),
         image=np.zeros((20, 40)),
         row=(0, 0, 40, 12),
         n_lanes=2,
-        reference={0: (10, 5, 20, 15), 1: (30, 0, 32, 20)},
-        lane_cx=(15.0, 35.0),
+        reference={0: right, 1: left} if mirrored else {0: left, 1: right},
+        lane_cx=(35.0, 15.0) if mirrored else (15.0, 35.0),
         lane_cy=(10.0, 10.0),
     )
+    return case, own
+
+
+def test_the_truth_is_read_from_the_bands_alone():
+    # A hand-made band of 1000 over 10 x 10 px in lane 0's column (lanes 20
+    # px apart), the row box over its top 7 rows: 30% cut off; its smoothed
+    # peak 1000 over noise 400 / sqrt(15).
+    case, own = hand_made_row()
     truth = lane_truth(Recipe("hand-made", "adversarial", 0, noise=400.0), case, own)
     assert truth[0].cut_share == pytest.approx(0.3)
     assert truth[0].snr == pytest.approx(1000.0 * math.sqrt(15) / 400.0)
@@ -933,6 +943,16 @@ def test_the_truth_is_read_from_the_bands_alone():
     single = dataclasses.replace(case, n_lanes=1, reference={0: (10, 5, 20, 15)}, lane_cx=(15.0,))
     alone = lane_truth(Recipe("hand-made", "adversarial", 0), single, own)
     assert alone[0].cut_share == pytest.approx(1.0 - (70000 + 120) / (100000 + 200))
+
+
+def test_the_truth_reads_a_row_whose_lanes_run_right_to_left():
+    # The same row numbered right to left: the centres step by -20 px, and
+    # each lane's column is still one pitch wide about its centre.
+    case, own = hand_made_row(mirrored=True)
+    truth = lane_truth(Recipe("hand-made", "adversarial", 0, noise=400.0), case, own)
+    assert truth[1].cut_share == pytest.approx(0.3)
+    assert truth[0].cut_share == pytest.approx(0.4)
+    assert truth[1].snr == pytest.approx(1000.0 * math.sqrt(15) / 400.0)
 
 
 def test_the_own_bands_leave_out_noise_artefacts_and_the_row_beside():
