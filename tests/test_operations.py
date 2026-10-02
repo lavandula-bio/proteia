@@ -43,7 +43,7 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
-from proteia.core import boxes, imaging, mwcal, record, results, rowdetect, storage
+from proteia.core import boxes, imaging, mwcal, quantify, record, results, rowdetect, storage
 from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
@@ -5581,7 +5581,9 @@ def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes
         if abs((rect[0] + rect[2]) / 2 - LADDER.lane_cx[lane]) > step / 2
     ]
     assert off == [4, 5, 6, 7]  # what the doubt is there for
-    assert "doubtful_lanes" in placement.flags
+    assert "doubtful_lanes" in placement.flags, (
+        f"lanes 5 to 8 boxed a lane off, placed with flags {placement.flags}"
+    )
     assert found.doubt_note is not None and found.doubt_note in placement.notes
     params = s.project.log[-1].params
     assert (params["flags"], params["notes"]) == (list(placement.flags), list(found.notes))
@@ -5702,7 +5704,7 @@ def test_lanes_on_the_image_at_the_far_end_or_both_ends_leave_no_lane_off_silent
     # the lanes at the far end, or at both ends, show: the row is refused or
     # placed with its lane numbers doubtful, never a lane off unflagged.
     outcome = anchored_row(tmp_path, LADDER, lanes, dx=dx)
-    assert read_with_care(outcome), outcome
+    assert read_with_care(outcome), outcome.off_in_words()
 
 
 @pytest.mark.parametrize(("lanes", "kind"), [([0, 1], "refused"), ([6, 7], "placed")])
@@ -5846,7 +5848,7 @@ def test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, see
     bias, notices, same = stained_net(tmp_path_factory, "deep_ring_stain", seed)
     assert same
     assert abs(bias) <= 0.01, f"lane 3: net {bias:+.2%} with the stain"
-    assert "BACKGROUND_UNEVEN" in notices
+    assert "BACKGROUND_UNEVEN" in notices, f"lane 3: no uneven-background notice ({notices})"
 
 
 @pytest.mark.parametrize("seed", range(1000, 1005))
@@ -5862,6 +5864,52 @@ def test_a_stain_on_the_only_side_left_of_a_ring_is_noticed(tmp_path_factory, se
     bias, notices, same = stained_net(tmp_path_factory, "stain_below", seed, top)
     assert same
     assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
+
+
+# --- #181: the operations degraded on purpose fail the recipes ---
+# Each runs one recipe test above under a degraded operation and expects its
+# named assertion to fail: the recipes would catch the regression.
+
+
+def test_a_ring_never_clipped_fails_the_deep_stain_recipe(tmp_path_factory, monkeypatch):
+    # The stain ten noise sigmas deep enters the ring's median: the net moves
+    # by about 2%. The nets are taken under the degraded ring, never kept.
+    monkeypatch.setitem(globals(), "_RING_NETS", {})
+    monkeypatch.setattr(quantify, "RING_CLIP_K", math.inf)
+    with pytest.raises(AssertionError, match=r"lane 3: net -\d\.\d\d% with the stain"):
+        test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, 1000)
+
+
+def test_no_uneven_background_notice_fails_the_deep_stain_recipe(tmp_path_factory, monkeypatch):
+    # The stain is clipped out (the net within 1%) but nothing says the ring
+    # was uneven.
+    monkeypatch.setitem(globals(), "_RING_NETS", {})
+    monkeypatch.setattr(results, "BACKGROUND_UNEVEN_LIMIT", math.inf)
+    with pytest.raises(AssertionError, match=r"lane 3: no uneven-background notice \(\(\)\)"):
+        test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, 1000)
+
+
+def test_lanes_on_the_image_taken_to_check_every_lane_fail_the_one_end_recipe(
+    tmp_path, monkeypatch
+):
+    # Lanes 1 and 2 on the image taken to check the lanes past them too (the
+    # gap #155's review closed): the doubt is dropped, lanes 5 to 8 a lane off.
+    def every_lane(anchors, lanes):
+        return set(lanes) if anchors else set()
+
+    monkeypatch.setattr(ops, "anchoring_lanes", every_lane)
+    with pytest.raises(AssertionError, match="lanes 5 to 8 boxed a lane off, placed with flags"):
+        test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, [0, 1], 0.0)
+
+
+def test_lanes_on_the_image_that_never_refuse_fail_the_far_end_recipe(tmp_path, monkeypatch):
+    # No band ever found off its lane: lanes 1 and 8 on the image place the
+    # squeezed row with no flag on its lane numbers.
+    monkeypatch.setattr(ops, "_off_lanes", lambda centres, expected: [])
+    with pytest.raises(AssertionError, match=r"placed with flags \(.*\): lane 5: box centre"):
+        test_lanes_on_the_image_at_the_far_end_or_both_ends_leave_no_lane_off_silently(
+            tmp_path, [0, 7], 0.0
+        )
 
 
 def _row_scene(tmp_path: Path, setup) -> tuple[ProjectSession, Recorder, dict[str, str]]:
