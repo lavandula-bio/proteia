@@ -833,20 +833,72 @@ def test_grid_boxes_are_scored_by_the_centres_they_hold():
     assert (score.n_ref, score.hits) == (4, 2)
 
 
+@pytest.mark.parametrize("change", [{"dx": 11}, {"dy": 3}])
+def test_a_grid_box_holding_most_of_its_band_is_right(change):
+    # 11 px along the row, the box holds 0.851 of what the centred box does
+    # (1 px further, 0.825: below); 3 px down, 0.876 (4 px, 0.784).
+    case = GRID_ROW.build()
+    assert grid_score({1: centred(case, 1, **change)}).lanes == ()
+
+
 @pytest.mark.parametrize(
-    ("change", "kind", "low", "high"),
+    ("change", "kind", "value"),
     [
-        ({"dy": 4}, "partial", 0.7, 0.8),  # on the band's centre, 0.78 of the band
-        ({"dx": 27}, "partial", 0.3, 0.45),  # past the band's centre
-        (None, "missed", 100.0, 1000.0),  # the expected SNR
+        ({"dx": 12}, "partial", 0.8253),  # on the band's centre, a little short
+        ({"dy": 4}, "partial", 0.7836),
+        ({"dx": 27}, "partial", 0.4147),  # past the band's centre
+        ({"wide": True}, "partial", 0.7821),  # lane 2's band in it counts for nothing
     ],
 )
-def test_a_grid_box_holding_too_little_of_its_band_is_partial(change, kind, low, high):
+def test_a_grid_box_holding_too_little_of_its_band_is_partial(change, kind, value):
+    # The capture compares the box with the box of its size centred on the
+    # band, both within the lane's column (one pitch wide).
     case = GRID_ROW.build()
-    rect = None if change is None else centred(case, 1, **change)
+    if "wide" in change:
+        x0 = math.floor(case.lane_cx[1] + 0.5) - 10  # 120 px, over lane 2's band
+        rect = (x0, centred(case, 1)[1], x0 + 120, centred(case, 1)[3])
+    else:
+        rect = centred(case, 1, **change)
     [lane] = grid_score({1: rect}).lanes
     assert (lane.lane, lane.kind) == (1, kind)
-    assert low < lane.value < high
+    assert lane.value == pytest.approx(value, abs=1e-4)
+
+
+def test_a_grid_band_missed_is_scored_by_its_expected_snr():
+    [lane] = grid_score({1: None}).lanes
+    assert (lane.lane, lane.kind, lane.status) == (1, "missed", "silent")
+    assert lane.value == scored(GRID_ROW)[2][1].snr > 100.0
+
+
+def test_a_grid_box_off_its_band_centre_is_partial_however_much_it_holds():
+    # A doublet whose lower part is a tenth as deep, 12 px below: a box on
+    # the upper part holds more of the band than one on the band's centre
+    # between them, but not the centre.
+    recipe = Recipe("weak doublet", "grid", 1000, {"doublet": (12.0, 0.1)})
+    case = recipe.build()
+    _, found, truth = scored(recipe)
+    rect = centred(case, 1, y=case.lane_cy[1] - 6.0)
+    rect = (rect[0], rect[1] + 2, rect[2], rect[3] - 2)  # 8 px high, clear of the centre
+    lanes = {1: {"rect": rect, "peaks": (), "cut": False, "components": 1}}
+    score = score_row(recipe, case, changed(found, lanes, flags=()), truth)
+    [lane] = [lane for lane in score.lanes if lane.lane == 1]
+    assert (lane.lane, lane.kind) == (1, "partial")
+    assert lane.value > 1.0
+
+
+@pytest.mark.parametrize(("below", "kind"), [(0.0, "both"), (0.5, None)])
+def test_a_centre_on_a_grid_box_edge_is_held(below, kind):
+    # Box edges hold a centre that lies on them: the neighbouring band's
+    # centre on the box's bottom edge makes the box hold both.
+    case = GRID_ROW.build()
+    _, found, truth = scored(GRID_ROW)
+    rect = centred(case, 2)
+    neighbour = list(case.neighbour_cy)
+    neighbour[2] = rect[3] - 0.5 + below  # its pixel centre (+ 0.5) on the edge, or past it
+    moved = dataclasses.replace(case, neighbour_cy=tuple(neighbour))
+    lanes = {2: {"rect": rect, "peaks": (), "cut": False, "components": 1}}
+    score = score_row(GRID_ROW, moved, changed(found, lanes, flags=()), truth)
+    assert [s.kind for s in score.lanes if s.lane == 2] == ([] if kind is None else [kind])
 
 
 # --- What the score is measured against ---
@@ -872,6 +924,9 @@ def test_the_truth_is_read_from_the_bands_alone():
     assert truth[0].cut_share == pytest.approx(0.3)
     assert truth[0].snr == pytest.approx(1000.0 * math.sqrt(15) / 400.0)
     assert truth[1].cut_share == pytest.approx(0.4)
+    # The expected SNR reads the smoothed signal: a band 2 px wide keeps
+    # 2/5 of its depth over the 5 columns.
+    assert truth[1].snr == pytest.approx(5.0 * 2 / 5 * math.sqrt(15) / 400.0)
     quiet = lane_truth(Recipe("hand-made", "adversarial", 0, noise=0.0), case, own)
     assert quiet[0].snr == math.inf
     # One lane: its column is the whole row, lane 1's band included.
@@ -890,6 +945,19 @@ def test_the_own_bands_leave_out_noise_artefacts_and_the_row_beside():
         noise=3200.0,
     )
     assert np.array_equal(own_bands(busy), own_bands(plain))
+    plain_grid = Recipe("plain", "grid", 1000)
+    busy_grid = Recipe(
+        "busy",
+        "grid",
+        1000,
+        {
+            "artefacts": [blob(2, 6.0, 9000.0)],
+            "smears": [(1, 15000.0, 12.0)],
+            "neighbour_dy": 16.0,
+        },
+        noise=3200.0,
+    )
+    assert np.array_equal(own_bands(busy_grid), own_bands(plain_grid))
     # A band's depth (its centre drawn off the pixel grid by up to half a
     # pixel), and none of it in a lane without a band.
     deep = Recipe("deep", "adversarial", 1000, {"depths": {2: 12345.0}, "missing": [4]})
@@ -943,31 +1011,79 @@ def test_every_stress_recipe_draws_a_row(key):
     assert len(case.lane_cx) == case.n_lanes and case.reference
 
 
-@pytest.mark.parametrize("side", ["top", "bottom"])
-def test_a_ring_stain_is_flat_on_one_side_of_the_band(side):
-    # On a row without bands or noise: 1000 deep from 13 to 40 px from lane
-    # 2's centre on that side, 40 px either side of it along the row.
+@pytest.mark.parametrize(("side", "rows"), [("top", (40, 68)), ("bottom", (93, 121))])
+def test_a_ring_stain_is_flat_on_one_side_of_the_band(side, rows):
+    # On a row without bands, noise or jitter (lane 2's centre at x 232,
+    # y 80): 1000 deep from 13 to 40 px from it on that side, both ends in,
+    # and 40 px either side of it along the row.
     case = adversarial_row(
         "stain",
         1000,
         missing=range(6),
         noise=0.0,
+        x_jitter=0.0,
+        y_jitter=0.0,
         artefacts=[ring_stain(2, side, 1000.0)],
     )
-    stained = MEMBRANE - case.image
-    cx, cy = case.lane_cx[2], case.lane_cy[2]
-    step = -1 if side == "top" else 1
-    near, far = (
-        (math.floor(cy - 13), math.ceil(cy - 40))
-        if step < 0
-        else (math.ceil(cy + 13), math.floor(cy + 40))
+    assert (case.lane_cx[2], case.lane_cy[2]) == (232.0, 80.0)
+    expected = np.zeros(case.image.shape)
+    expected[rows[0] : rows[1], 192:273] = 1000.0
+    assert np.array_equal(MEMBRANE - case.image, expected)
+
+
+def test_the_grid_row_draws_its_geometry():
+    # Seed 1000's draws: lanes about 70 px apart from x 92, the box from half
+    # a pitch before the first lane's nominal centre to half a pitch past the
+    # last's, 6 px beyond the bands' extents; a pitch of membrane more on the
+    # right. A tilt and a smile are measured from the nominal centre (x 267).
+    case = neighbour_grid_row("grid", 1000)
+    assert (case.row, case.image.shape, case.neighbour_cy) == ((57, 87, 477, 114), (200, 604), None)
+    assert case.lane_cx == pytest.approx(
+        [92.08554295, 162.41536739, 231.88376719, 300.81299177, 372.11503610, 440.76414512]
     )
-    x = round(cx)
-    assert stained[near, x] == stained[far, x] == 1000.0
-    assert stained[near - step, x] == stained[far + step, x] == 0.0
-    assert stained[near, math.ceil(cx - 40)] == stained[near, math.floor(cx + 40)] == 1000.0
-    assert stained[near, math.ceil(cx - 40) - 1] == stained[near, math.floor(cx + 40) + 1] == 0.0
-    assert stained.sum() == 1000.0 * stained.astype(bool).sum()
+    tilted = neighbour_grid_row("grid", 1000, tilt=12.0, smile=4.0)
+    assert tilted.lane_cy == pytest.approx(
+        [91.56993368, 97.49297467, 100.73829396, 103.73741534, 104.77153153, 103.51066989]
+    )
+
+
+def test_the_grid_row_draws_each_part_where_it_says():
+    def drawn(**params) -> tuple[RowCase, np.ndarray]:
+        case = neighbour_grid_row("parts", 1000, noise=0.0, **params)
+        return case, MEMBRANE - case.image
+
+    flat = {"depths": [12000.0] * 6}
+    # A faint lane: a tenth of the others' mean, its peak up to half a pixel
+    # off its drawn centre.
+    case, dark = drawn(faint=2, **flat)
+    x0, y0, x1, y1 = case.reference[2]
+    assert 0.98 * 1200.0 < dark[y0:y1, x0:x1].max() <= 1200.5
+    # A band 30 px below each, half as deep, or 7000 deep.
+    for params, depth in (
+        ({"neighbour_rel": 0.5}, 6000.0),
+        ({"neighbour_depths": [7000.0] * 6}, 7000.0),
+    ):
+        case, dark = drawn(neighbour_dy=30.0, **flat, **params)
+        y, x = round(case.neighbour_cy[3]), round(case.lane_cx[3])
+        assert case.neighbour_cy[3] == case.lane_cy[3] + 30.0
+        assert 0.98 * depth < dark[y, x] <= depth + 0.5
+    # A pale line across each band's middle, half its depth.
+    _, plain = drawn(**flat)
+    case, dark = drawn(slit=(0.5, 1.2), **flat)
+    y, x = round(case.lane_cy[3]), round(case.lane_cx[3])
+    assert 0.49 < dark[y, x] / plain[y, x] < 0.55
+    # A doublet: two parts 12 px apart, a dip between them.
+    case, dark = drawn(doublet=(12.0, 0.6), **flat)
+    cy, x = case.lane_cy[3], round(case.lane_cx[3])
+    upper, middle, lower = (dark[round(cy + dy), x] for dy in (-6.0, 0.0, 6.0))
+    assert middle < 0.2 * lower and lower < upper
+    # A smear down from the left half of lane 1's band, fading over 12 px.
+    case, dark = drawn(smears=[(1, 15000.0, 12.0)], **flat)
+    cx, cy = case.lane_cx[1], case.lane_cy[1]
+    left, right = round(cx - 11.0), round(cx + 11.0)
+    y = round(cy + 15.0)
+    assert dark[y, left] > 3000.0 and dark[y, right] < 50.0
+    assert dark[round(cy - 15.0), left] < 50.0
 
 
 def test_a_ring_stain_has_two_sides_only():
