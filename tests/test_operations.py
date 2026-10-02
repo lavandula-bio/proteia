@@ -21,6 +21,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
@@ -5874,16 +5875,16 @@ def test_a_stain_on_the_only_side_left_of_a_ring_is_noticed(tmp_path_factory, se
 def test_a_ring_never_clipped_fails_the_deep_stain_recipe(tmp_path_factory, monkeypatch):
     # The stain ten noise sigmas deep enters the ring's median: the net moves
     # by about 2%. The nets are taken under the degraded ring, never kept.
-    monkeypatch.setitem(globals(), "_RING_NETS", {})
+    monkeypatch.setattr(sys.modules[__name__], "_RING_NETS", {})
     monkeypatch.setattr(quantify, "RING_CLIP_K", math.inf)
-    with pytest.raises(AssertionError, match=r"lane 3: net -\d\.\d\d% with the stain"):
+    with pytest.raises(AssertionError, match=r"lane 3: net [-+]\d+\.\d\d% with the stain"):
         test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, 1000)
 
 
 def test_no_uneven_background_notice_fails_the_deep_stain_recipe(tmp_path_factory, monkeypatch):
     # The stain is clipped out (the net within 1%) but nothing says the ring
     # was uneven.
-    monkeypatch.setitem(globals(), "_RING_NETS", {})
+    monkeypatch.setattr(sys.modules[__name__], "_RING_NETS", {})
     monkeypatch.setattr(results, "BACKGROUND_UNEVEN_LIMIT", math.inf)
     with pytest.raises(AssertionError, match=r"lane 3: no uneven-background notice \(\(\)\)"):
         test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, 1000)
