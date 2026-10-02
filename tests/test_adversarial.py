@@ -326,11 +326,6 @@ def test_a_noisy_tight_row_holds_bands_well_above_the_noise(seed):
     assert min(t.snr for t in truth.values()) > 10.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#179 very noisy tightly cropped rows lose bands to an inflated noise estimate",
-)
 @pytest.mark.parametrize("seed", [1000, 1008])
 def test_a_noisy_tight_row_loses_no_band_silently(seed):
     score, found, _ = scored(bench("tight_box", seed, noise=6400.0))
