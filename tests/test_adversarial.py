@@ -82,18 +82,39 @@ def detect(recipe: Recipe, case: RowCase) -> RowDetection:
     )
 
 
-_SCORED: dict[str, tuple[RowScore, RowDetection, dict[int, LaneTruth]]] = {}
+Scored = tuple[RowScore, RowDetection, dict[int, LaneTruth]]
+_SCORED: dict[str, tuple[Recipe, Scored]] = {}
 
 
-def scored(recipe: Recipe) -> tuple[RowScore, RowDetection, dict[int, LaneTruth]]:
+def _drawn_alike(a: Recipe, b: Recipe) -> bool:
+    """Whether two recipes draw and read the same row."""
+    return (a.kind, a.seed, a.noise, dict(a.params), dict(a.detect)) == (
+        b.kind,
+        b.seed,
+        b.noise,
+        dict(b.params),
+        dict(b.detect),
+    )
+
+
+def scored(recipe: Recipe) -> Scored:
     """The recipe's score, today's detection and its lanes' truth, kept by
-    label: the floors and the recipe tests share them (no image is kept)."""
-    if recipe.label not in _SCORED:
-        case = recipe.build()
-        found = detect(recipe, case)
-        truth = lane_truth(recipe, case)
-        _SCORED[recipe.label] = (score_row(recipe, case, found, truth), found, truth)
-    return _SCORED[recipe.label]
+    label: the floors and the recipe tests share them (no image is kept).
+    Raises ValueError for a recipe whose label another recipe was scored
+    under: it would get that recipe's score."""
+    if recipe.label in _SCORED:
+        kept, result = _SCORED[recipe.label]
+        if not _drawn_alike(kept, recipe):
+            raise ValueError(
+                f"{recipe.label!r} already names another recipe: scores are kept by label"
+            )
+        return result
+    case = recipe.build()
+    found = detect(recipe, case)
+    truth = lane_truth(recipe, case)
+    result = (score_row(recipe, case, found, truth), found, truth)
+    _SCORED[recipe.label] = (recipe, result)
+    return result
 
 
 def ids(recipes: list[Recipe]) -> list[str]:
@@ -170,6 +191,18 @@ def totals(recipes: list[Recipe]) -> tuple[int, int, str, str]:
 def test_the_floor_rows_are_the_measured_set():
     assert (len(HONEST), len(STRESSED), len(FLOOR_SUBSET)) == (90, 72, 96)
     assert len({recipe.label for recipe in FLOOR_ROWS}) == 162
+
+
+def test_two_recipes_under_one_label_are_not_scored_as_one():
+    # The scores are kept by label, so the floors and the recipe tests share
+    # one detection of each row: the same recipe built again gets the kept
+    # score; another recipe under that label is an error, never that score.
+    first = scored(Recipe("one label", "adversarial", 1000))
+    assert scored(Recipe("one label", "adversarial", 1000)) is first
+    with pytest.raises(ValueError, match="'one label' already names another recipe"):
+        scored(Recipe("one label", "adversarial", 1001))
+    with pytest.raises(ValueError, match="'one label' already names another recipe"):
+        scored(Recipe("one label", "adversarial", 1000, {"missing": [2]}))
 
 
 def test_todays_detector_holds_its_floor():
