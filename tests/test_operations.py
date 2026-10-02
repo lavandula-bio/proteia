@@ -5755,17 +5755,33 @@ STAIN_LANE = 2  # the lane the ring stains lie beside
 _RING_NETS: dict[tuple, tuple[float, tuple[str, ...], dict]] = {}
 
 
-def _lane_net(tmp_path_factory, key: str | None, seed: int, depth: tuple | None):
+def cropped(case: RowCase, top: int) -> RowCase:
+    """``case`` with its image's first ``top`` rows cut off, the row box's top
+    edge at the image's top at most."""
+    x0, y0, x1, y1 = case.row
+    return dataclasses.replace(
+        case,
+        image=case.image[top:].copy(),
+        row=(x0, max(0, y0 - top), x1, y1 - top),
+        reference={k: (r[0], r[1] - top, r[2], r[3] - top) for k, r in case.reference.items()},
+        lane_cy=tuple(y - top for y in case.lane_cy),
+    )
+
+
+def _lane_net(
+    tmp_path_factory, key: str | None, seed: int, depth: tuple | None, top: int = 0
+) -> tuple[float, tuple[str, ...], dict]:
     """Lane 2's net once the row is placed by the operation and its results
     computed, the background notices on lane 2, and the row's boxes: ``key``
     a :data:`rowcases.STRESS` ring-stain recipe, None for the same row (same
     draws) without the stain; ``depth`` the bands' depth range (the
-    recipe's). Kept for the tests that share a row (numbers only)."""
-    if (key, seed, depth) not in _RING_NETS:
+    recipe's); ``top`` image rows cut off above the row. Kept for the tests
+    that share a row (numbers only)."""
+    if (key, seed, depth, top) not in _RING_NETS:
         recipe = {} if key is None else dict(STRESS[key])
         if depth is not None:
             recipe["depth_range"] = depth
-        case = adversarial_row("ring", seed, **recipe)
+        case = cropped(adversarial_row("ring", seed, **recipe), top)
         s, _, protein = row_session(tmp_path_factory.mktemp("ring"), case)
         ops.detect_row_boxes(s, protein, case.row)
         notices = sorted(
@@ -5775,16 +5791,19 @@ def _lane_net(tmp_path_factory, key: str | None, seed: int, depth: tuple | None)
             and STAIN_LANE in notice.lane_indices
         )
         net = lane_bands(s, protein)[STAIN_LANE].net
-        _RING_NETS[key, seed, depth] = (net, tuple(notices), rects_by_lane(s, protein))
-    return _RING_NETS[key, seed, depth]
+        _RING_NETS[key, seed, depth, top] = (net, tuple(notices), rects_by_lane(s, protein))
+    return _RING_NETS[key, seed, depth, top]
 
 
-def stained_net(tmp_path_factory, key: str, seed: int) -> tuple[float, tuple[str, ...], bool]:
+def stained_net(
+    tmp_path_factory, key: str, seed: int, top: int = 0
+) -> tuple[float, tuple[str, ...], bool]:
     """Lane 2's net with the stain over its net without it, minus 1; the
-    notices on lane 2 with the stain; whether every box stayed where it was."""
+    notices on lane 2 with the stain; whether every box stayed where it was
+    (both images cut ``top`` rows short)."""
     depth = STRESS[key].get("depth_range")
-    net, notices, rects = _lane_net(tmp_path_factory, key, seed, depth)
-    clean, _, clean_rects = _lane_net(tmp_path_factory, None, seed, depth)
+    net, notices, rects = _lane_net(tmp_path_factory, key, seed, depth, top)
+    clean, _, clean_rects = _lane_net(tmp_path_factory, None, seed, depth, top)
     return net / clean - 1.0, notices, rects == clean_rects
 
 
@@ -5828,41 +5847,18 @@ def test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, see
 
 
 @pytest.mark.parametrize("seed", range(1000, 1005))
-def test_a_stain_on_the_only_side_left_of_a_ring_is_noticed(seed):
-    # The image cropped 2 px above the boxes: the ring keeps its lower side
-    # only, where a stain ten sigmas deep lies. The net may move a lot; the
-    # lane must then show the fallback or the uneven notice (as the results
-    # raise them: a fallback mode, or a spread over 5% of the net).
-    clean = adversarial_row("ring", seed)
-    stained = stress("stain_below", seed)
-    found = rowdetect.detect_row(
-        clean.image,
-        clean.row,
-        clean.n_lanes,
-        background=estimate_background(clean.image),
-        dark_on_light=True,
-    )
-    top = min(rect[1] for rect in found.slots) - 2
-    rects = [(x0, y0 - top, x1, y1 - top) for x0, y0, x1, y1 in found.slots]
-    sizes = [(x1 - x0, y1 - y0) for x0, y0, x1, y1 in rects]
-    fallback = estimate_background(clean.image[top:])
-
-    def lane_net(image: np.ndarray) -> tuple[float, BandBackground]:
-        ring = band_backgrounds(
-            image, rects, sizes, dark_on_light=True, integral=True, fallback=fallback
-        )[STAIN_LANE]
-        x0, y0, x1, y1 = rects[STAIN_LANE]
-        size = BoxSize(width=x1 - x0, height=y1 - y0)
-        net = net_signal(
-            image, Box(x=x0, y=y0), size, ring.level, dark_on_light=True, clamp=RING_CLAMP
-        )
-        return net, ring
-
-    net, ring = lane_net(stained.image[top:])
-    clean_net, _ = lane_net(clean.image[top:])
-    width, height = sizes[STAIN_LANE]
-    noticed = ring.mode in ("asymmetric", "image") or ring.spread * width * height > 0.05 * net
-    assert abs(net / clean_net - 1.0) <= 0.05 or noticed
+def test_a_stain_on_the_only_side_left_of_a_ring_is_noticed(tmp_path_factory, seed):
+    # The image cropped 2 px above the boxes the operation places on the
+    # unstained row: the ring keeps its lower side only, where a stain ten
+    # noise sigmas deep lies. The net may move a lot (here -28% to -43%); the
+    # lane must then show a background notice.
+    boxes_uncropped = _lane_net(tmp_path_factory, None, seed, None)[2]
+    top = min(rect[1] for rect in boxes_uncropped.values()) - 2
+    boxes = _lane_net(tmp_path_factory, None, seed, None, top)[2]
+    assert min(rect[1] for rect in boxes.values()) == 2
+    bias, notices, same = stained_net(tmp_path_factory, "stain_below", seed, top)
+    assert same
+    assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
 
 
 def _row_scene(tmp_path: Path, setup) -> tuple[ProjectSession, Recorder, dict[str, str]]:
