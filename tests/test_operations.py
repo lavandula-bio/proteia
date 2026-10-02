@@ -98,6 +98,7 @@ from proteia.core.storage import canonical_json, content_hash, load_project
 from proteia.web.state import project_state
 from rowcases import (
     MEMBRANE,
+    STRESS,
     RowCase,
     adversarial,
     adversarial_row,
@@ -106,6 +107,7 @@ from rowcases import (
     beside,
     bottom_strip,
     hstripe,
+    stress,
     synthetic_row,
     vstreak,
 )
@@ -5560,14 +5562,16 @@ LADDER = adversarial_row(
 )
 
 
+@pytest.mark.parametrize("dx", [0.0, 4.0, -4.0])
 @pytest.mark.parametrize("lanes", [[0, 1], [0, 1, 2]])
-def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes):
+def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes, dx):
     # They check the reading between them only: past them the expected x
     # steps by the row's own pitch, so the lanes squeezed a lane early there
-    # are not refused. The row is placed, its lane numbers still doubtful.
+    # are not refused. The row is placed, its lane numbers still doubtful;
+    # so too with the other protein's boxes dragged 4 px either way (#180).
     s, image, protein = row_session(tmp_path, LADDER)
     found = detected(s, protein, LADDER.row)
-    other_protein_in_lanes(s, image, LADDER, lanes)
+    other_protein_in_lanes(s, image, LADDER, lanes, dx=dx)
     placement = ops.detect_row_boxes(s, protein, LADDER.row)
     step = float(np.median(np.diff(LADDER.lane_cx)))
     off = [
@@ -5592,6 +5596,242 @@ def test_lanes_on_the_image_refuse_a_row_read_off_whatever_its_doubt(tmp_path):
         ops.detect_row_boxes(s, protein, case.row)
     assert refused.value.code is ErrorCode.ROW_LANES_UNCLEAR
     assert refused.value.detail["cause"] == "off_lanes"
+
+
+# --- #180: lanes on the image at one end of the row ---
+
+
+def flipped(case: RowCase) -> RowCase:
+    """``case`` flipped left to right: its lanes run right to left on the
+    image, lane 0 at the right."""
+    width = case.image.shape[1]
+    x0, y0, x1, y1 = case.row
+    n = case.n_lanes
+    return dataclasses.replace(
+        case,
+        image=case.image[:, ::-1].copy(),
+        row=(width - x1, y0, width - x0, y1),
+        reference={
+            n - 1 - k: (width - r[2], r[1], width - r[0], r[3]) for k, r in case.reference.items()
+        },
+        lane_cx=tuple(width - 1 - x for x in reversed(case.lane_cx)),
+        lane_cy=tuple(reversed(case.lane_cy)),
+    )
+
+
+def anchored_row(
+    tmp_path: Path,
+    case: RowCase,
+    lanes: Sequence[int] | None,
+    *,
+    dx: float = 0.0,
+    mirrored: bool = False,
+) -> tuple[str, tuple[str, ...], list[int]]:
+    """The row placed by the operation with another protein's boxes in
+    ``lanes`` (none if None; numbered right to left when ``mirrored``):
+    ``("refused", (code, cause), [])``, or ``("placed", flags, the stored
+    lanes whose box lies more than half a lane step off that lane's band)``."""
+    s, image, protein = row_session(tmp_path, case)
+    if lanes is not None:
+        other_protein_in_lanes(s, image, case, lanes, dx=dx, mirrored=mirrored)
+    try:
+        placement = ops.detect_row_boxes(s, protein, case.row)
+    except OperationError as exc:
+        return "refused", (exc.code.name, exc.detail.get("cause", "")), []
+    n = case.n_lanes
+    step = float(np.median(np.abs(np.diff(case.lane_cx))))
+    off = [
+        lane
+        for lane, rect in rects_by_lane(s, protein).items()
+        if abs((rect[0] + rect[2]) / 2 - case.lane_cx[n - 1 - lane if mirrored else lane])
+        > step / 2
+    ]
+    return "placed", placement.flags, off
+
+
+def read_with_care(outcome: tuple[str, tuple[str, ...], list[int]]) -> bool:
+    """Refused, placed with its lane numbers doubtful, or placed right: never
+    placed a lane off without a flag."""
+    kind, flags, off = outcome
+    return kind == "refused" or "doubtful_lanes" in flags or not off
+
+
+@pytest.mark.parametrize("dx", [0.0, 4.0, -4.0])
+@pytest.mark.parametrize("lanes", [[6, 7], [5, 6, 7], [0, 7]])
+def test_lanes_on_the_image_at_the_far_end_or_both_ends_leave_no_lane_off_silently(
+    tmp_path, lanes, dx
+):
+    # The ladder's band past lane 7 squeezes the bands a lane early, which
+    # the lanes at the far end, or at both ends, show: the row is refused or
+    # placed with its lane numbers doubtful, never a lane off unflagged.
+    outcome = anchored_row(tmp_path, LADDER, lanes, dx=dx)
+    assert read_with_care(outcome), outcome
+
+
+@pytest.mark.parametrize(("lanes", "kind"), [([0, 1], "refused"), ([6, 7], "placed")])
+def test_lanes_on_a_flipped_image_are_read_from_its_own_end(tmp_path, lanes, kind):
+    # The same row flipped, its lanes numbered right to left: lanes 0 and 1
+    # now lie at the ladder's end and refuse the row; lanes 6 and 7, at the
+    # other end, leave it placed with its numbers doubtful.
+    outcome = anchored_row(tmp_path, flipped(LADDER), lanes, mirrored=True)
+    assert read_with_care(outcome), outcome
+    assert outcome[0] == kind
+
+
+@pytest.mark.parametrize("end", ["first", "last"])
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", ["ladder_beside", "label_beside", "panel_beside"])
+def test_lanes_on_the_image_at_either_end_refuse_a_row_over_what_lies_beside(
+    tmp_path, key, seed, end
+):
+    case = adversarial(key, seed)
+    n = case.n_lanes
+    outcome = anchored_row(tmp_path, case, [0, 1] if end == "first" else [n - 2, n - 1])
+    assert outcome[:2] == ("refused", ("ROW_LANES_UNCLEAR", "off_lanes")), outcome
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#111 an arrow past the last lane, the first lane empty, shifts the lane numbers"
+    " without a flag",
+)
+@pytest.mark.parametrize("seed", [1000, 1001])
+@pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1.3"])
+def test_a_row_box_over_an_arrow_past_the_last_lane_is_not_read_off_silently(tmp_path, key, seed):
+    kind, flags, off = anchored_row(tmp_path, stress(key, seed), None)
+    assert read_with_care((kind, flags, off)), (
+        f"placed with flags {flags}: lanes {', '.join(str(lane + 1) for lane in off)}"
+        " boxed more than half a lane step off their bands"
+    )
+
+
+@pytest.mark.parametrize("end", ["first", "last"])
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1.3"])
+def test_lanes_on_the_image_refuse_a_row_box_over_an_arrow(tmp_path, key, seed, end):
+    case = stress(key, seed)
+    lanes = [1, 2] if end == "first" else [case.n_lanes - 2, case.n_lanes - 1]
+    outcome = anchored_row(tmp_path, case, lanes)
+    assert outcome[:2] == ("refused", ("ROW_LANES_UNCLEAR", "off_lanes")), outcome
+
+
+# --- #180: a stain on one side of a band's background ring ---
+
+STAIN_LANE = 2  # the lane the ring stains lie beside
+
+
+_RING_NETS: dict[tuple, tuple[float, tuple[str, ...], dict]] = {}
+
+
+def _lane_net(tmp_path_factory, key: str | None, seed: int, depth: tuple | None):
+    """Lane 2's net once the row is placed by the operation and its results
+    computed, the background notices on lane 2, and the row's boxes: ``key``
+    a :data:`rowcases.STRESS` ring-stain recipe, None for the same row (same
+    draws) without the stain; ``depth`` the bands' depth range (the
+    recipe's). Kept for the tests that share a row (numbers only)."""
+    if (key, seed, depth) not in _RING_NETS:
+        recipe = {} if key is None else dict(STRESS[key])
+        if depth is not None:
+            recipe["depth_range"] = depth
+        case = adversarial_row("ring", seed, **recipe)
+        s, _, protein = row_session(tmp_path_factory.mktemp("ring"), case)
+        ops.detect_row_boxes(s, protein, case.row)
+        notices = sorted(
+            notice.code.name
+            for notice in results.compute_results(s.project.batch).notices
+            if notice.code in (NoticeCode.BACKGROUND_UNEVEN, NoticeCode.BACKGROUND_FALLBACK)
+            and STAIN_LANE in notice.lane_indices
+        )
+        net = lane_bands(s, protein)[STAIN_LANE].net
+        _RING_NETS[key, seed, depth] = (net, tuple(notices), rects_by_lane(s, protein))
+    return _RING_NETS[key, seed, depth]
+
+
+def stained_net(tmp_path_factory, key: str, seed: int) -> tuple[float, tuple[str, ...], bool]:
+    """Lane 2's net with the stain over its net without it, minus 1; the
+    notices on lane 2 with the stain; whether every box stayed where it was."""
+    depth = STRESS[key].get("depth_range")
+    net, notices, rects = _lane_net(tmp_path_factory, key, seed, depth)
+    clean, _, clean_rects = _lane_net(tmp_path_factory, None, seed, depth)
+    return net / clean - 1.0, notices, rects == clean_rects
+
+
+@pytest.mark.parametrize("seed", range(1000, 1005))
+def test_a_faint_stain_on_a_weak_bands_ring_moves_no_box(tmp_path_factory, seed):
+    assert stained_net(tmp_path_factory, "faint_ring_stain", seed)[2]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#177 a faint stain on one side of a weak band's ring lowers its net without a notice",
+)
+@pytest.mark.parametrize("seed", range(1000, 1005))
+def test_a_faint_stain_on_a_weak_bands_ring_moves_its_net_little_or_is_noticed(
+    tmp_path_factory, seed
+):
+    # Bands 3000 deep, a stain one noise sigma deep over the ring's upper
+    # side: the net must stay within 5% of the unstained row's, or the lane
+    # must show a background notice.
+    bias, notices, _ = stained_net(tmp_path_factory, "faint_ring_stain", seed)
+    assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", ["ring_stain", "ring_stain_x4"])
+def test_a_faint_stain_on_an_ordinary_bands_ring_moves_its_net_little(tmp_path_factory, key, seed):
+    bias, notices, same = stained_net(tmp_path_factory, key, seed)
+    assert same
+    assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, seed):
+    # Ten noise sigmas deep: the ring's clip drops it (the net within 1%),
+    # and the spread it leaves raises the uneven-background notice.
+    bias, notices, same = stained_net(tmp_path_factory, "deep_ring_stain", seed)
+    assert same
+    assert abs(bias) <= 0.01, f"lane 3: net {bias:+.2%} with the stain"
+    assert "BACKGROUND_UNEVEN" in notices
+
+
+@pytest.mark.parametrize("seed", range(1000, 1005))
+def test_a_stain_on_the_only_side_left_of_a_ring_is_noticed(seed):
+    # The image cropped 2 px above the boxes: the ring keeps its lower side
+    # only, where a stain ten sigmas deep lies. The net may move a lot; the
+    # lane must then show the fallback or the uneven notice (as the results
+    # raise them: a fallback mode, or a spread over 5% of the net).
+    clean = adversarial_row("ring", seed)
+    stained = stress("stain_below", seed)
+    found = rowdetect.detect_row(
+        clean.image,
+        clean.row,
+        clean.n_lanes,
+        background=estimate_background(clean.image),
+        dark_on_light=True,
+    )
+    top = min(rect[1] for rect in found.slots) - 2
+    rects = [(x0, y0 - top, x1, y1 - top) for x0, y0, x1, y1 in found.slots]
+    sizes = [(x1 - x0, y1 - y0) for x0, y0, x1, y1 in rects]
+    fallback = estimate_background(clean.image[top:])
+
+    def lane_net(image: np.ndarray) -> tuple[float, BandBackground]:
+        ring = band_backgrounds(
+            image, rects, sizes, dark_on_light=True, integral=True, fallback=fallback
+        )[STAIN_LANE]
+        x0, y0, x1, y1 = rects[STAIN_LANE]
+        size = BoxSize(width=x1 - x0, height=y1 - y0)
+        net = net_signal(
+            image, Box(x=x0, y=y0), size, ring.level, dark_on_light=True, clamp=RING_CLAMP
+        )
+        return net, ring
+
+    net, ring = lane_net(stained.image[top:])
+    clean_net, _ = lane_net(clean.image[top:])
+    width, height = sizes[STAIN_LANE]
+    noticed = ring.mode in ("asymmetric", "image") or ring.spread * width * height > 0.05 * net
+    assert abs(net / clean_net - 1.0) <= 0.05 or noticed
 
 
 def _row_scene(tmp_path: Path, setup) -> tuple[ProjectSession, Recorder, dict[str, str]]:
