@@ -25,6 +25,7 @@ import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pytest
@@ -5619,6 +5620,38 @@ def flipped(case: RowCase) -> RowCase:
     )
 
 
+class Placed(NamedTuple):
+    """What the operation did with a row (:func:`anchored_row`): ``kind``
+    ``"refused"`` (``flags`` the error code and cause) or ``"placed"``
+    (``flags`` the placement's); ``offsets`` maps each stored lane to its box
+    centre's x minus the lane's true centre (px); ``half_step`` is half the
+    median step between the lanes' centres; ``empty`` the stored lanes
+    without a band."""
+
+    kind: str
+    flags: tuple[str, ...]
+    offsets: dict[int, float]
+    half_step: float
+    empty: frozenset[int]
+
+    @property
+    def off(self) -> list[int]:
+        """The stored lanes whose box lies more than half a step off."""
+        return [lane for lane, dx in sorted(self.offsets.items()) if abs(dx) > self.half_step]
+
+    def off_in_words(self) -> str:
+        """The lanes boxed more than half a step off, each with its offset."""
+        lanes = "; ".join(
+            f"lane {lane + 1}: no band, boxed {self.offsets[lane]:+.1f} px from the lane's centre"
+            if lane in self.empty
+            else f"lane {lane + 1}: box centre {self.offsets[lane]:+.1f} px from the band's"
+            for lane in self.off
+        )
+        return (
+            f"placed with flags {self.flags}: {lanes} (half the lane step {self.half_step:.1f} px)"
+        )
+
+
 def anchored_row(
     tmp_path: Path,
     case: RowCase,
@@ -5626,34 +5659,35 @@ def anchored_row(
     *,
     dx: float = 0.0,
     mirrored: bool = False,
-) -> tuple[str, tuple[str, ...], list[int]]:
+) -> Placed:
     """The row placed by the operation with another protein's boxes in
-    ``lanes`` (none if None; numbered right to left when ``mirrored``):
-    ``("refused", (code, cause), [])``, or ``("placed", flags, the stored
-    lanes whose box lies more than half a lane step off that lane's band)``."""
+    ``lanes`` (none if None; numbered right to left when ``mirrored``)."""
     s, image, protein = row_session(tmp_path, case)
     if lanes is not None:
         other_protein_in_lanes(s, image, case, lanes, dx=dx, mirrored=mirrored)
+    n = case.n_lanes
+    half_step = float(np.median(np.abs(np.diff(case.lane_cx)))) / 2
+
+    def drawn(lane: int) -> int:
+        return n - 1 - lane if mirrored else lane
+
+    empty = frozenset(lane for lane in range(n) if drawn(lane) not in case.reference)
     try:
         placement = ops.detect_row_boxes(s, protein, case.row)
     except OperationError as exc:
-        return "refused", (exc.code.name, exc.detail.get("cause", "")), []
-    n = case.n_lanes
-    step = float(np.median(np.abs(np.diff(case.lane_cx))))
-    off = [
-        lane
+        cause = (exc.code.name, exc.detail.get("cause", ""))
+        return Placed("refused", cause, {}, half_step, empty)
+    offsets = {
+        lane: (rect[0] + rect[2]) / 2 - case.lane_cx[drawn(lane)]
         for lane, rect in rects_by_lane(s, protein).items()
-        if abs((rect[0] + rect[2]) / 2 - case.lane_cx[n - 1 - lane if mirrored else lane])
-        > step / 2
-    ]
-    return "placed", placement.flags, off
+    }
+    return Placed("placed", placement.flags, offsets, half_step, empty)
 
 
-def read_with_care(outcome: tuple[str, tuple[str, ...], list[int]]) -> bool:
+def read_with_care(outcome: Placed) -> bool:
     """Refused, placed with its lane numbers doubtful, or placed right: never
     placed a lane off without a flag."""
-    kind, flags, off = outcome
-    return kind == "refused" or "doubtful_lanes" in flags or not off
+    return outcome.kind == "refused" or "doubtful_lanes" in outcome.flags or not outcome.off
 
 
 @pytest.mark.parametrize("dx", [0.0, 4.0, -4.0])
@@ -5699,16 +5733,13 @@ def test_lanes_on_the_image_at_either_end_refuse_a_row_over_what_lies_beside(
 @pytest.mark.parametrize("seed", [1000, 1001])
 @pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1.3"])
 def test_a_row_box_over_an_arrow_past_the_last_lane_is_not_read_off_silently(tmp_path, key, seed):
-    kind, flags, off = anchored_row(tmp_path, stress(key, seed), None)
-    assert read_with_care((kind, flags, off)), (
-        f"placed with flags {flags}: lanes {', '.join(str(lane + 1) for lane in off)}"
-        " boxed more than half a lane step off their bands"
-    )
+    outcome = anchored_row(tmp_path, stress(key, seed), None)
+    assert read_with_care(outcome), outcome.off_in_words()
 
 
 @pytest.mark.parametrize("end", ["first", "last"])
 @pytest.mark.parametrize("seed", [1000, 1001, 1002])
-@pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1.3"])
+@pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1", "arrow_1.1", "arrow_1.3"])
 def test_lanes_on_the_image_refuse_a_row_box_over_an_arrow(tmp_path, key, seed, end):
     case = stress(key, seed)
     lanes = [1, 2] if end == "first" else [case.n_lanes - 2, case.n_lanes - 1]
