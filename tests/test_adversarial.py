@@ -1435,6 +1435,48 @@ def test_a_degraded_detector_loses_score_on_every_row(variant):
     assert not problem, problem
 
 
+def test_the_self_check_runs_the_measured_variants_on_the_measured_rows():
+    # The variants and rows the deltas above were measured on: five always,
+    # on the 96 rows; all eleven on the 162 floor rows and the 187 grid rows.
+    assert [variant.id for variant in DEGRADED] == [
+        "equal_slots",
+        "half_pitch",
+        "no_doubt",
+        "no_cut",
+        "detect_k_12",
+        "no_off_row_line",
+        "no_size_guard",
+        "no_line_filter",
+        "weak_speck_filter",
+        "no_second_peak",
+        "no_valley_split",
+    ]
+    assert [variant.id for variant in IN_CI] == [
+        "equal_slots",
+        "half_pitch",
+        "no_doubt",
+        "no_cut",
+        "detect_k_12",
+    ]
+    every = self_check_rows(True)
+    assert (len(self_check_rows(False)), len(every)) == (96, 349)
+    assert len({recipe.label for recipe in every}) == 349
+
+
+def test_the_valley_split_variant_ignores_its_warning():
+    # VALLEY_FRAC=0 on a burnt-out band raises a RuntimeWarning; the variant
+    # ignores it (the grid row that always runs).
+    variant = {variant.id: variant for variant in DEGRADED}["no_valley_split"]
+    label = "burnt_out/light90000_speck4_60000_-18-10"
+    recipe = next(recipe for recipe in GRID if recipe.label == label)
+    case, today = recipe.build(), scored(recipe)[1]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(RuntimeWarning, match="invalid value encountered in multiply"):
+            dataclasses.replace(variant, quiet=None).detect(recipe, case, today)
+        variant.detect(recipe, case, today)
+
+
 def test_a_degraded_detector_leaves_the_detector_as_it_was():
     degraded_scores(False)
     assert [
@@ -1534,12 +1576,23 @@ def test_a_degraded_detector_scored_on_other_rows_is_an_error():
 
 def test_equal_slots_number_the_boxes_by_where_they_lie():
     # The bench row with lane 2's box moved onto lane 1's band, stronger
-    # than lane 1's box: slot 1 keeps it, slot 2 is empty. The doubt and the
-    # reading's refusals are dropped; any other flag and note stay.
+    # than lane 1's box: slot 1 keeps it, slot 2 is empty, none of lane 2's
+    # band left in it. The doubt and the reading's refusals are dropped; any
+    # other flag and note stay.
     case, found, _ = base()
     x0, y0, x1, y1 = case.row
     width = (x1 - x0) / 6
-    moved = {2: {"rect": found.lanes[1].rect, "snr": found.lanes[1].snr + 1.0}}
+    moved = {
+        2: {
+            "rect": found.lanes[1].rect,
+            "snr": found.lanes[1].snr + 1.0,
+            "extent": (1, 2, 3, 4),
+            "bg_offset": 2.0,
+            "hollow": True,
+            "cut": True,
+            "line_offset": 3.0,
+        }
+    }
     doubt = "lane numbers doubtful: lane 3 lies a lane early"
     flags = ("ambiguous_lanes", "lanes_outside_row", "doubtful_lanes", "background_mismatch")
     notes = ("a note", doubt)
@@ -1548,6 +1601,8 @@ def test_equal_slots_number_the_boxes_by_where_they_lie():
     assert (numbered.lanes[1].lane, numbered.lanes[1].snr) == (1, found.lanes[1].snr + 1.0)
     empty = numbered.lanes[2]
     assert (empty.rect, empty.reason, empty.components, empty.peaks) == (None, "no_band", 0, ())
+    kept = (empty.extent, empty.bg_offset, empty.hollow, empty.cut, empty.line_offset)
+    assert kept == (None, None, False, False, None)
     assert empty.window == (int(x0 + 2 * width), y0, int(x0 + 3 * width), y1)
     assert (numbered.flags, numbered.notes) == (("background_mismatch",), ("a note",))
     # The weaker of two boxes in a slot gives way: lane 1's own box, now.
@@ -1555,11 +1610,24 @@ def test_equal_slots_number_the_boxes_by_where_they_lie():
     assert equal_slots(changed(found, weaker), case).lanes[1] == found.lanes[1]
 
 
-def test_a_half_pitch_shift_moves_every_box_right():
+def test_equal_slots_hold_a_box_beyond_the_row_box_in_the_end_slot():
+    # Lane 1's box moved left of the row box and lane 6's right of it, their
+    # centres 25 px outside: each stays in the slot at its own end.
     case, found, _ = base()
-    dx = round(found.pitch / 2)
-    assert dx > 20
-    empty = changed(found, {3: EMPTY})
+    x0, _, x1, _ = case.row
+    first, last = found.lanes[0].rect, found.lanes[5].rect
+    left = (x0 - 40, first[1], x0 - 10, first[3])
+    right = (x1 + 10, last[1], x1 + 40, last[3])
+    numbered = equal_slots(changed(found, {0: {"rect": left}, 5: {"rect": right}}), case)
+    assert numbered.slots == (left, *found.slots[1:5], right)
+    assert [lane.lane for lane in numbered.lanes] == [0, 1, 2, 3, 4, 5]
+
+
+@pytest.mark.parametrize(("pitch", "dx"), [(68.6, 34), (69.8, 35)])
+def test_a_half_pitch_shift_moves_every_box_right(pitch, dx):
+    # Half the pitch to the nearest px: 34.3 is 34, 34.9 is 35.
+    case, found, _ = base()
+    empty = changed(found, {3: EMPTY}, pitch=pitch)
     shifted = half_pitch_shift(empty, case)
     assert shifted.lanes[3] == empty.lanes[3]
     for before, after in zip(empty.slots, shifted.slots, strict=True):
