@@ -1175,15 +1175,32 @@ def test_a_ring_stain_has_two_sides_only():
 LOSS = 3
 
 
+def _nth(labels: Sequence[str], k: int) -> str:
+    return repr(labels[k]) if k < len(labels) else "none"
+
+
+def _lanes(score: RowScore) -> str:
+    """The row's score in words, without its label."""
+    return str(score).removeprefix(f"{score.label}: ")
+
+
 def not_worse(name: str, today: Sequence[RowScore], degraded: Sequence[RowScore]) -> str:
     """Why the degraded detector ``name`` does not score worse than today's on
     the same rows, "" when it does (:data:`LOSS`): both differences, the
     threshold, and the rows whose silent or wrong lanes changed (the first
-    10). Raises ValueError when the two score other rows."""
+    10), each with both scores. Raises ValueError when the two score other
+    rows, naming the first that differs."""
     labels = [score.label for score in today]
-    if [score.label for score in degraded] != labels:
+    theirs = [score.label for score in degraded]
+    if theirs != labels:
+        k = next(
+            k
+            for k in range(max(len(labels), len(theirs)))
+            if labels[k : k + 1] != theirs[k : k + 1]
+        )
         raise ValueError(
-            f"{name}: {len(degraded)} rows scored against today's {len(today)}, not the same rows"
+            f"{name}: {len(degraded)} rows scored against today's {len(today)}, not the same"
+            f" rows; row {k + 1}: {_nth(theirs, k)} against today's {_nth(labels, k)}"
         )
     silent = sum(score.silent for score in degraded) - sum(score.silent for score in today)
     wrong = sum(score.wrong for score in degraded) - sum(score.wrong for score in today)
@@ -1195,7 +1212,9 @@ def not_worse(name: str, today: Sequence[RowScore], degraded: Sequence[RowScore]
         if (old.silent, old.wrong) != (new.silent, new.wrong)
     ]
     rows = "".join(
-        f"\n  silent {old.silent} -> {new.silent}, wrong {old.wrong} -> {new.wrong}: {new}"
+        f"\n  {new.label}: silent {old.silent} -> {new.silent}, wrong {old.wrong} -> {new.wrong}"
+        f"\n    today:    {_lanes(old)}"
+        f"\n    degraded: {_lanes(new)}"
         for old, new in changed[:10]
     )
     return (
@@ -1470,25 +1489,47 @@ def test_a_detector_that_does_not_lose_is_shown_with_the_rows_it_changed():
         "variant (how): silent +0, wrong -12 against today's detector on 13 rows; it must"
         " have at least 3 more silent lanes, or at least 3 more wrong lanes and no fewer"
         " silent ones. Rows changed: 12 (the first 10)\n"
-        "  silent 0 -> 0, wrong 1 -> 0: row 0: 20/20 right\n"
+        "  row 0: silent 0 -> 0, wrong 1 -> 0\n"
+        "    today:    19/20 right; lane 1 miss flagged (doubtful_lanes)\n"
+        "    degraded: 20/20 right\n"
+        "  row 1: silent 0 -> 0, wrong 1 -> 0\n"
     )
-    shown = [line.split(": ")[1] for line in message.splitlines()[1:]]
-    assert shown == [f"row {k}" for k in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10)]
-    # One row more silent: 1 silent lane, as many wrong.
-    one = not_worse("variant", today[:2], [counted("row 0", 1, 1), today[1]])
+    lines = message.splitlines()
+    assert len(lines) == 31
+    shown = [line.split(":")[0] for line in lines[1::3]]
+    assert shown == [f"  row {k}" for k in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10)]
+    # One row more silent: lane 1, wrong today, read right; lane 2 missed
+    # silently. Both lanes are named.
+    lane_2_silent = RowScore("row 0", None, 20, 19, (LaneScore(1, "miss", "silent"),))
+    one = not_worse("variant", today[:2], [lane_2_silent, today[1]])
     assert one.endswith(
         "silent +1, wrong +0 against today's detector on 2 rows; it must have at least 3 more"
         " silent lanes, or at least 3 more wrong lanes and no fewer silent ones. Rows changed:"
-        " 1\n  silent 0 -> 1, wrong 1 -> 1: row 0: 19/20 right; lane 1 miss silent"
+        " 1\n  row 0: silent 0 -> 1, wrong 1 -> 1\n"
+        "    today:    19/20 right; lane 1 miss flagged (doubtful_lanes)\n"
+        "    degraded: 19/20 right; lane 2 miss silent"
     )
 
 
 def test_a_degraded_detector_scored_on_other_rows_is_an_error():
+    # The message names the first row that differs, counted from 1.
     today = [counted("a", 0, 1), counted("b", 0, 1)]
-    with pytest.raises(ValueError, match="variant: 1 rows scored against today's 2"):
+    with pytest.raises(
+        ValueError,
+        match="^variant: 1 rows scored against today's 2, not the same rows; row 2: none"
+        " against today's 'b'$",
+    ):
         not_worse("variant", today, today[:1])
-    with pytest.raises(ValueError, match="not the same rows"):
+    with pytest.raises(ValueError, match="; row 3: 'c' against today's none$"):
+        not_worse("variant", today, [*today, counted("c", 0, 1)])
+    with pytest.raises(
+        ValueError,
+        match="^variant: 2 rows scored against today's 2, not the same rows; row 2: 'c'"
+        " against today's 'b'$",
+    ):
         not_worse("variant", today, [today[0], counted("c", 0, 1)])
+    with pytest.raises(ValueError, match="; row 1: 'b' against today's 'a'$"):
+        not_worse("variant", today, today[::-1])
 
 
 def test_equal_slots_number_the_boxes_by_where_they_lie():
