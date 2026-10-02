@@ -897,6 +897,18 @@ def test_a_grid_box_holding_too_little_of_its_band_is_partial(change, kind, valu
     assert lane.value == pytest.approx(value, abs=1e-4)
 
 
+def test_a_grid_box_is_compared_with_the_box_on_the_nearest_pixel():
+    # Lane 4's centre lies past a pixel's middle (x 300.81): the box of the
+    # same size centred on its band starts at x 279 (300.81 + 0.5 - 22,
+    # rounded down), not 278. A box 12 px to the right of that holds 0.8136
+    # of what it holds (0.8156 against the box at 278).
+    case = GRID_ROW.build()
+    assert case.lane_cx[3] == pytest.approx(300.81, abs=0.01)
+    [lane] = grid_score({3: centred(case, 3, dx=12)}).lanes
+    assert (lane.lane, lane.kind) == (3, "partial")
+    assert lane.value == pytest.approx(0.8136, abs=1e-4)
+
+
 def test_a_grid_band_missed_is_scored_by_its_expected_snr():
     [lane] = grid_score({1: None}).lanes
     assert (lane.lane, lane.kind, lane.status) == (1, "missed", "silent")
