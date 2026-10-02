@@ -5603,8 +5603,11 @@ def test_lanes_on_the_image_refuse_a_row_read_off_whatever_its_doubt(tmp_path):
 
 
 def flipped(case: RowCase) -> RowCase:
-    """``case`` flipped left to right: its lanes run right to left on the
-    image, lane 0 at the right."""
+    """``case`` flipped left to right: the image, the row box and the
+    references mirrored, the lanes renumbered so lane 0 is again the
+    leftmost (the mirror of the original last lane). Numbering them right to
+    left, as a mirrored blot is read, is :func:`anchored_row`'s
+    ``mirrored=True``."""
     width = case.image.shape[1]
     x0, y0, x1, y1 = case.row
     n = case.n_lanes
