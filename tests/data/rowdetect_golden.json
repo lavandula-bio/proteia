@@ -488,6 +488,18 @@
     {"rect": [417, 70, 465, 90], "reason": "band", "components": 1, "snr": 206.588980081338}
    ]
   },
+  "adversarial/frame/1000": {
+   "flags": [],
+   "notes": [],
+   "lanes": [
+    {"rect": [70, 74, 114, 86], "reason": "band", "components": 1, "snr": 156.7740553387223},
+    {"rect": [141, 75, 185, 87], "reason": "band", "components": 1, "snr": 185.6891508634086},
+    {"rect": null, "reason": "line", "components": 0, "snr": 2.6592787258194344},
+    {"rect": [279, 75, 323, 87], "reason": "band", "components": 1, "snr": 188.0587307929423},
+    {"rect": [350, 75, 394, 87], "reason": "band", "components": 1, "snr": 252.57014774428305},
+    {"rect": [419, 74, 463, 86], "reason": "band", "components": 1, "snr": 227.07199249328087}
+   ]
+  },
   "bench/overexposed saturated_at=0": {
    "flags": [],
    "notes": [],
