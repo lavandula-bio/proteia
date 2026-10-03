@@ -1459,6 +1459,32 @@ _WORDS = [
         + "; lane 6's box lies off the expected MW's row (1.50 box heights, limit 0.75), so the"
         " line may run through another row" + CLICK.format("lanes 4, 6"),
     ),
+    (  # boxes exactly on the expected row (0, and the limit) are not named off it
+        "other_box_limits",
+        _found(
+            _off({0: (0.0, 0.0), 1: (0.0, 0.75), 3: (1.0, 1.0), 5: (0.2, 1.5)}),
+            ["off_row_line"],
+            off_cause="other_box",
+        ),
+        LADDERS,
+        "no row placed: in lane 4 "
+        + OFF.format("1.00", "that lane picked")
+        + "; lane 6's box lies off the expected MW's row (1.50 box heights, limit 0.75), so the"
+        " line may run through another row" + CLICK.format("lanes 4, 6"),
+    ),
+    (  # two off the line: one on the expected row (0 from it), one off it
+        "expected_row_mixed",
+        _found(
+            _off({1: (1.2, 1.3), 4: (1.0, 0.0)}),
+            ["off_row_line"],
+            off_cause="expected_row",
+        ),
+        LADDERS,
+        "no row placed: in lanes 2, 5 "
+        + OFF.format("1.20 and 1.00", "those lanes picked")
+        + "; lane 5's box lies on the expected MW's row (0.00 box heights from it, limit"
+        " 0.75), so the line may run through another row" + CLICK.format("lane 2"),
+    ),
     (  # placed again, still off the line
         "again",
         _found(

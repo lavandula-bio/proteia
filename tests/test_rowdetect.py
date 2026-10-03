@@ -3839,9 +3839,11 @@ def _not_detected_note(found: RowDetection) -> tuple[str, list[float], list[floa
 
 
 def _assert_not_detected(found: RowDetection, lanes: Sequence[int]) -> None:
-    """``lanes`` (0-based) recorded as not detected, the row placed."""
+    """``lanes`` (0-based) recorded as not detected, the row placed: the
+    first placement's off_row_line flag and note replaced by the record's."""
     assert not found.refused and found.crossed == ()
     assert "off_expected_row" in found.flags and "off_row_line" not in found.flags
+    assert not any("box centre more than" in note for note in found.notes), found.notes
     for i in lanes:
         lane = found.lanes[i]
         assert (lane.rect, lane.extent, lane.reason) == (None, None, "off_expected_row")
@@ -4063,6 +4065,15 @@ def test_a_lane_recorded_not_detected_is_never_named_cut_or_outlier(monkeypatch)
             {1: "no_band"},
             (None, [1]),
         ),
+        # A box exactly 0.75 off the line (on the expected row) is on the line:
+        # not off it, so not one whose box on the expected row says the line
+        # runs elsewhere.
+        (
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: -0.75, 4: 0.0},
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.0, 4: 0.0},
+            {1: "no_band"},
+            (None, [1]),
+        ),
     ],
     ids=[
         "half-of-boxed",
@@ -4074,6 +4085,7 @@ def test_a_lane_recorded_not_detected_is_never_named_cut_or_outlier(monkeypatch)
         "line-outside",
         "off-row",
         "off-row-limit",
+        "off-line-limit",
     ],
 )
 def test_off_lanes_are_not_detected_only_when_every_condition_holds(
@@ -4139,11 +4151,32 @@ def test_the_not_detected_lane_s_reading_is_its_region_s():
         assert again.lanes[1].window == lane.window
 
 
+def test_an_off_lane_s_own_band_is_the_one_it_grew_from_of_two_in_its_window():
+    # Lane 2 knocked out, a non-specific band 12 px above every lane's, and
+    # another band as deep 20 px below the row in lane 2 alone, little
+    # noise: lane 2's window holds two bands, and it grows from the one
+    # above, nearer the expected row. Its own band is the pixels draining to
+    # that one: on the row's line its tail is taken out by its reflection
+    # about it, and lane 2 is recorded as not detected. Read with the other
+    # band as its own, the tail would stay (some 26 noise sigmas).
+    case, expected = _knocked_out(24000.0, -12.0, (1,), 25.0)
+    ys, xs = np.mgrid[0 : case.image.shape[0], 0 : case.image.shape[1]]
+    below = _band_at(1, 20.0, 24000.0, 44.0, 12.0)
+    image = case.image - below(xs, ys, np.array(case.lane_cx), np.array(case.lane_cy))
+    case = dataclasses.replace(case, image=np.round(image))
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    check_invariants(case, found)
+    _assert_not_detected(found, [1])
+    assert found.lanes[1].snr < 3.0
+
+
 def test_a_row_still_off_its_line_placed_again_is_refused(monkeypatch):
     # Lane 3 off the row's line and recorded as not detected, the row is
     # placed again without it; were a box still off the line then (the
     # second fit made to leave lane 6 1.1 box heights off it), the row is
     # refused: no lane recorded, the first fit's boxes reported, and why.
+    # Lane 1, exactly 0.75 box heights off the second line, is on it: not
+    # named.
     case = _row_beside(16.0, 2.0, missing=(2,))
     fits = []
     real = rowdetect._row_line
@@ -4154,6 +4187,7 @@ def test_a_row_still_off_its_line_placed_again_is_refused(monkeypatch):
         if len(fits) == 2:
             offsets = offsets.copy()
             offsets[-1] = 1.1
+            offsets[0] = -0.75
         return offsets
 
     monkeypatch.setattr(rowdetect, "_row_line", row_line)
@@ -4166,6 +4200,45 @@ def test_a_row_still_off_its_line_placed_again_is_refused(monkeypatch):
     assert (found.off_cause, found.again) == ("again", ((5, 1.1),))
     assert found.lanes[2].line_reason == "no_band"  # it would have been recorded
     assert [note for note in found.notes if "recorded as not detected" in note] == []
+
+
+def _line_with(monkeypatch, at: dict[int, dict[int, float]]) -> list[list[int]]:
+    """Make the row's line fit number k (from 1) leave lane i ``at[k][i]`` box
+    heights off it, the other lanes as fitted; returns the lanes of each fit."""
+    fits: list[list[int]] = []
+    real = rowdetect._row_line
+
+    def row_line(centres, height, lanes=()):
+        offsets = real(centres, height, lanes)
+        fits.append(list(lanes))
+        if len(fits) in at:
+            offsets = offsets.copy()
+            for i, v in at[len(fits)].items():
+                offsets[list(lanes).index(i)] = v
+        return offsets
+
+    monkeypatch.setattr(rowdetect, "_row_line", row_line)
+    return fits
+
+
+def test_a_box_exactly_the_limit_off_the_row_s_line_is_on_it(monkeypatch):
+    # ROW_LINE_K (0.75 box heights) off the row's line is on it, in every
+    # fit: a row whose one box lies that far off is placed with no
+    # off_row_line; with lane 3 knocked out and off the line, a box that far
+    # off in the first fit is neither read on the line nor recorded as not
+    # detected with lane 3, and that far off in the second it keeps the row
+    # placed.
+    plain = adversarial_row("on the limit", 1000)
+    fits = _line_with(monkeypatch, {1: {3: 0.75}})
+    found = detect(plain, prefer_y=_target_row(plain))
+    assert len(fits) == 1 and not found.refused and found.flags == (), found.flags
+    case = _row_beside(16.0, 2.0, missing=(2,))
+    for at in ({1: {4: -0.75}}, {2: {4: 0.75}}):
+        fits = _line_with(monkeypatch, at)
+        found = detect(case, prefer_y=_target_row(case))
+        assert fits == [[0, 1, 2, 3, 4, 5], [0, 1, 3, 4, 5]], (at, fits)
+        _assert_not_detected(found, [2])
+        assert found.lanes[4].rect is not None and found.lanes[4].line_reason is None, at
 
 
 _A_BAND_LEFT_OUT = re.compile(
@@ -4298,6 +4371,11 @@ def test_other_bands_note_words_each_kind_and_way():
     # The top row (50) is in it.
     assert ", inside the box" in rowdetect._other_bands_note({0: (box, [(0.0, 20.0)])}, 100, 50)
     assert "inside" not in rowdetect._other_bands_note({0: (box, [(-0.1, 20.0)])}, 100, 50)
+    # Level with the box's centre (56), beside it: 0 px, above (not below).
+    assert rowdetect._other_bands_note({0: (box, [(6.0, -0.5)])}, 100, 50) == (
+        "lane 1: another band lies beside the box, 0 px above its centre; the box does not"
+        " include it"
+    )
 
 
 @pytest.mark.parametrize("seed", [1001, 1003])
@@ -4489,6 +4567,137 @@ def test_on_the_line_outside_the_rows_reads_nothing():
     assert read(20.6) == ("outside", 0.0, None)  # index 20.1, past row 19
     assert read(0.5)[2] == (2, 0, 8, 3)  # row 0: the rows read, clipped
     assert read(19.5)[2] == (2, 18, 8, 20)  # row 19
+    # The columns read stop at the crop's sides: from column 0, to column 10.
+    assert rowdetect._on_the_line(res, surfaces, own, 10, (1.0, 10.5), 16.5, 10.0)[2] == (
+        0,
+        15,
+        4,
+        19,
+    )
+    assert rowdetect._on_the_line(res, surfaces, own, 10, (8.0, 10.5), 16.5, 10.0)[2] == (
+        5,
+        15,
+        10,
+        19,
+    )
+
+
+@pytest.mark.parametrize("flip", [False, True])
+def test_on_the_line_reads_the_own_band_s_centre_short_of_the_row_midway(flip):
+    # One column, its own band rising from the seed (row 10) to the row's
+    # line (row 22) and falling past it: no peak of its own on the seed's
+    # side. Its centre is read on the rows short of the row midway (16):
+    # the top of rows 0 to 15 (15, at row 15), moved to the parabola's
+    # vertex through rows 14 to 16 (row 16 read as 0): row 14.5625. The
+    # reflection of row 22 about it, row 7.125, holds 7.125: the line reads
+    # 22 - 7.125 = 14.875. Mirrored (the seed below the line), the same.
+    s = (22.0 - np.abs(np.arange(40.0) - 22.0))[:, None]
+    seed, line = 10, 22.5
+    if flip:
+        s, seed, line = s[::-1].copy(), 29, 17.5
+    res = _line_pass(s)
+    reason, snr, _ = rowdetect._on_the_line(
+        res, rowdetect._slot_surfaces(res), s > 0.0, seed, (0.5, 10.5), line, 1.0
+    )
+    assert (reason, snr) == ("unassigned", pytest.approx(14.875, abs=1e-9))
+
+
+def test_on_the_line_reads_all_of_a_column_whose_own_band_has_no_centre_on_the_seed_s_side():
+    # Two columns: in column 0 the own band peaks at the seed's row (10),
+    # holding nothing on the row's line (row 22); in column 1 it lies only
+    # past the row midway (16), peaking at row 27.5, 9 high on the line. No
+    # centre on the seed's side in column 1: nothing is taken out there, and
+    # the line reads 9.
+    y = np.arange(40.0)
+    s = np.stack(
+        [
+            np.maximum(0.0, 10.0 - 2.0 * np.abs(y - 10.0)),
+            np.maximum(0.0, 20.0 - 2.0 * np.abs(y - 27.5)),
+        ],
+        axis=1,
+    )
+    res = _line_pass(s)
+    reason, snr, _ = rowdetect._on_the_line(
+        res, rowdetect._slot_surfaces(res), s > 0.0, 10, (1.0, 10.5), 22.5, 10.0
+    )
+    assert (reason, snr) == ("unassigned", pytest.approx(9.0, abs=1e-9))
+
+
+def test_centre_row_reads_a_band_s_top_plateau_by_its_middle():
+    # The middle of the top plateau: the pixels within a relative 1e-9 of
+    # the top (equal up to rounding); a lone top moved to the parabola's
+    # vertex; None for a column holding nothing above 0.
+    centre = rowdetect._centre_row
+    assert centre(np.array([0.0, 5.0, 10.0, 10.0, 10.0, 5.0, 0.0])) == 3.0
+    assert centre(np.array([7.0, 7.0, 3.0])) == 0.5  # at the column's first row
+    assert centre(np.array([0.0, 4.0, 10.0, 6.0, 0.0])) == pytest.approx(2.1)  # toward the 6
+    top = 10.0
+    assert centre(np.array([0.0, 5.0, top, top, top - 1e-9 * top, 5.0, 0.0])) == 3.0
+    assert centre(np.array([0.0, 5.0, top, top, top - 1.2e-8, 5.0, 0.0])) == 2.5
+    assert centre(np.zeros(5)) is None
+    assert centre(np.array([0.0, 0.5, 0.0])) == 1.0
+
+
+def test_read_at_interpolates_within_the_column_and_reads_0_outside():
+    column = np.array([5.0, 6.0, 7.0])
+    assert rowdetect._read_at(column, 0.0) == 5.0
+    assert rowdetect._read_at(column, 1.5) == 6.5
+    assert rowdetect._read_at(column, 2.0) == 7.0
+    assert rowdetect._read_at(column, -0.1) == 0.0
+    assert rowdetect._read_at(column, 2.1) == 0.0
+
+
+_SLOT = (40, 10)  # rows, columns
+_STAIN = ("artefact", (slice(10, 20), slice(2, 5)))  # a streak's rows and columns
+
+
+@pytest.mark.parametrize(
+    ("region", "snr", "line", "reason"),
+    [
+        ((slice(19, 23), slice(4, 6)), 0.0, 0.0, "artefact"),  # its last row and column
+        ((slice(0, None), slice(0, 10)), 0.0, 0.0, "artefact"),  # every row (the crop's 40)
+        ((slice(20, 24), slice(0, 10)), 0.0, 0.0, "no_band"),  # the rows below it
+        ((slice(6, 10), slice(0, 10)), 0.0, 0.0, "no_band"),  # the rows above it
+        ((slice(10, 14), slice(5, 8)), 0.0, 0.0, "no_band"),  # the columns right of it
+        ((slice(10, 14), slice(0, 2)), 0.0, 0.0, "no_band"),  # the columns left of it
+        ((slice(20, 24), slice(0, 10)), 6.0, 0.0, "unassigned"),  # DETECT_K reached
+        ((slice(20, 24), slice(0, 10)), 0.0, 6.0, "line"),
+        ((slice(20, 24), slice(0, 10)), 0.0, 5.9, "no_band"),
+    ],
+)
+def test_slot_reason_reads_a_streak_by_the_rows_and_columns_it_shares(region, snr, line, reason):
+    # Why a slot (rows, columns of the crop) leaves its lane empty: a streak
+    # or stain over any of its rows and columns; else its SNR reaching
+    # DETECT_K (6); else a line reaching it in the slot.
+    s = np.zeros(_SLOT)
+    lines = np.zeros(_SLOT)
+    lines[21, :] = line
+    res = SimpleNamespace(
+        sig=SimpleNamespace(s_sm=s, sigma_sm=1.0), cand=SimpleNamespace(rejected=[_STAIN])
+    )
+    surfaces = rowdetect._Surfaces(row=s, all=s, line=lines, side=s)
+    assert rowdetect._slot_reason(res, surfaces, snr, region) == reason
+
+
+def test_an_empty_lane_s_slot_reads_the_box_s_edge_rows_too():
+    # Two empty lanes, the row's rows 1 to 19 (row 0 left out): signal 7
+    # sigmas high on row 0 alone in lane 1's slot makes lane 1 edge_signal
+    # (signal at the box's edge), lane 2 no band.
+    s = np.zeros((20, 20))
+    s[0, 3:6] = 7.0
+    none = np.zeros(s.shape, bool)
+    lanes = [rowdetect._Lane(), rowdetect._Lane()]
+    cand = SimpleNamespace(
+        rows=(1, 20), dropped=none, lines=none, side=none, dust=none, cut=none, rejected=[]
+    )
+    res = SimpleNamespace(
+        sig=SimpleNamespace(s_sm=s, sigma_sm=1.0), cand=cand, lanes=lanes, assign=None
+    )
+    rowdetect._empty_lanes(res, 2, 20, 10.0)
+    assert [(ln.reason, ln.snr, ln.window) for ln in lanes] == [
+        ("edge_signal", 0.0, (2, 1, 8, 20)),
+        ("no_band", 0.0, (12, 1, 18, 20)),
+    ]
 
 
 def test_beside_the_lane_tells_a_speck_beside_it_from_a_band_over_it():
@@ -4504,7 +4713,8 @@ def test_beside_the_lane_tells_a_speck_beside_it_from_a_band_over_it():
     assert not rowdetect._beside_the_lane(ks, 1, 19, 10, 20)
     ks[1, 10], ks[1, 15] = 100.0, 29.9
     assert rowdetect._beside_the_lane(ks, 1, 10, 10, 20)
-    assert not rowdetect._beside_the_lane(ks, 1, 11, 10, 20)  # an inner column: never
+    ks[1, 11] = ks[1, 18] = 100.0  # as high, the middle as low: an inner column, never
+    assert not rowdetect._beside_the_lane(ks, 1, 11, 10, 20)
     assert not rowdetect._beside_the_lane(ks, 1, 18, 10, 20)
     ks[0, 15] = 0.0  # the middle read in the peak's own row, not another
     ks[2, 15] = 100.0
@@ -4759,6 +4969,36 @@ def test_prefer_y_stops_at_the_valley_to_a_band_however_much_lower(below, flip, 
         assert lane.rect[3] == 34 and lane.rect[1] in (23, 24), lane.rect
     else:  # rows 8 to 12, the valley at row 16
         assert lane.rect[1] == 6 and lane.rect[3] in (16, 17), lane.rect
+
+
+@pytest.mark.parametrize(
+    ("top", "speck", "prefer", "seed_row"),
+    [
+        ((19, 10), False, 20.5, 19),  # its own top a row from the crop's: that top
+        ((18, 10), False, 20.5, 20),  # two rows: its own as well, nearer the expected row
+        ((20, 10), True, 31.5, 20),  # a speck 8 high (4 sigmas): no peak, though nearer
+    ],
+)
+def test_prefer_y_seeds_from_the_lane_s_own_peaks_apart_from_the_crop_s(
+    top, speck, prefer, seed_row
+):
+    # One lane, its band peaking 100 high at row 20, noise sigma 2: its seed
+    # range's peaks are the crop's top given there and its own peaks
+    # (DETECT_K sigmas, 12, at the range alone), each of these more than a
+    # row from the crop's; the seed is the one nearest the expected row. A
+    # top of its own a row from the crop's is that top; two rows away it is
+    # another. A speck 8 high (row 32) is no peak of the lane's: under 12.
+    y = np.arange(40.0)[:, None]
+    s = (
+        100.0
+        * np.exp(-0.5 * ((y - 20.0) / 3.0) ** 2)
+        * np.r_[np.zeros(3), np.ones(14), np.zeros(3)]
+    )
+    if speck:
+        s[31:34, 8:12] += 8.0
+    lane = rowdetect._Lane(present=True, x_range=(0.0, 20.0), centre=10.0)
+    rowdetect._measure([lane], s, s > 0.0, 2.0, None, [top], prefer)
+    assert lane.seed_row == seed_row and lane.rect[1] < 20 < lane.rect[3], lane
 
 
 @pytest.mark.parametrize("slope", [0.06, -0.06])
