@@ -127,8 +127,9 @@ MODULES: Final = (
     "proteia.web.server",
     "proteia.web.state",
 )
-# Not in a frozen bundle (ADR 0003): the napari GUI and what only it needs.
-LEFT_OUT: Final = ("proteia.gui", "napari", "PySide6", "shiboken6", "qtpy", "tkinter")
+# Not in a frozen bundle (ADR 0003): napari, which Proteia no longer uses (#57),
+# Qt, and tkinter.
+LEFT_OUT: Final = ("napari", "PySide6", "shiboken6", "qtpy", "tkinter")
 
 # Fixed values for the statistics step: two or three conditions of 4 values, and
 # two with tied values (the Mann-Whitney U test's permutation path).

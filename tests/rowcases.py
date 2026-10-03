@@ -13,11 +13,22 @@ references may overlap. The row box spans every declared lane's nominal band,
 the empty ones included, plus a margin.
 
 * :func:`synthetic_row` and :func:`bench_cases`: the fifteen rows of the #51
-  benchmark (bench51), rebuilt bit for bit: same parameters, same random draws.
+  benchmark (bench51), rebuilt bit for bit: same parameters, same random draws;
+  :data:`BENCH_RECIPES` and :func:`bench_row` give each by name, at any seed
+  and membrane noise.
 * :func:`adversarial_row` and :data:`ADVERSARIAL`: the accuracy judge's
   generator and the recipes the tests use (neighbouring rows, doublets,
-  streaks, stains, dust between lanes, bubbles), plus rows of the tests' own
-  (a row large enough for the fits' subsample, guards that bind).
+  streaks, stains, dust between lanes, bubbles, a panel's frame), plus rows of
+  the tests' own (a row large enough for the fits' subsample, guards that
+  bind).
+* :data:`STRESS` (#180): rows that make each known kind of silent error show
+  (a stain on one side of a band's background ring, row boxes cut through
+  bands, dust, a box over two rows, a mark past the last lane), kept apart
+  from :data:`ADVERSARIAL`; :func:`neighbour_grid_row`: a row with a
+  neighbouring band at a set distance and strength in every lane.
+* :class:`Recipe` and :func:`score_row` (#180): a row's lanes scored against
+  the recipe's own truth: wrong lanes, and wrong lanes the page shows no flag
+  for.
 * :func:`jpeg`: a row as an 8-bit JPEG export, read back (block artefacts).
 * :func:`fuzz_row`: seeded random geometry for the invariant checks.
 """
@@ -25,12 +36,16 @@ the empty ones included, plus a margin.
 import dataclasses
 import io
 import math
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import uniform_filter
 
+from proteia.core import evaluate, rowdetect
 from proteia.core.model import Rect
 
 MEMBRANE = 50000.0
@@ -48,7 +63,9 @@ class RowCase:
     """One synthetic row: ``image`` (float64, integer-valued), the ``row`` box,
     ``n_lanes`` and the ``reference`` rect of each lane with a band.
     ``lane_cx`` and ``lane_cy`` are every lane's true centre, the empty ones
-    included."""
+    included. ``neighbour_cy`` is the centre of each lane's neighbouring band
+    above or below, where :func:`neighbour_grid_row` draws one; None
+    otherwise."""
 
     name: str
     description: str
@@ -59,6 +76,7 @@ class RowCase:
     reference: dict[int, Rect]
     lane_cx: tuple[float, ...]
     lane_cy: tuple[float, ...]
+    neighbour_cy: tuple[float, ...] | None = None
 
 
 def _ref_rect(cx: float, cy: float, w: float, h: float) -> Rect:
@@ -99,12 +117,15 @@ def synthetic_row(
     y_jitter: float = 1.0,
     w_var: float = 0.08,
     h_var: float = 0.10,
+    noise: float = NOISE_SIGMA,
 ) -> RowCase:
     """One bench51 row: ``n`` lanes at ``pitch`` (or the steps ``pitches``), bands
     about ``w`` x ``h`` px (the 20% extents), ``missing`` lanes empty. ``smile``
     lifts the outer bands; ``gradient`` tilts the membrane across and down the
     row; ``depth_override`` sets a lane's depth, ``"faint10"`` a tenth of the
-    others' mean; ``mx``/``my`` are the row box margins (negative cuts bands)."""
+    others' mean; ``mx``/``my`` are the row box margins (negative cuts bands).
+    ``noise`` is the membrane noise's sigma: any value scales the same draws,
+    so a noisier row keeps its bands, box and noise pattern."""
     rng = np.random.default_rng(seed)
     steps = list(pitches) if pitches is not None else [pitch] * (n - 1)
     cx0 = _BENCH_MARGIN_X + w / 2
@@ -145,8 +166,8 @@ def synthetic_row(
         fy = np.exp(-0.5 * ((ys - lane_cy[i]) / sy) ** 2)
         depth_map += depths[i] * np.outer(fy, fx)
         reference[i] = all_refs[i]
-    noise = rng.normal(0.0, NOISE_SIGMA, bg.shape)
-    image = np.round(np.clip(bg - depth_map + noise, 0.0, FULL_SCALE))
+    grain = rng.normal(0.0, noise, bg.shape)
+    image = np.round(np.clip(bg - depth_map + grain, 0.0, FULL_SCALE))
     if light_on_dark:
         image = FULL_SCALE - image
     row = (
@@ -168,53 +189,63 @@ def synthetic_row(
     )
 
 
+_BASE = 51  # all_present and the missing-lane rows share geometry and noise
+
+# The fifteen bench51 rows by name: (description, seed, keyword arguments of
+# synthetic_row).
+BENCH_RECIPES: dict[str, tuple[str, int, dict]] = {
+    "all_present": ("6 lanes, pitch 70, W~44 H~12, depths 18k-30k", _BASE, {}),
+    "missing_first": ("lane 0 empty (the box covers it)", _BASE, {"missing": [0]}),
+    "missing_middle": ("lane 2 empty", _BASE, {"missing": [2]}),
+    "missing_last": ("lane 5 empty (the box covers it)", _BASE, {"missing": [5]}),
+    "missing_two": ("lanes 0 and 3 empty", _BASE, {"missing": [0, 3]}),
+    "touching": (
+        "pitch 48, W 60: neighbours overlap at half height, no valley between them",
+        52,
+        {
+            "pitch": 48.0,
+            "w": 60.0,
+            "w_var": 0.0,
+            "x_jitter": 0.0,
+            "depth_range": (22000.0, 26000.0),
+        },
+    ),
+    "smile": ("outer bands 8 px higher than the middle", 53, {"smile": 8.0}),
+    "uneven_spacing": (
+        "pitches 56/84/63/80/60 (70 +/-20%), W~40",
+        54,
+        {"w": 40.0, "pitches": [56.0, 84.0, 63.0, 80.5, 59.5], "x_jitter": 0.0},
+    ),
+    "faint_band": ("lane 3 ten times fainter", 55, {"depth_override": {3: "faint10"}}),
+    "overexposed": ("lane 2 clipped flat at 0", 56, {"depth_override": {2: 1.5 * MEMBRANE}}),
+    "uneven_background": (
+        "membrane -6000..+6000 across the row, +/-1000 down it",
+        57,
+        {"gradient": (6000.0, 1000.0)},
+    ),
+    "light_on_dark": ("inverted: membrane 15535, bright bands", 58, {"light_on_dark": True}),
+    "loose_box": ("margins half a pitch across, 15 px down", 59, {"mx": 35, "my": 15}),
+    "tight_box": ("cuts 4 px off both outer bands, 1 px down", 60, {"mx": -4, "my": 1}),
+    "twelve_lanes": (
+        "12 lanes, pitch 50, W~34 H~10",
+        61,
+        {"n": 12, "pitch": 50.0, "w": 34.0, "h": 10.0},
+    ),
+}
+
+
+def bench_row(name: str, seed: int | None = None, *, noise: float = NOISE_SIGMA) -> RowCase:
+    """The bench51 row ``name`` at its own seed (or ``seed``), with membrane
+    noise ``noise``."""
+    description, own_seed, recipe = BENCH_RECIPES[name]
+    return synthetic_row(
+        name, description, own_seed if seed is None else seed, noise=noise, **recipe
+    )
+
+
 def bench_cases() -> list[RowCase]:
     """The fifteen bench51 rows (91 reference bands), rebuilt on every call."""
-    base = 51  # all_present and the missing-lane rows share geometry and noise
-    return [
-        synthetic_row("all_present", "6 lanes, pitch 70, W~44 H~12, depths 18k-30k", base),
-        synthetic_row("missing_first", "lane 0 empty (the box covers it)", base, missing=[0]),
-        synthetic_row("missing_middle", "lane 2 empty", base, missing=[2]),
-        synthetic_row("missing_last", "lane 5 empty (the box covers it)", base, missing=[5]),
-        synthetic_row("missing_two", "lanes 0 and 3 empty", base, missing=[0, 3]),
-        synthetic_row(
-            "touching",
-            "pitch 48, W 60: neighbours overlap at half height, no valley between them",
-            52,
-            pitch=48.0,
-            w=60.0,
-            w_var=0.0,
-            x_jitter=0.0,
-            depth_range=(22000.0, 26000.0),
-        ),
-        synthetic_row("smile", "outer bands 8 px higher than the middle", 53, smile=8.0),
-        synthetic_row(
-            "uneven_spacing",
-            "pitches 56/84/63/80/60 (70 +/-20%), W~40",
-            54,
-            w=40.0,
-            pitches=[56.0, 84.0, 63.0, 80.5, 59.5],
-            x_jitter=0.0,
-        ),
-        synthetic_row("faint_band", "lane 3 ten times fainter", 55, depth_override={3: "faint10"}),
-        synthetic_row(
-            "overexposed", "lane 2 clipped flat at 0", 56, depth_override={2: 1.5 * MEMBRANE}
-        ),
-        synthetic_row(
-            "uneven_background",
-            "membrane -6000..+6000 across the row, +/-1000 down it",
-            57,
-            gradient=(6000.0, 1000.0),
-        ),
-        synthetic_row(
-            "light_on_dark", "inverted: membrane 15535, bright bands", 58, light_on_dark=True
-        ),
-        synthetic_row("loose_box", "margins half a pitch across, 15 px down", 59, mx=35, my=15),
-        synthetic_row("tight_box", "cuts 4 px off both outer bands, 1 px down", 60, mx=-4, my=1),
-        synthetic_row(
-            "twelve_lanes", "12 lanes, pitch 50, W~34 H~10", 61, n=12, pitch=50.0, w=34.0, h=10.0
-        ),
-    ]
+    return [bench_row(name) for name in BENCH_RECIPES]
 
 
 # --- The accuracy judge's generator ---
@@ -522,6 +553,30 @@ def shade_above(end: int, rows: int, depth: float) -> Artefact:
     return f
 
 
+def ring_stain(
+    lane: int,
+    side: str,
+    depth: float,
+    *,
+    near: float = 13.0,
+    far: float = 40.0,
+    half: float = 40.0,
+) -> Artefact:
+    """A flat stain beside ``lane``'s band, ``depth`` deep, on its ``side``
+    (``"top"`` or ``"bottom"``): from ``near`` to ``far`` px above or below the
+    band's centre, ``half`` px either side of it along the row. Over a band's
+    background ring, it covers that side of the ring and none of the band."""
+    if side not in ("top", "bottom"):
+        raise ValueError(f"side must be 'top' or 'bottom', not {side!r}")
+    sign = -1.0 if side == "top" else 1.0
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        away = sign * (Y - lcy[lane])  # px from the band's centre, on the stain's side
+        return depth * ((away >= near) & (away <= far) & (np.abs(X - lcx[lane]) <= half))
+
+    return f
+
+
 def image_cut(case: RowCase, *, top: int = 0, bottom: int | None = None) -> RowCase:
     """``case`` with its image cut to the rows ``[top, bottom)`` and its row
     box dragged to each cut (to the image's new top or bottom row), as over a
@@ -538,6 +593,22 @@ def image_cut(case: RowCase, *, top: int = 0, bottom: int | None = None) -> RowC
         },
         lane_cy=tuple(cy - top for cy in case.lane_cy),
     )
+
+
+def frame_recipe(dy: int, px: int) -> dict:
+    """The recipe of a row with lane 2 empty inside a panel's drawn frame (#116),
+    lines ``px`` px thick ``dy`` px above and below the bands' centres, and a
+    box drawn over the whole frame, its sides included."""
+    return {
+        "missing": [2],
+        "artefacts": [frame(dy, px, 20000.0)],
+        "box_adjust": (-30, -(dy - 4), 30, dy - 4),
+    }
+
+
+def framed(dy: int, px: int) -> RowCase:
+    """The row of :func:`frame_recipe` at seed 1000."""
+    return adversarial_row("framed", 1000, **frame_recipe(dy, px))
 
 
 # The judge's recipes the tests use (seeds 1000 and up, as the judge ran them),
@@ -645,12 +716,234 @@ ADVERSARIAL: dict[str, dict] = {
         "artefacts": [blob(1, 4.0, 60000.0, dx=x, dy=-6.0) for x in (-13.0, 13.0)],
         "my": 10,
     },
+    # #116: lane 2 empty inside a panel's drawn frame, 2 px lines 16 px above
+    # and below the bands, the box over the whole frame: the lines are no bands.
+    "frame": frame_recipe(16, 2),
 }
 
 
 def adversarial(key: str, seed: int) -> RowCase:
     """The recipe ``key`` of :data:`ADVERSARIAL` at ``seed``."""
     return adversarial_row(key, seed, **ADVERSARIAL[key])
+
+
+# --- #180: rows that make a silent error show ---
+
+
+def two_rows_recipe(above: Mapping[int, float], rel: float = 1.0) -> dict:
+    """The recipe of a row with another row 40 px above it, the row box dragged
+    over both: the row above ``above[lane]`` (else ``rel``) times as deep as
+    the row's own band, so a lane where it is deeper holds its strongest band
+    there."""
+    return {
+        "neighbour_dy": -40.0,
+        "neighbour_rel": rel,
+        "neighbour_rels": dict(above),
+        "box_adjust": (0, -40, 0, 0),
+        "img_h": 200,
+    }
+
+
+def two_rows(seed: int, above: Mapping[int, float], rel: float = 1.0, **kwargs) -> RowCase:
+    """The row of :func:`two_rows_recipe` at ``seed``; ``kwargs`` go to
+    :func:`adversarial_row`."""
+    return adversarial_row("two rows", seed, **two_rows_recipe(above, rel), **kwargs)
+
+
+def mark_past_end(lanes: float) -> dict:
+    """The recipe of a row whose first lane is empty and whose box also covers
+    an arrow (a short mark, 20 x 6 px) ``lanes`` lane steps past the last
+    lane's centre, the box's right edge 30 px past the arrow's centre: the
+    bands fit the lanes shifted by one as well as the true ones (#111)."""
+    return {
+        "missing": [0],
+        "artefacts": [beside(lanes, 20, 6, 15000)],
+        "margin_right": 200,
+        "box_adjust": (0, 0, round(70 * lanes + 30), 0),
+    }
+
+
+# Rows the adversarial tests (#180) score beside ADVERSARIAL, each the kind
+# of row a known error shows on, at seeds 1000 and up. They are kept out of
+# ADVERSARIAL, whose every recipe the golden file pins and the honest-row
+# checks read: some of these are refused by design, and some are read wrong
+# today (their tests are expected failures, each citing its issue).
+STRESS: dict[str, dict] = {
+    # Weak bands (3000 deep) and a faint flat stain, one noise sigma deep, over
+    # the side of lane 2's background ring above its band (#177).
+    "faint_ring_stain": {
+        "depth_range": (3000.0, 3000.0),
+        "artefacts": [ring_stain(2, "top", 400.0)],
+    },
+    # The same stain over ordinary bands, then four and ten times as deep.
+    "ring_stain": {"artefacts": [ring_stain(2, "top", 400.0)]},
+    "ring_stain_x4": {"artefacts": [ring_stain(2, "top", 1600.0)]},
+    "deep_ring_stain": {"artefacts": [ring_stain(2, "top", 4000.0)]},
+    # A stain ten sigma deep below lane 2's band (the tests crop the image
+    # 2 px above the boxes: the ring keeps only the stained side).
+    "stain_below": {"artefacts": [ring_stain(2, "bottom", 4000.0)]},
+    # The row box's left and right edges 12 px inside both end bands'
+    # extents (#178); only its right edge, 12 px inside the last band's.
+    "side_cut": {"mx": -12},
+    "right_side_cut": {"box_adjust": (0, 0, -22, 0)},
+    # Both side edges 4 px inside the end bands, as the bench's tight_box:
+    # a little signal cut off, honestly boxed.
+    "tight_sides": {"mx": -4},
+    # The box's bottom edge 10 px up: it cuts every band.
+    "bottom_cut": {"box_adjust": (0, 0, 0, -10)},
+    # Lanes 1, 3 and 4 empty (the tests raise the noise).
+    "empty_three": {"missing": [1, 3, 4]},
+    # Dust on empty lane 3: a round speck of sigma 1.5 or 2 px.
+    "dust": {"missing": [3], "artefacts": [blob(3, 1.5, 20000.0)]},
+    "dust_2px": {"missing": [3], "artefacts": [blob(3, 2.0, 20000.0)]},
+    # The box dragged over its row and the row 40 px above, whose bands are
+    # twice as deep in lanes 0-2 and half as deep elsewhere; the same with
+    # lanes 0-2 empty in the row and the row above only there.
+    "two_rows": two_rows_recipe({0: 2.0, 1: 2.0, 2: 2.0}, rel=0.5),
+    "two_rows_near_empty": {
+        **two_rows_recipe({0: 2.0, 1: 2.0, 2: 2.0}, rel=0.0),
+        "missing": [0, 1, 2],
+    },
+    # An arrow past the last lane, 0.9 to 1.3 lane steps away (#111).
+    **{f"arrow_{lanes:g}": mark_past_end(lanes) for lanes in (0.9, 1.0, 1.1, 1.3)},
+}
+
+
+def stress(key: str, seed: int, *, noise: float = NOISE_SIGMA) -> RowCase:
+    """The recipe ``key`` of :data:`STRESS` at ``seed``."""
+    return adversarial_row(key, seed, noise=noise, **STRESS[key])
+
+
+def neighbour_grid_row(
+    name: str,
+    seed: int,
+    *,
+    n: int = 6,
+    pitch: float = 70.0,
+    w: float = 44.0,
+    h: float = 12.0,
+    depth_range: tuple[float, float] = (18000.0, 30000.0),
+    depths: Sequence[float] | None = None,
+    faint: int | None = None,
+    missing: Iterable[int] = (),
+    neighbour_dy: float | None = None,
+    neighbour_rel: float = 1.0,
+    neighbour_depths: Sequence[float] | None = None,
+    smile: float = 0.0,
+    tilt: float = 0.0,
+    doublet: tuple[float, float] | None = None,
+    slit: tuple[float, float] | None = None,
+    smears: Sequence[tuple[int, float, float]] = (),
+    artefacts: Sequence[Artefact] = (),
+    noise: float = NOISE_SIGMA,
+    img_h: int = 200,
+    margin: int = 70,
+) -> RowCase:
+    """A row of the neighbouring-band grid (#180): a band in each lane and,
+    with ``neighbour_dy``, another band that far below it (above if negative)
+    in every lane, empty or not.
+
+    ``n`` lanes ``pitch`` apart, the first ``margin`` px plus half a band in,
+    each drawn 2 px either way along the row and 1 px down it; bands about
+    ``w`` x ``h`` px (20% extents, drawn 8% and 10% either way), ``depths``
+    deep or drawn from ``depth_range``; ``faint`` makes one lane a tenth as
+    deep as the others' mean. The membrane is a pitch wider on the right than
+    the bands need. ``smile`` and ``tilt`` are measured from the lanes'
+    nominal centres. A neighbouring band has its lane's drawn width and height
+    and is ``neighbour_rel`` times as deep as the lane's band (or
+    ``neighbour_depths[lane]``). ``doublet`` = ``(dy, frac)``: every band two
+    components ``dy`` apart, 0.7 times as high, the lower ``frac`` as deep;
+    ``slit`` = ``(frac, sigma)``: a pale line across each band's middle,
+    ``frac`` of its depth, ``sigma`` px high; ``smears`` = ``(lane, depth,
+    length)``: a streak 4 px wide down from the left half of the lane's band,
+    fading over ``length`` px; ``artefacts`` as :func:`adversarial_row`'s (a
+    burnt-out band's light centre, specks).
+
+    The row box is the one a user drags snugly over the row: from half a
+    pitch before the first lane's nominal centre to half a pitch past the
+    last's, 6 px above and below the bands' 20% extents. ``neighbour_cy``
+    holds the neighbouring bands' centres."""
+    rng = np.random.default_rng(seed)
+    centre = margin + w / 2 + pitch * (n - 1) / 2
+    half = max(pitch * (n - 1) / 2, 1.0)
+    lane_cx = margin + w / 2 + pitch * np.arange(n) + rng.uniform(-2.0, 2.0, n)
+    u = (lane_cx - centre) / half
+    lane_cy = img_h / 2 + smile * (0.5 - u**2) + tilt * u / 2 + rng.uniform(-1.0, 1.0, n)
+    ws = w * rng.uniform(0.92, 1.08, n)
+    hs = h * rng.uniform(0.9, 1.1, n)
+    dps = rng.uniform(*depth_range, n)
+    if depths is not None:
+        dps = np.asarray(depths, dtype=float)
+    if faint is not None:
+        dps[faint] = float(np.mean([dps[i] for i in range(n) if i != faint])) / 10.0
+    width_img = int(math.ceil(lane_cx[-1] + ws[-1] / 2 + margin + pitch))
+    xs = np.arange(width_img, dtype=float)
+    ys = np.arange(img_h, dtype=float)
+    X, Y = xs[None, :], ys[:, None]
+    # Summed as artefacts and smears, then the lanes' bands, then the
+    # neighbouring ones.
+    dmap = np.zeros((img_h, width_img))
+    for f in artefacts:
+        dmap += f(X, Y, lane_cx, lane_cy)
+    for lane, depth, length in smears:
+        x0 = lane_cx[lane] - ws[lane] / 4
+        below = np.where(Y > lane_cy[lane], np.exp(-(Y - lane_cy[lane]) / length), 0.0)
+        dmap += depth * (np.exp(-0.5 * ((X - x0) / 4.0) ** 2) * below)
+    refs_all: dict[int, Rect] = {}
+    reference: dict[int, Rect] = {}
+    gone = set(missing)
+    for i in range(n):
+        refs_all[i] = _ref_rect(lane_cx[i], lane_cy[i], ws[i], hs[i])
+        if i in gone:
+            continue
+        if doublet is not None:
+            dy, frac = doublet
+            hh = hs[i] * 0.7
+            c1, c2 = lane_cy[i] - dy / 2, lane_cy[i] + dy / 2
+            band = _band(xs, ys, lane_cx[i], c1, ws[i], hh, dps[i], "super")
+            band += _band(xs, ys, lane_cx[i], c2, ws[i], hh, dps[i] * frac, "super")
+            r1, r2 = _ref_rect(lane_cx[i], c1, ws[i], hh), _ref_rect(lane_cx[i], c2, ws[i], hh)
+            reference[i] = (
+                min(r1[0], r2[0]),
+                min(r1[1], r2[1]),
+                max(r1[2], r2[2]),
+                max(r1[3], r2[3]),
+            )
+        else:
+            band = _band(xs, ys, lane_cx[i], lane_cy[i], ws[i], hs[i], dps[i], "super")
+            if slit is not None:
+                frac, sigma = slit
+                band = band * (1.0 - frac * np.exp(-0.5 * ((Y - lane_cy[i]) / sigma) ** 2))
+            reference[i] = refs_all[i]
+        dmap += band
+    neighbour_cy = None
+    if neighbour_dy is not None:
+        neighbour_cy = lane_cy + neighbour_dy
+        for i in range(n):
+            depth = dps[i] * neighbour_rel if neighbour_depths is None else neighbour_depths[i]
+            dmap += _band(xs, ys, lane_cx[i], neighbour_cy[i], ws[i], hs[i], depth, "super")
+    grain = rng.normal(0.0, 1.0, dmap.shape) * noise
+    image = np.round(np.clip(MEMBRANE - dmap + grain, 0.0, FULL_SCALE))
+    top = min(lane_cy[i] - hs[i] / 2 for i in range(n)) + 0.5
+    bottom = max(lane_cy[i] + hs[i] / 2 for i in range(n)) + 0.5
+    row = (
+        max(0, math.floor(margin + w / 2 - pitch / 2)),
+        max(0, math.floor(top) - 6),
+        min(width_img, math.ceil(margin + w / 2 + pitch * (n - 1) + pitch / 2)),
+        min(img_h, math.ceil(bottom) + 6),
+    )
+    return RowCase(
+        name,
+        "",
+        image,
+        True,
+        row,
+        n,
+        reference,
+        tuple(float(c) for c in lane_cx),
+        tuple(float(c) for c in lane_cy),
+        None if neighbour_cy is None else tuple(float(c) for c in neighbour_cy),
+    )
 
 
 def jpeg(case: RowCase, quality: int = 75, membrane: float = 200.0) -> RowCase:
@@ -693,3 +986,358 @@ def fuzz_row(seed: int) -> RowCase:
         ),
     )
     return dataclasses.replace(case, n_lanes=max(1, n + int(rng.integers(-1, 2))))
+
+
+# --- #180: a row's lanes scored against its recipe ---
+
+# The score's thresholds, written as literals: never the detector's settings,
+# which a degraded detector would move along with what it finds.
+CUT_SHARE = 0.15  # a boxed band with this share of its signal outside the row box is cut
+CAPTURE_MIN = 0.85  # grid rows: a box holding less of its band than the ideal box is partial
+LIMIT_SNR = 6.0  # a miss below this expected SNR is an honest n.d.
+SNR_SMOOTH = (3, 5)  # (rows, columns) the expected SNR is smoothed over
+_OUTLIER_NOTE = "left out of the shared size"  # the size_outlier note ends so
+_LANES_NOTE = re.compile(r"^lanes? (\d+(?:, \d+)*):")  # a note's lanes, counted from 1
+
+RecipeKind = Literal["bench", "adversarial", "grid"]
+LaneStatus = Literal["flagged", "row_warned", "silent", "limit", "refused"]
+
+# What each generator leaves out to draw a row's own bands alone.
+_OWN_ONLY: dict[str, dict] = {
+    "bench": {},
+    "adversarial": {"artefacts": (), "neighbour_dy": None},
+    "grid": {"artefacts": (), "smears": (), "neighbour_dy": None},
+}
+
+
+@dataclass(frozen=True, eq=False)
+class Recipe:
+    """A row to score (#180): drawn by ``kind``'s generator (``"bench"``:
+    :func:`synthetic_row`, ``"adversarial"``: :func:`adversarial_row`,
+    ``"grid"``: :func:`neighbour_grid_row`) from ``params`` at ``seed``, with
+    membrane noise ``noise``. ``detect`` holds what detection is called with
+    besides the image's own (``saturated_at``, as the operation passes it).
+    A grid row is scored by where each box lies against the lane's band and
+    its neighbouring band, any other by the box's overlap with the band's
+    reference rect."""
+
+    label: str
+    kind: RecipeKind
+    seed: int
+    params: Mapping[str, Any] = field(default_factory=dict)
+    noise: float = NOISE_SIGMA
+    detect: Mapping[str, Any] = field(default_factory=dict)
+
+    def build(self, **changes: Any) -> RowCase:
+        """The row, ``changes`` overriding its generator's arguments."""
+        kwargs = {"noise": self.noise, **self.params, **changes}
+        if self.kind == "bench":
+            return synthetic_row(self.label, "", self.seed, **kwargs)
+        if self.kind == "adversarial":
+            return adversarial_row(self.label, self.seed, **kwargs)
+        if self.kind == "grid":
+            return neighbour_grid_row(self.label, self.seed, **kwargs)
+        raise ValueError(f"unknown recipe kind {self.kind!r}")
+
+
+def own_bands(recipe: Recipe) -> np.ndarray:
+    """The row's own bands, noise-free, in image units with the bands positive:
+    the recipe's row drawn from the same draws with no noise, no artefact and
+    no neighbouring row (a hole or a doublet is part of its band), taken from
+    the same row with every lane empty. Clipped and rounded as the image is:
+    an over-exposed band is as deep as the membrane."""
+    only = {**_OWN_ONLY[recipe.kind], "noise": 0.0}
+    banded = recipe.build(**only)
+    bare = recipe.build(missing=range(banded.n_lanes), **only)
+    sign = 1.0 if banded.dark_on_light else -1.0
+    return sign * (bare.image - banded.image)
+
+
+@dataclass(frozen=True)
+class LaneTruth:
+    """What the recipe says of one reference band. ``cut_share``: the share of
+    its noise-free signal in the lane's column (one pitch wide about its true
+    centre) that lies outside the row box. ``snr``: its expected detection SNR,
+    the peak of that signal smoothed over :data:`SNR_SMOOTH` px within its
+    reference rect, over the smoothed noise (``noise / sqrt(15)``); inf on a
+    noise-free row."""
+
+    cut_share: float
+    snr: float
+
+
+def _column(case: RowCase, lane: int, width: int) -> tuple[int, int]:
+    """The image columns ``[c0, c1)`` of a lane: one pitch (the median step
+    between the true centres, whichever way the lanes run) about its true
+    centre; every column for a single lane."""
+    if len(case.lane_cx) < 2:
+        return 0, width
+    pitch = float(np.median(np.abs(np.diff(case.lane_cx))))
+    cx = case.lane_cx[lane]
+    return max(0, math.floor(cx - pitch / 2)), min(width, math.ceil(cx + pitch / 2))
+
+
+def lane_truth(
+    recipe: Recipe, case: RowCase, own: np.ndarray | None = None
+) -> dict[int, LaneTruth]:
+    """The :class:`LaneTruth` of each reference band of ``case``, the recipe's
+    row (its row box may be another): ``own`` is :func:`own_bands`, drawn when
+    not given. Only these numbers are kept, never the bands' image."""
+    own = own_bands(recipe) if own is None else own
+    height, width = own.shape
+    content = np.clip(own, 0.0, None)
+    smooth = uniform_filter(own, size=SNR_SMOOTH, mode="nearest")
+    sigma = recipe.noise / math.sqrt(SNR_SMOOTH[0] * SNR_SMOOTH[1])
+    x0, y0, x1, y1 = case.row
+    truth = {}
+    for lane, (rx0, ry0, rx1, ry1) in sorted(case.reference.items()):
+        c0, c1 = _column(case, lane, width)
+        total = float(content[:, c0:c1].sum())
+        a, b = max(c0, x0), min(c1, x1)
+        inside = float(content[max(0, y0) : min(height, y1), a:b].sum()) if b > a else 0.0
+        peak = float(smooth[max(0, ry0) : min(height, ry1), max(0, rx0) : min(width, rx1)].max())
+        truth[lane] = LaneTruth(
+            cut_share=1.0 - inside / total if total > 0 else 0.0,
+            snr=peak / sigma if sigma > 0 else math.inf,
+        )
+    return truth
+
+
+@dataclass(frozen=True)
+class LaneScore:
+    """A lane the score does not count right; ``lane`` is its index (0-based,
+    shown counted from 1).
+
+    ``kind``: ``miss`` (a band, no box), ``wrong_box`` (the box's IoU with the
+    band's reference rect under :data:`~proteia.core.evaluate.IOU_MIN`, or 0),
+    ``cut`` (the box is on the band but :data:`CUT_SHARE` or more of the band
+    lies outside the row box), ``fp`` (a box, no band); on a grid row
+    ``missed``, ``neighbour`` (the box holds the neighbouring band's centre
+    and not the band's), ``both`` (both centres), ``partial`` (it holds the
+    band's centre but less than :data:`CAPTURE_MIN` of what the box of its
+    size centred on the band holds, or neither centre), ``false_box`` (a box
+    in an empty lane). ``value`` is the number its kind was decided by (the
+    IoU, the cut share, the capture, a miss's expected SNR), None where there
+    is none.
+
+    ``status``: ``flagged`` (the page shows the lane in doubt: ``shown_by``
+    says how), ``row_warned`` (only a warning about other lanes or the row),
+    ``silent``, ``limit`` (a silent miss of expected SNR under
+    :data:`LIMIT_SNR`: an honest n.d., not wrong), ``refused`` (the row was
+    refused: nothing placed, the user told)."""
+
+    lane: int
+    kind: str
+    status: LaneStatus
+    value: float | None = None
+    shown_by: str | None = None
+
+    def __str__(self) -> str:
+        value = "" if self.value is None else f" {self.value:.3f}"
+        shown = f" ({self.shown_by})" if self.shown_by else ""
+        return f"lane {self.lane + 1} {self.kind}{value} {self.status}{shown}"
+
+
+@dataclass(frozen=True)
+class RowScore:
+    """One row's score: ``refused`` names the refusing flag (or
+    ``no_band_found``), None for a placed row; ``hits`` of the ``n_ref``
+    reference bands right; ``lanes`` the lanes not right, in lane order."""
+
+    label: str
+    refused: str | None
+    n_ref: int
+    hits: int
+    lanes: tuple[LaneScore, ...]
+
+    @property
+    def wrong(self) -> int:
+        """Wrong lanes: all of :attr:`lanes` but the honest n.d.s."""
+        return sum(1 for lane in self.lanes if lane.status != "limit")
+
+    @property
+    def silent(self) -> int:
+        """Wrong lanes the page shows nothing about."""
+        return sum(1 for lane in self.lanes if lane.status == "silent")
+
+    def __str__(self) -> str:
+        refused = f"refused ({self.refused}), " if self.refused else ""
+        lanes = "".join(f"; {lane}" for lane in self.lanes)
+        return f"{self.label}: {refused}{self.hits}/{self.n_ref} right{lanes}"
+
+
+def _holds(rect: Rect, x: float, y: float) -> bool:
+    return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+
+def _capture(own: np.ndarray, case: RowCase, lane: int, rect: Rect) -> float:
+    """The band's signal in ``rect`` over the signal in a box of its size
+    centred on the band's true centre, both within the lane's column."""
+    height, width = own.shape
+    c0, c1 = _column(case, lane, width)
+
+    def mass(x0: int, y0: int, x1: int, y1: int) -> float:
+        a, b, top, bottom = max(x0, c0), min(x1, c1), max(0, y0), min(height, y1)
+        return (
+            float(np.clip(own[top:bottom, a:b], 0.0, None).sum()) if b > a and bottom > top else 0.0
+        )
+
+    w, h = rect[2] - rect[0], rect[3] - rect[1]
+    ix = math.floor(case.lane_cx[lane] + 0.5 - w / 2)
+    iy = math.floor(case.lane_cy[lane] + 0.5 - h / 2)
+    ideal = mass(ix, iy, ix + w, iy + h)
+    return mass(*rect) / ideal if ideal > 0 else 1.0
+
+
+def _overlap_kinds(
+    case: RowCase, found: rowdetect.RowDetection, truth: Mapping[int, LaneTruth]
+) -> dict[int, tuple[str, float | None]]:
+    """The kind of each lane not right, by its box's overlap with the band."""
+    hits = evaluate.hit_rate(found.slots, case.reference)
+    kinds: dict[int, tuple[str, float | None]] = {}
+    for lane, rect in enumerate(found.slots):
+        if lane not in case.reference:
+            if rect is not None:
+                kinds[lane] = ("fp", None)
+        elif rect is None:
+            kinds[lane] = ("miss", truth[lane].snr)
+        elif not (hits.iou[lane] > 0.0 and hits.iou[lane] >= evaluate.IOU_MIN):
+            kinds[lane] = ("wrong_box", hits.iou[lane])
+        elif truth[lane].cut_share >= CUT_SHARE:
+            kinds[lane] = ("cut", truth[lane].cut_share)
+    return kinds
+
+
+def _grid_kinds(
+    case: RowCase,
+    found: rowdetect.RowDetection,
+    truth: Mapping[int, LaneTruth],
+    own: np.ndarray,
+) -> dict[int, tuple[str, float | None]]:
+    """The kind of each lane not right, by which centres its box holds (each
+    as a pixel's centre, x + 0.5) and how much of the band."""
+    kinds: dict[int, tuple[str, float | None]] = {}
+    for lane, rect in enumerate(found.slots):
+        if lane not in case.reference:
+            if rect is not None:
+                kinds[lane] = ("false_box", None)
+            continue
+        if rect is None:
+            kinds[lane] = ("missed", truth[lane].snr)
+            continue
+        x = case.lane_cx[lane] + 0.5
+        on_band = _holds(rect, x, case.lane_cy[lane] + 0.5)
+        on_neighbour = case.neighbour_cy is not None and _holds(
+            rect, x, case.neighbour_cy[lane] + 0.5
+        )
+        if on_neighbour:
+            kinds[lane] = ("both" if on_band else "neighbour", None)
+            continue
+        capture = _capture(own, case, lane, rect)
+        if not on_band or capture < CAPTURE_MIN:
+            kinds[lane] = ("partial", capture)
+    return kinds
+
+
+def _named_lanes(notes: Iterable[str], marker: str) -> set[int]:
+    """The lane indices the notes holding ``marker`` name (notes count lanes
+    from 1)."""
+    named: set[int] = set()
+    for note in notes:
+        match = _LANES_NOTE.match(note)
+        if marker in note and match:
+            named.update(int(number) - 1 for number in match.group(1).split(", "))
+    return named
+
+
+def _shown_by(
+    lane: rowdetect.LaneDetection,
+    index: int,
+    row_wide: str | None,
+    boxed: int,
+    outliers: set[int],
+    rows: tuple[int, int],
+) -> str | None:
+    """What the page shows of a lane in doubt, None for nothing: the whole
+    row's doubt; an empty lane not measured or not recorded; a box flagged,
+    named by the size note, or holding more bands in the row box's rows than
+    one (the results' band count)."""
+    if row_wide is not None:
+        return row_wide
+    if lane.rect is None:
+        if lane.reason != "no_band":
+            return f"not measured: {lane.reason}"
+        if lane.window is None:
+            return "not measured: outside the row box"
+        if boxed < 2:
+            return "not recorded: fewer than two bands"
+        return None
+    if lane.cut:
+        return "cut_by_row_box"
+    if lane.components > 1:
+        return "multiple_components"
+    if lane.hollow:
+        return "hollow_band"
+    if index in outliers:
+        return "size_outlier"
+    if rowdetect.bands_in(lane, *rows) > 1:
+        return "band count"
+    return None
+
+
+def score_row(
+    recipe: Recipe,
+    case: RowCase,
+    found: rowdetect.RowDetection,
+    truth: Mapping[int, LaneTruth] | None = None,
+) -> RowScore:
+    """Score ``found``, detection on ``case`` (the recipe's row), lane by lane
+    against the recipe's truth (:class:`LaneScore` says how), never against
+    what the detector reports of itself.
+
+    A refused row (a refusing flag, or no band at all: the operation refuses
+    both) counts every reference band wrong and none silent; its lanes are not
+    read. ``truth`` (:func:`lane_truth`) is drawn when not given, and a grid
+    row draws the row's own bands either way. A row without reference bands
+    counts only its boxes. Raises ValueError when ``case`` declares another
+    number of lanes than it draws, or ``found`` reads another: nothing to
+    score."""
+    n = case.n_lanes
+    if len(case.lane_cx) != n or len(found.lanes) != n:
+        raise ValueError(
+            f"{recipe.label}: {n} lanes declared, {len(case.lane_cx)} drawn,"
+            f" {len(found.lanes)} read"
+        )
+    if found.refused or found.size is None:
+        cause = found.flags[0] if found.refused else "no_band_found"
+        refused = tuple(
+            LaneScore(lane, "miss", "refused", shown_by=cause) for lane in sorted(case.reference)
+        )
+        return RowScore(recipe.label, cause, len(case.reference), 0, refused)
+    grid = recipe.kind == "grid"
+    own = own_bands(recipe) if grid or truth is None else None
+    truth = lane_truth(recipe, case, own) if truth is None else truth
+    kinds = _grid_kinds(case, found, truth, own) if grid else _overlap_kinds(case, found, truth)
+    if "doubtful_lanes" in found.flags:
+        row_wide: str | None = "doubtful_lanes"
+    elif any(lane.reason == "unassigned" for lane in found.lanes):
+        row_wide = "unassigned piece"
+    else:
+        row_wide = None
+    boxed = sum(rect is not None for rect in found.slots)
+    outliers = _named_lanes(found.notes, _OUTLIER_NOTE)
+    rows = (max(0, case.row[1]), min(case.image.shape[0], case.row[3]))
+    lanes = []
+    for index, (kind, value) in sorted(kinds.items()):
+        shown = _shown_by(found.lanes[index], index, row_wide, boxed, outliers, rows)
+        if shown is not None:
+            status: LaneStatus = "flagged"
+        elif found.flags:
+            status = "row_warned"
+        elif kind in ("miss", "missed") and value is not None and value < LIMIT_SNR:
+            status = "limit"
+        else:
+            status = "silent"
+        lanes.append(LaneScore(index, kind, status, value, shown))
+    hits = sum(1 for lane in case.reference if lane not in kinds)
+    return RowScore(recipe.label, None, len(case.reference), hits, tuple(lanes))

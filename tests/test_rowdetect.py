@@ -77,12 +77,14 @@ from rowcases import (
     bottom_strip,
     dark_edge,
     frame,
+    framed,
     fuzz_row,
     hstripe,
     image_cut,
     jpeg,
     shade_above,
     synthetic_row,
+    two_rows,
 )
 
 BENCH = {case.name: case for case in bench_cases()}
@@ -1303,19 +1305,6 @@ def test_flag_vocabulary():
 # --- #116: lines, strips and edges that are not bands ---
 
 
-def _framed(dy: int, px: int) -> RowCase:
-    """A row with lane 2 empty inside a panel's drawn frame, lines ``px`` px
-    thick ``dy`` px above and below the bands' centres, and a box drawn over
-    the whole frame, its sides included."""
-    return adversarial_row(
-        "framed",
-        1000,
-        missing=[2],
-        artefacts=[frame(dy, px, 20000.0)],
-        box_adjust=(-30, -(dy - 4), 30, dy - 4),
-    )
-
-
 def _rules_off(monkeypatch) -> None:
     """Detection without #116's rules: no line, no piece rising into a side."""
     monkeypatch.setattr(rowdetect, "_lines", lambda s, *_: np.zeros(s.shape, bool))
@@ -1331,7 +1320,7 @@ def test_frame_lines_across_the_row_are_no_bands(monkeypatch, dy, px):
     # The lines cross every gap between the lanes: taken out, they leave each
     # band its box and the empty lane unmeasured (a band may lie under a
     # line), as the same row without the frame is boxed.
-    case = _framed(dy, px)
+    case = framed(dy, px)
     found = detect(case)
     assert_hits_own_lanes(case, found)
     assert found.lanes[2].reason == "line"
@@ -1610,7 +1599,7 @@ def _side_cut() -> RowCase:
 
 # The rows #116's rules act on: lines, strips, the image's edge, a side cut.
 RULE_ROWS = {
-    "frame": lambda: _framed(16, 2),
+    "frame": lambda: framed(16, 2),
     "strip": lambda: adversarial_row(
         "strip",
         1000,
@@ -1656,7 +1645,7 @@ def test_rule_rows_keep_the_invariants_and_polarity_symmetry(name):
     ("name", "value"), [("LINE_SPAN", 100.0), ("LINE_FLAT", 1.01), ("LINE_PX", 0)]
 )
 def test_each_line_setting_takes_part(monkeypatch, name, value):
-    case = _framed(16, 2)
+    case = framed(16, 2)
     found = detect(case)
     monkeypatch.setattr(rowdetect, name, value)
     assert settings()[name.lower()] == value
@@ -2283,23 +2272,6 @@ def test_settings_are_a_fresh_copy():
 
 
 # --- #114: the boxes of a row lie on one line ---
-
-
-def two_rows(seed: int, above: dict[int, float], rel: float = 1.0, **kwargs) -> RowCase:
-    """A row with another row 40 px above it, the row box dragged over both:
-    the row above ``above[lane]`` (else ``rel``) times as deep as the row's own
-    band, so a lane where it is deeper holds its strongest band there;
-    ``kwargs`` go to :func:`adversarial_row`."""
-    return adversarial_row(
-        "two rows",
-        seed,
-        neighbour_dy=-40.0,
-        neighbour_rel=rel,
-        neighbour_rels=above,
-        box_adjust=(0, -40, 0, 0),
-        img_h=200,
-        **kwargs,
-    )
 
 
 def off_line(found: RowDetection) -> list[int]:

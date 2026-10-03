@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // The page: keeps this launch's access token, talks to the local server, and
-// shows the open project's images, proteins, boxes and checks. Every edit, and
+// shows the open project's images, proteins, boxes, molecular-weight
+// calibration and checks. Every edit, and
 // every undo and redo, goes to the server, which answers with the stored
 // project and its results; the page only draws what it is given.
+import { CalibrationPanel } from "/static/calibration.js";
 import { ChartCards } from "/static/charts.js";
 import { DiagnosticsDialog } from "/static/diagnostics.js";
 import { Dock } from "/static/dock.js";
@@ -88,7 +90,9 @@ class NotSent extends Error {
 // named all the same, so the server refuses it if another project is open now;
 // its answer is of the opening it makes. An aborted `signal` cancels it;
 // `priority` orders it among those waiting for a connection (the browser's
-// fetch priority).
+// fetch priority). `read`: a request that changes nothing whatever its method
+// (a ladder proposal, a snap), so a project_changed refusal of it says nothing
+// was left undone (projectChanged).
 async function request(
   method,
   path,
@@ -101,6 +105,7 @@ async function request(
     anyProject = false,
     closes = null,
     answer = false,
+    read = false,
   } = {},
 ) {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
@@ -137,7 +142,7 @@ async function request(
     }
     const error = new ApiError(response.status, detail);
     if (error.code === PROJECT_CHANGED) {
-      projectChanged(error, method, path);
+      projectChanged(error, method, path, { read });
     }
     throw error;
   }
@@ -293,11 +298,13 @@ function saidElsewhere(error) {
   );
 }
 
-function report(error) {
+// Show a refusal in the status line: the server's message, or `text` (the
+// refusal as the control that was refused words it).
+function report(error, text = null) {
   if (saidElsewhere(error)) {
     return;
   }
-  showStatus(error.message);
+  showStatus(text || error.message);
 }
 
 // Answers can arrive out of order: one is shown only if it is not older than
@@ -395,10 +402,17 @@ function pending() {
 
 // Send an edit and show a refusal in the status line (unless another project
 // is shown by then): the server's reason, or as `refused(error)` shows it.
-async function edit(method, path, json, { refused = report } = {}) {
+// `sent(project)` is given the state shown when it is sent, which its answer
+// can be compared with: the same revision, and it changed nothing.
+async function edit(method, path, json, { refused = report, sent = null } = {}) {
   const opened = shownOpening();
   try {
-    return await ordered(() => send(method, path, json));
+    return await ordered(() => {
+      if (sent) {
+        sent(state.project);
+      }
+      return send(method, path, json);
+    });
   } catch (error) {
     if (opened === shownOpening()) {
       refused(error);
@@ -424,6 +438,10 @@ const view = new ImageView($("view"), {
     state.boxId = boxId;
     render();
   },
+  // A ladder found, adjusted or marked (#58): the calibration section's.
+  pick: (x, y, where) => calibration.pick(x, y, where),
+  ruler: (step) => calibration.ruler(step),
+  ladderPoint: (step) => calibration.ladderPoint(step),
 });
 
 const proteinPanel = new ProteinPanel({
@@ -438,6 +456,31 @@ const proteinPanel = new ProteinPanel({
   pending,
   laneName: (index) => laneName(state.project, index),
   remeasured: (answer) => remeasuredText(answer),
+});
+
+// The "Molecular weight" section (#58). A proposal, a snap and the presets
+// change nothing: read as the diagnostics dialog reads, not awaited as an edit
+// ("Updating…"), and a refusal of them as project_changed says nothing was
+// left undone. Its changes are edits, in order with the others.
+const calibration = new CalibrationPanel(view, {
+  read: (method, path, json, { anyProject = false } = {}) =>
+    request(method, path, { json, answer: true, anyProject, read: true }),
+  edit: (method, path, json, options) => edit(method, path, json, options),
+  status: showStatus,
+  report,
+  undo: (seq) => takeStep("undo", { seq }),
+  reread: () => reread().catch(report),
+  showImage: (imageId) => {
+    state.imageId = imageId;
+    state.boxId = null;
+    select();
+    render();
+  },
+  changed: () => {
+    if (state.project) {
+      render();
+    }
+  },
 });
 
 // Its edits run in the panel's queue: in order with the protein edits, the
@@ -530,6 +573,7 @@ function showOpened(answer) {
   state.originalColours.clear();
   proteinPanel.forgetTyped();
   laneTable.forgetTyped();
+  calibration.forget(); // a ruler or a tool belongs to the image it was on
   charts.forget(); // its object URLs revoked: chart URLs repeat across projects too
   $("lane-picker").hidden = true; // its retry places a box in the project it asked about
   applyAnswer(answer, { choose: { imageId: null, proteinId: null, boxId: null } });
@@ -607,11 +651,12 @@ async function openProject(path, name, json) {
 // this page's own switch, say), the page follows: it shows the project open
 // now. The edits queued meanwhile are dropped, and with them what they would
 // say: each would be refused. `method` and `path`: the request's, which says
-// what was not done (NOT_DONE): nothing for a read, or a reveal (a folder not
-// shown); otherwise by its path (REFUSED_AS), or a change. Nothing either if
+// what was not done (NOT_DONE): nothing for a read (a GET, or one sent as a
+// `read`: a ladder proposal or a snap), or a reveal (a folder not shown);
+// otherwise by its path (REFUSED_AS), or a change. Nothing either if
 // `answered`: the request was answered, about an opening newer than the one
 // it named (request()), so it was not refused.
-function projectChanged(error, method, path, { answered = false } = {}) {
+function projectChanged(error, method, path, { answered = false, read = false } = {}) {
   const now = error.detail && error.detail.open_id;
   const shown = shownOpening();
   if (opening !== null || !shown || !(now > shown)) {
@@ -619,7 +664,7 @@ function projectChanged(error, method, path, { answered = false } = {}) {
   }
   proteinPanel.invalidateEdits();
   const refused =
-    answered || method === "GET" || path === "/api/project/reveal"
+    answered || read || method === "GET" || path === "/api/project/reveal"
       ? null
       : REFUSED_AS[path] || "change";
   followOpening({ refused });
@@ -1319,6 +1364,7 @@ function render() {
       : "Saving…";
   const image = project.images.find((i) => i.id === state.imageId) || null;
   renderImages(project, image);
+  calibration.render(project, image);
   proteinPanel.render(project, image, state.proteinId, state.results);
   renderBox(project);
   renderNotices(project);
@@ -1523,6 +1569,9 @@ function renderNotices(project) {
 // this signal image and the lanes are declared ({proteinId, color, lanes});
 // otherwise null, and the drag pans.
 function rowTool(project, image) {
+  if (calibration.busy()) {
+    return null; // a ladder is being found, marked or adjusted: a drag pans
+  }
   const protein = image
     ? project.proteins.find((p) => p.id === state.proteinId && p.image_id === image.id)
     : null;
@@ -1541,8 +1590,13 @@ function renderHint(project, image) {
   }
   const protein = project.proteins.find((p) => p.id === state.proteinId);
   const lanes = project.lanes.length;
-  if (image.kind === "visible_marker") {
-    hint.textContent = "A marker image: boxes are placed on signal images.";
+  const calibrating = calibration.hint();
+  hint.classList.toggle("away", calibration.hintAway());
+  if (calibrating) {
+    hint.textContent = calibrating;
+  } else if (image.kind === "visible_marker") {
+    hint.textContent =
+      "A marker image: boxes are placed on signal images; find its ladder under Molecular weight";
   } else if (!protein) {
     hint.textContent = "Add a protein to place boxes on this image.";
   } else if (!lanes) {
@@ -2288,7 +2342,19 @@ $("import-file").addEventListener("change", async (event) => {
     $("import-membrane").value = "";
     // What the import found about the file, until it is dismissed by the next action.
     const found = image ? image.warnings.map((warning) => warning.message) : [];
-    showStatus(found.length ? `Imported ${name}. ${found.join(" ")}` : "");
+    // A marker image whose membrane has one chemiluminescence image of its size
+    // not linked yet (#58): the status line offers to link the two.
+    const offer = image ? calibration.linkOffer(answer.project, image.id) : null;
+    if (offer) {
+      const said = [`Imported ${name}.`, ...found].join(" ");
+      showStatus(said, {
+        label: `Link as the marker of ${offer.name}`,
+        name: `Link ${name} as the marker image of ${offer.name}`,
+        run: () => calibration.link(offer.imageId, image.id),
+      });
+    } else {
+      showStatus(found.length ? `Imported ${name}. ${found.join(" ")}` : "");
+    }
   } catch (error) {
     if (opened === shownOpening()) {
       report(error);
@@ -2778,12 +2844,16 @@ function takeStep(direction, { seq = null, back = () => $("clear-boxes") } = {})
       }
       const before = state.project;
       const opened = shownOpening();
+      calibration.takeDropped(); // said already: only a ruler this step drops is said with it
       try {
         const answer = await send("POST", `/api/${direction}`);
         if (!answer || !current()) {
           return null;
         }
-        showStatus(stepText(direction, answer, before));
+        // A ruler open on the ladder or the marker link the step changed is
+        // dropped as the answer is drawn: said after the step's own words.
+        const dropped = calibration.takeDropped();
+        showStatus([stepText(direction, answer, before), dropped].filter(Boolean).join(" "));
         keepFocus(had, direction, from);
         return answer;
       } catch (error) {
@@ -2895,9 +2965,21 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     deleteSelected();
   } else if (event.key === "Escape") {
+    // First a ladder's popup, tool or ruler (#58); the view took the key
+    // already if it cancelled a drag, which then drops nothing more.
+    if (calibration.escape({ gestureCancelled: event.defaultPrevented })) {
+      return;
+    }
     state.boxId = null;
     $("lane-picker").hidden = true;
     render();
+  } else if (event.key === "Enter") {
+    // Not on a control, whose Enter is its own (a ruler tick's applies too:
+    // calibration.js); on the page, it applies the ruler.
+    const control = target instanceof Element && target.closest("button, summary, a");
+    if (!control && calibration.enter()) {
+      event.preventDefault(); // the ruler applied
+    }
   } else if (event.key === "f" || event.key === "F") {
     view.fit();
   } else if (event.key === "+" || event.key === "=") {

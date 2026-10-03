@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the project operations and the session they work on.
 
-No napari and no Qt: every test drives :mod:`proteia.core.operations` directly,
+With no front end, every test drives :mod:`proteia.core.operations` directly,
 in project folders with non-ASCII names, on real TIFF files written by
 ``conftest.write_tiff``. The box tests use a 16-bit ``synthetic_blot`` with a
 narrow and a wide band in one row; the parity tests at the end pin the whole
@@ -21,12 +21,12 @@ import json
 import math
 import os
 import shutil
-import subprocess
 import sys
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pytest
@@ -44,7 +44,7 @@ from conftest import (
     write_image_files,
     write_tiff,
 )
-from proteia.core import boxes, imaging, mwcal, record, results, rowdetect, storage
+from proteia.core import boxes, imaging, mwcal, quantify, record, results, rowdetect, storage
 from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
@@ -100,6 +100,7 @@ from proteia.core.storage import canonical_json, content_hash, load_project
 from proteia.web.state import project_state
 from rowcases import (
     MEMBRANE,
+    STRESS,
     RowCase,
     adversarial,
     adversarial_row,
@@ -108,6 +109,7 @@ from rowcases import (
     beside,
     bottom_strip,
     hstripe,
+    stress,
     synthetic_row,
     vstreak,
 )
@@ -1278,19 +1280,6 @@ def test_parallel_operations_get_distinct_ids(tmp_path):
     assert added == [p.id for p in s.project.batch.proteins]  # in commit order
 
 
-def test_core_imports_no_gui_toolkit():
-    code = (
-        "import sys\n"
-        "import proteia.core.operations, proteia.core.results\n"
-        "gui = ('napari', 'qtpy', 'magicgui', 'PySide6')\n"
-        "print([name for name in gui if name in sys.modules])\n"
-    )
-    done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True
-    )
-    assert done.stdout.strip() == "[]"
-
-
 # --- images ---
 
 
@@ -2355,35 +2344,6 @@ def test_a_removal_reads_the_pixels_only_when_bands_stay_on_the_image(tmp_path):
     ops.remove_box(reopened, band_a)  # the last box: nothing is left to quantify
     assert _bands_on_image(reopened, image) == []
     assert reopened._pixels == {}
-
-
-def test_the_napari_app_shows_the_nets_the_operations_store(tmp_path):
-    # The app module imports headlessly (napari and Qt are imported inside
-    # launch); #57 retires the app, and this case with it.
-    from proteia.gui import app
-
-    s, image, a, b = two_proteins(tmp_path)
-    for protein, x, lane in ((a, NARROW_X, 0), (b, NARROW_X + 16, 1), (a, WIDE_X, 2)):
-        ops.place_box(s, protein, x, ROW, lane_index=lane, grow=False)  # GAPDH in a ring
-    proteins = [protein_of(s, a), protein_of(s, b)]
-    state = {  # the app's state, as its placement leaves it
-        "images": [
-            {
-                "array": s.pixels(image),
-                "dark": True,
-                "bit_depth": s.project.batch.find_image(image).bit_depth,
-            }
-        ],
-        "proteins": [{"image": 0, "base": p.box_size, "pad_w": 0, "pad_h": 0} for p in proteins],
-        "placed": [
-            {"pid": k, "rect": band.box.rect(p.box_size)}
-            for k, p in enumerate(proteins)
-            for band in p.bands
-        ],
-    }
-    for k, protein in enumerate(proteins):
-        stored = sorted((band.box.x, band.net) for band in protein.bands)
-        assert app._boxes_with_nets(state, k) == stored, protein.name
 
 
 def test_a_ring_cut_short_stores_its_fallback_and_is_reported(tmp_path):
@@ -5604,14 +5564,16 @@ LADDER = adversarial_row(
 )
 
 
+@pytest.mark.parametrize("dx", [0.0, 4.0, -4.0])
 @pytest.mark.parametrize("lanes", [[0, 1], [0, 1, 2]])
-def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes):
+def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes, dx):
     # They check the reading between them only: past them the expected x
     # steps by the row's own pitch, so the lanes squeezed a lane early there
-    # are not refused. The row is placed, its lane numbers still doubtful.
+    # are not refused. The row is placed, its lane numbers still doubtful;
+    # so too with the other protein's boxes dragged 4 px either way (#180).
     s, image, protein = row_session(tmp_path, LADDER)
     found = detected(s, protein, LADDER.row)
-    other_protein_in_lanes(s, image, LADDER, lanes)
+    other_protein_in_lanes(s, image, LADDER, lanes, dx=dx)
     placement = ops.detect_row_boxes(s, protein, LADDER.row)
     step = float(np.median(np.diff(LADDER.lane_cx)))
     off = [
@@ -5620,7 +5582,9 @@ def test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, lanes
         if abs((rect[0] + rect[2]) / 2 - LADDER.lane_cx[lane]) > step / 2
     ]
     assert off == [4, 5, 6, 7]  # what the doubt is there for
-    assert "doubtful_lanes" in placement.flags
+    assert "doubtful_lanes" in placement.flags, (
+        f"lanes 5 to 8 boxed a lane off, placed with flags {placement.flags}"
+    )
     assert found.doubt_note is not None and found.doubt_note in placement.notes
     params = s.project.log[-1].params
     assert (params["flags"], params["notes"]) == (list(placement.flags), list(found.notes))
@@ -5636,6 +5600,317 @@ def test_lanes_on_the_image_refuse_a_row_read_off_whatever_its_doubt(tmp_path):
         ops.detect_row_boxes(s, protein, case.row)
     assert refused.value.code is ErrorCode.ROW_LANES_UNCLEAR
     assert refused.value.detail["cause"] == "off_lanes"
+
+
+# --- #180: lanes on the image at one end of the row ---
+
+
+def flipped(case: RowCase) -> RowCase:
+    """``case`` flipped left to right: the image, the row box and the
+    references mirrored, the lanes renumbered so lane 0 is again the
+    leftmost (the mirror of the original last lane). Numbering them right to
+    left, as a mirrored blot is read, is :func:`anchored_row`'s
+    ``mirrored=True``."""
+    width = case.image.shape[1]
+    x0, y0, x1, y1 = case.row
+    n = case.n_lanes
+    return dataclasses.replace(
+        case,
+        image=case.image[:, ::-1].copy(),
+        row=(width - x1, y0, width - x0, y1),
+        reference={
+            n - 1 - k: (width - r[2], r[1], width - r[0], r[3]) for k, r in case.reference.items()
+        },
+        lane_cx=tuple(width - 1 - x for x in reversed(case.lane_cx)),
+        lane_cy=tuple(reversed(case.lane_cy)),
+    )
+
+
+class Placed(NamedTuple):
+    """What the operation did with a row (:func:`anchored_row`): ``kind``
+    ``"refused"`` (``flags`` the error code and cause) or ``"placed"``
+    (``flags`` the placement's); ``offsets`` maps each stored lane to its box
+    centre's x minus the lane's true centre (px); ``half_step`` is half the
+    median step between the lanes' centres; ``empty`` the stored lanes
+    without a band."""
+
+    kind: str
+    flags: tuple[str, ...]
+    offsets: dict[int, float]
+    half_step: float
+    empty: frozenset[int]
+
+    @property
+    def off(self) -> list[int]:
+        """The stored lanes whose box lies more than half a step off."""
+        return [lane for lane, dx in sorted(self.offsets.items()) if abs(dx) > self.half_step]
+
+    def off_in_words(self) -> str:
+        """The lanes boxed more than half a step off, each with its offset."""
+        lanes = "; ".join(
+            f"lane {lane + 1}: no band, boxed {self.offsets[lane]:+.1f} px from the lane's centre"
+            if lane in self.empty
+            else f"lane {lane + 1}: box centre {self.offsets[lane]:+.1f} px from the band's"
+            for lane in self.off
+        )
+        return (
+            f"placed with flags {self.flags}: {lanes} (half the lane step {self.half_step:.1f} px)"
+        )
+
+
+def anchored_row(
+    tmp_path: Path,
+    case: RowCase,
+    lanes: Sequence[int] | None,
+    *,
+    dx: float = 0.0,
+    mirrored: bool = False,
+) -> Placed:
+    """The row placed by the operation with another protein's boxes in
+    ``lanes`` (none if None; numbered right to left when ``mirrored``)."""
+    s, image, protein = row_session(tmp_path, case)
+    if lanes is not None:
+        other_protein_in_lanes(s, image, case, lanes, dx=dx, mirrored=mirrored)
+    n = case.n_lanes
+    half_step = float(np.median(np.abs(np.diff(case.lane_cx)))) / 2
+
+    def drawn(lane: int) -> int:
+        return n - 1 - lane if mirrored else lane
+
+    empty = frozenset(lane for lane in range(n) if drawn(lane) not in case.reference)
+    try:
+        placement = ops.detect_row_boxes(s, protein, case.row)
+    except OperationError as exc:
+        cause = (exc.code.name, exc.detail.get("cause", ""))
+        return Placed("refused", cause, {}, half_step, empty)
+    offsets = {
+        lane: (rect[0] + rect[2]) / 2 - case.lane_cx[drawn(lane)]
+        for lane, rect in rects_by_lane(s, protein).items()
+    }
+    return Placed("placed", placement.flags, offsets, half_step, empty)
+
+
+def read_with_care(outcome: Placed) -> bool:
+    """Refused, placed with its lane numbers doubtful, or placed right: never
+    placed a lane off without a flag."""
+    return outcome.kind == "refused" or "doubtful_lanes" in outcome.flags or not outcome.off
+
+
+@pytest.mark.parametrize("dx", [0.0, 4.0, -4.0])
+@pytest.mark.parametrize("lanes", [[6, 7], [5, 6, 7], [0, 7]])
+def test_lanes_on_the_image_at_the_far_end_or_both_ends_leave_no_lane_off_silently(
+    tmp_path, lanes, dx
+):
+    # The ladder's band past lane 7 squeezes the bands a lane early, which
+    # the lanes at the far end, or at both ends, show: the row is refused or
+    # placed with its lane numbers doubtful, never a lane off unflagged.
+    outcome = anchored_row(tmp_path, LADDER, lanes, dx=dx)
+    assert read_with_care(outcome), outcome.off_in_words()
+
+
+@pytest.mark.parametrize(("lanes", "kind"), [([0, 1], "refused"), ([6, 7], "placed")])
+def test_lanes_on_a_flipped_image_are_read_from_its_own_end(tmp_path, lanes, kind):
+    # The same row flipped, its lanes numbered right to left: lanes 0 and 1
+    # now lie at the ladder's end and refuse the row; lanes 6 and 7, at the
+    # other end, leave it placed with its numbers doubtful.
+    outcome = anchored_row(tmp_path, flipped(LADDER), lanes, mirrored=True)
+    assert read_with_care(outcome), outcome
+    assert outcome[0] == kind
+
+
+@pytest.mark.parametrize("end", ["first", "last"])
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", ["ladder_beside", "label_beside", "panel_beside"])
+def test_lanes_on_the_image_at_either_end_refuse_a_row_over_what_lies_beside(
+    tmp_path, key, seed, end
+):
+    case = adversarial(key, seed)
+    n = case.n_lanes
+    outcome = anchored_row(tmp_path, case, [0, 1] if end == "first" else [n - 2, n - 1])
+    assert outcome[:2] == ("refused", ("ROW_LANES_UNCLEAR", "off_lanes")), outcome
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#111 an arrow past the last lane, the first lane empty, shifts the lane numbers"
+    " without a flag",
+)
+@pytest.mark.parametrize("seed", [1000, 1001])
+@pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1.3"])
+def test_a_row_box_over_an_arrow_past_the_last_lane_is_not_read_off_silently(tmp_path, key, seed):
+    outcome = anchored_row(tmp_path, stress(key, seed), None)
+    assert read_with_care(outcome), outcome.off_in_words()
+
+
+@pytest.mark.parametrize("end", ["first", "last"])
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", ["arrow_0.9", "arrow_1", "arrow_1.1", "arrow_1.3"])
+def test_lanes_on_the_image_refuse_a_row_box_over_an_arrow(tmp_path, key, seed, end):
+    case = stress(key, seed)
+    lanes = [1, 2] if end == "first" else [case.n_lanes - 2, case.n_lanes - 1]
+    outcome = anchored_row(tmp_path, case, lanes)
+    assert outcome[:2] == ("refused", ("ROW_LANES_UNCLEAR", "off_lanes")), outcome
+
+
+# --- #180: a stain on one side of a band's background ring ---
+
+STAIN_LANE = 2  # the lane the ring stains lie beside
+
+
+_RING_NETS: dict[tuple, tuple[float, tuple[str, ...], dict]] = {}
+
+
+def cropped(case: RowCase, top: int) -> RowCase:
+    """``case`` with its image's first ``top`` rows cut off, the row box's top
+    edge at the image's top at most."""
+    x0, y0, x1, y1 = case.row
+    return dataclasses.replace(
+        case,
+        image=case.image[top:].copy(),
+        row=(x0, max(0, y0 - top), x1, y1 - top),
+        reference={k: (r[0], r[1] - top, r[2], r[3] - top) for k, r in case.reference.items()},
+        lane_cy=tuple(y - top for y in case.lane_cy),
+    )
+
+
+def _lane_net(
+    tmp_path_factory, key: str | None, seed: int, depth: tuple | None, top: int = 0
+) -> tuple[float, tuple[str, ...], dict]:
+    """Lane 2's net once the row is placed by the operation and its results
+    computed, the background notices on lane 2, and the row's boxes: ``key``
+    a :data:`rowcases.STRESS` ring-stain recipe, None for the same row (same
+    draws) without the stain; ``depth`` the bands' depth range (the
+    recipe's); ``top`` image rows cut off above the row. Kept for the tests
+    that share a row (numbers only)."""
+    if (key, seed, depth, top) not in _RING_NETS:
+        recipe = {} if key is None else dict(STRESS[key])
+        if depth is not None:
+            recipe["depth_range"] = depth
+        case = cropped(adversarial_row("ring", seed, **recipe), top)
+        s, _, protein = row_session(tmp_path_factory.mktemp("ring"), case)
+        ops.detect_row_boxes(s, protein, case.row)
+        notices = sorted(
+            notice.code.name
+            for notice in results.compute_results(s.project.batch).notices
+            if notice.code in (NoticeCode.BACKGROUND_UNEVEN, NoticeCode.BACKGROUND_FALLBACK)
+            and STAIN_LANE in notice.lane_indices
+        )
+        net = lane_bands(s, protein)[STAIN_LANE].net
+        _RING_NETS[key, seed, depth, top] = (net, tuple(notices), rects_by_lane(s, protein))
+    return _RING_NETS[key, seed, depth, top]
+
+
+def stained_net(
+    tmp_path_factory, key: str, seed: int, top: int = 0
+) -> tuple[float, tuple[str, ...], bool]:
+    """Lane 2's net with the stain over its net without it, minus 1; the
+    notices on lane 2 with the stain; whether every box stayed where it was
+    (both images cut ``top`` rows short)."""
+    depth = STRESS[key].get("depth_range")
+    net, notices, rects = _lane_net(tmp_path_factory, key, seed, depth, top)
+    clean, _, clean_rects = _lane_net(tmp_path_factory, None, seed, depth, top)
+    return net / clean - 1.0, notices, rects == clean_rects
+
+
+@pytest.mark.parametrize("seed", range(1000, 1005))
+def test_a_faint_stain_on_a_weak_bands_ring_moves_no_box(tmp_path_factory, seed):
+    assert stained_net(tmp_path_factory, "faint_ring_stain", seed)[2]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="#177 a faint stain on one side of a weak band's ring lowers its net without a notice",
+)
+@pytest.mark.parametrize("seed", range(1000, 1005))
+def test_a_faint_stain_on_a_weak_bands_ring_moves_its_net_little_or_is_noticed(
+    tmp_path_factory, seed
+):
+    # Bands 3000 deep, a stain one noise sigma deep over the ring's upper
+    # side: the net must stay within 5% of the unstained row's, or the lane
+    # must show a background notice.
+    bias, notices, _ = stained_net(tmp_path_factory, "faint_ring_stain", seed)
+    assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+@pytest.mark.parametrize("key", ["ring_stain", "ring_stain_x4"])
+def test_a_faint_stain_on_an_ordinary_bands_ring_moves_its_net_little(tmp_path_factory, key, seed):
+    bias, notices, same = stained_net(tmp_path_factory, key, seed)
+    assert same
+    assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
+
+
+@pytest.mark.parametrize("seed", [1000, 1001, 1002])
+def test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, seed):
+    # Ten noise sigmas deep: the ring's clip drops it (the net within 1%),
+    # and the spread it leaves raises the uneven-background notice.
+    bias, notices, same = stained_net(tmp_path_factory, "deep_ring_stain", seed)
+    assert same
+    assert abs(bias) <= 0.01, f"lane 3: net {bias:+.2%} with the stain"
+    assert "BACKGROUND_UNEVEN" in notices, f"lane 3: no uneven-background notice ({notices})"
+
+
+@pytest.mark.parametrize("seed", range(1000, 1005))
+def test_a_stain_on_the_only_side_left_of_a_ring_is_noticed(tmp_path_factory, seed):
+    # The image cropped 2 px above the boxes the operation places on the
+    # unstained row: the ring keeps its lower side only, where a stain ten
+    # noise sigmas deep lies. The net may move a lot (here -28% to -43%); the
+    # lane must then show a background notice.
+    boxes_uncropped = _lane_net(tmp_path_factory, None, seed, None)[2]
+    top = min(rect[1] for rect in boxes_uncropped.values()) - 2
+    boxes = _lane_net(tmp_path_factory, None, seed, None, top)[2]
+    assert min(rect[1] for rect in boxes.values()) == 2
+    bias, notices, same = stained_net(tmp_path_factory, "stain_below", seed, top)
+    assert same
+    assert abs(bias) <= 0.05 or notices, f"lane 3: net {bias:+.1%} with the stain, no notice"
+
+
+# --- #181: the operations degraded on purpose fail the recipes ---
+# Each runs one recipe test above under a degraded operation and expects its
+# named assertion to fail: the recipes would catch the regression.
+
+
+def test_a_ring_never_clipped_fails_the_deep_stain_recipe(tmp_path_factory, monkeypatch):
+    # The stain ten noise sigmas deep enters the ring's median: the net moves
+    # by about 2%. The nets are taken under the degraded ring, never kept.
+    monkeypatch.setattr(sys.modules[__name__], "_RING_NETS", {})
+    monkeypatch.setattr(quantify, "RING_CLIP_K", math.inf)
+    with pytest.raises(AssertionError, match=r"lane 3: net [-+]\d+\.\d\d% with the stain"):
+        test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, 1000)
+
+
+def test_no_uneven_background_notice_fails_the_deep_stain_recipe(tmp_path_factory, monkeypatch):
+    # The stain is clipped out (the net within 1%) but nothing says the ring
+    # was uneven.
+    monkeypatch.setattr(sys.modules[__name__], "_RING_NETS", {})
+    monkeypatch.setattr(results, "BACKGROUND_UNEVEN_LIMIT", math.inf)
+    with pytest.raises(AssertionError, match=r"lane 3: no uneven-background notice \(\(\)\)"):
+        test_a_deep_stain_on_a_ring_is_clipped_out_and_noticed(tmp_path_factory, 1000)
+
+
+def test_lanes_on_the_image_taken_to_check_every_lane_fail_the_one_end_recipe(
+    tmp_path, monkeypatch
+):
+    # Lanes 1 and 2 on the image taken to check the lanes past them too (the
+    # gap #155's review closed): the doubt is dropped, lanes 5 to 8 a lane off.
+    def every_lane(anchors, lanes):
+        return set(lanes) if anchors else set()
+
+    monkeypatch.setattr(ops, "anchoring_lanes", every_lane)
+    with pytest.raises(AssertionError, match="lanes 5 to 8 boxed a lane off, placed with flags"):
+        test_lanes_on_the_image_at_one_end_leave_the_doubt_past_them(tmp_path, [0, 1], 0.0)
+
+
+def test_lanes_on_the_image_that_never_refuse_fail_the_far_end_recipe(tmp_path, monkeypatch):
+    # No band ever found off its lane: lanes 1 and 8 on the image place the
+    # squeezed row with no flag on its lane numbers.
+    monkeypatch.setattr(ops, "_off_lanes", lambda centres, expected: [])
+    with pytest.raises(AssertionError, match=r"placed with flags \(.*\): lane 5: box centre"):
+        test_lanes_on_the_image_at_the_far_end_or_both_ends_leave_no_lane_off_silently(
+            tmp_path, [0, 7], 0.0
+        )
 
 
 def _row_scene(tmp_path: Path, setup) -> tuple[ProjectSession, Recorder, dict[str, str]]:

@@ -182,7 +182,9 @@ class PlotSpec(BaseModel):
     ``test_name`` (the test's id), ``test_p`` (the omnibus or the single
     comparison's p) and ``test_note`` (why there is no test, or which
     conditions the test leaves out) are the fields charts had before ``test``
-    and ``statement``; they are kept, derived, for the napari chart.
+    and ``statement``; they are kept, derived: the statement and the
+    reproducibility record read ``test_note``, the self-test ``test_name`` and
+    ``test_p``.
     """
 
     title: str
@@ -533,10 +535,10 @@ def build_plotspec(
 
     ``replicates`` gives every plotted condition (in x order) its number of
     replicates, including a condition with no value, which then keeps its slot
-    with no bar; without it (the napari chart) the plotted conditions are those
-    of ``stats``. ``not_detected_lanes`` gives the first lane of each replicate
-    not detected: such a condition draws no bar and is not tested (its detected
-    values are still points).
+    with no bar; without it the plotted conditions are those of ``stats``.
+    ``not_detected_lanes`` gives the first lane of each replicate not detected:
+    such a condition draws no bar and is not tested (its detected values are
+    still points).
 
     ``test`` is the core's test (:func:`~proteia.core.analyze.compare`) of the
     plotted conditions less those with a replicate not detected; its plan

@@ -29,8 +29,8 @@ import pytest
 
 import proteia
 from proteia import samples
+from proteia.core import mwcal, results, rowdetect
 from proteia.core import operations as ops
-from proteia.core import results, rowdetect
 from proteia.core.model import ImageKind, Polarity
 from proteia.web import api, cli, handoff, launch, projects, server
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
@@ -1546,6 +1546,7 @@ def test_every_module_the_page_imports_is_served(running):
                 pending.append(target)
     assert seen == {
         "/static/app.js",
+        "/static/calibration.js",
         "/static/charts.js",
         "/static/diagnostics.js",
         "/static/dock.js",
@@ -2337,3 +2338,469 @@ def test_a_box_at_the_image_edge_shows_no_fitted_outline():
     block = block[: block.index("color,")]
     assert "x0 <= 0 || y0 <= 0 || x1 >= image.width || y1 >= image.height" in block
     assert "inset && !atEdge ?" in block
+
+
+# --- Molecular weights: finding, adjusting and marking ladders (#58) ---
+
+
+def _constants(script: str) -> dict[str, float]:
+    """The numbers of a script's top-level ``const NAME = <number>;`` lines."""
+    found = re.findall(r"^const (\w+) = (-?[\d.]+);", script, re.MULTILINE)
+    return {name: float(value) for name, value in found}
+
+
+def test_the_fit_line_warns_where_the_core_does():
+    # The page words a group's fit with the core's own thresholds: a ladder
+    # whose leave-one-out check (D2) is above FIT_WARN, two ladders that
+    # disagree beyond LADDERS_WARN, a side with too few marks or shared MWs.
+    panel = _code("calibration.js")
+    constants = _constants(panel)
+    names = ("FIT_WARN", "LADDERS_WARN", "MIN_LADDER_POINTS", "MIN_SHARED_MWS")
+    assert {name: constants[name] for name in names} == {
+        name: getattr(mwcal, name) for name in names
+    }
+    lines = _method(panel, "fitLines(")
+    assert "take one ladder band away and predict it from the bands above and below it" in lines
+    assert "left and right differ by" in lines and '"the ladders agree"' in lines
+    assert "2 points · less reliable" in lines
+    assert "the bands above and below it put it at" in lines and "check its label" in lines
+    assert "not used;" in lines and "mark at least ${MIN_LADDER_POINTS}" in lines
+
+
+def test_a_ruler_stores_its_solid_labelled_ticks_in_one_step():
+    # Apply sends the ticks on a band (found, snapped to, placed by hand or
+    # as stored), never one only predicted (hollow) nor a band ▲▼ left with
+    # no label, at the ruler's x with the x it was found at, in one PUT: one
+    # change, one undo step.
+    panel = _code("calibration.js")
+    assert re.search(r'function solid\(tick\) \{\s*return tick.state !== "predicted";', panel)
+    assert re.search(r"function kept\(tick\) \{\s*return solid\(tick\) && labelled\(tick\);", panel)
+    apply = _method(panel, "async apply(")
+    assert "draft.ticks.filter(kept)" in apply
+    assert "/calibration/${draft.side}/ladder`" in apply
+    assert "x: draft.x," in apply and "found_at: draft.foundAt," in apply
+    # A tick's snap under way lands first; a tick snapped before the ruler
+    # moved sideways is snapped again at the x it is stored at, so the server
+    # finds it where a snap there puts it.
+    moved = apply.index("tick.snappedX !== draft.x")
+    sent = apply.index('this.handlers.edit("PUT", path, body,')
+    assert apply.index("await this.snapping") < moved < apply.index("this.snapAgain(draft)") < sent
+    # A predicted tick moved with the whole ruler (a shift, a stretch) stays
+    # predicted: only a tick dragged, nudged or snapped onto a band is stored.
+    assert '(state === "predicted" ? state : "hand")' in _method(panel, "moved(")
+    # Esc while it is being stored drops nothing: the answer closes it.
+    escape = _method(panel, "escape(")
+    assert escape.index("if (this.applying)") < escape.index("this.closeDraft();")
+
+
+def test_a_proposal_is_worded_as_labels_to_check():
+    # A proposal is the best labelling of the peaks down the lane clicked, and
+    # a lane of samples has one too: the status line never says a ladder was
+    # found, and asks to check that the lane is the ladder. A doubtful one says
+    # the labels may be one band off, and how to check and move them. Where
+    # no ladder stands out, the page marks by clicks instead.
+    panel = _code("calibration.js")
+    text = _method(panel, "proposalText(")
+    assert "Check that this lane is the ladder" in text
+    assert text.index("if (proposal.doubtful)") < text.index("this.doubtText()")
+    doubt = _method(panel, "doubtText(")
+    assert "The labels may be one band off: check the coloured reference bands" in doubt
+    assert doubt.count(" move them with ▲▼.") == 1
+    find = _method(panel, "async find(")
+    fallback = find.index("if (!proposal)")
+    assert fallback < find.index('this.tool = this.newTool({ kind: "mark", side, edges: false });')
+
+
+def test_the_ruler_moves_as_its_parts_are_dragged():
+    # D8: the line moves every tick up or down (or the ruler sideways), a grip
+    # stretches it (every tick linear in y between the fixed end and the
+    # dragged one), a tick moves alone and snaps unless Alt is held. The view
+    # draws predicted ticks hollow and the peaks no label took as grey dots.
+    panel = _code("calibration.js")
+    moved = _method(panel, "moved(")
+    assert 'part.kind === "body" && axis === "x"' in moved
+    assert "(dragged - fixed) / (end - fixed)" in moved
+    assert "fixed + (tick.y - fixed) * factor" in moved
+    ruler = _method(panel, "ruler(")
+    assert 'step.part.kind === "tick" && !step.alt' in ruler and "this.snapTick(" in ruler
+    view = _code("view.js")
+    drawn = _method(view, "drawRuler(")
+    assert "if (tick.solid)" in drawn and "strokeRect(" in drawn and "EXTRA_PEAK_COLOR" in drawn
+    # ▲▼ move every label one ladder position, and back again.
+    shift = _method(panel, "shiftLabels(")
+    assert "const index = tick.index + step;" in shift
+    # A tick clicked offers its relabel and "Not a ladder band".
+    menu = _method(panel, "relabelMenu(")
+    assert 'extra: { label: "Not a ladder band", run: () => this.notABand(id) }' in menu
+
+
+def test_the_ruler_keys():
+    # Tab goes tick to tick (a button each, top to bottom); ↑↓ move the
+    # focused one 0.5 px, Shift+↑↓ 5 px; Enter applies, on a tick or on the
+    # page; Esc drops the ruler, once no popup or tool takes it, and only the
+    # drag when it cancels one.
+    panel = _code("calibration.js")
+    constants = _constants(panel)
+    assert (constants["NUDGE"], constants["NUDGE_FAR"]) == (0.5, 5.0)
+    keys = _method(panel, "tickKey(")
+    for key in ('"ArrowUp"', '"ArrowDown"', '"Enter"', '"Delete"'):
+        assert key in keys
+    assert "event.shiftKey ? NUDGE_FAR : NUDGE" in keys
+    escape = _method(panel, "escape(")
+    order = ["if (this.menu)", "if (gestureCancelled)", "if (this.tool)", "if (this.draft)"]
+    assert [escape.index(step) for step in order] == sorted(escape.index(step) for step in order)
+    app = _code("app.js")
+    assert "calibration.escape({ gestureCancelled: event.defaultPrevented })" in app
+    assert "calibration.enter()" in app
+    # The view takes Esc when it cancels a drag, so the page's Esc drops nothing more.
+    view = _code("view.js")
+    assert re.search(
+        r'event.key === "Escape" && this.gesture\) \{\s*event.preventDefault\(\);', view
+    )
+    parser = _Tags()
+    parser.feed((server.STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    assert parser.by_id["cal-apply"]["aria-keyshortcuts"] == "Enter"
+    assert parser.by_id["cal-drop"]["aria-keyshortcuts"] == "Escape"
+    assert parser.by_id["cal-ticks"]["aria-label"] == "Ruler ticks, top to bottom"
+
+
+def test_a_stored_mark_dragged_or_clicked_is_one_edit():
+    # After Apply, a mark dragged up or down is moved (snapped unless Alt is
+    # held) and a mark clicked relabelled or removed: each its own change and
+    # undo step.
+    panel = _code("calibration.js")
+    point = _method(panel, "ladderPoint(")
+    assert "this.movePoint(tick.point, y, !alt)" in point and "this.pointMenu(" in point
+    edit = _method(panel, "async editPoint(")
+    assert 'this.handlers.edit("PATCH", this.pointPath(point), body, {' in edit
+    assert '"edit_calibration_point"' in edit
+    remove = _method(panel, "async removePoint(")
+    assert 'this.handlers.edit("DELETE", this.pointPath(point))' in remove
+
+
+def test_click_marking_marks_the_ladder_the_click_is_on():
+    # Marking by clicks (where no ladder stands out, or a custom ladder with no
+    # MWs listed): a strip edge is the left ladder's; a band nearer the image's
+    # right edge than the first ladder's lane is the second ladder's, as Find
+    # second ladder would take it, never a far lane of the first.
+    side = _method(_code("calibration.js"), "markSide(")
+    assert 'point.source !== "strip_edge"' in side
+    assert 'x > lane + (this.image.width - lane) / 2 ? "right" : "left"' in side
+
+
+def test_the_ladder_section_is_labelled():
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    controls = _Controls()
+    controls.feed(_markup(html, '<section id="calibration"', "</section>"))
+    labelled = [labelled for tag, _, labelled in controls.controls if tag != "button"]
+    assert labelled and all(labelled)
+    parser = _Tags()
+    parser.feed(html)
+    for tool in ("cal-find", "cal-find-right", "cal-mark", "cal-mark-edges"):
+        assert parser.by_id[tool]["aria-pressed"] == "false"
+    marker = _Controls()
+    marker.feed(_markup(html, '<label id="marker-field"', "</select>"))
+    assert [(tag, labelled) for tag, _, labelled in marker.controls] == [("select", True)]
+
+
+def test_a_marker_imported_beside_one_unlinked_image_offers_the_link():
+    # After a marker is imported into a membrane with exactly one unlinked
+    # chemiluminescence image of its size, the status line offers the link.
+    app = _code("app.js")
+    block = app[app.index('$("import-file").addEventListener("change"') :]
+    block = block[: block.index("\n});\n")]
+    assert "calibration.linkOffer(answer.project, image.id)" in block
+    assert "label: `Link as the marker of ${offer.name}`" in block
+    offer = _method(_code("calibration.js"), "linkOffer(")
+    assert 'image.kind === "chemiluminescence"' in offer
+    assert "image.marker_image_id === null" in offer
+    assert "image.width === marker.width" in offer and "unlinked.length === 1" in offer
+
+
+def test_an_apply_that_changes_nothing_offers_no_undo():
+    # Adjust, then Apply with nothing moved, stores the marks as they are: the
+    # server logs nothing, so the last undo step is an earlier change (the
+    # other ladder's Apply, say), which an Undo offered here would take back.
+    # The page compares the answer with the state the edit was sent against:
+    # the same revision, and it says there was no change, with no Undo.
+    panel = _code("calibration.js")
+    apply = _method(panel, "async apply(")
+    assert "sent: (project) => {" in apply
+    same = apply.index("before.revision === answer.project.revision")
+    block = apply.index("if (unchanged) {")
+    undo = apply.index('this.undoOf(answer, "set_ladder_points"')
+    assert same < block < apply.index("return;", block) < undo
+    assert "No change: the ruler holds the ${which} marks as they are stored." in apply
+    app = _code("app.js")
+    _, edit = _function(app, "async function edit(")
+    assert edit.index("sent(state.project);") < edit.index("return send(method, path, json);")
+
+
+def test_a_ruler_goes_with_the_ladder_and_the_images_it_was_opened_for():
+    # A ruler's labels are the membrane's ladder as it was when it opened, and
+    # its Apply replaces a ladder of its register group's marks. While it is
+    # open (or a ladder is being found) the ladder and the marker link are
+    # disabled; changed all the same (Undo, Redo, another tab), the ruler is
+    # dropped, never applied with another ladder's labels or over the marks of
+    # images it did not show.
+    panel = _code("calibration.js")
+    opened = _method(panel, "openDraft(")
+    assert "ladder: this.ladderScope()," in opened and "group: this.groupScope()," in opened
+    stale = _method(panel, "staleRuler(")
+    assert "draft.ladder !== this.ladderScope()" in stale
+    assert "draft.group !== this.groupScope()" in stale
+    assert "const stale = draft ? this.staleRuler(draft) : null;" in _method(panel, "render(")
+    locks = _method(panel, "renderLocks(")
+    assert "const locked = Boolean(this.draft) || this.finding;" in locks
+    for control in ('$("cal-ladder")', '$("marker-image")', '$("cal-link")', 'type="submit"'):
+        assert control in locks
+    assert "this.renderLocks();" in _method(panel, "refresh(")
+    # A proposal answered once the ladder or the link changed is not shown.
+    find = _method(panel, "async find(")
+    scope = find.index("this.ladderScope() !== scope[0] || this.groupScope() !== scope[1]")
+    assert scope < find.index("this.openDraft(")
+
+
+def test_a_tool_is_put_away_on_another_register_group():
+    # Find ladder or a marking tool armed on one image acts on its register
+    # group only: shown another membrane's image (or its button disabled since,
+    # the ladder taken back), it is put away, never sent there.
+    panel = _code("calibration.js")
+    fits = _method(panel, "toolFits(")
+    assert "tool.group !== this.groupScope()" in fits
+    assert "this.findRefusal(tool.side) : this.markRefusal()" in fits
+    assert "if (this.tool && !this.toolFits(this.tool))" in _method(panel, "render(")
+    assert "this.tool = same ? null : this.newTool(tool);" in _method(panel, "arm(")
+    assert "group: this.groupScope()" in _method(panel, "newTool(")
+
+
+def test_a_ruler_holds_only_the_marks_its_apply_keeps():
+    # Apply stores the ruler's ticks as band marks of its image at its x, in
+    # place of all the marks of its side. Adjust puts only such marks on the
+    # ruler (and takes its x from them): never a strip edge, nor a mark on
+    # another image of the group, which Apply would turn into a band of this
+    # image. Those Apply removes are named before (the ruler's panel, Apply's
+    # description) and after (the status line, with Undo).
+    panel = _code("calibration.js")
+    adjust = _method(panel, "adjust(")
+    assert "const bands = this.bandPoints(side);" in adjust
+    marks = adjust.index("const marks = bands.filter((mark) => mark.image_id === imageId);")
+    assert marks < adjust.index("const xs = marks.map((mark) => mark.x)")
+    assert 'point.source !== "strip_edge"' in _method(panel, "bandPoints(")
+    lost = _method(panel, "lostPoints(")
+    assert 'point.source === "strip_edge" || point.image_id !== draft.imageId' in lost
+    assert "Apply replaces this ladder's marks: it removes" in _method(panel, "renderDraft(")
+    assert "which the ruler did not hold." in _method(panel, "appliedText(")
+    marks_list = _method(panel, "renderMarks(")
+    assert '$("cal-adjust").hidden = !this.bandPoints("left").length;' in marks_list
+    parser = _Tags()
+    parser.feed((server.STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    assert parser.by_id["cal-apply"]["aria-describedby"] == "cal-draft-lost"
+    assert "hidden" in parser.by_id["cal-draft-lost"]
+
+
+def test_the_keyboard_focus_never_stays_on_a_hidden_control():
+    # Enter or Esc on a ruler tick, or Drop, hides the ruler's panel with the
+    # focus still on that button: a hidden control has lost the focus too, so
+    # it goes on (to Apply's Undo, or to Find ladder).
+    panel = _code("calibration.js")
+    lost = _method(panel, "focusLost(")
+    assert "!active.getClientRects().length" in lost and "Boolean(active.disabled)" in lost
+    escape = _method(panel, "escape(")
+    assert escape.index("this.closeDraft();") < escape.index("this.keepFocus();")
+    keep = _method(panel, "keepFocus(")
+    assert '["cal-find", "cal-mark", "cal-ladder"]' in keep
+    assert "button.getClientRects().length" in keep
+
+
+def test_snap_all_names_the_ticks_it_left_where_they_are():
+    # A solid tick no band took stays where it is, and Apply stores it there:
+    # the status line names it, as it names the hollow ones not stored.
+    snap = _method(_code("calibration.js"), "async snapAll(")
+    assert snap.index("if (!result.snapped) {") < snap.index("stayed.push(tick);")
+    assert '"stays where it is" : "stay where they are"' in snap
+    assert 'and Apply stores ${one ? "it" : "them"} there' in snap
+
+
+def test_a_read_refused_as_project_changed_says_nothing_was_left_undone():
+    # A ladder proposal and a snap are POSTs that change nothing: refused
+    # because another project was opened, they are no change "not made".
+    app = _code("app.js")
+    _, changed = _function(app, "function projectChanged(")
+    assert 'answered || read || method === "GET"' in changed
+    _, sent = _function(app, "async function request(")
+    assert "projectChanged(error, method, path, { read });" in sent
+    assert "request(method, path, { json, answer: true, anyProject, read: true })" in app
+
+
+def test_a_dropped_ticks_snap_lands_by_its_id():
+    # The ruler may change while a dropped tick's snap is asked for (another
+    # tick dragged, a nudge, ▲▼): the snap lands on that tick by its id while
+    # it is still where it was dropped, and a later move of it stands.
+    snap = _method(_code("calibration.js"), "snapTick(")
+    assert "ruler.ticks.find((tick) => tick.id === id)" in snap
+    assert "now.y === dropped.y && now.state === dropped.state" in snap
+    assert "this.draft = onBand(this.draft);" in snap and "this.base = onBand(this.base);" in snap
+    assert "this.draft !== draft" not in snap
+
+
+def test_nothing_opens_a_ruler_or_a_popup_while_a_ladder_is_found():
+    # The proposal's answer opens a ruler: until it comes, Adjust, the marking
+    # tools, Remove and Clear are disabled, as Find is.
+    panel = _code("calibration.js")
+    busy = "const busy = Boolean(this.draft) || this.applying || this.finding;"
+    assert busy in _method(panel, "renderMarks(")
+    marking = _method(panel, "renderMarking(")
+    assert "Boolean(this.draft) || this.applying || this.finding;" in marking
+    assert "this.draft || this.applying || this.finding" in _method(panel, "adjust(")
+    assert "if (this.finding || this.applying)" in _method(panel, "arm(")
+
+
+def test_apply_names_what_its_ruler_was_opened_with():
+    # The server refuses a ruler whose ladder or register group changed since
+    # it was opened (calibration_changed, another tab's change this page does
+    # not know of), but only when the page names them: a page that stopped
+    # sending them would lose the check without a sign. Apply sends every
+    # field the route reads, as the ruler was opened; such a refusal drops
+    # the ruler, says why and reads the project again.
+    panel = _code("calibration.js")
+    apply = _method(panel, "async apply(")
+    start = apply.index("const body = {")
+    fields = re.findall(r"^\s*(\w+):", apply[start : apply.index("};", start)], re.MULTILINE)
+    assert sorted(fields) == sorted(api.LadderPointsBody.model_fields)
+    assert "ladder_kda: draft.ladderKda," in apply and "group: draft.groupIds," in apply
+    opened = _method(panel, "openDraft(")
+    assert "ladderKda: [...this.ladderKda()]," in opened
+    assert "groupIds: [...this.group.image_ids]," in opened
+    # A found ruler's labels are the ladder the proposal names (the server's
+    # when it labelled them), opened only while it is the ladder shown.
+    find = _method(panel, "async find(")
+    same = find.index("if (!sameLadder(labels, this.ladderKda())) {")
+    assert find.index("const labels = answer.ladder_kda;") < same < find.index("this.openDraft(")
+    assert find.index("this.handlers.reread();", same) < find.index("this.openDraft(")
+    assert "ladderKda: [...labels]," in find
+    refused = _method(panel, "applyRefused(")
+    changed = refused.index('error.code === "calibration_changed"')
+    assert changed < refused.index("this.closeDraft();") < refused.index("this.sayOnceRead(")
+    # Its words, by the field the refusal names.
+    start = panel.index("const CHANGED_WORDS = {")
+    words = set(re.findall(r"^  (\w+):", panel[start : panel.index("};", start)], re.MULTILINE))
+    assert words == {"ladder_kda", "group"} <= set(api.LadderPointsBody.model_fields)
+    assert "reread: () => reread().catch(report)," in _code("app.js")
+
+
+def test_a_mark_or_relabel_names_the_ladder_its_mw_was_chosen_from():
+    # The server refuses a mark, or a relabel, whose MW was chosen from a
+    # ladder list that is no longer the membrane's (calibration_changed:
+    # another tab chose another ladder), but only when the page names that
+    # list: a page that stopped sending it would lose the check without a
+    # sign. The popup's list is sent with an MW chosen from it, never with a
+    # typed one; such a refusal is said and the project read again.
+    panel = _code("calibration.js")
+    mark = _method(panel, "async mark(")
+    body = mark[mark.index("const body = {") :]
+    body = body[: body.index(";")]
+    sent = set(re.findall(r"[{,] (?:\.\.\.\(kda \? \{ )?(\w+)", body))
+    assert sent == set(api.PointBody.model_fields)
+    assert "...(kda ? { ladder_kda: kda } : {})" in body
+    ask = _method(panel, "askMark(")
+    chosen = "choose: (mw, listed) => this.mark(tool, side, image, x, y, mw, listed ? kda : null),"
+    assert chosen in ask
+    menu = _method(panel, "pointMenu(")
+    assert "this.editPoint(point, listed ? { mw, ladder_kda: kda } : { mw }, said, image);" in menu
+    assert "ladder_kda" in api.PointEditBody.model_fields
+    opened = _method(panel, "openMenu(")
+    assert "choose(choice.mw, true);" in opened and "choose(mw, false);" in opened
+    for method in ("async mark(", "async editPoint("):
+        refused = _method(panel, method)
+        assert 'error.code === "calibration_changed"' in refused, method
+        assert "this.ladderChanged(" in refused, method
+    assert "this.sayOnceRead(image, openId, (shown) => {" in _method(panel, "ladderChanged(")
+    once = _method(panel, "async sayOnceRead(")
+    assert once.index("await this.handlers.reread();") < once.index(
+        "this.handlers.status(words(this.shows(image, openId) && Boolean(this.membrane)));"
+    )
+
+
+def test_a_refusal_read_again_says_what_to_do_only_on_its_image():
+    # A refusal said once the project is read again (the ladder changed in
+    # another tab) says what to do next from the membrane shown then (its
+    # ladder, findAgain), so only while the image refused is still shown:
+    # another image shown meanwhile, by keyboard say, may be another
+    # membrane's. Then what was refused is said, with no next step. Apply,
+    # Find ladder, and a mark or relabel pass the image refused.
+    panel = _code("calibration.js")
+    once = _method(panel, "async sayOnceRead(")
+    assert once.startswith("  async sayOnceRead(image, openId, words, refocus = false) {")
+    assert "words(this.shows(image, openId) && Boolean(this.membrane))" in once
+    assert re.findall(r"this\.sayOnceRead\(\s*(\w+),", panel) == ["image", "image", "image"]
+    refused = _method(panel, "applyRefused(")
+    ruler = refused.index("const image = this.image;")
+    assert ruler < refused.index("this.closeDraft();") < refused.index("this.sayOnceRead(")
+    for words in (refused, _method(panel, "async find(")):
+        said = words[words.index("this.sayOnceRead(") :]
+        said = said[: said.index(");\n")]
+        then, *otherwise = said[said.index("shown\n") :].splitlines()[1:]
+        assert then.lstrip().startswith("? `") and "${this.findAgain()}" in then
+        assert otherwise[0].lstrip().startswith(": ")
+        assert not any("findAgain" in line for line in otherwise)
+    assert "if (!shown) {\n        return `${said}.`;" in _method(panel, "ladderChanged(")
+
+
+def test_a_ladder_refusal_is_worded_from_its_code_and_detail():
+    # A refusal of the ladder's order, of an MW held twice or of the ladders'
+    # sides is worded from its code and detail (the ladder side and the MWs
+    # the server gives), never shown as the server's message, which names ids
+    # and positions; any other keeps that message. Apply, a mark, a mark moved
+    # or relabelled and a link say it so.
+    panel = _code("calibration.js")
+    _, words = _function(panel, "function ladderRefusalWords(")
+    for code in ("calibration_order", "duplicate_mw", "ladder_sides"):
+        assert f'error.code === "{code}"' in words
+    for field in ("detail.upper", "detail.lower", "detail.mw", "detail.side"):
+        assert field in words
+    for reason in ("same_height", "strip_edge", "no_x", "not_right"):
+        assert f'detail.reason === "{reason}"' in words
+    assert "return null;" in words
+    _, text = _function(panel, "function refusalText(")
+    assert "sentence(error.message)" in text
+    for method, verb in (
+        ("applyRefused(", '"Not applied"'),
+        ("async mark(", '"Not marked"'),
+        ("async editPoint(", '"Not moved"'),
+        ("async link(", '"Not linked"'),
+    ):
+        assert verb in _method(panel, method), method
+    _, report = _function(_code("app.js"), "function report(")
+    assert "showStatus(text || error.message);" in report
+
+
+def test_space_presses_only_a_tick_or_its_popup_over_the_image():
+    # Space held pans the image, with the pointer over it, and a tap of it
+    # there presses no focused control (the status line's Undo, Clear marks,
+    # Remove): it was meant to pan. Only a ruler tick's button (its relabel
+    # popup) and the controls of the popup opened from it, which sit over the
+    # image, are pressed by it; not those of a popup opened by a click on the
+    # image (a band marked, a stored mark, a tick there), which the click left
+    # the keyboard in. And a drag it panned makes its release press nothing.
+    view = _code("view.js")
+    _, over = _function(view, "function pressedOverImage(")
+    assert "pressedBySpace(element)" in over and '.closest("[data-space-presses]")' in over
+    keydown = view[view.index('document.addEventListener("keydown"') :]
+    keydown = keydown[: keydown.index('document.addEventListener("keyup"')]
+    assert "!typesSpace(target) &&\n        !pressedOverImage(target) &&" in keydown
+    assert "pressedBySpace(target)" not in keydown
+    assert "if (this.spaceTaken || this.spacePanned) {" in view
+    assert "this.untype();\n        this.spacePanned = true;" in view
+    page = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    marked = re.findall(r'<\w+ id="([\w-]+)"[^>]*\bdata-space-presses\b', page)
+    assert marked == ["cal-ticks"]
+    assert re.search(r'<div id="cal-menu"[^>]*>', page).group().count("data-space-presses") == 0
+    panel = _code("calibration.js")
+    opened = _method(panel, "openMenu(")
+    assert 'menu.toggleAttribute("data-space-presses", Boolean(back));' in opened
+    assert opened.index("this.closeMenu(false);") < opened.index("menu.toggleAttribute(")
+    # Only a tick's button opens one with somewhere to go back to.
+    assert "this.relabelMenu(tick.id, button)" in panel
+    assert "this.relabelMenu(step.part.id, null, step);" in panel
+    assert re.findall(r"\bback(?:: (\w+))?,\n", panel) == ["", "null", "null", ""]
