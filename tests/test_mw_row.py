@@ -1809,6 +1809,13 @@ def _mw_row(dy: float, **kwargs):
     return case, expected, dy
 
 
+def _expected_off(built, by: float):
+    """A row built for a refusal, its expected row ``by`` px lower (the
+    protein running that far off its expected MW)."""
+    case, expected, dy = built
+    return case, expected + by, dy
+
+
 _REFUSED = {
     # every lane's band clipped and lighter along its middle: its two edges
     "slit": (
@@ -1819,8 +1826,8 @@ _REFUSED = {
         lambda: _mw_row(26.0, neighbour_depths=[48000.0] * 6, missing=(1, 2, 3)),
         "half",
     ),
-    "expected_row": (
-        lambda: _mw_row(12.0, seed=1001, neighbour_depths=[48000.0] * 6, missing=(1, 2)),
+    "expected_row_18px": (
+        lambda: _mw_row(18.0, seed=1001, neighbour_depths=[24000.0] * 6, missing=(1, 2)),
         "expected_row",
     ),
     "line_signal": (_speck_row, "line_signal"),
@@ -1832,23 +1839,58 @@ _REFUSED = {
     ),
     "crossed": (_crossed_row, None),
 }
+# The same refusals with another band 12 px from the protein's, half as deep
+# to twice as deep: a click on the protein's band grows over it.
+_MERGED = {
+    "expected_row_2x_below": (
+        lambda: _mw_row(12.0, seed=1001, neighbour_depths=[48000.0] * 6, missing=(1, 2)),
+        "expected_row",
+    ),
+    "expected_row_half_below": (
+        lambda: _mw_row(12.0, seed=1001, neighbour_depths=[12000.0] * 6, missing=(1, 2)),
+        "expected_row",
+    ),
+    "expected_row_1x_above": (
+        lambda: _mw_row(-12.0, neighbour_depths=[24000.0] * 6, missing=(1, 2)),
+        "expected_row",
+    ),
+    "line_signal_2x_above": (
+        lambda: _mw_row(-12.0, seed=1001, neighbour_depths=[48000.0] * 6, missing=(0,)),
+        "line_signal",
+    ),
+    "line_signal_shoulder": (
+        lambda: _mw_row(
+            12.0,
+            depths=[8000.0, 12000.0, 18000.0, 26000.0, 36000.0, 48000.0],
+            neighbour_depths=[24000.0] * 6,
+        ),
+        "line_signal",
+    ),
+    "crossed_knocked_out": (
+        lambda: _expected_off(_mw_row(12.0, neighbour_depths=[24000.0] * 6, missing=(1,)), 6.0),
+        None,
+    ),
+}
 
 
 @pytest.mark.parametrize(
     "name",
     [
-        pytest.param(
-            name,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="a click on the protein's band grows over a band twice as deep 12 px"
-                " below it (no valley under 30% of the clicked pixel): the step to click"
-                " boxes both, as a click does on a shoulder",
-            ),
-        )
-        if name == "expected_row"
-        else name
-        for name in _REFUSED
+        *_REFUSED,
+        *(
+            pytest.param(
+                name,
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="known limit: a click on the protein's band grows over another"
+                    " band 12 px away, half as deep to twice as deep (no valley under 30% of"
+                    " the clicked pixel), so the step to click the protein's bands boxes"
+                    " both, as a click does on a shoulder; from 18 px on it boxes the"
+                    " protein's alone",
+                ),
+            )
+            for name in _MERGED
+        ),
     ],
 )
 def test_following_each_mw_refusal_leaves_no_silent_wrong_box(name):
@@ -1859,7 +1901,7 @@ def test_following_each_mw_refusal_leaves_no_silent_wrong_box(name):
     # other band) or where a lane holds no protein, else a row box over the
     # protein's whole band. (A click is a seed click, grow_box; a row box is
     # detect_row on the box drawn.)
-    build, off_cause = _REFUSED[name]
+    build, off_cause = {**_REFUSED, **_MERGED}[name]
     built = build()
     case, expected = built[0], built[1]
     dy = built[2] if len(built) > 2 else None
