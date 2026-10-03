@@ -1485,6 +1485,32 @@ _WORDS = [
         + "; lane 5's box lies on the expected MW's row (0.00 box heights from it, limit"
         " 0.75), so the line may run through another row" + CLICK.format("lane 2"),
     ),
+    (  # numbers a hair past or short of the limit, shown on their side of it
+        "near_limits",
+        _found(
+            _off({2: (0.7504, 1.0), 4: (1.3, 0.7499)}),
+            ["off_row_line"],
+            off_cause="expected_row",
+        ),
+        LADDERS,
+        "no row placed: in lanes 3, 5 "
+        + OFF.format("0.7504 and 1.30", "those lanes picked")
+        + "; lane 5's box lies on the expected MW's row (0.7499 box heights from it, limit"
+        " 0.75), so the line may run through another row" + CLICK.format("lane 3"),
+    ),
+    (  # an SNR a hair past DETECT_K, on its side of it
+        "line_signal_near_limit",
+        _found(
+            _off({1: (1.0, 1.0)}, extra={1: {"line_reason": "unassigned", "line_snr": 6.04}}),
+            ["off_row_line"],
+            off_cause="line_signal",
+        ),
+        LADDERS,
+        "no row placed: in lane 2 "
+        + OFF.format("1.00", "that lane picked")
+        + "; another band reaches the detection limit on the row's line in lane 2 (SNR 6.04,"
+        " limit 6), so it is not recorded as not detected" + CLICK.format("lane 2"),
+    ),
     (  # placed again, still off the line
         "again",
         _found(

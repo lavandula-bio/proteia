@@ -3874,8 +3874,11 @@ def _boxes_lie(lanes: Sequence[rowdetect.LaneDetection]) -> str:
 
 
 def _heights(values: Iterable[float | None]) -> str:
-    """Box heights in words, 2 decimals, as the limit they meet is given."""
-    return _in_words([f"{abs(v or 0.0):.2f}" for v in values])
+    """Box heights in words, 2 decimals, as the limit they meet is given,
+    more where 2 would round one onto the limit (:func:`rowdetect.shown_against`)."""
+    return _in_words(
+        [rowdetect.shown_against(abs(v or 0.0), rowdetect.ROW_LINE_K, 2) for v in values]
+    )
 
 
 # What lies on the row's line in a lane off it, by the reading's reason
@@ -3921,7 +3924,12 @@ def _not_recorded(found: rowdetect.RowDetection) -> str:
         bands = [lane for lane in named if lane.line_reason == "unassigned"]
         parts = []
         if bands:
-            snrs = _in_words([f"{lane.line_snr or 0.0:.1f}" for lane in bands])
+            snrs = _in_words(
+                [
+                    rowdetect.shown_against(lane.line_snr or 0.0, rowdetect.DETECT_K, 1)
+                    for lane in bands
+                ]
+            )
             parts.append(
                 "another band reaches the detection limit on the row's line in"
                 f" {lanes_phrase([lane.lane for lane in bands])} (SNR {snrs}, limit"

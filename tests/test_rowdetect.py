@@ -4221,6 +4221,59 @@ def _line_with(monkeypatch, at: dict[int, dict[int, float]]) -> list[list[int]]:
     return fits
 
 
+@pytest.mark.parametrize(
+    ("value", "limit", "places", "shown"),
+    [
+        (1.234, 0.75, 2, "1.23"),
+        (0.75, 0.75, 2, "0.75"),
+        (0.751, 0.75, 2, "0.751"),  # past the limit: never shown as it
+        (0.7504, 0.75, 2, "0.7504"),
+        (0.7496, 0.75, 2, "0.7496"),  # short of it
+        (0.7449, 0.75, 2, "0.74"),
+        (5.94, 6.0, 1, "5.9"),
+        (5.96, 6.0, 1, "5.96"),
+        (6.0, 6.0, 1, "6.0"),
+        (6.04, 6.0, 1, "6.04"),
+        (61.25, 6.0, 1, "61.2"),
+    ],
+)
+def test_shown_against_keeps_a_number_on_its_side_of_the_limit(value, limit, places, shown):
+    # A number printed with the limit it was compared with lies on the
+    # side of the limit the value does: to more decimals where fewer would
+    # round it onto the limit.
+    assert rowdetect.shown_against(value, limit, places) == shown
+
+
+@pytest.mark.parametrize(
+    ("offset", "snr", "words"),
+    [
+        (0.7504, 5.96, "(0.7504 box heights, limit 0.75) and off the expected MW's row, and no"),
+        (1.2345, 2.345, "(1.23 box heights, limit 0.75) and off the expected MW's row, and no"),
+    ],
+)
+def test_a_not_detected_lane_s_numbers_just_past_their_limits_are_not_shown_as_them(
+    monkeypatch, offset, snr, words
+):
+    # Lane 3 knocked out, its box 0.7504 box heights off the row's line,
+    # its reading on the line 5.96 noise sigmas: recorded as not detected,
+    # the note says 0.7504 (limit 0.75) and 5.96 (limit 6), not 0.75 and 6.0;
+    # farther from the limits, 2 decimals and 1.
+    case = _row_beside(16.0, 2.0, missing=(2,))
+    _line_with(monkeypatch, {1: {2: offset}})
+    real = rowdetect._on_the_line
+
+    def reading(*args, **kwargs):
+        _, _, window = real(*args, **kwargs)
+        return "no_band", snr, window
+
+    monkeypatch.setattr(rowdetect, "_on_the_line", reading)
+    found = detect(case, prefer_y=_target_row(case))
+    _assert_not_detected(found, [2])
+    [note] = [note for note in found.notes if "recorded as not detected" in note]
+    shown = {5.96: "5.96", 2.345: "2.3"}[snr]
+    assert words in note and f"(SNR {shown}, limit 6)" in note, note
+
+
 def test_a_box_exactly_the_limit_off_the_row_s_line_is_on_it(monkeypatch):
     # ROW_LINE_K (0.75 box heights) off the row's line is on it, in every
     # fit: a row whose one box lies that far off is placed with no

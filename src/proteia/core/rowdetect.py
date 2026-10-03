@@ -2548,6 +2548,19 @@ def _phrase(values: Sequence[str]) -> str:
     return values[0] if len(values) == 1 else f"{', '.join(values[:-1])} and {values[-1]}"
 
 
+def shown_against(value: float, limit: float, places: int) -> str:
+    """``value`` to ``places`` decimals, for words that print it with the
+    ``limit`` it was compared with (#58): to more decimals where fewer would
+    round it onto the limit or past it, so the number shown lies on the side
+    of the limit the value does (0.7504 against 0.75: "0.7504", not "0.75";
+    5.96 against 6: "5.96", not "6.0")."""
+    text = f"{value:.{places}f}"
+    while (float(text) > limit, float(text) < limit) != (value > limit, value < limit):
+        places += 1
+        text = f"{value:.{places}f}"
+    return text
+
+
 def _other_bands_note(
     seconds: Mapping[int, tuple[Rect, Sequence[tuple[float, float]]]], x0: int, y0: int
 ) -> str:
@@ -3203,8 +3216,8 @@ def detect_row(
                     lanes[i].reason = "off_expected_row"
                     lanes[i].snr = readings[i][1]
                     lanes[i].window = readings[i][2]
-                lines = [f"{abs(first.offsets[i]):.2f}" for i in off]
-                snrs = [f"{readings[i][1]:.1f}" for i in off]
+                lines = [shown_against(abs(first.offsets[i]), ROW_LINE_K, 2) for i in off]
+                snrs = [shown_against(readings[i][1], DETECT_K, 1) for i in off]
                 notes.append(
                     f"{lanes_phrase(numbered(off))}: the band found lies off the row's line"
                     f" through the other boxes ({_phrase(lines)} box heights, limit"
