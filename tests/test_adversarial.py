@@ -17,8 +17,8 @@ through the operations, in ``test_operations``.
 The rows prove their own power (#181): detectors degraded on purpose (lanes
 numbered by equal slots, the doubt or the cut flag left out, a duller
 threshold, and so on) must score worse on them than today's, in the same
-run. Five run always, on the rows at seed 1000; all of them run on every row
-with ``PROTEIA_SLOW=1``.
+run. Five run always, on the rows at seed 1000 and the bench's; all of them
+run on every row with ``PROTEIA_SLOW=1``.
 """
 
 import dataclasses
@@ -1168,10 +1168,12 @@ def test_a_ring_stain_has_two_sides_only():
 
 # --- #181: a degraded detector must lose score ---
 
-# A degraded detector has at least this many more silent lanes than today's
-# on the same rows, or at least this many more wrong lanes and no fewer
-# silent ones. Every variant below loses 6 or more on every row; a detector
-# that makes no row worse loses nothing.
+# A degraded detector has, summed over the same rows, at least this many
+# more silent lanes than today's, or at least this many more wrong lanes and
+# no fewer silent ones. Summed over the rows it runs on, each variant below
+# has at least 6 more silent lanes, or at least 15 more wrong lanes and no
+# fewer silent ones (the table below); a detector that makes no row worse
+# loses nothing.
 LOSS = 3
 
 
@@ -1404,8 +1406,8 @@ def lost_score(variant: Degraded, every: bool) -> str:
 
 
 # Measured on main (fbc2afb), silent / wrong lanes against today's (2 / 51
-# on the 96 rows at seed 1000, 2 / 231 on all 349):
-#                     seed 1000      every row
+# on the 96 rows at seed 1000 and the bench's, 2 / 231 on all 349):
+#                      96 rows       349 rows
 #   equal_slots        +22 / -6      +58 / -22
 #   half_pitch        +467 / +521  +1394 / +1838
 #   no_doubt           +23 / 0       +63 / 0
@@ -1423,7 +1425,7 @@ def lost_score(variant: Degraded, every: bool) -> str:
 
 
 @pytest.mark.parametrize("variant", IN_CI, ids=lambda variant: variant.id)
-def test_a_degraded_detector_loses_score_on_the_seed_1000_rows(variant):
+def test_a_degraded_detector_loses_score_on_the_seed_1000_and_bench_rows(variant):
     problem = lost_score(variant, every=False)
     assert not problem, problem
 
