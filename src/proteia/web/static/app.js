@@ -1895,6 +1895,7 @@ const NOT_MEASURED = {
   side_signal: "only signal at the row box's left or right edge",
   unassigned: "signal that fits no lane",
   no_band: "outside the row box",
+  off_expected_row: "the band found lies off the row",
 };
 
 // The detector's warnings about a row it placed (WARNING_FLAGS in
@@ -1935,6 +1936,11 @@ const ROW_WARNINGS = {
       const bands = lanes.startsWith("lanes") ? "bands" : "band";
       return `the row box cuts through the ${bands} in ${lanes}; include the whole ${bands}`;
     },
+  },
+  off_expected_row: {
+    note: "recorded as not detected (n.d.)",
+    words: (lanes) =>
+      `${lanes || "a lane"}: the band found lies off the row; recorded as not detected (n.d.) at the expected MW`,
   },
 };
 

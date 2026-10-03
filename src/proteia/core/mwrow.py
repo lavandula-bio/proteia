@@ -431,7 +431,12 @@ def settings() -> dict[str, JsonValue]:
             " the shift of their centre column"
         ),
         "steep_row_deg": STEEP_ROW_DEG,
-        "seed": "each lane grown from its peak nearest the expected MW's row",
+        "seed": (
+            "each lane grown from its peak nearest the expected MW's row, the lane's own"
+            " peaks among them, stopping at the valley to any other band; a few lanes off"
+            " the row's line and the expected MW's row, with no other band on the line"
+            " there and the other boxes on that row, recorded as not detected"
+        ),
         "lane_span": (
             "the span dragged; else the lanes placed on the image, half a pitch past the end"
             " lanes; else those of the image of its register group with the most lanes"

@@ -82,6 +82,7 @@ from rowcases import (
     hstripe,
     image_cut,
     jpeg,
+    mw_slot_row,
     shade_above,
     synthetic_row,
     two_rows,
@@ -1931,6 +1932,19 @@ def check_invariants(case: RowCase, found: RowDetection) -> None:
     assert ("hollow_band" in found.flags) == any(lane.hollow for lane in found.lanes)
     assert all(lane.rect is not None for lane in found.lanes if lane.hollow)
     assert math.isfinite(found.membrane_shift)
+    # Lanes recorded as not detected off the row's line: read on it, below
+    # the detection limit, with their window, the row placed.
+    recorded = [lane for lane in found.lanes if lane.reason == "off_expected_row"]
+    assert ("off_expected_row" in found.flags) == bool(recorded)
+    for lane in recorded:
+        assert lane.window is not None and lane.line_reason == "no_band"
+        assert lane.snr == lane.line_snr < DETECT_K and abs(lane.line_offset) > ROW_LINE_K
+        assert abs(lane.expected_offset) > ROW_LINE_K
+    if recorded:
+        assert not found.refused and found.off_cause is None
+        assert 2 * len(recorded) < len(recorded) + len(rects)
+        assert all(abs(lane.expected_offset) <= ROW_LINE_K for lane in found.lanes if lane.rect)
+    assert (found.off_cause == "again") == bool(found.again)
 
 
 @pytest.mark.parametrize("name", INVARIANT_CASES)
@@ -3198,14 +3212,16 @@ def test_prefer_y_stops_at_the_valley_to_a_deeper_band():
     # (above that level, below VALLEY_FRAC of the peak) into the deeper band:
     # one extent over both, a 52 x 27 box in every lane, the deeper band's
     # peak read as the band's own, no flag. It stops at the valley: each band
-    # boxed alone at a lone band's size, the deeper band another component.
+    # boxed alone at a lone band's size, the deeper band another component,
+    # named 14 px or so above the box centre, outside it.
     case = _row_beside(-14.0, 3.0)
     found = detect(case, prefer_y=_target_row(case))
     check_invariants(case, found)
     assert found.flags == ("multiple_components",)
-    assert any(
-        note.endswith("the box covers the one nearest the expected row") for note in found.notes
-    )
+    [note] = found.notes
+    lanes, lo, hi, way = _another_band(note)
+    assert (lanes, way) == ("lanes 1, 2, 3, 4, 5, 6", "above"), note
+    assert 12 <= lo <= hi <= 16, note
     assert found.size.height <= _lone_height(1000) + 1
     for lane, cy in zip(found.lanes, case.lane_cy, strict=True):
         y, deeper_y = cy + 0.5, cy + 0.5 - 14.0
@@ -3558,9 +3574,9 @@ def test_prefer_y_stops_at_a_band_as_saturated_as_the_target(depth, rel, dy, sat
     # differ in the signal by the background plane alone, a hair: the other
     # band, a hair lower, was not higher than the target's, and the growth
     # climbed into it, one 54 x 31 box over both rows in every lane and no
-    # flag. A band within the noise of the target's height is not clearly
-    # lower, whether or not the saturation level is known: each lane is
-    # boxed on its own band alone, the other band a second component.
+    # flag. Growth stops at the valley to any other band, whether or not
+    # the saturation level is known: each lane is boxed on its own band
+    # alone, the other band a second component.
     case = _row_beside(dy, rel, depths={i: depth * MEMBRANE for i in range(6)})
     kwargs = {} if saturated_at is None else {"saturated_at": saturated_at}
     found = detect(case, prefer_y=_target_row(case), **kwargs)
@@ -3605,91 +3621,897 @@ def test_prefer_y_stops_at_a_clipped_band_across_a_shallow_valley(depth, rel, dy
     assert detect(case, saturated_at=limit).flags == ()
 
 
+_ANOTHER_BAND = re.compile(
+    r"(?P<lanes>lanes? [\d, ]+): another band lies (?P<lo>\d+)(?: to (?P<hi>\d+))? px"
+    r" (?P<way>above|below) the box centre; the box does not include it"
+)
+
+
+def _another_band(note: str) -> tuple[str, int, int, str]:
+    """The lanes, the px range and the way of the note naming another band
+    outside the boxes (the whole note)."""
+    match = _ANOTHER_BAND.fullmatch(note)
+    assert match, note
+    lo = int(match["lo"])
+    return match["lanes"], lo, int(match["hi"] or lo), match["way"]
+
+
 def test_prefer_y_stops_at_a_saturated_band_on_a_shaded_membrane():
     # The bands of lanes 2 to 6 clipped at 0 (lane 1's 0.9 times as deep as
     # the membrane, not clipped), another row 1.5 times as deep and clipped
     # 16 px below, on a membrane darkening 60 levels a row downward: in the
     # signal the other row's clipped tops lie some 960 levels, about eight
-    # noise sigmas, below the target's. Clipped, neither height says which
-    # band is stronger: with the saturation level known (at each band's own
-    # top), the other band is not clearly lower, and each lane is boxed on
-    # its own band alone. Without it, the other band reads as clearly lower
-    # and the growth takes it in where the valley to it is shallow: those
-    # lanes are named as holding a weaker one inside the box.
+    # noise sigmas, below the target's. Without the saturation level the
+    # other band read as clearly lower, and the growth took it in where the
+    # valley to it was shallow. Growth stops at the valley to any other band
+    # (#58), whichever is higher, with or without the saturation
+    # level: each lane boxed on its own band alone, the other band a second
+    # component named below the box centre: 12 to 14 px, its peak where the
+    # shading puts it, at its clipped core's top row, some 3 px above its
+    # middle.
     def shade(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
         return 60.0 * (Y - float(np.mean(lcy))) + 0.0 * X
 
     depths = {i: 2.0 * MEMBRANE if i else 0.9 * MEMBRANE for i in range(6)}
     case = _row_beside(16.0, 1.5, depths=depths, artefacts=[shade])
-    found = detect(case, prefer_y=_target_row(case), saturated_at=0.0)
-    check_invariants(case, found)
-    assert found.flags == ("multiple_components",)
-    for lane, slot, cy in zip(found.lanes, found.slots, case.lane_cy, strict=True):
-        assert _holds(slot, cy + 0.5) and not _holds(slot, cy + 16.5), slot
-        assert lane.components == 2
-    unknown = detect(case, prefer_y=_target_row(case))
-    assert unknown.flags == ("multiple_components",)
-    took = [
-        i
-        for i, (lane, cy) in enumerate(zip(unknown.lanes, case.lane_cy, strict=True))
-        if _holds(lane.extent, cy + 16.5)
-    ]
-    assert len(took) >= 3  # not vacuous
-    assert unknown.notes[-1] == (
-        "lanes 1, 2, 3, 4, 5, 6: a second separate component reaches 25% of the lane's peak;"
-        f" the box covers the one nearest the expected row, and in {lanes_phrase(took)} a"
-        " weaker one with it"
-    )
+    for kwargs in ({"saturated_at": 0.0}, {}):
+        found = detect(case, prefer_y=_target_row(case), **kwargs)
+        check_invariants(case, found)
+        assert found.flags == ("multiple_components",), kwargs
+        for lane, slot, cy in zip(found.lanes, found.slots, case.lane_cy, strict=True):
+            assert _holds(slot, cy + 0.5) and not _holds(slot, cy + 16.5), (kwargs, slot)
+            assert _holds(lane.extent, cy + 0.5) and not _holds(lane.extent, cy + 16.5), kwargs
+            assert lane.components == 2
+        [note] = found.notes
+        lanes, lo, hi, way = _another_band(note)
+        assert (lanes, way) == ("lanes 1, 2, 3, 4, 5, 6", "below"), note
+        assert 11 <= lo <= hi <= 17, note
+        for lane in found.lanes:
+            [other] = [peak for peak in lane.peaks if not peak.own]
+            centre = (lane.rect[1] + lane.rect[3]) / 2
+            assert lo <= math.floor(other.y - centre + 0.5) <= hi, (note, other)
 
 
-def test_prefer_y_reports_a_weaker_band_it_boxes_with_the_target():
-    # Pinned as it is, awaiting the maintainer's decision (#58): whether the
-    # growth from the expected row's peak stops at the valley to any separate
-    # band, or, as now, only to one not clearly lower than its own. The
-    # targets 8000 to 48000 deep, another band 24000 deep 12 px below each:
-    # stronger than the target in lanes 1 to 3, weaker in lanes 4 to 6. In
-    # lanes 1 to 3 the box stops at the valley to it; in lanes 4 to 6 it
-    # holds both, so boxes across the row hold different bands (fold changes
-    # off). Every lane is named with a second component, the note saying
-    # which boxes hold it; the weaker band's top reads as the band's own.
+def test_prefer_y_stops_at_another_band_stronger_or_weaker_than_the_target():
+    # #58: the targets 8000 to 48000 deep, another band 24000 deep 12
+    # px below each: stronger than the target in lanes 1 to 3, weaker in lanes
+    # 4 to 6. Growth used to stop only at a band not clearly lower than the
+    # target's, so lanes 4 to 6 boxed both and boxes across the row held
+    # different bands (fold changes off). It stops at the valley to any other
+    # band: every box holds its target alone, the other band another band
+    # along the lane, named in one note with how far below the box centre.
     targets = (8000.0, 12000.0, 18000.0, 26000.0, 36000.0, 48000.0)
     rels = {i: 24000.0 / d for i, d in enumerate(targets)}
     case = _row_beside(12.0, 1.0, depths=dict(enumerate(targets)), neighbour_rels=rels)
     found = detect(case, prefer_y=_target_row(case))
     check_invariants(case, found)
     assert found.flags == ("multiple_components",)
-    assert found.notes == (
-        "lanes 1, 2, 3, 4, 5, 6: a second separate component reaches 25% of the lane's peak;"
-        " the box covers the one nearest the expected row, and in lanes 4, 5, 6 a weaker one"
-        " with it",
-    )
-    for i, (lane, cy) in enumerate(zip(found.lanes, case.lane_cy, strict=True)):
+    [note] = found.notes
+    lanes, lo, hi, way = _another_band(note)
+    assert (lanes, way) == ("lanes 1, 2, 3, 4, 5, 6", "below"), note
+    assert 10 <= lo <= hi <= 14, note
+    for lane, cy in zip(found.lanes, case.lane_cy, strict=True):
         y, other_y = cy + 0.5, cy + 12.5
         assert lane.components == 2
-        assert _holds(lane.extent, y)
-        assert _holds(lane.extent, other_y) == (i >= 3), i
+        assert _holds(lane.extent, y) and not _holds(lane.extent, other_y), lane
+        assert _holds(lane.rect, y) and not _holds(lane.rect, other_y), lane
         [other] = [peak for peak in lane.peaks if abs(peak.y - other_y) < 2.5]
-        assert (other.own, other.other_band) == ((True, False) if i >= 3 else (False, True))
-        assert rowdetect.bands_in(lane, -math.inf, math.inf) == (1 if i >= 3 else 2)
+        assert (other.own, other.other_band) == (False, True)
+        assert rowdetect.bands_in(lane, -math.inf, math.inf) == 2
 
 
-@pytest.mark.parametrize("speck", [False, True])
+def _mirrored(case: RowCase) -> RowCase:
+    """The row flipped left to right: lane i becomes lane n - 1 - i."""
+    width = case.image.shape[1]
+    n = case.n_lanes
+    x0, y0, x1, y1 = case.row
+    return dataclasses.replace(
+        case,
+        image=np.ascontiguousarray(case.image[:, ::-1]),
+        row=(width - x1, y0, width - x0, y1),
+        reference={
+            n - 1 - i: (width - r[2], r[1], width - r[0], r[3]) for i, r in case.reference.items()
+        },
+        lane_cx=tuple(width - x for x in reversed(case.lane_cx)),
+        lane_cy=tuple(reversed(case.lane_cy)),
+    )
+
+
+def _inverted(case: RowCase) -> RowCase:
+    """The row as light bands on a dark membrane."""
+    return dataclasses.replace(case, image=FULL_SCALE - case.image, dark_on_light=False)
+
+
+_ANY_BAND = [
+    *[(rel, dy, "plain") for rel in (0.45, 0.8, 1.5, 3.0) for dy in (-18, -14, -12, 12, 14, 18)],
+    *[(rel, dy, way) for rel in (0.45, 3.0) for dy in (-12, 14) for way in ("mirrored", "light")],
+]
+
+
+@pytest.mark.parametrize(("rel", "dy", "way"), _ANY_BAND)
+def test_prefer_y_stops_at_any_other_band(rel, dy, way):
+    # #58: another row 0.45 to 3 times as deep 12 to 18 px above or
+    # below the expected one; also flipped left to right, and as light bands
+    # on a dark membrane. Where a lane's band is a separate peak, its extent
+    # and box hold it and not the other band, whatever its depth, and the
+    # other band is reported (a second component, or another band along the
+    # lane). Growth used to take in a band clearly weaker than the target's.
+    case = _row_beside(float(dy), rel)
+    if way == "mirrored":
+        case = _mirrored(case)
+    elif way == "light":
+        case = _inverted(case)
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    ys = [cy + 0.5 for cy in case.lane_cy]
+    separate = [
+        any(abs(peak.y - y) <= 2.5 for peak in lane.peaks)
+        for lane, y in zip(found.lanes, ys, strict=True)
+    ]
+    if abs(dy) >= 14:  # not vacuous: from 14 px on, every lane's band is a peak
+        assert all(separate), found
+    if found.refused:
+        assert rel > 1.0, found  # a weaker band never refuses the row
+        return
+    for lane, y, alone in zip(found.lanes, ys, separate, strict=True):
+        if not alone:
+            continue
+        other_y = y + dy
+        assert _holds(lane.extent, y) and not _holds(lane.extent, other_y), lane
+        assert _holds(lane.rect, y) and not _holds(lane.rect, other_y), lane
+        assert lane.components > 1 or any(peak.other_band for peak in lane.peaks), lane
+        assert not any(peak.own and abs(peak.y - other_y) < 2.5 for peak in lane.peaks), lane
+
+
+def _band_at(lane: int, dy: float, depth: float, w: float, h: float):
+    """A flat-topped band ``w`` x ``h`` px at 20%, ``depth`` deep, ``dy`` px
+    below ``lane``'s band centre (above if negative)."""
+    ux4, ux2 = (2.0 * math.log(5.0)) ** 0.25, math.sqrt(2.0 * math.log(5.0))
+
+    def f(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
+        across = np.exp(-0.5 * np.abs((X - lcx[lane]) / (w / (2.0 * ux4))) ** 4)
+        down = np.exp(-0.5 * ((Y - lcy[lane] - dy) / (h / (2.0 * ux2))) ** 2)
+        return depth * across * down
+
+    return f
+
+
+@pytest.mark.parametrize(
+    ("pitch", "w", "dy", "seed"), [(20.0, 22.0, -15.0, 1001), (20.0, 22.0, 15.0, 1000)]
+)
+def test_prefer_y_seeds_a_lane_whose_band_touches_a_stronger_neighbour(pitch, w, dy, seed):
+    # Eleven touching lanes 20 px apart, bands 22 px wide; lane 3's band 6 px
+    # high and half as deep as its neighbours' (24 px high), a faint band 15
+    # px above or below it in lane 3 alone. The shallow valley from lane 3's
+    # band to its neighbours' leaves it no separate peak of the row, so lane
+    # 3 grew from the faint band, the only peak in its seed range, its box 15
+    # px off with no flag (the boxes 24 px high pass for a row). Its own
+    # separate peaks seed it too: lane 3 is boxed on its band.
+    depths = {i: 15000.0 if i == 2 else 30000.0 for i in range(11)}
+    case = adversarial_row(
+        "touching",
+        seed,
+        n=11,
+        pitch=pitch,
+        w=w,
+        h=6.0,
+        heights={i: 24.0 for i in range(11) if i != 2},
+        depths=depths,
+        artefacts=[_band_at(2, dy, 9000.0, w, 6.0)],
+        img_h=200,
+        margin_left=30,
+        margin_right=30,
+        x_jitter=0.5,
+        mx=4,
+    )
+    cy = _target_row(case)
+    x0, _, x1, _ = case.row
+    case = dataclasses.replace(case, row=(x0, round(cy - 36), x1, round(cy + 36)))
+    found = detect(case, prefer_y=cy, saturated_at=0.0)
+    check_invariants(case, found)
+    assert not found.refused
+    for lane, lane_cy in zip(found.lanes, case.lane_cy, strict=True):
+        assert _holds(lane.rect, lane_cy + 0.5), lane
+    third = found.lanes[2]
+    assert not _holds(third.rect, case.lane_cy[2] + 0.5 + dy), third
+
+
+_NOT_DETECTED = re.compile(
+    r"(?P<lanes>lanes? [\d, ]+): the band found lies off the row's line through the other"
+    r" boxes \((?P<offsets>[-\d., and]+) box heights, limit 0\.75\) and off the expected MW's"
+    r" row, and no other band reaches the detection limit on that line \(SNR"
+    r" (?P<snrs>[-\d., and]+), limit 6\): recorded as not detected \(n\.d\.\) at the"
+    r" expected MW"
+)
+
+
+def _numbers(text: str) -> list[float]:
+    """The numbers of "a", "a and b" or "a, b and c"."""
+    return [float(v) for v in re.split(r", | and ", text)]
+
+
+def _not_detected_note(found: RowDetection) -> tuple[str, list[float], list[float]]:
+    """The lanes, offsets and SNRs the off_expected_row note names."""
+    [note] = [note for note in found.notes if "recorded as not detected" in note]
+    match = _NOT_DETECTED.fullmatch(note)
+    assert match, note
+    return match["lanes"], _numbers(match["offsets"]), _numbers(match["snrs"])
+
+
+def _assert_not_detected(found: RowDetection, lanes: Sequence[int]) -> None:
+    """``lanes`` (0-based) recorded as not detected, the row placed."""
+    assert not found.refused and found.crossed == ()
+    assert "off_expected_row" in found.flags and "off_row_line" not in found.flags
+    for i in lanes:
+        lane = found.lanes[i]
+        assert (lane.rect, lane.extent, lane.reason) == (None, None, "off_expected_row")
+        assert abs(lane.line_offset) > ROW_LINE_K and lane.snr < DETECT_K
+        assert lane.window is not None and not lane.cut and lane.components == 0
+    named, offsets, snrs = _not_detected_note(found)
+    assert named == lanes_phrase(list(lanes))
+    for i, offset, snr in zip(lanes, offsets, snrs, strict=True):
+        assert offset == pytest.approx(abs(found.lanes[i].line_offset), abs=0.051)
+        assert snr == pytest.approx(found.lanes[i].snr, abs=0.051)
+
+
+@pytest.mark.parametrize("speck", [None, 32.0])
 @pytest.mark.parametrize("dy", [-16.0, 16.0])
-def test_prefer_y_does_not_cross_a_knocked_out_lane(dy, speck):
+def test_prefer_y_marks_a_knocked_out_lane_not_detected(dy, speck):
     # Lane 3 holds no band at the expected row (a knockout), another row
     # twice as deep lies dy px away: lane 3 grows from that row's band, its
-    # only one, off the row's line, and is named for it. Its neighbours hold
-    # a band on both rows, but lane 3 none on theirs: lanes cross only when
-    # each of two neighbours holds a band on the other's row. A speck of dust
-    # at the row's height 24 px beside lane 3's centre, outside its band's
-    # x-range, is no band of lane 3.
-    artefacts = [blob(2, 4.0, 15000.0, dx=24.0)] if speck else []
+    # only one, off the row's line through the other boxes and off the
+    # expected row, and no other band reaches the detection limit on the
+    # line there. It is recorded as not detected at the expected MW, with no
+    # box, and the row is placed (it used to be refused). Its neighbours hold
+    # a band on both rows, but lane 3 none on theirs: no lanes cross. A speck
+    # of dust at the row's height 32 px beside lane 3's centre, outside its
+    # band's x-range and its slot, is no band of lane 3: not detected all
+    # the same.
+    artefacts = [] if speck is None else [blob(2, 4.0, 15000.0, dx=speck)]
     case = _row_beside(dy, 2.0, missing=(2,), artefacts=artefacts)
     found = detect(case, prefer_y=_target_row(case))
     check_invariants(case, found)
-    assert found.refused and found.crossed == ()
-    [line] = [note for note in found.notes if "row's line" in note or "two rows" in note]
-    assert line.startswith("lane 3: box centre more than 0.75 box height")
+    _assert_not_detected(found, [2])
+    for i, (lane, cy) in enumerate(zip(found.lanes, case.lane_cy, strict=True)):
+        if i != 2:
+            assert _holds(lane.rect, cy + 0.5) and not _holds(lane.rect, cy + 0.5 + dy), lane
+    assert found.size.height <= _lone_height(1000) + 1
+
+
+@pytest.mark.parametrize("dy", [-16.0, 16.0])
+def test_a_speck_in_a_knocked_out_lane_is_no_seed_and_keeps_the_row_refused(dy):
+    # The knockout above, the speck 24 px beside lane 3's centre, at the
+    # expected row: past the side of the lane's band's x-range, in its margin.
+    # Read in the x-range alone, the speck's flank rose to its side, a peak
+    # nearest the expected row, and lane 3 was boxed on the speck, a 4 x 1
+    # extent. Its row holds nothing at the lane's middle: no peak of the
+    # lane, which grows from the other row's band. Within the slot an n.d.
+    # record would cover on the row's line,
+    # the speck reaches the detection limit: the row stays refused.
+    case = _row_beside(dy, 2.0, missing=(2,), artefacts=[blob(2, 4.0, 15000.0, dx=24.0)])
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    assert found.refused and found.off_cause == "line_signal"
+    lane = found.lanes[2]
+    assert _holds(lane.extent, case.lane_cy[2] + 0.5 + dy), lane
+    assert lane.extent[3] - lane.extent[1] > 6 and lane.extent[2] - lane.extent[0] > 30, lane
+    assert (lane.line_reason, lane.line_snr > DETECT_K) == ("unassigned", True)
+
+
+def _slot_row(case: RowCase, half: int = 36) -> RowCase:
+    """The row box over the lanes' span and ``half`` px above and below the
+    expected row, as a slot placed by an expected MW searches it."""
+    cy = round(_target_row(case))
+    x0, _, x1, _ = case.row
+    return dataclasses.replace(case, row=(x0, cy - half, x1, cy + half))
+
+
+def _knocked_out(
+    depth: float, dy: float, missing: Sequence[int], noise: float = 400.0, seed: int = 1000
+) -> tuple[RowCase, float]:
+    """A row in its MW slot (:func:`mw_slot_row`) and the expected row: a
+    non-specific band ``depth`` deep ``dy`` px from every lane's band, the
+    bands of ``missing`` knocked out, membrane noise ``noise``."""
+    return mw_slot_row(
+        "knocked out",
+        seed,
+        neighbour_dy=dy,
+        neighbour_depths=[depth] * 6,
+        missing=missing,
+        noise=noise,
+    )
+
+
+@pytest.mark.parametrize("noise", [0.0, 25.0, 400.0])
+@pytest.mark.parametrize(
+    ("depth", "dy", "missing"),
+    [(24000.0, 12.0, (1,)), (12000.0, -12.0, (1,)), (48000.0, 12.0, (1, 2))],
+)
+def test_a_knocked_out_lane_is_not_detected_at_low_noise(depth, dy, missing, noise):
+    # Lanes knocked out, a non-specific band 12 px from every lane's band:
+    # the knocked-out lanes grow from it. With no noise or little, the
+    # non-specific band's own tail on the row's line reaches the detection
+    # limit there (8 sigma or so at noise 25); it is its own band's, not
+    # another band's, and is left out (by its reflection about the band's
+    # centre): the knocked-out lanes are recorded as not detected at any
+    # noise level, and the row is placed.
+    case, expected = _knocked_out(depth, dy, missing, noise)
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    check_invariants(case, found)
+    _assert_not_detected(found, list(missing))
+    for i, (lane, cy) in enumerate(zip(found.lanes, case.lane_cy, strict=True)):
+        if i not in missing:
+            assert _holds(lane.rect, cy + 0.5) and not _holds(lane.rect, cy + 0.5 + dy), lane
+
+
+def test_an_off_lane_does_not_size_the_other_boxes():
+    # Lane 3 knocked out, a band 20 px high 18 px above its row in lane 3
+    # alone: lane 3 grows from it, off the row's line. Recorded as not
+    # detected, its extent sizes no box: every other box is a lone band's
+    # height, as if lane 3 held nothing.
+    case = _slot_row(
+        adversarial_row(
+            "tall off", 1000, missing=(2,), artefacts=[_band_at(2, -18.0, 24000.0, 44.0, 20.0)]
+        )
+    )
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    _assert_not_detected(found, [2])
+    assert found.size.height <= _lone_height(1000) + 1
+    assert "size_outlier" not in found.flags
+
+
+def test_a_lane_recorded_not_detected_is_never_named_cut_or_outlier(monkeypatch):
+    # Lane 3 knocked out, a band 46 px high 18 px below its row in lane 3
+    # alone, reaching the row box's bottom edge: lane 3 grows from it, off
+    # the row's line, its extent cut by the box and over twice the others'
+    # height (refused, cut, a size outlier). Its tail on the row's line,
+    # whose reflection the box's edge cuts off, keeps the row refused; read
+    # as nothing there instead, lane 3 is recorded as not detected, and the
+    # row is placed again without it: named neither cut nor a size outlier,
+    # the boxes placed the other lanes', none cut, a lone band's size.
+    case = _slot_row(
+        adversarial_row(
+            "cut off", 1000, missing=(2,), artefacts=[_band_at(2, 18.0, 24000.0, 44.0, 46.0)]
+        )
+    )
+    refused = detect(case, prefer_y=_target_row(case))
+    assert refused.refused and refused.off_cause == "line_signal"
+    assert {"size_outlier", "cut_by_row_box"} <= set(refused.flags)  # not vacuous
+    assert refused.lanes[2].cut
+    real = rowdetect._on_the_line
+
+    def nothing(*args, **kwargs):
+        _, _, window = real(*args, **kwargs)
+        return "no_band", 1.0, window
+
+    monkeypatch.setattr(rowdetect, "_on_the_line", nothing)
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    _assert_not_detected(found, [2])
+    assert not any(lane.cut for lane in found.lanes)
+    assert "cut_by_row_box" not in found.flags and "size_outlier" not in found.flags
+    assert not any(
+        "cuts through" in note or "left out of the shared size" in note for note in found.notes
+    )
+    assert found.size.height <= _lone_height(1000) + 1
+
+
+@pytest.mark.parametrize(
+    ("offsets", "expected", "on_line", "outcome"),
+    [
+        # 5 boxes of 7 lanes (2 empty), 3 off the row's line: half or more.
+        (
+            {0: 0.0, 1: 1.2, 3: -1.1, 4: 0.1, 6: 1.3},
+            {0: 0.0, 1: 1.2, 3: -1.1, 4: 0.1, 6: 1.3},
+            {},
+            ("half", [1, 3, 6]),
+        ),
+        # 7 boxes, the same 3 off: fewer than half, recorded.
+        (
+            {0: 0.0, 1: 1.2, 2: 0.2, 3: -1.1, 4: 0.1, 5: -0.3, 6: 1.3},
+            {0: 0.0, 1: 1.2, 2: 0.2, 3: -1.1, 4: 0.1, 5: -0.3, 6: 1.3},
+            {1: "no_band", 3: "no_band", 6: "no_band"},
+            (None, [1, 3, 6]),
+        ),
+        # 6 boxes, 3 off: half.
+        (
+            {i: (1.0 if i < 3 else 0.0) for i in range(6)},
+            {i: (1.0 if i < 3 else 0.0) for i in range(6)},
+            {},
+            ("half", [0, 1, 2]),
+        ),
+        # Off the line but on the expected row (0.75 is on it): the line runs elsewhere.
+        (
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.0, 4: 0.0},
+            {0: 0.9, 1: 0.75, 2: 0.9, 3: 0.9, 4: 0.9},
+            {1: "no_band"},
+            ("expected_row", [1]),
+        ),
+        # Off both, the other lane off the line on it (above): named, first.
+        (
+            {0: 0.0, 1: -0.9, 2: 0.0, 3: 0.0, 4: 1.2, 5: 0.0, 6: 0.0},
+            {0: 0.0, 1: -0.76, 2: 0.0, 3: 0.0, 4: -0.7, 5: 0.0, 6: 0.0},
+            {1: "unassigned", 4: "no_band"},
+            ("expected_row", [4]),
+        ),
+        # Another band on the line in lane 2 (and a line in lane 4): kept refused.
+        (
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: -0.8, 4: 0.0},
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: -0.8, 4: 0.0},
+            {1: "unassigned", 3: "line"},
+            ("line_signal", [1, 3]),
+        ),
+        # The line out of the rows searched in lane 2.
+        (
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.0, 4: 0.0},
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.0, 4: 0.0},
+            {1: "outside"},
+            ("line_signal", [1]),
+        ),
+        # A box that stays lies off the expected row (just past 0.75, above).
+        (
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.0, 4: 0.0},
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: -0.76, 4: 0.0},
+            {1: "no_band"},
+            ("other_box", [3]),
+        ),
+        # The same 0.75 below: on the row, recorded.
+        (
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.0, 4: 0.0},
+            {0: 0.0, 1: 0.9, 2: 0.0, 3: 0.75, 4: 0.0},
+            {1: "no_band"},
+            (None, [1]),
+        ),
+    ],
+    ids=[
+        "half-of-boxed",
+        "fewer-than-half",
+        "half",
+        "on-row",
+        "on-row-first",
+        "line-signal",
+        "line-outside",
+        "off-row",
+        "off-row-limit",
+    ],
+)
+def test_off_lanes_are_not_detected_only_when_every_condition_holds(
+    offsets, expected, on_line, outcome
+):
+    # The lanes off the row's line are recorded as not detected only when
+    # fewer than half of the boxes are off (of the boxes, not the declared
+    # lanes), each lies off the expected row too, no other band reaches the
+    # detection limit on the line in it, and every other box lies on the
+    # expected row; else the first condition that fails says why not.
+    assert rowdetect._not_detected(offsets, expected, on_line) == outcome
+
+
+@pytest.mark.parametrize(
+    ("missing", "off"), [((1, 2, 3), [0, 4, 5]), ((0, 2, 4), [0, 1, 2, 3, 4, 5])]
+)
+def test_half_the_lanes_knocked_out_refuses_the_row(missing, off):
+    # Three lanes of six knocked out, a non-specific band 48000 deep 26 px
+    # below every lane's: half of the boxes, or all, lie off the row's line
+    # (here the protein's: the line runs through the other band's boxes), so
+    # the line cannot tell the protein's row from the other. Refused, none
+    # recorded. (No row of the synthetic sets reaches this refusal; 16 px
+    # apart, the line bends through both rows' boxes and leaves a box on the
+    # expected row off it.)
+    case, expected = _knocked_out(48000.0, 26.0, missing)
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    check_invariants(case, found)
+    assert found.refused and "off_row_line" in found.flags and "off_expected_row" not in found.flags
+    assert found.off_cause == "half" and found.crossed == ()
+    assert not any(lane.reason == "off_expected_row" for lane in found.lanes)
+    assert [lane.lane for lane in found.lanes if abs(lane.line_offset) > ROW_LINE_K] == off
+    assert sum(lane.rect is not None for lane in found.lanes) == 6
+
+
+def test_the_not_detected_lane_s_reading_is_its_region_s():
+    # Lane 2 knocked out, a non-specific band 24000 deep 12 px below every
+    # lane's, little noise: on the row's line in lane 2 the non-specific
+    # band's own tail reaches some 8 noise sigmas, which its reflection about
+    # the band's centre takes out. The lane's SNR is read on the line, in the
+    # four rows its region spans: a speck of about 5 sigmas there counts, the
+    # same speck 10 px below the line, outside the region, does not.
+    case, expected = _knocked_out(24000.0, 12.0, (1,), 25.0)
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    _assert_not_detected(found, [1])
+    lane = found.lanes[1]
+    assert lane.snr < 3.0
+    wx0, wy0, wx1, wy1 = lane.window
+    assert wy1 - wy0 == 4  # the rows the reading interpolates between, smoothed 3 high
+    line = float(np.mean([(r[1] + r[3]) / 2 for r in found.slots if r is not None]))
+    assert wy0 + 1.0 <= line <= wy0 + 3.0
+    assert wx1 - wx0 == pytest.approx(2 * EMPTY_WINDOW * found.pitch, abs=2.0)
+    # A speck 2 px across: 3 x 5 smoothing keeps 0.73 of its depth.
+    depth = 5.0 * found.noise / 0.733
+    ys, xs = np.mgrid[0 : case.image.shape[0], 0 : case.image.shape[1]]
+    for dy, low, high in ((0.0, 4.0, 6.0), (10.0, -math.inf, 3.0)):
+        speck = depth * np.exp(
+            -0.5 * (((xs - 0.5 * (wx0 + wx1)) / 2.0) ** 2 + ((ys - line - dy) / 2.0) ** 2)
+        )
+        specked = dataclasses.replace(case, image=np.round(case.image - speck))
+        again = detect(specked, prefer_y=expected, saturated_at=0.0)
+        _assert_not_detected(again, [1])
+        assert low <= again.lanes[1].snr < high, (dy, again.lanes[1].snr)
+        assert again.lanes[1].window == lane.window
+
+
+def test_a_row_still_off_its_line_placed_again_is_refused(monkeypatch):
+    # Lane 3 off the row's line and recorded as not detected, the row is
+    # placed again without it; were a box still off the line then (the
+    # second fit made to leave lane 6 1.1 box heights off it), the row is
+    # refused: no lane recorded, the first fit's boxes reported, and why.
+    case = _row_beside(16.0, 2.0, missing=(2,))
+    fits = []
+    real = rowdetect._row_line
+
+    def row_line(centres, height, lanes=()):
+        offsets = real(centres, height, lanes)
+        fits.append(list(lanes))
+        if len(fits) == 2:
+            offsets = offsets.copy()
+            offsets[-1] = 1.1
+        return offsets
+
+    monkeypatch.setattr(rowdetect, "_row_line", row_line)
+    found = detect(case, prefer_y=_target_row(case))
+    assert fits == [[0, 1, 2, 3, 4, 5], [0, 1, 3, 4, 5]]
+    assert found.refused and "off_row_line" in found.flags and "off_expected_row" not in found.flags
+    assert found.lanes[2].rect is not None and found.lanes[2].reason == "band"
+    assert abs(found.lanes[2].line_offset) > ROW_LINE_K
+    assert abs(found.lanes[5].line_offset) <= ROW_LINE_K  # the first fit's
+    assert (found.off_cause, found.again) == ("again", ((5, 1.1),))
+    assert found.lanes[2].line_reason == "no_band"  # it would have been recorded
+    assert [note for note in found.notes if "recorded as not detected" in note] == []
+
+
+_A_BAND_LEFT_OUT = re.compile(
+    r"(?P<lanes>lanes? [\d, ]+): another band lies (?P<lo>\d+)(?: to (?P<hi>\d+))? px"
+    r" (?P<way>above|below) the box centre(?P<inside>, inside the box: the box holds part of"
+    r" it|; the box does not include it)"
+)
+
+
+def test_prefer_y_names_another_band_the_box_leaves_out():
+    # #58: the note on a second component says where the other band
+    # lies, from the box's centre, and whether the box holds part of it.
+    # Above and below: another row 0.6 times as deep 14 px above every
+    # lane's band, and a band 16 px below lanes 4 to 6 too: one clause per
+    # way, above first, lanes in order, the px as a range when they differ.
+    below = [_band_at(i, 16.0, 12000.0, 44.0, 12.0) for i in (3, 4, 5)]
+    case = adversarial_row(
+        "above and below",
+        1000,
+        neighbour_dy=-14.0,
+        neighbour_rel=0.6,
+        artefacts=below,
+        box_adjust=(0, -30, 0, 30),
+        img_h=200,
+    )
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    assert found.flags == ("multiple_components",)
+    [note] = found.notes
+    parts = re.findall(
+        r"lanes? [\d, ]+: another band lies [^;]+; the box does not include it", note
+    )
+    assert "; ".join(parts) == note, note
+    named = [_another_band(part) for part in parts]
+    assert [(lanes, way) for lanes, _, _, way in named] == [
+        ("lanes 1, 2, 3, 4, 5, 6", "above"),
+        ("lanes 4, 5, 6", "below"),
+    ], note
+    (_, lo_up, hi_up, _), (_, lo_down, hi_down, _) = named
+    assert 12 <= lo_up < hi_up <= 16 and 14 <= lo_down < hi_down <= 18, note  # ranges
+    for lane, cy in zip(found.lanes, case.lane_cy, strict=True):
+        assert not _holds(lane.rect, cy + 0.5 - 14.0) and not _holds(lane.rect, cy + 16.5)
+
+
+def test_prefer_y_names_another_band_inside_or_beside_the_box():
+    # The box holds part of another band: lanes 1 and 6 hold bands 18 px
+    # high, which set the box's height (16 px); lanes 2 to 5 hold bands 8 px
+    # high, another band 8 px below each. Where that band's peak falls in the
+    # box's rows (lanes 2, 3), the box holds part of it; else (lanes 4, 5)
+    # the box does not include it: a clause for each, the box's own first.
+    case = adversarial_row(
+        "inside",
+        1000,
+        h=8.0,
+        heights={0: 18.0, 5: 18.0},
+        artefacts=[_band_at(i, 8.0, 18000.0, 44.0, 8.0) for i in range(1, 5)],
+        box_adjust=(0, -20, 0, 20),
+    )
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    assert found.flags == ("multiple_components",)
+    [note] = found.notes
+    clauses = note.split("; the box does not include it; ")
+    assert len(clauses) == 2, note
+    outside, inside = (
+        _A_BAND_LEFT_OUT.fullmatch(clauses[0] + "; the box does not include it"),
+        (_A_BAND_LEFT_OUT.fullmatch(clauses[1])),
+    )
+    assert outside and inside and inside["inside"].startswith(", inside"), note
+    assert (outside["lanes"], inside["lanes"]) == ("lanes 4, 5", "lanes 2, 3"), note
+    assert outside["way"] == inside["way"] == "below"
+    for match, held in ((outside, False), (inside, True)):
+        assert 7 <= int(match["lo"]) <= int(match["hi"] or match["lo"]) <= 9, note
+        for i in (1, 2) if held else (3, 4):
+            lane = found.lanes[i]
+            [other] = [peak for peak in lane.peaks if not peak.own]
+            assert (lane.rect[1] <= other.y < lane.rect[3]) == held, (lane, other)
+    # Beside it: lanes 140 px apart, a stain in lane 4 46 px right of its
+    # centre, past the box's side, in its rows.
+    wide = adversarial_row(
+        "beside",
+        1000,
+        pitch=140.0,
+        artefacts=[blob(3, 6.0, 20000.0, dx=46.0)],
+        box_adjust=(0, -20, 0, 20),
+    )
+    found = detect(wide, prefer_y=_target_row(wide))
+    check_invariants(wide, found)
+    assert found.lanes[3].components == 2
+    [note] = [note for note in found.notes if "another band" in note]
+    assert note == (
+        "lane 4: another band lies beside the box, 0 px below its centre; the box does not"
+        " include it"
+    )
+    [stain] = [peak for peak in found.lanes[3].peaks if not peak.own]
+    rect = found.lanes[3].rect
+    assert rect[1] <= stain.y < rect[3] and stain.x >= rect[2]
+
+
+def test_other_bands_note_words_each_kind_and_way():
+    # The note from the boxes and second components alone (crop at (100,
+    # 50)): every box 40 x 12 at x 100..140, rows 50..62, centre row 56.
+    # Above them, 12.5 px (to the nearest px, half up: 13) and 10 px; below,
+    # past the box's bottom row, 15.4 px; inside one, 3.4 px below; in their
+    # rows beside one, right of it 2.5 px above and left of it 0.5 px below.
+    box = (100, 50, 140, 62)
+    note = rowdetect._other_bands_note(
+        {
+            0: (box, [(-6.5, 20.0)]),  # image y 43.5
+            2: (box, [(-4.0, 20.0), (21.4, 20.0)]),  # y 46, and y 71.4
+            3: (box, [(9.4, 30.0)]),  # y 59.4, x 130: inside
+            5: (box, [(3.5, 40.0), (6.5, -0.5)]),  # x 140 and 99.5: beside
+        },
+        100,
+        50,
+    )
+    assert note == (
+        "lanes 1, 3: another band lies 10 to 13 px above the box centre; the box does not"
+        " include it; lane 3: another band lies 15 px below the box centre; the box does not"
+        " include it; lane 4: another band lies 3 px below the box centre, inside the box:"
+        " the box holds part of it; lane 6: another band lies beside the box, 3 px above its"
+        " centre; the box does not include it; lane 6: another band lies beside the box,"
+        " 1 px below its centre; the box does not include it"
+    )
+    # The box's last row (61.x) is in it; its bottom edge (62) is not.
+    inside = rowdetect._other_bands_note({0: (box, [(11.9, 20.0)])}, 100, 50)
+    edge = rowdetect._other_bands_note({0: (box, [(12.0, 20.0)])}, 100, 50)
+    assert inside.endswith("6 px below the box centre, inside the box: the box holds part of it")
+    assert edge.endswith("6 px below the box centre; the box does not include it")
+    # The top row (50) is in it.
+    assert ", inside the box" in rowdetect._other_bands_note({0: (box, [(0.0, 20.0)])}, 100, 50)
+    assert "inside" not in rowdetect._other_bands_note({0: (box, [(-0.1, 20.0)])}, 100, 50)
+
+
+@pytest.mark.parametrize("seed", [1001, 1003])
+def test_a_lane_on_the_expected_row_but_off_the_bent_line_refuses(seed):
+    # Lanes 2 and 3 knocked out, a non-specific band 48000 deep 12 px below
+    # every lane's: lanes 2 and 3 are boxed on it, and the row's line, bent
+    # through those boxes, leaves the box of a lane that holds the protein,
+    # on the expected row, off it (lane 6; at seed 1003 lanes 5 and 6). That
+    # box on the expected row says the line runs through another row: none
+    # is recorded as not detected, and the row is refused.
+    case, expected = _knocked_out(48000.0, 12.0, (1, 2), seed=seed)
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    check_invariants(case, found)
+    assert found.refused and found.off_cause == "expected_row"
+    on_row = [
+        lane.lane
+        for lane in found.lanes
+        if abs(lane.line_offset) > ROW_LINE_K and abs(lane.expected_offset) <= ROW_LINE_K
+    ]
+    assert on_row == {1001: [5], 1003: [4, 5]}[seed]
+    for i in on_row:
+        assert _holds(found.lanes[i].rect, case.lane_cy[i] + 0.5)  # the protein's band
+
+
+@pytest.mark.parametrize("noise", [0.0, 25.0, 400.0])
+@pytest.mark.parametrize("dy", [-12.0, 12.0])
+def test_a_band_on_the_line_keeps_the_row_refused(dy, noise):
+    # Targets 8000 to 48000 deep, another band 24000 deep 12 px from each:
+    # lane 1's target, a shoulder on the deeper band with no peak of its
+    # own, is no seed, and lane 1 is boxed on the other band, off the row's
+    # line. On the line there lies the target, read past the other band's
+    # own tail by some 60 noise sigmas at noise 400 (more with less noise):
+    # it is not recorded as not detected, and the row is refused.
+    targets = [8000.0, 12000.0, 18000.0, 26000.0, 36000.0, 48000.0]
+    case, expected = mw_slot_row(
+        "shoulder",
+        1000,
+        depths=targets,
+        neighbour_dy=dy,
+        neighbour_depths=[24000.0] * 6,
+        noise=noise,
+    )
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    check_invariants(case, found)
+    assert found.refused and found.off_cause == "line_signal"
+    lane = found.lanes[0]
+    assert _holds(lane.rect, case.lane_cy[0] + 0.5 + dy) and abs(lane.line_offset) > ROW_LINE_K
+    assert lane.line_reason == "unassigned" and lane.line_snr > 40.0
+    assert [ld.lane for ld in found.lanes if ld.line_reason is not None] == [0]
+
+
+_ENDS = [
+    (dy, noise, seed)
+    for dy in (-22.0, -18.0, 18.0, 22.0)
+    for noise in (400.0, 25.0)
+    for seed in (1000, 1001, 1002, 1003, 1004)
+]
+
+
+@pytest.mark.parametrize(("dy", "noise", "seed"), _ENDS)
+def test_a_box_off_the_expected_row_keeps_the_row_refused(dy, noise, seed):
+    # Five lanes, lanes 1 to 3 holding the protein at the expected row,
+    # lanes 4 and 5 none, a band 24000 deep 18 to 22 px above or below in
+    # each of those two. The row's line passes lane 5's box for a smile and
+    # leaves lane 4's off it: lane 4 alone would be recorded as not
+    # detected, beside lane 5's box on that other band. A box that stays off
+    # the expected row says the line is not the expected row's: refused.
+    case, expected = mw_slot_row(
+        "ends",
+        seed,
+        n=5,
+        missing=(3, 4),
+        neighbour_dy=dy,
+        neighbour_depths=[0.0, 0.0, 0.0, 24000.0, 24000.0],
+        noise=noise,
+    )
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    check_invariants(case, found)
+    assert found.refused and found.off_cause == "other_box"
+    assert [lane.lane for lane in found.lanes if abs(lane.line_offset) > ROW_LINE_K] == [3]
+    fifth = found.lanes[4]
+    assert abs(fifth.line_offset) <= ROW_LINE_K < abs(fifth.expected_offset)
+    assert _holds(fifth.rect, case.lane_cy[4] + 0.5 + dy)  # on the other band
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="known limit (#201): two knocked-out end lanes beside a band 12 px off, within the"
+    " MW tolerance, pass for a smile and are boxed on it with no flag",
+)
+@pytest.mark.parametrize("dy", [-12.0, 12.0])
+def test_two_knocked_out_end_lanes_beside_a_band_within_the_tolerance(dy):
+    # As above, the band 12 px off: the row's line takes both end lanes'
+    # boxes in as a smile, and both are boxed on that band with no flag. A
+    # knocked-out lane should be recorded as not detected, or the row
+    # refused.
+    case, expected = mw_slot_row(
+        "ends",
+        1000,
+        n=5,
+        missing=(3, 4),
+        neighbour_dy=dy,
+        neighbour_depths=[0.0, 0.0, 0.0, 24000.0, 24000.0],
+    )
+    found = detect(case, prefer_y=expected, saturated_at=0.0)
+    assert found.refused or all(found.lanes[i].rect is None for i in (3, 4)), found.flags
+
+
+def _line_pass(s: np.ndarray) -> SimpleNamespace:
+    """A detection pass over the smoothed signal ``s`` (noise sigma 1), its
+    rows all the row's, nothing rejected, no line or side signal."""
+    none = np.zeros(s.shape, bool)
+    cand = SimpleNamespace(
+        rows=(0, s.shape[0]), dropped=none, lines=none, side=none, dust=none, rejected=[]
+    )
+    return SimpleNamespace(sig=SimpleNamespace(s_sm=s, sigma_sm=1.0), cand=cand)
+
+
+def _column_band(rows: int, cols: int, centre: float, depth: float, sigma: float) -> np.ndarray:
+    """A band ``depth`` high at row ``centre`` (index units) in every column."""
+    y = np.arange(rows, dtype=float)
+    return np.outer(depth * np.exp(-0.5 * ((y - centre) / sigma) ** 2), np.ones(cols))
+
+
+def test_on_the_line_leaves_out_the_own_band_s_tail_by_its_reflection():
+    # The lane's own band at row 10 (100 high, sigma 3) in every column; the
+    # row's line at row 16 (continuous 16.5), where the band's tail is 13.5
+    # high. Its reflection about the band's centre (row 4) is as high: the
+    # line holds nothing else, SNR 0, no band, though the tail in the four
+    # rows read (15 to 18) reaches DETECT_K. The slot: within 0.3 pitch of
+    # the box's centre (x 5, pitch 10: columns 2 to 7).
+    s = _column_band(40, 10, 10.0, 100.0, 3.0)
+    own = s > 1e-6
+    res = _line_pass(s)
+    surfaces = rowdetect._slot_surfaces(res)
+    reason, snr, window = rowdetect._on_the_line(res, surfaces, own, 10, (5.0, 10.5), 16.5, 10.0)
+    assert (reason, window) == ("no_band", (2, 15, 8, 19))
+    assert snr == pytest.approx(0.0, abs=1e-9)
+    # Another band on the line, 20 high, apart from the own band: it reads.
+    s2 = s + _column_band(40, 10, 16.0, 20.0, 1.0)
+    res2 = _line_pass(s2)
+    reason, snr, _ = rowdetect._on_the_line(
+        res2,
+        rowdetect._slot_surfaces(res2),
+        own & (s2 > 0) & (np.arange(40) < 14)[:, None],
+        10,
+        (5.0, 10.5),
+        16.5,
+        10.0,
+    )
+    assert reason == "unassigned" and snr == pytest.approx(20.0 + 100.0 * math.exp(-2.0), abs=0.01)
+
+
+def test_on_the_line_finds_the_own_band_s_centre_on_the_seed_s_side():
+    # The lane grew from a band 50 high at row 10; joined to it, with no peak
+    # of its own there, a band 100 high lies on the row's line (row 22). The
+    # own band's centre is read on the seed's side of row 16, midway: at row
+    # 10, so the band on the line reads whole. Read over the whole column,
+    # the centre would be the band on the line's, and its reflection would
+    # take it all out: recorded as not detected over the protein.
+    s = _column_band(40, 6, 10.0, 50.0, 3.0) + _column_band(40, 6, 22.0, 100.0, 3.0)
+    own = s > 1e-6
+    res = _line_pass(s)
+    reason, snr, _ = rowdetect._on_the_line(
+        res, rowdetect._slot_surfaces(res), own, 10, (3.0, 10.5), 22.5, 10.0
+    )
+    assert reason == "unassigned" and snr > 95.0
+    # The seed below the line: its side is below row 16.
+    flipped = s[::-1].copy()
+    res = _line_pass(flipped)
+    reason, snr, _ = rowdetect._on_the_line(
+        res, rowdetect._slot_surfaces(res), own[::-1], 29, (3.0, 30.5), 17.5, 10.0
+    )
+    assert reason == "unassigned" and snr > 95.0
+
+
+def test_on_the_line_outside_the_rows_reads_nothing():
+    # The line at a lane off the row's line can run past the row box's rows:
+    # nothing on it is read, and nothing recorded (reason outside).
+    s = _column_band(20, 10, 10.0, 100.0, 3.0)
+    own = s > 1e-6
+    res = _line_pass(s)
+    surfaces = rowdetect._slot_surfaces(res)
+
+    def read(line: float) -> tuple[str, float, tuple[int, int, int, int] | None]:
+        return rowdetect._on_the_line(res, surfaces, own, 10, (5.0, 10.5), line, 10.0)
+
+    assert read(0.4) == ("outside", 0.0, None)  # index -0.1
+    assert read(20.6) == ("outside", 0.0, None)  # index 20.1, past row 19
+    assert read(0.5)[2] == (2, 0, 8, 3)  # row 0: the rows read, clipped
+    assert read(19.5)[2] == (2, 18, 8, 20)  # row 19
+
+
+def test_beside_the_lane_tells_a_speck_beside_it_from_a_band_over_it():
+    # A seed range [10, 20), its middle column 15; a peak of the range alone
+    # on its last or first column whose row, at the middle, holds under
+    # EXTENT_LEVEL (30%) of it lies beside the lane (a speck's flank past
+    # the side); 30% or more there, the band reaches over the lane's middle.
+    ks = np.zeros((3, 40))
+    ks[1, 19] = 100.0
+    ks[1, 15] = 29.0
+    assert rowdetect._beside_the_lane(ks, 1, 19, 10, 20)
+    ks[1, 15] = 30.0
+    assert not rowdetect._beside_the_lane(ks, 1, 19, 10, 20)
+    ks[1, 10], ks[1, 15] = 100.0, 29.9
+    assert rowdetect._beside_the_lane(ks, 1, 10, 10, 20)
+    assert not rowdetect._beside_the_lane(ks, 1, 11, 10, 20)  # an inner column: never
+    assert not rowdetect._beside_the_lane(ks, 1, 18, 10, 20)
+    ks[0, 15] = 0.0  # the middle read in the peak's own row, not another
+    ks[2, 15] = 100.0
+    assert rowdetect._beside_the_lane(ks, 1, 10, 10, 20)
+    # An odd range [10, 21): middle column 15.
+    ks[1, 20], ks[1, 15], ks[1, 16] = 100.0, 31.0, 0.0
+    assert not rowdetect._beside_the_lane(ks, 1, 20, 10, 21)
 
 
 def _basin_pairs(basin: np.ndarray) -> tuple[int, int]:
@@ -3808,33 +4630,25 @@ def test_band_basins_reads_tops_touching_at_a_corner_by_their_rows():
     assert band == [0, 0]
 
 
-def test_apart_from_higher_takes_out_each_band_not_clearly_lower():
-    # One pixel per top, each its own basin, h = 10. The seed's band (tops 0
-    # and 7) is 130 high: its highest top's. Taken out: band 1 at 125, within
-    # h of it; band 2, whose highest top (140, listed after a lower one) is
-    # higher; band 3 at 80 but, like the seed's band, at the saturation level.
-    # Left: band 4 at 80 and band 5 at 120, h or more below it; and the
-    # seed's band's own other top, however high.
-    window = np.ones((8, 1))
-    basin = np.arange(1, 9).reshape(8, 1)
-    band = [0, 1, 2, 2, 3, 4, 5, 0]
-    heights = [100.0, 125.0, 50.0, 140.0, 80.0, 80.0, 120.0, 130.0]
-    at_limit = [True, False, False, False, True, False, False, False]
-    kept = rowdetect._apart_from_higher(window, basin, band, heights, 0, 10.0, at_limit)
-    assert kept[:, 0].tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-    # The seed's band not at the saturation level: band 3, clearly lower, stays.
-    at_limit[0] = False
-    kept = rowdetect._apart_from_higher(window, basin, band, heights, 0, 10.0, at_limit)
-    assert kept[:, 0].tolist() == [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
-    # No band that is not clearly lower: the window itself.
-    lower = rowdetect._apart_from_higher(window, basin, [0, 1], [100.0, 90.0], 0, 10.0, [False] * 2)
-    assert lower is window
-    # A band at the saturation level at a top lower than its highest (listed
-    # after it; the background tilts the heights): at the level all the same.
-    window, basin = np.ones((3, 1)), np.arange(1, 4).reshape(3, 1)
-    heights, at_limit = [130.0, 100.0, 90.0], [True, False, True]
-    kept = rowdetect._apart_from_higher(window, basin, [0, 1, 1], heights, 0, 10.0, at_limit)
-    assert kept[:, 0].tolist() == [1.0, 0.0, 0.0]
+def test_without_other_bands_takes_out_every_band_but_the_seed_s():
+    # One pixel per top, each its own basin, the values their heights. The
+    # seed (top 2) is of band 1, with top 5 beside it; bands 0, 3 and 4 are
+    # others, higher or lower, whatever their heights: taken out, each
+    # pixel draining to them set to 0. The seed's band's other top stays,
+    # however high, and so do pixels draining to no top (basin 0).
+    window = np.array([[50.0], [140.0], [100.0], [99.0], [20.0], [130.0], [7.0]])
+    basin = np.array([[1], [2], [3], [4], [5], [6], [0]])
+    band = [0, 1, 1, 3, 4, 1]  # top k's band: tops 1, 2 and 5 are one band
+    kept = rowdetect._without_other_bands(window, basin, band, 2)
+    assert kept[:, 0].tolist() == [0.0, 140.0, 100.0, 0.0, 0.0, 130.0, 7.0]
+    assert window[:, 0].tolist() == [50.0, 140.0, 100.0, 99.0, 20.0, 130.0, 7.0]  # not written
+    # Seeded from top 0, band 0's alone: every other top's basin goes.
+    kept = rowdetect._without_other_bands(window, basin, band, 0)
+    assert kept[:, 0].tolist() == [50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0]
+    # Every top of the seed's band: the window itself.
+    assert rowdetect._without_other_bands(window, basin, [0] * 6, 3) is window
+    # One top: no basins (_band_basins), the window itself.
+    assert rowdetect._without_other_bands(window, None, [0], 0) is window
 
 
 def test_other_row_takes_the_own_band_of_two_tops_as_near():
@@ -3879,13 +4693,12 @@ def _row_under(dy: float, depth: float):
     return f
 
 
-def test_prefer_y_counts_a_band_grown_into_as_a_component_from_a_share_of_the_lane_s_peak():
+def test_prefer_y_counts_another_band_as_a_component_from_a_share_of_the_lane_s_peak():
     # Every band 12000 deep, a row three times as deep 16 px above it, and a
-    # band 7200 deep 12 px below it. The growth stops at the valley to the
-    # band above (a second component) and takes in the one below, clearly
-    # weaker (pending the maintainer's decision, as above). That one reaches
-    # a fifth of the lane's peak, the band above's: under SECOND_SHARE, not a
-    # component, as it would not be outside the box.
+    # band 7200 deep 12 px below it. The growth stops at the valley to each
+    # (it used to take in the one below, clearly weaker): the extent holds
+    # neither. The band above is a second component; the one below reaches a
+    # fifth of the lane's peak, the band above's: under SECOND_SHARE, not one.
     case = adversarial_row(
         "three rows",
         1000,
@@ -3900,23 +4713,18 @@ def test_prefer_y_counts_a_band_grown_into_as_a_component_from_a_share_of_the_la
     check_invariants(case, found)
     assert found.flags == ("multiple_components",)
     for lane, cy in zip(found.lanes, case.lane_cy, strict=True):
-        assert _holds(lane.extent, cy + 12.5) and not _holds(lane.extent, cy - 15.5), lane
+        assert _holds(lane.extent, cy + 0.5), lane
+        assert not _holds(lane.extent, cy + 12.5) and not _holds(lane.extent, cy - 15.5), lane
         [under] = [peak for peak in lane.peaks if abs(peak.y - cy - 12.5) < 2.5]
+        assert not under.own
         assert under.snr < 0.25 * max(peak.snr for peak in lane.peaks)
         assert lane.components == 2
 
 
-@pytest.mark.parametrize(("below", "stops"), [(4.5, True), (6.5, False)])
-def test_prefer_y_reads_a_band_within_detect_k_sigma_of_the_seed_s_as_not_clearly_lower(
-    below, stops
-):
-    # One lane, noise sigma 1: a band 100 high on rows 8 to 12 and another
-    # ``below`` lower on rows 20 to 24, the valley between them 50 high,
-    # above the growth threshold (30). Grown from the first (the expected
-    # row's), growth stops at the valley to the other while it lies within
-    # DETECT_K sigma (6) of the seed's band's height; 6.5 lower, it is
-    # clearly lower and taken in, as growth from a lane's strongest pixel
-    # takes it in.
+def _two_bands(below: float, flip: bool) -> np.ndarray:
+    """One lane 14 px wide, noise sigma 1: a band 100 high on rows 8 to 12 and
+    another ``below`` lower on rows 20 to 24, the valley between them 50 high
+    (rows upside down with ``flip``)."""
     column = np.zeros(40)
     column[4:9] = np.linspace(0.0, 100.0, 5)
     column[8:13] = 100.0
@@ -3924,38 +4732,33 @@ def test_prefer_y_reads_a_band_within_detect_k_sigma_of_the_seed_s_as_not_clearl
     column[16:21] = np.linspace(50.0, 100.0 - below, 5)
     column[20:25] = 100.0 - below
     column[24:29] = np.linspace(100.0 - below, 0.0, 5)
-    s = np.outer(column, np.r_[np.zeros(3), np.ones(14), np.zeros(3)])
+    if flip:
+        column = column[::-1]
+    return np.outer(column, np.r_[np.zeros(3), np.ones(14), np.zeros(3)])
+
+
+@pytest.mark.parametrize("saturated", [False, True])
+@pytest.mark.parametrize("flip", [False, True])
+@pytest.mark.parametrize("below", [-20.0, 4.5, 6.5, 25.0])
+def test_prefer_y_stops_at_the_valley_to_a_band_however_much_lower(below, flip, saturated):
+    # The valley between the two bands lies above the growth threshold (30).
+    # Grown from the first (the expected row's), growth stops at the valley
+    # to the other, below or above it, higher (20 more), within DETECT_K
+    # sigma of it, or lower by more (6.5, 25), where it used to be taken in;
+    # with the bands' tops at the saturation level, too.
+    s = _two_bands(below, flip)
     kept = s > 0.0
     tops = rowdetect._peaks(np.where(kept, s, 0.0), DETECT_K)
-    assert [y for y, _ in sorted(tops)] in ([8, 20], [8, 24])  # two peaks: not vacuous
+    rows = sorted(y for y, _ in tops)
+    assert len(rows) == 2 and rows[1] - rows[0] >= 8  # two peaks: not vacuous
     lane = rowdetect._Lane(present=True, x_range=(0.0, 20.0), centre=10.0)
-    rowdetect._measure([lane], s, kept, 1.0, None, tops, 10.5)
-    assert lane.rect[1] == 6
-    assert lane.rect[3] == (17 if stops else 27)  # the valley at row 16, or past the other band
-
-
-def test_prefer_y_counts_each_band_grown_into_once_from_a_quarter_of_the_lane_s_peak():
-    # One lane grown over its band (100 high) and three others above or
-    # below it (_band_basins' bands 1, 2, 3), clearly lower, taken in (as
-    # growth from a lane's strongest pixel takes them in, pending the
-    # maintainer's decision): band 1's top at exactly a quarter of the lane's
-    # peak, band 2's two tops side by side at 40 and 41, band 3's at 24.
-    # Bands 1 and 2 count, each once: three components in all.
-    s = np.zeros((30, 10))
-    s[1:28, 2:8] = 10.0
-    s[5, 5] = 100.0
-    s[12, 5] = 25.0
-    s[19, 3], s[19, 6] = 40.0, 41.0
-    s[26, 5] = 24.0
-    tops = [(5, 5), (12, 5), (19, 3), (19, 6), (26, 5)]
-    lane = rowdetect._Lane(present=True, span=(0, 10), grown=s > 0.0)
-    lane.apart = {(12, 5): 1, (19, 3): 2, (19, 6): 2, (26, 5): 3}
-    sig = SimpleNamespace(s_sm=s, s_ds=np.zeros_like(s), sigma_sm=1.0)
-    res = SimpleNamespace(sig=sig, cand=SimpleNamespace(kept=s > 0.0), tops=tops, lanes=[lane])
-    rowdetect._count_components(res, None)
-    assert lane.within == 2
-    assert lane.components == 3
-    assert all(own for _, _, _, own, _ in lane.peaks)
+    limit = s >= min(100.0, 100.0 - below) if saturated else None
+    prefer = 29.5 if flip else 10.5
+    rowdetect._measure([lane], s, kept, 1.0, limit, tops, prefer)
+    if flip:  # rows 27 to 31, the valley at row 23
+        assert lane.rect[3] == 34 and lane.rect[1] in (23, 24), lane.rect
+    else:  # rows 8 to 12, the valley at row 16
+        assert lane.rect[1] == 6 and lane.rect[3] in (16, 17), lane.rect
 
 
 @pytest.mark.parametrize("slope", [0.06, -0.06])
@@ -4046,3 +4849,26 @@ def test_clipped_peaks_are_clipped_bands_stacked_across_a_shallow_valley(parts, 
     assert len(found) == len(extra)
     for (y, x), cols in zip(found, extra, strict=True):
         assert UNDER.start <= y < UNDER.stop and cols.start <= x < cols.stop
+
+
+def test_clipped_peaks_read_a_hollow_band_by_the_extent_a_click_grows():
+    # A clipped band (96) under another (100), a valley of 78 between, and a
+    # lighter centre (32) through the under band's height and the valley
+    # (columns 3 and 4), a tail (45) below it: both above EXTENT_LEVEL of
+    # the under band's height (28.8), so the extent a click on it grows holds
+    # them, and the centre lies between clipped pixels along its rows and
+    # well below the signal above and below it: a hollow band, its halves one
+    # band, no peak added. Grown to half its height instead (48), the extent
+    # would leave the centre and the tail out, read no hollow band, and add
+    # a peak (8, 2).
+    s, saturated = _plateaus(
+        (TOP, ALL, 100.0, True),
+        (VALLEY, ALL, 78.0, False),
+        (UNDER, ALL, 96.0, True),
+        (slice(6, 11), slice(3, 5), 32.0, False),
+        (slice(11, 14), slice(3, 5), 45.0, False),
+    )
+    tops = rowdetect._peaks(s, 6.0)
+    assert not any(UNDER.start <= y < UNDER.stop for y, _ in tops)  # no peak of _peaks
+    assert EXTENT_LEVEL * 96.0 < 32.0 < 45.0 < 0.5 * 96.0  # not vacuous
+    assert rowdetect._clipped_peaks(s, s > 0.0, 6.0, saturated, tops) == []
