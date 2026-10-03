@@ -978,7 +978,7 @@ def test_log_params(tmp_path):
 @pytest.mark.parametrize("padding", [None, (2, 3)])
 def test_same_placement_again_is_noop(tmp_path, padding):
     # The same placement again finds the same bands where its boxes are: no
-    # change, no entry. With padding (N1 §8): the fitted size plus the padding.
+    # change, no entry. With padding: the fitted size plus the padding.
     b = calibrated(tmp_path)
     s = b.session
     target = add(b, TARGET)
@@ -1515,12 +1515,13 @@ _WORDS = [
     ("found", "mw", "message"), [w[1:] for w in _WORDS], ids=[w[0] for w in _WORDS]
 )
 def test_a_row_off_its_line_placed_by_mw_says_why_and_what_to_do(found, mw, message):
-    # §4 of #58's row by MW: the lanes off the row's line and the numbers
-    # they were refused by, why none was recorded as not detected (the
-    # first condition that failed), and the next step: where boxes lie off
-    # the expected MW's row, click the protein's bands (a row box would box
-    # that other band); else a row box over the whole band, clicks where a
-    # lane holds no protein. Never a row box the user did not draw.
+    # A row placed by its expected MW (#58) and refused off its line says
+    # which lanes lie off it and the numbers they were refused by, why none
+    # was recorded as not detected (the first condition that failed), and
+    # the next step: where boxes lie off the expected MW's row, click the
+    # protein's bands (a row box would box that other band); else a row box
+    # over the whole band, clicks where a lane holds no protein. Never a row
+    # box the user did not draw.
     error = ops._row_refusal(found, 60, 600, mw)
     assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
     assert str(error) == message

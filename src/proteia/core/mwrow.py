@@ -10,7 +10,7 @@ MW check's tolerance t: from m (1 + 2t) down to m / (1 + 2t)
 (:data:`SEARCH_FACTOR` tolerances either way, within the calibrated range),
 plus a margin above and below of :data:`SLOT_MARGIN_DECADES` of a decade of MW
 there (half a typical band), at least :data:`SLOT_MIN_PX` px, all read at the
-centre of the lanes' span. The slot follows the protein line (D1): at each
+centre of the lanes' span. The slot follows the protein line: at each
 column of the span it lies as many whole pixels lower as the line at m does
 there, ``round(y(m, x + 0.5) - y(m, centre))``, which the detector levels
 (:func:`~proteia.core.rowdetect.detect_row_along`). The line at one MW is
@@ -135,7 +135,7 @@ def _shifts(
     """Each column's shift at log10 MW ``z``, ``round(y(x + 0.5) - at_centre)``,
     and the line's slope there in degrees, from ``curves``: the calibration's
     curves at the span's first and last column (``curve_at``). The protein line
-    at one MW is straight in x (D1), so y is read at those two columns and
+    at one MW is straight in x, so y is read at those two columns and
     interpolated between them; with one ladder they are one curve, and every
     shift is 0."""
     first, last = x0 + 0.5, x1 - 0.5
