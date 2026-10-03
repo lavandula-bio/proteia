@@ -4554,6 +4554,8 @@ def test_a_box_off_the_expected_row_keeps_the_row_refused(dy, noise, seed):
     # leaves lane 4's off it: lane 4 alone would be recorded as not
     # detected, beside lane 5's box on that other band. A box that stays off
     # the expected row says the line is not the expected row's: refused.
+    # Nearer, 12 to 16 px, the line may take both boxes in as a smile (#201,
+    # the next test).
     case, expected = mw_slot_row(
         "ends",
         seed,
@@ -4574,22 +4576,37 @@ def test_a_box_off_the_expected_row_keeps_the_row_refused(dy, noise, seed):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="known limit (#201): two knocked-out end lanes beside a band 12 px off, within the"
-    " MW tolerance, pass for a smile and are boxed on it with no flag",
+    reason="known limit (#201): two knocked-out end lanes beside a band 12 to 16 px off,"
+    " within the MW tolerance, pass for a smile and are boxed on it with no flag",
 )
-@pytest.mark.parametrize("dy", [-12.0, 12.0])
-def test_two_knocked_out_end_lanes_beside_a_band_within_the_tolerance(dy):
-    # As above, the band 12 px off: the row's line takes both end lanes'
-    # boxes in as a smile, and both are boxed on that band with no flag. A
-    # knocked-out lane should be recorded as not detected, or the row
-    # refused.
+@pytest.mark.parametrize(
+    ("dy", "noise", "seed"),
+    [
+        (-12.0, 400.0, 1000),
+        (12.0, 400.0, 1000),
+        (-14.0, 400.0, 1001),
+        (14.0, 400.0, 1000),
+        (-14.0, 25.0, 1003),
+        (14.0, 25.0, 1004),
+        (-16.0, 400.0, 1002),
+        (16.0, 400.0, 1000),
+        (16.0, 25.0, 1000),
+    ],
+)
+def test_two_knocked_out_end_lanes_beside_a_band_within_the_tolerance(dy, noise, seed):
+    # As above, the band 12 to 16 px off (in 2 of 10 rows at 16 px, 6 or 8
+    # of 10 at 14, nearly every row at 12): the row's line takes both end
+    # lanes' boxes in as a smile, and both are boxed on that band with no
+    # flag. A knocked-out lane should be recorded as not detected, or the
+    # row refused.
     case, expected = mw_slot_row(
         "ends",
-        1000,
+        seed,
         n=5,
         missing=(3, 4),
         neighbour_dy=dy,
         neighbour_depths=[0.0, 0.0, 0.0, 24000.0, 24000.0],
+        noise=noise,
     )
     found = detect(case, prefer_y=expected, saturated_at=0.0)
     assert found.refused or all(found.lanes[i].rect is None for i in (3, 4)), found.flags
