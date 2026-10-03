@@ -13,25 +13,35 @@ citing their issue, so the fix must remove the mark.
 The rows of every neighbouring-band family run only with ``PROTEIA_SLOW=1``;
 one row of each runs always. The ring-stain and lane-anchor recipes run
 through the operations, in ``test_operations``.
+
+The rows prove their own power (#181): detectors degraded on purpose (lanes
+numbered by equal slots, the doubt or the cut flag left out, a duller
+threshold, and so on) must score worse on them than today's, in the same
+run. Five run always, on the rows at seed 1000 and the bench's; all of them
+run on every row with ``PROTEIA_SLOW=1``.
 """
 
 import dataclasses
 import functools
 import math
 import os
+import warnings
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import pytest
 
 from proteia.core import evaluate, rowdetect
 from proteia.core.quantify import estimate_background
-from proteia.core.rowdetect import Peak, RowDetection
+from proteia.core.rowdetect import LaneDetection, Peak, RowDetection
 from rowcases import (
     ADVERSARIAL,
     BENCH_RECIPES,
     MEMBRANE,
     NOISE_SIGMA,
     STRESS,
+    LaneScore,
     LaneTruth,
     Recipe,
     RowCase,
@@ -1154,3 +1164,487 @@ def test_the_grid_row_draws_each_part_where_it_says():
 def test_a_ring_stain_has_two_sides_only():
     with pytest.raises(ValueError, match="side must be 'top' or 'bottom', not 'left'"):
         ring_stain(2, "left", 1000.0)
+
+
+# --- #181: a degraded detector must lose score ---
+
+# A degraded detector has, summed over the same rows, at least this many
+# more silent lanes than today's, or at least this many more wrong lanes and
+# no fewer silent ones. Summed over the rows it runs on, each variant below
+# has at least 6 more silent lanes, or at least 15 more wrong lanes and no
+# fewer silent ones (the table below); a detector that makes no row worse
+# loses nothing.
+LOSS = 3
+
+
+def _nth(labels: Sequence[str], k: int) -> str:
+    return repr(labels[k]) if k < len(labels) else "none"
+
+
+def _lanes(score: RowScore) -> str:
+    """The row's score in words, without its label."""
+    return str(score).removeprefix(f"{score.label}: ")
+
+
+def not_worse(name: str, today: Sequence[RowScore], degraded: Sequence[RowScore]) -> str:
+    """Why the degraded detector ``name`` does not score worse than today's on
+    the same rows, "" when it does (:data:`LOSS`): both differences, the
+    threshold, and the rows whose silent or wrong lanes changed (the first
+    10), each with both scores. Raises ValueError when the two score other
+    rows, naming the first that differs."""
+    labels = [score.label for score in today]
+    theirs = [score.label for score in degraded]
+    if theirs != labels:
+        k = next(
+            k
+            for k in range(max(len(labels), len(theirs)))
+            if labels[k : k + 1] != theirs[k : k + 1]
+        )
+        raise ValueError(
+            f"{name}: {len(degraded)} rows scored against today's {len(today)}, not the same"
+            f" rows; row {k + 1}: {_nth(theirs, k)} against today's {_nth(labels, k)}"
+        )
+    silent = sum(score.silent for score in degraded) - sum(score.silent for score in today)
+    wrong = sum(score.wrong for score in degraded) - sum(score.wrong for score in today)
+    if silent >= LOSS or (wrong >= LOSS and silent >= 0):
+        return ""
+    changed = [
+        (old, new)
+        for old, new in zip(today, degraded, strict=True)
+        if (old.silent, old.wrong) != (new.silent, new.wrong)
+    ]
+    rows = "".join(
+        f"\n  {new.label}: silent {old.silent} -> {new.silent}, wrong {old.wrong} -> {new.wrong}"
+        f"\n    today:    {_lanes(old)}"
+        f"\n    degraded: {_lanes(new)}"
+        for old, new in changed[:10]
+    )
+    return (
+        f"{name}: silent {silent:+d}, wrong {wrong:+d} against today's detector on"
+        f" {len(labels)} rows; it must have at least {LOSS} more silent lanes, or at least"
+        f" {LOSS} more wrong lanes and no fewer silent ones. Rows changed: {len(changed)}"
+        f"{' (the first 10)' if len(changed) > 10 else ''}{rows}"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class Degraded:
+    """A detector degraded on purpose: ``patches`` sets these
+    :mod:`~proteia.core.rowdetect` attributes while each row is detected
+    again (monkeypatch, raising: a renamed one is an error, never a detector
+    left whole), or ``rewrite`` changes today's result of the row (kept, never
+    changed in place). ``quiet``: the message of a RuntimeWarning the setting
+    raises, ignored."""
+
+    id: str
+    how: str
+    patches: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    rewrite: Callable[[RowDetection, RowCase], RowDetection] | None = None
+    quiet: str | None = None
+
+    def detect(self, recipe: Recipe, case: RowCase, today: RowDetection) -> RowDetection:
+        """The degraded detection of the recipe's row ``case``, ``today`` today's."""
+        if self.rewrite is not None:
+            return self.rewrite(today, case)
+        with pytest.MonkeyPatch.context() as patch, warnings.catch_warnings():
+            if self.quiet is not None:
+                warnings.filterwarnings("ignore", self.quiet, RuntimeWarning)
+            for attribute, value in self.patches.items():
+                patch.setattr(rowdetect, attribute, value)
+            return detect(recipe, case)
+
+
+# What a lane reading is checked by: its doubt and its two refusals.
+_READING_FLAGS = ("doubtful_lanes", "ambiguous_lanes", "lanes_outside_row")
+
+
+def equal_slots(found: RowDetection, case: RowCase) -> RowDetection:
+    """``found`` numbered as a plain gel tool numbers lanes: the row box split
+    into equal slots, one per lane, each box in the slot its centre falls in
+    (the stronger of two), the reading never checked (its doubt and
+    refusals dropped)."""
+    x0, y0, x1, y1 = case.row
+    n = case.n_lanes
+    width = (x1 - x0) / n
+    best: list[LaneDetection | None] = [None] * n
+    for lane in found.lanes:
+        if lane.rect is None:
+            continue
+        slot = min(n - 1, max(0, int(((lane.rect[0] + lane.rect[2]) / 2 - x0) // width)))
+        held = best[slot]
+        if held is None or lane.snr > held.snr:
+            best[slot] = lane
+    lanes = []
+    for slot, lane in enumerate(best):
+        if lane is not None:
+            lanes.append(dataclasses.replace(lane, lane=slot))
+            continue
+        empty = dataclasses.replace(
+            found.lanes[slot],
+            rect=None,
+            reason="no_band",
+            extent=None,
+            bg_offset=None,
+            components=0,
+            hollow=False,
+            window=(int(x0 + slot * width), y0, int(x0 + (slot + 1) * width), y1),
+            cut=False,
+            line_offset=None,
+            peaks=(),
+        )
+        lanes.append(empty)
+    return dataclasses.replace(
+        found,
+        lanes=tuple(lanes),
+        flags=tuple(flag for flag in found.flags if flag not in _READING_FLAGS),
+        notes=tuple(note for note in found.notes if note != found.doubt_note),
+    )
+
+
+def half_pitch_shift(found: RowDetection, case: RowCase) -> RowDetection:
+    """``found`` with every box moved right by half the row's pitch (to the
+    nearest px), as a coordinate off by half a lane; a row without a pitch as
+    it was."""
+    if found.pitch is None:
+        return found
+    dx = round(found.pitch / 2)
+    return dataclasses.replace(
+        found,
+        lanes=tuple(
+            lane
+            if lane.rect is None
+            else dataclasses.replace(
+                lane, rect=(lane.rect[0] + dx, lane.rect[1], lane.rect[2] + dx, lane.rect[3])
+            )
+            for lane in found.lanes
+        ),
+    )
+
+
+def no_doubt(found: RowDetection, case: RowCase) -> RowDetection:
+    """``found`` without the doubtful_lanes flag and its note: what detection
+    returns when it never doubts a reading (it only adds them)."""
+    return dataclasses.replace(
+        found,
+        flags=tuple(flag for flag in found.flags if flag != "doubtful_lanes"),
+        notes=tuple(note for note in found.notes if note != found.doubt_note),
+    )
+
+
+def no_lines(s: np.ndarray, *args: Any, **kwargs: Any) -> np.ndarray:
+    """No line or strip across the lanes, anywhere (for ``rowdetect._lines``)."""
+    return np.zeros(s.shape, bool)
+
+
+DEGRADED = (
+    # A plain gel tool's lane numbers: wrong when the box holds a ladder, a
+    # label or empty lanes, or its margins differ.
+    Degraded("equal_slots", "lanes numbered by equal slots of the box", rewrite=equal_slots),
+    # A coordinate off by half a lane (a mirror, a crop shift); also a check
+    # of the score itself.
+    Degraded("half_pitch", "every box moved right by half the pitch", rewrite=half_pitch_shift),
+    # #111: a first row box over a ladder or a label reads every lane off.
+    Degraded("no_doubt", "no doubtful_lanes flag", rewrite=no_doubt),
+    # A box edge through a band, its net low and nothing said.
+    Degraded("no_cut", "CUT_LEVEL=inf: no cut_by_row_box", {"CUT_LEVEL": math.inf}),
+    # A threshold tuned on clean rows misses weak bands under real noise.
+    Degraded("detect_k_12", "DETECT_K=12", {"DETECT_K": 12.0}),
+    # A box dragged over two rows takes the other row's bands for its own.
+    Degraded("no_off_row_line", "ROW_LINE_K=inf: no off_row_line", {"ROW_LINE_K": math.inf}),
+    # One very tall band stretches the shared box.
+    Degraded("no_size_guard", "SIZE_GUARD=inf", {"SIZE_GUARD": math.inf}),
+    # A panel's frame line or a strip along the image's edge boxed (#116).
+    Degraded("no_line_filter", "no line across the lanes", {"_lines": no_lines}),
+    # Dust boxed as a band.
+    Degraded(
+        "weak_speck_filter",
+        "MIN_WIDTH_PX=1, MIN_WIDTH_PITCH=0",
+        {"MIN_WIDTH_PX": 1, "MIN_WIDTH_PITCH": 0.0},
+    ),
+    # Two bands in one box, no hint of the second.
+    Degraded("no_second_peak", "SECOND_SHARE=inf", {"SECOND_SHARE": math.inf}),
+    # Touching bands not cut apart.
+    Degraded(
+        "no_valley_split",
+        "VALLEY_FRAC=0",
+        {"VALLEY_FRAC": 0.0},
+        quiet="invalid value encountered in multiply",
+    ),
+)
+IN_CI = DEGRADED[:5]
+# Each attribute the variants patch, as the detector holds it.
+_UNPATCHED = {name: getattr(rowdetect, name) for variant in DEGRADED for name in variant.patches}
+
+
+def self_check_rows(every: bool) -> list[Recipe]:
+    """The rows the variants are scored on: every floor row and grid row, or
+    the floor rows at seed 1000 and the bench's."""
+    return FLOOR_ROWS + GRID if every else FLOOR_SUBSET
+
+
+@functools.cache
+def degraded_scores(every: bool) -> dict[str, list[RowScore]]:
+    """Each variant's score of each row (:func:`self_check_rows`), by its id:
+    all variants on every row, those in :data:`IN_CI` on the subset. Each row
+    is drawn once for all of them and dropped before the next."""
+    variants = DEGRADED if every else IN_CI
+    table: dict[str, list[RowScore]] = {variant.id: [] for variant in variants}
+    for recipe in self_check_rows(every):
+        _, today, truth = scored(recipe)
+        case = recipe.build()
+        for variant in variants:
+            found = variant.detect(recipe, case, today)
+            table[variant.id].append(score_row(recipe, case, found, truth))
+    return table
+
+
+def lost_score(variant: Degraded, every: bool) -> str:
+    """What :func:`not_worse` says of the variant against today's detector."""
+    today = [scored(recipe)[0] for recipe in self_check_rows(every)]
+    name = f"{variant.id} ({variant.how})"
+    return not_worse(name, today, degraded_scores(every)[variant.id])
+
+
+# Measured on main (fbc2afb), silent / wrong lanes against today's (2 / 51
+# on the 96 rows at seed 1000 and the bench's, 2 / 231 on all 349):
+#                      96 rows       349 rows
+#   equal_slots        +22 / -6      +58 / -22
+#   half_pitch        +467 / +521  +1394 / +1838
+#   no_doubt           +23 / 0       +63 / 0
+#   no_cut              +8 / 0       +56 / 0
+#   detect_k_12        +16 / +48     +16 / +51
+#   no_off_row_line                   +9 / -9
+#   no_size_guard                    +20 / +14
+#   no_line_filter                    +0 / +15
+#   weak_speck_filter                 +6 / +18
+#   no_second_peak                    +8 / 0
+#   no_valley_split                  +26 / +22
+# Three settings make no row worse and are not tested (every row): no
+# ambiguity margin (6 wrong lanes fewer, as many silent), DETECT_K=3 (no
+# change), no second background stage (7 wrong lanes fewer).
+
+
+@pytest.mark.parametrize("variant", IN_CI, ids=lambda variant: variant.id)
+def test_a_degraded_detector_loses_score_on_the_seed_1000_and_bench_rows(variant):
+    problem = lost_score(variant, every=False)
+    assert not problem, problem
+
+
+@slow
+@pytest.mark.parametrize("variant", DEGRADED, ids=lambda variant: variant.id)
+def test_a_degraded_detector_loses_score_on_every_row(variant):
+    problem = lost_score(variant, every=True)
+    assert not problem, problem
+
+
+def test_the_self_check_runs_the_measured_variants_on_the_measured_rows():
+    # The variants and rows the deltas above were measured on: five always,
+    # on the 96 rows; all eleven on the 162 floor rows and the 187 grid rows.
+    assert [variant.id for variant in DEGRADED] == [
+        "equal_slots",
+        "half_pitch",
+        "no_doubt",
+        "no_cut",
+        "detect_k_12",
+        "no_off_row_line",
+        "no_size_guard",
+        "no_line_filter",
+        "weak_speck_filter",
+        "no_second_peak",
+        "no_valley_split",
+    ]
+    assert [variant.id for variant in IN_CI] == [
+        "equal_slots",
+        "half_pitch",
+        "no_doubt",
+        "no_cut",
+        "detect_k_12",
+    ]
+    every = self_check_rows(True)
+    assert (len(self_check_rows(False)), len(every)) == (96, 349)
+    assert len({recipe.label for recipe in every}) == 349
+
+
+def test_the_valley_split_variant_ignores_its_warning():
+    # VALLEY_FRAC=0 on a burnt-out band raises a RuntimeWarning; the variant
+    # ignores it (the grid row that always runs).
+    variant = {variant.id: variant for variant in DEGRADED}["no_valley_split"]
+    label = "burnt_out/light90000_speck4_60000_-18-10"
+    recipe = next(recipe for recipe in GRID if recipe.label == label)
+    case, today = recipe.build(), scored(recipe)[1]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(RuntimeWarning, match="invalid value encountered in multiply"):
+            dataclasses.replace(variant, quiet=None).detect(recipe, case, today)
+        variant.detect(recipe, case, today)
+
+
+def test_a_degraded_detector_leaves_the_detector_as_it_was():
+    degraded_scores(False)
+    assert [
+        name for name, value in _UNPATCHED.items() if getattr(rowdetect, name) is not value
+    ] == []
+
+
+def test_a_setting_the_detector_does_not_have_is_an_error():
+    # The setting patched before it is set back too.
+    variant = Degraded("renamed", "a setting gone", {"CUT_LEVEL": 0.0, "NO_SUCH_SETTING": 1.0})
+    with pytest.raises(AttributeError, match="NO_SUCH_SETTING"):
+        variant.detect(BASE, _base_case(), scored(BASE)[1])
+    assert rowdetect.CUT_LEVEL is _UNPATCHED["CUT_LEVEL"]
+
+
+def counted(label: str, silent: int, wrong: int) -> RowScore:
+    """A 20-lane row's score with ``silent`` silent misses and ``wrong`` -
+    ``silent`` flagged ones."""
+    lanes = [LaneScore(lane, "miss", "silent") for lane in range(silent)]
+    lanes += [
+        LaneScore(lane, "miss", "flagged", shown_by="doubtful_lanes")
+        for lane in range(silent, wrong)
+    ]
+    return RowScore(label, None, 20, 20 - wrong, tuple(lanes))
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "loses"),
+    [
+        ((3, 3), (1, 1), True),  # 3 more silent, 2 fewer wrong
+        ((2, 7), (1, 1), False),  # 2 more of each
+        ((0, 8), (1, 1), True),  # 3 more wrong, as many silent
+        ((1, 9), (1, 1), True),  # 4 more wrong, 1 more silent
+        ((0, 15), (0, 1), False),  # 10 more wrong, 1 fewer silent
+        ((0, 7), (1, 1), False),  # 2 more wrong
+        ((0, 5), (1, 1), False),  # today's scores
+    ],
+)
+def test_a_degraded_detector_loses_three_silent_or_three_wrong_lanes(first, second, loses):
+    # Today: 1 silent and 6 wrong lanes on the two rows.
+    today = [counted("a", 0, 5), counted("b", 1, 1)]
+    degraded = [counted("a", *first), counted("b", *second)]
+    assert (not_worse("variant", today, degraded) == "") is loses
+
+
+def test_a_detector_that_does_not_lose_is_shown_with_the_rows_it_changed():
+    # 13 rows, each with one wrong lane, flagged; the variant reads 12 of
+    # them right: 12 fewer wrong lanes, as many silent.
+    today = [counted(f"row {k}", 0, 1) for k in range(13)]
+    degraded = [counted(f"row {k}", 0, 1 if k == 6 else 0) for k in range(13)]
+    message = not_worse("variant (how)", today, degraded)
+    assert message.startswith(
+        "variant (how): silent +0, wrong -12 against today's detector on 13 rows; it must"
+        " have at least 3 more silent lanes, or at least 3 more wrong lanes and no fewer"
+        " silent ones. Rows changed: 12 (the first 10)\n"
+        "  row 0: silent 0 -> 0, wrong 1 -> 0\n"
+        "    today:    19/20 right; lane 1 miss flagged (doubtful_lanes)\n"
+        "    degraded: 20/20 right\n"
+        "  row 1: silent 0 -> 0, wrong 1 -> 0\n"
+    )
+    lines = message.splitlines()
+    assert len(lines) == 31
+    shown = [line.split(":")[0] for line in lines[1::3]]
+    assert shown == [f"  row {k}" for k in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10)]
+    # One row more silent: lane 1, wrong today, read right; lane 2 missed
+    # silently. Both lanes are named.
+    lane_2_silent = RowScore("row 0", None, 20, 19, (LaneScore(1, "miss", "silent"),))
+    one = not_worse("variant", today[:2], [lane_2_silent, today[1]])
+    assert one.endswith(
+        "silent +1, wrong +0 against today's detector on 2 rows; it must have at least 3 more"
+        " silent lanes, or at least 3 more wrong lanes and no fewer silent ones. Rows changed:"
+        " 1\n  row 0: silent 0 -> 1, wrong 1 -> 1\n"
+        "    today:    19/20 right; lane 1 miss flagged (doubtful_lanes)\n"
+        "    degraded: 19/20 right; lane 2 miss silent"
+    )
+
+
+def test_a_degraded_detector_scored_on_other_rows_is_an_error():
+    # The message names the first row that differs, counted from 1.
+    today = [counted("a", 0, 1), counted("b", 0, 1)]
+    with pytest.raises(
+        ValueError,
+        match="^variant: 1 rows scored against today's 2, not the same rows; row 2: none"
+        " against today's 'b'$",
+    ):
+        not_worse("variant", today, today[:1])
+    with pytest.raises(ValueError, match="; row 3: 'c' against today's none$"):
+        not_worse("variant", today, [*today, counted("c", 0, 1)])
+    with pytest.raises(
+        ValueError,
+        match="^variant: 2 rows scored against today's 2, not the same rows; row 2: 'c'"
+        " against today's 'b'$",
+    ):
+        not_worse("variant", today, [today[0], counted("c", 0, 1)])
+    with pytest.raises(ValueError, match="; row 1: 'b' against today's 'a'$"):
+        not_worse("variant", today, today[::-1])
+
+
+def test_equal_slots_number_the_boxes_by_where_they_lie():
+    # The bench row with lane 2's box moved onto lane 1's band, stronger
+    # than lane 1's box: slot 1 keeps it, slot 2 is empty, none of lane 2's
+    # band left in it. The doubt and the reading's refusals are dropped; any
+    # other flag and note stay.
+    case, found, _ = base()
+    moved = {
+        2: {
+            "rect": found.lanes[1].rect,
+            "snr": found.lanes[1].snr + 1.0,
+            "extent": (1, 2, 3, 4),
+            "bg_offset": 2.0,
+            "hollow": True,
+            "cut": True,
+            "line_offset": 3.0,
+        }
+    }
+    doubt = "lane numbers doubtful: lane 3 lies a lane early"
+    flags = ("ambiguous_lanes", "lanes_outside_row", "doubtful_lanes", "background_mismatch")
+    notes = ("a note", doubt)
+    numbered = equal_slots(changed(found, moved, flags=flags, notes=notes), case)
+    assert numbered.slots[:2] == found.slots[:2] and numbered.slots[3:] == found.slots[3:]
+    assert (numbered.lanes[1].lane, numbered.lanes[1].snr) == (1, found.lanes[1].snr + 1.0)
+    empty = numbered.lanes[2]
+    assert (empty.rect, empty.reason, empty.components, empty.peaks) == (None, "no_band", 0, ())
+    kept = (empty.extent, empty.bg_offset, empty.hollow, empty.cut, empty.line_offset)
+    assert kept == (None, None, False, False, None)
+    # Slot 2 of six in the row box: x 199.67 to 268, cut to whole px.
+    assert case.row == (63, 48, 473, 74)
+    assert empty.window == (199, 48, 268, 74)
+    assert (numbered.flags, numbered.notes) == (("background_mismatch",), ("a note",))
+    # The weaker of two boxes in a slot gives way: lane 1's own box, now.
+    weaker = {2: {"rect": found.lanes[1].rect, "snr": found.lanes[1].snr - 1.0}}
+    assert equal_slots(changed(found, weaker), case).lanes[1] == found.lanes[1]
+
+
+def test_equal_slots_hold_a_box_beyond_the_row_box_in_the_end_slot():
+    # Lane 1's box moved left of the row box and lane 6's right of it, their
+    # centres 25 px outside: each stays in the slot at its own end.
+    case, found, _ = base()
+    x0, _, x1, _ = case.row
+    first, last = found.lanes[0].rect, found.lanes[5].rect
+    left = (x0 - 40, first[1], x0 - 10, first[3])
+    right = (x1 + 10, last[1], x1 + 40, last[3])
+    numbered = equal_slots(changed(found, {0: {"rect": left}, 5: {"rect": right}}), case)
+    assert numbered.slots == (left, *found.slots[1:5], right)
+    assert [lane.lane for lane in numbered.lanes] == [0, 1, 2, 3, 4, 5]
+
+
+@pytest.mark.parametrize(("pitch", "dx"), [(68.6, 34), (69.8, 35)])
+def test_a_half_pitch_shift_moves_every_box_right(pitch, dx):
+    # Half the pitch to the nearest px: 34.3 is 34, 34.9 is 35.
+    case, found, _ = base()
+    empty = changed(found, {3: EMPTY}, pitch=pitch)
+    shifted = half_pitch_shift(empty, case)
+    assert shifted.lanes[3] == empty.lanes[3]
+    for before, after in zip(empty.slots, shifted.slots, strict=True):
+        if before is not None:
+            assert after == (before[0] + dx, before[1], before[2] + dx, before[3])
+    no_pitch = dataclasses.replace(found, pitch=None)
+    assert half_pitch_shift(no_pitch, case) is no_pitch
+
+
+def test_no_doubt_drops_the_doubt_alone():
+    case, found, _ = base()
+    doubt = "lane numbers doubtful: lane 3 lies a lane early"
+    flags = ("doubtful_lanes", "background_mismatch")
+    doubtful = changed(found, {}, flags=flags, notes=("a note", doubt))
+    assert no_doubt(doubtful, case) == changed(
+        found, {}, flags=("background_mismatch",), notes=("a note",)
+    )
