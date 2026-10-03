@@ -4624,6 +4624,38 @@ def test_edit_protein_drops_mw_guided_records_when_the_expected_mw_changes(tmp_p
     assert s.project.log[-1].params["dropped_undetected"] == [_record_json(beta, guided)]
 
 
+def test_edit_protein_drops_mw_guided_records_when_the_tolerance_changes(tmp_path):
+    # The rows a row placed by its expected MW searched span the MW tolerance
+    # (twice it, either way): a new tolerance leaves its records about rows
+    # nobody looked in, and they go, logged in full. A row box's record does
+    # not depend on it, nor does another protein's; the same tolerance again
+    # changes nothing.
+    s, image, beta = boxed(tmp_path)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    guided, row = _record(1, source=ProposalSource.MW_GUIDED), _record(2, snr=-0.5)
+    plant_records(s, beta, guided, row)
+    plant_records(s, gapdh, _record(0, source=ProposalSource.MW_GUIDED))
+    committed = s.project
+    ops.edit_protein(s, beta, mw_tolerance=protein_of(s, beta).mw_tolerance)
+    assert s.project is committed and _keys(s, beta) == [(1, 0), (2, 0)]
+    ops.edit_protein(s, beta, mw_tolerance=0.2)
+    assert _keys(s, beta) == [(2, 0)]
+    assert _keys(s, gapdh) == [(0, 0)]
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "edit_protein",
+        {
+            "protein_id": beta,
+            "pinned_targets": [],
+            "mw_tolerance": 0.2,
+            "dropped_undetected": [_record_json(beta, guided)],
+        },
+    )
+    assert entry.content_hash == content_hash(s.project)
+    ops.undo(s)
+    assert _keys(s, beta) == [(1, 0), (2, 0)]
+
+
 def test_a_calibration_change_drops_the_membranes_mw_guided_records(tmp_path):
     # Only on the images whose curve changed (#58): the reprobe img-4, a register
     # group of its own with no points, keeps its curve (none) and GAPDH its records.
