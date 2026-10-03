@@ -48,6 +48,7 @@ from proteia.core.storage import load_project
 from proteia.web.state import project_state
 from rowcases import adversarial_row, blob, mw_slot_row
 from test_checks import VENDOR_YS
+from test_checks import Row as ModelRow
 from test_checks import blot as model_blot
 from test_checks import ladder as model_ladder
 from test_checks import law as model_law
@@ -549,6 +550,136 @@ def test_a_refused_mw_reads_past_the_range_named():
     two = fitted_from([*model_ladder(X_LEFT), *model_ladder(X_RIGHT, side=RIGHT)])
     assert two.two_ladders
     assert mwrow.outside_words(two, 1000.0, "img-1").endswith(", where both ladders reach)")
+
+
+def _ladders(left_x: float, right_x: float, left, right) -> list[CalibrationPoint]:
+    """Ladder bands ``(y, kDa)`` on ``img-1``, a left ladder at ``left_x`` and
+    a right one at ``right_x``."""
+    return [
+        CalibrationPoint(image_id="img-1", y=y, mw=mw, source=MARKER_BAND, x=x, side=side)
+        for x, side, bands in ((left_x, LEFT, left), (right_x, RIGHT, right))
+        for y, mw in bands
+    ]
+
+
+# Two ladders that disagree strongly: 100 to 25 kDa over 20 px on the left
+# (x 400), over 380 px on the right (x 900). Past the left one, the protein
+# line folds over (at x 141.5 already).
+FOLD_LEFT = ((100.0, 100.0), (110.0, 50.0), (120.0, 25.0))
+FOLD_RIGHT = ((100.0, 100.0), (290.0, 50.0), (480.0, 25.0))
+
+
+def test_the_slot_s_refusals_and_its_one_column_span():
+    fitted = fitted_from(_ladders(400.0, 900.0, FOLD_LEFT, FOLD_RIGHT))
+    assert fitted.curve_at(141.5) is None and fitted.curve_at(399.5) is not None
+    with pytest.raises(mwrow.SlotError) as refused:
+        mwrow.slot(fitted, [60.0], 0.1, 100, 800, 500)
+    assert (refused.value.code, str(refused.value)) == (
+        "outside_range",
+        "the protein line folds over within x=100..799: the two ladders disagree too strongly"
+        " there to place a row by its MW",
+    )
+    # Just past the range's top (126 kDa), though the rows searched reach
+    # into it: refused all the same (the caller checks the range first).
+    assert 10.0**fitted.z_hi < 130.0 < 10.0 ** (fitted.z_hi + math.log10(1.2))
+    with pytest.raises(mwrow.SlotError) as refused:
+        mwrow.slot(fitted, [130.0], 0.1, 400, 900, 500)
+    assert (refused.value.code, str(refused.value)) == (
+        "outside_range",
+        "130 kDa lies outside the calibrated range",
+    )
+    # A span one column wide: that column's shift, 0, and no slope.
+    one = mwrow.slot(fitted, [60.0], 0.1, 600, 601, 500)
+    assert (one.shifts, one.slope_deg) == ((0,), 0.0)
+    # Slots and spans are values.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        one.x0 = 1  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        mwrow.LaneSpan(0, 10, "given").x0 = 1  # type: ignore[misc]
+
+
+def test_spans_reach_the_image_s_first_column():
+    # Ladders at x 0 and 10 around 8 lanes: the pitch 10 / 9, half of it
+    # left of the first lane: column 0. Anchors 20 px apart at x 10 and 30:
+    # half a pitch left of the first, column 0 too; no lanes, no span.
+    fitted = fitted_from(
+        _ladders(0.0, 10.0, ((100.0, 100.0), (140.0, 50.0)), ((100.0, 100.0), (140.0, 50.0)))
+    )
+    assert mwrow.span_between_ladders(fitted, 8, 1330) == (0, 10)
+    assert mwrow.span_of_anchors([(10.0, 0), (30.0, 1)], 2, 1000) == (0, 40)
+    assert mwrow.span_of_anchors([(10.0, 0), (30.0, 1)], 0, 1000) is None
+
+
+def test_range_ends_in_words_far_from_any_protein():
+    # Past the largest float, infinity; a million kDa or more, or under 0.1,
+    # in 3 significant digits; an end that 3 digits round onto the refused
+    # MW, in as many more as show the MW past it (4 for one far from any
+    # protein); an end equal to the MW written, as many digits as can be.
+    assert mwrow._mw_at(400.0) == math.inf
+    assert mwrow._kda_at(400.0) == "∞"
+    assert mwrow._kda_at(math.log10(2e6)) == "2e+06"
+    assert mwrow._kda_at(math.log10(0.05)) == "0.05"
+    assert mwrow._end_words(math.log10(1.2351e6), "1.2352e+06", above=True) == "1.235e+06"
+    assert mwrow._end_words(2.0, "100", above=True) == "100"
+
+
+def test_a_prediction_off_its_slot_reads_the_span_s_centre():
+    # A target expected at 60 kDa between the folding ladders, another
+    # protein's boxes in the 8 lanes (x 205 to 1101): the span they give
+    # reaches past the left ladder, where the line folds, so no slot is
+    # placed; the row is predicted at the span's centre all the same.
+    project = model_blot(
+        _ladders(400.0, 900.0, FOLD_LEFT, FOLD_RIGHT),
+        ModelRow("anchors", 60.0, source="click"),
+        ModelRow("target", 60.0, expected=60.0, lanes=()),
+    )
+    target = next(p for p in project.batch.proteins if p.name == "target")
+    predicted = mwrow.predict(project.batch, target)
+    assert predicted.slot is None and predicted.span.source == "anchors"
+    fitted = mwcal.calibration_for(project.batch.membranes[0], "img-2")
+    centre = 0.5 * (predicted.span.x0 + predicted.span.x1)
+    assert predicted.expected_y == (fitted.y_at(60.0, centre),)
+    assert predicted.expected_y[0] is not None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        predicted.slot = None  # type: ignore[misc]
+
+
+def test_a_prediction_with_no_lanes_reads_between_the_ladders():
+    # No lanes declared: no span. With two ladders the row is predicted
+    # midway between them (x 650: 60 kDa at y 213.7 here), not at either.
+    project = model_blot(
+        _ladders(400.0, 900.0, FOLD_LEFT, FOLD_RIGHT),
+        ModelRow("target", 60.0, expected=60.0, lanes=()),
+    )
+    batch = project.batch.model_copy(update={"lanes": []})
+    predicted = mwrow.predict(batch, batch.proteins[0])
+    fitted = mwcal.calibration_for(batch.membranes[0], "img-2")
+    assert (predicted.span, predicted.slot) == (None, None)
+    assert predicted.expected_y == (fitted.y_at(60.0, 650.0),)
+    assert predicted.expected_y[0] != fitted.y_at(60.0, 400.0)
+
+
+def test_a_row_by_mw_where_the_line_folds_is_refused(tmp_path):
+    # The folding ladders marked on the marker, the span dragged from x 0:
+    # the protein line folds over within it, and the row is refused for
+    # the calibration, changing nothing.
+    b = calibrated(tmp_path, sides=())
+    s = b.session
+    for point in _ladders(400.0, 900.0, FOLD_LEFT, FOLD_RIGHT):
+        ops.add_calibration_point(
+            s, b.marker, point.y, point.mw, MARKER_BAND, x=point.x, side=point.side, snap=False
+        )
+    target = ops.add_protein(s, "PSD-95", Role.TARGET, b.blot, expected_mw=60)
+    error = unchanged(s, lambda: ops.detect_mw_row(s, target, span=(0, 1330)))
+    assert (error.code, error.ids) == (ErrorCode.MW_OUTSIDE_CALIBRATION, (b.blot,))
+    assert str(error).startswith("the protein line folds over within x=0..1329")
+
+
+def test_a_span_dragged_past_the_image_starts_at_its_first_column(tmp_path):
+    b = calibrated(tmp_path)
+    target = add(b, TARGET)
+    placed = ops.detect_mw_row(b.session, target, span=(-5, 1165))
+    assert placed.span == (0, 1165) and placed.row[0] == 0
 
 
 def test_refusals_change_nothing(tmp_path):
@@ -1544,6 +1675,62 @@ def test_every_other_mw_refusal_is_worded_by_what_it_searched(
     drawn = ops._row_refusal(found, 60, 600)
     assert (drawn.code, drawn.detail["cause"]) == (code, cause)
     assert "expected MW" not in str(drawn) and "off_cause" not in drawn.detail
+
+
+def test_mw_refusal_words_name_lanes_off_the_line_past_its_limit_only():
+    # A box exactly 0.75 box heights off the row's line is on it: neither
+    # named off it nor counted among the boxes off it.
+    found = _found(
+        _off({0: (1.1, 1.1), 1: (-1.2, -1.2), 2: (1.3, 1.3), 3: (0.75, 0.2)}),
+        ["off_row_line"],
+        off_cause="half",
+    )
+    message = str(ops._row_refusal(found, 60, 600, LADDERS))
+    assert message.startswith("no row placed: in lanes 1, 2, 3 the band found")
+    assert "; 3 of 6 boxes are off the line, half or more," in message
+    # Nothing checked (a detection the detector does not give with an
+    # expected row): no reason given.
+    unchecked = _found(_off({2: (1.2, 1.2)}), ["off_row_line"])
+    assert str(ops._row_refusal(unchecked, 60, 600, LADDERS)) == (
+        "no row placed: in lane 3 "
+        + OFF.format("1.20", "that lane picked")
+        + CLICK.format("lane 3")
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        LADDERS.lanes = 7  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("span", [None, (141, 1165)])
+def test_an_mw_row_off_the_lanes_placed_asks_for_the_span(tmp_path, monkeypatch, span):
+    # Bands that do not line up with the lanes already placed: worded by
+    # the bands found around the expected MW, and the span's step (where
+    # the lanes were taken to lie, with the hint, or the drag again).
+    b = calibrated(tmp_path)
+    s = b.session
+    target = add(b, TARGET)
+    monkeypatch.setattr(ops, "_off_lanes", lambda centres, expected: [2])
+    monkeypatch.setattr(ops, "lane_positions", lambda *args, **kwargs: {0: 1.0})
+    error = unchanged(s, lambda: ops.detect_mw_row(s, target, span=span))
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_LANES_UNCLEAR, "off_lanes")
+    lead = (
+        "no row placed: the bands found around the expected MW do not line up with the lanes"
+        " already placed on this image"
+    )
+    if span is None:
+        assert str(error) == (
+            f"{lead}; the lanes were taken to lie between the two ladders: drag across all 8"
+            " lanes (only the left and right ends are used)"
+        )
+        assert (error.detail["span_from"], error.detail["hint"]) == (
+            "ladders",
+            "lane_span_required",
+        )
+    else:
+        assert str(error) == (
+            f"{lead}. Drag across all 8 lanes again, from the outer edge of the first lane's band"
+            " to the outer edge of the last's"
+        )
+        assert "hint" not in error.detail
 
 
 def _refused_by_mw(case, expected):

@@ -228,7 +228,7 @@ def span_between_ladders(fitted: mwcal.Calibration, n: int, width: int) -> tuple
     if not fitted.two_ladders or n < 1:
         return None
     left, right = fitted.ladders
-    if left.x is None or right.x is None:
+    if left.x is None or right.x is None:  # never: the model gives both ladders their x
         return None
     pitch = (right.x - left.x) / (n + 1)
     x0 = max(0, math.floor(left.x + pitch / 2))
@@ -332,7 +332,7 @@ def predict(batch: Batch, protein: Protein) -> Prediction | None:
         return None
     image = batch.find_image(protein.image_id)
     fitted = mwcal.calibration_for(batch.membrane_of(image.id), image.id)
-    if not isinstance(fitted, mwcal.Calibration):
+    if not isinstance(fitted, mwcal.Calibration):  # never: placed_on_add found the curve
         return None
     mws = (protein.expected_mw,)
     span = lane_span(batch, protein, fitted)
