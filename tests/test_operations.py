@@ -3438,8 +3438,10 @@ def test_a_possibly_over_exposed_loading_control_names_the_values_it_biases(tmp_
         "'GAPDH' is possibly over-exposed in lane 3: its box holds 5 or more pixels within"
         " 2 grey levels of the detector limit, and its image has lossy (JPEG-type)"
         " compression, so saturation cannot be confirmed; if it is over-exposed there, its"
-        " net is an under-estimate, which biases every value normalized to it; check the"
-        " imager's original capture"
+        " net is an under-estimate, which biases every value normalized to it, and a"
+        " saturated band next to it may have merged into the same box, which then holds both"
+        " bands and its net may be too high; check the imager's original capture, or shorten"
+        " the exposure and image the membrane again"
     )
     # The excluded lane 4 holds a value: the all-lanes set has its own notice.
     [every] = [n for n in res.all_lanes.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]

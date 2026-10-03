@@ -1089,6 +1089,14 @@ def _unchecked_reasons(image: model.ImageRef) -> str:
     return " and ".join(reasons)
 
 
+# What a saturated band beside an over-exposed one may do to its box (#58):
+# their saturated pixels touching, one box holds both, whoever placed it.
+_MERGED: Final = (
+    "a saturated band next to it may have merged into the same box, which then holds both"
+    " bands and its net may be too high"
+)
+
+
 def _clipping_effect(protein: model.Protein) -> str:
     """What over-exposure would do to a protein's values."""
     effect = "if it is over-exposed there, its net is an under-estimate"
@@ -1118,8 +1126,9 @@ def _possibly_clipped(
     joined to the lanes) in the included lanes: those whose image the clipping
     check cannot trust, with :data:`~proteia.core.quantify.POSSIBLY_CLIPPED_PIXELS`
     or more pixels near the limit (#112). It names the lanes, the rule, why the
-    image cannot confirm it (as ``clipping_not_checked`` does), and what the
-    bias reaches."""
+    image cannot confirm it (as ``clipping_not_checked`` does), what the bias
+    reaches, that a saturated band beside it may have merged into the box,
+    making the net too high (#58), and the remedy, as ``clipped`` does."""
     flagged = tuple(
         i
         for i, band in enumerate(bands)
@@ -1134,8 +1143,8 @@ def _possibly_clipped(
         NoticeCode.POSSIBLY_CLIPPED,
         f"{protein.name!r} is possibly over-exposed in {lanes_phrase(flagged)}: {boxes}"
         f" {POSSIBLY_CLIPPED_PIXELS} or more pixels within {_near_limit(image.bit_depth)} of"
-        f" the detector limit{because}; {_clipping_effect(protein)}; check the imager's"
-        " original capture",
+        f" the detector limit{because}; {_clipping_effect(protein)}, and {_MERGED}; check the"
+        " imager's original capture, or shorten the exposure and image the membrane again",
         protein_ids=(protein.id,),
         lane_indices=flagged,
     )
@@ -1462,7 +1471,8 @@ def _compute(
             note(
                 NoticeCode.CLIPPED,
                 f"{column.name!r} is over-exposed in {lanes_phrase(over)}: pixels at the detector"
-                f" limit make its net an under-estimate; {kept} included",
+                f" limit make its net an under-estimate, and {_MERGED}; shorten the exposure"
+                f" and image the membrane again; {kept} included",
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
