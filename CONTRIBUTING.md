@@ -1,7 +1,11 @@
 # Contributing to Proteia
 
-Thanks for your interest in Proteia. This guide covers local setup and the
-development workflow.
+Proteia is developed by its maintainer, and pull requests from outside the
+project are not accepted at this time. To report a problem or suggest
+something, write to **hello@lavandula.bio**.
+
+This guide covers local setup and the development workflow for the project's
+collaborators.
 
 ## Requirements
 
@@ -85,8 +89,7 @@ every change reaches it through a short-lived branch and a pull request.
 - The maintainer merges only after the `ci` check is green and an
   independent review (a person, or an automated review pass run by the
   maintainer) whose findings have been resolved.
-- Branches in this repository are deleted automatically on merge; delete
-  branches in your own fork yourself.
+- Branches are deleted automatically on merge.
 - Releases are tagged on `main` using SemVer.
 
 ## License

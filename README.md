@@ -42,6 +42,10 @@ Alpha testing is not open yet. If you run Western blots regularly (molecular bio
 
 Contact: **hello@lavandula.bio**
 
+Proteia is developed by its maintainer, and pull requests from outside the
+project are not accepted at this time. To report a problem or suggest
+something, write to the address above.
+
 ## License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
