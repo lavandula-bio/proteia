@@ -1509,6 +1509,7 @@ def counted(label: str, silent: int, wrong: int) -> RowScore:
         ((3, 3), (1, 1), True),  # 3 more silent, 2 fewer wrong
         ((2, 7), (1, 1), False),  # 2 more of each
         ((0, 8), (1, 1), True),  # 3 more wrong, as many silent
+        ((1, 9), (1, 1), True),  # 4 more wrong, 1 more silent
         ((0, 15), (0, 1), False),  # 10 more wrong, 1 fewer silent
         ((0, 7), (1, 1), False),  # 2 more wrong
         ((0, 5), (1, 1), False),  # today's scores
@@ -1580,8 +1581,6 @@ def test_equal_slots_number_the_boxes_by_where_they_lie():
     # band left in it. The doubt and the reading's refusals are dropped; any
     # other flag and note stay.
     case, found, _ = base()
-    x0, y0, x1, y1 = case.row
-    width = (x1 - x0) / 6
     moved = {
         2: {
             "rect": found.lanes[1].rect,
@@ -1603,7 +1602,9 @@ def test_equal_slots_number_the_boxes_by_where_they_lie():
     assert (empty.rect, empty.reason, empty.components, empty.peaks) == (None, "no_band", 0, ())
     kept = (empty.extent, empty.bg_offset, empty.hollow, empty.cut, empty.line_offset)
     assert kept == (None, None, False, False, None)
-    assert empty.window == (int(x0 + 2 * width), y0, int(x0 + 3 * width), y1)
+    # Slot 2 of six in the row box: x 199.67 to 268, cut to whole px.
+    assert case.row == (63, 48, 473, 74)
+    assert empty.window == (199, 48, 268, 74)
     assert (numbered.flags, numbered.notes) == (("background_mismatch",), ("a note",))
     # The weaker of two boxes in a slot gives way: lane 1's own box, now.
     weaker = {2: {"rect": found.lanes[1].rect, "snr": found.lanes[1].snr - 1.0}}
