@@ -3116,6 +3116,29 @@ def test_detect_row_along_known_shift(name, line):
     assert not any(overlaps(a, b) for a, b in itertools.combinations(moved, 2))
 
 
+def test_detect_row_along_reads_a_row_past_the_image_s_right_side_as_cut_to_it():
+    # A row along the ramp from x0 to 15 columns past the image's right
+    # side: its columns past the side are never read, and their shifts not
+    # used; found as the row cut to the image, with its shifts.
+    case = BENCH["all_present"]
+    x0, y0, x1, y1 = case.row
+    image = _along_a_line(case, _LINES["ramp"])
+    width = image.shape[1]
+    assert x0 > 0 and x1 <= width  # not vacuous: the row starts inside
+    shifts = [_LINES["ramp"](x) for x in range(x0, width)]
+    kwargs = {
+        "background": estimate_background(case.image),
+        "dark_on_light": case.dark_on_light,
+    }
+    cut = rowdetect.detect_row_along(
+        image, (x0, y0 + _PAD, width, y1 + _PAD), case.n_lanes, shifts, **kwargs
+    )
+    wide = rowdetect.detect_row_along(
+        image, (x0, y0 + _PAD, width + 15, y1 + _PAD), case.n_lanes, shifts + [99] * 15, **kwargs
+    )
+    assert cut.size is not None and wide == cut
+
+
 def test_detect_row_along_refuses_rows_the_line_takes_off_the_image():
     case = BENCH["all_present"]
     x0, y0, x1, y1 = case.row
@@ -4391,6 +4414,41 @@ def test_prefer_y_names_another_band_inside_or_beside_the_box():
     assert rect[1] <= stain.y < rect[3] and stain.x >= rect[2]
 
 
+@pytest.mark.parametrize(
+    ("dx", "edge", "words"),
+    [
+        # peaking on the box's first column: in the box
+        (-33.0, 0, "lies 0 px below the box centre, inside the box: the box holds part of it"),
+        # on the column just past its last: beside it
+        (33.25, 2, "lies beside the box, 0 px below its centre; the box does not include it"),
+    ],
+)
+def test_prefer_y_reads_another_band_on_the_box_s_side_column_by_its_pixel(dx, edge, words):
+    # Lanes 140 px apart, bands 70 px wide but lane 4's, 30 px: its box, as
+    # wide as the others, reaches 20 px past its band either side. A stain
+    # beside the band, in its rows, peaks on the box's first column, or on
+    # the column just past its last: a pixel's column is in the box where
+    # the box's columns hold it.
+    widths = dict.fromkeys(range(6), 70.0)
+    widths[3] = 30.0
+    case = adversarial_row(
+        "side column",
+        1000,
+        pitch=140.0,
+        widths=widths,
+        artefacts=[blob(3, 5.0, 20000.0, dx=dx)],
+        box_adjust=(0, -20, 0, 20),
+    )
+    found = detect(case, prefer_y=_target_row(case))
+    check_invariants(case, found)
+    lane = found.lanes[3]
+    [stain] = [peak for peak in lane.peaks if not peak.own]
+    assert stain.x == lane.rect[edge] + 0.5 and lane.rect[1] <= stain.y < lane.rect[3]
+    assert lane.components == 2
+    [note] = [note for note in found.notes if "another band" in note]
+    assert note == f"lane 4: another band {words}"
+
+
 def test_other_bands_note_words_each_kind_and_way():
     # The note from the boxes and second components alone (crop at (100,
     # 50)): every box 40 x 12 at x 100..140, rows 50..62, centre row 56.
@@ -4940,6 +4998,66 @@ def test_band_basins_reads_tops_joined_by_signal_by_their_valley():
     assert band == [0, 1]
 
 
+def test_band_basins_joins_tops_whose_basins_meet_at_one_pixel_pair_side_by_side():
+    # One row: two tops, the pixel between them in one basin, so the basins
+    # meet at a single pair of pixels side by side, none stacked: one band.
+    basin, band = rowdetect._band_basins(np.array([[9.0, 5.0, 8.0]]), [(0, 0), (0, 2)], 1.0)
+    assert _basin_pairs(basin) == (1, 0)
+    assert band == [0, 0]
+
+
+def test_band_basins_reads_pieces_above_the_threshold_only():
+    # Two humps apart on rows 0 to 2 (their centres 10 high, the rest 2 or
+    # less), a tail exactly at the growth threshold (3.0) hanging from the
+    # left one's lower edge. Above the threshold, each hump's piece is its
+    # centre on row 1: one band. Were the tail in it, the left piece would
+    # span rows 1 to 11 against the right's one: two.
+    window = np.zeros((12, 7))
+    window[0:3, 0:3] = _hump(3, 3)
+    window[0:3, 4:7] = _hump(3, 3) * 1.01
+    window[2:12, 1] = 3.0
+    _, band = rowdetect._band_basins(window, [(1, 1), (1, 5)], 3.0)
+    assert band == [0, 0]
+
+
+def test_band_basins_reads_each_top_by_its_own_piece_s_rows():
+    # Three humps apart: two side by side on rows 0 to 2, one under the left
+    # on rows 6 to 8. The two side by side are one band, the one under it
+    # another: each top read by the rows of the piece that holds it.
+    window = np.zeros((9, 7))
+    window[0:3, 0:3] = _hump(3, 3)
+    window[0:3, 4:7] = _hump(3, 3) * 1.01
+    window[6:9, 0:3] = _hump(3, 3) * 1.02
+    _, band = rowdetect._band_basins(window, [(1, 1), (1, 5), (7, 1)], 0.3)
+    assert band == [0, 0, 2]
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "side_by_side"),
+    [
+        ((0, 4), (1, 5), True),  # 3 of the 5 rows the two span
+        ((0, 4), (2, 6), False),  # 2 of 6
+        ((0, 10), (3, 7), False),  # 4 of 10
+        ((0, 4), (0, 2), True),  # 2 of 4: JOIN_ROWS exactly
+        ((2, 6), (0, 6), True),  # 4 of 6
+        ((5, 9), (0, 6), False),  # 1 of 9
+        ((0, 2), (1, 2), True),  # 1 of 2
+        ((0, 3), (1, 4), True),  # 2 of 4
+    ],
+)
+def test_share_rows_reads_the_rows_two_things_share_of_those_they_span(a, b, side_by_side):
+    assert rowdetect._share_rows(a, b) is side_by_side
+    assert rowdetect._share_rows(b, a) is side_by_side
+
+
+def test_step_is_the_shift_that_best_matches_the_rows():
+    # A band one row lower in the second lane: 1; one row higher: -1; the
+    # same rows, two bands each: 0, though a shift of 2 matches one band.
+    assert rowdetect._step(np.array([0.0, 0, 1, 0, 0, 0]), np.array([0.0, 0, 0, 1, 0, 0])) == 1
+    assert rowdetect._step(np.array([0.0, 0, 0, 1, 0, 0]), np.array([0.0, 0, 1, 0, 0, 0])) == -1
+    assert rowdetect._step(np.array([0.0, 1, 0, 1, 0, 0]), np.array([0.0, 1, 0, 1, 0, 0])) == 0
+
+
 def _row_under(dy: float, depth: float):
     """A flat-topped band 44 x 12 px at 20% ``depth`` deep ``dy`` px below each
     lane's band."""
@@ -5054,6 +5172,168 @@ def test_prefer_y_seeds_from_the_lane_s_own_peaks_apart_from_the_crop_s(
     assert lane.seed_row == seed_row and lane.rect[1] < 20 < lane.rect[3], lane
 
 
+def _measured(
+    s: np.ndarray,
+    ranges: Sequence[tuple[float, float]],
+    prefer: float | None,
+    sigma: float = 1.0,
+) -> list:
+    """Lanes over ``ranges`` measured on ``s`` (noise ``sigma``, all of it
+    kept), seeded nearest ``prefer`` from the peaks at DETECT_K sigma, or
+    from their strongest pixel without it: each lane's present, rect, seed
+    row and crossed."""
+    lanes = [rowdetect._Lane(present=True, x_range=r, centre=0.5 * (r[0] + r[1])) for r in ranges]
+    tops = None if prefer is None else rowdetect._peaks(s, 6.0 * sigma)
+    rowdetect._measure(lanes, s, s > 0.0, sigma, None, tops, prefer)
+    return [(ln.present, ln.rect, ln.seed_row, ln.crossed) for ln in lanes]
+
+
+@pytest.mark.parametrize("prefer", [None, 11.5])
+def test_a_lane_grows_from_its_walls_and_seeds_only(prefer):
+    # Lane 1 over columns 0 to 9, its band (rows 10 to 12) 60 high from
+    # column 0, 100 at columns 4 to 6: grown from column 4, its extent
+    # reaches column 0, the box's edge, its wall.
+    s = np.zeros((20, 10))
+    s[10:13, 0:10] = 60.0
+    s[10:13, 4:7] = 100.0
+    [(present, rect, _, _)] = _measured(s, [(0.0, 10.0)], prefer)
+    assert present and rect == (0, 10, 10, 13)
+    # A lane 0 to 13 beside a narrow one (14 to 17): the wall between them
+    # at their centres' midpoint, 11.5; lane 1's band (6 to 13) peaks at
+    # column 12, past it. Its growth window reaches past the wall to its
+    # seed's column and no further: the band's column 13 stays out.
+    s = np.zeros((20, 20))
+    s[10:13, 6:14] = 60.0
+    s[10:13, 12] = 100.0
+    s[10:13, 15:18] = 100.0
+    first, second = _measured(s, [(0.0, 14.0), (14.0, 18.0)], prefer)
+    assert first[1] == (6, 10, 13, 13) and second[1] == (15, 10, 18, 13)
+
+
+def test_prefer_y_seeds_from_a_peak_on_its_range_s_first_column():
+    # Two lanes, 0 to 9 and 10 to 19; lane 2's band (rows 10 to 12) peaks at
+    # (11, 10): its seed range's first column, and lane 1's wall. That peak
+    # is lane 2's, not lane 1's, though nearer lane 1's expected row than
+    # its own band (rows 4 to 6); each lane boxes its own band.
+    s = np.zeros((20, 20))
+    s[4:7, 2:8] = 90.0
+    s[5, 5] = 100.0
+    s[10:13, 10:18] = 90.0
+    s[11, 10] = 100.0
+    first, second = _measured(s, [(0.0, 10.0), (10.0, 20.0)], 11.5)
+    assert first == (True, (2, 4, 8, 7), 5, False)
+    assert second == (True, (10, 10, 18, 13), 11, False)
+    # One lane whose band peaks on column 0, the box's edge.
+    s = np.zeros((20, 10))
+    s[10:13, 0:8] = 90.0
+    s[11, 0] = 100.0
+    assert _measured(s, [(0.0, 10.0)], 11.5) == [(True, (0, 10, 8, 13), 11, False)]
+
+
+def test_prefer_y_seeds_from_the_peak_nearest_the_row_by_its_centre():
+    # Bands on rows 10 and 13 (their centres 10.5 and 13.5): the expected
+    # row 12.1 lies nearer 13.5; at 12.0, as near both, the higher (row 10).
+    s = np.zeros((20, 10))
+    s[10, 2:8] = s[13, 2:8] = 100.0
+    assert _measured(s, [(0.0, 10.0)], 12.1)[0][2] == 13
+    assert _measured(s, [(0.0, 10.0)], 12.0)[0][2] == 10
+
+
+@pytest.mark.parametrize("prefer", [None, 11.5])
+def test_a_lane_with_no_signal_in_its_range_is_empty_and_a_faint_band_is_not(prefer):
+    # Lane 2's seed range holds no signal: no band, not present. A band 0.8
+    # high over a noise of 0.1 (8 sigmas) is one.
+    s = np.zeros((20, 20))
+    s[10:13, 2:8] = 100.0
+    first, second = _measured(s, [(0.0, 10.0), (10.0, 20.0)], prefer)
+    assert first[0] and second[:2] == (False, None)
+    s = np.zeros((20, 10))
+    s[10:13, 2:8] = 0.8
+    [(present, rect, _, _)] = _measured(s, [(0.0, 10.0)], prefer, sigma=0.1)
+    assert present and rect == (2, 10, 8, 13)
+
+
+def test_prefer_y_crosses_lanes_by_their_seeds_rows_and_tops_rows_alike():
+    # Lane 1's bands on rows 8 and 10, lane 2's on rows 9 and 11 (one row
+    # lower: the step). Expected at row 10.0, lane 1 grows from row 10, lane
+    # 2 from row 9: moved by the step, each seed lies on the other lane's
+    # other band, row for row. Crossed.
+    s = np.zeros((20, 20))
+    s[8, 2:8] = s[10, 2:8] = 100.0
+    s[9, 12:18] = s[11, 12:18] = 100.0
+    first, second = _measured(s, [(0.0, 10.0), (10.0, 20.0)], 10.0)
+    assert (first[2], second[2]) == (10, 9) and first[3] and second[3]
+
+
+@pytest.mark.parametrize(
+    ("first_rows", "second_rows", "prefer", "seeds"),
+    [
+        # lane 1 grows from row 6 (6.5), midway between lane 2's bands (4.5, 8.5)
+        ((4, 6), (4, 8), 6.0, (6, 4)),
+        # lane 2 grows from row 6, midway between lane 1's (4.5, 8.5)
+        ((4, 8), (6, 8), 7.0, (8, 6)),
+    ],
+)
+def test_prefer_y_reads_a_seed_midway_between_two_bands_as_on_the_lane_s_own(
+    first_rows, second_rows, prefer, seeds
+):
+    # Bands one row high over 6 columns, the step between the two lanes'
+    # rows 0. A lane's seed row lying midway between the other lane's two
+    # bands is read as on that lane's own band (of two as near, its own):
+    # the lanes are not crossed.
+    s = np.zeros((20, 20))
+    for row in first_rows:
+        s[row, 2:8] = 100.0
+    for row in second_rows:
+        s[row, 12:18] = 100.0
+    first, second = _measured(s, [(0.0, 10.0), (10.0, 20.0)], prefer)
+    assert (first[2], second[2]) == seeds
+    assert not first[3] and not second[3]
+
+
+def test_prefer_y_reads_a_lane_s_bands_in_its_seed_range_only():
+    # Lane 1's seed range 0 to 7, its walls 0 and 10; lane 2's 12 to 19.
+    # Lane 1 grows from row 6 of its bands (4, 6), lane 2 from row 8 of its
+    # (5, 8); the step between their rows is -1. A speck on row 10 at
+    # columns 8 and 9, in lane 1's growth window but past its seed range, is
+    # none of lane 1's bands: read with them, it would lie nearer lane 2's
+    # seed row moved by the step (9.5) than lane 1's own band, and cross the
+    # lanes.
+    s = np.zeros((20, 20))
+    s[4, 1:7] = s[6, 1:7] = 100.0
+    s[5, 13:19] = s[8, 13:19] = 100.0
+    s[10, 8:10] = 100.0
+    first, second = _measured(s, [(0.0, 8.0), (12.0, 20.0)], 8.0)
+    assert (first[2], second[2]) == (6, 8)
+    assert not first[3] and not second[3]
+
+
+def test_prefer_y_marks_a_lone_band_s_whole_signal_its_own():
+    # One band (rows 10 to 12, 100 high) in the lane's window, a faint tail
+    # under it (rows 13 to 15, half a grey level): with one peak there are no
+    # basins, and the lane's own pixels, read on the row's line, are the
+    # band's part of the signal, its faint tail too.
+    s = np.zeros((20, 10))
+    s[10:13, 2:8] = 100.0
+    s[13:16, 2:8] = 0.5
+    lane = rowdetect._Lane(present=True, x_range=(0.0, 10.0), centre=5.0)
+    rowdetect._measure([lane], s, s > 0.0, 1.0, None, rowdetect._peaks(s, 6.0), 11.5)
+    assert lane.rect == (2, 10, 8, 13)
+    assert np.array_equal(lane.own, s > 0.0)
+
+
+@pytest.mark.parametrize("seed", [1000, 1002])
+def test_prefer_y_reads_a_weak_band_s_peaks_as_without_it(seed):
+    # Weak bands (3000 to 5000 deep) under heavy noise (sigma 1600): a dip
+    # the noise leaves on a band's top, shallower than DETECT_K noise sigmas,
+    # makes no second peak, with an expected row as without one.
+    case = adversarial_row("weak", seed, depth_range=(3000.0, 5000.0), noise=1600.0)
+    plain = detect(case)
+    found = detect(case, prefer_y=_target_row(case))
+    assert [len(lane.peaks) for lane in found.lanes] == [1] * 6
+    assert [lane.peaks for lane in found.lanes] == [lane.peaks for lane in plain.lanes]
+
+
 @pytest.mark.parametrize("slope", [0.06, -0.06])
 @pytest.mark.parametrize("seed", [1001, 1002])
 def test_prefer_y_keeps_a_tilted_clipped_ring_one_band(slope, seed):
@@ -5165,3 +5445,59 @@ def test_clipped_peaks_read_a_hollow_band_by_the_extent_a_click_grows():
     assert not any(UNDER.start <= y < UNDER.stop for y, _ in tops)  # no peak of _peaks
     assert EXTENT_LEVEL * 96.0 < 32.0 < 45.0 < 0.5 * 96.0  # not vacuous
     assert rowdetect._clipped_peaks(s, s > 0.0, 6.0, saturated, tops) == []
+
+
+def test_clipped_peaks_grow_a_click_s_extent_above_extent_level_only():
+    # As above, with the lighter centre and the tail exactly at EXTENT_LEVEL
+    # of the under band's height (0.3 x 96), and a patch 60 high under the
+    # tail: the extent a click grows (above that level) leaves the centre
+    # out, open below through the tail: no hollow band, a peak added. Were
+    # pixels at the level in it, the centre would lie in the band between
+    # clipped pixels, well below the signal above and below it: hollow.
+    s, saturated = _plateaus(
+        (TOP, ALL, 100.0, True),
+        (VALLEY, ALL, 78.0, False),
+        (UNDER, ALL, 96.0, True),
+        (slice(6, 11), slice(3, 5), 0.3 * 96.0, False),
+        (slice(11, 14), slice(3, 5), 0.3 * 96.0, False),
+        (slice(14, 16), slice(3, 5), 60.0, False),
+    )
+    tops = rowdetect._peaks(s, 6.0)
+    [(y, _)] = rowdetect._clipped_peaks(s, s > 0.0, 6.0, saturated, tops)
+    assert UNDER.start <= y < UNDER.stop
+
+
+def test_clipped_peaks_count_only_the_kept_signal_s_clipped_pixels():
+    # Two clipped bands stacked across a valley of 80 (a peak added under
+    # the top one), and clipped pixels the detector did not keep (a speck it
+    # rejected) in one column of the valley, joining them: they are no
+    # band's clipped pixels, and the two bands stay stacked.
+    s, saturated = _plateaus(
+        (TOP, ALL, 100.0, True), (VALLEY, ALL, 80.0, False), (UNDER, ALL, 99.0, True)
+    )
+    kept = s > 0.0
+    saturated[VALLEY, 5] = True
+    kept[VALLEY, 5] = False
+    tops = rowdetect._peaks(np.where(kept, s, 0.0), 6.0)
+    [(y, _)] = rowdetect._clipped_peaks(s, kept, 6.0, saturated, tops)
+    assert UNDER.start <= y < UNDER.stop
+
+
+def test_clipped_peaks_read_a_saddle_at_the_level_as_below_it():
+    # The clipped bands stacked across a valley of 80, and under the lower
+    # (99), through a bridge exactly at VALLEY_FRAC of it (0.75 x 99), a band
+    # higher than both and not clipped. At the level it reads (0.75 x 99),
+    # the lower band's region stops at the bridge: it holds the top band
+    # alone, clipped and stacked, and a peak is added. Were the bridge above
+    # the level, the region would hold the band not clipped: none.
+    s, saturated = _plateaus(
+        (TOP, ALL, 100.0, True),
+        (VALLEY, ALL, 80.0, False),
+        (UNDER, ALL, 99.0, True),
+        (slice(11, 13), slice(4, 7), 0.75 * 99.0, False),
+        (slice(13, 16), ALL, 101.0, False),
+    )
+    tops = rowdetect._peaks(s, 6.0)
+    assert not any(UNDER.start <= y < UNDER.stop for y, _ in tops)  # not vacuous
+    [(y, _)] = rowdetect._clipped_peaks(s, s > 0.0, 6.0, saturated, tops)
+    assert UNDER.start <= y < UNDER.stop

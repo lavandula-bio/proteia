@@ -456,6 +456,49 @@ def test_span_from_group_anchors_on_reprobe(tmp_path):
     assert_mw_current(s)
 
 
+def _reprobes(b: Blot, lanes: Sequence[Sequence[int]]) -> list[tuple[str, set[str]]]:
+    """A reprobe in the blot's register group for each of ``lanes``, in
+    membrane order, a protein's box clicked on the target's band in each of
+    its lanes; (the image, its boxes) each."""
+    s = b.session
+    out = []
+    for k, boxed in enumerate(lanes):
+        image = import_blot(
+            s, np.array(blot_pixels()), f"reprobe {k} γ.tif", membrane_id=b.membrane
+        )
+        ops.set_marker_image(s, image, b.marker)
+        protein = ops.add_protein(s, f"probe {k}", Role.TARGET, image)
+        for lane in boxed:
+            x, y = truth(TARGET[0], LANES[lane])
+            ops.place_box(s, protein, round(x), round(y), lane_index=lane, grow=True)
+        out.append((image, {band.id for band in protein_of(s, protein).bands}))
+    return out
+
+
+def _span_of(b: Blot, protein_id: str) -> mwrow.LaneSpan | None:
+    batch = b.session.project.batch
+    fitted = mwcal.calibration_for(batch.membrane_of(b.blot), b.blot)
+    return mwrow.lane_span(batch, batch.find_protein(protein_id), fitted)
+
+
+def test_span_from_the_group_image_with_the_most_lanes_placed(tmp_path):
+    # One ladder, no lanes placed on the blot: three reprobes in its register
+    # group with 3, 5 and 5 lanes placed. The span is read from the image
+    # with the most, the first of them in membrane order (the second), from
+    # its boxes; half a pitch (64 px) past lanes 1 and 8 at x 205 and 1101.
+    b = calibrated(tmp_path, sides=(LEFT,))
+    images = _reprobes(b, [(0, 1, 2), (1, 2, 3, 4, 5), (2, 3, 4, 5, 6)])
+    span = _span_of(b, add(b))
+    assert (span.source, span.image_id) == ("group_anchors", images[1][0])
+    assert set(span.anchor_ids) == images[1][1] and len(span.anchor_ids) == 5
+    assert abs(span.x0 - 141) <= 2 and abs(span.x1 - 1165) <= 2, span
+    # Only two lanes placed on the one other image that has any: enough.
+    c = calibrated(tmp_path / "two lanes", sides=(LEFT,))
+    [(image, boxes)] = _reprobes(c, [(3, 4)])
+    span = _span_of(c, add(c))
+    assert (span.source, span.image_id, set(span.anchor_ids)) == ("group_anchors", image, boxes)
+
+
 def test_lane_span_required_without_anchors(tmp_path):
     b = calibrated(tmp_path, sides=(LEFT,))
     s = b.session
@@ -621,6 +664,144 @@ def test_range_ends_in_words_far_from_any_protein():
     assert mwrow._kda_at(math.log10(0.05)) == "0.05"
     assert mwrow._end_words(math.log10(1.2351e6), "1.2352e+06", above=True) == "1.235e+06"
     assert mwrow._end_words(2.0, "100", above=True) == "100"
+
+
+def test_range_ends_in_words_at_each_format_s_limit():
+    # A million kDa exactly: in significant digits; 12.3 kDa: whole kDa;
+    # 0.12 kDa: one decimal.
+    assert mwrow._kda_at(6.0) == "1e+06"
+    assert mwrow._kda_at(math.log10(12.3)) == "12"
+    assert mwrow._kda_at(math.log10(0.12)) == "0.1"
+    # The fewest digits that show the MW past the end, from as many as the
+    # end's whole kDa take plus one (4 for 124.6 and 125.94: never fewer, as
+    # 1.2e+02 would show 124.8 above 124.6 by rounding the end down), or 2
+    # under 1 kDa (0.55 for 0.6, which reads 0.56 inside), from 2 at 0.1 to
+    # 0.15 kDa too (0.123: 0.12 reads 0.12 on it).
+    assert mwrow._end_words(math.log10(124.6), "124.8", above=True) == "124.6"
+    assert mwrow._end_words(math.log10(125.94), "126", above=True) == "125.9"
+    assert mwrow._end_words(math.log10(0.55), "0.56", above=True) == "0.55"
+    assert mwrow._end_words(math.log10(0.1234), "0.12", above=False) == "0.123"
+
+
+def test_a_slot_s_end_columns_and_slope_read_its_own():
+    # A slot 4 columns wide (x 10 to 13) whose shift differs at every column:
+    # its ends are the first and the last column's, and a column past either
+    # end reads that end's. A slope of exactly 3 degrees is not steep; past
+    # it, either way, it is.
+    found = mwrow.Slot(
+        mws=(92.0,),
+        x0=10,
+        x1=14,
+        centre=12.0,
+        m_top=110.4,
+        m_bot=76.7,
+        margin=12.0,
+        y0=100,
+        y1=140,
+        expected_y=(120.0,),
+        shifts=(-3, -1, 2, 5),
+        slope_deg=3.0,
+    )
+    assert found.shift_ends == (-3, 5)
+    columns = (-50.0, 9.9, 10.0, 10.99, 11.0, 12.5, 13.0, 13.99, 14.0, 99.0)
+    assert [found.shift_at(x) for x in columns] == [-3, -3, -3, -3, -1, 2, 5, 5, 5, 5]
+    assert not found.steep and not dataclasses.replace(found, slope_deg=-3.0).steep
+    assert dataclasses.replace(found, slope_deg=3.0001).steep
+    assert dataclasses.replace(found, slope_deg=-3.0001).steep
+
+
+def test_a_slot_is_cut_to_the_image_at_its_top_and_bottom():
+    # One ladder at rows 10 and 110 for 100 and 10 kDa (100 px a decade, the
+    # range reaching 125.9 kDa at row 0): a 100-kDa target's rows searched,
+    # 6 px past 120 kDa at row 2.1, would start above the image: at row 0.
+    near_top = fitted_from(marked((10.0, 100.0), (110.0, 10.0)))
+    assert mwrow.slot(near_top, [100.0], 0.1, 141, 1165, HEIGHT).y0 == 0
+    # Two ladders turned 2 degrees: the slot lies 18 rows lower at the
+    # span's right end than at its centre, so on an image 10 rows taller than
+    # the rows searched (to row 212) it stops 18 rows short of the bottom.
+    tilted = fitted_from([*model_ladder(X_LEFT, 2.0), *model_ladder(X_RIGHT, 2.0, side=RIGHT)])
+    full = mwrow.slot(tilted, [92.0], 0.1, 141, 1165, HEIGHT)
+    assert (full.y1, max(full.shifts)) == (212, 18)
+    assert mwrow.slot(tilted, [92.0], 0.1, 141, 1165, 222).y1 == 204
+    # Level, an image ending at the slot's first row leaves no row; one row
+    # more leaves one.
+    level = fitted_from(model_ladder(X_LEFT))
+    y0 = mwrow.slot(level, [92.0], 0.1, 141, 1165, HEIGHT).y0
+    with pytest.raises(mwrow.SlotError) as refused:
+        mwrow.slot(level, [92.0], 0.1, 141, 1165, y0)
+    assert (refused.value.code, str(refused.value)) == (
+        "out_of_image",
+        "the rows where 92 kDa is searched lie off the image across x=141..1164",
+    )
+    one = mwrow.slot(level, [92.0], 0.1, 141, 1165, y0 + 1)
+    assert (one.y0, one.y1) == (y0, y0 + 1)
+
+
+def test_spans_of_one_lane_or_of_no_column():
+    # One lane between two ladders 1152 px apart: each a lane pitch (576 px)
+    # outside it, the span the middle half, x 365 to 941.
+    two = fitted_from([*model_ladder(X_LEFT), *model_ladder(X_RIGHT, side=RIGHT)])
+    assert mwrow.span_between_ladders(two, 1, WIDTH) == (365, 941)
+    # Cut by the image's width to no column (x 141 to 141): no span; to one
+    # column, that column.
+    assert mwrow.span_between_ladders(two, 8, 141) is None
+    assert mwrow.span_between_ladders(two, 8, 142) == (141, 142)
+    anchors = [(333.0, 1), (461.0, 2), (845.0, 5)]
+    assert mwrow.span_of_anchors(anchors, 8, 141) is None
+    assert mwrow.span_of_anchors(anchors, 8, 142) == (141, 142)
+
+
+def test_a_one_lane_batch_reads_its_lane_between_the_ladders(tmp_path):
+    b = calibrated(tmp_path)
+    ops.set_lanes(b.session, [LaneInput(samples.CONDITIONS[0], samples.SAMPLES[0])])
+    target = add(b)
+    batch = b.session.project.batch
+    fitted = mwcal.calibration_for(batch.membrane_of(b.blot), b.blot)
+    span = mwrow.lane_span(batch, batch.find_protein(target), fitted)
+    assert span == mwrow.LaneSpan(365, 941, "ladders")
+
+
+@pytest.mark.parametrize("end", ["top", "bottom"])
+def test_an_expected_mw_on_a_range_end_is_searched(tmp_path, end):
+    # The calibrated range's ends, 314.7 and 7.94 kDa (a tenth of a decade
+    # past the ladder's 250 and 10): an MW whose log10 is exactly an end lies
+    # in the range. Its slot is predicted, and placing it searches the rows
+    # there (no band in them) rather than refusing the MW.
+    b = calibrated(tmp_path)
+    s = b.session
+    fitted = mwcal.calibration_for(s.project.batch.membrane_of(b.blot), b.blot)
+    z = fitted.z_hi if end == "top" else fitted.z_lo
+    mw = 10.0**z
+    assert math.log10(mw) == z  # not vacuous: exactly on the end
+    target = ops.add_protein(s, "end", Role.TARGET, b.blot, expected_mw=mw)
+    predicted = mwrow.predict(s.project.batch, s.project.batch.find_protein(target))
+    assert predicted.slot is not None and predicted.slot.expected_y[0] is not None
+    searched = "from 315 to 262 kDa" if end == "top" else "from 9.53 to 7.94 kDa"
+    assert predicted.slot.y0 == (0 if end == "top" else 455)
+    error = unchanged(s, lambda: ops.detect_mw_row(s, target))
+    assert (error.code, str(error)) == (
+        ErrorCode.NO_BAND_FOUND,
+        f"no band reaches the detection limit around the expected MW ({searched}) in any lane."
+        " Check the expected MW and the ladder marks, or drag a row box over the protein's band",
+    )
+
+
+def test_a_span_of_no_column_is_refused(tmp_path):
+    # A span given as no column, or cut by the image to none: refused,
+    # nothing changed.
+    b = calibrated(tmp_path)
+    s = b.session
+    target = add(b)
+    error = unchanged(s, lambda: ops.detect_mw_row(s, target, span=(400, 400)))
+    assert (error.code, str(error)) == (
+        ErrorCode.INVALID_INPUT,
+        "span (400, 400) is empty or inverted",
+    )
+    error = unchanged(s, lambda: ops.detect_mw_row(s, target, span=(WIDTH, WIDTH + 40)))
+    assert (error.code, str(error)) == (
+        ErrorCode.OUT_OF_IMAGE,
+        f"span ({WIDTH}, {WIDTH + 40}) lies outside the {WIDTH}x{HEIGHT} image {b.blot}",
+    )
 
 
 def test_a_prediction_off_its_slot_reads_the_span_s_centre():
@@ -1579,6 +1760,20 @@ _NO_ROW = [
         " MW and its tolerance",
         False,
     ),
+    (  # cut, and off the line with the lanes unsettled: the cut first
+        "cut_by_row_box",
+        _found(
+            _off({2: (1.2, 1.2)}, extra={0: {"cut": True}}),
+            ["ambiguous_lanes", "off_row_line", "cut_by_row_box"],
+        ),
+        LADDERS,
+        ErrorCode.ROW_LANES_UNCLEAR,
+        f"no row placed: bands cross the top or bottom edge of the rows searched around the"
+        f" expected MW {SLOT_KDA}, so they do not show which lane each band is in. Drag a row box"
+        " over the protein's band, its whole height, across all 6 lanes, or check the expected"
+        " MW and its tolerance",
+        False,
+    ),
     (
         "side_signal",
         _found(
@@ -1728,6 +1923,37 @@ def test_every_other_mw_refusal_is_worded_by_what_it_searched(
     drawn = ops._row_refusal(found, 60, 600)
     assert (drawn.code, drawn.detail["cause"]) == (code, cause)
     assert "expected MW" not in str(drawn) and "off_cause" not in drawn.detail
+
+
+@pytest.mark.parametrize(
+    ("row", "side_x", "cause"),
+    [
+        # Lane 8's expected centre (x 350) lies past the box's right edge (x
+        # 300), outside it: the edge cut a band and left the lane out.
+        ((40, 20, 300, 480), 350.0, "side_signal"),
+        # Lane 1's (x 0.5) lies inside the box from x 0: no lane left out.
+        ((0, 300, 400, 480), 0.5, "lanes_outside_row"),
+    ],
+)
+def test_a_drawn_row_s_side_edge_is_read_at_its_columns(tmp_path, monkeypatch, row, side_x, cause):
+    # A row box refused with lanes outside it, signal rising into its side at
+    # an end lane past the bands: whether that side edge cut a band and left
+    # the lane out is read against the box's left and right columns, not its
+    # rows.
+    b = calibrated(tmp_path)
+    s = b.session
+    target = add(b)
+    end = 7 if side_x > 100.0 else 0
+    lanes = [
+        _lane(i, reason="side_signal", expected_x=side_x)
+        if i == end
+        else _lane(i, expected_x=60.0 + 30.0 * i)
+        for i in range(8)
+    ]
+    outside = _found(lanes, ["lanes_outside_row"])
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: outside)
+    error = unchanged(s, lambda: ops.detect_row_boxes(s, target, row))
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_LANES_UNCLEAR, cause)
 
 
 def test_mw_refusal_words_name_lanes_off_the_line_past_its_limit_only():
