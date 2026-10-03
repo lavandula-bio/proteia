@@ -772,6 +772,10 @@ def test_an_expected_mw_on_a_range_end_is_searched(tmp_path, end):
     fitted = mwcal.calibration_for(s.project.batch.membrane_of(b.blot), b.blot)
     z = fitted.z_hi if end == "top" else fitted.z_lo
     mw = 10.0**z
+    for _ in range(8):  # the float whose log10 is the end, within a few last bits
+        if math.log10(mw) == z:
+            break
+        mw = math.nextafter(mw, math.inf if math.log10(mw) < z else -math.inf)
     assert math.log10(mw) == z  # not vacuous: exactly on the end
     target = ops.add_protein(s, "end", Role.TARGET, b.blot, expected_mw=mw)
     predicted = mwrow.predict(s.project.batch, s.project.batch.find_protein(target))
