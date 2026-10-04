@@ -3438,8 +3438,10 @@ def test_a_possibly_over_exposed_loading_control_names_the_values_it_biases(tmp_
         "'GAPDH' is possibly over-exposed in lane 3: its box holds 5 or more pixels within"
         " 2 grey levels of the detector limit, and its image has lossy (JPEG-type)"
         " compression, so saturation cannot be confirmed; if it is over-exposed there, its"
-        " net is an under-estimate, which biases every value normalized to it; check the"
-        " imager's original capture"
+        " net is an under-estimate, which biases every value normalized to it, and a"
+        " saturated band next to it may have merged into the same box, which then holds both"
+        " bands and its net may be too high; check the imager's original capture, or shorten"
+        " the exposure and image the membrane again"
     )
     # The excluded lane 4 holds a value: the all-lanes set has its own notice.
     [every] = [n for n in res.all_lanes.notices if n.code is NoticeCode.POSSIBLY_CLIPPED]
@@ -4620,6 +4622,38 @@ def test_edit_protein_drops_mw_guided_records_when_the_expected_mw_changes(tmp_p
     ops.edit_protein(s, beta, expected_mw=None)  # cleared: the searched slot means nothing
     assert _keys(s, beta) == [(2, 0)]
     assert s.project.log[-1].params["dropped_undetected"] == [_record_json(beta, guided)]
+
+
+def test_edit_protein_drops_mw_guided_records_when_the_tolerance_changes(tmp_path):
+    # The rows a row placed by its expected MW searched span the MW tolerance
+    # (twice it, either way): a new tolerance leaves its records about rows
+    # nobody looked in, and they go, logged in full. A row box's record does
+    # not depend on it, nor does another protein's; the same tolerance again
+    # changes nothing.
+    s, image, beta = boxed(tmp_path)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    guided, row = _record(1, source=ProposalSource.MW_GUIDED), _record(2, snr=-0.5)
+    plant_records(s, beta, guided, row)
+    plant_records(s, gapdh, _record(0, source=ProposalSource.MW_GUIDED))
+    committed = s.project
+    ops.edit_protein(s, beta, mw_tolerance=protein_of(s, beta).mw_tolerance)
+    assert s.project is committed and _keys(s, beta) == [(1, 0), (2, 0)]
+    ops.edit_protein(s, beta, mw_tolerance=0.2)
+    assert _keys(s, beta) == [(2, 0)]
+    assert _keys(s, gapdh) == [(0, 0)]
+    entry = s.project.log[-1]
+    assert (entry.action, entry.params) == (
+        "edit_protein",
+        {
+            "protein_id": beta,
+            "pinned_targets": [],
+            "mw_tolerance": 0.2,
+            "dropped_undetected": [_record_json(beta, guided)],
+        },
+    )
+    assert entry.content_hash == content_hash(s.project)
+    ops.undo(s)
+    assert _keys(s, beta) == [(1, 0), (2, 0)]
 
 
 def test_a_calibration_change_drops_the_membranes_mw_guided_records(tmp_path):
@@ -7530,6 +7564,81 @@ def test_a_row_box_over_two_rows_that_cuts_bands_names_the_lanes_off_its_line(tm
     assert_raw_reason(error.detail, found)
 
 
+def _crossed(dy: float, rel: float, **kwargs) -> tuple[RowCase, RowDetection]:
+    """A row smiling 8 px with another row ``dy`` px below it (above if
+    negative), ``rel`` times as deep, the row box over both, detected with the
+    expected row 3.5 px off the row's bands towards the other row where they
+    lie nearest it: its middle lanes (with the other row above) or its end
+    lanes (below) grow from the other row's bands, the rest from the row's
+    own (#58)."""
+    adjust = (0, -30, 0, 0) if dy < 0 else (0, 0, 0, 30)
+    case = adversarial_row(
+        "smiling",
+        1000,
+        smile=8.0,
+        neighbour_dy=dy,
+        neighbour_rel=rel,
+        box_adjust=kwargs.pop("box_adjust", adjust),
+        **kwargs,
+    )
+    ys = [cy + 0.5 for cy in case.lane_cy]
+    found = rowdetect.detect_row(
+        case.image,
+        case.row,
+        case.n_lanes,
+        background=estimate_background(case.image),
+        prefer_y=min(ys) - 3.5 if dy < 0 else max(ys) + 3.5,
+    )
+    return case, found
+
+
+def _off_line(found: RowDetection) -> list[int]:
+    return [
+        lane.lane
+        for lane in found.lanes
+        if lane.line_offset is not None and abs(lane.line_offset) > rowdetect.ROW_LINE_K
+    ]
+
+
+def test_lanes_grown_from_bands_on_two_rows_are_named_before_a_lane_off_the_line():
+    # Lanes 1, 2, 5, 6 grew from bands on two rows, and lane 3's bands lie
+    # 9 px below the others' (a montage's panel), off the row's line. The
+    # lanes grown from two rows say why the row box covers more than one row:
+    # they are named, not lane 3.
+    case, found = _crossed(-16.0, 2.0, shifts={2: 9.0})
+    assert found.crossed == (0, 1, 4, 5)
+    assert _off_line(found) == [2]
+    error = ops._row_refusal(found, case.row[0], case.row[2])
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
+    assert str(error) == (
+        "the bands found in lanes 1, 2, 5, 6 lie on two rows, a lane's on one and its"
+        " neighbour's on the other, each lane holding a band on both: the row box covers more"
+        " than one row, and the bands nearest the expected row do not lie on one; draw it over"
+        " one row only, or box those lanes by clicking their bands"
+    )
+
+
+def test_lanes_grown_from_bands_on_two_rows_refuse_the_row_as_off_its_line_when_it_cuts():
+    # The row box's bottom edge runs 2 px above the other row's bands'
+    # centres in lanes 3 and 4, cutting them. The lanes are read, and lanes
+    # 1, 2, 5, 6 grew from bands on two rows: said so, with the cut, not that
+    # the box does not show which lane each band is in.
+    case, found = _crossed(16.0, 3.0, box_adjust=(0, 0, 0, 2))
+    assert found.crossed == (0, 1, 4, 5)
+    assert [lane.lane for lane in found.lanes if lane.cut] == [2, 3]
+    assert _off_line(found) == []
+    error = ops._row_refusal(found, case.row[0], case.row[2])
+    assert (error.code, error.detail["cause"]) == (ErrorCode.ROW_OFF_LINE, "off_row_line")
+    assert str(error).startswith(
+        "the row box cuts through the bands, and the bands found in lanes 1, 2, 5, 6 lie on"
+        " two rows,"
+    )
+    assert str(error).endswith(
+        "draw it over one row only, over the whole band height, or box those lanes by"
+        " clicking their bands"
+    )
+
+
 def test_two_boxes_on_two_rows_are_both_named(tmp_path):
     # Two lanes, the first one's strongest band in the row above: neither box
     # is the row's.
@@ -8449,6 +8558,7 @@ MW_WRITERS = frozenset(
         "set_box_size",
         "set_box_padding",
         "detect_row_boxes",
+        "detect_mw_row",
         "remove_image",
         "set_marker_image",
         "set_ladder",
@@ -8497,11 +8607,12 @@ def test_every_operation_is_classified_for_the_mw_writer():
     functions = {name for name in ops.__all__ if inspect.isfunction(getattr(ops, name))}
     assert MW_WRITERS | MW_NEUTRAL == functions
     assert not MW_WRITERS & MW_NEUTRAL
+    writers = ("_refresh_mw(", "_refresh_box_mws(", "_calibration_change(", "_place_row(")
     for name in MW_WRITERS:
         source = inspect.getsource(getattr(ops, name))
-        assert any(
-            call in source for call in ("_refresh_mw(", "_refresh_box_mws(", "_calibration_change(")
-        ), name
+        assert any(call in source for call in writers), name
+    # The commit every row shares (detect_row_boxes, detect_mw_row) calls it.
+    assert "_refresh_box_mws(" in inspect.getsource(ops._place_row)
 
 
 def test_mw_current_after_each_operation(tmp_path):
@@ -8528,6 +8639,9 @@ def test_mw_current_after_each_operation(tmp_path):
     )
     step("detect_row_boxes", lambda: ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX))
     assert all(band.apparent_mw is not None for band in protein_of(s, c.protein).bands)
+    # The same row placed by its expected MW, between the ladders: in place, MW-guided.
+    step("detect_mw_row", lambda: ops.detect_mw_row(s, c.protein))
+    assert {band.source for band in protein_of(s, c.protein).bands} == {ProposalSource.MW_GUIDED}
     moved = lane_bands(s, c.protein)[2]
     x0, y0, x1, y1 = moved.box.rect(protein_of(s, c.protein).box_size)
     step("move_box", lambda: ops.move_box(s, moved.id, (x0 + 2, y0 + 3, x1 + 2, y1 + 3)))

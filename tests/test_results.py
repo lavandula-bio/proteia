@@ -1006,13 +1006,50 @@ def _clipped(*band_ids: str) -> Callable[[Project], None]:
     return edit
 
 
+# What every over-exposure notice adds (#58): a box over two saturated bands.
+MERGED = (
+    "a saturated band next to it may have merged into the same box, which then holds both"
+    " bands and its net may be too high"
+)
+
+
+@pytest.mark.parametrize("source", [ProposalSource.ROW_BOX, ProposalSource.MW_GUIDED])
+def test_an_over_exposed_box_notice_says_a_neighbour_may_have_merged(source):
+    # #58: two saturated bands whose saturated pixels touch are boxed
+    # together, by a row box or a row placed by its expected MW alike: every
+    # over-exposure notice says so, that the net may then be too high, and
+    # that a shorter exposure fixes it; whoever placed the box, the same
+    # words, a loading control's too.
+    def placed_by(draft: Project) -> None:
+        for band_id in ("band-11", "band-14"):
+            draft.batch.find_band(band_id)[1].source = source
+
+    res = compute_results(_batch(placed_by, _clipped("band-11", "band-14")))
+    notices = {n.protein_ids: n.message for n in res.notices if n.code is NoticeCode.CLIPPED}
+    assert notices == {
+        ("prot-7",): (
+            "'β-catenin' is over-exposed in lane 2: pixels at the detector limit make its net"
+            " an under-estimate, and a saturated band next to it may have merged into the"
+            " same box, which then holds both bands and its net may be too high; shorten the"
+            " exposure and image the membrane again; the lane stays included"
+        ),
+        ("prot-8",): (
+            "'α-tubulin' is over-exposed in lane 2: pixels at the detector limit make its net"
+            " an under-estimate, and a saturated band next to it may have merged into the"
+            " same box, which then holds both bands and its net may be too high; shorten the"
+            " exposure and image the membrane again; the lane stays included"
+        ),
+    }
+
+
 def test_notices_count_lanes_from_one():
     res = compute_results(_batch(_clipped("band-11"), _net("band-13", 0.0), _net("band-14", 0.0)))
     clipped = _one(res, NoticeCode.CLIPPED)
     assert clipped.lane_indices == (1,)
     assert clipped.message == (
         "'β-catenin' is over-exposed in lane 2: pixels at the detector limit make its net"
-        " an under-estimate; the lane stays included"
+        f" an under-estimate, and {MERGED}; shorten the exposure and image the membrane"
+        " again; the lane stays included"
     )
     loading = _one(res, NoticeCode.LOADING_NOT_POSITIVE)
     assert loading.lane_indices == (0, 1)
@@ -1607,6 +1644,7 @@ UNKNOWN = {"code": "unknown_bit_depth", "message": "The pixel type has no fixed 
 BETA_BANDS = ("band-10", "band-11", "band-12")
 EVERY_BAND = (*BETA_BANDS, "band-13", "band-14", "band-15", "band-16", "band-17", "band-18")
 UNDER = "if it is over-exposed there, its net is an under-estimate"
+RETAKE = "check the imager's original capture, or shorten the exposure and image the membrane again"
 
 
 def _image(image_id: str, bit_depth: int | None, *warnings: dict) -> Callable[[Project], None]:
@@ -1850,7 +1888,7 @@ def test_a_band_possibly_over_exposed_is_reported_with_its_lanes():
             message=(
                 f"'β-catenin' is possibly over-exposed in lane 1: its box holds {NEAR_2},"
                 " and its image has lossy (JPEG-type) compression, so saturation cannot be"
-                f" confirmed; {UNDER}; check the imager's original capture"
+                f" confirmed; {UNDER}, and {MERGED}; {RETAKE}"
             ),
             protein_ids=("prot-7",),
             lane_indices=(0,),
@@ -1884,8 +1922,8 @@ def test_a_possibly_over_exposed_loading_control_names_the_values_it_biases():
     assert notice.message == (
         f"'α-tubulin' is possibly over-exposed in lanes 1, 2: each of those boxes holds {NEAR_2},"
         " and its image has color channels averaged into gray, so saturation cannot be"
-        f" confirmed; {UNDER}, which biases every value normalized to it; check the imager's"
-        " original capture"
+        f" confirmed; {UNDER}, which biases every value normalized to it, and {MERGED};"
+        f" {RETAKE}"
     )
     # The target normalized to it gets no notice of its own: the chart card of
     # the series shows its loading control's (a notice about either protein).
@@ -1917,7 +1955,7 @@ def test_the_possible_notice_states_the_range_and_the_reason(bit_depth, warnings
     assert notice.message == (
         f"'β-catenin' is possibly over-exposed in lane 2: its box holds 5 or more pixels"
         f" within {near} of the detector limit, and its image has {because}, so saturation"
-        f" cannot be confirmed; {UNDER}; check the imager's original capture"
+        f" cannot be confirmed; {UNDER}, and {MERGED}; {RETAKE}"
     )
 
 
@@ -1930,7 +1968,7 @@ def test_a_possible_flag_without_a_reason_is_still_reported():
     assert notice.message == (
         "'β-catenin' is possibly over-exposed in lane 2: its box holds 5 or more pixels"
         " within 514 grey levels (2 on an 8-bit scale) of the detector limit;"
-        f" {UNDER}; check the imager's original capture"
+        f" {UNDER}, and {MERGED}; {RETAKE}"
     )
 
 

@@ -279,6 +279,36 @@ def test_settings_are_the_code_constants():
                 "tilt_warn": 0.05,
                 "tilt_min_lanes": 4,
             },
+            "placement": {  # a row placed by its expected MW (D11, D12)
+                "search_factor": 2.0,
+                "slot_margin_decades": 0.04,
+                "slot_min_px": 6,
+                "slot": (
+                    "from the expected MW x (1 + search_factor x tolerance) down to it / (1 +"
+                    " search_factor x tolerance), within the calibrated range, plus"
+                    " slot_margin_decades of a decade (at least slot_min_px px) above and"
+                    " below, at the centre of the lanes' span"
+                ),
+                "along_the_line": (
+                    "each column of the span shifted by whole pixels, round(y(mw, x + 0.5) -"
+                    " y(mw, centre)), so the protein line lies level for detection; boxes"
+                    " moved back by the shift of their centre column"
+                ),
+                "steep_row_deg": 3.0,
+                "seed": (
+                    "each lane grown from its peak nearest the expected MW's row, the lane's"
+                    " own peaks among them, stopping at the valley to any other band; a few"
+                    " lanes off the row's line and the expected MW's row, with no other band"
+                    " on the line there and the other boxes on that row, recorded as not"
+                    " detected"
+                ),
+                "lane_span": (
+                    "the span dragged; else the lanes placed on the image, half a pitch past"
+                    " the end lanes; else those of the image of its register group with the"
+                    " most lanes placed; else between two ladders, each one pitch outside its"
+                    " end lane, inset by half a pitch"
+                ),
+            },
             "presets_version": ladders.PRESETS_VERSION,
         },
         "statistics": {

@@ -448,6 +448,97 @@ def band_between(left: int, w: float, h: float, depth: float, dy: float = 0.0) -
     return f
 
 
+# A slot an expected MW places (#58, mwrow.slot): at 300 px per decade of MW
+# and the default 10% tolerance searched twice as wide, the expected row
+# +- log10(1.2) decades, plus a margin of 0.04 decade (12 px).
+MW_SLOT_HALF = math.log10(1.2) * 300.0 + 12.0  # 35.75 px
+
+
+def mw_slot_row(
+    name: str,
+    seed: int,
+    *,
+    n: int = 6,
+    pitch: float = 70.0,
+    w: float = 44.0,
+    h: float = 12.0,
+    depths: Sequence[float] | None = None,
+    missing: Sequence[int] = (),
+    neighbour_dy: float | None = None,
+    neighbour_depths: Sequence[float] | None = None,
+    slit: tuple[float, float] | None = None,
+    noise: float = NOISE_SIGMA,
+    img_h: int = 200,
+    margin: int = 70,
+) -> tuple[RowCase, float]:
+    """A row as a row placed by its expected MW (#58) reads it, and the
+    expected row (continuous): ``n`` lanes ``pitch`` apart, bands ``w`` x
+    ``h`` at 20% drawn as :func:`adversarial_row` draws them (centres off by
+    up to 2 px across and 1 px down, sizes by up to 8% and 10%, depths 18000
+    to 30000, or ``depths``), those of ``missing`` knocked out; with
+    ``neighbour_dy``, another band that far below each lane's (above if
+    negative), its height that band's, ``neighbour_depths`` deep (each lane's
+    own depth without), in the knocked-out lanes too; ``slit`` ``(share,
+    sigma)``: each band lighter along its middle by that share, over a
+    Gaussian ``sigma`` px high (a band with a light line along its middle).
+    The row box is the slot: from half a pitch outside the end lanes' nominal
+    centres, and :data:`MW_SLOT_HALF` above and below the expected row, the
+    row's nominal centre, rounded outward."""
+    rng = np.random.default_rng(seed)
+    lane_cx = margin + w / 2 + pitch * np.arange(n) + rng.uniform(-2.0, 2.0, n)
+    lane_cy = img_h / 2 + rng.uniform(-1.0, 1.0, n)
+    ws = w * rng.uniform(0.92, 1.08, n)
+    hs = h * rng.uniform(0.9, 1.1, n)
+    dps = rng.uniform(18000.0, 30000.0, n)
+    if depths is not None:
+        dps = np.asarray(depths, float)
+    width = int(math.ceil(lane_cx[-1] + ws[-1] / 2 + margin + pitch))
+    xs, ys = np.arange(width, dtype=float), np.arange(img_h, dtype=float)
+    parts: list[np.ndarray] = []
+    reference: dict[int, Rect] = {}
+    for i in range(n):
+        if i in set(missing):
+            continue
+        band = _band(xs, ys, lane_cx[i], lane_cy[i], ws[i], hs[i], dps[i], "super")
+        if slit is not None:
+            share, sigma = slit
+            band = band * (1.0 - share * np.exp(-0.5 * ((ys[:, None] - lane_cy[i]) / sigma) ** 2))
+        parts.append(band)
+        reference[i] = _ref_rect(lane_cx[i], lane_cy[i], ws[i], hs[i])
+    if neighbour_dy is not None:
+        for i in range(n):
+            deep = dps[i] if neighbour_depths is None else neighbour_depths[i]
+            parts.append(
+                _band(xs, ys, lane_cx[i], lane_cy[i] + neighbour_dy, ws[i], hs[i], deep, "super")
+            )
+    dark = np.zeros((img_h, width))
+    for part in parts:
+        dark += part
+    image = np.round(
+        np.clip(MEMBRANE - dark + rng.normal(0.0, 1.0, dark.shape) * noise, 0.0, FULL_SCALE)
+    )
+    centre, half = margin + w / 2 + pitch * (n - 1) / 2, pitch * (n - 1) / 2
+    expected = img_h / 2 + 0.5
+    row = (
+        max(0, math.floor(centre - half - pitch / 2)),
+        max(0, math.floor(expected - MW_SLOT_HALF)),
+        min(width, math.ceil(centre + half + pitch / 2)),
+        min(img_h, math.ceil(expected + MW_SLOT_HALF)),
+    )
+    case = RowCase(
+        name,
+        "",
+        image,
+        True,
+        row,
+        n,
+        reference,
+        tuple(float(c) for c in lane_cx),
+        tuple(float(c) for c in lane_cy),
+    )
+    return case, expected
+
+
 def beside(
     lanes: float,
     w: float,
@@ -1259,12 +1350,15 @@ def _shown_by(
     rows: tuple[int, int],
 ) -> str | None:
     """What the page shows of a lane in doubt, None for nothing: the whole
-    row's doubt; an empty lane not measured or not recorded; a box flagged,
-    named by the size note, or holding more bands in the row box's rows than
-    one (the results' band count)."""
+    row's doubt; an empty lane recorded as not detected off the row's line
+    (its row warning, with its n.d. record), not measured or not recorded; a
+    box flagged, named by the size note, or holding more bands in the row
+    box's rows than one (the results' band count)."""
     if row_wide is not None:
         return row_wide
     if lane.rect is None:
+        if lane.reason == "off_expected_row":
+            return "row warning: off_expected_row"
         if lane.reason != "no_band":
             return f"not measured: {lane.reason}"
         if lane.window is None:

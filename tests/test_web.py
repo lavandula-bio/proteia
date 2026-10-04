@@ -1672,8 +1672,11 @@ def _logged_actions() -> set[str]:
     operations = (core / "operations.py").read_text(encoding="utf-8")
     session = (core / "session.py").read_text(encoding="utf-8")
     applied = re.findall(r'\b_apply\(\s*session,\s*"(\w+)"', operations)
+    # The commit rows share (_place_row) applies the action its callers name,
+    # each as action="..." (found below).
+    shared = re.findall(r"\b_apply\(\s*session,\s*action,", operations)
     # Each call is found, however it is laid out.
-    assert len(applied) == len(re.findall(r"(?<!def )\b_apply\(", operations))
+    assert len(applied) + len(shared) == len(re.findall(r"(?<!def )\b_apply\(", operations))
     moves = re.findall(r'\._move\("(\w+)"\)', operations)
     own = re.findall(r'\baction="(\w+)"', operations + session)
     return {*applied, *moves, *own}

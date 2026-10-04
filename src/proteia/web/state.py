@@ -62,7 +62,9 @@ share (0.1: ±10%). ``membranes`` lists each membrane's ``id``, its
 ``image_ids``, its calibration ``points`` (``image_id``, ``y``, ``mw``,
 ``source``, ``x`` and ``side``, in continuous coordinates of the analysis
 array) and its ``fit`` (:meth:`~proteia.core.operations.CalibrationFit.as_json`,
-null without a curve).
+null without a curve). Each protein's ``predicted_row`` is where its row is
+predicted by its expected MW (:func:`_predicted_row`), and before it has a box,
+its missing lanes' y follows it.
 """
 
 from __future__ import annotations
@@ -74,6 +76,7 @@ import numpy as np
 from PIL import Image
 from pydantic import JsonValue
 
+from proteia.core import mwrow
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
 from proteia.core.model import Batch, ImageRef, Membrane, Project, Protein
 from proteia.core.operations import calibration_fit, unassessed_images
@@ -82,14 +85,18 @@ from proteia.core.session import HistoryStep, ProjectSession
 
 
 def _missing_lanes(
-    batch: Batch, protein: Protein, anchors: list[tuple[float, int]]
+    batch: Batch,
+    protein: Protein,
+    anchors: list[tuple[float, int]],
+    predicted: mwrow.Prediction | None,
 ) -> list[JsonValue]:
     """The declared lanes where ``protein`` has neither a first-band box nor a
     first-band not-detected record (that lane was examined), each with where its
     box is expected: the lane's centre x from ``anchors``, the boxes already on
     its image (:func:`~proteia.core.project.lane_positions`), and the protein's
-    row (the median centre y of its first bands); None where that cannot be
-    known yet."""
+    row (the median centre y of its first bands; before it has one, its
+    ``predicted`` row's at its expected MW, along the protein line where the
+    lane's x is known); None where that cannot be known yet."""
     first = [band for band in protein.bands if band.band_index == 0]
     has = {band.lane_index for band in first}
     has.update(record.lane_index for record in protein.undetected if record.band_index == 0)
@@ -99,7 +106,37 @@ def _missing_lanes(
     xs = lane_positions(anchors, lanes)
     centres = [band.box.y + protein.box_size.height / 2 for band in first]
     y = statistics.median(centres) if centres else None
-    return [{"lane_index": lane, "x": xs.get(lane), "y": y} for lane in lanes]
+    if y is not None or predicted is None or predicted.expected_y[0] is None:
+        return [{"lane_index": lane, "x": xs.get(lane), "y": y} for lane in lanes]
+    at = predicted.expected_y[0]
+    missing: list[JsonValue] = []
+    for lane in lanes:
+        x = xs.get(lane)
+        shift = 0 if x is None or predicted.slot is None else predicted.slot.shift_at(x)
+        missing.append({"lane_index": lane, "x": x, "y": at + shift})
+    return missing
+
+
+def _predicted_row(predicted: mwrow.Prediction | None) -> JsonValue:
+    """Where the protein's row is predicted by its expected MW (#58), for the
+    page to draw: null without an expected MW or a curve (or for a protein
+    expecting several bands); else ``bands``, each expected MW and its y at the
+    lanes' centre (null outside the calibrated range there), and, where the
+    lanes' span is known and the slot can be placed, the slot at the centre as
+    ``row`` ``[x0, y0, x1, y1]``, the rows it lies lower at the span's first
+    and last columns along the protein line (``shift_ends``) and where the span
+    was read (``span_from``); those are null otherwise."""
+    if predicted is None:
+        return None
+    found = predicted.slot
+    return {
+        "row": None if found is None else list(found.row),
+        "shift_ends": None if found is None else list(found.shift_ends),
+        "span_from": None if predicted.span is None else predicted.span.source,
+        "bands": [
+            {"mw": mw, "y": y} for mw, y in zip(predicted.mws, predicted.expected_y, strict=True)
+        ],
+    }
 
 
 def _membrane(membrane: Membrane) -> JsonValue:
@@ -182,6 +219,7 @@ def project_state(
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
         size, fitted, padding = protein.box_size, protein.fitted_size, protein.box_padding
+        predicted = mwrow.predict(batch, protein)
         proteins.append(
             {
                 "id": protein.id,
@@ -222,7 +260,10 @@ def project_state(
                     }
                     for record in protein.undetected
                 ],
-                "missing_lanes": _missing_lanes(batch, protein, anchors[protein.image_id]),
+                "missing_lanes": _missing_lanes(
+                    batch, protein, anchors[protein.image_id], predicted
+                ),
+                "predicted_row": _predicted_row(predicted),
             }
         )
     return {

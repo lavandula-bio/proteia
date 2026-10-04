@@ -650,7 +650,11 @@ class UndetectedBand(_Model):
     detection limit". ``threshold`` is the limit in force when the record was
     written, so each record backs its own claim. The detector's window comes from
     code constants, not from the protein's box size, so a size change never makes
-    ``snr`` stale.
+    ``snr`` stale. A row placed by its expected MW also records a lane whose
+    band lay off the row's line and off the expected row (#58,
+    ``off_expected_row``): its ``snr`` is read on the row's line, the band's
+    own tail there less its reflection about the band's centre, and its
+    ``region`` is the rows that reading read.
     """
 
     lane_index: int = Field(ge=0)  # index into Batch.lanes, as for a band

@@ -109,14 +109,20 @@ Resizing or padding the boxes keeps it. Like nets, a cleared count is a field
 of a band with an id and is not logged: a calibration operation's
 ``curves_changed`` names the images whose counts went.
 
+A row placed by its expected MW (:func:`detect_mw_row`, #58) commits as a
+dragged row box does, through the commit every row shares (:func:`_place_row`):
+what is said here of :func:`detect_row_boxes` holds for it, with source
+``mw_guided`` on the boxes it places and the records it writes.
+
 A not-detected record (:class:`~proteia.core.model.UndetectedBand`) is a
 detector's measurement that cannot be redone from the model alone, so an edit
 that invalidates one drops it, in the same change, and logs it in full: a box
 placed or moved into its lane replaces it (``replaced_undetected``), and a
 polarity change or a lane table that cuts its lane drops it
 (``dropped_undetected``). An MW-guided record searched a slot placed from the
-protein's expected MW and its image's calibration, so a change to the
-expected MW drops that protein's MW-guided records, and a change to the curve
+protein's expected MW, its MW tolerance and its image's calibration, so a
+change to the expected MW or the tolerance drops that protein's MW-guided
+records, and a change to the curve
 of an image (its register group's calibration points, or the marker links
 that make the group) drops those of every protein on it
 (``dropped_undetected``). A removed protein or image takes its
@@ -152,7 +158,7 @@ import logging
 import math
 import shutil
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Concatenate, Final
@@ -160,7 +166,7 @@ from typing import Any, BinaryIO, Concatenate, Final
 import numpy as np
 from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, export, ladders, mwcal, record, results, rowdetect, storage
+from proteia.core import boxes, export, ladders, mwcal, mwrow, record, results, rowdetect, storage
 from proteia.core.analyze import ReduceMethod, StatisticsSetting, statistics_setting
 from proteia.core.export import (
     BUNDLE_RECORD_FILE,
@@ -268,6 +274,7 @@ __all__ = [
     "LadderFit",
     "LaneInput",
     "LanesUpdate",
+    "MwRowPlacement",
     "OperationError",
     "PaddingChange",
     "ProjectSession",
@@ -280,6 +287,7 @@ __all__ = [
     "clear_calibration",
     "compute",
     "compute_view",
+    "detect_mw_row",
     "detect_row_boxes",
     "edit_calibration_point",
     "edit_protein",
@@ -428,6 +436,35 @@ class RowPlacement:
     remeasured: tuple[tuple[str, float, float], ...] = ()  # other proteins' nets it changed
     largest_change: tuple[str, float] | None = None  # (band id, share of its net before)
     unlocated_lanes: tuple[int, ...] = ()  # no_band lanes whose slot rests on one band alone
+
+
+@dataclass(frozen=True, kw_only=True)
+class MwRowPlacement(RowPlacement):
+    """What :func:`detect_mw_row` did: a :class:`RowPlacement`, and where the
+    row was searched (#58, D11, D12).
+
+    ``row`` is the slot at the span's centre, as a row box; along the protein
+    line it lies ``shift_ends`` rows lower at the span's first and last
+    columns (0 and 0 on a level line). ``expected_y`` is each expected MW's y
+    at the centre. ``span`` is the lanes' columns, ``x0`` to ``x1 - 1``, read
+    from ``span_from``: ``given`` (dragged), ``anchors`` (the lanes already
+    placed on the image), ``group_anchors`` (those of its register group's
+    image with the most) or ``ladders`` (between its two ladders).
+    ``two_ladders`` and ``tilt_deg`` describe the protein line
+    (:class:`CalibrationFit`), ``slope_deg`` its slope at the expected MW.
+    ``span_hint`` is set when lanes read between the ladders are doubtful
+    (``doubtful_lanes``): the ladder lanes may be declared as lanes, or a well
+    beside a ladder empty, and a drag across the lanes settles them."""
+
+    row: Rect
+    shift_ends: tuple[int, int]
+    expected_y: tuple[float, ...]
+    span: tuple[int, int]
+    span_from: str
+    two_ladders: bool
+    tilt_deg: float | None
+    slope_deg: float
+    span_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -740,9 +777,9 @@ def _drop_undetected_where(
 
 def _drop_mw_guided(protein: Protein) -> list[dict[str, JsonValue]]:
     """Remove a draft protein's MW-guided records: the slot each one examined was
-    placed from the expected MW and its image's calibration curve (its register
-    group's), so a change to either leaves the record about a slot nobody
-    looked in."""
+    placed from the expected MW, the MW tolerance and its image's calibration
+    curve (its register group's), so a change to any of them leaves the record
+    about a slot nobody looked in."""
     return _drop_undetected_where(protein, lambda record: record.source is ProposalSource.MW_GUIDED)
 
 
@@ -2961,7 +2998,9 @@ def edit_protein(
     the band counts of its MW-guided bands. A changed MW tolerance (#58) is
     read by the MW check at once; it clears the band counts of the protein's
     detector bands where their window came from it (its image has a curve),
-    and drops no record.
+    and drops the protein's MW-guided records too, whose slot came from the
+    old tolerance (the rows searched around the expected MW); a row box's
+    records do not depend on it.
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
@@ -2995,7 +3034,7 @@ def edit_protein(
         edited.mw_tolerance = tolerance
         edited.loading_control_ids = controls
         dropped: list[JsonValue] = []
-        if mw != protein.expected_mw:
+        if mw != protein.expected_mw or tolerance != protein.mw_tolerance:
             dropped.extend(_drop_mw_guided(edited))
         for band in edited.bands:  # counts whose window or slot the edit moved
             guided = mw != protein.expected_mw and band.source is ProposalSource.MW_GUIDED
@@ -3793,7 +3832,263 @@ def _misnumbered_lanes(
     )
 
 
-def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationError:
+@dataclass(frozen=True)
+class _MwSearch:
+    """What a row placed by its expected MW searched (:func:`detect_mw_row`),
+    for its refusals' words (:func:`_row_refusal`): the declared lanes, the
+    slot's MW ends before its margin (``m_top``, ``m_bot``), where the lanes'
+    span came from (``span_from``), and where the lanes were taken to lie
+    (``where``; None for a span the user dragged)."""
+
+    lanes: int
+    m_top: float
+    m_bot: float
+    span_from: str
+    where: str | None
+
+
+def _kda_words(mw: float) -> str:
+    """An MW to 3 significant digits, as plain digits: 92 / 1.2 -> 76.7."""
+    return f"{float(f'{mw:.3g}'):g}"
+
+
+def _span_step(mw: _MwSearch) -> str:
+    """The step that redoes a row's lanes' span: its drag again, from band
+    to band, or, for a span taken from elsewhere, where it came from and the
+    drag."""
+    if mw.where is None:
+        return (
+            f". Drag across all {mw.lanes} lanes again, from the outer edge of the first"
+            " lane's band to the outer edge of the last's"
+        )
+    return (
+        f"; the lanes were taken to lie {mw.where}: drag across all {mw.lanes} lanes (only the"
+        " left and right ends are used)"
+    )
+
+
+def _boxes_lie(lanes: Sequence[rowdetect.LaneDetection]) -> str:
+    """``lane 2's box lies`` or ``the boxes of lanes 2, 5 lie``."""
+    named = lanes_phrase([lane.lane for lane in lanes])
+    return f"{named}'s box lies" if len(lanes) == 1 else f"the boxes of {named} lie"
+
+
+def _heights(values: Iterable[float | None]) -> str:
+    """Box heights in words, 2 decimals, as the limit they meet is given,
+    more where 2 would round one onto the limit (:func:`rowdetect.shown_against`)."""
+    return _in_words(
+        [rowdetect.shown_against(abs(v or 0.0), rowdetect.ROW_LINE_K, 2) for v in values]
+    )
+
+
+# What lies on the row's line in a lane off it, by the reading's reason
+# (rowdetect._on_the_line), but another band's (which gives its SNR).
+_ON_THE_LINE: Final = {
+    "line": "a line or strip across the lanes reaches the detection limit on the row's line in",
+    "side_signal": (
+        "signal rising into the left or right end of the lanes' span reaches the detection"
+        " limit on the row's line in"
+    ),
+    "edge_signal": (
+        "signal at the top or bottom edge of the rows searched reaches the detection limit on"
+        " the row's line in"
+    ),
+    "artefact": "a streak or stain lies on the row's line in",
+    "outside": "the row's line runs outside the rows searched in",
+}
+
+
+def _not_recorded(found: rowdetect.RowDetection) -> str:
+    """Why the lanes off a row's line placed by its expected MW were not
+    recorded as not detected (:attr:`~proteia.core.rowdetect.RowDetection.off_cause`),
+    with the lanes and the numbers each condition met or missed; empty when
+    nothing was checked."""
+    k = rowdetect.ROW_LINE_K
+    boxed = [lane for lane in found.lanes if lane.rect is not None]
+    off = [lane for lane in boxed if abs(lane.line_offset or 0.0) > k]
+    cause = found.off_cause
+    if cause == "half":
+        return (
+            f"; {len(off)} of {len(boxed)} boxes are off the line, half or more, so none is"
+            " recorded as not detected"
+        )
+    if cause == "expected_row":
+        named = [lane for lane in off if abs(lane.expected_offset or 0.0) <= k]
+        return (
+            f"; {_boxes_lie(named)} on the expected MW's row"
+            f" ({_heights(lane.expected_offset for lane in named)} box heights from it, limit"
+            f" {k:g}), so the line may run through another row"
+        )
+    if cause == "line_signal":
+        named = [lane for lane in off if lane.line_reason != "no_band"]
+        bands = [lane for lane in named if lane.line_reason == "unassigned"]
+        parts = []
+        if bands:
+            snrs = _in_words(
+                [
+                    rowdetect.shown_against(lane.line_snr or 0.0, rowdetect.DETECT_K, 1)
+                    for lane in bands
+                ]
+            )
+            parts.append(
+                "another band reaches the detection limit on the row's line in"
+                f" {lanes_phrase([lane.lane for lane in bands])} (SNR {snrs}, limit"
+                f" {rowdetect.DETECT_K:g})"
+            )
+        for reason, words in _ON_THE_LINE.items():
+            lanes = [lane.lane for lane in named if lane.line_reason == reason]
+            if lanes:
+                parts.append(f"{words} {lanes_phrase(lanes)}")
+        they = "it is" if len(named) == 1 else "they are"
+        return f"; {_in_words(parts)}, so {they} not recorded as not detected"
+    if cause == "other_box":
+        named = [lane for lane in boxed if lane not in off and abs(lane.expected_offset or 0.0) > k]
+        return (
+            f"; {_boxes_lie(named)} off the expected MW's row"
+            f" ({_heights(lane.expected_offset for lane in named)} box heights, limit {k:g}),"
+            " so the line may run through another row"
+        )
+    if cause == "again":
+        again = sorted(found.again)
+        return (
+            f"; placed again without {lanes_phrase([lane.lane for lane in off])},"
+            f" {_boxes_lie([found.lanes[lane] for lane, _ in again])} off the line"
+            f" ({_heights(v for _, v in again)} box heights, limit {k:g}), so none is"
+            " recorded as not detected"
+        )
+    return ""
+
+
+def _off_row_step(found: rowdetect.RowDetection, n: int) -> str:
+    """The next step after a row placed by its expected MW whose bands lie off
+    its line or on two rows: where boxes lie off the expected row
+    (``expected_offset`` beyond ``ROW_LINE_K``), they may hold another band,
+    so the user clicks the protein's bands; else a row box over the
+    protein's whole band, but clicks where a lane holds no protein (a row
+    box would box another band there)."""
+    away = [
+        lane.lane
+        for lane in found.lanes
+        if lane.rect is not None and abs(lane.expected_offset or 0.0) > rowdetect.ROW_LINE_K
+    ]
+    if away:
+        return (
+            f". In {lanes_phrase(away)} the band found lies off the expected MW's row: box the"
+            " protein's bands by clicking them in the lanes that hold it; a row box may box that"
+            " other band there"
+        )
+    return (
+        f". Drag a row box over the protein's band, its whole height, across all {n} lanes; if a"
+        " lane holds no protein, box the protein's bands by clicking them instead, since a row"
+        " box may box another band in that lane"
+    )
+
+
+def _mw_refusal_words(found: rowdetect.RowDetection, cause: str, mw: _MwSearch) -> tuple[str, bool]:
+    """The words of a refusal of a row placed by its expected MW, by the
+    ``cause`` :func:`_row_refusal` found, and whether they end with the
+    drag of a span the user did not drag (:func:`_span_step`). None of them
+    speaks of a row box the user drew: the row is the rows searched around
+    the expected MW, between the lanes' span's ends."""
+    n = mw.lanes
+    kda = f"(from {_kda_words(mw.m_top)} to {_kda_words(mw.m_bot)} kDa)"
+    asks = mw.where is not None
+    if found.refused:
+        if cause == "cut_by_row_box":
+            return (
+                "no row placed: bands cross the top or bottom edge of the rows searched around"
+                f" the expected MW {kda}, so they do not show which lane each band is in. Drag a"
+                f" row box over the protein's band, its whole height, across all {n} lanes, or"
+                " check the expected MW and its tolerance"
+            ), False
+        if cause == "side_signal":
+            return (
+                "no row placed: the left or right end of the lanes' span cuts through a band,"
+                f" so lanes lie outside it{_span_step(mw)}"
+            ), asks
+        settled = not any(
+            flag in rowdetect.REFUSING_FLAGS and flag != "off_row_line" for flag in found.flags
+        )
+        if cause == "off_row_line" and settled:
+            lead = ""
+            if any(lane.cut for lane in found.lanes):
+                lead = (
+                    "bands cross the top or bottom edge of the rows searched around the"
+                    " expected MW, and "
+                )
+            if found.crossed:
+                what = (
+                    f"the bands nearest the expected MW in {lanes_phrase(found.crossed)} lie on"
+                    " two rows, a lane's on one and its neighbour's on the other: the expected"
+                    " MW's row lies between two bands"
+                )
+            else:
+                off = [
+                    lane
+                    for lane in found.lanes
+                    if abs(lane.line_offset or 0.0) > rowdetect.ROW_LINE_K
+                ]
+                those = "that lane picked" if len(off) == 1 else "those lanes picked"
+                what = (
+                    f"in {lanes_phrase([lane.lane for lane in off])} the band found lies off the"
+                    " row's line through the other lanes' bands"
+                    f" ({_heights(lane.line_offset for lane in off)} box heights, limit"
+                    f" {rowdetect.ROW_LINE_K:g}): {those} another band, or the other edge of one"
+                    " band (a band with a light line along its middle reads as two)"
+                    + _not_recorded(found)
+                )
+            return f"no row placed: {lead}{what}{_off_row_step(found, n)}", False
+        unclear = "no row placed: the bands found around the expected MW do not show which lane"
+        if mw.where is None:
+            return (
+                f"{unclear} each band is in. Drag across all {n} lanes again, from the outer edge"
+                " of the first lane's band to the outer edge of the last's, or drag a row box"
+                f" over the protein's band across all {n} lanes, or box the bands by clicking"
+                " them"
+            ), False
+        return (
+            f"{unclear} each band is in. Drag a row box over the protein's band across all {n}"
+            f" lanes, or box the bands by clicking them{_span_step(mw)}"
+        ), True
+    words = {
+        "unassigned": (
+            f"bands were found around the expected MW {kda} but do not fit the lanes. Drag"
+            f" across all {n} lanes, or box the bands by clicking them"
+        ),
+        "edge_signal": (
+            f"the only signal around the expected MW {kda} lies at the top or bottom edge of"
+            " the rows searched: the protein's band may lie outside them. Check the expected"
+            " MW, or drag a row box over the protein's band"
+        ),
+        "side_signal": (
+            "the only signal around the expected MW rises into the left or right end of the"
+            f" lanes' span. Drag across all {n} lanes"
+        ),
+        "line": (
+            "the only signal around the expected MW runs across the lanes as a line or strip,"
+            " not as bands. Drag a row box over the bands only, or box them by clicking"
+        ),
+        "artefact": (
+            "the only signal around the expected MW runs through the whole height searched: a"
+            " streak or stain. Drag a row box over the protein's band, or box it by clicking"
+        ),
+        "too_little_membrane": (
+            f"the rows searched around the expected MW {kda} hold too little membrane to"
+            " measure the bands against. Drag a row box over the protein's band, with some"
+            " membrane above and below it"
+        ),
+        "no_band": (
+            f"no band reaches the detection limit around the expected MW {kda} in any lane."
+            " Check the expected MW and the ladder marks, or drag a row box over the protein's"
+            " band"
+        ),
+    }
+    return words[cause], False
+
+
+def _row_refusal(
+    found: rowdetect.RowDetection, x0: int, x1: int, mw: _MwSearch | None = None
+) -> OperationError:
     """The refusal of a row whose detection :func:`detect_row_boxes` cannot
     commit, worded by what the detector saw; ``x0`` and ``x1`` are the row
     box's sides, clipped to the image.
@@ -3811,7 +4106,9 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     (``ROW_OFF_LINE``, cause ``off_row_line``: a box more than
     :data:`~proteia.core.rowdetect.ROW_LINE_K` box heights off the row's
     line, as a box over two rows, or over a lane whose band lies off the row,
-    places one; every box off it, two rows and neither the row's), naming
+    places one; every box off it, two rows and neither the row's; or lanes
+    grown from their peaks nearest an expected row on two rows of bands,
+    :attr:`~proteia.core.rowdetect.RowDetection.crossed`, named first), naming
     those lanes unless another refusing flag leaves the reading unsettled;
     otherwise the first refusing flag (signal rising into
     the box's side elsewhere, as a dark image edge leaves, does not make the
@@ -3835,6 +4132,17 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
     ``lane_index``, ``reason``, ``snr``, ``cut`` and ``line_offset``. Only the
     ``off_row_line`` message names lanes: a reading the row box does not
     settle numbers them unreliably.
+
+    With ``mw``, a row placed by its expected MW (:func:`detect_mw_row`): the
+    same causes and codes, worded by what that row searched, never by a row
+    box the user did not draw (:func:`_mw_refusal_words`). Lanes off the
+    row's line name the numbers they were refused by and why none was
+    recorded as not detected (:func:`_not_recorded`), and the next step
+    depends on whether boxes lie off the expected MW's row
+    (:func:`_off_row_step`). ``detail`` adds the detector's ``off_cause``
+    and each lane's ``expected_offset``, ``line_snr`` and ``line_reason``;
+    where the words ask for the drag of a span the user did not drag, the
+    span's source (``span_from``) and ``hint`` ``lane_span_required``.
     """
     reasons = {lane.reason for lane in found.lanes}
     if found.refused:
@@ -3862,8 +4170,9 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
         settled = not any(
             flag in rowdetect.REFUSING_FLAGS and flag != "off_row_line" for flag in found.flags
         )
+        crossed = list(found.crossed)  # grown from their peaks nearest the expected row
         cut = any(lane.cut for lane in found.lanes)
-        if cut and not (off and settled):
+        if cut and not ((off or crossed) and settled):
             cause = "cut_by_row_box"
             message = (
                 "the row box cuts through the bands, so it does not show which lane each band"
@@ -3877,18 +4186,30 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
                 " which lane each band is in; draw it over the whole bands of every declared"
                 " lane, empty end lanes included"
             )
-        elif off:
+        elif off or crossed:
             code = ErrorCode.ROW_OFF_LINE
             cause = "off_row_line"
+            named = crossed or off
             if not settled:
                 which, lie, those, fix = "some bands found", "lie", "some bands", ""
-            elif len(off) == 1:
-                which, lie, those = f"the band found in {lanes_phrase(off)}", "lies", "that band"
+            elif len(named) == 1:
+                which, lie, those = f"the band found in {lanes_phrase(named)}", "lies", "that band"
                 fix = ", or box that lane by clicking its band"
             else:
-                which, lie, those = f"the bands found in {lanes_phrase(off)}", "lie", "those bands"
+                which, lie, those = (
+                    f"the bands found in {lanes_phrase(named)}",
+                    "lie",
+                    "those bands",
+                )
                 fix = ", or box those lanes by clicking their bands"
-            if settled and len(off) == sum(lane.rect is not None for lane in found.lanes):
+            if crossed:
+                # Neighbours grown from bands on two rows, each holding a band on both.
+                what = (
+                    f"{which} {lie} on two rows, a lane's on one and its neighbour's on the other,"
+                    " each lane holding a band on both: the row box covers more than one row,"
+                    " and the bands nearest the expected row do not lie on one"
+                )
+            elif settled and len(off) == sum(lane.rect is not None for lane in found.lanes):
                 # Every box off the line: two rows, neither the row's.
                 what = (
                     f"{which} {lie} on two rows, more than {rowdetect.ROW_SMILE:g} box heights"
@@ -3974,6 +4295,17 @@ def _row_refusal(found: rowdetect.RowDetection, x0: int, x1: int) -> OperationEr
             for lane in found.lanes
         ],
     }
+    if mw is not None:
+        message, asks = _mw_refusal_words(found, cause, mw)
+        detail["off_cause"] = found.off_cause
+        for entry, lane in zip(detail["lanes"], found.lanes, strict=True):
+            entry.update(
+                expected_offset=lane.expected_offset,
+                line_snr=lane.line_snr,
+                line_reason=lane.line_reason,
+            )
+        if asks:
+            detail.update(span_from=mw.span_from, hint=ErrorCode.LANE_SPAN_REQUIRED.value)
     return OperationError(code, message, detail=detail)
 
 
@@ -4180,9 +4512,55 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     given = _row(row)
-    n = len(batch.lanes)
-    if n == 0:
+    if not batch.lanes:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before detecting a row")
+    return _place_row(
+        session,
+        protein,
+        given,
+        action="detect_row_boxes",
+        source=ProposalSource.ROW_BOX,
+        detect=rowdetect.detect_row,
+        lead={"row": list(given)},
+    )
+
+
+# The detection a row commit runs, called as rowdetect.detect_row is:
+# detect(array, row, n_lanes, background=..., dark_on_light=..., right_to_left=...,
+# saturated_at=...).
+_Detect = Callable[..., rowdetect.RowDetection]
+
+
+def _place_row(
+    session: ProjectSession,
+    protein: Protein,
+    given: Rect,
+    *,
+    action: str,
+    source: ProposalSource,
+    detect: _Detect,
+    lead: Mapping[str, JsonValue],
+    what: str = "row box",
+    also_notes: Sequence[str] = (),
+    mw: _MwSearch | None = None,
+) -> RowPlacement:
+    """The commit a row shares, whoever placed it (:func:`detect_row_boxes`,
+    :func:`detect_mw_row`): detect one band per declared lane in the rows of
+    ``given`` with ``detect`` and commit the outcome for the protein's band
+    index 0, as :func:`detect_row_boxes` describes, under the log action
+    ``action``. The boxes placed or replaced in place, and the not-detected
+    records written, take ``source``. The log entry's params are the
+    protein's id, then ``lead`` (what placed the row), then the outcome, lane
+    by lane, from ``lanes`` to ``settings``; ``also_notes`` follow the
+    detector's notes. ``what`` names the row in the session log. The declared
+    lanes are not checked: the caller refused a batch without them. ``mw``:
+    what a row placed by its expected MW searched, for the words of its
+    refusals (:func:`_row_refusal`). A lane the detector recorded as not
+    detected off the row's line (``off_expected_row``) gets a not-detected
+    record of the rows it read on that line, as a lane with no band does."""
+    protein_id = protein.id
+    batch = session.project.batch
+    n = len(batch.lanes)
     image = batch.find_image(protein.image_id)
     width, height = image.width, image.height
     # The lanes on the image, less this protein's boxes that give way to the
@@ -4218,7 +4596,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         # record reports (record.settings) with how saturated_at is chosen; the
         # rest comes from the image and its lanes, and the log keeps the
         # direction and the saturation level.
-        found = rowdetect.detect_row(
+        found = detect(
             array,
             given,
             n,
@@ -4231,7 +4609,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         ids = (image.id,) if exc.code == "invalid_image" else ()
         raise OperationError(_ROW_ERRORS[exc.code], str(exc), ids=ids) from exc
     if found.refused or found.size is None:
-        raise _row_refusal(found, max(0, given[0]), min(width, given[2]))
+        raise _row_refusal(found, max(0, given[0]), min(width, given[2]), mw)
 
     # Band index 0, per lane: a box edited by hand stays, and so does one the
     # user placed where no band was found; any other gives way.
@@ -4257,16 +4635,27 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     if off:
         named = _named_lanes(anchors, off)
         placed_ids = lane_anchor_ids(batch, image, without=detectors)
+        message = (
+            "the bands in the row box do not line up with the lanes already placed on this"
+            " image; draw the box over every declared lane, empty end lanes included"
+        )
+        detail: dict[str, JsonValue] = {"cause": "off_lanes", "off_lanes": list(off)}
+        if mw is not None:
+            message = (
+                "no row placed: the bands found around the expected MW do not line up with the"
+                f" lanes already placed on this image{_span_step(mw)}"
+            )
+            if mw.where is not None:
+                detail.update(span_from=mw.span_from, hint=ErrorCode.LANE_SPAN_REQUIRED.value)
         raise OperationError(
             ErrorCode.ROW_LANES_UNCLEAR,
-            "the bands in the row box do not line up with the lanes already placed on this"
-            " image; draw the box over every declared lane, empty end lanes included",
+            message,
             ids=[
                 band_id
                 for band_id, (_, lane) in zip(placed_ids, anchors, strict=True)
                 if lane in named
             ],
-            detail={"cause": "off_lanes", "off_lanes": list(off)},
+            detail=detail,
         )
     # The boxes that survive the commit: those kept, and those of another band
     # index.
@@ -4326,7 +4715,9 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     measured = [
         lane
         for lane in found.lanes
-        if lane.reason == "no_band" and lane.window is not None and lane.lane not in kept
+        if lane.reason in ("no_band", "off_expected_row")
+        and lane.window is not None
+        and lane.lane not in kept
     ]
     located = len(banded) > 1
     records = measured if located else []
@@ -4348,6 +4739,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     if checked and all(min(checked) <= lane <= max(checked) for lane in centres):
         warnings = [flag for flag in warnings if flag != "doubtful_lanes"]
         notes = tuple(note for note in notes if note != found.doubt_note)
+    notes = (*notes, *also_notes)
 
     def change(
         draft: Project,
@@ -4365,21 +4757,20 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                 band = by_id[yielding[lane]]
                 if rect != band.box.rect(old_size):  # else it keeps what its position gave it
                     _set_box(band, rect)
-                band.source = ProposalSource.ROW_BOX
+                band.source = source
             else:
                 band = Band(
                     id=draft.new_id("band"),
                     lane_index=lane,
                     band_index=0,
                     box=Box(x=rect[0], y=rect[1]),
-                    source=ProposalSource.ROW_BOX,
+                    source=source,
                     **_UNQUANTIFIED,
                 )
             band.bands_found = counts[lane]
             edited.bands.append(band)
         # The boxes placed, moved and removed change every ring on the image.
         _quantify_image(draft, edited.image_id, array)
-        _refresh_box_mws(session.project, draft)
         # Every band-index-0 record gives way to this run's outcome in its lane (a
         # kept box's lane holds none).
         dropped: list[JsonValue] = list(
@@ -4395,10 +4786,12 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
                 snr=lane.snr,
                 threshold=rowdetect.DETECT_K,
                 region=Region(x0=x0, y0=y0, x1=x1, y1=y1),
-                source=ProposalSource.ROW_BOX,
+                source=source,
             )
             edited.undetected.append(record)
             written.append(_undetected_json(protein_id, record))
+        # The MWs of the boxes placed, moved or resized, last (#58).
+        _refresh_box_mws(session.project, draft)
         # Each lane's first-band box after the change: placed, replaced or kept.
         after = {b.lane_index: b for b in edited.bands if b.band_index == 0}
         band_ids = [after[lane].id if lane in after else None for lane in range(n)]
@@ -4411,7 +4804,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         band_ids, lane_rects, written, dropped = result
         return {
             "protein_id": protein_id,
-            "row": list(given),
+            **lead,
             "lanes": [
                 {
                     "band_id": band_ids[lane.lane],
@@ -4439,12 +4832,13 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         }
 
     prior = session.project
-    band_ids, _, _, _ = _apply(session, "detect_row_boxes", change, params)
+    band_ids, _, _, _ = _apply(session, action, change, params)
     if session.project is not prior and (warnings or unlocated):
         _log.info(
-            "in %r: the row box of %s on %s: the detector warns of %s; lanes not located"
+            "in %r: the %s of %s on %s: the detector warns of %s; lanes not located"
             " (one band found): %s",
             session.folder.name,
+            what,
             protein_id,
             image.id,
             ", ".join(warnings) or "nothing",
@@ -4476,6 +4870,228 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
         remeasured=remeasured,
         largest_change=largest,
         unlocated_lanes=unlocated,
+    )
+
+
+def _span(span: object) -> tuple[int, int]:
+    """A lane span as given: two ints ``(x0, x1)`` with ``x0 < x1``, else
+    ``INVALID_INPUT``."""
+    if (
+        isinstance(span, str | bytes | bytearray | memoryview)
+        or not isinstance(span, Sequence)
+        or len(span) != 2
+    ):
+        raise _invalid(f"span must be (x0, x1), not {span!r}")
+    x0, x1 = (_int(v, "span coordinate") for v in span)
+    if x1 <= x0:
+        raise _invalid(f"span {(x0, x1)} is empty or inverted")
+    return x0, x1
+
+
+def _no_calibration(
+    membrane: Membrane, image: ImageRef, fitted: mwcal.NoCalibration
+) -> OperationError:
+    """The refusal of a row placed by MW on an image without a curve, worded by
+    why it has none."""
+    names = _group_names(membrane, fitted.group)
+    if fitted.reason == "one_point":
+        message = f"{names}: each ladder there has one calibration point; mark at least two"
+    elif image.marker_image_id is not None:
+        message = (
+            f"{names} have no calibration points: mark the ladder on the marker image"
+            f" {image.marker_image_id}"
+        )
+    else:
+        message = (
+            f"{image.id} has no calibration points: mark the ladder on its marker image and"
+            f" link {image.id} to it, or mark the ladder on {image.id} itself"
+        )
+    return OperationError(ErrorCode.NO_CALIBRATION, message, ids=(image.id,))
+
+
+@_locked
+def detect_mw_row(
+    session: ProjectSession, protein_id: str, *, span: Sequence[int] | None = None
+) -> MwRowPlacement:
+    """Place a protein's row by its expected MW (#58, D11, D12): detect one band
+    per declared lane where its image's calibration puts the MW, and commit the
+    outcome for the protein's band index 0 as a dragged row box's
+    (:func:`detect_row_boxes`), with source ``mw_guided``.
+
+    The slot (:func:`~proteia.core.mwrow.slot`): the rows from the expected MW
+    times ``1 + 2 x tolerance`` down to it over that (the protein's MW
+    tolerance, within the calibrated range), plus a margin of 0.04 decade of
+    MW (at least 6 px) above and below, read at the centre of the lanes'
+    span. With two ladders it follows the protein line: each column of the
+    span is shifted by whole pixels so the line lies level, detection runs on
+    it (:func:`~proteia.core.rowdetect.detect_row_along`, so the row's line
+    check runs on the levelled row), and each box is moved back by the shift
+    of its centre column. Its rows are cut to those every column's shift keeps
+    on the image. Each lane grows from its peak nearest the expected MW's row
+    (``prefer_y``), not from a stronger band beside it in the slot. A line
+    sloping more than :data:`~proteia.core.mwrow.STEEP_ROW_DEG` across the span
+    adds a note: the boxes are level rectangles.
+
+    The lanes' span (:func:`~proteia.core.mwrow.lane_span`): ``span``, the
+    columns ``(x0, x1)`` the user dragged across (end-exclusive, only x);
+    else the lanes already placed on the image (the first-band boxes of every
+    protein, less this protein's boxes a detector placed that nobody edited),
+    half a lane pitch past the end lanes; else those of the image of its
+    register group with the most lanes placed; else between its two ladders,
+    each taken to stand one pitch outside its end lane, inset by half a pitch.
+    Its refusals are those of a row box, worded by what it searched, never
+    by a row box the user did not draw (:func:`_row_refusal`): a reading of
+    the lanes refused for the lanes' span (a span end cutting a band, an
+    unclear reading, bands that do not line up with the lanes placed)
+    asks for the span's drag, saying where the lanes were taken to lie when
+    the span was not dragged (``detail``: ``span_from``, ``hint``:
+    ``lane_span_required``), and again from band to band when it was; bands
+    off the row's line say why no lane was recorded as not detected. Lanes
+    read between the ladders that are doubtful (``doubtful_lanes``) are
+    placed with ``span_hint``.
+
+    Refused, changing nothing, in this order: ``span`` not two ints, or empty
+    or inverted (``INVALID_INPUT``); no lanes (``NO_LANES``); no expected MW,
+    or a protein expecting several bands (``MW_REQUIRED``); an image without a
+    curve (``NO_CALIBRATION``, with the reason); an expected MW outside the
+    calibrated range (``MW_OUTSIDE_CALIBRATION``: with two ladders, where both
+    reach); no span (``LANE_SPAN_REQUIRED``); a span off the image, or a slot
+    no row of which stays on it (``OUT_OF_IMAGE``); a protein line that folds
+    over within the span (``MW_OUTSIDE_CALIBRATION``); then every refusal of
+    a row box, in its order.
+
+    The log entry (``detect_mw_row``) holds the protein, its expected MWs and
+    tolerance, the search factor, its image's calibration
+    (:class:`CalibrationFit`) with ``two_ladders`` and ``tilt_deg``, the
+    expected ys (2 decimals), the slot (``row``, ``shift_ends``, ``m_top``,
+    ``m_bot``, ``margin``), the line's ``slope_deg``, the ``span``, where it
+    came from (``span_from``) and the boxes it was read from (``anchor_ids``,
+    on ``anchor_image_id``), then every param a row box logs, from ``lanes``
+    to ``settings``. The same placement again changes nothing.
+    """
+    batch = session.project.batch
+    protein = batch.find_protein(protein_id)
+    given = None if span is None else _span(span)
+    n = len(batch.lanes)
+    if n == 0:
+        raise OperationError(ErrorCode.NO_LANES, "declare the lanes before placing a row")
+    if protein.expected_mw is None:
+        raise OperationError(
+            ErrorCode.MW_REQUIRED,
+            f"{protein.name!r} has no expected MW: enter it to place its row by MW",
+            ids=(protein_id,),
+        )
+    if protein.expected_band_count != 1:
+        count = protein.expected_band_count
+        raise OperationError(
+            ErrorCode.MW_REQUIRED,
+            f"{protein.name!r} expects {count} bands: placing its row by MW needs the MW of"
+            f" each of the {count}",
+            ids=(protein_id,),
+        )
+    mws = (protein.expected_mw,)
+    image = batch.find_image(protein.image_id)
+    membrane = batch.membrane_of(image.id)
+    fitted = mwcal.calibration_for(membrane, image.id)
+    if isinstance(fitted, mwcal.NoCalibration):
+        raise _no_calibration(membrane, image, fitted)
+    names = _group_names(membrane, fitted.group)
+    for mw in mws:
+        if not fitted.z_lo <= math.log10(mw) <= fitted.z_hi:
+            raise OperationError(
+                ErrorCode.MW_OUTSIDE_CALIBRATION,
+                mwrow.outside_words(fitted, mw, names),
+                ids=(image.id,),
+            )
+    if given is not None:
+        x0, x1 = max(0, given[0]), min(image.width, given[1])
+        if x1 <= x0:
+            raise OperationError(
+                ErrorCode.OUT_OF_IMAGE,
+                f"span {given} lies outside the {image.width}x{image.height} image {image.id}",
+                ids=(image.id,),
+            )
+        lanes_span: mwrow.LaneSpan | None = mwrow.LaneSpan(x0, x1, "given")
+    else:
+        lanes_span = mwrow.lane_span(batch, protein, fitted)
+    if lanes_span is None:
+        raise OperationError(
+            ErrorCode.LANE_SPAN_REQUIRED,
+            f"no lanes are placed on {names} and no two ladders show where they lie: drag"
+            f" across all {n} lanes (only the left and right ends are used)",
+            ids=(image.id,),
+        )
+    try:
+        slot = mwrow.slot(
+            fitted, mws, protein.mw_tolerance, lanes_span.x0, lanes_span.x1, image.height
+        )
+    except mwrow.SlotError as exc:
+        outside = exc.code == "outside_range"
+        code = ErrorCode.MW_OUTSIDE_CALIBRATION if outside else ErrorCode.OUT_OF_IMAGE
+        raise OperationError(code, str(exc), ids=(image.id,)) from exc
+    fit = calibration_fit(membrane, image.id)
+    lead: dict[str, JsonValue] = {
+        "expected_mws": list(mws),
+        "mw_tolerance": protein.mw_tolerance,
+        "search_factor": mwrow.SEARCH_FACTOR,
+        "fit": None if fit is None else fit.as_json(),
+        "two_ladders": fitted.two_ladders,
+        "tilt_deg": fitted.tilt_deg,
+        "expected_y": [round(y, 2) for y in slot.expected_y],
+        "row": list(slot.row),
+        "shift_ends": list(slot.shift_ends),
+        "m_top": _finite(slot.m_top),
+        "m_bot": _finite(slot.m_bot),
+        "margin": slot.margin,
+        "slope_deg": slot.slope_deg,
+        "span": [lanes_span.x0, lanes_span.x1],
+        "span_from": lanes_span.source,
+        "anchor_ids": list(lanes_span.anchor_ids),
+        "anchor_image_id": lanes_span.image_id,
+    }
+    steep = (
+        f"the row slopes steeply along the protein line (about {abs(slot.slope_deg):.1f}°);"
+        " boxes are level rectangles"
+    )
+    detect = functools.partial(
+        rowdetect.detect_row_along, shifts=slot.shifts, prefer_y=slot.expected_y[0]
+    )
+    drag = f"drag across all {n} lanes (only the left and right ends are used)"
+    where = {
+        "anchors": f"where the boxes already on {lanes_span.image_id} put them",
+        "group_anchors": f"where the boxes already on {lanes_span.image_id} put them",
+        "ladders": "between the two ladders",
+    }.get(lanes_span.source)
+    placed = _place_row(
+        session,
+        protein,
+        slot.row,
+        action="detect_mw_row",
+        source=ProposalSource.MW_GUIDED,
+        detect=detect,
+        lead=lead,
+        what="row placed by its MW",
+        also_notes=(steep,) if slot.steep else (),
+        mw=_MwSearch(n, slot.m_top, slot.m_bot, lanes_span.source, where),
+    )
+    hint = None
+    if lanes_span.source == "ladders" and "doubtful_lanes" in placed.flags:
+        hint = (
+            "the lanes were taken to lie between the two ladders, each a lane pitch outside"
+            " its end lane; if a ladder lane is declared as a lane, or a well beside a ladder"
+            f" is empty, {drag}"
+        )
+    return MwRowPlacement(
+        **{field.name: getattr(placed, field.name) for field in fields(RowPlacement)},
+        row=slot.row,
+        shift_ends=slot.shift_ends,
+        expected_y=slot.expected_y,
+        span=(lanes_span.x0, lanes_span.x1),
+        span_from=lanes_span.source,
+        two_ladders=fitted.two_ladders,
+        tilt_deg=fitted.tilt_deg,
+        slope_deg=slot.slope_deg,
+        span_hint=hint,
     )
 
 
