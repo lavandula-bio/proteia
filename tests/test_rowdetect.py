@@ -435,6 +435,107 @@ def test_a_band_the_box_edge_only_grazes_is_not_cut():
     assert not any(lane.cut for lane in found.lanes)
 
 
+def _spy_passes(monkeypatch) -> list:
+    """Each detection pass of :func:`detect_row` as it runs, in order: the
+    last one's signal and lanes are what the cut check reads."""
+    passes: list = []
+    real = rowdetect._run_pass
+
+    def spy(*args, **kwargs):
+        res = real(*args, **kwargs)
+        passes.append(res)
+        return res
+
+    monkeypatch.setattr(rowdetect, "_run_pass", spy)
+    return passes
+
+
+def _edge_rows(noise: float) -> RowCase:
+    """Six bands 12 px high on row 80, Gaussian across the lane: a row near a
+    band's top or bottom holds far less over the band's extent than on its
+    middle column."""
+    case = adversarial_row(
+        "edge rows",
+        1000,
+        noise=noise,
+        shape="gauss",
+        heights=dict.fromkeys(range(6), 12.0),
+        y_jitter=0.0,
+    )
+    assert case.lane_cy == (80.0,) * 6 and case.row[1::2] == (68, 93)
+    return case
+
+
+@pytest.mark.parametrize("noise", [0.0, 400.0])
+@pytest.mark.parametrize("edge", ["top", "bottom"])
+def test_the_cut_check_reads_the_box_s_own_edge_row(monkeypatch, noise, edge):
+    # The box's top edge row 5 px above the bands' centre row (row 75), or
+    # its bottom edge row 5 px below it (row 85). Every band's extent reaches
+    # that edge row, where its middle columns pass 30% of the peak; but over
+    # the extent's columns that row holds under 30% of the peak, while the
+    # row next to it inside the box holds over 30%. The edge row is the one
+    # that counts: no band is cut. One row further in, every band is.
+    passes = _spy_passes(monkeypatch)
+    case = _edge_rows(noise)
+    x0, y0, x1, y1 = case.row
+    row = (x0, 75, x1, y1) if edge == "top" else (x0, y0, x1, 86)
+    found = detect(dataclasses.replace(case, row=row))
+    res = passes[-1]
+    s = res.sig.s_sm
+    hc = row[3] - row[1]
+    outer, inner = (0, 1) if edge == "top" else (hc - 1, hc - 2)
+    for lane, ln in zip(found.lanes, res.lanes, strict=True):
+        a, top, b, bottom = ln.rect
+        assert (top == 0) if edge == "top" else (bottom == hc)  # the extent reaches the edge
+        assert lane.extent[1 if edge == "top" else 3] == row[1 if edge == "top" else 3]
+        assert float(s[outer, a:b].max()) > 0.33 * ln.peak
+        assert float(s[outer, a:b].mean()) < 0.28 * ln.peak
+        assert float(s[inner, a:b].mean()) > 0.32 * ln.peak
+    assert [lane.cut for lane in found.lanes] == [False] * 6
+    assert found.flags == ()
+    assert not any("cuts through" in note for note in found.notes)
+    inward = (x0, 76, x1, y1) if edge == "top" else (x0, y0, x1, 85)
+    cut = detect(dataclasses.replace(case, row=inward))
+    assert [lane.cut for lane in cut.lanes] == [True] * 6
+    assert cut.flags == ("cut_by_row_box",)
+
+
+@pytest.mark.parametrize("noise", [0.0, 400.0])
+@pytest.mark.parametrize("prefer_y", [None, 80.5])
+def test_a_band_whose_extent_stops_one_row_inside_the_box_is_not_cut(monkeypatch, noise, prefer_y):
+    # A thin neighbouring band 5 px above each band, centred one row above
+    # the box's top edge row (row 76): the box's top row is that band's, a
+    # neighbouring row's hump at the box's edge, left out above its valley
+    # on the next row. Each band's extent starts on that next row (row 77),
+    # one row inside the box, so the box does not cut it, though the edge row
+    # holds over half its peak over the extent. With or without an expected
+    # row alike.
+    passes = _spy_passes(monkeypatch)
+    case = adversarial_row(
+        "band on the top edge",
+        1000,
+        noise=noise,
+        heights=dict.fromkeys(range(6), 8.0),
+        h=3.0,  # the neighbouring band's
+        neighbour_dy=-5.0,
+        neighbour_rel=1.2,
+        y_jitter=0.0,
+    )
+    assert case.lane_cy == (80.0,) * 6 and case.row[3] == 91
+    x0, _, x1, y1 = case.row
+    found = detect(dataclasses.replace(case, row=(x0, 76, x1, y1)), prefer_y=prefer_y)
+    res = passes[-1]
+    s = res.sig.s_sm
+    assert res.cand.rows == (1, 15)  # the edge row left out, a neighbouring row's
+    for lane, ln in zip(found.lanes, res.lanes, strict=True):
+        a, top, b, _ = ln.rect
+        assert top == 1 and lane.extent[1] == 77
+        assert float(s[0, a:b].mean()) > 0.5 * ln.peak
+    assert [lane.cut for lane in found.lanes] == [False] * 6
+    assert found.flags == ()
+    assert not any("cuts through" in note for note in found.notes)
+
+
 def test_only_the_lanes_the_box_cuts_are_named():
     # A smile: the outer bands sit higher, so a low top edge cuts only them.
     case = adversarial_row("smile_cut", 1000, smile=8.0)
