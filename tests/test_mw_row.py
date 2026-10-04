@@ -675,11 +675,12 @@ def test_range_ends_in_words_at_each_format_s_limit():
     # The fewest digits that show the MW past the end, from as many as the
     # end's whole kDa take plus one (4 for 124.6 and 125.94: never fewer, as
     # 1.2e+02 would show 124.8 above 124.6 by rounding the end down), or 2
-    # under 1 kDa (0.55 for 0.6, which reads 0.56 inside), from 2 at 0.1 to
-    # 0.15 kDa too (0.123: 0.12 reads 0.12 on it).
+    # under 1 kDa (0.55 for 0.6, which reads 0.56 inside; for 0.554 too, not
+    # 0.554), from 2 at 0.1 to 0.15 kDa too (0.123: 0.12 reads 0.12 on it).
     assert mwrow._end_words(math.log10(124.6), "124.8", above=True) == "124.6"
     assert mwrow._end_words(math.log10(125.94), "126", above=True) == "125.9"
     assert mwrow._end_words(math.log10(0.55), "0.56", above=True) == "0.55"
+    assert mwrow._end_words(math.log10(0.554), "0.56", above=True) == "0.55"
     assert mwrow._end_words(math.log10(0.1234), "0.12", above=False) == "0.123"
 
 
@@ -842,6 +843,10 @@ def test_a_prediction_with_no_lanes_reads_between_the_ladders():
     assert (predicted.span, predicted.slot) == (None, None)
     assert predicted.expected_y == (fitted.y_at(60.0, 650.0),)
     assert predicted.expected_y[0] != fitted.y_at(60.0, 400.0)
+    # A protein expecting two bands, its MW known, on the same curve: no
+    # row is predicted (its MWs come with #58's multi-band rows).
+    two = batch.proteins[0].model_copy(update={"expected_band_count": 2})
+    assert two.expected_mw == 60.0 and mwrow.predict(batch, two) is None
 
 
 def test_a_row_by_mw_where_the_line_folds_is_refused(tmp_path):
