@@ -168,6 +168,7 @@ from pydantic import JsonValue, ValidationError
 
 from proteia.core import boxes, export, ladders, mwcal, mwrow, record, results, rowdetect, storage
 from proteia.core.analyze import ReduceMethod, StatisticsSetting, statistics_setting
+from proteia.core.boxes import COVER_SHARE, overlap_share
 from proteia.core.export import (
     BUNDLE_RECORD_FILE,
     DEFAULT_CHART_FORMATS,
@@ -216,6 +217,7 @@ from proteia.core.model import (
     UnknownIdError,
     apply_change,
     format_timestamp,
+    in_words,
     lane_number,
     lanes_phrase,
     overlaps,
@@ -329,10 +331,6 @@ LANE_TABLE_RECORD_FILE: Final = "lane-table.record.json"
 _RESERVED_KEYS: Final = frozenset(name_key(column) for column in LANE_COLUMNS)
 # How many names an export tries for its new folder: the plain one, then numbered.
 _FOLDER_ATTEMPTS: Final = 1000
-# A box placed, moved or resized may overlap another protein's box on its
-# image by at most this share of the smaller box's area (#114): more, and the
-# two would measure the same band.
-COVER_SHARE: Final = 0.5
 # How a band's background was measured when its ring was cut short
 # (quantify.band_backgrounds), as the session log words it.
 _CUT_BACKGROUNDS: Final = {
@@ -1302,22 +1300,14 @@ def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> lis
     ]
 
 
-def _overlap_share(rect: Rect, box: Rect) -> float:
-    """How much of the smaller of two boxes' areas they share: 1.0 for a box
-    wholly inside the other, whichever is larger."""
-    w = min(rect[2], box[2]) - max(rect[0], box[0])
-    h = min(rect[3], box[3]) - max(rect[1], box[1])
-    smaller = min((r[2] - r[0]) * (r[3] - r[1]) for r in (rect, box))
-    return max(0, w) * max(0, h) / smaller
-
-
 def _covered(
     batch: Batch, protein: Protein, rects: Iterable[Rect]
 ) -> list[tuple[Protein, Band, float]]:
     """The other proteins' bands on ``protein``'s image whose box one of
     ``rects`` overlaps by more than :data:`COVER_SHARE` of the smaller box's
-    area, with the largest share (:func:`_overlap_share`); protein by protein
-    and band by band, as stored.
+    area, with the largest share (:func:`~proteia.core.boxes.overlap_share`);
+    protein by protein and band by band, as stored. Less is accepted, and the
+    results note it (#208).
 
     Against the smaller box: a box wholly inside another protein's larger box
     shares all of it, and would measure its band as that box does; against
@@ -1330,7 +1320,7 @@ def _covered(
             continue
         for band in other.bands:
             box = band.box.rect(other.box_size)
-            share = max((_overlap_share(rect, box) for rect in rects), default=0.0)
+            share = max((overlap_share(rect, box) for rect in rects), default=0.0)
             if share > COVER_SHARE:
                 found.append((other, band, share))
     return found
@@ -1353,7 +1343,7 @@ def _cover_refusal(covered: Sequence[tuple[Protein, Band, float]], what: str) ->
     ]
     return OperationError(
         ErrorCode.OVERLAP,
-        f"{what} {_in_words(parts)} by more than {COVER_SHARE:.0%} of the smaller box's area:"
+        f"{what} {in_words(parts)} by more than {COVER_SHARE:.0%} of the smaller box's area:"
         " two proteins' boxes would measure the same band",
         ids=[band.id for _, band, _ in covered],
         detail={
@@ -3738,11 +3728,6 @@ def _named_lanes(anchors: Sequence[tuple[float, int]], off: Iterable[int]) -> se
     return anchoring_lanes(anchors, {lane + d for lane in off for d in (-1, 0, 1)})
 
 
-def _in_words(items: Sequence[str]) -> str:
-    """``a``, ``a and b``, ``a, b and c``."""
-    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
-
-
 def _misnumbered_lanes(
     batch: Batch, image: ImageRef, without: Collection[str]
 ) -> OperationError | None:
@@ -3800,8 +3785,8 @@ def _misnumbered_lanes(
         return OperationError(
             ErrorCode.ROW_LANES_UNCLEAR,
             "the lanes already placed on this image are numbered both ways: the boxes of"
-            f" {_in_words([repr(p.name) for p in ltr])} left to right, those of"
-            f" {_in_words([repr(p.name) for p in rtl])} right to left; {fix}",
+            f" {in_words([repr(p.name) for p in ltr])} left to right, those of"
+            f" {in_words([repr(p.name) for p in rtl])} right to left; {fix}",
             ids=[p.id for p in ltr + rtl],
         )
     columns: dict[int, list[float]] = {}
@@ -3825,8 +3810,8 @@ def _misnumbered_lanes(
     return OperationError(
         ErrorCode.ROW_LANES_UNCLEAR,
         f"the lanes already placed on this image are numbered inconsistently: in {where}"
-        f" {_in_words([str(lane_number(lane)) for lane in apart])}, the boxes of"
-        f" {_in_words([repr(p.name) for p in named])} lie more than {pitch / 2:.0f} px"
+        f" {in_words([str(lane_number(lane)) for lane in apart])}, the boxes of"
+        f" {in_words([repr(p.name) for p in named])} lie more than {pitch / 2:.0f} px"
         f" (half the lane pitch) apart; {fix}",
         ids=[band_id for _, _, band_id in boxes_in],
     )
@@ -3876,7 +3861,7 @@ def _boxes_lie(lanes: Sequence[rowdetect.LaneDetection]) -> str:
 def _heights(values: Iterable[float | None]) -> str:
     """Box heights in words, 2 decimals, as the limit they meet is given,
     more where 2 would round one onto the limit (:func:`rowdetect.shown_against`)."""
-    return _in_words(
+    return in_words(
         [rowdetect.shown_against(abs(v or 0.0), rowdetect.ROW_LINE_K, 2) for v in values]
     )
 
@@ -3924,7 +3909,7 @@ def _not_recorded(found: rowdetect.RowDetection) -> str:
         bands = [lane for lane in named if lane.line_reason == "unassigned"]
         parts = []
         if bands:
-            snrs = _in_words(
+            snrs = in_words(
                 [
                     rowdetect.shown_against(lane.line_snr or 0.0, rowdetect.DETECT_K, 1)
                     for lane in bands
@@ -3940,7 +3925,7 @@ def _not_recorded(found: rowdetect.RowDetection) -> str:
             if lanes:
                 parts.append(f"{words} {lanes_phrase(lanes)}")
         they = "it is" if len(named) == 1 else "they are"
-        return f"; {_in_words(parts)}, so {they} not recorded as not detected"
+        return f"; {in_words(parts)}, so {they} not recorded as not detected"
     if cause == "other_box":
         named = [lane for lane in boxed if lane not in off and abs(lane.expected_offset or 0.0) > k]
         return (

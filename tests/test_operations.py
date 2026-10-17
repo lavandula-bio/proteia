@@ -7429,8 +7429,28 @@ def test_a_box_over_half_of_another_proteins_box_or_less_is_placed(tmp_path):
     band_id = ops.place_box(s, target, cx, cy + 6, lane_index=1, grow=False)
     rect = band_of(s, band_id).box.rect(size)
     assert (rect[0] - x0, rect[1] - y0) == (0, 6)  # over half of it: placed
+    assert overlap_messages(s) == both_overlap("in lane 2 by 50%")  # and noted (#208)
     ops.move_box(s, band_id, (rect[0], rect[1] + 1, rect[2], rect[3] + 1))
+    assert overlap_messages(s) == both_overlap("in lane 2 by 42%")  # 5 of 12 rows
     assert_nets_current(s)
+
+
+def overlap_messages(s: ProjectSession) -> list[str]:
+    """The boxes_overlap notices of the session's results (#208)."""
+    return [n.message for n in ops.compute(s).notices if n.code is NoticeCode.BOXES_OVERLAP]
+
+
+def both_overlap(where: str, *, lanes: int = 1) -> list[str]:
+    """The overlap notices of β-catenin and GAPDH, each over the other ``where``."""
+    its = "its net there also counts" if lanes == 1 else "its nets there also count"
+    end = (
+        f" of the smaller box's area: {its} the pixels the boxes share; move a box so they do"
+        " not overlap"
+    )
+    return [
+        f"'β-catenin' overlaps 'GAPDH' {where}{end}",
+        f"'GAPDH' overlaps 'β-catenin' {where}{end}",
+    ]
 
 
 def test_a_box_wholly_inside_a_larger_box_of_another_protein_is_refused(tmp_path):
@@ -7471,6 +7491,8 @@ def test_a_box_size_over_another_proteins_boxes_is_refused(tmp_path):
     assert ops.compute(s) == results
     ops.set_box_size(s, loading, BoxSize(width=44, height=80))
     assert protein_of(s, loading).box_size == BoxSize(width=44, height=80)
+    # 6 of the target's 12 rows in each lane: half, noted (#208).
+    assert overlap_messages(s) == both_overlap("in lanes 1, 2, 3, 4, 5, 6 by 50%", lanes=6)
 
 
 def _smear(X: np.ndarray, Y: np.ndarray, lcx: np.ndarray, lcy: np.ndarray) -> np.ndarray:
@@ -7530,6 +7552,25 @@ def test_a_row_that_grows_its_kept_boxes_over_another_proteins_is_refused(tmp_pa
         " the boxes of 'β-catenin' in lanes 1, 2, 3, 4, 5, 6 by more than 50% of the smaller"
         " box's area: two proteins' boxes would measure the same band"
     )
+
+
+def test_a_row_that_grows_its_kept_boxes_over_half_of_another_proteins_or_less_is_noted(
+    tmp_path, monkeypatch
+):
+    # As above, the row's bands needing boxes 80 px high: the kept boxes,
+    # moved 1 px right and grown to that, cover 43 columns by 6 rows of the
+    # target's 44x12 in each lane (258 of 528 px, 49%). Placed, and noted
+    # (#208).
+    s, loading, target = two_rows_session(tmp_path)
+    for band in list(protein_of(s, loading).bands):
+        edit_by_hand(s, band.id)
+    found = detected(s, loading, ABOVE_ROW)
+    tall = dataclasses.replace(found, size=BoxSize(width=44, height=80))
+    monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: tall)
+    assert overlap_messages(s) == []
+    ops.detect_row_boxes(s, loading, ABOVE_ROW)
+    assert protein_of(s, loading).box_size.height == 80
+    assert overlap_messages(s) == both_overlap("in lanes 1, 2, 3, 4, 5, 6 by 49%", lanes=6)
 
 
 def test_a_row_box_over_two_rows_that_cuts_bands_names_the_lanes_off_its_line(tmp_path):

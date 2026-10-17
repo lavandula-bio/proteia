@@ -29,7 +29,7 @@ import pytest
 
 import proteia
 from proteia import samples
-from proteia.core import mwcal, results, rowdetect
+from proteia.core import export, mwcal, results, rowdetect
 from proteia.core import operations as ops
 from proteia.core.model import ImageKind, Polarity
 from proteia.web import api, cli, handoff, launch, projects, server
@@ -1720,6 +1720,30 @@ def _function(script: str, head: str) -> tuple[int, str]:
     """Where the top-level function that starts with ``head`` begins, and its text."""
     start = script.index(head)
     return start, script[start : script.index("\n}\n", start) + 2]
+
+
+def test_the_export_writes_a_notice_as_a_sentence_as_the_page_does():
+    # A notice's message is a clause; the page's Checks list shows it through
+    # dom.js sentence() and the bundle's README through export._sentence (#208).
+    # The page's rule as it is, and the README's on what it gives.
+    _, text = _function(_code("dom.js"), "export function sentence(")
+    assert text == (
+        "export function sentence(text) {\n"
+        "  const capital = text.charAt(0).toUpperCase() + text.slice(1);\n"
+        "  return /[.!?]$/.test(capital) ? capital : `${capital}.`;\n"
+        "}"
+    )
+    for message, shown in (
+        ("no target protein: raw nets only", "No target protein: raw nets only."),
+        ("'β-catenin' overlaps 'GAPDH'", "'β-catenin' overlaps 'GAPDH'."),
+        ("α-tubulin was not checked", "Α-tubulin was not checked."),
+        ("already one.", "Already one."),
+        ("Is it?", "Is it?"),
+        ("so it is!", "So it is!"),
+        ("1.5 kDa", "1.5 kDa."),
+        ("", "."),
+    ):
+        assert export._sentence(message) == shown, message
 
 
 def test_the_page_words_a_box_possibly_over_exposed():

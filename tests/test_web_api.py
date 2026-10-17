@@ -1831,6 +1831,75 @@ def test_a_box_padding_reports_boxes_the_edge_shifts_and_boxes_it_overlaps(clien
     assert all(band["rect"][1::2] == [0, 72] for band in state["bands"])
     assert answer["edge_shifted"] == [band["id"] for band in state["bands"]]
     assert answer["overlapping"] == [band["id"] for band in protein_of(answer, loading)["bands"]]
+    # The results say so too (#208): 2 rows of the loading control's 14x10 boxes.
+    assert overlap_notices(answer) == [
+        (
+            [loading],
+            [0, 1, 2, 3, 4],
+            "'α-tubulin' overlaps 'β-catenin' in lanes 1, 2, 3, 4, 5 by 20%" + OVERLAP_MANY,
+        ),
+        (
+            [target],
+            [0, 1, 2, 3, 4],
+            "'β-catenin' overlaps 'α-tubulin' in lanes 1, 2, 3, 4, 5 by 20%" + OVERLAP_MANY,
+        ),
+    ]
+
+
+# The end of a boxes_overlap notice (#208): of one lane of its protein, or several.
+OVERLAP_ONE = (
+    " of the smaller box's area: its net there also counts the pixels the boxes share;"
+    " move a box so they do not overlap"
+)
+OVERLAP_MANY = (
+    " of the smaller box's area: its nets there also count the pixels the boxes share;"
+    " move a box so they do not overlap"
+)
+
+
+def overlap_notices(answer: dict, set_index: int = 0) -> list[tuple[list, list, str]]:
+    """The answer's boxes_overlap notices of a result set: (protein ids, lane
+    indices, message)."""
+    return [
+        (n["protein_ids"], n["lane_indices"], n["message"])
+        for n in answer["results"]["sets"][set_index]["notices"]
+        if n["code"] == "boxes_overlap"
+    ]
+
+
+def test_boxes_placed_moved_or_resized_over_part_of_another_proteins_are_noted(client, tmp_path):
+    # β-catenin boxed in lanes 2 to 5 at y 25 to 35, α-tubulin in every lane at
+    # y 70 to 80 (both 14x10). Each route that puts a β-catenin box over 4 of
+    # the 10 rows of α-tubulin's answers the two notices; undo takes them away.
+    target, loading, answer = live(client, tmp_path, DOSES, boxed=(1, 2, 3, 4))
+    assert overlap_notices(answer) == []
+
+    def noted(share: str, lanes: list[int]) -> list[tuple[list, list, str]]:
+        where = f"lane {lanes[0] + 1}" if len(lanes) == 1 else "lanes 2, 3, 4, 5"
+        end = OVERLAP_ONE if len(lanes) == 1 else OVERLAP_MANY
+        return [
+            ([loading], lanes, f"'α-tubulin' overlaps 'β-catenin' in {where} by {share}{end}"),
+            ([target], lanes, f"'β-catenin' overlaps 'α-tubulin' in {where} by {share}{end}"),
+        ]
+
+    body = {"protein_id": target, "x": LANE_X[0], "y": 69, "lane_index": 0}  # (43, 64, 57, 74)
+    answer = client.ok("POST", "/api/boxes", body)
+    assert overlap_notices(answer) == noted("40%", [0])
+    assert overlap_notices(client.ok("POST", "/api/undo")) == []
+
+    moved = column(answer, target)["band_ids"][1]
+    rect = [LANE_X[1] - 7, 64, LANE_X[1] + 7, 74]
+    assert overlap_notices(client.ok("PUT", f"/api/boxes/{moved}", {"rect": rect})) == noted(
+        "40%", [1]
+    )
+    assert overlap_notices(client.ok("POST", "/api/undo")) == []
+
+    # 74 px high, centred at y 30: shifted into the image, (.., 0, .., 74).
+    answer = client.ok("PUT", f"/api/proteins/{target}/box-size", {"width": 14, "height": 74})
+    assert overlap_notices(answer) == noted("40%", [1, 2, 3, 4])
+    answer = client.ok("POST", "/api/undo")
+    assert overlap_notices(answer) == []
+    assert overlap_notices(client.ok("POST", "/api/redo")) == noted("40%", [1, 2, 3, 4])
 
 
 def test_a_box_padding_answers_the_other_proteins_nets_it_changed(client, tmp_path):
@@ -3645,7 +3714,8 @@ def test_an_export_uses_the_workspaces_result_settings(client):
     answer = client.ok("POST", "/api/export", {"formats": ["svg"]})
     folder = client.root / SAMPLE / answer["folder"]
     doc = json.loads((folder / "export.record.json").read_bytes())
-    assert {key: value for key, value in doc["results"].items() if key != "statistics"} == {
+    left = {"statistics", "notices"}  # checked below
+    assert {key: value for key, value in doc["results"].items() if key not in left} == {
         "method": "representative",
         "error_type": "SEM",
         "plot_conditions": ["vehicle"],
@@ -3661,6 +3731,10 @@ def test_an_export_uses_the_workspaces_result_settings(client):
         "statistics": auto,
     }
     assert answer["results"]["settings"] == settings
+    # The notices of the results the screen shows (#208).
+    assert [(n["result_set"], n["message"]) for n in doc["results"]["notices"]] == [
+        (one["label"], n["message"]) for one in answer["results"]["sets"] for n in one["notices"]
+    ]
     [chart] = answer["results"]["sets"][0]["series"]
     assert chart["chart"]["error_type"] == "SEM"
     assert [bar["label"] for bar in chart["chart"]["bars"]] == ["vehicle"]

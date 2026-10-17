@@ -15,7 +15,9 @@ clamped into the image; :func:`center_snap` reads an edited rect by its centre;
 :func:`grow_to_fit_all` to several bands at once (a detected row), each keeping
 the protein's padding (#57; its sizes in words: :func:`size_words`). Only one
 protein's own boxes must not overlap (:func:`overlaps_any`); boxes of different
-proteins may. :func:`place_in_row` places one row of same-size boxes left to
+proteins may, by at most :data:`COVER_SHARE` of the smaller box's area
+(:func:`overlap_share`): the operations refuse more (#114), and the results
+note any (#208). :func:`place_in_row` places one row of same-size boxes left to
 right without overlap (row-box detection, :mod:`proteia.core.rowdetect`).
 
 Coordinates use the model's :data:`~proteia.core.model.Rect` convention:
@@ -33,6 +35,10 @@ from proteia.core.model import BoxPadding, BoxSize, Rect, overlaps
 
 BoxRuleCode = Literal["overlap", "size_would_overlap"]
 NO_PADDING: Final = BoxPadding()
+# A box placed, moved or resized may overlap another protein's box on its
+# image by at most this share of the smaller box's area (#114): more, and the
+# two would measure the same band. Any overlap is noted in the results (#208).
+COVER_SHARE: Final = 0.5
 
 
 class BoxRuleError(ValueError):
@@ -57,6 +63,27 @@ class BoxRuleError(ValueError):
 def overlaps_any(rect: Rect, others: Iterable[Rect]) -> bool:
     """True if ``rect`` overlaps any of ``others``."""
     return any(overlaps(rect, other) for other in others)
+
+
+def shared_area(a: Rect, b: Rect) -> int:
+    """How many pixels two boxes share: 0 for boxes apart or only touching."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return max(0, w) * max(0, h)
+
+
+def smaller_area(a: Rect, b: Rect) -> int:
+    """The area of the smaller of two boxes, in pixels."""
+    return min((r[2] - r[0]) * (r[3] - r[1]) for r in (a, b))
+
+
+def overlap_share(a: Rect, b: Rect) -> float:
+    """How much of the smaller of two boxes' areas they share
+    (:func:`shared_area` over :func:`smaller_area`): 1.0 for a box wholly
+    inside the other, whichever is larger. Against the smaller box, a box
+    inside a larger one of another protein shares all of it, and would
+    measure its band as that box does."""
+    return shared_area(a, b) / smaller_area(a, b)
 
 
 def _overlaps_any(rects: Sequence[Rect], i: int) -> bool:

@@ -8,18 +8,22 @@ import numpy as np
 import pytest
 
 from proteia.core.boxes import (
+    COVER_SHARE,
     BoxRuleError,
     center_snap,
     centered_rect,
     grow_to_fit,
     grow_to_fit_all,
     initial_box_size,
+    overlap_share,
     overlaps_any,
     padding_words,
     place_in_row,
     resize_all,
     resize_checked,
+    shared_area,
     size_words,
+    smaller_area,
 )
 from proteia.core.model import BoxPadding, BoxSize, overlaps
 
@@ -94,6 +98,61 @@ def test_overlaps_any():
     assert overlaps_any(rect, [(0, 0, 5, 5), (19, 13, 30, 20)])
     assert not overlaps_any(rect, [(20, 10, 30, 14), (10, 14, 20, 18)])  # edges only touch
     assert not overlaps_any(rect, [])
+
+
+def test_the_overlap_share_is_of_the_smaller_box():
+    # The share two boxes of different proteins hold in common, of the smaller
+    # box's area: what refuses a box past half of another (#114), and what the
+    # results write below that (#208).
+    rect = (50, 25, 70, 35)  # 200 px
+    for other, shared, share in (
+        ((70, 25, 90, 35), 0, 0.0),  # touching on the right
+        ((30, 25, 50, 35), 0, 0.0),  # touching on the left
+        ((50, 35, 70, 45), 0, 0.0),  # touching below
+        ((80, 50, 100, 60), 0, 0.0),  # apart
+        ((69, 34, 89, 44), 1, 0.005),  # one pixel
+        ((62, 25, 82, 35), 80, 0.4),
+        ((60, 25, 80, 35), 100, 0.5),
+        ((60, 25, 100, 35), 100, 0.5),  # of the smaller, not of the larger (0.25)
+        ((55, 27, 65, 32), 50, 1.0),  # wholly inside
+        ((40, 20, 80, 40), 200, 1.0),  # wholly around
+    ):
+        assert shared_area(rect, other) == shared_area(other, rect) == shared, other
+        assert overlap_share(rect, other) == overlap_share(other, rect) == share, other
+    assert COVER_SHARE == 0.5
+
+
+def _share_before_208(rect, box):
+    """The share as the refusal computed it before it moved here, written out."""
+    w = min(rect[2], box[2]) - max(rect[0], box[0])
+    h = min(rect[3], box[3]) - max(rect[1], box[1])
+    smaller = min((r[2] - r[0]) * (r[3] - r[1]) for r in (rect, box))
+    return max(0, w) * max(0, h) / smaller
+
+
+def test_the_overlap_share_is_what_the_refusal_computed_before_it_moved():
+    # Random pairs of boxes, near enough to touch, overlap, hold one another
+    # or lie apart: the moved share is the old one, bit for bit.
+    rng = np.random.default_rng(208)
+    kinds = {"apart": 0, "touching": 0, "inside": 0, "partial": 0}
+    for _ in range(20000):
+        x0, y0 = (int(v) for v in rng.integers(0, 30, 2))
+        w0, h0 = (int(v) for v in rng.integers(1, 25, 2))
+        x1, y1 = (int(v) for v in rng.integers(0, 30, 2))
+        w1, h1 = (int(v) for v in rng.integers(1, 25, 2))
+        a, b = (x0, y0, x0 + w0, y0 + h0), (x1, y1, x1 + w1, y1 + h1)
+        old = _share_before_208(a, b)
+        assert overlap_share(a, b) == old, (a, b)
+        assert smaller_area(a, b) == smaller_area(b, a) == min(w0 * h0, w1 * h1), (a, b)
+        assert shared_area(a, b) == round(old * min(w0 * h0, w1 * h1)), (a, b)
+        if not overlaps(a, b):
+            near = a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
+            kinds["touching" if near else "apart"] += 1
+        elif old == 1.0:
+            kinds["inside"] += 1
+        else:
+            kinds["partial"] += 1
+    assert min(kinds.values()) > 500, kinds
 
 
 def test_initial_box_size_is_clamped_to_the_image():
