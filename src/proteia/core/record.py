@@ -24,7 +24,7 @@ numbers came from and how:
 * ``results``: the compute settings of the results the export used, or None,
   with what each chart's test resolved to (:func:`results_statistics`): the
   automatic rule may change in a later version, and the record keeps what this
-  one chose.
+  one chose; and their notices (:func:`results_notices`, #208).
 
 Nothing is sent anywhere, and no platform, host name, user or path is recorded.
 A record serializes canonically (sorted keys, no NaN), so a later signature can
@@ -164,6 +164,19 @@ def results_settings(results: Results) -> dict[str, JsonValue]:
         "excluded_lanes": list(results.excluded_lanes),
         "statistics": results_statistics(results),
     }
+
+
+def results_notices(results: Results) -> list[JsonValue]:
+    """The notices of ``results`` and of its all-lanes set, as computed (#208):
+    the set the include flags apply to first, each notice with its set's label
+    (``result_set``; None for the only set) and its fields, its lane indices
+    0-based as the record's content numbers lanes."""
+    sets = [results] if results.all_lanes is None else [results, results.all_lanes]
+    return [
+        {"result_set": one.label, **notice.model_dump(mode="json")}
+        for one in sets
+        for notice in one.notices
+    ]
 
 
 def results_statistics(results: Results) -> dict[str, JsonValue]:
@@ -309,7 +322,9 @@ def build_record(
             name: {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
             for name, data in files.items()
         },
-        "results": None if results is None else results_settings(results),
+        "results": None
+        if results is None
+        else {**results_settings(results), "notices": results_notices(results)},
     }
 
 

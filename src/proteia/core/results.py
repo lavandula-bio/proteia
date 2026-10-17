@@ -64,6 +64,12 @@ not used, rows that slope against the protein line), name the images and MWs
 involved (:attr:`Notice.image_ids`) and count only the lanes of their set.
 Every check reads the stored model: nothing is fitted to pixels here.
 
+Boxes of two proteins on one image may overlap by up to half the smaller box
+(more is refused when placed, #114). Each net then counts the shared pixels,
+so a ``boxes_overlap`` warning names, for each protein whose counted box
+overlaps another protein's, the other proteins, the lanes and the share of the
+smaller box's area (#208); it is read from the stored boxes, never stored.
+
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
 MWs in them are whole kDa (one decimal below 10 kDa).
@@ -101,7 +107,8 @@ from proteia.core.analyze import (
     replicate_lanes,
     statistics_setting,
 )
-from proteia.core.model import Role, lanes_phrase
+from proteia.core.boxes import COVER_SHARE, shared_area, smaller_area
+from proteia.core.model import Role, in_words, lanes_phrase
 from proteia.core.names import name_key, resolve_label
 from proteia.core.plotspec import (
     ErrorType,
@@ -153,6 +160,11 @@ class NoticeCode(StrEnum):
     BACKGROUND_FALLBACK = "background_fallback"
     # Bands whose background differs around the box by more than the QC limit.
     BACKGROUND_UNEVEN = "background_uneven"
+    # Per protein: its counted boxes share pixels with other proteins' boxes on
+    # its image, so its nets count them too (#208). Up to boxes.COVER_SHARE of
+    # the smaller box is accepted; more is refused (#114), but an old file may
+    # hold it.
+    BOXES_OVERLAP = "boxes_overlap"
     # Nets above the whole-image median, as quantified before #83: requantify.
     LEGACY_BACKGROUND = "legacy_background"
     # Per image: nets measured on a reading of its file this version no longer
@@ -468,6 +480,97 @@ def _background_notices(
             f" {BACKGROUND_UNEVEN_LIMIT:.0%} of the net; check the membrane there",
             protein_ids=(protein.id,),
             lane_indices=uneven,
+        )
+
+
+def share_words(shared: int, smaller: int) -> str:
+    """The share of the smaller box's area two boxes hold in common, ``shared``
+    of ``smaller`` pixels (:func:`~proteia.core.boxes.overlap_share`), as the
+    overlap notice writes it: ``under 1%``; a whole percent, rounded half up,
+    up to :data:`~proteia.core.boxes.COVER_SHARE` (99 of 200 is ``50%``); past
+    it (an old file's) as :func:`_percent_past` writes a share past a limit,
+    never reading as within it (``50.1%``). Whole pixels are counted, so the
+    rounding is exact."""
+    share = shared / smaller
+    if share > COVER_SHARE:
+        return _percent_past(share, COVER_SHARE, signed=False)
+    if 100 * shared < smaller:
+        return "under 1%"
+    return f"{(200 * shared + smaller) // (2 * smaller)}%"
+
+
+def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..., None]) -> None:
+    """The ``boxes_overlap`` notices (#208): one per protein whose counted box
+    (its first band's, in a lane this set includes, as the nets are joined)
+    shares pixels with a box of another protein on its image, of any band and
+    in any lane. Boxes of one protein never overlap (the model refuses them),
+    and boxes on two images share no pixel, even on one membrane; a
+    not-detected record has no box.
+
+    Each notice names the other proteins in the batch's order, each with the
+    lanes and shares (:func:`share_words`) of the protein's boxes over it, by
+    the protein's lane and then the other's: the lanes of one share together,
+    and a box over the other's box of another lane with that lane; where
+    several boxes of one lane of the other protein
+    lie over one box (an old file's boxes beyond the first band), the largest
+    share. Its lanes (``lane_indices``) are the protein's lanes named. The
+    boxes are swept left to right, so each pair whose columns meet is
+    compared once."""
+    on_image: dict[str, list[tuple[int, model.Band, model.Rect]]] = {}
+    for p, protein in enumerate(batch.proteins):
+        for band in protein.bands:
+            rect = band.box.rect(protein.box_size)
+            on_image.setdefault(protein.image_id, []).append((p, band, rect))
+    # By protein, then by the other protein (their places in the batch): (its
+    # lane, the other's lane) -> (shared pixels, the smaller box's area).
+    found: dict[int, dict[int, dict[tuple[int, int], tuple[int, int]]]] = {}
+    for boxes in on_image.values():
+        boxes.sort(key=lambda item: item[2][0])
+        for i, (p, band, rect) in enumerate(boxes):
+            for q, other, box in boxes[i + 1 :]:
+                if box[0] >= rect[2]:
+                    break  # this box and every one after it start right of rect
+                shared = shared_area(rect, box)  # > 0 only for two proteins' boxes
+                if not shared:
+                    continue
+                smaller = smaller_area(rect, box)
+                for mine, theirs, counted, over in ((p, q, band, other), (q, p, other, band)):
+                    if counted.band_index or not included[counted.lane_index]:
+                        continue  # its value is not this box's, or not in this set
+                    pairs = found.setdefault(mine, {}).setdefault(theirs, {})
+                    key = (counted.lane_index, over.lane_index)
+                    held = pairs.get(key)
+                    if held is None or shared * held[1] > held[0] * smaller:
+                        pairs[key] = (shared, smaller)
+    for p in sorted(found):
+        protein, parts, named = batch.proteins[p], [], set()
+        for q in sorted(found[p]):
+            other = batch.proteins[q]
+            # By share in words: the lanes whose box lies over the other's of that lane.
+            same: dict[str, list[int]] = {}
+            items: list[tuple[tuple[int, int], str]] = []  # by (its lane, the other's lane)
+            for (lane, its_lane), (shared, smaller) in found[p][q].items():
+                named.add(lane)
+                words = share_words(shared, smaller)
+                if lane == its_lane:
+                    same.setdefault(words, []).append(lane)
+                else:
+                    where = f"(the box of {other.name!r} in {lanes_phrase([its_lane])})"
+                    items.append(
+                        ((lane, its_lane), f"in {lanes_phrase([lane])} {where} by {words}")
+                    )
+            for words, lanes in same.items():
+                first = min(lanes)
+                items.append(((first, first), f"in {lanes_phrase(lanes)} by {words}"))
+            items.sort(key=lambda item: item[0])
+            parts.append(f"{other.name!r} {in_words([text for _, text in items])}")
+        its = "its net there also counts" if len(named) == 1 else "its nets there also count"
+        note(
+            NoticeCode.BOXES_OVERLAP,
+            f"{protein.name!r} overlaps {in_words(parts)} of the smaller box's area: {its} the"
+            " pixels the boxes share; move a box so they do not overlap",
+            protein_ids=(protein.id,),
+            lane_indices=tuple(sorted(named)),
         )
 
 
@@ -1484,6 +1587,7 @@ def _compute(
         _clipping_not_checked(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # backgrounds to check, in lanes this set includes
         _background_notices(protein, joined[protein.id], included, note)
+    _overlap_notices(batch, included, note)  # #208, of boxes counted in lanes this set includes
     for column in columns:  # not-detected records in lanes this set includes
         below = tuple(i for i, flag in enumerate(column.detected) if flag is False and included[i])
         if not below:

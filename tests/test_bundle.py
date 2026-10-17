@@ -24,8 +24,8 @@ from PIL import Image
 
 from conftest import FakeClock, make_project, make_project_with_clashing_names, write_image_files
 from proteia import viz
+from proteia.core import export, record, storage
 from proteia.core import operations as ops
-from proteia.core import record, storage
 from proteia.core.analyze import StatisticsSetting, compare, describe
 from proteia.core.export import (
     BUNDLE_README_FILE,
@@ -43,6 +43,7 @@ from proteia.core.export import (
 from proteia.core.model import Project, Role, apply_change
 from proteia.core.operations import ErrorCode, LaneInput, OperationError, ProjectSession
 from proteia.core.plotspec import ErrorType, ValueKind, build_plotspec
+from proteia.core.results import Level, Notice, NoticeCode, Results, compute_results
 from proteia.core.session import save_to_folder
 from proteia.viz import render_figure, render_pdf, render_png, render_svg
 
@@ -359,6 +360,7 @@ def test_the_record_is_the_projects_current_record_and_lists_every_file(tmp_path
         "plot_conditions": None,
         "excluded_lanes": [3],
         "statistics": record.results_statistics(ops.compute(s)),
+        "notices": record.results_notices(ops.compute(s)),
     }
     assert doc["settings"]["lane_table_ratio_decimals"] == LANE_TABLE_RATIO_DECIMALS
     assert doc["settings"]["lane_table_first_lane"] == 1
@@ -383,6 +385,7 @@ def test_the_export_uses_the_compute_settings_given(tmp_path):
         "plot_conditions": ["vehicle"],
         "excluded_lanes": [3],
         "statistics": record.results_statistics(res),
+        "notices": record.results_notices(res),
     }
     svg = (bundle.folder / f"chart {SERIES} ({APPLIED}).svg").read_bytes()
     assert svg == render_svg(res.series[0].chart)
@@ -611,6 +614,173 @@ def test_the_readme_explains_replicates_not_detected(tmp_path):
     )
     svg = (bundle.folder / f"chart {SERIES} ({APPLIED}).svg").read_bytes().decode()
     assert 'id="nd-1-0"' in svg  # the open circle of lane 3
+
+
+# --- #208: the checks ---
+
+# The sample with GAPDH on β-catenin's image, its lane-1 box over the right 8
+# of the 24 columns of β-catenin's: one third of the smaller box.
+OVERLAP_ENDS = (
+    " of the smaller box's area: its net there also counts the pixels the boxes share;"
+    " move a box so they do not overlap"
+)
+OVERLAPS = [
+    f"'β-catenin' overlaps 'GAPDH' in lane 1 by 33%{OVERLAP_ENDS}",
+    f"'GAPDH' overlaps 'β-catenin' in lane 1 by 33%{OVERLAP_ENDS}",
+]
+
+
+def overlapping_sample() -> Project:
+    def change(draft: Project) -> None:
+        gapdh = draft.batch.find_protein("prot-9")
+        gapdh.image_id = "img-2"
+        box = gapdh.bands[0].box  # lane 1's, at (18, 100)
+        box.x, box.y = 34, 43  # (34, 43, 58, 57) over β-catenin's (18, 43, 42, 57)
+
+    return apply_change(make_project(), change)[0]
+
+
+def _notice(code: str, level: str, message: str) -> Notice:
+    return Notice(code=NoticeCode(code), level=Level(level), message=message)
+
+
+def test_the_checks_list_warnings_first_then_notes_each_once():
+    # As the page's Checks list orders them: the warnings of the set the
+    # include flags apply to, then the all-lanes set's own, under its label;
+    # then the notes, the same way. A test notice both sets keep, word for
+    # word, is listed once. Each is a sentence.
+    res = compute_results(make_project().batch)
+    both = _notice("conditions_not_tested", "warning", "not tested: 'KO' (n = 1)")
+    applied = [
+        _notice("clipped", "warning", "'β-catenin' is over-exposed in lane 1"),
+        _notice("technical_repeats", "info", "repeats averaged"),
+        both,
+        _notice("background_uneven", "warning", "uneven. Check it."),
+    ]
+    every = [
+        both,
+        _notice("clipped", "warning", "'β-catenin' is over-exposed in lanes 1, 4"),
+        _notice("log_scale_unavailable", "info", "linear values!"),
+        _notice("conditions_not_tested", "warning", "not tested: 'WT' (n = 1)"),
+    ]
+    two = res.model_copy(
+        update={
+            "notices": applied,
+            "all_lanes": res.all_lanes.model_copy(update={"notices": every}),
+        }
+    )
+    assert export.notice_lines(two) == [
+        "'β-catenin' is over-exposed in lane 1.",
+        "Not tested: 'KO' (n = 1).",
+        "Uneven. Check it.",
+        "All lanes: 'β-catenin' is over-exposed in lanes 1, 4.",
+        "All lanes: Not tested: 'WT' (n = 1).",
+        "Repeats averaged.",
+        "All lanes: Linear values!",
+    ]
+    one = two.model_copy(update={"all_lanes": None})
+    assert export.notice_lines(one) == [
+        "'β-catenin' is over-exposed in lane 1.",
+        "Not tested: 'KO' (n = 1).",
+        "Uneven. Check it.",
+        "Repeats averaged.",
+    ]
+    assert export.notice_lines(one.model_copy(update={"notices": []})) == []
+
+
+def test_the_readme_lists_the_checks_before_the_files(tmp_path):
+    s = open_sample(tmp_path, project=overlapping_sample())
+    bundle = ops.export_bundle(s, formats=["svg"])
+    lines = _readme_lines(bundle)
+    res = ops.compute(s)
+    tables = next(i for i, line in enumerate(lines) if line.startswith("Lane tables: "))
+    start, end = lines.index("Checks"), lines.index("Files")
+    assert tables < start < end < lines.index("Legends")
+    assert lines[start + 1 : start + 3] == ["------", ""]
+    section = lines[start + 3 : end]
+    blank = section.index("")  # the intro, then one indented paragraph per check
+    assert not any(line.startswith(" ") for line in section[:blank])
+    assert all(line == "" or line.startswith("    ") for line in section[blank:])
+    said = " ".join(" ".join(section).split())
+    assert said == " ".join(
+        [
+            "The checks of these results, as the app's Checks list words them: warnings"
+            ' first, then notes. A line that starts "All lanes:" is about the "All lanes"'
+            " set.",
+            *export.notice_lines(res),
+        ]
+    )
+    assert len(export.notice_lines(res)) == len(res.notices) + len(res.all_lanes.notices)
+    for message in OVERLAPS:
+        assert f"{message}." in said, message
+    assert said.index(OVERLAPS[0]) < said.index(OVERLAPS[1])
+
+
+def test_the_readme_of_one_set_says_nothing_of_the_all_lanes_set(tmp_path):
+    def included(draft: Project) -> None:
+        draft.batch.lanes[3].included = True
+
+    s = open_sample(tmp_path, project=apply_change(overlapping_sample(), included)[0])
+    assert ops.compute(s).all_lanes is None
+    text = readme_text(ops.export_bundle(s, formats=["svg"]))
+    assert (
+        "The checks of these results, as the app's Checks list words them: warnings first,"
+        " then notes. 'β-catenin' was not checked" in text
+    )
+    assert "All lanes" not in text
+    for message in OVERLAPS:
+        assert f"{message}." in text, message
+
+
+def test_a_readme_without_checks_has_no_checks_section_and_is_otherwise_the_same():
+    res = compute_results(make_project().batch)
+    quiet = res.model_copy(
+        update={"notices": [], "all_lanes": res.all_lanes.model_copy(update={"notices": []})}
+    )
+
+    def readme(one: Results) -> list[str]:
+        files = export.bundle_files(one, formats=[], exported_at="2026-09-26T08:00:00.000Z")
+        return files[BUNDLE_README_FILE].decode("utf-8").splitlines()
+
+    noted, plain = readme(res), readme(quiet)
+    assert "Checks" in noted and "Checks" not in plain
+    start, end = noted.index("Checks"), noted.index("Files")
+    assert noted[:start] + noted[end:] == plain
+
+
+def test_the_record_lists_the_notices_of_each_set(tmp_path):
+    s = open_sample(tmp_path, project=overlapping_sample())
+    bundle = ops.export_bundle(s, formats=["svg"])
+    doc = json.loads((bundle.folder / BUNDLE_RECORD_FILE).read_bytes())
+    res = ops.compute(s)
+    notices = doc["results"]["notices"]
+    assert notices == record.results_notices(res)
+    assert [n["result_set"] for n in notices] == [APPLIED] * len(res.notices) + [ALL] * len(
+        res.all_lanes.notices
+    )
+    overlaps = [n for n in notices if n["code"] == "boxes_overlap"]
+    assert overlaps == [
+        {
+            "result_set": APPLIED,
+            "code": "boxes_overlap",
+            "level": "warning",
+            "message": OVERLAPS[0],
+            "protein_ids": ["prot-7"],
+            "lane_indices": [0],
+            "conditions": [],
+            "image_ids": [],
+        },
+        {
+            "result_set": APPLIED,
+            "code": "boxes_overlap",
+            "level": "warning",
+            "message": OVERLAPS[1],
+            "protein_ids": ["prot-9"],
+            "lane_indices": [0],
+            "conditions": [],
+            "image_ids": [],
+        },
+    ]
 
 
 # --- Folders ---

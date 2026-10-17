@@ -11,7 +11,8 @@ Two exports are built from these pieces (:mod:`proteia.core.operations`): the
 lane table alone (:func:`lane_table_bytes`), and the export bundle (#53), a new
 folder per export (:func:`bundle_folder_name`) with each result set's lane table
 and charts and a README (:func:`bundle_files`), next to which the operation
-writes the reproducibility record. The README says how the charts were tested
+writes the reproducibility record. The README says how the charts were tested,
+lists the checks of the results as the page does (:func:`notice_lines`, #208)
 and gives each chart's legend as its caption; the images draw a key of their
 marks, and the legend under the chart only when asked. Every file numbers
 lanes from 1, as the app does (:func:`~proteia.core.model.lane_number`); the
@@ -60,7 +61,7 @@ from proteia.core.analyze import (
 from proteia.core.model import lane_number
 from proteia.core.names import name_key
 from proteia.core.plotspec import PlotSpec, ValueKind
-from proteia.core.results import Results, SeriesResult
+from proteia.core.results import Level, Results, SeriesResult
 
 CSV_ENCODING = "utf-8-sig"
 # The lane-identity columns that lead the lane table, before one column per protein.
@@ -699,7 +700,30 @@ def _statistics_text(setting: StatisticsSetting) -> str:
 
 
 def _sentence(line: str) -> str:
-    return line if line.endswith((".", "!", "?")) else f"{line}."
+    """``line`` as a sentence, as the page writes a server message (dom.js
+    ``sentence``): its first character capitalized, and a full stop unless it
+    ends with one, ``!`` or ``?``."""
+    capital = line[:1].upper() + line[1:]
+    return capital if capital.endswith((".", "!", "?")) else f"{capital}."
+
+
+def notice_lines(results: Results) -> list[str]:
+    """The notices of ``results`` and of its all-lanes set, each a sentence
+    (:func:`_sentence`), in the order of the page's Checks list (#208): the
+    warnings, then the notes; within each, the set the include flags apply to,
+    then the all-lanes set, whose lines start with its label (``All lanes:``)
+    and leave out a notice the other set has word for word (a test notice,
+    which each set keeps). The page's list also names the lanes a protein has
+    no box in; these lines do not."""
+    listed = {(notice.code, notice.message) for notice in results.notices}
+    lines: dict[Level, list[str]] = {Level.WARNING: [], Level.INFO: []}
+    for notice in results.notices:
+        lines[notice.level].append(_sentence(notice.message))
+    every = results.all_lanes
+    for notice in [] if every is None else every.notices:
+        if (notice.code, notice.message) not in listed:
+            lines[notice.level].append(f"{every.label}: {_sentence(notice.message)}")
+    return [*lines[Level.WARNING], *lines[Level.INFO]]
 
 
 def _readme(
@@ -719,7 +743,8 @@ def _readme(
     columns were renamed, and why (:func:`lane_columns`). ``legends`` gives each
     chart's file stem and its legend lines, which the README gives as the
     chart's caption; ``statement_in_charts`` says whether the images draw them
-    too."""
+    too. The results' notices, if any, are listed under Checks
+    (:func:`notice_lines`)."""
     lines = ["Proteia export", "==============", ""]
     lines += _paragraph(
         f"Exported at {exported_at} (UTC) by Proteia {proteia.__version__}. Every file"
@@ -786,6 +811,18 @@ def _readme(
         )
         for sentence in renamed:
             lines += _paragraph(sentence, "    ")
+    checks = notice_lines(results)
+    if checks:
+        intro = (
+            "The checks of these results, as the app's Checks list words them: warnings"
+            " first, then notes."
+        )
+        if len(sets) == 2:
+            label = sets[1].label
+            intro += f' A line that starts "{label}:" is about the "{label}" set.'
+        lines += ["Checks", "------", "", *_paragraph(intro)]
+        for line in checks:
+            lines += _paragraph(line, "    ")
     lines += ["Files", "-----", ""]
     for name, text in about.items():
         lines.append(name)

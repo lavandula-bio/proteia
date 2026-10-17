@@ -39,6 +39,7 @@ from proteia.core.record import (
     build_record,
     history_issues,
     record_bytes,
+    results_notices,
     results_settings,
     results_statistics,
     settings,
@@ -213,10 +214,43 @@ def test_record_names_the_compute_settings():
         "statistics": results_statistics(res),
     }
     assert results_settings(res) == expected
-    assert build_record(project, exported_at=EXPORTED_AT, files={}, results=res)["results"] == (
-        expected
-    )
+    assert build_record(project, exported_at=EXPORTED_AT, files={}, results=res)["results"] == {
+        **expected,
+        "notices": results_notices(res),
+    }
     assert results_settings(compute_results(project.batch))["plot_conditions"] is None
+
+
+def test_record_lists_each_sets_notices():
+    # #208: the notices of the results the export used, the set the include
+    # flags apply to first, each with its set's label (None for the only set),
+    # its lanes 0-based as the record's content numbers them.
+    project = make_project()
+    res = compute_results(project.batch)
+    listed = results_notices(res)
+    assert [n["result_set"] for n in listed] == ["Excluding lane 4"] * len(res.notices) + [
+        "All lanes"
+    ] * len(res.all_lanes.notices)
+    assert listed[0] == {
+        "result_set": "Excluding lane 4",
+        "code": "clipping_not_checked",
+        "level": "warning",
+        "message": "'β-catenin' was not checked for over-exposure in lanes 1, 2; if it is"
+        " over-exposed there, its net is an under-estimate",
+        "protein_ids": ["prot-7"],
+        "lane_indices": [0, 1],
+        "conditions": [],
+        "image_ids": [],
+    }
+    assert listed[-1]["lane_indices"] == [0, 1, 2, 3]  # α-tubulin's, in every lane
+
+    def every_lane(draft: Project) -> None:
+        draft.batch.lanes[3].included = True
+
+    one = compute_results(apply_change(project, every_lane)[0].batch)
+    assert one.all_lanes is None
+    assert [n["result_set"] for n in results_notices(one)] == [None] * len(one.notices)
+    assert [n["message"] for n in results_notices(one)] == [n.message for n in one.notices]
 
 
 def test_settings_are_the_code_constants():

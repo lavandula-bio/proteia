@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Final, Literal
@@ -288,6 +288,11 @@ def lanes_phrase(indices: Iterable[int]) -> str:
     ascending: ``lane 8``, ``lanes 3, 7``."""
     numbers = sorted(lane_number(index) for index in indices)
     return ("lane " if len(numbers) == 1 else "lanes ") + ", ".join(map(str, numbers))
+
+
+def in_words(items: Sequence[str]) -> str:
+    """Items of a message in words: ``a``, ``a and b``, ``a, b and c``."""
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
 
 
 class Box(_Model):
