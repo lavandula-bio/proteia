@@ -53,6 +53,16 @@ MANY = (
     " of the smaller box's area: its nets there also count the pixels the boxes share;"
     " move a box so they do not overlap"
 )
+# The same, of a notice naming two or more other proteins: their shares are each
+# of the smaller box's area.
+EACH_ONE = (
+    ", each of the smaller box's area: its net there also counts the pixels the boxes share;"
+    " move a box so they do not overlap"
+)
+EACH_MANY = (
+    ", each of the smaller box's area: its nets there also count the pixels the boxes share;"
+    " move a box so they do not overlap"
+)
 
 
 # --- Projects built from the model ---
@@ -365,7 +375,8 @@ def test_a_box_over_two_proteins_names_both_in_the_proteins_order():
         (
             (A,),
             (0,),
-            f"'β-catenin' overlaps 'GAPDH' in lane 1 by 40% and 'µ-calpain' in lane 1 by 25%{ONE}",
+            "'β-catenin' overlaps 'GAPDH' in lane 1 by 40%; and 'µ-calpain' in lane 1 by"
+            f" 25%{EACH_ONE}",
         ),
         ((B,), (0,), f"'GAPDH' overlaps 'β-catenin' in lane 1 by 40%{ONE}"),
         ((C,), (0,), f"'µ-calpain' overlaps 'β-catenin' in lane 1 by 25%{ONE}"),
@@ -376,10 +387,39 @@ def test_a_box_over_two_proteins_names_both_in_the_proteins_order():
         (
             (A,),
             (0,),
-            f"'β-catenin' overlaps 'µ-calpain' in lane 1 by 25% and 'GAPDH' in lane 1 by 40%{ONE}",
+            "'β-catenin' overlaps 'µ-calpain' in lane 1 by 25%; and 'GAPDH' in lane 1 by"
+            f" 40%{EACH_ONE}",
         ),
         ((B,), (0,), f"'µ-calpain' overlaps 'β-catenin' in lane 1 by 25%{ONE}"),
         ((C,), (0,), f"'GAPDH' overlaps 'β-catenin' in lane 1 by 40%{ONE}"),
+    ]
+
+
+def test_a_protein_over_three_proteins_names_them_apart_in_the_proteins_order():
+    # β-catenin's boxes of lanes 1 to 4: GAPDH's over those of lanes 1 to 3
+    # (12%, 40%, 12%, as above), and in lane 4 α-tubulin's at its lower left
+    # (10 x 5 px, 25%) and µ-calpain's at its right (40%), apart from each
+    # other. The proteins' order is neither their names' nor their shares'.
+    project = project_with(
+        beta((0, 10, 25), (1, 110, 25), (2, 210, 25), (3, 300, 25)),
+        gapdh((0, 18, 33), (1, 122, 25), (2, 218, 33)),
+        Boxed("α-tubulin", [(3, 290, 30)]),
+        Boxed("µ-calpain", [(3, 312, 25)]),
+    )
+    assert overlap_notices(project) == [
+        (
+            (A,),
+            (0, 1, 2, 3),
+            "'β-catenin' overlaps 'GAPDH' in lanes 1, 3 by 12% and in lane 2 by 40%;"
+            f" 'α-tubulin' in lane 4 by 25%; and 'µ-calpain' in lane 4 by 40%{EACH_MANY}",
+        ),
+        (
+            (B,),
+            (0, 1, 2),
+            f"'GAPDH' overlaps 'β-catenin' in lanes 1, 3 by 12% and in lane 2 by 40%{MANY}",
+        ),
+        ((C,), (3,), f"'α-tubulin' overlaps 'β-catenin' in lane 4 by 25%{ONE}"),
+        (("prot-103",), (3,), f"'µ-calpain' overlaps 'β-catenin' in lane 4 by 40%{ONE}"),
     ]
 
 
@@ -586,7 +626,8 @@ def test_the_all_lanes_view_keeps_an_overlap_its_own_notice_of_the_protein_also_
         (
             (A,),
             (0, 3),
-            f"'β-catenin' overlaps 'GAPDH' in lane 1 by 40% and 'µ-calpain' in lane 4 by 40%{MANY}",
+            "'β-catenin' overlaps 'GAPDH' in lane 1 by 40%; and 'µ-calpain' in lane 4 by"
+            f" 40%{EACH_MANY}",
         ),
         ((C,), (3,), f"'µ-calpain' overlaps 'β-catenin' in lane 4 by 40%{ONE}"),
         ((B,), (0,), f"'GAPDH' overlaps 'β-catenin' in lane 1 by 40%{ONE}"),

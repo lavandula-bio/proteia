@@ -61,7 +61,7 @@ from proteia.core.analyze import (
 from proteia.core.model import lane_number
 from proteia.core.names import name_key
 from proteia.core.plotspec import PlotSpec, ValueKind
-from proteia.core.results import Level, Results, SeriesResult
+from proteia.core.results import Level, Notice, Results, SeriesResult
 
 CSV_ENCODING = "utf-8-sig"
 # The lane-identity columns that lead the lane table, before one column per protein.
@@ -715,15 +715,21 @@ def notice_lines(results: Results) -> list[str]:
     and leave out a notice the other set has word for word (a test notice,
     which each set keeps). The page's list also names the lanes a protein has
     no box in; these lines do not."""
-    listed = {(notice.code, notice.message) for notice in results.notices}
     lines: dict[Level, list[str]] = {Level.WARNING: [], Level.INFO: []}
     for notice in results.notices:
         lines[notice.level].append(_sentence(notice.message))
     every = results.all_lanes
-    for notice in [] if every is None else every.notices:
-        if (notice.code, notice.message) not in listed:
-            lines[notice.level].append(f"{every.label}: {_sentence(notice.message)}")
+    for notice in [] if every is None else _own_notices(every, results):
+        lines[notice.level].append(f"{every.label}: {_sentence(notice.message)}")
     return [*lines[Level.WARNING], *lines[Level.INFO]]
+
+
+def _own_notices(every: Results, applied: Results) -> list[Notice]:
+    """The notices of the all-lanes set ``every`` that the set the include
+    flags apply to (``applied``) lacks word for word: those whose lines in
+    :func:`notice_lines` start with its label."""
+    listed = {(notice.code, notice.message) for notice in applied.notices}
+    return [notice for notice in every.notices if (notice.code, notice.message) not in listed]
 
 
 def _readme(
@@ -744,7 +750,8 @@ def _readme(
     chart's file stem and its legend lines, which the README gives as the
     chart's caption; ``statement_in_charts`` says whether the images draw them
     too. The results' notices, if any, are listed under Checks
-    (:func:`notice_lines`)."""
+    (:func:`notice_lines`); with two sets, its intro says which set the lines
+    are about."""
     lines = ["Proteia export", "==============", ""]
     lines += _paragraph(
         f"Exported at {exported_at} (UTC) by Proteia {proteia.__version__}. Every file"
@@ -818,8 +825,23 @@ def _readme(
             " first, then notes."
         )
         if len(sets) == 2:
-            label = sets[1].label
-            intro += f' A line that starts "{label}:" is about the "{label}" set.'
+            applied, every = sets
+            if not applied.notices:
+                intro += (
+                    f' Each line is about the "{every.label}" set only; the'
+                    f' "{applied.label}" set has no checks.'
+                )
+            elif _own_notices(every, applied):
+                intro += (
+                    f' Lines without a prefix are about the "{applied.label}" set, and a check'
+                    f' both sets share is listed once; a line that starts "{every.label}:" is'
+                    f' about the "{every.label}" set only.'
+                )
+            else:
+                intro += (
+                    f' Each line is about the "{applied.label}" set, and a check both sets'
+                    f' share is listed once; the "{every.label}" set has no other checks.'
+                )
         lines += ["Checks", "------", "", *_paragraph(intro)]
         for line in checks:
             lines += _paragraph(line, "    ")

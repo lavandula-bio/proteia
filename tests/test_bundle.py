@@ -705,8 +705,9 @@ def test_the_readme_lists_the_checks_before_the_files(tmp_path):
     assert said == " ".join(
         [
             "The checks of these results, as the app's Checks list words them: warnings"
-            ' first, then notes. A line that starts "All lanes:" is about the "All lanes"'
-            " set.",
+            ' first, then notes. Lines without a prefix are about the "Excluding lane 4"'
+            " set, and a check both sets share is listed once; a line that starts"
+            ' "All lanes:" is about the "All lanes" set only.',
             *export.notice_lines(res),
         ]
     )
@@ -730,6 +731,73 @@ def test_the_readme_of_one_set_says_nothing_of_the_all_lanes_set(tmp_path):
     assert "All lanes" not in text
     for message in OVERLAPS:
         assert f"{message}." in text, message
+
+
+CHECKS_INTRO = (
+    "The checks of these results, as the app's Checks list words them: warnings first, then notes."
+)
+PREFIXED = (
+    ' Lines without a prefix are about the "Excluding lane 4" set, and a check both sets'
+    ' share is listed once; a line that starts "All lanes:" is about the "All lanes" set'
+    " only."
+)
+UNPREFIXED = (
+    ' Each line is about the "Excluding lane 4" set, and a check both sets share is listed'
+    ' once; the "All lanes" set has no other checks.'
+)
+ALL_LANES_ONLY = (
+    ' Each line is about the "All lanes" set only; the "Excluding lane 4" set has no checks.'
+)
+
+
+@pytest.mark.parametrize(
+    ("applied", "every", "intro"),
+    [
+        # Each all-lanes check the other set has word for word: no line starts
+        # "All lanes:".
+        pytest.param(["both", "own"], ["both"], UNPREFIXED, id="one-shared"),
+        pytest.param(["own"], [], UNPREFIXED, id="none-of-all-lanes"),
+        # One the other set has not: its line starts "All lanes:".
+        pytest.param(["both", "own"], ["both", "other"], PREFIXED, id="one-of-its-own"),
+        # The other set has no checks at all: every line starts "All lanes:".
+        pytest.param([], ["other"], ALL_LANES_ONLY, id="all-lanes-only"),
+        # The same words under another code are another check.
+        pytest.param(["both"], ["recoded"], PREFIXED, id="same-words-another-code"),
+    ],
+)
+def test_the_readme_says_which_set_the_checks_are_about(applied, every, intro):
+    res = compute_results(make_project().batch)
+    notices = {
+        "both": _notice("conditions_not_tested", "warning", "not tested: 'KO' (n = 1)"),
+        "own": _notice("clipped", "warning", "'β-catenin' is over-exposed in lane 1"),
+        "other": _notice("technical_repeats", "info", "repeats averaged"),
+        "recoded": _notice("clipped", "warning", "not tested: 'KO' (n = 1)"),
+    }
+    two = res.model_copy(
+        update={
+            "notices": [notices[key] for key in applied],
+            "all_lanes": res.all_lanes.model_copy(
+                update={"notices": [notices[key] for key in every]}
+            ),
+        }
+    )
+    assert checks_intro(two) == CHECKS_INTRO + intro
+    prefixed = [line.startswith("All lanes:") for line in export.notice_lines(two)]
+    assert any(prefixed) is (intro in (PREFIXED, ALL_LANES_ONLY))
+    assert all(prefixed) is (intro == ALL_LANES_ONLY)
+    # One set: not a word of the sets, and no Checks without its own.
+    one = two.model_copy(update={"all_lanes": None})
+    assert checks_intro(one) == (CHECKS_INTRO if applied else None)
+
+
+def checks_intro(results: Results) -> str | None:
+    """The intro of the README's Checks, its lines joined; None without Checks."""
+    files = export.bundle_files(results, formats=[], exported_at="2026-09-26T08:00:00.000Z")
+    lines = files[BUNDLE_README_FILE].decode("utf-8").splitlines()
+    if "Checks" not in lines:
+        return None
+    section = lines[lines.index("Checks") + 3 : lines.index("Files")]
+    return " ".join(section[: section.index("")])
 
 
 def test_a_readme_without_checks_has_no_checks_section_and_is_otherwise_the_same():

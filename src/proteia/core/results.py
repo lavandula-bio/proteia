@@ -513,9 +513,10 @@ def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..
     and a box over the other's box of another lane with that lane; where
     several boxes of one lane of the other protein
     lie over one box (an old file's boxes beyond the first band), the largest
-    share. Its lanes (``lane_indices``) are the protein's lanes named. The
-    boxes are swept left to right, so each pair whose columns meet is
-    compared once."""
+    share. Two or more other proteins are set apart with semicolons, ``and``
+    before the last, their shares each of the smaller box's area. Its lanes
+    (``lane_indices``) are the protein's lanes named. The boxes are swept left
+    to right, so each pair whose columns meet is compared once."""
     on_image: dict[str, list[tuple[int, model.Band, model.Rect]]] = {}
     for p, protein in enumerate(batch.proteins):
         for band in protein.bands:
@@ -527,14 +528,17 @@ def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..
     for boxes in on_image.values():
         boxes.sort(key=lambda item: item[2][0])
         for i, (p, band, rect) in enumerate(boxes):
-            for q, other, box in boxes[i + 1 :]:
+            for q, their_band, box in boxes[i + 1 :]:
                 if box[0] >= rect[2]:
                     break  # this box and every one after it start right of rect
                 shared = shared_area(rect, box)  # > 0 only for two proteins' boxes
                 if not shared:
                     continue
                 smaller = smaller_area(rect, box)
-                for mine, theirs, counted, over in ((p, q, band, other), (q, p, other, band)):
+                for mine, theirs, counted, over in (
+                    (p, q, band, their_band),
+                    (q, p, their_band, band),
+                ):
                     if counted.band_index or not included[counted.lane_index]:
                         continue  # its value is not this box's, or not in this set
                     pairs = found.setdefault(mine, {}).setdefault(theirs, {})
@@ -545,30 +549,34 @@ def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..
     for p in sorted(found):
         protein, parts, named = batch.proteins[p], [], set()
         for q in sorted(found[p]):
-            other = batch.proteins[q]
+            their_protein = batch.proteins[q]
             # By share in words: the lanes whose box lies over the other's of that lane.
             same: dict[str, list[int]] = {}
             items: list[tuple[tuple[int, int], str]] = []  # by (its lane, the other's lane)
-            for (lane, its_lane), (shared, smaller) in found[p][q].items():
+            for (lane, their_lane), (shared, smaller) in found[p][q].items():
                 named.add(lane)
                 words = share_words(shared, smaller)
-                if lane == its_lane:
+                if lane == their_lane:
                     same.setdefault(words, []).append(lane)
                 else:
-                    where = f"(the box of {other.name!r} in {lanes_phrase([its_lane])})"
+                    where = f"(the box of {their_protein.name!r} in {lanes_phrase([their_lane])})"
                     items.append(
-                        ((lane, its_lane), f"in {lanes_phrase([lane])} {where} by {words}")
+                        ((lane, their_lane), f"in {lanes_phrase([lane])} {where} by {words}")
                     )
             for words, lanes in same.items():
                 first = min(lanes)
                 items.append(((first, first), f"in {lanes_phrase(lanes)} by {words}"))
             items.sort(key=lambda item: item[0])
-            parts.append(f"{other.name!r} {in_words([text for _, text in items])}")
+            parts.append(f"{their_protein.name!r} {in_words([text for _, text in items])}")
+        if len(parts) == 1:
+            overlapped = f"{parts[0]} of"
+        else:  # the proteins apart, as each names its lanes with "and"
+            overlapped = f"{'; '.join(parts[:-1])}; and {parts[-1]}, each of"
         its = "its net there also counts" if len(named) == 1 else "its nets there also count"
         note(
             NoticeCode.BOXES_OVERLAP,
-            f"{protein.name!r} overlaps {in_words(parts)} of the smaller box's area: {its} the"
-            " pixels the boxes share; move a box so they do not overlap",
+            f"{protein.name!r} overlaps {overlapped} the smaller box's area: {its} the pixels"
+            " the boxes share; move a box so they do not overlap",
             protein_ids=(protein.id,),
             lane_indices=tuple(sorted(named)),
         )
