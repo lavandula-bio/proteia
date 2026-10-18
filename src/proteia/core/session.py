@@ -151,7 +151,8 @@ class ErrorCode(StrEnum):
     INVALID_IMAGE = "invalid_image"  # an empty stream, or a name store_image refuses
     UNREADABLE_IMAGE = "unreadable_image"  # the loader cannot decode it
     # An import of a file of printing inks: CMYK, or a separated TIFF of other
-    # inks (#207); one imported before is still read, converted.
+    # inks (#207); one imported before is still read, converted. ``detail``:
+    # inks ("cmyk" or "other"), several_images, uncompressed_copy.
     CMYK_IMAGE = "cmyk_image"
     IMAGE_FILE_CHANGED = "image_file_changed"  # stored file missing, other bytes, other shape
     # The project folder's path leaves an export's files too little room within

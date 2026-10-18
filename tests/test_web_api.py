@@ -604,8 +604,42 @@ def test_a_cmyk_file_is_refused_on_import_naming_it_and_what_to_do(client, tmp_p
         f"'{name}' is a CMYK file, which Proteia does not import: its gray levels could"
         " only be estimated from its inks; save it as RGB or grayscale and import it again"
     )
+    # #207 review: which inks, for a client that words the refusal itself.
+    assert answer["detail"] == {"inks": "cmyk", "several_images": False, "uncompressed_copy": False}
     assert client.ok("GET", "/api/project") == before
     assert list((client.workspace.current().folder / storage.IMAGES_DIR).iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("pages", "detail"),
+    [
+        (
+            [({"extratags": [(332, 3, 1, 2, True)]}, np.uint8)],
+            {"inks": "other", "several_images": False, "uncompressed_copy": False},
+        ),
+        (
+            [({}, np.uint8), ({}, np.uint8)],
+            {"inks": "cmyk", "several_images": True, "uncompressed_copy": False},
+        ),
+        (
+            [({}, np.uint16)],
+            {"inks": "cmyk", "several_images": False, "uncompressed_copy": True},
+        ),
+    ],
+    ids=["other-inks", "stack", "16-bit"],
+)
+def test_a_refusal_of_inks_tells_their_kind_apart_in_its_detail(client, pages, detail):
+    # #207 review: one code, cmyk_image, for every file of inks; its detail
+    # says which inks, whether the file holds several images, and whether the
+    # copy to import must be an uncompressed TIFF.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    inks = np.asarray(Image.fromarray(ponceau()).convert("CMYK"))
+    buffer = io.BytesIO()
+    with tifffile.TiffWriter(buffer) as tif:
+        for options, dtype in pages:
+            tif.write(inks.astype(dtype), photometric="separated", **options)
+    status, answer = upload(client, buffer.getvalue(), name="inks µ.tif", kind="visible_marker")
+    assert (status, answer["code"], answer["detail"]) == (422, "cmyk_image", detail)
 
 
 @pytest.mark.parametrize("fmt", ["TIFF", "JPEG"])
@@ -621,7 +655,8 @@ def test_a_cmyk_file_imported_before_207_is_offered_in_its_converted_colours(
     original = upload(client, png_bytes(stain), name=PONCEAU, kind="visible_marker")[1]
     suffix = ".tif" if fmt == "TIFF" else ".jpg"
     with monkeypatch.context() as before_207:
-        before_207.setattr(ops, "ink_set", lambda path: None)  # the import without its refusal
+        # The import without its refusal, from the header or as read.
+        before_207.setattr(ops, "_refuse_inks", lambda name, inks: None)
         status, answer = upload(
             client, cmyk_bytes(fmt), name=f"cmyk{suffix}", kind="visible_marker"
         )
