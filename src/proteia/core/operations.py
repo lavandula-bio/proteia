@@ -180,8 +180,12 @@ from proteia.core.export import (
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
     UNTRUSTED_WARNINGS,
+    Inks,
+    InkSet,
+    NotSingleImageError,
     assess_processed,
     clipping_depth,
+    ink_set,
     load_image,
     possible_clipping_depth,
     reads_as_palette,
@@ -1383,6 +1387,15 @@ def import_image(
     (:func:`~proteia.core.imaging.assess_processed`). Without ``membrane_id`` the
     image starts a new membrane. ``kind`` and ``polarity`` are required (the
     model has no silent default).
+
+    A file of printing inks, CMYK or other, is refused (``CMYK_IMAGE``, #207;
+    :func:`_refuse_inks`): the message names it and says to save it as RGB or
+    grayscale (an uncompressed TIFF, for a copy of more than 8 bits or with
+    alpha) and import it again; of a stack, which reading refuses too, it says
+    so and to save one of its images. The header says so before the file is
+    read; inks it does not see (after a first image of none) are refused as
+    reading finds them, and so is, failing closed, any file reading converts
+    from CMYK. Images imported converted before keep being read so.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1420,12 +1433,20 @@ def import_image(
 
     path = session.folder / storage.IMAGES_DIR / stored.file
     try:
+        _refuse_inks(original_name, _header_inks(path))
         try:
             loaded = load_image(path)
         except (ValueError, OSError) as exc:
+            if isinstance(exc, NotSingleImageError):
+                _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
             raise OperationError(
                 ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
             ) from exc
+        if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
+            # Failing closed: inks the header check missed are refused as read,
+            # never imported converted. Reading drops an alpha channel, so the
+            # copy asked for is uncompressed by its bit depth alone.
+            _refuse_inks(original_name, Inks("cmyk", True, loaded.bit_depth != 8))
         background = estimate_background(loaded.array)
         warnings = assess_processed(
             loaded.warnings,
@@ -1483,6 +1504,62 @@ def import_image(
                 path.unlink(missing_ok=True)
         raise
     return image_id
+
+
+# Why an import refuses a file of printing inks (#207), by its ink set; the
+# file is named as it was offered.
+_INK_REFUSALS: Final[dict[InkSet, str]] = {
+    "cmyk": (
+        "{name} is a CMYK file, which Proteia does not import: its gray levels could only"
+        " be estimated from its inks"
+    ),
+    "other": (
+        "{name} holds printing inks other than CMYK (a separated TIFF), which Proteia does"
+        " not import"
+    ),
+}
+# A file of inks that reading would refuse as a stack too: the refusal names
+# both, so that the copy the user saves imports.
+_SEVERAL_IMAGES: Final = (
+    "; it also holds more than one image (a stack or a multi-channel composite), and"
+    " only a single image can be quantified"
+)
+# What to save, by whether the copy must be uncompressed to be read (a 16-bit
+# RGB or an RGBA TIFF is read only uncompressed; Inks.uncompressed_copy).
+_COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grayscale TIFF"}
+
+
+def _header_inks(path: Path) -> Inks | None:
+    """The printing inks of the stored copy at ``path``, from its header
+    (:func:`~proteia.core.imaging.ink_set`); None for a header that cannot be
+    read, as reading the file then says why."""
+    try:
+        return ink_set(path)
+    except (ValueError, OSError):
+        return None
+
+
+def _refuse_inks(original_name: str, inks: Inks | None) -> None:
+    """Refuse (``CMYK_IMAGE``) the file offered as ``original_name`` if it
+    holds printing ``inks``; nothing if None. Until #207 an import converted
+    CMYK, guessing its colours from an ink model; an RGB or grayscale copy the
+    user saves is measured as it is, one image of a stack. The refusal's
+    detail says which inks (``cmyk`` or ``other``), whether the file holds
+    several images, and whether the copy must be an uncompressed TIFF."""
+    if inks is None:
+        return
+    reason = _INK_REFUSALS[inks.kind].format(name=repr(original_name))
+    several = "" if inks.single_image else _SEVERAL_IMAGES
+    what = "it" if inks.single_image else "one of its images"
+    raise OperationError(
+        ErrorCode.CMYK_IMAGE,
+        f"{reason}{several}; save {what} as {_COPIES[inks.uncompressed_copy]} and import it again",
+        detail={
+            "inks": inks.kind,
+            "several_images": not inks.single_image,
+            "uncompressed_copy": inks.uncompressed_copy,
+        },
+    )
 
 
 def _log_import(session: ProjectSession, image_id: str) -> None:

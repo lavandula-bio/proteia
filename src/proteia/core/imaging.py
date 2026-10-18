@@ -13,6 +13,12 @@ black inks) is converted to red, green and blue as it is read, then to gray like
 any colour file (#131): through the ICC colour profile it embeds, to sRGB, or
 else with the standard formula, and its ``cmyk_converted`` warning says which.
 Every reader here gives the converted colours, so nothing downstream sees inks.
+Since #207 an import refuses a file of printing inks instead (:func:`ink_set`,
+:func:`~proteia.core.operations.import_image`): reading one still converts it,
+for the images imported converted before. The header check looks at what the
+file holds, whatever its suffix; reading picks its reader by the suffix, as it
+did for the images imported before, and says which inks a TIFF of several
+images holds when it refuses it (:class:`NotSingleImageError`).
 A TIFF in any other colour space that is not gray, RGB or a palette (CIELAB,
 YCbCr, ...) is refused with the colour space's name rather than read wrong.
 
@@ -35,10 +41,10 @@ from __future__ import annotations
 import io
 import os
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, NamedTuple
 
 import numpy as np
 import tifffile
@@ -79,8 +85,9 @@ _COLOUR_SPACES = {
 _INK_SET, _NUMBER_OF_INKS, _INK_SET_CMYK = 332, 334, 1
 
 # Warning codes and messages recorded on import. Each but looks_processed turns
-# the over-exposure check off (clipping_depth), and its message says so. The
-# cmyk_converted message names how the colours were converted: one of
+# the over-exposure check off (clipping_depth), and its message says so. Since
+# #207 an import refuses CMYK, so only images imported before hold
+# cmyk_converted, whose message names how the colours were converted: one of
 # CMYK_CONVERSIONS; the looks_processed message names the signals that fired
 # (processed_signals), joined by semicolons.
 WARNINGS = {
@@ -176,11 +183,12 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool, str | None]:
     with tifffile.TiffFile(path) as tif:
         series = tif.series
         axes = series[0].axes if series else ""
-        if len(series) != 1 or axes not in _SINGLE_IMAGE_AXES:
-            raise ValueError(
+        if not _single_image(series):
+            raise NotSingleImageError(
                 f"{path.name}: holds {len(series)} image series with axes {axes!r};"
                 " only a single 2-D gray or color image can be quantified"
-                " (stacks and multi-channel composites are not supported)"
+                " (stacks and multi-channel composites are not supported)",
+                _inks_of(series),
             )
         keyframe = series[0].keyframe
         cmyk = _holds_cmyk(keyframe, path.name)
@@ -209,6 +217,73 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool, str | None]:
         return pixels, lossy, None
     rgb, how = _cmyk_to_rgb(pixels[..., :4], profile)  # extra samples (alpha) dropped
     return rgb, lossy, how
+
+
+def _single_image(series: Sequence[tifffile.TiffPageSeries]) -> bool:
+    """Whether a TIFF's image series are the single 2-D gray or colour image
+    reading takes (:func:`_read_tiff`), not a stack, a multi-channel composite
+    or images of several sizes; a reduced-resolution thumbnail page after the
+    image is no series of its own."""
+    return len(series) == 1 and series[0].axes in _SINGLE_IMAGE_AXES
+
+
+class NotSingleImageError(ValueError):
+    """A TIFF that is not the single image reading takes (:func:`_single_image`):
+    a stack, a multi-channel composite, images of several sizes, or none.
+    ``inks`` are the printing inks among its images (:func:`_inks_of`), None
+    if there are none, so that an import, which refuses inks (#207), can name
+    both problems."""
+
+    def __init__(self, message: str, inks: Inks | None) -> None:
+        super().__init__(message)
+        self.inks = inks
+
+
+def _image_series(tif: tifffile.TiffFile, name: str) -> Sequence[tifffile.TiffPageSeries]:
+    """A TIFF's image series, refused (``ValueError``) if it holds none."""
+    series = tif.series
+    if not series:
+        raise ValueError(f"{name}: holds no image")
+    return series
+
+
+def _first_page(tif: tifffile.TiffFile, name: str) -> tifffile.TiffPage:
+    """A TIFF's first page, read when the file is opened; refused
+    (``ValueError``) if it has none."""
+    try:
+        return tif.pages.first
+    except IndexError:
+        raise ValueError(f"{name}: holds no image") from None
+
+
+def _inks_of(series: Sequence[tifffile.TiffPageSeries]) -> Inks | None:
+    """The printing inks of a TIFF's images (its image series), None if none
+    of them is separated: of the ink set the first separated one's InkSet tag
+    names (CMYK by default); whether they are the single image reading takes
+    (:func:`_single_image`); and whether the copy a user saves of any of them
+    as RGB or grayscale must be uncompressed (:func:`_uncompressed_copy`)."""
+    images = [one.keyframe for one in series]
+    separated = [page for page in images if page.photometric == tifffile.PHOTOMETRIC.SEPARATED]
+    if not separated:
+        return None
+    cmyk = separated[0].tags.valueof(_INK_SET, _INK_SET_CMYK) == _INK_SET_CMYK
+    return Inks(
+        "cmyk" if cmyk else "other",
+        _single_image(series),
+        any(_uncompressed_copy(page) for page in images),
+    )
+
+
+def _uncompressed_copy(page: tifffile.TiffPage) -> bool:
+    """Whether the RGB or grayscale copy of a TIFF image that a user saves is
+    one reading decodes only uncompressed (:func:`_read_tiff_with_pillow`):
+    one of more than 8 bits (or not integer), or one that keeps a channel
+    besides its colours (alpha, an ink beyond four)."""
+    return (
+        page.dtype != np.uint8
+        or bool(page.extrasamples)
+        or (page.photometric == tifffile.PHOTOMETRIC.SEPARATED and page.samplesperpixel > 4)
+    )
 
 
 class UnsupportedColourSpaceError(ValueError):
@@ -449,13 +524,71 @@ def converts_cmyk(path: str | os.PathLike[str]) -> bool:
     try:
         if path.suffix.lower() in TIFF_SUFFIXES:
             with tifffile.TiffFile(path) as tif:
-                if not tif.series:
-                    raise ValueError(f"{path.name}: holds no image")
-                return _holds_cmyk(tif.series[0].keyframe, path.name)
+                return _holds_cmyk(_image_series(tif, path.name)[0].keyframe, path.name)
         return _pillow_mode(path) == "CMYK"
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+
+
+InkSet = Literal["cmyk", "other"]
+
+
+class Inks(NamedTuple):
+    """The printing inks a file holds (:func:`ink_set`)."""
+
+    # "cmyk", or "other" for a separated TIFF whose InkSet tag names other inks.
+    kind: InkSet
+    # Whether it holds the single image reading takes: False for a TIFF of
+    # several (a stack, a multi-channel composite), which reading refuses too.
+    single_image: bool
+    # Whether the copy a user saves of it (or of one of its images) as RGB or
+    # grayscale must be an uncompressed TIFF to be read: one of more than 8
+    # bits, or with alpha (:func:`_uncompressed_copy`).
+    uncompressed_copy: bool
+
+
+# The first bytes of a TIFF: byte order, then 42 (classic) or 43 (BigTIFF).
+_TIFF_SIGNATURES = frozenset({b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"})
+
+
+def _holds_tiff(path: Path) -> bool:
+    """Whether the file is a TIFF, by its first bytes, whatever its suffix."""
+    with path.open("rb") as file:
+        return file.read(4) in _TIFF_SIGNATURES
+
+
+def ink_set(path: str | os.PathLike[str]) -> Inks | None:
+    """Whether the file's pixels are printing inks, which an import refuses
+    (#207), from its header alone and by what the file holds, whatever its
+    suffix: of kind ``"cmyk"`` for a file Pillow opens as CMYK (a CMYK JPEG)
+    or a separated TIFF whose InkSet tag says CMYK (its default), whatever the
+    number or type of its inks; ``"other"`` for a separated TIFF of other
+    inks; None otherwise (gray, RGB, a palette, or a TIFF colour space reading
+    refuses by name). It says too whether the file holds a single image, so
+    that the refusal names a stack as well, and whether the RGB or grayscale
+    copy to import must be uncompressed (:func:`_inks_of`).
+
+    Of a TIFF it reads the first page, and the image series only if that page
+    is separated, so that an ordinary TIFF of many pages is not parsed twice:
+    inks after a first image of none are found when reading refuses the file
+    as several images (:class:`NotSingleImageError`). Reading such a file still
+    converts CMYK, for images imported before (:func:`load_image`). A file it
+    cannot read raises ``ValueError`` or ``OSError``.
+    """
+    path = Path(path)
+    try:
+        if not _holds_tiff(path):
+            # Read by Pillow (:func:`_read_other`), as its first image: never a stack.
+            return Inks("cmyk", True, False) if _pillow_mode(path) == "CMYK" else None
+        with tifffile.TiffFile(path) as tif:
+            if _first_page(tif, path.name).photometric != tifffile.PHOTOMETRIC.SEPARATED:
+                return None
+            return _inks_of(_image_series(tif, path.name))
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:  # a damaged file: struct.error, ...
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
 
 
@@ -776,9 +909,7 @@ def _tiff_colours(path: Path) -> tuple[int, np.ndarray | None]:
     """The photometric interpretation of a TIFF's image and its colour map (3 x N,
     16-bit), from the header."""
     with tifffile.TiffFile(path) as tif:
-        if not tif.series:
-            raise ValueError(f"{path.name}: holds no image")
-        page = tif.series[0].keyframe
+        page = _image_series(tif, path.name)[0].keyframe
         photometric, colormap = int(page.photometric), page.colormap
     if colormap is not None and (colormap.ndim != 2 or colormap.shape[0] != 3):
         colormap = None  # not red, green and blue levels

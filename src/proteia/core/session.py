@@ -150,6 +150,10 @@ class ErrorCode(StrEnum):
     IMAGE_TOO_LARGE = "image_too_large"
     INVALID_IMAGE = "invalid_image"  # an empty stream, or a name store_image refuses
     UNREADABLE_IMAGE = "unreadable_image"  # the loader cannot decode it
+    # An import of a file of printing inks: CMYK, or a separated TIFF of other
+    # inks (#207); one imported before is still read, converted. ``detail``:
+    # inks ("cmyk" or "other"), several_images, uncompressed_copy.
+    CMYK_IMAGE = "cmyk_image"
     IMAGE_FILE_CHANGED = "image_file_changed"  # stored file missing, other bytes, other shape
     # The project folder's path leaves an export's files too little room within
     # the file system's path limit (Windows' 259 characters, long paths off).
@@ -347,8 +351,8 @@ def _outdated_reading(image: ImageRef, header: bool | str) -> str | None:
         return (
             f"{name!r} is a CMYK file imported before Proteia converted CMYK colours: its"
             " stored background and nets were measured with its cyan, magenta and yellow"
-            " read as red, green and blue; remove the image and import the file again to"
-            " measure it converted"
+            " read as red, green and blue; remove the image, save the file as RGB or"
+            " grayscale and import it again"  # an import refuses CMYK since #207
         )
     return None
 

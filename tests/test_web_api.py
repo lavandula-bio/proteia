@@ -583,21 +583,83 @@ def test_a_palette_tiff_is_shown_through_its_colour_map(client, tmp_path):
     assert preview_of(client, other, "?colour=original") == preview_of(client, other)
 
 
+def cmyk_bytes(fmt: str) -> bytes:
+    """The Ponceau stain as a CMYK file: a JPEG or a separated TIFF."""
+    buffer = io.BytesIO()
+    quality = {"quality": 95} if fmt == "JPEG" else {}
+    Image.fromarray(ponceau()).convert("CMYK").save(buffer, format=fmt, **quality)
+    return buffer.getvalue()
+
+
 @pytest.mark.parametrize("fmt", ["TIFF", "JPEG"])
-def test_a_cmyk_file_is_imported_converted_and_offered_in_its_converted_colours(
-    client, tmp_path, fmt
+def test_a_cmyk_file_is_refused_on_import_naming_it_and_what_to_do(client, tmp_path, fmt):
+    # #207: refused (422 cmyk_image), with what to do; nothing is stored, and
+    # the project is as it was.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    before = client.ok("GET", "/api/project")
+    name = "Ponceau µ.tif" if fmt == "TIFF" else "Ponceau α.jpg"
+    status, answer = upload(client, cmyk_bytes(fmt), name=name, kind="visible_marker")
+    assert (status, answer["code"], answer["ids"]) == (422, "cmyk_image", [])
+    assert answer["message"] == (
+        f"'{name}' is a CMYK file, which Proteia does not import: its gray levels could"
+        " only be estimated from its inks; save it as RGB or grayscale and import it again"
+    )
+    # #207 review: which inks, for a client that words the refusal itself.
+    assert answer["detail"] == {"inks": "cmyk", "several_images": False, "uncompressed_copy": False}
+    assert client.ok("GET", "/api/project") == before
+    assert list((client.workspace.current().folder / storage.IMAGES_DIR).iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("pages", "detail"),
+    [
+        (
+            [({"extratags": [(332, 3, 1, 2, True)]}, np.uint8)],
+            {"inks": "other", "several_images": False, "uncompressed_copy": False},
+        ),
+        (
+            [({}, np.uint8), ({}, np.uint8)],
+            {"inks": "cmyk", "several_images": True, "uncompressed_copy": False},
+        ),
+        (
+            [({}, np.uint16)],
+            {"inks": "cmyk", "several_images": False, "uncompressed_copy": True},
+        ),
+    ],
+    ids=["other-inks", "stack", "16-bit"],
+)
+def test_a_refusal_of_inks_tells_their_kind_apart_in_its_detail(client, pages, detail):
+    # #207 review: one code, cmyk_image, for every file of inks; its detail
+    # says which inks, whether the file holds several images, and whether the
+    # copy to import must be an uncompressed TIFF.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    inks = np.asarray(Image.fromarray(ponceau()).convert("CMYK"))
+    buffer = io.BytesIO()
+    with tifffile.TiffWriter(buffer) as tif:
+        for options, dtype in pages:
+            tif.write(inks.astype(dtype), photometric="separated", **options)
+    status, answer = upload(client, buffer.getvalue(), name="inks µ.tif", kind="visible_marker")
+    assert (status, answer["code"], answer["detail"]) == (422, "cmyk_image", detail)
+
+
+@pytest.mark.parametrize("fmt", ["TIFF", "JPEG"])
+def test_a_cmyk_file_imported_before_207_is_offered_in_its_converted_colours(
+    client, tmp_path, fmt, monkeypatch
 ):
     # #131: its inks are converted to red, green and blue, then to gray as the
-    # RGB original's are, and the import says so; its original colours are the
+    # RGB original's are, and the import said so; its original colours are the
     # converted ones (exact for this TIFF, within JPEG's error for the JPEG).
+    # Imported before #207 refused CMYK, it is still read so.
     client.ok("POST", "/api/projects", {"name": "Blot"})
     stain = ponceau()
     original = upload(client, png_bytes(stain), name=PONCEAU, kind="visible_marker")[1]
-    buffer = io.BytesIO()
-    quality = {"quality": 95} if fmt == "JPEG" else {}
-    Image.fromarray(stain).convert("CMYK").save(buffer, format=fmt, **quality)
     suffix = ".tif" if fmt == "TIFF" else ".jpg"
-    status, answer = upload(client, buffer.getvalue(), name=f"cmyk{suffix}", kind="visible_marker")
+    with monkeypatch.context() as before_207:
+        # The import without its refusal, from the header or as read.
+        before_207.setattr(ops, "_refuse_inks", lambda name, inks: None)
+        status, answer = upload(
+            client, cmyk_bytes(fmt), name=f"cmyk{suffix}", kind="visible_marker"
+        )
     assert status == 201, answer
     image_id = answer["image_id"]
     image = next(i for i in answer["project"]["images"] if i["id"] == image_id)
@@ -5568,6 +5630,48 @@ def test_a_file_that_cannot_be_imported_is_left_out_and_said(client, tmp_path):
     assert [image["original_name"] for image in answer["project"]["images"]] == [
         "blot.tif",
         "marker α.tif",
+    ]
+    assert staging(client) == []
+
+
+def test_a_cmyk_file_handed_off_with_others_is_left_out_and_the_others_imported(client, tmp_path):
+    # #207: a CMYK file is refused as the page's import refuses it, and like any
+    # file that cannot be imported it is left out with why: the others, before
+    # and after it, are imported (also a marker meant to join its membrane, on
+    # a new one).
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    ids = [
+        staged(client, blot_bytes(tmp_path), "blot.tif")["file_id"],
+        staged(client, cmyk_bytes("JPEG"), "cmyk µ.jpg")["file_id"],
+        staged(client, blot_bytes(tmp_path), "marker α.tif")["file_id"],
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids})
+    files = listed(client, offered["handoff_id"])["files"]
+    answer = accept(client, offered["handoff_id"], files, membranes={2: 1})
+    handed = answer["handoff"]
+    assert [(f["name"], f["new_membrane"]) for f in handed["imported"]] == [
+        ("blot.tif", True),
+        ("marker α.tif", True),
+    ]
+    assert handed["refused"] == [
+        {
+            "file_id": ids[1],
+            "name": "cmyk µ.jpg",
+            "code": "cmyk_image",
+            "message": "'cmyk µ.jpg' is a CMYK file, which Proteia does not import: its gray"
+            " levels could only be estimated from its inks; save it as RGB or grayscale and"
+            " import it again",
+        }
+    ]
+    assert handed["notes"] == [
+        "marker α.tif was put on a new membrane because cmyk µ.jpg was not imported"
+    ]
+    assert [image["original_name"] for image in answer["project"]["images"]] == [
+        "blot.tif",
+        "marker α.tif",
+    ]
+    assert sorted(p.name for p in (client.workspace.current().folder / "images").iterdir()) == [
+        f"{image['id']}.tif" for image in answer["project"]["images"]
     ]
     assert staging(client) == []
 
