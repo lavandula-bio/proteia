@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -117,6 +118,7 @@ from test_background_truth import LANES as TRUTH_LANES
 from test_background_truth import _blot as truth_blot
 from test_background_truth import _fold_changes as truth_fold_changes
 from test_background_truth import _worst as truth_worst
+from test_imaging import _cmyk_profile
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -1708,12 +1710,273 @@ def _cmyk_tiff(gray: np.ndarray) -> io.BytesIO:
     return data
 
 
-def test_a_cmyk_image_is_measured_on_its_converted_gray(tmp_path):
+def _before_207(s: ProjectSession, source, name: str, *, kind: ImageKind = CHEMI, **options):
+    """Import ``source`` as Proteia did from #131 to #207, which converted a CMYK
+    file instead of refusing it: the same import without the refusal. The
+    image's id."""
+    with mock.patch.object(ops, "ink_set", return_value=None):
+        return ops.import_image(s, source, name, kind=kind, polarity=DARK, **options)
+
+
+def _tinted_rgb() -> np.ndarray:
+    """:func:`blot` in 8 bits as RGB, with a red mark away from the bands, so
+    that its channels differ."""
+    gray = (blot() >> 8).astype(np.uint8)
+    rgb = np.stack([gray, gray, gray], axis=-1)
+    rgb[:4, :4] = (200, 30, 30)
+    return rgb
+
+
+def _encoded(image, fmt: str, **options) -> io.BytesIO:
+    data = io.BytesIO()
+    image.save(data, format=fmt, **options)
+    data.seek(0)
+    return data
+
+
+def _separated(pixels: np.ndarray, **options) -> io.BytesIO:
+    data = io.BytesIO()
+    tifffile.imwrite(data, pixels, photometric="separated", **options)
+    data.seek(0)
+    return data
+
+
+def _cmyk_files() -> dict[str, io.BytesIO]:
+    """Every kind of CMYK file the import refuses (#207), by the name it is
+    imported under."""
+    from PIL import Image
+
+    cmyk = Image.fromarray(_tinted_rgb()).convert("CMYK")
+    inks = np.asarray(cmyk)
+    return {
+        "cmyk µ.jpg": _encoded(cmyk, "JPEG", quality=95),
+        "profile α.jpg": _encoded(cmyk, "JPEG", quality=95, icc_profile=_cmyk_profile()),
+        "jpeg named β.png": _encoded(cmyk, "JPEG", quality=95),
+        "cmyk β.tif": _separated(inks),
+        "black ink 16-bit.tif": _cmyk_tiff(blot()),
+        "profile.tif": _separated(inks, iccprofile=_cmyk_profile()),
+        "lzw.TIF": _encoded(cmyk, "TIFF", compression="tiff_lzw"),
+        "five inks.tiff": _separated(
+            np.dstack([inks, inks[..., :1]]), extratags=[(334, 3, 1, 5, True)]
+        ),
+        "float inks.tif": _separated(inks.astype(np.float32) / 255),
+        # A reduced-resolution thumbnail page is no second image (reading takes it).
+        "thumbnail.tif": _tiff_pages(
+            (inks, {"photometric": "separated"}),
+            (inks[::4, ::4], {"photometric": "separated", "subfiletype": 1}),
+        ),
+    }
+
+
+def _tiff_pages(*pages: tuple[np.ndarray, dict]) -> io.BytesIO:
+    """A TIFF of these pages, each written on its own with its options: by
+    tifffile, an image series each, unless it is a thumbnail."""
+    data = io.BytesIO()
+    with tifffile.TiffWriter(data) as tif:
+        for pixels, options in pages:
+            tif.write(pixels, **options)
+    data.seek(0)
+    return data
+
+
+def _cmyk_stacks() -> dict[str, tuple[str, io.BytesIO]]:
+    """CMYK files of more than one image, which reading refuses too, by the
+    name they are imported under: their ink set (``cmyk`` or ``other``) and
+    the file."""
+    from PIL import Image
+
+    cmyk = Image.fromarray(_tinted_rgb()).convert("CMYK")
+    inks = np.asarray(cmyk)
+    separated = {"photometric": "separated"}
+    return {
+        "stack µ.tif": ("cmyk", _separated(np.stack([inks, inks]))),
+        "pillow stack α.tif": (
+            "cmyk",
+            _encoded(cmyk, "TIFF", save_all=True, append_images=[cmyk.copy()]),
+        ),
+        "lzw stack.tif": (
+            "cmyk",
+            _encoded(
+                cmyk, "TIFF", save_all=True, append_images=[cmyk.copy()], compression="tiff_lzw"
+            ),
+        ),
+        "planar stack.tif": (
+            "cmyk",
+            _separated(np.moveaxis(np.stack([inks, inks]), -1, 1), planarconfig="separate"),
+        ),
+        "two sizes.tif": ("cmyk", _tiff_pages((inks, separated), (inks[:20, :30], separated))),
+        "spot stack β.tif": (
+            "other",
+            _separated(np.stack([inks, inks]), extratags=[(332, 3, 1, 2, True)]),
+        ),
+    }
+
+
+def _imports_nothing(s: ProjectSession, refused) -> OperationError:
+    """``refused`` raises an OperationError and changes nothing (the project,
+    its log and next id, the stored files, the undo history): the error."""
+    before, files, steps = s.project, _stored_files(s), s.history_steps
+    with pytest.raises(OperationError) as info:
+        refused()
+    assert s.project is before
+    assert _stored_files(s) == files  # the stored copy deleted
+    assert s.history_steps == steps
+    return info.value
+
+
+def _stored_files(s: ProjectSession) -> list[str]:
+    return sorted(path.name for path in (s.folder / storage.IMAGES_DIR).iterdir())
+
+
+@pytest.mark.parametrize("name", list(_cmyk_files()))
+def test_a_cmyk_file_is_refused_on_import_naming_it_and_what_to_do(tmp_path, name):
+    # #207: a CMYK file is no longer converted on import; the user saves it as
+    # RGB or grayscale and imports that.
+    s = session_on(tmp_path)
+    source = _cmyk_files()[name]
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
+    )
+    assert (error.code, error.ids, error.detail) == (ErrorCode.CMYK_IMAGE, (), None)
+    assert str(error) == (
+        f"{name!r} is a CMYK file, which Proteia does not import: its gray levels could"
+        " only be estimated from its inks; save it as RGB or grayscale and import it again"
+    )
+
+
+@pytest.mark.parametrize("name", list(_cmyk_stacks()))
+def test_a_cmyk_file_of_several_images_is_refused_naming_both_problems(tmp_path, name):
+    # #207 review: a stack (or images of several sizes) is refused by reading
+    # too; a refusal naming only the inks would send a user who saves the
+    # stack as RGB back for a second refusal, so it names both.
+    s = session_on(tmp_path)
+    inks, source = _cmyk_stacks()[name]
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
+    )
+    assert (error.code, error.ids, error.detail) == (ErrorCode.CMYK_IMAGE, (), None)
+    reason = {
+        "cmyk": (
+            f"{name!r} is a CMYK file, which Proteia does not import: its gray levels could"
+            " only be estimated from its inks"
+        ),
+        "other": (
+            f"{name!r} holds printing inks other than CMYK (a separated TIFF), which"
+            " Proteia does not import"
+        ),
+    }[inks]
+    assert str(error) == (
+        f"{reason}; it also holds more than one image (a stack or a multi-channel"
+        " composite), and only a single image can be quantified; save one of its images"
+        " as RGB or grayscale and import it again"
+    )
+
+
+@pytest.mark.parametrize("mode", ["RGB", "L"])
+def test_one_image_of_a_cmyk_stack_saved_as_rgb_or_grayscale_is_imported(tmp_path, mode):
+    # The stack refusal's next step, done: one of its images saved as RGB or
+    # grayscale imports and measures; the whole stack saved so would not (it
+    # is refused as a stack, which is why the refusal says one image).
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    _, stack = _cmyk_stacks()["pillow stack α.tif"]
+    with Image.open(stack) as cmyk:
+        pages = []
+        for index in range(2):
+            cmyk.seek(index)
+            pages.append(cmyk.convert(mode))
+    whole = _encoded(pages[0], "TIFF", save_all=True, append_images=pages[1:])
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, whole, "stack saved.tif", kind=CHEMI, polarity=DARK)
+    )
+    assert error.code is ErrorCode.UNREADABLE_IMAGE
+    assert "stacks and multi-channel composites are not supported" in str(error)
+    image_id = ops.import_image(
+        s, _encoded(pages[1], "TIFF"), "stack page 2 µ.tif", kind=CHEMI, polarity=DARK
+    )
+    image = s.project.batch.find_image(image_id)
+    assert image.bit_depth == 8
+    assert [w.code for w in image.import_warnings] == (
+        ["color_channels_differ"] if mode == "RGB" else []
+    )
+    protein = ops.add_protein(s, "β-actin", Role.TARGET, image_id)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert_nets_current(s)
+
+
+def test_a_separated_tiff_of_other_inks_is_refused_on_import(tmp_path):
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    inks = np.asarray(Image.fromarray(_tinted_rgb()).convert("CMYK"))
+    source = _separated(inks, extratags=[(332, 3, 1, 2, True)])  # InkSet: not CMYK
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, "spot inks µ.tif", kind=CHEMI, polarity=DARK)
+    )
+    assert error.code is ErrorCode.CMYK_IMAGE
+    assert str(error) == (
+        "'spot inks µ.tif' holds printing inks other than CMYK (a separated TIFF), which"
+        " Proteia does not import; save it as RGB or grayscale and import it again"
+    )
+
+
+def test_a_cmyk_marker_image_is_refused_too(tmp_path):
+    s = session_on(tmp_path)
+    blot_id = import_blot(s, blot())
+    membrane = s.project.batch.membrane_of(blot_id).id
+    source = _cmyk_files()["cmyk µ.jpg"]
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s,
+            source,
+            "marker.jpg",
+            kind=ImageKind.VISIBLE_MARKER,
+            polarity=DARK,
+            membrane_id=membrane,
+        ),
+    )
+    assert error.code is ErrorCode.CMYK_IMAGE
+    assert str(error).startswith("'marker.jpg' is a CMYK file, which Proteia does not import:")
+
+
+@pytest.mark.parametrize(
+    ("mode", "fmt", "warnings"),
+    [
+        ("RGB", "PNG", ["color_channels_differ"]),
+        ("RGB", "TIFF", ["color_channels_differ"]),
+        ("L", "PNG", []),
+        ("L", "TIFF", []),
+    ],
+)
+def test_a_cmyk_file_saved_as_rgb_or_grayscale_is_imported(tmp_path, mode, fmt, warnings):
+    # The refusal's next step, done: the CMYK JPEG and the separated TIFF, saved
+    # as RGB or grayscale by an image editor (Pillow here), import and measure.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    suffix = ".png" if fmt == "PNG" else ".tif"
+    for name in ("cmyk µ.jpg", "cmyk β.tif"):
+        with Image.open(_cmyk_files()[name]) as cmyk:
+            saved = _encoded(cmyk.convert(mode), fmt)
+        image_id = ops.import_image(s, saved, f"{name} saved{suffix}", kind=CHEMI, polarity=DARK)
+        image = s.project.batch.find_image(image_id)
+        assert ([w.code for w in image.import_warnings], image.bit_depth) == (warnings, 8)
+        protein = ops.add_protein(s, f"{name} β", Role.TARGET, image_id)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert_nets_current(s)
+
+
+def test_a_cmyk_image_imported_before_207_is_measured_on_its_converted_gray(tmp_path):
     # #131: the gray of a CMYK file is that of its inks converted to RGB, so
-    # its nets are those of the same blot stored as gray.
+    # its nets are those of the same blot stored as gray. Imported before #207,
+    # it keeps being read so.
     s = session_on(tmp_path)
     gray = blot()
-    cmyk = ops.import_image(s, _cmyk_tiff(gray), "cmyk µ.tif", kind=CHEMI, polarity=DARK)
+    cmyk = _before_207(s, _cmyk_tiff(gray), "cmyk µ.tif")
     plain = import_blot(s, gray)
     image = s.project.batch.find_image(cmyk)
     assert [w.code for w in image.import_warnings] == ["cmyk_converted"]
@@ -1722,13 +1985,89 @@ def test_a_cmyk_image_is_measured_on_its_converted_gray(tmp_path):
     assert s.file_colours(image) == "rgb"  # converted: its channels are red, green and blue
 
 
+# The nets origin/main (327f878) measured on the images of
+# _project_before_207, by protein: lanes 1 and 2.
+NETS_BEFORE_207 = {
+    "cmyk 8 µ": [3135.8953488372103, 6089.729591836733],
+    "cmyk 16 α": [798893.2142857142, 1555767.3913043481],
+}
+CONVERTED_BY_FORMULA = (
+    "The file's colours are CMYK: they were converted to red, green and blue with the"
+    " standard formula, as it embeds no ICC colour profile, then to gray. Values from a"
+    " converted file are approximate, so over-exposure cannot be checked."
+)
+
+
+def _project_before_207(s: ProjectSession, imports) -> None:
+    """The project of a CMYK JPEG and two separated TIFFs (8 and 16 bits)
+    imported with ``imports`` (a function as :func:`_before_207`), a protein on
+    each with a box in lanes 1 and 2; saved."""
+    from PIL import Image
+
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    cmyk = Image.fromarray(_tinted_rgb()).convert("CMYK")
+    sources = {
+        "cmyk 8 µ": ("cmyk 8 µ.tif", _separated(np.asarray(cmyk))),
+        "cmyk 16 α": ("cmyk 16 α.tif", _cmyk_tiff(blot())),
+        "cmyk jpeg β": ("cmyk β.jpg", _encoded(cmyk, "JPEG", quality=95)),
+    }
+    for protein_name, (name, source) in sources.items():
+        image_id = imports(s, source, name)
+        protein = ops.add_protein(s, protein_name, Role.TARGET, image_id)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    s.save()
+
+
+def _nets(s: ProjectSession) -> dict[str, list[float | None]]:
+    return {p.name: [b.net for b in p.bands] for p in s.project.batch.proteins}
+
+
+def test_a_project_with_cmyk_images_imported_before_207_opens_with_its_nets(tmp_path):
+    # #207 refuses CMYK on import only: images imported converted before keep
+    # opening, reading and measuring as they did, with their warnings, and
+    # opening and measuring rewrites nothing.
+    s = session_on(tmp_path)
+    _project_before_207(s, _before_207)
+    folder = s.folder
+    saved = (folder / "project.json").read_bytes()
+    measured = _nets(s)
+    reopened = ops.open_project(folder, autosave=save_to_folder, clock=FakeClock())
+    assert not reopened.dirty
+    nets = _nets(reopened)
+    assert nets == measured
+    for protein, expected in NETS_BEFORE_207.items():
+        assert nets[protein] == pytest.approx(expected, rel=1e-12)
+    images = {i.original_name: i for i in reopened.project.batch.iter_images()}
+    assert {name: [w.code for w in i.import_warnings] for name, i in images.items()} == {
+        "cmyk 8 µ.tif": ["cmyk_converted", "color_channels_differ"],
+        "cmyk 16 α.tif": ["cmyk_converted"],
+        "cmyk β.jpg": ["lossy_format", "cmyk_converted", "color_channels_differ"],
+    }
+    assert images["cmyk 16 α.tif"].import_warnings[0].message == CONVERTED_BY_FORMULA
+    assert all(reopened.outdated_reading(i) is None for i in images.values())
+    assert_nets_current(reopened)  # measured again from the stored files: the same nets
+    notices = [
+        n for n in ops.compute(reopened).notices if n.code is NoticeCode.CLIPPING_NOT_CHECKED
+    ]
+    assert len(notices) == 3
+    assert all("CMYK converted to RGB" in n.message for n in notices)
+    assert reopened.colour_pixels(images["cmyk 8 µ.tif"].id).shape == (H, W, 3)
+    assert (folder / "project.json").read_bytes() == saved
+    # A box placed now measures on the same reading.
+    protein = next(p.id for p in reopened.project.batch.proteins if p.name == "cmyk 16 α")
+    ops.remove_box(reopened, reopened.project.batch.find_protein(protein).bands[1].id)
+    ops.place_box(reopened, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    assert _nets(reopened)["cmyk 16 α"] == pytest.approx(NETS_BEFORE_207["cmyk 16 α"], rel=1e-12)
+
+
 def test_a_cmyk_image_imported_before_conversion_is_refused_until_imported_again(tmp_path):
     # An image imported before #131 read its CMYK file as C, M and Y taken for
     # R, G and B: its record has no cmyk_converted warning, and its background
     # and nets came from that reading. Measured now on the converted gray, its
     # boxes would mix the two readings, so its pixels are refused.
     s = session_on(tmp_path)
-    image_id = ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK)
+    image_id = _before_207(s, _cmyk_tiff(blot()), "old cmyk.tif")
     ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
 
@@ -1746,19 +2085,32 @@ def test_a_cmyk_image_imported_before_conversion_is_refused_until_imported_again
         assert str(info.value) == (
             "'old cmyk.tif' is a CMYK file imported before Proteia converted CMYK colours:"
             " its stored background and nets were measured with its cyan, magenta and yellow"
-            " read as red, green and blue; remove the image and import the file again to"
-            " measure it converted"
+            " read as red, green and blue; remove the image, save the file as RGB or"
+            " grayscale and import it again"
         )
     assert s.project is before
     assert s._pixels == {}
     assert s.colour_pixels(image_id).shape == (H, W, 3)  # display only: its converted colours
+    # What it says to do, done: the file itself is refused since #207, but saved
+    # as grayscale it is imported and measured.
+    ops.remove_image(s, image_id)
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK),
+    )
+    assert error.code is ErrorCode.CMYK_IMAGE
+    again = import_blot(s, blot(), "old cmyk.tif")
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, again)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert s.outdated_reading(s.project.batch.find_image(again)) is None
+    assert_nets_current(s)
 
 
 OLD_CMYK = (
     "'old cmyk.tif' is a CMYK file imported before Proteia converted CMYK colours:"
     " its stored background and nets were measured with its cyan, magenta and yellow"
-    " read as red, green and blue; remove the image and import the file again to"
-    " measure it converted"
+    " read as red, green and blue; remove the image, save the file as RGB or grayscale"
+    " and import it again"
 )
 OLD_LAB = (
     "'lab blot µ.tif': its pixels are stored in the CIELAB colour space, which Proteia"
@@ -1771,7 +2123,7 @@ OLD_LAB = (
 def _imported_before_cmyk(s: ProjectSession) -> tuple[str, str]:
     """An image imported before #131 converted CMYK, with a box in lane 1: its
     record has no cmyk_converted warning. Its image and protein ids."""
-    image_id = ops.import_image(s, _cmyk_tiff(blot()), "old cmyk.tif", kind=CHEMI, polarity=DARK)
+    image_id = _before_207(s, _cmyk_tiff(blot()), "old cmyk.tif")
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image_id)
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
 
@@ -3370,8 +3722,11 @@ def test_colour_and_converted_images_are_flagged_on_their_gray_mean(tmp_path, pi
         rgb[:4, :4] = (65535, 0, 0)  # a red marking, away from the bands
         image = import_blot(s, rgb, "blot 16-bit colour.tif")
         expected = (16, ["color_channels_differ"])
-    else:
-        image = import_encoded(s, "blot CMYK.tif", Image.fromarray(gray).convert("CMYK"))
+    else:  # imported before #207 refused CMYK
+        cmyk = io.BytesIO()
+        Image.fromarray(gray).convert("CMYK").save(cmyk, format="TIFF")
+        cmyk.seek(0)
+        image = _before_207(s, cmyk, "blot CMYK.tif")
         expected = (8, ["cmyk_converted"])
     stored = s.project.batch.find_image(image)
     assert (stored.bit_depth, [w.code for w in stored.import_warnings]) == expected

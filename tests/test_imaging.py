@@ -945,6 +945,163 @@ def test_a_jpeg_compressed_cmyk_tiff_is_lossy_and_converted(tmp_path):
     assert np.abs(loaded.array - rgb.mean(axis=-1)).max() <= 3
 
 
+def _separated(pixels: np.ndarray, **options):
+    return lambda path: tifffile.imwrite(path, pixels, photometric="separated", **options)
+
+
+def _cmyk_jpeg(path: Path) -> None:
+    """A CMYK JPEG, whatever the suffix of ``path``."""
+    Image.fromarray(_blot_rgb()).convert("CMYK").save(path, format="JPEG", quality=95)
+
+
+_INKS = {"photometric": "separated"}
+
+
+def _pages(*pages: tuple[np.ndarray, dict]):
+    """A writer of a TIFF of these pages, each written on its own with its
+    options: by tifffile, an image series each, unless it is a thumbnail."""
+
+    def write(path: Path) -> None:
+        with tifffile.TiffWriter(path) as tif:
+            for pixels, options in pages:
+                tif.write(pixels, **options)
+
+    return write
+
+
+def _pillow_cmyk_stack(path: Path) -> None:
+    """Two CMYK pages, as Pillow saves a multi-page TIFF."""
+    page = Image.fromarray(_blot_rgb()).convert("CMYK")
+    page.save(path, save_all=True, append_images=[page.copy()])
+
+
+@pytest.mark.parametrize(
+    ("name", "write", "inks"),
+    [
+        ("gray.tif", lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535)), None),
+        ("rgb.tif", lambda path: tifffile.imwrite(path, _rgb8(), photometric="rgb"), None),
+        (
+            "palette.tif",
+            lambda path: tifffile.imwrite(
+                path, _gray(np.uint8, 255), photometric="palette", colormap=_palette_map()
+            ),
+            None,
+        ),
+        ("lab α.tif", lambda path: tifffile.imwrite(path, _rgb8(), photometric="cielab"), None),
+        ("rgb.jpg", lambda path: Image.fromarray(_rgb8()).save(path, quality=95), None),
+        ("gray.jpg", lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path), None),
+        ("rgb.png", lambda path: Image.fromarray(_rgb8()).save(path), None),
+        ("palette.png", lambda path: _palette_png().save(path), None),
+        ("gray stack.tif", _pages((_gray(np.uint8, 255), {}), (_gray(np.uint8, 255), {})), None),
+        ("cmyk µ.tif", lambda path: _write_cmyk(path, _blot_rgb(), "pillow"), ("cmyk", True)),
+        (
+            "lzw.tif",
+            lambda path: _write_cmyk(path, _blot_rgb(), "pillow", compression="tiff_lzw"),
+            ("cmyk", True),
+        ),
+        ("planar.tif", lambda path: _write_cmyk(path, _blot_rgb(), "planar"), ("cmyk", True)),
+        ("16-bit.tif", _separated(_inks(_blot_rgb().astype(np.uint16) * 257)), ("cmyk", True)),
+        (
+            "tagged cmyk.tif",
+            _separated(_inks(_rgb8()), extratags=[(332, 3, 1, 1, True)]),
+            ("cmyk", True),
+        ),
+        (
+            "five inks.tif",
+            _separated(
+                np.dstack([_inks(_rgb8()), _gray(np.uint8, 255)]),
+                extratags=[(334, 3, 1, 5, True)],
+            ),
+            ("cmyk", True),
+        ),
+        ("float inks.tif", _separated(_inks(_rgb8()).astype(np.float32) / 255), ("cmyk", True)),
+        (
+            "not cmyk.tif",
+            _separated(_inks(_rgb8()), extratags=[(332, 3, 1, 2, True)]),
+            ("other", True),
+        ),
+        (
+            "ink set 3.tif",
+            _separated(_inks(_rgb8()), extratags=[(332, 3, 1, 3, True)]),
+            ("other", True),
+        ),
+        ("cmyk β.jpg", _cmyk_jpeg, ("cmyk", True)),
+        ("cmyk jpeg.png", _cmyk_jpeg, ("cmyk", True)),  # what the file holds, not its suffix
+        (
+            "jpeg cmyk.tif",
+            lambda path: _write_cmyk(path, _blot_rgb(), "pillow", compression="jpeg"),
+            ("cmyk", True),
+        ),
+        # Several images, which reading refuses too (#207 review): a stack as
+        # tifffile and Pillow write one, and two images of different sizes.
+        ("stack µ.tif", _separated(np.stack([_inks(_rgb8())] * 2)), ("cmyk", False)),
+        ("pillow stack.tif", _pillow_cmyk_stack, ("cmyk", False)),
+        (
+            "two sizes.tif",
+            _pages((_inks(_rgb8()), _INKS), (_inks(_rgb8())[:3, :4], _INKS)),
+            ("cmyk", False),
+        ),
+        (
+            "spot stack.tif",
+            _separated(np.stack([_inks(_rgb8())] * 2), extratags=[(332, 3, 1, 2, True)]),
+            ("other", False),
+        ),
+        # A reduced-resolution thumbnail page is no second image: reading takes it.
+        (
+            "thumbnail.tif",
+            _pages((_inks(_rgb8()), _INKS), (_inks(_rgb8())[::2, ::2], _INKS | {"subfiletype": 1})),
+            ("cmyk", True),
+        ),
+    ],
+)
+def test_the_header_tells_whether_a_file_holds_printing_inks(tmp_path, name, write, inks):
+    # #207: an import refuses a file of printing inks; whether one is, from its
+    # header alone: CMYK whatever the number or type of its inks, else the ink
+    # set its separated TIFF names; and whether it holds the single image
+    # reading takes, so that the refusal can name both problems.
+    path = tmp_path / name
+    write(path)
+    assert imaging.ink_set(path) == inks
+
+
+def test_reading_takes_a_file_of_inks_as_one_image_as_its_ink_set_says(tmp_path):
+    # The ink set's single_image is reading's own rule (one source): a file it
+    # says holds several images is refused as a stack, and the thumbnail file
+    # it says is one image is read.
+    stack = tmp_path / "stack.tif"
+    _separated(np.stack([_inks(_rgb8())] * 2))(stack)
+    two_sizes = tmp_path / "two sizes.tif"
+    _pages((_inks(_rgb8()), _INKS), (_inks(_rgb8())[:3, :4], _INKS))(two_sizes)
+    for path in (stack, two_sizes):
+        with pytest.raises(ValueError, match="stacks and multi-channel composites"):
+            load_image(path)
+    thumbnail = tmp_path / "thumbnail.tif"
+    _pages((_inks(_rgb8()), _INKS), (_inks(_rgb8())[::2, ::2], _INKS | {"subfiletype": 1}))(
+        thumbnail
+    )
+    assert load_image(thumbnail).pixels.tolist() == _rgb8().tolist()
+
+
+@pytest.mark.parametrize("name", ["damaged.tif", "damaged.png", "damaged.jpg"])
+def test_the_ink_set_of_a_file_it_cannot_read_is_a_value_or_os_error(tmp_path, name):
+    path = tmp_path / name
+    with pytest.raises(FileNotFoundError):  # as the system says it, not rewrapped
+        imaging.ink_set(path)
+    path.write_bytes(b"not an image" * 10)
+    with pytest.raises((ValueError, OSError)):
+        imaging.ink_set(path)
+
+
+def test_the_ink_set_of_a_tiff_with_no_image_is_a_value_error(tmp_path, monkeypatch):
+    path = tmp_path / "empty.tif"
+    tifffile.imwrite(path, _gray(np.uint8, 255))
+    monkeypatch.setattr(tifffile.TiffFile, "series", property(lambda self: []))
+    with pytest.raises(ValueError, match=r"^empty\.tif: not a readable image"):
+        imaging.ink_set(path)
+    with pytest.raises(ValueError, match=r"^empty\.tif: holds 0 image series with axes '';"):
+        load_image(path)  # no single image either
+
+
 # --- Processed figures (#127) ---
 
 
