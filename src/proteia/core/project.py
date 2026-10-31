@@ -232,18 +232,18 @@ def _anchored(
 ) -> list[tuple[str, float, int]]:
     """``(band id, centre x, stored lane)`` of each anchor (:func:`lane_anchors`)."""
     anchors = []
-    for protein in batch.proteins:
-        if protein.image_id == image.id:
-            for band in protein.bands:
-                x0, _, x1, _ = band.box.rect(protein.box_size)
-                if (
-                    band.band_index == 0
-                    and x0 > 0
-                    and x1 < image.width
-                    and band.id not in without
-                    and (only is None or band.id in only)
-                ):
-                    anchors.append((band.id, (x0 + x1) / 2, band.lane_index))
+    for protein in batch.proteins_on(image.id):
+        boxes = batch.boxes_of(protein)
+        for band in boxes.bands:
+            x0, _, x1, _ = band.box.rect(boxes.box_size)
+            if (
+                band.band_index == 0
+                and x0 > 0
+                and x1 < image.width
+                and band.id not in without
+                and (only is None or band.id in only)
+            ):
+                anchors.append((band.id, (x0 + x1) / 2, band.lane_index))
     return anchors
 
 
