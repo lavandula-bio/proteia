@@ -70,6 +70,14 @@ so a ``boxes_overlap`` warning names, for each protein whose counted box
 overlaps another protein's, the other proteins, the lanes and the share of the
 smaller box's area (#208); it is read from the stored boxes, never stored.
 
+A file may be imported more than once, under any name and into any membrane
+(#216). Each group of images with the same ``sha256`` (the same file bytes)
+gets one ``duplicate_images`` note, which names them and gives a next step
+that removes nothing; a marker image holding no protein is left out. It is
+read from the stored images, never stored, once per computation: removing a
+copy, undo and redo update it, and a project saved before shows it when
+opened. The same pixels saved another way are other bytes, and are not found.
+
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
 MWs in them are whole kDa (one decimal below 10 kDa).
@@ -79,6 +87,7 @@ from __future__ import annotations
 
 import math
 import statistics as stats
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from enum import StrEnum
 from functools import partial
@@ -196,6 +205,10 @@ class NoticeCode(StrEnum):
     LADDERS_DISAGREE = "ladders_disagree"
     # Per register group: a ladder side marked but not used, and why.
     LADDER_SIDE_IGNORED = "ladder_side_ignored"
+    # #216. Per group of images whose files have the same bytes (one sha256),
+    # on any membranes, but for markers holding no protein: a note, read from
+    # the stored images and never stored.
+    DUPLICATE_IMAGES = "duplicate_images"
 
 
 class Level(StrEnum):
@@ -213,8 +226,16 @@ _INFO_CODES = frozenset(
         NoticeCode.MW_NOT_CHECKED,
         NoticeCode.CALIBRATION_TWO_POINTS,
         NoticeCode.LADDER_SIDE_IGNORED,
+        NoticeCode.DUPLICATE_IMAGES,
     }
 )
+
+
+def _level(code: NoticeCode) -> Level:
+    """A notice's level: a note for the codes of :data:`_INFO_CODES`, else a warning."""
+    return Level.INFO if code in _INFO_CODES else Level.WARNING
+
+
 # Notices about one set's charts: the tests of the two sets are their own (an
 # exclusion can leave a condition out of one and not the other), so each set
 # keeps these even when the other has the same.
@@ -242,6 +263,9 @@ SERIES_NOTICE_CODES = frozenset(
 )
 # The background modes of a ring cut short (quantify.band_backgrounds).
 _FALLBACK_MODES = frozenset({"asymmetric", "image"})
+# A duplicate_images note names each image of a group of up to this many; that
+# of a bigger group names its first image and counts the others (#216).
+NAMED_COPIES: Final = 3
 # What makes imaging.clipping_depth distrust an image, besides an unknown bit
 # depth: its import warnings, as the clipping_not_checked and possibly_clipped
 # notices name them. The keys are imaging.UNTRUSTED_WARNINGS, kept in step by a
@@ -497,6 +521,62 @@ def share_words(shared: int, smaller: int) -> str:
     if 100 * shared < smaller:
         return "under 1%"
     return f"{(200 * shared + smaller) // (2 * smaller)}%"
+
+
+def _duplicate_notices(batch: model.Batch) -> list[Notice]:
+    """The ``duplicate_images`` notes (#216): one per group of two or more
+    images with the same ``sha256`` (one file's bytes, under any names and on
+    any membranes), by the place of each group's first image in the image
+    list (:meth:`~proteia.core.model.Batch.iter_images`, the order the page
+    lists images in). Left out of the groups: a visible-light marker image,
+    on which the model takes no protein (kept in step by a test), and an
+    image another image takes as its marker (a merged image) that holds no
+    protein. A note states the fact and a next step that removes nothing.
+
+    It names the images in list order: each one, up to :data:`NAMED_COPIES`;
+    past it, the first and how many more. An image is its file name, quoted as
+    the notices quote names (as Python writes a string), and where another
+    image of the project (of any kind: the list shows them all) has the same
+    name, as written, its place in the list, from 1: ``'blot.tif' (image
+    3)``. So no two images a note names read alike. It compares bytes, not
+    pixels: the same pixels saved another way are not found."""
+    markers = {image.marker_image_id for image in batch.iter_images()}
+    held = {protein.image_id for protein in batch.proteins}
+    place: dict[str, int] = {}
+    names: Counter[str] = Counter()
+    groups: dict[str, list[model.ImageRef]] = {}
+    for number, image in enumerate(batch.iter_images(), start=1):
+        place[image.id] = number
+        names[image.original_name] += 1
+        if image.kind is model.ImageKind.VISIBLE_MARKER:
+            continue  # no protein may be on it
+        if image.id in markers and image.id not in held:
+            continue  # another image's marker, holding no protein
+        groups.setdefault(image.sha256, []).append(image)
+
+    def named(image: model.ImageRef) -> str:
+        shared = names[image.original_name] > 1
+        return repr(image.original_name) + (f" (image {place[image.id]})" if shared else "")
+
+    notices = []
+    for images in groups.values():
+        if len(images) < 2:
+            continue
+        if len(images) <= NAMED_COPIES:
+            who = in_words([named(image) for image in images])
+        else:
+            who = f"{named(images[0])} and {len(images) - 1} more copies"
+        notices.append(
+            Notice(
+                code=NoticeCode.DUPLICATE_IMAGES,
+                level=_level(NoticeCode.DUPLICATE_IMAGES),
+                message=f"{who} are the same file (identical bytes). If one should be a"
+                " different image, import that image's file; a copy imported on purpose"
+                " needs no change",
+                image_ids=tuple(image.id for image in images),
+            )
+        )
+    return notices
 
 
 def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..., None]) -> None:
@@ -1384,7 +1464,9 @@ def compute_results(
     value (a ladder, an empty lane) change nothing, so they add no second set.
     Notices the two sets share are kept only in the first, but for those about
     a set's charts (:data:`TEST_NOTICE_CODES`), which each set keeps: the two
-    sets test on their own. Two sets are labelled
+    sets test on their own. The notes of images of one file are about the
+    images, not the lanes (:func:`_duplicate_notices`, #216): computed once and
+    given to the returned set only, first. Two sets are labelled
     (see :class:`Results`); one set has no label. A chart with a plotted group
     too small for a test (n < 2) is still drawn. When at least two other groups
     can be tested, the chart shows their test, with brackets only among them and
@@ -1420,8 +1502,10 @@ def compute_results(
         for lane in batch.lanes
         if not lane.included and any(nets[lane.index] is not None for nets in per_protein)
     ]
+    copies = _duplicate_notices(batch)  # #216: of the images, so of the returned set only
     if not removed:
-        return one_set(batch, set_label=None)
+        results = one_set(batch, set_label=None)
+        return results.model_copy(update={"notices": [*copies, *results.notices]})
     results = one_set(batch, set_label=f"Excluding {lanes_phrase(removed)}")
     every_lane = batch.model_copy(
         update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
@@ -1432,7 +1516,12 @@ def compute_results(
         for notice in all_lanes.notices
         if notice.code in TEST_NOTICE_CODES or notice not in results.notices
     ]
-    return results.model_copy(update={"all_lanes": all_lanes.model_copy(update={"notices": own})})
+    return results.model_copy(
+        update={
+            "notices": [*copies, *results.notices],
+            "all_lanes": all_lanes.model_copy(update={"notices": own}),
+        }
+    )
 
 
 def _compute(
@@ -1469,8 +1558,7 @@ def _compute(
     notices: list[Notice] = []
 
     def note(code: NoticeCode, message: str, **objects: tuple) -> None:
-        level = Level.INFO if code in _INFO_CODES else Level.WARNING
-        notices.append(Notice(code=code, level=level, message=message, **objects))
+        notices.append(Notice(code=code, level=_level(code), message=message, **objects))
 
     # 1. The lane rows and the raw table, and what the model lacks.
     lanes = [
