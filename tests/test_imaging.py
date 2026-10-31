@@ -867,17 +867,26 @@ def test_a_compressed_rgba_tiff_saved_by_an_image_editor_is_read(tmp_path):
         assert (loaded.bit_depth, loaded.warnings) == (8, [])
 
 
-def test_a_jpeg_compressed_rgba_tiff_is_read_as_lossy(tmp_path):
+@pytest.mark.parametrize("alpha", ["opaque", "translucent"])
+def test_a_jpeg_compressed_rgba_tiff_is_read_as_lossy(tmp_path, alpha):
     # Any compression Pillow decodes for tifffile takes the same rule (#232):
-    # unassociated alpha after the colours is kept; JPEG is lossy, so the
-    # colours come back near the written ones, and the import says so.
-    level = np.linspace(40, 200, 32 * 48).reshape(32, 48).astype(np.uint8)
-    pixels = np.dstack([level, level, level, np.full_like(level, 255)])
-    path = tmp_path / "jpeg rgba α.tif"
+    # unassociated alpha after the colours is kept as stored; JPEG is lossy,
+    # so the colours come back near those of the uncompressed copy, and the
+    # import says so. A translucent alpha (20 to 235 down the image) would
+    # move them far off if they were premultiplied or un-premultiplied.
+    y, x = np.mgrid[0:32, 0:48]
+    level = (40 + 160 * x / 47).astype(np.uint8)
+    opacity = (
+        np.full_like(level, 255) if alpha == "opaque" else (20 + 215 * y / 31).astype(np.uint8)
+    )
+    pixels = np.dstack([level, 255 - level, level // 2, opacity])
+    path = tmp_path / f"jpeg rgba {alpha} α.tif"
     Image.fromarray(pixels, "RGBA").save(path, compression="tiff_jpeg")
-    read = imaging.read_file(path)
+    plain = tmp_path / f"copy {alpha} β.tif"
+    tifffile.imwrite(plain, pixels, photometric="rgb", extrasamples=[2])
+    read, copy = imaging.read_file(path), imaging.read_file(plain)
     assert (read.pixels.shape, read.pixels.dtype, read.lossy) == ((32, 48, 4), np.uint8, True)
-    assert np.abs(read.pixels.astype(int) - pixels).max() <= 8
+    assert np.abs(read.pixels.astype(int) - copy.pixels).max() <= 8
     assert "lossy_format" in _codes(imaging.load_pixels(read))
 
 
@@ -968,6 +977,11 @@ def test_a_compressed_tiff_whose_extra_sample_pillow_changes_is_refused_unread(
             _RGB | _UNASSOCIATED,
             "6x8x4 uint16 RGB",
         ),
+        (
+            np.dstack([_rgb8(), _TRANSLUCENT]).astype(np.uint16) * 257,
+            _RGB | _UNASSOCIATED | {"planar": True, "byteorder": ">"},
+            "6x8x4 uint16 RGB",
+        ),
         # And it cannot read 16-bit gray with alpha.
         (
             _gray_alpha(_TRANSLUCENT).astype(np.uint16) * 257,
@@ -975,14 +989,61 @@ def test_a_compressed_tiff_whose_extra_sample_pillow_changes_is_refused_unread(
             "6x8x2 uint16 MINISBLACK",
         ),
     ],
-    ids=["rgb16-alpha", "gray16-alpha"],
+    ids=["rgb16-alpha", "rgb16-alpha-planar-big-endian", "gray16-alpha"],
 )
-def test_a_compressed_16_bit_tiff_with_alpha_stays_refused(tmp_path, pixels, layout, declared):
+def test_a_compressed_16_bit_tiff_with_alpha_stays_refused_unread(
+    tmp_path, monkeypatch, pixels, layout, declared
+):
+    # Refused from its header, with the message it had before, and never
+    # decoded: a large one must not reach Pillow's size limit first.
     _, lzw = _plain_and_lzw(tmp_path, pixels, **layout)
+    opened = []
+    monkeypatch.setattr(Image, "open", lambda *args, **kwargs: opened.append(args))
     with pytest.raises(ValueError) as info:
         imaging.read_file(lzw)
     shape, dtype, photometric = declared.split()
     assert str(info.value) == _refusal("lzw α µ.tif", shape, dtype, photometric)
+    assert opened == []
+
+
+def test_a_large_compressed_16_bit_rgba_tiff_is_refused_for_its_layout(tmp_path, monkeypatch):
+    # Refused for what it holds, not for Pillow's size limit, which it never reaches.
+    pixels = np.dstack([_rgb8(), _TRANSLUCENT]).astype(np.uint16) * 257
+    _, lzw = _plain_and_lzw(tmp_path, pixels, **(_RGB | _UNASSOCIATED))
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)  # 48 pixels is over twice the limit
+    with pytest.raises(ValueError) as info:
+        imaging.read_file(lzw)
+    assert str(info.value) == _refusal("lzw α µ.tif", "6x8x4", "uint16", "RGB")
+
+
+def test_planar_rgba_is_read_compressed_only_with_lzw(tmp_path, monkeypatch):
+    # Planar RGB with alpha is read compressed only as measured: with LZW,
+    # whose result equals the uncompressed copy (test above). The same strips
+    # labelled with another compression Pillow decodes (JPEG here) are refused
+    # from the header, unread.
+    pixels = np.dstack([_rgb8(), _TRANSLUCENT])
+    path = write_lzw_tiff(
+        tmp_path / "planar jpeg µ.tif",
+        pixels,
+        planar=True,
+        compression=tifffile.COMPRESSION.JPEG,
+        **(_RGB | _UNASSOCIATED),
+    )
+    with tifffile.TiffFile(path) as tif:
+        page = tif.pages.first
+        assert (page.compression, page.planarconfig) == (
+            tifffile.COMPRESSION.JPEG,
+            tifffile.PLANARCONFIG.SEPARATE,
+        )
+    opened = []
+    monkeypatch.setattr(Image, "open", lambda *args, **kwargs: opened.append(args))
+    with pytest.raises(ValueError) as info:
+        imaging.read_file(path)
+    assert str(info.value) == (
+        "planar jpeg µ.tif: JPEG compression of this 6x8x4 uint8 RGB image cannot be"
+        " decoded by this installation; save the image as an uncompressed TIFF"
+    )
+    assert opened == []
 
 
 def test_the_lzw_writer_of_the_tests_is_decoded_as_written(tmp_path):

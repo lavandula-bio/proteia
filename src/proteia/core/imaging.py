@@ -472,14 +472,18 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
 
     Only the layouts Pillow reads with the same values as tifffile are accepted:
     8- or 16-bit black-is-zero gray, 8-bit RGB, and 8-bit CMYK without extra
-    samples (its inks, converted afterwards as tifffile's are). The gray or RGB
-    may be followed by one sample of unassociated alpha (#232), which Pillow
-    reads as stored, as tifffile does; the alpha is kept, channels last, and
-    ignored as it is in an uncompressed file. Pillow inverts white-is-zero gray,
-    un-premultiplies associated alpha, drops or cannot read an unspecified extra
-    sample, loses the alpha of planar gray, and narrows 16-bit color, so those,
-    and any result whose shape or pixel type differs from the declaration, are
-    refused rather than read with changed values.
+    samples (its inks, converted afterwards as tifffile's are); and, since
+    #232, 8-bit black-is-zero gray or 8-bit RGB followed by one sample of
+    unassociated alpha, which Pillow reads as stored, as tifffile does: gray
+    with its samples together, RGB with its samples together or, with LZW
+    (the compression measured so), each apart. The alpha is kept, channels
+    last, and ignored as it is in an uncompressed file. Pillow inverts
+    white-is-zero gray, un-premultiplies associated alpha, drops or cannot read
+    an unspecified extra sample, loses the alpha of planar gray, narrows 16-bit
+    color and cannot read 16-bit gray with alpha, so those, and any result
+    whose shape or pixel type differs from the declaration, are refused rather
+    than read with changed values; any other layout with an extra sample is
+    refused from its header, before it is decoded.
     """
     from PIL import Image
 
@@ -489,12 +493,20 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
         f" {declared.photometric.name} image cannot be decoded by this installation;"
         " save the image as an uncompressed TIFF"
     )
-    alpha = declared.extrasamples == (tifffile.EXTRASAMPLE.UNASSALPHA,)
+    # One unassociated alpha sample after 8-bit colours.
+    alpha = (
+        declared.extrasamples == (tifffile.EXTRASAMPLE.UNASSALPHA,) and declared.dtype == np.uint8
+    )
     gray = declared.photometric is tifffile.PHOTOMETRIC.MINISBLACK and (
         declared.samples == 1 or (declared.samples == 2 and alpha and not declared.planar)
     )
     color = declared.photometric is tifffile.PHOTOMETRIC.RGB and (
-        declared.samples == 3 or (declared.samples == 4 and alpha)
+        declared.samples == 3
+        or (
+            declared.samples == 4
+            and alpha
+            and (not declared.planar or declared.codec == tifffile.COMPRESSION.LZW.name)
+        )
     )
     cmyk = declared.photometric is tifffile.PHOTOMETRIC.SEPARATED and declared.samples == 4
     if not (gray or color or cmyk):

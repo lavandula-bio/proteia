@@ -427,6 +427,7 @@ def write_lzw_tiff(
     rowsperstrip: int | None = None,
     tile: tuple[int, int] | None = None,
     predictor: bool = False,
+    compression: int = tifffile.COMPRESSION.LZW,
     **options,
 ) -> Path:
     """Write ``pixels`` (2-D, or channels last) as an LZW-compressed TIFF, in
@@ -434,7 +435,8 @@ def write_lzw_tiff(
     such as ``photometric`` and ``extrasamples``): planar, of either byte order,
     in strips or tiles, with the horizontal predictor. tifffile cannot encode
     LZW without imagecodecs, so it writes the strips (or tiles) encoded here as
-    Deflate, and the Compression tag is then set to LZW."""
+    Deflate, and the Compression tag is then set to LZW, or to another
+    ``compression`` for a test of what the header alone decides."""
     data = np.asarray(pixels)
     data = data.astype(data.dtype.newbyteorder(byteorder))
     stored = np.moveaxis(data, -1, 0) if planar else data
@@ -477,7 +479,7 @@ def write_lzw_tiff(
         offset = tif.pages.first.tags["Compression"].valueoffset
     with path.open("r+b") as file:
         file.seek(offset)
-        file.write((5).to_bytes(2, "little" if byteorder == "<" else "big"))
+        file.write(int(compression).to_bytes(2, "little" if byteorder == "<" else "big"))
     return path
 
 
