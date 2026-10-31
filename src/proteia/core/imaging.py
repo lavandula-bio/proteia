@@ -678,7 +678,8 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
     another suffix, when the import counts them (:func:`check_misnamed_tiff`).
     Reading such a file still converts CMYK, for images imported before
     (:func:`load_image`). A file it cannot read raises ``ValueError`` or
-    ``OSError``.
+    ``OSError``; running out of memory or stack while reading the header
+    raises that error itself (#230).
     """
     path = Path(path)
     try:
@@ -689,7 +690,9 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
             if _first_page(tif, path.name).photometric != tifffile.PHOTOMETRIC.SEPARATED:
                 return None
             return _inks_of(_image_series(tif, path.name))
-    except (ValueError, OSError):
+    except (ValueError, OSError, MemoryError, RecursionError):
+        # Running out of memory or stack is not a damaged header: the import
+        # must not carry on without the ink check (as #217 and #224).
         raise
     except Exception as exc:  # a damaged file: struct.error, ...
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
