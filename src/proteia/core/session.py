@@ -565,8 +565,8 @@ class ProjectSession:
                 ids=(image_id,),
             )
 
-        def refused(exc: ValueError | OSError) -> OperationError:
-            why = named_refusal(exc, image.original_name, path, remedy=False)
+        def refused(exc: ValueError | OSError, why: str | None = None) -> OperationError:
+            why = why or named_refusal(exc, image.original_name, path, remedy=False)
             return OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image_id,))
 
         try:
@@ -584,13 +584,9 @@ class ProjectSession:
             pixels = read(path)
         except OperationError:  # the read's own refusal, in its words (an outdated reading)
             raise
-        except UnsupportedColourSpaceError as exc:
-            message = self.outdated_reading(image)
-            if message is None:
-                raise refused(exc) from exc
-            raise OperationError(ErrorCode.UNREADABLE_IMAGE, message, ids=(image_id,)) from exc
         except (ValueError, OSError) as exc:
-            raise refused(exc) from exc
+            colour_space = isinstance(exc, UnsupportedColourSpaceError)
+            raise refused(exc, self.outdated_reading(image) if colour_space else None) from exc
         if pixels.shape[:2] != (image.height, image.width):
             raise OperationError(
                 ErrorCode.IMAGE_FILE_CHANGED,

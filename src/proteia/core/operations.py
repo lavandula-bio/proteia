@@ -187,6 +187,7 @@ from proteia.core.imaging import (
     NotSingleImageError,
     PixelType,
     assess_processed,
+    check_frames,
     check_misnamed_tiff,
     clipping_depth,
     declared_pixel_type,
@@ -1456,12 +1457,14 @@ def import_image(
     keep being read so.
 
     Any other file reading refuses is refused (``UNREADABLE_IMAGE``) by the
-    name it was offered under, never by its stored copy's name or a local path
-    (#234; :func:`~proteia.core.imaging.named_refusal`, whatever the words of
-    the library that read it): a colour space reading does not convert, a
-    file of more than one frame (an animated PNG or GIF: save one frame as
-    its own file), one Pillow cannot tell the format of (save the image as a
-    TIFF, PNG or JPEG file), a damaged one.
+    name it was offered under, in Proteia's words only (#234;
+    :func:`~proteia.core.imaging.named_refusal`): a colour space reading does
+    not convert; a file of more than one frame (an animated PNG, GIF or
+    WebP: save one frame as its own file), refused here only
+    (:func:`~proteia.core.imaging.check_frames`), so that one imported before
+    reads as it did; one Pillow cannot tell the format of, or one damaged
+    (save the image as, or again as, a TIFF, PNG or JPEG file), whose
+    library's words are logged instead.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1503,6 +1506,7 @@ def import_image(
         _refuse_pixel_type(original_name, _header_pixel_type(path))
         try:
             _count_misnamed_tiff(path)
+            check_frames(path)  # the import's, not reading's: images imported before read so
             read = read_file(path)
         except (ValueError, OSError) as exc:
             if isinstance(exc, NotSingleImageError):

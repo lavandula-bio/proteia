@@ -18,6 +18,7 @@ import hashlib
 import inspect
 import io
 import json
+import logging
 import math
 import os
 import shutil
@@ -2097,7 +2098,7 @@ def test_inks_the_header_check_misses_are_refused_as_read_with_the_same_answer(t
     [
         # Reading picks its reader by the suffix, as for the images imported
         # before: a JPEG named .tif is no TIFF to it.
-        ("jpeg named γ.tif", "not a TIFF file"),
+        ("jpeg named γ.tif", "it is damaged or not an image Proteia can read (TiffFileError)"),
         # Inks reading does not convert, as before #207 (#234: named as chosen).
         ("five inks.tiff", "this separated TIFF has 5 inks"),
         ("float inks.tif", "this separated TIFF has float32 inks"),
@@ -2467,21 +2468,34 @@ def test_a_jpeg_of_several_pictures_is_imported_as_its_first_as_before(tmp_path,
 
 
 @pytest.mark.parametrize("fmt", ["TIFF", "PNG", "JPEG"])
+@pytest.mark.parametrize(
+    ("name", "data", "step"),
+    [
+        (
+            "unknown µ.png",
+            b"not an image at all",
+            "; save the image as a TIFF, PNG or JPEG file and import it again",
+        ),
+        (
+            "damaged α.tif",
+            b"II*\x00",
+            "; save the image again as a TIFF, PNG or JPEG file and import that",
+        ),
+    ],
+    ids=["unidentified", "damaged"],
+)
 def test_the_image_of_a_file_proteia_cannot_tell_saved_as_tiff_png_or_jpeg_is_imported(
-    tmp_path, fmt
+    tmp_path, fmt, name, data, step
 ):
-    # #234: the refusal's next step, done: the image saved as a TIFF, PNG or
-    # JPEG file imports.
+    # #234: the refusal's next step, done: the image saved (again) as a TIFF,
+    # PNG or JPEG file imports.
     from PIL import Image
 
     s = session_on(tmp_path)
     error = _imports_nothing(
-        s,
-        lambda: ops.import_image(
-            s, io.BytesIO(b"not an image at all"), "unknown µ.png", kind=CHEMI, polarity=DARK
-        ),
+        s, lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
     )
-    assert str(error).endswith("; save the image as a TIFF, PNG or JPEG file and import it again")
+    assert str(error).endswith(step)
     suffix = {"TIFF": "tif", "PNG": "png", "JPEG": "jpg"}[fmt]
     saved = _encoded(Image.fromarray(_gray8()), fmt)
     image_id = ops.import_image(s, saved, f"saved α.{suffix}", kind=CHEMI, polarity=DARK)
@@ -2568,9 +2582,9 @@ def test_a_stored_copy_the_system_cannot_read_is_refused_without_its_path(
     )
 
 
-def test_the_words_of_a_library_that_name_no_path_are_kept(tmp_path):
-    # #234: a damaged file the library refuses in its own words, which name
-    # neither the stored copy nor a path, keeps them, as before.
+def test_a_librarys_words_never_reach_a_refusal(tmp_path, caplog):
+    # #234 review: a damaged file the library refuses in its own words gives
+    # Proteia's instead, with the error's kind; the library's are logged.
     s = session_on(tmp_path)
     answers = {}
     for name, data in (
@@ -2578,14 +2592,23 @@ def test_the_words_of_a_library_that_name_no_path_are_kept(tmp_path):
         ("truncated α.png", _encoded_png()[:-200]),
     ):
         source = io.BytesIO(data)
-        error = _imports_nothing(
-            s, functools.partial(ops.import_image, s, source, name, kind=CHEMI, polarity=DARK)
-        )
+        with caplog.at_level(logging.INFO, logger="proteia"):
+            error = _imports_nothing(
+                s,
+                functools.partial(ops.import_image, s, source, name, kind=CHEMI, polarity=DARK),
+            )
         answers[name] = str(error)
+    words = (
+        "it is damaged or not an image Proteia can read ({}); save the image again as a TIFF,"
+        " PNG or JPEG file and import that"
+    )
     assert answers == {
-        "png named µ.tif": "cannot read 'png named µ.tif': not a TIFF file: header=b'\\x89PNG'",
-        "truncated α.png": "cannot read 'truncated α.png': image file is truncated",
+        "png named µ.tif": "cannot read 'png named µ.tif': " + words.format("TiffFileError"),
+        "truncated α.png": "cannot read 'truncated α.png': " + words.format("OSError"),
     }
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "not a TIFF file: header=b'\\x89PNG'" in logged
+    assert "image file is truncated" in logged
 
 
 # Errors of reading that name the stored copy in their words, as a library
@@ -2593,23 +2616,17 @@ def test_the_words_of_a_library_that_name_no_path_are_kept(tmp_path):
 # stored copy at a path, and what the refusal says after "cannot read
 # '<name>': ".
 _NAMING_THE_COPY = {
-    "path in a ValueError": (
-        lambda path: ValueError(f"`{path}` can not be opened"),
-        "`gel µ.tif` can not be opened",
-    ),
+    "path in a ValueError": (lambda path: ValueError(f"`{path}` can not be opened"), "ValueError"),
     "posix path in an OSError": (
         lambda path: OSError(f"cannot open {path.as_posix()}"),
-        "cannot open gel µ.tif",
+        "OSError",
     ),
-    "escaped path": (
-        lambda path: ValueError(f"cannot open {str(path)!r}"),
-        "cannot open 'gel µ.tif'",
-    ),
-    "folder": (lambda path: OSError(f"no room in {path.parent}"), "no room in gel µ.tif"),
-    "file name": (lambda path: ValueError(f"{path.name} is cut short"), "gel µ.tif is cut short"),
+    "escaped path": (lambda path: ValueError(f"cannot open {str(path)!r}"), "ValueError"),
+    "folder": (lambda path: OSError(f"no room in {path.parent}"), "OSError"),
+    "file name": (lambda path: ValueError(f"{path.name} is cut short"), "ValueError"),
     "damaged": (
-        lambda path: imaging.ReadingRefusal(path.name, f"not a readable image (at {path})"),
-        "not a readable image (at gel µ.tif)",
+        lambda path: imaging._damaged(path.name, OSError(f"at {path}")),
+        "OSError",
     ),
 }
 
@@ -2619,8 +2636,9 @@ def test_an_error_naming_the_stored_copy_names_the_chosen_file_on_import(
     tmp_path, monkeypatch, case
 ):
     # #234 review: only an OSError's filename was left out; any other words
-    # that named the stored copy or its folder showed them.
-    raised, words = _NAMING_THE_COPY[case]
+    # that named the stored copy or its folder showed them. A refusal holds
+    # Proteia's words only, with the error's kind.
+    raised, kind = _NAMING_THE_COPY[case]
 
     def unreadable(path):
         raise raised(path)
@@ -2635,7 +2653,8 @@ def test_an_error_naming_the_stored_copy_names_the_chosen_file_on_import(
     )
     assert (refused.code, str(refused)) == (
         ErrorCode.UNREADABLE_IMAGE,
-        f"cannot read 'gel µ.tif': {words}",
+        f"cannot read 'gel µ.tif': it is damaged or not an image Proteia can read ({kind});"
+        " save the image again as a TIFF, PNG or JPEG file and import that",
     )
 
 
@@ -2680,12 +2699,13 @@ _READING_AGAIN = {
     "library naming the copy": (
         "load_image",
         lambda path: ValueError(f"`{path}` can not be opened"),
-        "cannot read 'β-actin µ.tif': `β-actin µ.tif` can not be opened",
+        "cannot read 'β-actin µ.tif': it is damaged or not an image Proteia can read (ValueError)",
     ),
     "colours": (
         "read_colours",
-        lambda path: imaging.ReadingRefusal(path.name, "not a readable image (bad bytes)"),
-        "cannot read 'β-actin µ.tif': not a readable image (bad bytes)",
+        lambda path: imaging._damaged(path.name, struct.error("bad bytes")),
+        "cannot read 'β-actin µ.tif': it is damaged or not an image Proteia can read"
+        " (struct.error)",
     ),
     "bytes": (
         "file_digest",
@@ -2719,6 +2739,56 @@ def test_reading_an_image_already_imported_names_it_as_imported(tmp_path, monkey
     )
     assert "again" not in str(info.value)
     assert (reopened.project is before, reopened._pixels) == (True, {})
+
+
+def _animations() -> dict[str, bytes]:
+    """Animations main imported as one image, by the name they are offered
+    under: 3 frames of the blot's size, which scikit-image moves to the
+    channels; 2 frames 3 pixels wide, which pass for channels; a WebP, read
+    as its first frame."""
+    from PIL import Image
+
+    gray = _gray8()
+    blots = [Image.fromarray(gray), Image.fromarray(gray[::-1]), Image.fromarray(255 - gray)]
+    narrow = [Image.fromarray(np.full((40, 3), level, dtype=np.uint8)) for level in (60, 120)]
+    rgb = [image.convert("RGB") for image in blots[:2]]
+
+    def animated(images, fmt, **options):
+        return _encoded(images[0], fmt, save_all=True, append_images=images[1:], **options).read()
+
+    return {
+        "three frames µ.png": animated(blots, "PNG"),
+        "narrow frames α.png": animated(narrow, "PNG"),
+        "animated webp β.png": animated(rgb, "WEBP", lossless=True),
+    }
+
+
+@pytest.mark.parametrize("name", list(_animations()))
+def test_an_animation_imported_before_reads_and_measures_as_before(tmp_path, name):
+    # #234 review: the frame check is the import's, not reading's: a project
+    # holding an animation that main imported (it never looked for frames)
+    # opens, reads and measures it as before, in what scikit-image gives.
+    from skimage import io as skimage_io
+
+    s = session_on(tmp_path, save_to_folder)
+    data = _animations()[name]
+    refused = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
+    )
+    assert "it holds more than one frame" in str(refused)
+    with mock.patch.object(ops, "check_frames", lambda path: None):  # as main imported it
+        image_id = ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
+    reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
+    image = reopened.project.batch.find_image(image_id)
+    decoded = skimage_io.imread(storage.image_path(reopened.folder, image))
+    expected = quantify.to_grayscale(decoded).astype(np.float64)
+    np.testing.assert_array_equal(reopened.pixels(image_id), expected)
+    np.testing.assert_array_equal(reopened.colour_pixels(image_id), decoded)
+    if image.width >= 160:  # room for the blot's boxes
+        ops.set_lanes(reopened, [LaneInput("vehicle"), LaneInput("10 µM")])
+        protein = ops.add_protein(reopened, "β-actin", Role.TARGET, image_id)
+        ops.place_box(reopened, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        assert_nets_current(reopened)
 
 
 def test_a_colour_space_refused_where_the_header_cannot_tell_names_the_image_as_imported(
