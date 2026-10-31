@@ -128,7 +128,9 @@ NonNegative = Annotated[Finite, Field(ge=0)]
 Kda = Annotated[Finite, Field(gt=0)]  # molecular weight in kDa
 # Ids are lowercase (Windows file names ignore case) and hold no path characters.
 # The default (Rust) regex engine does not let ``$`` match before a trailing newline.
+# An id's number has at most nine digits: below NEXT_ID_LIMIT, the largest next_id.
 _N = r"[1-9][0-9]{0,8}"
+NEXT_ID_LIMIT: Final = 10**9
 MembraneId = Annotated[str, StringConstraints(pattern=rf"^mem-{_N}$")]
 ImageId = Annotated[str, StringConstraints(pattern=rf"^img-{_N}$")]
 ProteinId = Annotated[str, StringConstraints(pattern=rf"^prot-{_N}$")]
@@ -1350,7 +1352,7 @@ class Project(_Model):
     schema_version: Literal[3] = SCHEMA_VERSION
     background_method: ProjectBackgroundMethod = LOCAL_BACKGROUND_METHOD
     # Bookkeeping, excluded from the content hash: the number of the next new id.
-    next_id: int = Field(default=1, ge=1, le=10**9)
+    next_id: int = Field(default=1, ge=1, le=NEXT_ID_LIMIT)
     batch: Batch = Field(default_factory=Batch)
     log: tuple[LogEntry, ...] = ()  # history, oldest first; excluded from the content hash
 

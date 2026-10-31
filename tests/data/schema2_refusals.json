@@ -147,6 +147,8 @@
   {"base": "sample", "edits": [["set", ["batch", "membranes", 0, "lane_table_id"], "lt-30"]], "messages": ["Extra inputs are not permitted"]},
   {"base": "sample", "edits": [["set", ["batch", "proteins", 2, "rows"], []]], "messages": ["Extra inputs are not permitted"]},
   {"base": "sample", "edits": [["set", ["batch", "proteins", 0, "rows"], null]], "messages": ["Extra inputs are not permitted"]},
-  {"base": "sample", "edits": [["set", ["batch", "membranes", 1, "arenas"], []], ["set", ["batch", "membranes", 1, "lane_table_id"], "lt-30"], ["set", ["batch", "proteins", 2, "rows"], []], ["set", ["batch", "lane_tables"], []], ["set", ["batch", "images"], []]], "messages": ["Extra inputs are not permitted", "Extra inputs are not permitted", "Extra inputs are not permitted", "Extra inputs are not permitted", "Extra inputs are not permitted"]}
+  {"base": "sample", "edits": [["set", ["batch", "membranes", 1, "arenas"], []], ["set", ["batch", "membranes", 1, "lane_table_id"], "lt-30"], ["set", ["batch", "proteins", 2, "rows"], []], ["set", ["batch", "lane_tables"], []], ["set", ["batch", "images"], []]], "messages": ["Extra inputs are not permitted", "Extra inputs are not permitted", "Extra inputs are not permitted", "Extra inputs are not permitted", "Extra inputs are not permitted"]},
+  {"base": "sample", "edits": [["set", ["next_id"], 1000000001]], "messages": ["Input should be less than or equal to 1000000000"]},
+  {"base": "sample", "edits": [["set", ["batch", "proteins", 2, "bands", 1, "id"], "band-999999999"]], "messages": ["Value error, id band-999999999 is not below next_id 19"]}
  ]
 }

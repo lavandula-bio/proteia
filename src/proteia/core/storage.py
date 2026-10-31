@@ -108,6 +108,7 @@ import proteia
 from proteia.core.model import (
     IMAGE_SUFFIXES,
     LEGACY_BACKGROUND_METHOD,
+    NEXT_ID_LIMIT,
     SCHEMA_VERSION,
     UNKNOWN_IMAGE_ROWS,
     ImageId,
@@ -158,6 +159,19 @@ class ProjectError(Exception):
 class ProjectFormatError(ProjectError):
     """project.json is not UTF-8, not JSON, has a duplicate key or NaN/Infinity, is
     not an object, or fails validation (the pydantic ValidationError is __cause__)."""
+
+
+class TooManyIdsError(ProjectFormatError):
+    """An older project whose ids leave too little room below the id limit
+    (:data:`~proteia.core.model.NEXT_ID_LIMIT`) for the ids its conversion
+    adds. ``project`` names it in the message."""
+
+    def __init__(self, needed: int, project: str = PROJECT_FILE) -> None:
+        super().__init__(
+            f"{project} holds too many ids to convert: the conversion needs {needed} new"
+            f" ids, past the {NEXT_ID_LIMIT - 1} a project can number"
+        )
+        self.needed = needed
 
 
 class SchemaVersionError(ProjectFormatError):
@@ -513,12 +527,14 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
     file's other faults are not listed with it). A part that is not the
     shape it should be is left for validation to refuse. An image without an
     image id gets no area. A ``next_id`` that is not a whole number above
-    every id held is kept as it is, and the new ids are drawn above every
-    held number (:meth:`~proteia.core.model.Project.iter_ids` meets them
-    last). A
+    every id held, up to :data:`~proteia.core.model.NEXT_ID_LIMIT`, is kept as
+    it is, and the new ids are numbered from 1: the id check meets an id the
+    file holds first (:meth:`~proteia.core.model.Project.iter_ids`). A
     protein's reference to an image the file does not hold (or to no image
     id at all) stays as its row's area reference, which :func:`_parse` then
     has validated as the image reference it was (:func:`_rows_on_no_area`).
+    A file schema 2 opened whose ``next_id`` leaves no room below the limit
+    for the new ids raises :class:`TooManyIdsError`.
     """
     doc["schema_version"] = 3
     next_id = doc.get("next_id", 1)
@@ -531,8 +547,10 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
         ]
         raise ValidationError.from_exception_data("Project", lines)
     highest = _highest_number(batch)
-    usable = type(next_id) is int and highest < next_id  # a bool is not an int here
-    counter = next_id if usable else highest + 1
+    # Whether next_id numbers the new ids: a whole number (not a bool) above
+    # every id held, within the limit.
+    usable = type(next_id) is int and highest < next_id <= NEXT_ID_LIMIT
+    counter = next_id if usable else 1
 
     def new(prefix: str) -> str:
         nonlocal counter
@@ -575,6 +593,8 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
         row.update((key, protein.pop(key)) for key in _ROW_KEYS if key in protein)
         protein["rows"] = [row]
     if usable:
+        if counter > NEXT_ID_LIMIT:
+            raise TooManyIdsError(counter - next_id)
         doc["next_id"] = counter
     return doc
 
@@ -853,7 +873,10 @@ def read_project(
     file raises before it is written. Nothing else is written."""
     folder = Path(folder)
     data = (folder / PROJECT_FILE).read_bytes()
-    project, found = _parse(data)
+    try:
+        project, found = _parse(data)
+    except TooManyIdsError as exc:  # named by its folder, as the user knows it
+        raise TooManyIdsError(exc.needed, f"the project {folder.name!r}") from None
     if require_images:
         missing = _missing_images(project, folder)
         if missing:

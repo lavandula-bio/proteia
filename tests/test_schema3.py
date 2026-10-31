@@ -409,6 +409,9 @@ def _messages(doc: dict) -> list[str]:
         pytest.param(30.0, "Input should be a valid integer", id="float"),
         pytest.param(0, "Input should be greater than or equal to 1", id="zero"),
         pytest.param(-3, "Input should be greater than or equal to 1", id="negative"),
+        pytest.param(
+            10**9 + 1, "Input should be less than or equal to 1000000000", id="past-the-limit"
+        ),
         # Below ids already held: the first one met (membranes, images, proteins,
         # bands) is named, as at schema 2, never one the conversion drew.
         pytest.param(15, "Value error, id band-15 is not below next_id 15", id="below-a-band"),
@@ -465,6 +468,13 @@ def test_an_id_of_each_kind_above_next_id_is_refused_as_before(kind, held):
     assert _messages(doc) == [f"Value error, id {held}-40 is not below next_id 19"]
 
 
+def test_the_highest_id_above_next_id_is_refused_as_before():
+    # The ids the conversion draws for a file refused for its ids stay ids.
+    doc = sample_doc()
+    doc["batch"]["proteins"][2]["bands"][1]["id"] = "band-999999999"
+    assert _messages(doc) == ["Value error, id band-999999999 is not below next_id 19"]
+
+
 @pytest.mark.parametrize(
     ("next_id", "message"),
     [
@@ -485,6 +495,34 @@ def test_a_schema_2_next_id_near_its_limit_converts():
     doc = sample_doc()
     doc["next_id"] = 10**9 - 8
     assert project_from_json(_encode(doc)).next_id == 10**9
+
+
+@pytest.mark.parametrize(
+    ("doc", "needed"),
+    [
+        pytest.param({**sample_doc(), "next_id": 10**9 - 7}, 8, id="one-past"),
+        pytest.param({**sample_doc(), "next_id": 10**9}, 8, id="at-the-limit"),
+        pytest.param({"schema_version": 2, "next_id": 10**9}, 1, id="no-ids"),
+    ],
+)
+def test_a_project_too_near_the_id_limit_is_refused_plainly(doc, needed, tmp_path):
+    # Schema 2 opened these; the ids the conversion adds would pass the
+    # limit, so the project cannot be converted, and the message says so
+    # (the limit stays: ids are at most nine digits).
+    tail = (
+        f"holds too many ids to convert: the conversion needs {needed} new ids, past the"
+        " 999999999 a project can number"
+    )
+    with pytest.raises(storage.TooManyIdsError) as info:
+        project_from_json(_encode(doc))
+    assert str(info.value) == f"project.json {tail}"
+    folder = tmp_path / "Blot µ"
+    folder.mkdir()
+    (folder / storage.PROJECT_FILE).write_bytes(_encode(doc))
+    with pytest.raises(ProjectFormatError) as info:
+        storage.read_project(folder, require_images=False)
+    assert str(info.value) == f"the project 'Blot µ' {tail}"
+    assert not ID.search(str(info.value))
 
 
 @pytest.mark.parametrize(
@@ -678,7 +716,7 @@ def test_every_schema_2_refusal_keeps_its_messages():
     data = json.loads(REFUSALS.read_text(encoding="utf-8"))
     cases = data["cases"]
     docs = [_edited(data["bases"][case["base"]], case["edits"]) for case in cases]
-    assert len(docs) == 140
+    assert len(docs) == 142
     assert {doc["schema_version"] for doc in docs} == {1, 2}
     assert [_messages(doc) for doc in docs] == [case["messages"] for case in cases]
 
