@@ -25,7 +25,10 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   its folder's name, never its path; and so are opening, reading again and
   closing a project.
 * Pixels are read lazily and cached as read-only arrays, after checking the
-  stored file's SHA-256 and the array's shape against the image record.
+  stored file's SHA-256 and the array's shape against the image record. An
+  image's array is of the channel the committed project measures it on
+  (#206): a commit that changes the channel drops the cached array, unless the
+  change gives the new one.
 * The session keeps its undo history: the content of each state it committed,
   up to :data:`UNDO_LIMIT` steps back, as the exact bytes the content hash
   covers (:func:`~proteia.core.storage.content_bytes`). The history moves at the
@@ -90,6 +93,7 @@ from proteia.core.imaging import (
 from proteia.core.model import (
     IMAGE_SUFFIXES,
     LEGACY_BACKGROUND_METHOD,
+    Channel,
     ImageRef,
     LogEntry,
     Project,
@@ -452,7 +456,9 @@ class ProjectSession:
         return format_timestamp(self.clock())
 
     def pixels(self, image_id: str, *, keep: bool = True) -> np.ndarray:
-        """The image's read-only analysis array, read and checked on first use.
+        """The image's read-only analysis array, of the channel the committed
+        project measures it on (:attr:`~proteia.core.model.ImageRef.measured_channel`),
+        read and checked on first use.
 
         ``keep=False`` reads it without adding it to the cache (for a display
         preview, which should not hold every viewed image in memory); an array
@@ -469,21 +475,36 @@ class ProjectSession:
             if cached is not None:
                 return cached
             image = self._project.batch.find_image(image_id)
-            array = self._read_checked(image, lambda path: self._analysis_array(image, path))
-            array.flags.writeable = False
+            array = self._read_array(image, image.measured_channel)
             if keep:
                 self._pixels[image_id] = array
             return array
 
-    def _analysis_array(self, image: ImageRef, path: Path) -> np.ndarray:
-        """The analysis array of the image's stored file (:func:`load_image`),
-        refused (``ValueError``) while its stored numbers come from a reading
-        this version no longer makes (:meth:`outdated_reading`): boxes measured
-        now would mix the two readings."""
+    def channel_array(self, image_id: str, channel: Channel) -> np.ndarray:
+        """The image's read-only analysis array of ``channel`` (#206), read and
+        checked as :meth:`pixels` reads it, with the same errors, and never
+        cached: for a change of the channel the image is measured on, whose
+        commit caches it."""
+        with self.lock:
+            return self._read_array(self._project.batch.find_image(image_id), channel)
+
+    def _read_array(self, image: ImageRef, channel: Channel) -> np.ndarray:
+        """The image's analysis array of ``channel``, read and checked
+        (:meth:`_read_checked`), read-only. Called with the lock held."""
+        array = self._read_checked(image, lambda path: self._analysis_array(image, path, channel))
+        array.flags.writeable = False
+        return array
+
+    def _analysis_array(self, image: ImageRef, path: Path, channel: Channel) -> np.ndarray:
+        """The analysis array of the image's stored file on ``channel``
+        (:func:`load_image`), refused (``ValueError``) while its stored numbers
+        come from a reading this version no longer makes
+        (:meth:`outdated_reading`): boxes measured now would mix the two
+        readings."""
         why = self.outdated_reading(image)
         if why is not None:
             raise ValueError(why)
-        return load_image(path).array
+        return load_image(path, channel=channel).array
 
     def colour_pixels(self, image_id: str) -> np.ndarray:
         """The image's stored file in its own colours, for display only (2-D gray,
@@ -632,6 +653,11 @@ class ProjectSession:
         A failed save (``OSError`` or ``ProjectError``) is recorded in
         ``save_error`` and logged; the edit stays committed. Any other exception
         from the hook is a bug and propagates, after the commit.
+
+        ``add_pixels`` caches the arrays the change read (each of its image's
+        measured channel), and ``evict`` drops the cached arrays of those
+        images; the array of an image whose measured channel ``project``
+        changes is dropped either way, unless ``add_pixels`` gives it.
         """
         with self.lock:
             log = self._project.log
@@ -651,6 +677,15 @@ class ProjectSession:
                 if not self._states:
                     pushed.append(self._opening_state())
                 pushed.append(_state(project, seq=seq, action=action, data=data, digest=digest))
+            # A cached array is of the channel its image was measured on (#206):
+            # one the change (or the state undo and redo restore) measures on
+            # another goes, unless the change gives it below.
+            measured = {
+                image.id: image.measured_channel for image in self._project.batch.iter_images()
+            }
+            for image in project.batch.iter_images():
+                if measured.get(image.id, image.measured_channel) is not image.measured_channel:
+                    self._pixels.pop(image.id, None)
             # One object holds the change and its entry, so one save writes both.
             self._project = project.model_copy(update={"log": (*log, entry)})
             for image_id, array in (add_pixels or {}).items():
@@ -731,7 +766,8 @@ class ProjectSession:
         ``undetected_restored``), as :meth:`~proteia.core.model.Project.iter_ids`
         and the stored records order them (not sorted by id); an object whose
         fields change is in no list. Pixels of images the state lacks are
-        evicted, on undo and redo alike; those it brings back are read, and
+        evicted, on undo and redo alike, and so are those of images it measures
+        on another channel (:meth:`_commit`); those it brings back are read, and
         checked, when next used.
 
         Refused, changing nothing: nothing to undo or redo (``NOTHING_TO_UNDO``,

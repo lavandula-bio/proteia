@@ -6,7 +6,10 @@ value scale: a 16-bit scan keeps values up to 65535, so a saturated 16-bit pixel
 stays distinguishable from a mid-range one. Color is reduced to gray by
 :func:`proteia.core.quantify.to_grayscale`: the unweighted mean of the red, green
 and blue channels, (R+G+B)/3, which matches ImageJ's default conversion; an alpha
-channel is ignored, and gray plus alpha keeps the gray channel.
+channel is ignored, and gray plus alpha keeps the gray channel. Since #206 a
+colour image may be read on one of its channels instead (``channel``), as the
+image's stored choice says (:attr:`~proteia.core.model.ImageRef.measured_channel`);
+reading without one gives the mean, as before.
 
 A CMYK file (a CMYK JPEG, or a separated TIFF with cyan, magenta, yellow and
 black inks) is converted to red, green and blue as it is read, then to gray like
@@ -59,7 +62,8 @@ from typing import Final, Literal, NamedTuple
 import numpy as np
 import tifffile
 
-from proteia.core.model import ImageWarning
+from proteia.core.model import UNTRUSTED_WARNINGS as UNTRUSTED_WARNINGS  # read here too
+from proteia.core.model import Channel, ImageWarning, limit_distrusted_by
 from proteia.core.quantify import near_limit_tolerance, to_grayscale
 
 TIFF_SUFFIXES = (".tif", ".tiff")
@@ -140,20 +144,16 @@ _CMYK_CHANNELS_DIFFER = (
     "The red, green and blue channels converted from the file's CMYK differ; they were"
     " averaged into one gray channel, so over-exposure cannot be checked."
 )
+# The color_channels_differ message of an image a channel was chosen for
+# (operations.set_channel, #206), true whatever channel it is measured on: the
+# results say per image whether over-exposure can be checked there.
+CHANNELS_DIFFER_MEASURED = (
+    "The red, green and blue channels differ; the image is measured on one of them or on"
+    " their mean, as its channel says."
+)
 # The warnings that make clipping_depth distrust a known bit depth (and so let
-# possible_clipping_depth assess it). results names each in its
-# clipping_not_checked and possibly_clipped notices (_UNCHECKED_WARNINGS, kept
-# in step by a test), so a code added here needs a reason there.
-# looks_processed is not one of them (#127). Levelling a figure's background to
-# white moves the background onto a limit, not the bands, and on a lossless file
-# the exact check still counts the band pixels the file holds at the limit (a
-# lossy, colour or CMYK file is distrusted by its own warning already). The
-# warning is a heuristic that also fires on some raw images (a dark background
-# the imager cut at zero, a marker photo's white membrane), whose exact check it
-# would weaken. A known limit: a palette reduced to few colours can move a
-# saturated core a level or two off the limit, which the exact check then
-# misses; the warning says that over-exposure may be hidden.
-UNTRUSTED_WARNINGS = frozenset({"lossy_format", "color_channels_differ", "cmyk_converted"})
+# possible_clipping_depth assess it) are model.UNTRUSTED_WARNINGS, which says
+# why; model.limit_distrusted_by says which of them distrust a channel.
 
 
 def _warning(code: str, **fields: str) -> ImageWarning:
@@ -758,29 +758,37 @@ def _check_layout(pixels: np.ndarray, name: str) -> None:
     raise ValueError(f"{name}: unsupported image layout {pixels.shape}")
 
 
+def channels_differ(pixels: np.ndarray) -> bool:
+    """Whether pixels (2-D, or channels last) hold red, green and blue that are
+    not all equal: what the import records as ``color_channels_differ``. Gray,
+    with or without alpha, has one channel; alpha is not a colour."""
+    if pixels.ndim != 3 or pixels.shape[-1] < 3:
+        return False
+    red = pixels[..., 0]
+    return not (np.array_equal(red, pixels[..., 1]) and np.array_equal(red, pixels[..., 2]))
+
+
 def to_analysis_array(
-    pixels: np.ndarray, *, cmyk: bool = False
+    pixels: np.ndarray, *, cmyk: bool = False, channel: Channel | None = None
 ) -> tuple[np.ndarray, list[ImageWarning]]:
     """The 2-D float64 analysis array, and warnings about the conversion; with
     ``cmyk``, the pixels are a CMYK file's converted colours, and a
-    ``color_channels_differ`` warning says so.
+    ``color_channels_differ`` warning says so. The array is of ``channel``
+    (:func:`~proteia.core.quantify.to_grayscale`; None, the mean); the
+    warnings are the pixels', whatever the channel.
 
     Refuses NaN or infinite pixels: they would make the background and every
     net signal meaningless.
     """
     _check_layout(pixels, "image")
     warnings: list[ImageWarning] = []
-    if pixels.ndim == 3 and pixels.shape[-1] >= 3:
-        rgb = pixels[..., :3]
-        if not (
-            np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(rgb[..., 0], rgb[..., 2])
-        ):
-            warnings.append(
-                ImageWarning(code="color_channels_differ", message=_CMYK_CHANNELS_DIFFER)
-                if cmyk
-                else _warning("color_channels_differ")
-            )
-    array = to_grayscale(pixels).astype(np.float64)
+    if channels_differ(pixels):
+        warnings.append(
+            ImageWarning(code="color_channels_differ", message=_CMYK_CHANNELS_DIFFER)
+            if cmyk
+            else _warning("color_channels_differ")
+        )
+    array = to_grayscale(pixels, channel).astype(np.float64)
     if not np.isfinite(array).all():
         raise ValueError("image has NaN or infinite pixel values")
     return array, warnings
@@ -975,16 +983,18 @@ def assess_processed(
     dark_on_light: bool,
     background: float,
     palette: bool = False,
+    channel: Channel | None = None,
 ) -> list[ImageWarning]:
     """An image's import ``warnings`` with its ``looks_processed`` warning
     assessed for the polarity ``dark_on_light`` (:func:`processed_signals`):
     added, replaced or dropped, and last of them. ``array``, ``bit_depth`` and
-    ``palette`` are the image's reading (:class:`LoadedImage`), ``background``
-    its stored median. The import assesses it, and a polarity change again; no
-    other reading of the file does, so a read keeping only the array pays nothing
-    for it."""
+    ``palette`` are the image's reading (:class:`LoadedImage`) on ``channel``
+    (None: the mean), ``background`` its stored median. The import assesses
+    it, and a change of polarity or channel again; no other reading of the
+    file does, so a read keeping only the array pays nothing for it."""
     kept = [warning for warning in warnings if warning.code != "looks_processed"]
-    near_depth = possible_clipping_depth(bit_depth, kept)  # set where the exact check is off
+    # Set where the exact check is off, on the channel measured.
+    near_depth = possible_clipping_depth(bit_depth, kept, channel)
     near = 0.0 if near_depth is None else near_limit_tolerance(near_depth)
     signals = processed_signals(
         array,
@@ -1019,14 +1029,21 @@ def _levels_in_range(array: np.ndarray) -> tuple[int, int]:
 
 
 def from_pixels(
-    pixels: np.ndarray, *, lossy: bool = False, cmyk: str | None = None, palette: bool = False
+    pixels: np.ndarray,
+    *,
+    lossy: bool = False,
+    cmyk: str | None = None,
+    palette: bool = False,
+    channel: Channel | None = None,
 ) -> LoadedImage:
     """A :class:`LoadedImage` from pixels already in memory (e.g. generated);
     ``cmyk`` says how a CMYK file's colours were converted into them (a
     :data:`CMYK_CONVERSIONS` key), for pixels read from one, and ``palette``
-    that they are a palette image's colours, as a palette PNG reads. Whether
-    they look processed is not assessed here (:func:`assess_processed`)."""
-    array, warnings = to_analysis_array(pixels, cmyk=cmyk is not None)
+    that they are a palette image's colours, as a palette PNG reads. Its
+    array is of ``channel`` (None: the mean, :func:`to_analysis_array`).
+    Whether they look processed is not assessed here
+    (:func:`assess_processed`)."""
+    array, warnings = to_analysis_array(pixels, cmyk=cmyk is not None, channel=channel)
     depth = bit_depth_of(pixels)
     if depth is None:
         warnings.append(_warning("unknown_bit_depth"))
@@ -1039,24 +1056,32 @@ def from_pixels(
     )
 
 
-def clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> int | None:
-    """The bit depth whose detector limit the over-exposure check may trust, or None.
+def clipping_depth(
+    bit_depth: int | None, warnings: Iterable[ImageWarning], channel: Channel | None = None
+) -> int | None:
+    """The bit depth whose detector limit the over-exposure check may trust, or
+    None, for an image with the import ``warnings`` measured on ``channel``
+    (None: the mean, as for every image before #206).
 
     None when the depth is unknown (float data), when lossy compression moved
     saturated pixels off the limit (``lossy_format``), when color was averaged
-    into gray (``color_channels_differ``): a channel saturated alone never brings
-    the mean to the limit, or when the colours were converted from CMYK
-    (``cmyk_converted``): its values are inks turned into approximate colours,
-    not detector counts, and a profile may keep black off 0. A 12- or 14-bit
-    camera writing a 16-bit file is checked against the container limit, so its
+    into gray (``color_channels_differ`` on the mean): a channel saturated alone
+    never brings the mean to the limit, or when the colours were converted from
+    CMYK (``cmyk_converted``): its values are inks turned into approximate
+    colours, not detector counts, and a profile may keep black off 0
+    (:func:`~proteia.core.model.limit_distrusted_by`). One colour channel of a
+    lossless file is checked at the file's limit. A 12- or 14-bit camera
+    writing a 16-bit file is checked against the container limit, so its
     saturation goes unseen (a known limit).
     """
-    if bit_depth is None or any(w.code in UNTRUSTED_WARNINGS for w in warnings):
+    if bit_depth is None or limit_distrusted_by(warnings, channel):
         return None
     return bit_depth
 
 
-def possible_clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarning]) -> int | None:
+def possible_clipping_depth(
+    bit_depth: int | None, warnings: Iterable[ImageWarning], channel: Channel | None = None
+) -> int | None:
     """The bit depth the "possibly over-exposed" check (#112,
     :func:`~proteia.core.quantify.is_possibly_clipped`) measures against, or None.
 
@@ -1069,28 +1094,32 @@ def possible_clipping_depth(bit_depth: int | None, warnings: Iterable[ImageWarni
     relative intent and black point compensation through SWOP press CMYK comes
     back at about 19), which hides its saturation from this check too (a known
     limit). An unknown bit depth has no limit to measure against, so neither
-    check runs.
+    check runs. One colour channel of a lossy file is assessed on that channel
+    (``channel``, as for :func:`clipping_depth`).
     """
-    if bit_depth is None or clipping_depth(bit_depth, warnings) is not None:
+    if bit_depth is None or clipping_depth(bit_depth, warnings, channel) is not None:
         return None
     return bit_depth
 
 
-def load_image(path: str | os.PathLike[str]) -> LoadedImage:
+def load_image(path: str | os.PathLike[str], *, channel: Channel | None = None) -> LoadedImage:
     """Read an image file into an analysis array, with its bit depth and warnings.
 
     ``lossy_format`` is recorded for JPEG files and for TIFF files that use JPEG
     compression; ``cmyk_converted`` for a CMYK file, naming how its colours were
     converted to red, green and blue. ``looks_processed`` depends on the
-    polarity, so the import adds it (:func:`assess_processed`).
+    polarity, so the import adds it (:func:`assess_processed`). The array is of
+    ``channel`` (None: the mean, :func:`to_analysis_array`).
     """
-    return load_pixels(read_file(path))
+    return load_pixels(read_file(path), channel=channel)
 
 
-def load_pixels(read: FilePixels) -> LoadedImage:
+def load_pixels(read: FilePixels, *, channel: Channel | None = None) -> LoadedImage:
     """A file's pixels as read (:func:`read_file`) as :func:`load_image` loads
-    them: in an analysis array, with their bit depth and warnings."""
-    return from_pixels(read.pixels, lossy=read.lossy, cmyk=read.cmyk, palette=read.palette)
+    them: in an analysis array of ``channel``, with their bit depth and warnings."""
+    return from_pixels(
+        read.pixels, lossy=read.lossy, cmyk=read.cmyk, palette=read.palette, channel=channel
+    )
 
 
 def preview(pixels: np.ndarray) -> np.ndarray:

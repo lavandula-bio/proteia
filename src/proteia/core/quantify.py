@@ -88,26 +88,31 @@ import numpy as np
 from pydantic import JsonValue
 
 from proteia.core.grow import mad_sigma
-from proteia.core.model import BackgroundMode, Box, BoxSize, Rect  # the mode: a band field
+from proteia.core.model import BackgroundMode, Box, BoxSize, Channel, Rect  # the mode: a band field
 
 BackgroundMethod = Literal["global_median", "ring_median"]
 # "pixel": each pixel's contribution floored at 0; "total": the box total floored at 0.
 NetClamp = Literal["pixel", "total"]
+# Where each colour channel lies in pixels with the channels last.
+_CHANNEL_INDEX: Final = {Channel.RED: 0, Channel.GREEN: 1, Channel.BLUE: 2}
 
 
-def to_grayscale(image: np.ndarray) -> np.ndarray:
+def to_grayscale(image: np.ndarray, channel: Channel | None = None) -> np.ndarray:
     """Reduce an image to a 2D grayscale array.
 
     Color (3 or 4 channels last) becomes the unweighted mean of red, green and
     blue, which matches ImageJ's default conversion; alpha is ignored. Gray plus
-    alpha (2 channels) keeps the gray channel.
+    alpha (2 channels) keeps the gray channel. With ``channel`` red, green or
+    blue (#206), colour becomes that channel alone, as read; gray has no such
+    channel (``ValueError``). None and ``Channel.MEAN`` reduce as above.
     """
-    if image.ndim == 2:
-        return image
-    if image.ndim == 3 and image.shape[-1] == 2:
-        return image[..., 0]
+    index = None if channel is None else _CHANNEL_INDEX.get(channel)
+    if image.ndim == 2 or (image.ndim == 3 and image.shape[-1] == 2):
+        if index is not None:
+            raise ValueError(f"a gray image has no {channel} channel")
+        return image if image.ndim == 2 else image[..., 0]
     if image.ndim == 3 and image.shape[-1] in (3, 4):
-        return image[..., :3].mean(axis=-1)
+        return image[..., :3].mean(axis=-1) if index is None else image[..., index]
     raise ValueError(f"unsupported image layout {image.shape}")
 
 
@@ -663,9 +668,10 @@ def near_limit_pixels(
     image: np.ndarray, box: Box, size: BoxSize, *, bit_depth: int, dark_on_light: bool
 ) -> int:
     """How many pixels inside the box lie within :func:`near_limit_tolerance` of
-    the detector limit (:func:`detector_limit`), on the gray analysis values: a
-    colour image's mean of red, green and blue, as it is quantified, never a
-    single channel (a tinted export takes one channel to the limit early).
+    the detector limit (:func:`detector_limit`), on the analysis values, as the
+    image is quantified: a colour image's mean of red, green and blue, or the
+    one channel chosen for it (#206); never another channel than the one
+    measured (a tinted export takes one channel to the limit early).
     Raises ValueError if the box extends beyond the image bounds."""
     pixels = _box_pixels(image, box, size)
     tolerance = near_limit_tolerance(bit_depth)
@@ -690,7 +696,9 @@ def is_possibly_clipped(
     band is not over-exposed: a colour channel saturated alone moves the gray
     mean a third of the way (a known limit). A single-colour export, such as a
     fluorescence image with a green lookup table, never brings its gray mean
-    near the limit, so its bands are False whatever their exposure."""
+    near the limit, so its bands are False whatever their exposure while it is
+    measured on the mean; measured on its green channel (#206), they are
+    checked there."""
     if bit_depth is None:
         return None
     count = near_limit_pixels(image, box, size, bit_depth=bit_depth, dark_on_light=dark_on_light)

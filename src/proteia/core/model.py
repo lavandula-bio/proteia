@@ -385,6 +385,84 @@ class ImageWarning(_Model):
     message: Annotated[str, StringConstraints(min_length=1)]
 
 
+# The import warnings that make the over-exposure check distrust an image's
+# known bit depth (proteia.core.imaging.clipping_depth), and so let the
+# near-limit check assess it instead. results names each in its
+# clipping_not_checked and possibly_clipped notices (_UNCHECKED_WARNINGS, kept
+# in step by a test), so a code added here needs a reason there. They live in
+# the model, as limit_distrusted_by does, so that results reads them without
+# loading the image readers.
+# looks_processed is not one of them (#127). Levelling a figure's background to
+# white moves the background onto a limit, not the bands, and on a lossless file
+# the exact check still counts the band pixels the file holds at the limit (a
+# lossy, colour or CMYK file is distrusted by its own warning already). The
+# warning is a heuristic that also fires on some raw images (a dark background
+# the imager cut at zero, a marker photo's white membrane), whose exact check it
+# would weaken. A known limit: a palette reduced to few colours can move a
+# saturated core a level or two off the limit, which the exact check then
+# misses; the warning says that over-exposure may be hidden.
+UNTRUSTED_WARNINGS: Final = frozenset({"lossy_format", "color_channels_differ", "cmyk_converted"})
+
+
+class Channel(StrEnum):
+    """What an image is measured on (#206): one channel of its file as read, or
+    the unweighted mean of its red, green and blue, as ImageJ converts colour by
+    default. A gray image, and a colour image no channel was chosen for, are
+    measured on the mean (a gray image's own values)."""
+
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+    MEAN = "mean"
+
+
+class ChannelSource(StrEnum):
+    """Who chose the channel an image is measured on."""
+
+    CHOSEN = "chosen"  # the user (operations.set_channel)
+
+
+class ChannelChoice(_Model):
+    """The channel a colour image is measured on, and who chose it (#206)."""
+
+    channel: Channel
+    source: ChannelSource
+
+
+def limit_distrusted_by(
+    warnings: Iterable[ImageWarning], channel: Channel | None = None
+) -> list[str]:
+    """The codes of the import ``warnings`` that make the over-exposure check
+    distrust an image's detector limit when it is measured on ``channel``
+    (None: the mean), in their order: those of :data:`UNTRUSTED_WARNINGS`,
+    except ``color_channels_differ`` for one colour channel. A channel
+    saturated alone never brings the mean of differing channels to the limit,
+    but it reaches the limit itself; compression and a CMYK conversion move the
+    values of every channel."""
+    one_channel = channel is not None and channel is not Channel.MEAN
+    return [
+        warning.code
+        for warning in warnings
+        if warning.code in UNTRUSTED_WARNINGS
+        and not (one_channel and warning.code == "color_channels_differ")
+    ]
+
+
+# Why no channel can be chosen for an image (ImageRef.channel_blocker): its
+# red, green and blue are equal (or it is gray), it is a visible-light marker,
+# whose ladder is of several colours, or its colours were converted from CMYK.
+ChannelBlocker = Literal["gray", "marker", "cmyk"]
+_CHANNEL_BLOCKED: Final[dict[ChannelBlocker, str]] = {
+    "gray": "a channel is chosen only for an image whose red, green and blue differ",
+    "marker": (
+        "a visible-light marker image is measured on the mean of its colours, never on one channel"
+    ),
+    "cmyk": (
+        "an image converted from CMYK is measured on the mean of its colours, never on one channel"
+    ),
+}
+
+
 class ImageRef(_Model):
     """One image of a membrane; its pixels live in ``images/<file>`` in the project folder."""
 
@@ -402,6 +480,31 @@ class ImageRef(_Model):
     # grow seed threshold, the image-mode fallback and the legacy background.
     background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
+    # #206: the channel it is measured on; None = the mean of its red, green and
+    # blue (Channel.MEAN), as for a gray image and every image imported before.
+    # Left out of the saved form while None, so a project without a choice keeps
+    # its bytes and hash (see "Canonical form" in storage).
+    channel: ChannelChoice | None = Field(default=None, exclude_if=lambda v: v is None)
+
+    @property
+    def measured_channel(self) -> Channel:
+        """The channel the image is measured on: its choice's, else the mean."""
+        return Channel.MEAN if self.channel is None else self.channel.channel
+
+    @property
+    def channel_blocker(self) -> ChannelBlocker | None:
+        """Why no channel can be chosen for the image, or None if one can, the
+        first that holds: ``"gray"``, its import recorded no
+        ``color_channels_differ``; ``"marker"``, it is a visible-light marker;
+        ``"cmyk"``, its colours were converted from CMYK (``cmyk_converted``)."""
+        codes = {warning.code for warning in self.import_warnings}
+        if "color_channels_differ" not in codes:
+            return "gray"
+        if self.kind is ImageKind.VISIBLE_MARKER:
+            return "marker"
+        if "cmyk_converted" in codes:
+            return "cmyk"
+        return None
 
     @model_validator(mode="after")
     def _check_file_and_marker(self) -> ImageRef:
@@ -416,6 +519,15 @@ class ImageRef(_Model):
                 )
             if self.marker_image_id == self.id:
                 raise ValueError(f"image {self.id}: an image cannot be its own marker image")
+        return self
+
+    @model_validator(mode="after")
+    def _check_channel(self) -> ImageRef:
+        # A choice is made only where operations.set_channel takes one.
+        if self.channel is not None:
+            blocker = self.channel_blocker
+            if blocker is not None:
+                raise ValueError(f"image {self.id}: {_CHANNEL_BLOCKED[blocker]}")
         return self
 
 
