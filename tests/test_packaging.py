@@ -110,6 +110,71 @@ def test_universal_crt_dlls_are_recognized(name, crt):
 
 
 @pytest.mark.parametrize(
+    ("name", "left_out"),
+    [
+        # The C++ library and the other runtimes the Python build does not include,
+        # which PyInstaller would copy from the build machine's System32 (#54).
+        ("MSVCP140.dll", True),
+        ("msvcp140.DLL", True),
+        ("sub\\MSVCP140.dll", True),
+        ("sub/msvcp140.dll", True),
+        ("MSVCP140_1.dll", True),
+        ("msvcp140_2.dll", True),
+        ("msvcp140_atomic_wait.dll", True),
+        ("msvcp140_codecvt_ids.dll", True),
+        ("concrt140.dll", True),
+        ("vccorlib140.dll", True),
+        ("vcomp140.dll", True),
+        ("vcamp140.dll", True),
+        ("vcruntime140_threads.dll", True),
+        # The Python build's own copies stay, and so do the packages' renamed ones.
+        ("VCRUNTIME140.dll", False),
+        ("vcruntime140_1.dll", False),
+        ("numpy.libs/msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll", False),
+        ("scipy.libs\\msvcp140-0123abcd.dll", False),
+        # Windows' own C++ library and the .NET Framework's copies are not these.
+        ("msvcp_win.dll", False),
+        ("msvcp140_clr0400.dll", False),
+        ("msvcp140.pyd", False),
+        ("ucrtbase.dll", False),
+    ],
+)
+def test_vc_runtime_files_the_python_build_lacks_are_left_out(name, left_out):
+    assert bundle.is_left_out_vc_runtime(name) is left_out
+
+
+def test_the_spec_leaves_out_the_universal_crt_and_the_vc_runtime_python_lacks():
+    entries = [
+        ("python313.dll", r"C:\py\python313.dll", "BINARY"),
+        ("VCRUNTIME140.dll", r"C:\py\vcruntime140.dll", "BINARY"),
+        ("MSVCP140.dll", r"C:\Windows\System32\msvcp140.dll", "BINARY"),
+        ("api-ms-win-crt-heap-l1-1-0.dll", r"C:\Kits\api-ms-win-crt-heap-l1-1-0.dll", "BINARY"),
+        ("numpy.libs\\msvcp140-abc.dll", r"C:\sp\numpy.libs\msvcp140-abc.dll", "BINARY"),
+        ("concrt140.dll", r"C:\Windows\System32\concrt140.dll", "BINARY"),
+        ("ucrtbase.dll", r"C:\Kits\ucrtbase.dll", "BINARY"),
+    ]
+    kept, left_out = bundle.leave_out(entries)
+    assert [entry[0] for entry in kept] == [
+        "python313.dll",
+        "VCRUNTIME140.dll",
+        "numpy.libs\\msvcp140-abc.dll",
+    ]
+    assert left_out == {
+        "universal_crt": ["api-ms-win-crt-heap-l1-1-0.dll", "ucrtbase.dll"],
+        "vc_runtime": ["MSVCP140.dll", "concrt140.dll"],
+    }
+    spec = (WINDOWS / "proteia.spec").read_text(encoding="utf-8")
+    assert "a.binaries, left_out = bundle.leave_out(a.binaries)" in spec
+
+
+def test_the_self_test_knows_the_vc_runtime_names_the_bundle_knows():
+    # The frozen self-test lists the Visual C++ runtime files it loaded from
+    # outside the bundle by the same names the spec leaves out.
+    assert selftest.VC_RUNTIME.pattern == bundle.VC_RUNTIME_FILES.pattern
+    assert selftest.VC_RUNTIME.flags == bundle.VC_RUNTIME_FILES.flags
+
+
+@pytest.mark.parametrize(
     ("version", "numbers"),
     [
         ("0.1.0.dev0", (0, 1, 0, 0)),
@@ -293,6 +358,53 @@ def test_numbers_are_compared_key_by_key():
     ]
 
 
+_SYSTEM_MSVCP = r"C:\Windows\System32\MSVCP140.dll"
+
+
+def test_a_frozen_self_test_that_loaded_the_vc_runtime_from_outside_fails_the_build():
+    assert build.vc_runtime_problem({"vc_runtime_outside": []}) is None
+    problem = build.vc_runtime_problem({"vc_runtime_outside": [_SYSTEM_MSVCP]})
+    assert problem.startswith(
+        r"the self-test loaded Visual C++ runtime files from outside the bundle:"
+        r" C:\Windows\System32\MSVCP140.dll;"
+    )
+    assert "Visual C++ Redistributable" in problem
+    # A report that does not say (an older build, or the listing failed) fails too.
+    assert build.vc_runtime_problem({}) == (
+        "the self-test could not list the Visual C++ runtime files it loaded"
+    )
+    failed = {"vc_runtime_outside": None, "info": {"vc_runtime_error": "OSError: [WinError 5]"}}
+    assert build.vc_runtime_problem(failed) == (
+        "the self-test could not list the Visual C++ runtime files it loaded: OSError: [WinError 5]"
+    )
+
+
+def test_the_build_checks_what_the_frozen_self_test_loaded(tmp_path, monkeypatch):
+    monkeypatch.setenv("UV", "uv")
+    maker = build.Build(tmp_path / "work", tmp_path / "out")
+    outside: list = [[_SYSTEM_MSVCP]]
+
+    def run(argv, **kwargs):
+        frozen = Path(argv[0]).name == bundle.EXE_NAME
+        report = {
+            "ok": True,
+            "steps": [{"name": "imports", "ok": True}],
+            "numbers": {"a": 1.0},
+            # an unfrozen run never lists them (None): only the frozen one is checked
+            "vc_runtime_outside": outside[0] if frozen else None,
+            "info": {},
+        }
+        _file(Path(argv[argv.index("--json") + 1]), json.dumps(report))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    with pytest.raises(build.BuildError, match=r"MSVCP140\.dll"):
+        maker.self_test()
+    outside[0] = []
+    maker.self_test()
+    assert maker.summary["selftest_numbers_agree"] == 1
+
+
 def test_inno_setup_is_looked_for_in_the_variable_then_its_folders(tmp_path):
     env = {
         "ISCC": str(tmp_path / "mine" / "ISCC.exe"),
@@ -335,12 +447,23 @@ def test_the_finished_bundle_is_checked(tmp_path):
     ]
     _file(dist / "_internal" / "tifffile-2026.5.15.dist-info" / "METADATA")
     assert build.bundle_problems(dist) == []
+    # The Python build's Visual C++ runtime and a package's renamed copy may stay.
+    _file(dist / "_internal" / "VCRUNTIME140.dll")
+    _file(dist / "_internal" / "VCRUNTIME140_1.dll")
+    _file(dist / "_internal" / "numpy.libs" / "msvcp140-0123abcd.dll")
+    assert build.bundle_problems(dist) == []
     _file(dist / "_internal" / "PySide6" / "QtCore.pyd")
     _file(dist / "_internal" / "api-ms-win-crt-heap-l1-1-0.dll")
+    _file(dist / "_internal" / "MSVCP140.dll")
+    _file(dist / "_internal" / "beta" / "concrt140.dll")
     assert build.bundle_problems(dist) == [
         "_internal/PySide6 must not be in the bundle",
         "_internal/PySide6/QtCore.pyd must not be in the bundle",
         "_internal/api-ms-win-crt-heap-l1-1-0.dll: a Universal CRT DLL",
+        "_internal/MSVCP140.dll: a Visual C++ runtime file the Python build does not"
+        " include, which the bundle leaves out (#54)",
+        "_internal/beta/concrt140.dll: a Visual C++ runtime file the Python build does"
+        " not include, which the bundle leaves out (#54)",
     ]
 
 
@@ -573,8 +696,9 @@ def test_the_notices_hold_every_section_and_text(stand_in_bundle):
 
 
 def test_each_vc_runtime_file_is_given_where_it_came_from(stand_in_bundle, tmp_path):
-    # Only the Python build's own copies fall under its LICENSE.txt's conditions;
-    # MSVCP140.dll comes from the build machine, NumPy's copy from its wheel.
+    # Only the Python build's own copies fall under its LICENSE.txt's conditions,
+    # and a package's under its wheel's terms; one copied from the build machine
+    # (MSVCP140.dll) or of no known source is refused (#54).
     contents = stand_in_bundle / "_internal"
     python_dir, system_dir = tmp_path / "python", tmp_path / "System32"
     _file(contents / "VCRUNTIME140.dll", "the python build's")
@@ -595,11 +719,17 @@ def test_each_vc_runtime_file_is_given_where_it_came_from(stand_in_bundle, tmp_p
         == "from the beta 2.0 wheel (section 3)"
     )
     assert sources["_internal/MSVCP140_1.dll"] == "source not identified"
+    assert notices.foreign_vc_runtime(vc) == [
+        "_internal/MSVCP140.dll: " + sources["_internal/MSVCP140.dll"] + _NOT_CARRIED,
+        "_internal/MSVCP140_1.dll: source not identified" + _NOT_CARRIED,
+    ]
+    carried = [entry for entry in vc if "MSVCP140" not in entry[0]]
+    assert notices.foreign_vc_runtime(carried) == []
     text = notices.render(
         proteia_version="0.1.0.dev0",
         packages=packages,
         runtime=notices.Runtime("3.13.14", (), "PSF", ()),
-        vc_files=vc,
+        vc_files=carried,
         fonts=notices.font_notes(contents),
         pyinstaller=("6.22.3", "COPYING"),
         freetype=["Pillow"],
@@ -609,9 +739,31 @@ def test_each_vc_runtime_file_is_given_where_it_came_from(stand_in_bundle, tmp_p
     assert notices.VC_REDIST_TERMS in section and '"Distributable Code"' in section
     assert "under the\nconditions in section 1" not in section
     lines = section.splitlines()
-    msvcp = lines.index("  _internal/MSVCP140.dll")
-    assert "System32" in lines[msvcp + 1]
+    vcruntime = lines.index("  _internal/VCRUNTIME140.dll")
+    assert "Python runtime's Windows build" in lines[vcruntime + 1]
+    assert "  _internal/beta.libs/msvcp140-0123abcd.dll" in lines
+    assert "MSVCP140.dll" not in section and "System32" not in section
     assert all(len(line) <= 78 for line in lines)
+
+
+_NOT_CARRIED = (
+    "; the bundle carries only the Python runtime's and the packages' own copies"
+    " of the Visual C++ runtime (#54)"
+)
+
+
+def test_the_notices_refuse_a_vc_runtime_file_from_the_build_machine(
+    stand_in_bundle, tmp_path, monkeypatch, capsys
+):
+    windows = tmp_path / "Windows"
+    _file(windows / "System32" / "msvcp140.dll", "the redistributable's")
+    _file(stand_in_bundle / "_internal" / "MSVCP140.dll", "the redistributable's")
+    monkeypatch.setenv("SystemRoot", str(windows))
+    assert notices.main([str(stand_in_bundle), "--version", "0.1"]) == 1
+    err = capsys.readouterr().err
+    assert "notices: the bundle cannot be covered:" in err
+    assert "_internal/MSVCP140.dll: from the build machine's System32 folder" in err
+    assert not (stand_in_bundle / notices.NOTICES_FILE).exists()
 
 
 def test_a_missing_inno_setup_license_is_reported_without_a_traceback(
@@ -748,6 +900,7 @@ class _Windows:
         self.started: list[_Process] = []
         self.install_error: Exception | None = None
         self.uninstall_leaves_shortcut = False
+        self.vc_runtime_outside: list[str] | None = []  # what the self-test reports
 
     def run(self, argv, **kwargs):
         argv = [str(arg) for arg in argv]
@@ -759,7 +912,12 @@ class _Windows:
                 self.shortcut.unlink(missing_ok=True)
             self.registry.clear()
         elif "--self-test" in argv:
-            report = {"ok": True, "steps": [], "numbers": {}}
+            report = {
+                "ok": True,
+                "steps": [],
+                "numbers": {},
+                "vc_runtime_outside": self.vc_runtime_outside,
+            }
             _file(Path(argv[argv.index("--json") + 1]), json.dumps(report))
         else:  # the installer
             if self.install_error is not None:
@@ -838,6 +996,18 @@ def test_a_check_that_stops_midway_ends_what_it_started_and_uninstalls(faked_che
     assert windows.registry == {} and not windows.shortcut.exists()
     assert not [failure for failure in report["failures"] if failure.startswith("clean-up")]
     json.dumps(report, default=str)  # the report is still written
+
+
+def test_the_installed_self_test_may_load_no_vc_runtime_from_outside(faked_check):
+    module, windows, check = faked_check
+    assert not [f for f in check.run(None)["failures"] if "Visual C++" in f]
+    windows.vc_runtime_outside = [_SYSTEM_MSVCP]
+    report = module.Check(check.setup, check.folder).run(None)
+    [failure] = [f for f in report["failures"] if "Visual C++" in f]
+    assert failure.startswith(
+        "the installed self-test: the self-test loaded Visual C++ runtime files from"
+        r" outside the bundle: C:\Windows\System32\MSVCP140.dll;"
+    )
 
 
 def test_the_clean_up_says_what_it_could_not_remove(faked_check):

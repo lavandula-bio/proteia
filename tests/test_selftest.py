@@ -3,7 +3,11 @@
 writes its report, and names a step that fails without stopping the others.
 The installer build runs the same check inside the frozen bundle."""
 
+import ctypes
 import json
+import os
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +42,7 @@ def test_every_step_passes_here(report):
     assert [step["name"] for step in report["steps"]] == [name for name, _ in selftest.STEPS]
     assert report["proteia"] == proteia.__version__
     assert report["frozen"] is False
+    assert report["vc_runtime_outside"] is None  # listed only in a frozen bundle
 
 
 def test_the_report_names_every_library_version_the_record_reads(report):
@@ -95,6 +100,77 @@ def test_a_failing_step_is_named_and_the_others_still_run(tmp_path, monkeypatch)
         ("statistics", True),
     ]
     assert "left out of the bundle" in result["steps"][0]["error"]
+
+
+_BUNDLE = r"C:\Users\µ\AppData\Local\Programs\Proteia"
+
+
+def test_the_vc_runtime_loaded_from_outside_the_bundle_is_listed():
+    loaded = [
+        rf"{_BUNDLE}\Proteia.exe",
+        rf"{_BUNDLE}\_internal\VCRUNTIME140.dll",
+        rf"{_BUNDLE.lower()}\_internal\vcruntime140_1.dll",  # in the bundle, in any case
+        rf"{_BUNDLE}\_internal\numpy.libs\msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll",
+        r"C:\Windows\System32\MSVCP140.dll",
+        r"C:\Windows\System32\msvcp_win.dll",  # Windows' own C++ library
+        r"C:\Windows\System32\KERNEL32.DLL",
+        r"D:\elsewhere\concrt140.dll",
+        rf"{_BUNDLE} old\_internal\vcruntime140.dll",  # a folder beside it is not in it
+    ]
+    assert selftest.vc_runtime_outside(loaded, Path(_BUNDLE)) == [
+        rf"{_BUNDLE} old\_internal\vcruntime140.dll",
+        r"C:\Windows\System32\MSVCP140.dll",
+        r"D:\elsewhere\concrt140.dll",
+    ]
+    assert selftest.vc_runtime_outside(loaded[:4], Path(_BUNDLE)) == []
+
+
+def _frozen(monkeypatch, loaded) -> None:
+    """Run as a frozen bundle on Windows would, its loaded modules ``loaded`` (a
+    list, or an exception that listing them raises)."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "executable", rf"{_BUNDLE}\Proteia.exe")
+
+    def modules():
+        if isinstance(loaded, Exception):
+            raise loaded
+        return loaded
+
+    monkeypatch.setattr(selftest, "_loaded_modules", modules)
+    # A step that imports nothing: with sys.platform patched, a first import on
+    # another system could take its Windows branch.
+    monkeypatch.setattr(selftest, "STEPS", (("a step", lambda folder, report: None),))
+
+
+def test_a_frozen_run_lists_the_vc_runtime_it_loaded_from_outside(tmp_path, monkeypatch):
+    _frozen(
+        monkeypatch, [rf"{_BUNDLE}\_internal\VCRUNTIME140.dll", r"C:\Windows\System32\MSVCP140.dll"]
+    )
+    report = selftest.run(tmp_path)
+    assert report["frozen"] is True
+    assert report["vc_runtime_outside"] == [r"C:\Windows\System32\MSVCP140.dll"]
+    assert report["ok"]  # a fact for the build to judge (an injected DLL is no failure here)
+
+
+def test_a_frozen_run_that_cannot_list_its_modules_says_so(tmp_path, monkeypatch):
+    _frozen(monkeypatch, OSError(5, "Access is denied"))
+    report = selftest.run(tmp_path)
+    assert report["vc_runtime_outside"] is None
+    assert report["info"]["vc_runtime_error"] == "OSError: [Errno 5] Access is denied"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the modules of a Windows process")
+def test_the_modules_this_process_loaded_are_listed():
+    loaded = selftest._loaded_modules()
+    names = {Path(path).name.lower() for path in loaded}
+    assert f"python{sys.version_info.major}{sys.version_info.minor}.dll" in names
+    system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "msvcp140.dll"
+    if not system.is_file():
+        pytest.skip("no Visual C++ Redistributable here")
+    ctypes.WinDLL(str(system))  # as a module that imports it would load it
+    outside = selftest.vc_runtime_outside(selftest._loaded_modules(), Path(sys.base_prefix))
+    assert str(system).lower() in [path.lower() for path in outside]
 
 
 def test_main_writes_the_report_and_exits_0_or_1(tmp_path, monkeypatch, capsys):

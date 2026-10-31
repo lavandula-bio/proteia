@@ -12,8 +12,10 @@
 # - collects the web client (proteia/web/static) as package data;
 # - limits matplotlib to the Agg, SVG and PDF backends (its hook collects
 #   mpl-data, the fonts the charts are drawn with among it);
-# - leaves out napari, Qt, tkinter and the build tools (bundle.EXCLUDES), and the
-#   Universal CRT DLLs, which Windows 10 and later provide;
+# - leaves out napari, Qt, tkinter and the build tools (bundle.EXCLUDES), the
+#   Universal CRT DLLs, which Windows 10 and later provide, and the Visual C++
+#   runtime files the Python build does not include (MSVCP140.dll), which
+#   PyInstaller would copy from the build machine's System32 (#54);
 # - copies the metadata of every distribution the bundle takes code or data from:
 #   the record reads versions from it, and notices.py reads the license texts;
 #   the build stops if a bundled top-level name belongs to no distribution;
@@ -59,8 +61,7 @@ a = Analysis(  # noqa: F821
     optimize=0,
 )
 
-left_out = sorted(dest for dest, _, _ in a.binaries if bundle.is_universal_crt(dest))
-a.binaries = [entry for entry in a.binaries if not bundle.is_universal_crt(entry[0])]
+a.binaries, left_out = bundle.leave_out(a.binaries)
 
 found, unknown = bundle.bundled_distributions(
     (name for name, _, _ in a.pure),
@@ -90,7 +91,8 @@ with open(os.path.join(workpath, "bundle-manifest.json"), "w", encoding="utf-8")
         "python": sys.version.split()[0],
         "distributions": {name: importlib.metadata.version(name) for name in dists},
         "top_level": {name: sorted(names) for name, names in sorted(found.items())},
-        "universal_crt_left_out": left_out,
+        "universal_crt_left_out": left_out["universal_crt"],
+        "vc_runtime_left_out": left_out["vc_runtime"],
     }
     json.dump(manifest, f, indent=1)
 

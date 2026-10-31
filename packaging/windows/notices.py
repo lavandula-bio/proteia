@@ -11,8 +11,8 @@ besides Proteia ``VERSION``, and every license text it needs:
    (``licenses/cpython-X.Y-incorporated.txt``, with OpenSSL, expat, libffi, zlib
    and libmpdec) and liblzma (``licenses/xz-liblzma.txt``);
 2. the Visual C++ runtime DLLs, wherever they are in the bundle, each with where
-   it came from (the Python build, the build machine's System32, a package's
-   wheel), under a pointer to Microsoft's terms for redistributing them;
+   it came from (the Python build or a package's wheel), under a pointer to
+   Microsoft's terms for redistributing them;
 3. every Python package, from the metadata the spec copied into the bundle:
    name, version, license and every license file it carries (NumPy's, SciPy's
    and Pillow's name the libraries their wheels bundle);
@@ -23,8 +23,11 @@ besides Proteia ``VERSION``, and every license text it needs:
 It runs with the build environment's Python (``build.py`` does so), since the
 runtime and the packages it describes are that environment's. It audits the
 bundle first and exits 1, writing nothing, when an entry of ``_internal`` is
-accounted for by no package's ``RECORD``, the standard library or a runtime, or
-when a package carries no license text: every file shipped needs a notice.
+accounted for by no package's ``RECORD``, the standard library or a runtime,
+when a package carries no license text (every file shipped needs a notice), or
+when a Visual C++ runtime file is neither the Python build's nor a package's own
+copy: one from the build machine's System32, which Microsoft lets only Visual
+Studio licensees redistribute, is never shipped (#54).
 """
 
 from __future__ import annotations
@@ -194,6 +197,14 @@ def _same_file_in(folder: Path, file: Path) -> bool:
     return twin is not None and twin.is_file() and twin.read_bytes() == file.read_bytes()
 
 
+# The sources vc_runtime_sources gives a file the bundle may not carry (#54).
+FROM_SYSTEM = (
+    "from the build machine's System32 folder, where the Visual C++"
+    " Redistributable installs it; the Python build does not include it"
+)
+SOURCE_UNKNOWN = "source not identified"
+
+
 def vc_runtime_sources(
     root: Path,
     files: Sequence[str],
@@ -216,14 +227,23 @@ def vc_runtime_sources(
         elif _same_file_in(python_dir, root / name):
             source = "from the Python runtime's Windows build (section 1)"
         elif _same_file_in(system_dir, root / name):
-            source = (
-                "from the build machine's System32 folder, where the Visual C++"
-                " Redistributable installs it; the Python build does not include it"
-            )
+            source = FROM_SYSTEM
         else:
-            source = "source not identified"
+            source = SOURCE_UNKNOWN
         sources.append((name, source))
     return sources
+
+
+def foreign_vc_runtime(vc_files: Sequence[tuple[str, str]]) -> list[str]:
+    """The Visual C++ runtime files (``(path, source)``, as
+    :func:`vc_runtime_sources` gives them) that are neither the Python build's
+    nor a package's own copy, each with why."""
+    return [
+        f"{name}: {source}; the bundle carries only the Python runtime's and the"
+        " packages' own copies of the Visual C++ runtime (#54)"
+        for name, source in vc_files
+        if source in (FROM_SYSTEM, SOURCE_UNKNOWN)
+    ]
 
 
 def font_notes(contents: Path) -> tuple[list[str], list[tuple[str, str]]]:
@@ -451,17 +471,18 @@ def generate(root: Path, proteia_version: str, inno_license: Path | None = None)
         raise NoticesError(f"Inno Setup's license was not found at {inno_license}")
     contents = root / CONTENTS
     packages = read_packages(contents)
-    problems = audit(contents, packages, sys.stdlib_module_names)
+    system_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    vc_files = vc_runtime_sources(
+        root, vc_runtime_files(root), packages, Path(sys.base_prefix), system_dir
+    )
+    problems = audit(contents, packages, sys.stdlib_module_names) + foreign_vc_runtime(vc_files)
     if problems:
         raise NoticesError("the bundle cannot be covered:\n  " + "\n  ".join(problems))
-    system_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
     return render(
         proteia_version=proteia_version,
         packages=packages,
         runtime=build_runtime(),
-        vc_files=vc_runtime_sources(
-            root, vc_runtime_files(root), packages, Path(sys.base_prefix), system_dir
-        ),
+        vc_files=vc_files,
         fonts=font_notes(contents),
         pyinstaller=pyinstaller_license(),
         freetype=freetype_versions(),

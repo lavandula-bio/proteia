@@ -70,7 +70,22 @@ PYTHON_RUNTIME_FILES: Final = re.compile(
     r"|sqlite3\.dll|base_library\.zip)$",
     re.IGNORECASE,
 )
-VC_RUNTIME_FILES: Final = re.compile(r"^(vcruntime140(_1)?|msvcp140(_\w+)?)\.dll$", re.IGNORECASE)
+# The Visual C++ runtime (Visual Studio 2015 and later) under Microsoft's file
+# names: what the Visual C++ Redistributable installs into System32, and what
+# PyInstaller collects from there for a module that imports it (the names in its
+# depend/dylib.py). A package's renamed copy (numpy.libs/msvcp140-<hash>.dll) is
+# not matched. proteia.selftest.VC_RUNTIME is the same pattern (a test checks).
+VC_RUNTIME_FILES: Final = re.compile(
+    r"^(concrt140|msvcp140(_1|_2|_atomic_wait|_codecvt_ids)?|vccorlib140"
+    r"|vcruntime140(_1|_threads)?|vcamp140|vcomp140)\.dll$",
+    re.IGNORECASE,
+)
+# Of those, the ones the Python runtime's Windows build includes, which its
+# LICENSE.txt covers (notices.py, section 1). The bundle carries no other:
+# Microsoft lets only Visual Studio licensees redistribute the rest, so the spec
+# leaves them out (#54), MSVCP140.dll among them; the build fails if its frozen
+# self-test loads one from outside the bundle (build.py).
+PYTHON_VC_RUNTIME: Final = frozenset({"vcruntime140.dll", "vcruntime140_1.dll"})
 # PyInstaller's own modules in the bundle (its runtime hooks and their helpers).
 PYINSTALLER_MODULES: Final = re.compile(r"^(pyi_rth_\w+|_pyi_rth_utils|pyimod\d\d_\w+)$")
 
@@ -82,6 +97,34 @@ def is_universal_crt(name: str) -> bool:
     out (ADR 0003)."""
     base = PureWindowsPath(name).name.lower()
     return base == "ucrtbase.dll" or (base.startswith("api-ms-win-") and base.endswith(".dll"))
+
+
+def is_left_out_vc_runtime(name: str) -> bool:
+    """Whether ``name`` (a file name or a path in the bundle) is a Visual C++
+    runtime DLL under Microsoft's name (:data:`VC_RUNTIME_FILES`) other than the
+    Python build's (:data:`PYTHON_VC_RUNTIME`), such as ``MSVCP140.dll``: the
+    bundle leaves those out (#54)."""
+    base = PureWindowsPath(name).name
+    return VC_RUNTIME_FILES.match(base) is not None and base.lower() not in PYTHON_VC_RUNTIME
+
+
+def leave_out(
+    binaries: Iterable[tuple[str, str, str]],
+) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
+    """PyInstaller's ``binaries`` (``(name in the bundle, source, kind)``) without
+    the ones the bundle leaves out, and the names of those, by why: the Universal
+    CRT DLLs (:func:`is_universal_crt`) and the Visual C++ runtime the Python build
+    does not include (:func:`is_left_out_vc_runtime`)."""
+    kept: list[tuple[str, str, str]] = []
+    left_out: dict[str, list[str]] = {"universal_crt": [], "vc_runtime": []}
+    for entry in binaries:
+        if is_universal_crt(entry[0]):
+            left_out["universal_crt"].append(entry[0])
+        elif is_left_out_vc_runtime(entry[0]):
+            left_out["vc_runtime"].append(entry[0])
+        else:
+            kept.append(entry)
+    return kept, {reason: sorted(names) for reason, names in left_out.items()}
 
 
 def numeric_version(version: str) -> tuple[int, int, int, int]:

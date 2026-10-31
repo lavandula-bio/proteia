@@ -24,13 +24,16 @@ it fails:
    install that stopped halfway, or another interpreter, makes it anew.
 3. **Bundle.** PyInstaller runs ``proteia.spec`` into ``WORK/dist/Proteia``
    (log: ``WORK/pyinstaller.log``). The bundle may hold no napari, Qt or Tcl
-   file and no Universal CRT DLL, and must hold the web client and the
-   metadata the record reads. ``LICENSE.txt`` and ``THIRD_PARTY_NOTICES.txt``
+   file, no Universal CRT DLL and no Visual C++ runtime file the Python build
+   does not include (``MSVCP140.dll``, #54), and must hold the web client and
+   the metadata the record reads. ``LICENSE.txt`` and ``THIRD_PARTY_NOTICES.txt``
    (``notices.py``) are added to it.
 4. **Self-test.** ``Proteia.exe --self-test`` (:mod:`proteia.selftest`) runs with
    ``PATH`` limited to the Windows folders and per-user folders in ``WORK``, and
    the same test runs unfrozen in the build environment; every number must
-   agree.
+   agree, and the frozen run may have loaded no Visual C++ runtime file from
+   outside the bundle: a Windows without the Visual C++ Redistributable lacks
+   the copies in System32.
 5. **Launch check.** ``smoke.py`` launches the bundle ``--smoke-runs`` times
    (start, token, redirect file, second launch, quit) with a stand-in browser:
    no browser opens.
@@ -187,6 +190,27 @@ def compare_numbers(frozen: Mapping[str, Any], unfrozen: Mapping[str, Any]) -> l
     ]
 
 
+def vc_runtime_problem(report: Mapping[str, Any]) -> str | None:
+    """What a frozen self-test's ``report`` shows wrong with the Visual C++
+    runtime the bundle carries, or None: the test loaded such a file from outside
+    the bundle (a bundled module imports one the bundle leaves out, #54), or
+    could not list them."""
+    outside = report.get("vc_runtime_outside")
+    if outside is None:
+        error = report.get("info", {}).get("vc_runtime_error")
+        return "the self-test could not list the Visual C++ runtime files it loaded" + (
+            f": {error}" if error else ""
+        )
+    if outside:
+        return (
+            "the self-test loaded Visual C++ runtime files from outside the bundle: "
+            + ", ".join(outside)
+            + "; a bundled module imports one the bundle leaves out, and it fails to load"
+            " on a Windows without the Visual C++ Redistributable"
+        )
+    return None
+
+
 def folder_size(folder: Path) -> tuple[int, int]:
     """The bytes and the number of files under ``folder``."""
     files = [path for path in folder.rglob("*") if path.is_file()]
@@ -207,6 +231,12 @@ def bundle_problems(dist: Path) -> list[str]:
     paths = [path.relative_to(dist).as_posix() for path in dist.rglob("*")]
     problems = [f"{path} must not be in the bundle" for path in bundle.forbidden_paths(paths)]
     problems += [f"{path}: a Universal CRT DLL" for path in paths if bundle.is_universal_crt(path)]
+    problems += [
+        f"{path}: a Visual C++ runtime file the Python build does not include, which the"
+        " bundle leaves out (#54)"
+        for path in sorted(paths)
+        if bundle.is_left_out_vc_runtime(path)
+    ]
     if not (contents / "proteia" / "web" / "static" / "index.html").is_file():
         problems.append("the web client (proteia/web/static) is missing")
     metadata = [path.name.split("-")[0] for path in contents.glob("*.dist-info")]
@@ -431,10 +461,14 @@ class Build:
                 "exit": done.returncode,
                 "seconds": seconds,
                 "steps": {step["name"]: step["ok"] for step in reports[name]["steps"]},
+                "vc_runtime_outside": reports[name].get("vc_runtime_outside"),
             }
             if done.returncode != 0 or failed:
                 errors = "; ".join(f"{step['name']}: {step['error']}" for step in failed)
                 raise BuildError(f"the {name} self-test failed ({done.returncode}): {errors}")
+            problem = vc_runtime_problem(reports[name]) if name == "frozen" else None
+            if problem is not None:
+                raise BuildError(f"the frozen bundle is not right: {problem}")
         differences = compare_numbers(reports["frozen"]["numbers"], reports["unfrozen"]["numbers"])
         if differences:
             raise BuildError("frozen and unfrozen numbers differ:\n  " + "\n  ".join(differences))
