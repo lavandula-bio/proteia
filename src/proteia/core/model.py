@@ -1088,9 +1088,14 @@ class Batch(_Model):
                     f"membrane {membrane.id}: calibration point at x={point.x}"
                     f" is right of the edge of {image.id}"
                 )
-            # A mark across the whole width (no x) is read on the area's middle.
-            middle = image.width / 2 if arena.outline is None else arena.outline.centre[0]
-            if not arena.contains(image, middle if point.x is None else point.x, point.y):
+            # A whole-image area's bounds are the image's, checked above; a drawn
+            # one's are its turned outline, where a mark across the whole width (no
+            # x) is read on the outline's middle.
+            outline = arena.outline
+            if outline is None:
+                continue
+            x = outline.centre[0] if point.x is None else point.x
+            if not arena.contains(image, x, point.y):
                 raise ValueError(
                     f"membrane {membrane.id}: calibration point at y={point.y} on {image.id}"
                     f" lies outside its membrane area {arena.id}"

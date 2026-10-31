@@ -448,11 +448,16 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
     images: list[Any] = []
     arena_of: dict[str, str] = {}
     for membrane in _dicts(batch.get("membranes")):
-        held = membrane.pop("images", [])
+        held = membrane.get("images", [])
+        if not isinstance(held, list):
+            continue  # left as it is, for validation to refuse
+        membrane.pop("images", None)
         membrane["lane_table_id"] = table["id"]
         membrane["arenas"] = arenas = []
-        for image in _dicts(held):
-            images.append(image)
+        for image in held:
+            images.append(image)  # whatever it holds: validation refuses what is no image
+            if not isinstance(image, dict):
+                continue
             arena = {"id": new("arena"), "angle_deg": 0.0, "source": "whole_image"}
             if "id" in image:
                 arena["image_id"] = image["id"]  # a missing id stays missing, for validation

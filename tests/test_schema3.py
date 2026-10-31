@@ -63,6 +63,8 @@ V2_CONTENT_HASHES = {
     "padded": "67d1870d1a5d6d3a35cf4d44425cfa8b1df9d939414c56a5b884529de795636b",
     "no_lanes": "c22ace588bbe4b78f5fd40e11a22e10ea71c898c206602b0008e4c2b8f35042c",
     "membrane_without_images": "4301dbaeab90c3f10e2bc035c4ee4fe54454885f5a9e5a13cc6c57e1b4d61429",
+    # The same content: a schema-2 membrane's images default to none.
+    "no_images_key": "4301dbaeab90c3f10e2bc035c4ee4fe54454885f5a9e5a13cc6c57e1b4d61429",
     "empty": "f6ab14dda115562f0f767894caa17ffd8ab5558fa2ba16be7d9650b4727fdb36",
 }
 NEWER = "which this Proteia build cannot read; open the project with a newer build"
@@ -130,9 +132,9 @@ def _no_lanes_doc() -> dict:
     return doc
 
 
-def _membrane_without_images_doc() -> dict:
+def _membrane_without_images_doc(key: bool = True) -> dict:
     doc = sample_doc()
-    doc["batch"]["membranes"].append({"id": "mem-19", "images": []})
+    doc["batch"]["membranes"].append({"id": "mem-19", "images": []} if key else {"id": "mem-19"})
     doc["next_id"] = 20
     return doc
 
@@ -145,6 +147,7 @@ SCHEMA_2_DOCS = {
     "padded": _padded_doc,
     "no_lanes": _no_lanes_doc,
     "membrane_without_images": _membrane_without_images_doc,
+    "no_images_key": lambda: _membrane_without_images_doc(key=False),
     "empty": lambda: {"schema_version": 2},
 }
 
@@ -354,6 +357,12 @@ def test_newer_schema_refused():
             lambda d: d["batch"]["membranes"][0].update(images="x"), id="images-not-a-list"
         ),
         pytest.param(lambda d: d["batch"]["membranes"][0]["images"][0].pop("id"), id="image-no-id"),
+        pytest.param(
+            lambda d: d["batch"]["membranes"][0]["images"][0].update(id=["img-2"]),
+            id="image-id-list",
+        ),
+        pytest.param(lambda d: d["batch"]["membranes"][0]["images"].append(1), id="image-number"),
+        pytest.param(lambda d: d["batch"]["membranes"].append(1), id="membrane-number"),
         pytest.param(lambda d: d["batch"]["proteins"][0].update(image_id="img-99"), id="unknown"),
         pytest.param(lambda d: d["batch"]["proteins"][0].update(image_id=["img-2"]), id="list-id"),
         pytest.param(lambda d: d["batch"]["proteins"][0].update(bands="x"), id="bands-not-a-list"),
@@ -575,6 +584,39 @@ def test_an_outline_centre_outside_the_image_is_invalid():
         "membrane mem-5: the centre (200.5, 50) of area arena-23 lies outside the 200x100 image"
         " img-6" in _refusal(doc)
     )
+
+
+@pytest.mark.parametrize(
+    ("outline", "centre"),
+    [
+        pytest.param((-60, 0, 59, 100), "(-0.5, 50)", id="left"),
+        pytest.param((0, -60, 200, 59), "(100, -0.5)", id="top"),
+        pytest.param((0, 41, 200, 160), "(100, 100.5)", id="bottom"),
+        pytest.param((150, 0, 251, 100), "(200.5, 50)", id="right"),
+    ],
+)
+def test_an_outline_centre_on_each_side_of_the_image(outline, centre):
+    # img-6 is 200x100; the centre may lie on the edge (closed), not past it.
+    corners = dict(zip(("x0", "y0", "x1", "y1"), outline, strict=True))
+    doc = _v3()
+    _arena(doc, "arena-23")["outline"] = corners
+    assert f"the centre {centre} of area arena-23 lies outside the 200x100 image" in (_refusal(doc))
+
+
+def test_an_outline_centre_on_the_edge_belongs():
+    # Centres (0, 50), (200, 50), (100, 0) and (100, 100), reaching past the image.
+    for outline in ((-100, 0, 100, 100), (100, 0, 300, 100), (0, -50, 200, 50), (0, 50, 200, 150)):
+        doc = _v3()
+        # Over a part of img-6 the boxes and the strip edges (x 100) may not reach:
+        # no box, record or point there, so only the centre is checked.
+        doc["batch"]["proteins"].pop(1)  # α-tubulin
+        for protein in doc["batch"]["proteins"]:
+            protein["loading_control_ids"] = []
+        doc["batch"]["membranes"][1]["calibration"]["points"] = []
+        _arena(doc, "arena-23")["outline"] = dict(
+            zip(("x0", "y0", "x1", "y1"), outline, strict=True)
+        )
+        project_from_json(_encode(doc))
 
 
 def test_angle_bounds_and_zero():
