@@ -119,7 +119,7 @@ from test_background_truth import LANES as TRUTH_LANES
 from test_background_truth import _blot as truth_blot
 from test_background_truth import _fold_changes as truth_fold_changes
 from test_background_truth import _worst as truth_worst
-from test_imaging import _cmyk_profile
+from test_imaging import _cmyk_profile, _declared_as, _packed_tiff
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -203,7 +203,7 @@ def import_before_224(
     whose pixels have no fixed range (floating point, or integers other than
     unsigned 8 or 16 bits) with an unknown_bit_depth warning: the same import
     without its refusal. The image's id."""
-    with mock.patch.object(ops, "_refuse_pixel_type", lambda name, loaded: None):
+    with mock.patch.object(ops, "_refuse_pixel_type", lambda name, pixels: None):
         return import_blot(session, pixels, name, polarity, **options)
 
 
@@ -2066,10 +2066,14 @@ def test_inks_the_header_check_misses_are_refused_as_read_with_the_same_answer(t
     ],
 )
 def test_inks_the_header_check_misses_that_reading_refuses_are_not_imported(tmp_path, name, why):
-    # #207 review (fail closed): refused, though not as inks.
+    # #207 review (fail closed): refused, though not as inks. The header check
+    # of the pixel type (#224) would refuse float inks first: it misses too.
     s = session_on(tmp_path)
     source = (_cmyk_files() | _wide_cmyk_files())[name]
-    with mock.patch.object(ops, "ink_set", return_value=None):
+    with (
+        mock.patch.object(ops, "ink_set", return_value=None),
+        mock.patch.object(ops, "declared_pixel_type", return_value=None),
+    ):
         error = _imports_nothing(
             s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
         )
@@ -2824,9 +2828,33 @@ def _lzw_float() -> io.BytesIO:
     )
 
 
-# Files whose pixels have no fixed range, which an import refuses (#224), by
-# the name they are offered under: what the refusal says they hold, and the
-# copy it asks for.
+def _float_with(value: float) -> bytes:
+    """A float TIFF of :func:`blot` with one pixel set to ``value``."""
+    pixels = (blot() / 65535).astype(np.float32)
+    pixels[3, 4] = value
+    return _tiff_bytes(pixels)
+
+
+def _float_stack() -> bytes:
+    """A TIFF of three float images (a stack), as ImageJ's 32-bit type."""
+    data = io.BytesIO()
+    with tifffile.TiffWriter(data) as tif:
+        for _ in range(3):
+            tif.write((blot() / 65535).astype(np.float32))
+    return data.getvalue()
+
+
+def _five_samples() -> bytes:
+    """A float TIFF of one image with five samples a pixel, a layout reading
+    refuses."""
+    pixels = np.dstack([blot() / 65535] * 5).astype(np.float32)
+    return _tiff_bytes(pixels, photometric="minisblack", planarconfig="contig")
+
+
+# Files whose pixels have no known bit depth, which an import refuses (#224),
+# by the name they are offered under: what the refusal says they hold (a
+# TIFF's integers by the width its header says, which a reader may widen),
+# and the copy it asks for.
 _SIXTEEN, _UNSIGNED = "a 16-bit TIFF", "an unsigned 16-bit TIFF"
 _UNKNOWN_DEPTH_FILES = {
     "32-bit µ.tif": (
@@ -2853,9 +2881,57 @@ _UNKNOWN_DEPTH_FILES = {
         "floating-point",
         _SIXTEEN,
     ),
+    # #224 review: refused for its type, not as a file reading refuses: one
+    # NaN or infinite pixel (common in ratio images), a layout of five
+    # samples, a stack, a type Pillow (which reads a TIFF named .png) cannot
+    # read. Each is refused from its header, before it is decoded.
+    "nan µ.tif": (lambda: _float_with(np.nan), "floating-point", _SIXTEEN),
+    "infinite α.tif": (lambda: _float_with(np.inf), "floating-point", _SIXTEEN),
+    "minus infinite β.tif": (lambda: _float_with(-np.inf), "floating-point", _SIXTEEN),
+    "five samples µ.tif": (
+        _five_samples,
+        "floating-point",
+        _SIXTEEN,
+    ),
+    "stack α.tif": (_float_stack, "floating-point", _SIXTEEN),
+    "half named β.png": (
+        lambda: _tiff_bytes(blot().astype(np.float16)),
+        "floating-point",
+        _SIXTEEN,
+    ),
+    # Complex pixels, refused without the warning casting them gives.
     "complex.tif": (lambda: _tiff_bytes(blot().astype(np.complex64)), "complex-valued", _SIXTEEN),
     "uint32.tif": (lambda: _tiff_bytes(blot().astype(np.uint32)), "32-bit integer", _SIXTEEN),
+    # #224 review: the width the file stores, not the reader's: tifffile
+    # widens 24 bits to 32 (and reads them only with imagecodecs), Pillow a
+    # TIFF named .png of 16-bit integers to 32-bit ones, signed.
+    "24-bit µ.tif": (
+        lambda: _packed_tiff(blot().astype(np.uint32) * 200, 24),
+        "24-bit integer",
+        _SIXTEEN,
+    ),
+    "uint32 named α.png": (
+        lambda: _tiff_bytes(blot().astype(np.uint32) * 3),
+        "32-bit integer",
+        _SIXTEEN,
+    ),
+    "int16 named β.png": (
+        lambda: _tiff_bytes((blot() // 2).astype(np.int16)),
+        "signed 16-bit integer",
+        _UNSIGNED,
+    ),
+    # Pillow reads it as unsigned 8-bit (128 for -128): refused by its header.
+    "int8 named µ.png": (
+        lambda: _tiff_bytes((blot() >> 9).astype(np.int8) - 64),
+        "signed 8-bit integer",
+        _UNSIGNED,
+    ),
     "uint64.tif": (lambda: _tiff_bytes(blot().astype(np.uint64)), "64-bit integer", _SIXTEEN),
+    # Widths tifffile has no type for, which reading cannot decode: named by
+    # their header's sample format.
+    "signed 12-bit µ.tif": (lambda: _declared_as(12, 2), "signed 12-bit integer", _UNSIGNED),
+    "128-bit α.tif": (lambda: _declared_as(128, 1), "128-bit integer", _SIXTEEN),
+    "2-bit float β.tif": (lambda: _declared_as(2, 3), "floating-point", _SIXTEEN),
     "int32.tif": (
         lambda: _tiff_bytes(blot().astype(np.int32)),
         "signed 32-bit integer",
@@ -2871,34 +2947,167 @@ _UNKNOWN_DEPTH_FILES = {
         "signed 8-bit integer",
         _UNSIGNED,
     ),
-    "bilevel.tif": (lambda: _tiff_bytes(blot() < 40000, bitspersample=1), "1-bit", _SIXTEEN),
-    "bilevel.png": (lambda: _bilevel_png().getvalue(), "1-bit", _SIXTEEN),
 }
 
 
-# Reading a complex file casts it to real before the import refuses it.
-@pytest.mark.filterwarnings("ignore:Casting complex values to real")
+def _refused_for_type(tmp_path: Path, name: str, data: bytes) -> OperationError:
+    """Import ``data`` offered as ``name`` into a new project: the refusal,
+    which changed nothing (no stored file, no id taken, no autosave)."""
+    recorder = Recorder()
+    s = session_on(tmp_path, recorder)
+    source = io.BytesIO(data)
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
+    )
+    assert (error.code, error.ids, error.detail) == (ErrorCode.UNSUPPORTED_PIXEL_TYPE, (), None)
+    assert _stored_files(s) == []
+    assert s.project.next_id == 1
+    assert recorder.actions == []
+    return error
+
+
+# A refused file warns about nothing: casting complex pixels to gray did.
+@pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize("name", list(_UNKNOWN_DEPTH_FILES))
 def test_a_file_of_unknown_bit_depth_is_refused_on_import_naming_it_and_what_to_do(tmp_path, name):
     # #224: its pixels have no fixed range, so over-exposure could not be
     # checked on it; until #224 an import took it with an unknown_bit_depth
     # warning. The refusal names the file as offered and its pixel type, and
     # changes nothing (no stored file, no autosave).
-    recorder = Recorder()
-    s = session_on(tmp_path, recorder)
     data, what, copy = _UNKNOWN_DEPTH_FILES[name]
-    source = io.BytesIO(data())
-    error = _imports_nothing(
-        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
-    )
-    assert (error.code, error.ids, error.detail) == (ErrorCode.UNSUPPORTED_PIXEL_TYPE, (), None)
+    error = _refused_for_type(tmp_path, name, data())
     assert str(error) == (
         f"{name!r} holds {what} pixels, which Proteia does not import: save it as {copy}"
         " and import it again"
     )
-    assert _stored_files(s) == []
-    assert s.project.next_id == 1
-    assert recorder.actions == []
+
+
+# 1-bit files: each pixel black or white (a mask, a thresholded image).
+_BILEVEL_FILES = {
+    "bilevel µ.tif": lambda: _tiff_bytes(blot() < 40000, bitspersample=1),
+    "bilevel α.png": lambda: _bilevel_png().getvalue(),  # no TIFF: refused as read
+    "bilevel named β.png": lambda: _tiff_bytes(blot() < 40000, bitspersample=1),
+    "bilevel named µ.jpg": lambda: _tiff_bytes(blot() < 40000, bitspersample=1),
+}
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("name", list(_BILEVEL_FILES))
+def test_a_1_bit_file_is_refused_as_holding_no_gray_levels(tmp_path, name):
+    # #224 review: a 16-bit copy of it would hold the same two levels, so
+    # the refusal asks for the image it was made from instead.
+    error = _refused_for_type(tmp_path, name, _BILEVEL_FILES[name]())
+    assert str(error) == (
+        f"{name!r} holds 1-bit pixels, which Proteia does not import: each pixel is black or"
+        " white, so the file holds no gray levels to measure; import the original grayscale"
+        " image instead"
+    )
+
+
+def test_the_original_of_a_1_bit_file_imports(tmp_path):
+    # The 1-bit refusal's next step done: the grayscale image it was
+    # thresholded from imports, with its bit depth.
+    s = session_on(tmp_path)
+    error = _imports_nothing(s, lambda: import_blot(s, blot() < 40000, "mask µ.tif"))
+    assert str(error).startswith("'mask µ.tif' holds 1-bit pixels")
+    image_id = import_blot(s, blot(), "mask µ.tif")
+    image = s.project.batch.find_image(image_id)
+    assert (image_id, image.bit_depth, image.import_warnings) == ("img-1", 16, [])
+
+
+def _not_called(what: str):
+    def fail(*args, **kwargs):
+        raise AssertionError(f"{what} was called")
+
+    return fail
+
+
+_REFUSED_TIFFS = {
+    **{name: data for name, (data, _, _) in _UNKNOWN_DEPTH_FILES.items()},
+    **{name: data for name, data in _BILEVEL_FILES.items() if name != "bilevel α.png"},
+}
+
+
+@pytest.mark.parametrize("name", list(_REFUSED_TIFFS))
+def test_a_tiff_refused_for_its_type_is_not_decoded(tmp_path, name, monkeypatch):
+    # #224 review: a TIFF refused for its pixel type is refused from its
+    # header: its pixels are not read, converted or scanned (memory, time).
+    monkeypatch.setattr(imaging, "_read_tiff", _not_called("the TIFF reader"))
+    monkeypatch.setattr(imaging, "_read_other", _not_called("the other reader"))
+    _refused_for_type(tmp_path, name, _REFUSED_TIFFS[name]())
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    ("name", "data", "what", "copy"),
+    [
+        ("bilevel α.png", lambda: _bilevel_png().getvalue(), None, None),
+        # A TIFF the header check let through, as a reader may give a type its
+        # header does not say: refused as read, before a NaN pixel stops the
+        # conversion, and named without a width.
+        ("nan µ.tif", lambda: _float_with(np.nan), "floating-point pixels", _SIXTEEN),
+        (
+            "complex β.tif",
+            lambda: _tiff_bytes(blot().astype(np.complex64)),
+            "complex-valued pixels",
+            _SIXTEEN,
+        ),
+        (
+            "int16 µ.tif",
+            lambda: _tiff_bytes((blot() // 2).astype(np.int16)),
+            "integer pixels that are not unsigned 8- or 16-bit",
+            _UNSIGNED,
+        ),
+        (
+            "uint32 α.tif",
+            lambda: _tiff_bytes(blot().astype(np.uint32)),
+            "integer pixels that are not unsigned 8- or 16-bit",
+            _UNSIGNED,
+        ),
+        ("bilevel β.tif", lambda: _tiff_bytes(blot() < 40000, bitspersample=1), None, None),
+    ],
+)
+def test_pixels_of_a_type_the_header_did_not_say_are_refused_as_read_before_conversion(
+    tmp_path, monkeypatch, name, data, what, copy
+):
+    # Failing closed (#224): a file whose header declares no such type (a PNG
+    # is no TIFF) is refused for the pixels its reader gives, before they are
+    # converted to gray or scanned.
+    monkeypatch.setattr(ops, "_header_pixel_type", lambda path: None)
+    monkeypatch.setattr(imaging, "to_analysis_array", _not_called("the conversion"))
+    error = _refused_for_type(tmp_path, name, data())
+    if what is None:
+        assert str(error).startswith(f"{name!r} holds 1-bit pixels, which Proteia does not import")
+    else:
+        assert str(error) == (
+            f"{name!r} holds {what}, which Proteia does not import: save it as {copy} and"
+            " import it again"
+        )
+
+
+def test_a_header_that_cannot_be_read_leaves_the_reading_to_say_why(tmp_path):
+    # The header check only refuses: a header it cannot read (damaged, or
+    # untyped samples of a width tifffile has no type for) is refused by
+    # reading it, as before #224.
+    path = tmp_path / "damaged µ.tif"
+    path.write_bytes(b"II*\x00")
+    assert ops._header_pixel_type(path) is None
+    assert ops._header_pixel_type(tmp_path / "missing.tif") is None
+    s = session_on(tmp_path)
+    for name, data in (
+        ("damaged µ.tif", b"II*\x00"),
+        ("untyped 128-bit α.tif", _declared_as(128, 4)),
+        ("undefined format β.tif", _declared_as(16, 7)),
+    ):
+        source = io.BytesIO(data)
+        error = _imports_nothing(
+            s,
+            lambda source=source, name=name: ops.import_image(
+                s, source, name, kind=CHEMI, polarity=DARK
+            ),
+        )
+        assert error.code is ErrorCode.UNREADABLE_IMAGE
+        assert str(error).startswith(f"cannot read {name!r}: ")
 
 
 @pytest.mark.parametrize(("suffix", "warnings"), [(".png", []), (".jpg", ["lossy_format"])])
@@ -2930,9 +3139,16 @@ def test_a_big_endian_16_bit_tiff_named_otherwise_is_imported_with_its_bit_depth
 
 def test_a_pixel_type_no_reader_gives_is_named_as_numpy_names_it():
     # Readers give unsigned, signed, floating-point, complex or 1-bit pixels;
-    # a refusal of any other kind names it rather than failing on it.
-    assert ops._pixel_type(np.dtype("m8[s]")) == "timedelta64[s]"
-    assert ops._pixel_type(np.dtype(np.uint32)) == "32-bit integer"
+    # a refusal of any other kind names it rather than failing on it, and
+    # nothing is refused for a known bit depth.
+    with pytest.raises(OperationError) as info:
+        ops._refuse_pixel_type("odd µ.tif", imaging.pixel_type(np.zeros(3, dtype="m8[s]")))
+    assert (info.value.code, str(info.value)) == (
+        ErrorCode.UNSUPPORTED_PIXEL_TYPE,
+        "'odd µ.tif' holds timedelta64[s] pixels, which Proteia does not import: save it as"
+        " a 16-bit TIFF and import it again",
+    )
+    assert ops._refuse_pixel_type("blot α.tif", None) is None
 
 
 def test_a_floating_point_tiff_is_refused_in_the_words_of_224(tmp_path):

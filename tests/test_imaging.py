@@ -343,17 +343,210 @@ def _rgb8() -> np.ndarray:
 @pytest.mark.parametrize("suffix", [".png", ".jpg"])
 def test_a_big_endian_16_bit_tiff_named_otherwise_has_its_bit_depth(tmp_path, suffix):
     # Pillow, which reads a TIFF named .png or .jpg by its suffix, keeps a
-    # big-endian file's byte order; reading gives the machine's, so the file
-    # has its 16 bits. Its depth was unknown before, which an import now
-    # refuses (#224).
+    # big-endian file's byte order, and reading gives its pixels so, as it did
+    # before #224 (the self-test records their bytes). The bit depth is the
+    # same in either byte order: its depth was unknown before, which an import
+    # now refuses (#224).
     pixels = _gray(np.uint16, 65535)
     path = tmp_path / f"big-endian µ{suffix}"
     tifffile.imwrite(path, pixels.astype(">u2"), byteorder=">")
     loaded = load_image(path)
     np.testing.assert_array_equal(loaded.pixels, pixels)
-    assert loaded.pixels.dtype.isnative
+    assert loaded.pixels.dtype == np.dtype(">u2")  # as read, not converted
     assert loaded.bit_depth == 16
     assert _codes(loaded) == (["lossy_format"] if suffix == ".jpg" else [])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "depth"),
+    [
+        (np.uint8, 8),
+        (np.uint16, 16),
+        (np.int8, None),
+        (np.int16, None),
+        (np.uint32, None),
+        (np.float16, None),
+        (np.float32, None),
+        (np.complex64, None),
+        (np.bool_, None),
+    ],
+)
+@pytest.mark.filterwarnings("ignore:Casting complex values to real")  # from_pixels of complex
+def test_the_bit_depth_is_the_same_in_either_byte_order(dtype, depth):
+    # #224 review: an unsigned 16-bit image in the other byte order (Pillow
+    # keeps a big-endian TIFF's) has its 16 bits, not an unknown depth.
+    native = np.dtype(dtype)
+    for order in (native, native.newbyteorder("S")):
+        assert imaging.bit_depth_of(np.zeros((2, 3), dtype=order)) == depth
+        assert from_pixels(np.ones((2, 3), dtype=order)).bit_depth == depth
+
+
+def _packed_tiff(values: np.ndarray, bits: int, sampleformat: int = 1) -> bytes:
+    """A little-endian, uncompressed, single-strip gray TIFF of ``values``
+    stored ``bits`` wide (a whole number of bytes, each in the file's byte
+    order), with the SampleFormat tag ``sampleformat`` (1 unsigned, 2 signed
+    integer): a layout tifffile writes only with imagecodecs, such as 24-bit
+    unsigned integers."""
+    height, width = values.shape
+    size = bits // 8
+    signed = sampleformat == 2
+    data = b"".join(int(v).to_bytes(size, "little", signed=signed) for v in values.ravel())
+    tags = [
+        (256, 3, width),  # ImageWidth
+        (257, 3, height),  # ImageLength
+        (258, 3, bits),  # BitsPerSample
+        (259, 3, 1),  # Compression: none
+        (262, 3, 1),  # PhotometricInterpretation: black is zero
+        (273, 4, 0),  # StripOffsets: set below
+        (277, 3, 1),  # SamplesPerPixel
+        (278, 3, height),  # RowsPerStrip
+        (279, 4, len(data)),  # StripByteCounts
+        (339, 3, sampleformat),  # SampleFormat
+    ]
+    offset = 8 + 2 + 12 * len(tags) + 4
+    ifd = struct.pack("<H", len(tags))
+    for tag, kind, value in tags:
+        value = offset if tag == 273 else value
+        packed = struct.pack("<HH", value, 0) if kind == 3 else struct.pack("<I", value)
+        ifd += struct.pack("<HHI", tag, kind, 1) + packed
+    return b"II*\x00" + struct.pack("<I", 8) + ifd + struct.pack("<I", 0) + data
+
+
+def test_a_hand_made_24_bit_tiff_is_what_its_header_says():
+    # The helper's file is a TIFF of 24-bit unsigned integers, which tifffile
+    # widens to 32 bits but reads only with imagecodecs.
+    values = np.array([[0, 1, 2**23], [2**24 - 1, 70000, 5]], dtype=np.uint32)
+    with tifffile.TiffFile(BytesIO(_packed_tiff(values, 24))) as tif:
+        page = tif.pages.first
+        assert (page.shape, page.bitspersample, page.dtype) == ((2, 3), 24, np.uint32)
+        assert page.tags["StripByteCounts"].value == (18,)
+    signed = np.array([[-3, 0], [32767, -32768]])
+    with tifffile.TiffFile(BytesIO(_packed_tiff(signed, 16, 2))) as tif:
+        page = tif.pages.first
+        assert (page.bitspersample, page.dtype) == (16, np.int16)
+        np.testing.assert_array_equal(page.asarray(), signed)
+
+
+def _three_pages(pixels: np.ndarray):
+    def write(path):
+        with tifffile.TiffWriter(path) as tif:
+            for _ in range(3):
+                tif.write(pixels)
+
+    return write
+
+
+def _patched_header(data: bytes, bits: int, sampleformat: int) -> bytes:
+    """A :func:`_packed_tiff` file whose header says its samples are ``bits``
+    wide, of ``sampleformat`` (1 unsigned, 2 signed integer, 3 floating
+    point, 4 untyped), whatever its data."""
+    patched = bytearray(data)
+    for tag, value in ((258, bits), (339, sampleformat)):
+        at = patched.index(struct.pack("<HHI", tag, 3, 1)) + 8
+        patched[at : at + 2] = struct.pack("<H", value)
+    return bytes(patched)
+
+
+def _declared_as(bits: int, sampleformat: int) -> bytes:
+    """A TIFF whose header declares samples ``bits`` wide, of ``sampleformat``
+    (:func:`_patched_header`); its data is not read."""
+    return _patched_header(_packed_tiff(np.zeros((6, 8), dtype=np.int64), 16), bits, sampleformat)
+
+
+# A TIFF's header and the pixel type it declares when its bit depth is
+# unknown (#224), by file: numpy's kind of it, and the bits per sample the
+# file stores; None when the depth is known or the file no TIFF.
+_DECLARED_TYPES = {
+    "float µ.tif": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535).astype(np.float32)),
+        ("f", 32),
+    ),
+    "half α.tif": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint8, 255).astype(np.float16)),
+        ("f", 16),
+    ),
+    # Whatever its suffix: Pillow, which reads it by its suffix, cannot.
+    "double named β.png": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535).astype(np.float64)),
+        ("f", 64),
+    ),
+    "big-endian float.TIF": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint8, 255).astype(">f4"), byteorder=">"),
+        ("f", 32),
+    ),
+    "24-bit µ.tif": (
+        lambda path: path.write_bytes(_packed_tiff(_gray(np.uint32, 2**24 - 1), 24)),
+        ("u", 24),
+    ),
+    # Pillow reads it into 32-bit integers: the file's are 16.
+    "int16 named α.png": (lambda path: tifffile.imwrite(path, _gray(np.int16, 32767)), ("i", 16)),
+    "uint32 β.tif": (lambda path: tifffile.imwrite(path, _gray(np.uint32, 2**32 - 1)), ("u", 32)),
+    "bilevel µ.tif": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint8, 255) > 99, bitspersample=1),
+        ("b", 1),
+    ),
+    "complex α.tif": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint8, 255).astype(np.complex64)),
+        ("c", 64),
+    ),
+    # The first image's: a stack of them is refused as one when read.
+    "float stack β.tif": (_three_pages(_gray(np.uint8, 255).astype(np.float32)), ("f", 32)),
+    # Widths tifffile has no type for, named by their sample format.
+    "signed 12-bit µ.tif": (lambda path: path.write_bytes(_declared_as(12, 2)), ("i", 12)),
+    "128-bit α.tif": (lambda path: path.write_bytes(_declared_as(128, 1)), ("u", 128)),
+    "2-bit float β.tif": (lambda path: path.write_bytes(_declared_as(2, 3)), ("f", 2)),
+    # A known bit depth, in either byte order.
+    "uint16 µ.tif": (lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535)), None),
+    "uint8 α.tif": (lambda path: tifffile.imwrite(path, _gray(np.uint8, 255)), None),
+    "big-endian 16 named β.png": (
+        lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535).astype(">u2"), byteorder=">"),
+        None,
+    ),
+    # Untyped samples, which tifffile reads as unsigned integers.
+    "untyped 16-bit µ.tif": (lambda path: path.write_bytes(_declared_as(16, 4)), None),
+    # Not a TIFF: its pixel type is told as read.
+    "bilevel α.png": (lambda path: Image.fromarray(_gray(np.uint8, 255) > 99).save(path), None),
+}
+
+
+@pytest.mark.parametrize("name", list(_DECLARED_TYPES))
+def test_a_tiff_header_declares_the_type_of_pixels_with_no_known_bit_depth(tmp_path, name):
+    # #224 review: an import refuses such a file from its header, before
+    # decoding it, and names the width the file stores, which a reader may
+    # widen (tifffile 24 bits into 32, Pillow 16-bit integers into 32).
+    write, expected = _DECLARED_TYPES[name]
+    path = tmp_path / name
+    write(path)
+    declared = imaging.declared_pixel_type(path)
+    if expected is None:
+        assert declared is None
+    else:
+        assert declared == imaging.PixelType(*expected, "")
+        assert type(declared.bits) is int
+
+
+@pytest.mark.parametrize(
+    ("data", "error", "message"),
+    [
+        (b"II*\x00", ValueError, None),  # truncated
+        (b"MM\x00*\x00\x00\x00\x08\x00\x01\x01\x00\x00\x09", ValueError, None),  # damaged
+        (None, OSError, None),  # no such file
+        # Untyped samples of a width tifffile has no type for, complex ones,
+        # and sample formats TIFF does not define.
+        (_declared_as(128, 4), ValueError, "(128-bit samples of format 4)"),
+        (_declared_as(16, 6), ValueError, "(16-bit samples of format 6)"),
+        (_declared_as(16, 7), ValueError, "(16-bit samples of format 7)"),
+        (_declared_as(16, 0), ValueError, "(16-bit samples of format 0)"),
+    ],
+)
+def test_a_header_that_cannot_be_read_declares_no_type(tmp_path, data, error, message):
+    path = tmp_path / "damaged µ.tif"
+    if data is not None:
+        path.write_bytes(data)
+    with pytest.raises(error) as info:
+        imaging.declared_pixel_type(path)
+    if message is not None:
+        assert str(info.value) == f"damaged µ.tif: not a readable image {message}"
 
 
 @pytest.mark.parametrize(

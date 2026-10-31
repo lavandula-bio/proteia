@@ -24,12 +24,15 @@ Pillow would read as its first image (:func:`check_misnamed_tiff`).
 A TIFF in any other colour space that is not gray, RGB or a palette (CIELAB,
 YCbCr, ...) is refused with the colour space's name rather than read wrong.
 
-``bit_depth`` is the container depth of unsigned integer data (8 or 16), which
-sets the detector limit for the over-exposure check. Other pixel types (float,
-32-bit) have no fixed limit, so their depth is ``None`` and reading records an
-``unknown_bit_depth`` warning. Since #224 an import refuses them
-(:func:`~proteia.core.operations.import_image`): reading one still takes it,
-for the images imported before. Problems found on import become
+``bit_depth`` is the container depth of unsigned integer data (8 or 16, in
+either byte order), which sets the detector limit for the over-exposure check.
+Other pixel types (float, 32-bit) have no fixed limit, so their depth is
+``None`` and reading records an ``unknown_bit_depth`` warning. Since #224 an
+import refuses them (:func:`~proteia.core.operations.import_image`) before they
+are converted: a TIFF's from its header (:func:`declared_pixel_type`), before
+its pixels are read, and any other file's as read (:func:`read_file`,
+:func:`pixel_type`). Reading one still takes it, for the images imported
+before. Problems found on import become
 :class:`~proteia.core.model.ImageWarning` records, which the project keeps with
 the image. One of them, ``looks_processed``
 (#127), says that the image looks like a figure prepared for display rather than
@@ -347,7 +350,7 @@ def _check_inks(page: tifffile.TiffPage, name: str) -> None:
     elif inks != 4 or declared != 4:
         count = declared if declared != 4 else inks
         problem = f"{count} ink{'' if count == 1 else 's'}"
-    elif page.dtype not in _BIT_DEPTHS:
+    elif page.dtype not in _BIT_DEPTHS:  # tifffile's header type: in the machine's order
         problem = f"{page.dtype} inks"
     else:
         return
@@ -474,14 +477,27 @@ def read_pixels(path: str | os.PathLike[str]) -> np.ndarray:
     decode on its own); a CMYK JPEG with Pillow; other formats go through
     scikit-image.
     """
-    return _read(Path(path))[0]
+    return read_file(path).pixels
 
 
-def _read(path: Path) -> tuple[np.ndarray, bool, str | None, bool]:
+class FilePixels(NamedTuple):
+    """A file's pixels as read (:func:`read_file`), before they are converted
+    to the analysis array (:func:`load_pixels`)."""
+
+    pixels: np.ndarray  # as stored, except that CMYK is converted
+    lossy: bool
+    cmyk: str | None  # how its CMYK was converted (a CMYK_CONVERSIONS key); None if not CMYK
+    palette: bool  # its pixels are a palette's colours (a palette PNG)
+
+
+def read_file(path: str | os.PathLike[str]) -> FilePixels:
     """Read a file: its pixels, whether it is lossy, how its CMYK was converted
     (None if it is not CMYK), and whether its pixels are a palette's colours (a
     palette PNG; a palette TIFF reads as its indices); every failure to read it
-    becomes a ``ValueError`` or ``OSError``."""
+    becomes a ``ValueError`` or ``OSError``, and so does a layout other than a
+    single image. Its pixels are not yet converted to the analysis array, so
+    that an import can refuse their type first (#224)."""
+    path = Path(path)
     try:
         if path.suffix.lower() in TIFF_SUFFIXES:
             pixels, lossy, cmyk = _read_tiff(path)
@@ -494,7 +510,7 @@ def _read(path: Path) -> tuple[np.ndarray, bool, str | None, bool]:
     except Exception as exc:  # a damaged file: struct.error, SyntaxError from Pillow, ...
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     _check_layout(pixels, path.name)
-    return pixels, lossy, cmyk, palette
+    return FilePixels(pixels, lossy, cmyk, palette)
 
 
 # Pillow's modes of a palette image, which reads as its palette's colours.
@@ -507,9 +523,9 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
 
     A CMYK JPEG is decoded by Pillow, which reads an Adobe JPEG's inverted inks
     the right way up, and converted with the ICC profile it embeds, if any;
-    anything else goes through scikit-image. Its pixels come in the machine's
-    byte order, so that a 16-bit TIFF in big-endian order named .png, which
-    Pillow reads in the file's, has its bit depth (#224).
+    anything else goes through scikit-image. A 16-bit TIFF named .png comes in
+    the file's byte order, as Pillow reads it, and has its bit depth in either
+    (:func:`bit_depth_of`).
     """
     from PIL import Image
 
@@ -525,10 +541,7 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
     if inks is None:
         from skimage import io
 
-        pixels = io.imread(path)
-        if not pixels.dtype.isnative:
-            pixels = pixels.astype(pixels.dtype.newbyteorder("="))
-        return pixels, None, palette
+        return io.imread(path), None, palette
     rgb, how = _cmyk_to_rgb(inks, profile)
     return rgb, how, False
 
@@ -708,8 +721,83 @@ def to_analysis_array(
 
 
 def bit_depth_of(pixels: np.ndarray) -> int | None:
-    """8 or 16 for unsigned integer pixels; ``None`` for any other pixel type."""
-    return _BIT_DEPTHS.get(pixels.dtype)
+    """8 or 16 for unsigned integer pixels, in either byte order (Pillow keeps
+    a big-endian TIFF's); ``None`` for any other pixel type."""
+    return _depth_of(pixels.dtype)
+
+
+def _depth_of(dtype: np.dtype) -> int | None:
+    """The bit depth of unsigned integers of one or two bytes, in either byte
+    order; None for any other type."""
+    return _BIT_DEPTHS.get(dtype.newbyteorder("="))
+
+
+class PixelType(NamedTuple):
+    """Pixels with no known bit depth (:func:`bit_depth_of`), which an import
+    refuses (#224), as a reader gives them or a TIFF's header declares them."""
+
+    # numpy's kind: "f" floating point, "c" complex, "b" 1-bit, "u" unsigned
+    # or "i" signed integer, or another that no reader gives.
+    kind: str
+    # The bits per sample the file stores, where its header says; None
+    # otherwise: a reader may widen them (tifffile 24 bits to 32, Pillow a
+    # TIFF's 16-bit integers to signed 32).
+    bits: int | None
+    # numpy's name of the type as read, for a kind no reader gives; a
+    # header's kinds are those of its sample formats.
+    name: str = ""
+
+
+def pixel_type(pixels: np.ndarray) -> PixelType | None:
+    """The type of ``pixels`` as read if it has no known bit depth, without
+    the width the file stores; None if it has one."""
+    if bit_depth_of(pixels) is not None:
+        return None
+    return PixelType(pixels.dtype.kind, None, pixels.dtype.name)
+
+
+# numpy's kind of a TIFF sample format of a width tifffile has no type for (a
+# signed 12-bit integer, a 128-bit one), so that a header names it all the same.
+_SAMPLE_KINDS: Final = {
+    tifffile.SAMPLEFORMAT.UINT: "u",
+    tifffile.SAMPLEFORMAT.INT: "i",
+    tifffile.SAMPLEFORMAT.IEEEFP: "f",
+}
+
+
+def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
+    """The type a TIFF's header declares for its pixels (a TIFF by its first
+    bytes, whatever its suffix) if it has no known bit depth, with its bits
+    per sample, so that an import refuses the file before decoding it (#224).
+    It is the first image's, as tifffile reads it: a stack is refused as one
+    when read. A TIFF named otherwise is read by Pillow, which reads a signed
+    8-bit one as unsigned, and is refused by its header all the same. A type
+    tifffile does not read (signed 12-bit integers) is named by its sample
+    format.
+
+    None for a file that is not a TIFF (its type is told as read,
+    :func:`pixel_type`), and for a TIFF whose pixels have a known bit depth.
+    A file it cannot read raises ``ValueError`` or ``OSError``.
+    """
+    path = Path(path)
+    try:
+        if not _holds_tiff(path):
+            return None
+        with tifffile.TiffFile(path) as tif:
+            page = _first_page(tif, path.name)
+            dtype, bits, sampleformat = page.dtype, int(page.bitspersample), page.sampleformat
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:  # a damaged file: struct.error, ...
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+    if dtype is not None:
+        return None if _depth_of(dtype) is not None else PixelType(dtype.kind, bits)
+    kind = _SAMPLE_KINDS.get(sampleformat)
+    if kind is None:  # untyped (VOID), complex or unknown samples of such a width
+        raise ValueError(
+            f"{path.name}: not a readable image ({bits}-bit samples of format {int(sampleformat)})"
+        )
+    return PixelType(kind, bits)
 
 
 # The looks_processed warning (#127): signals that an image was prepared for
@@ -910,8 +998,13 @@ def load_image(path: str | os.PathLike[str]) -> LoadedImage:
     converted to red, green and blue. ``looks_processed`` depends on the
     polarity, so the import adds it (:func:`assess_processed`).
     """
-    pixels, lossy, cmyk, palette = _read(Path(path))
-    return from_pixels(pixels, lossy=lossy, cmyk=cmyk, palette=palette)
+    return load_pixels(read_file(path))
+
+
+def load_pixels(read: FilePixels) -> LoadedImage:
+    """A file's pixels as read (:func:`read_file`) as :func:`load_image` loads
+    them: in an analysis array, with their bit depth and warnings."""
+    return from_pixels(read.pixels, lossy=read.lossy, cmyk=read.cmyk, palette=read.palette)
 
 
 def preview(pixels: np.ndarray) -> np.ndarray:

@@ -700,7 +700,7 @@ def test_a_floating_point_tiff_is_refused_and_one_imported_before_224_is_shown(
     )
     assert client.ok("GET", "/api/project")["project"]["images"] == []
     with monkeypatch.context() as before_224:
-        before_224.setattr(ops, "_refuse_pixel_type", lambda name, loaded: None)
+        before_224.setattr(ops, "_refuse_pixel_type", lambda name, pixels: None)
         status, answer = upload(client, data.getvalue(), name="32-bit µ.tif")
     assert status == 201, answer
     [image] = answer["project"]["images"]
