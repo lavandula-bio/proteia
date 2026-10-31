@@ -43,11 +43,7 @@ The steps, each run even when an earlier one failed:
 ``--json PATH`` writes the report there too (as UTF-8); ``--keep`` leaves the
 temporary folder. The report's ``numbers`` are what the analysis computed, the
 same in every installation of one build on one machine; ``info`` holds the
-rest (sizes, times, paths). In a frozen bundle on Windows,
-``vc_runtime_outside`` lists the Visual C++ runtime files the process loaded
-from outside the bundle, after every step (#54): the installer build refuses a
-bundle with any, since a Windows without the Visual C++ Redistributable lacks
-them; it is None elsewhere, and when they could not be listed.
+rest (sizes, times, paths).
 """
 
 from __future__ import annotations
@@ -68,8 +64,8 @@ import tempfile
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterable, Sequence
-from pathlib import Path, PurePath, PureWindowsPath
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any, Final
 
 import proteia
@@ -134,17 +130,6 @@ MODULES: Final = (
 # Not in a frozen bundle (ADR 0003): napari, which Proteia no longer uses (#57),
 # Qt, and tkinter.
 LEFT_OUT: Final = ("napari", "PySide6", "shiboken6", "qtpy", "tkinter")
-# The Visual C++ runtime under Microsoft's file names (the installer build's
-# packaging/windows/bundle.py VC_RUNTIME_FILES; a test keeps them equal). A frozen
-# bundle carries the copies it needs; one loaded from elsewhere, such as the
-# Visual C++ Redistributable's in System32, is missing on a Windows without the
-# Redistributable, where the module that needs it fails to load (#54). The
-# report lists them (``vc_runtime_outside``) and the build refuses the bundle.
-VC_RUNTIME: Final = re.compile(
-    r"^(concrt140|msvcp140(_1|_2|_atomic_wait|_codecvt_ids)?|vccorlib140"
-    r"|vcruntime140(_1|_threads)?|vcamp140|vcomp140)\.dll$",
-    re.IGNORECASE,
-)
 
 # Fixed values for the statistics step: two or three conditions of 4 values, and
 # two with tied values (the Mann-Whitney U test's permutation path).
@@ -505,58 +490,6 @@ def _web_flow(client: _Client, root: Path, report: Report, record_file: str) -> 
     report["info"]["web"] = {"charts": len(charts), "previews": len(images)}
 
 
-def vc_runtime_outside(modules: Iterable[str], bundle: PurePath) -> list[str]:
-    """The ``modules`` (the files of loaded DLLs, Windows paths) named like a
-    Visual C++ runtime file (:data:`VC_RUNTIME`) that are not in the folder
-    ``bundle``, sorted."""
-    inside = str(PureWindowsPath(str(bundle))).lower().rstrip("\\") + "\\"
-    return sorted(
-        path
-        for path in modules
-        if VC_RUNTIME.match(PureWindowsPath(path).name)
-        and not str(PureWindowsPath(path)).lower().startswith(inside)
-    )
-
-
-# Room for the modules _loaded_modules lists: far more than the about 190 that a
-# frozen Proteia loads.
-_MAX_MODULES: Final = 4096
-
-
-def _loaded_modules() -> list[str]:
-    """The files of the DLLs this process has loaded (Windows); ``OSError`` when
-    Windows does not list them all."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.K32EnumProcessModules.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(wintypes.HMODULE),
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    kernel32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
-    handles = (wintypes.HMODULE * _MAX_MODULES)()
-    needed = wintypes.DWORD()
-    process = kernel32.GetCurrentProcess()
-    listed = kernel32.K32EnumProcessModules(
-        process, handles, ctypes.sizeof(handles), ctypes.byref(needed)
-    )
-    if not listed:  # never: listing this process's own modules does not fail
-        raise ctypes.WinError(ctypes.get_last_error())
-    if needed.value > ctypes.sizeof(handles):  # never: no Proteia loads 4096 modules
-        raise OSError(f"more than {_MAX_MODULES} modules are loaded")
-    buffer = ctypes.create_unicode_buffer(32768)
-    count = needed.value // ctypes.sizeof(wintypes.HMODULE)
-    return [
-        buffer.value
-        for handle in handles[:count]
-        if kernel32.GetModuleFileNameW(handle, buffer, len(buffer))
-    ]
-
-
 STEPS: Final[tuple[tuple[str, Callable[[Path, Report], None]], ...]] = (
     ("imports", _imports),
     ("versions", _versions),
@@ -577,7 +510,6 @@ def run(folder: Path) -> Report:
         "steps": [],
         "numbers": {},
         "versions": {},
-        "vc_runtime_outside": None,  # listed in a frozen bundle on Windows only
         "info": {},
     }
     for number, (name, step) in enumerate(STEPS, 1):
@@ -592,15 +524,6 @@ def run(folder: Path) -> Report:
         outcome["seconds"] = round(time.perf_counter() - start, 3)
         report["steps"].append(outcome)
     report["ok"] = all(outcome["ok"] for outcome in report["steps"])
-    if report["frozen"] and sys.platform == "win32":
-        # After every step, so that whatever they loaded is listed. A fact for the
-        # build to judge, not a failed step: on a user's machine, another program
-        # may put such a file into every process.
-        try:
-            bundle = PureWindowsPath(sys.executable).parent
-            report["vc_runtime_outside"] = vc_runtime_outside(_loaded_modules(), bundle)
-        except Exception as exc:  # the build refuses a report without the list
-            report["info"]["vc_runtime_error"] = f"{type(exc).__name__}: {exc}"
     return report
 
 

@@ -4,14 +4,19 @@ spec (``proteia.spec``) builds from, and the rules the spec, the build
 (``build.py``), the notices (``notices.py``) and the tests share.
 
 The standard library only, so the tests run it where PyInstaller is not
-installed.
+installed; reading import tables (:func:`pe_imports`) needs pefile, which
+PyInstaller requires on Windows, so the build runs ``python bundle.py imports``
+with the build environment's Python.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
+import sys
 from collections.abc import Iterable, Mapping, Sequence
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Final
 
 APP_NAME: Final = "Proteia"
@@ -54,6 +59,21 @@ EXCLUDES: Final = (
     "pkg_resources",
     "_distutils_hack",
 )
+# The extension modules that import MSVCP140.dll by that name (the import tables
+# of the scikit-image 0.26.0 wheel), which the bundle does not carry (#54).
+# Nothing the app runs loads them: scikit-image loads skimage.feature's modules
+# only when used, and _remap only inside skimage.util.map_array, which Proteia
+# does not call. Left out, a later use fails the same way on every machine
+# (ModuleNotFoundError in the frozen app, which the self-test reports), not only
+# on a Windows without the Visual C++ Redistributable; the build fails if a
+# bundled module imports a Visual C++ runtime file the bundle lacks (build.py).
+MSVCP140_IMPORTERS: Final = (
+    "skimage.feature._cascade",
+    "skimage.feature._haar",
+    "skimage.feature._hessian_det_appx",
+    "skimage.feature.brief_cy",
+    "skimage.util._remap",
+)
 # Names no file in a finished bundle may have: napari and Qt (ADR 0002's LGPL
 # duties arise only when Qt ships). Matched case-insensitively against each
 # part of every path in the bundle.
@@ -73,19 +93,23 @@ PYTHON_RUNTIME_FILES: Final = re.compile(
 # The Visual C++ runtime (Visual Studio 2015 and later) under Microsoft's file
 # names: what the Visual C++ Redistributable installs into System32, and what
 # PyInstaller collects from there for a module that imports it (the names in its
-# depend/dylib.py). A package's renamed copy (numpy.libs/msvcp140-<hash>.dll) is
-# not matched. proteia.selftest.VC_RUNTIME is the same pattern (a test checks).
-VC_RUNTIME_FILES: Final = re.compile(
-    r"^(concrt140|msvcp140(_1|_2|_atomic_wait|_codecvt_ids)?|vccorlib140"
-    r"|vcruntime140(_1|_threads)?|vcamp140|vcomp140)\.dll$",
-    re.IGNORECASE,
+# depend/dylib.py). Every rule about these files starts from this list.
+_VC_RUNTIME_NAMES: Final = (
+    r"concrt140|msvcp140(_1|_2|_atomic_wait|_codecvt_ids)?|vccorlib140"
+    r"|vcruntime140(_1|_threads)?|vcamp140|vcomp140"
 )
+VC_RUNTIME_FILES: Final = re.compile(rf"^({_VC_RUNTIME_NAMES})\.dll$", re.IGNORECASE)
+# The same files under Microsoft's names or under one a package's wheel gave its
+# own copy (numpy.libs/msvcp140-<hash>.dll, as delvewheel names them).
+VC_RUNTIME_COPIES: Final = re.compile(rf"^({_VC_RUNTIME_NAMES})([-.][^\\/]*)?\.dll$", re.IGNORECASE)
 # Of those, the ones the Python runtime's Windows build includes, which its
-# LICENSE.txt covers (notices.py, section 1). The bundle carries no other:
-# Microsoft lets only Visual Studio licensees redistribute the rest, so the spec
-# leaves them out (#54), MSVCP140.dll among them; the build fails if its frozen
-# self-test loads one from outside the bundle (build.py).
+# LICENSE.txt covers (notices.py, section 1). Besides these the bundle carries
+# only packages' own copies, from their folders: Microsoft lets only Visual
+# Studio licensees redistribute the files, so the spec leaves out the copies
+# PyInstaller finds elsewhere (System32's MSVCP140.dll, #54).
 PYTHON_VC_RUNTIME: Final = frozenset({"vcruntime140.dll", "vcruntime140_1.dll"})
+# The bundle's folder next to Proteia.exe, which PyInstaller puts everything in.
+CONTENTS: Final = "_internal"
 # PyInstaller's own modules in the bundle (its runtime hooks and their helpers).
 PYINSTALLER_MODULES: Final = re.compile(r"^(pyi_rth_\w+|_pyi_rth_utils|pyimod\d\d_\w+)$")
 
@@ -99,32 +123,122 @@ def is_universal_crt(name: str) -> bool:
     return base == "ucrtbase.dll" or (base.startswith("api-ms-win-") and base.endswith(".dll"))
 
 
-def is_left_out_vc_runtime(name: str) -> bool:
-    """Whether ``name`` (a file name or a path in the bundle) is a Visual C++
-    runtime DLL under Microsoft's name (:data:`VC_RUNTIME_FILES`) other than the
-    Python build's (:data:`PYTHON_VC_RUNTIME`), such as ``MSVCP140.dll``: the
-    bundle leaves those out (#54)."""
-    base = PureWindowsPath(name).name
-    return VC_RUNTIME_FILES.match(base) is not None and base.lower() not in PYTHON_VC_RUNTIME
+def is_vc_runtime(name: str) -> bool:
+    """Whether ``name`` (a file name or a path, either separator) is a Visual C++
+    runtime DLL under Microsoft's name (:data:`VC_RUNTIME_FILES`)."""
+    return VC_RUNTIME_FILES.match(PureWindowsPath(name).name) is not None
+
+
+def _is_python_vc_runtime(name: str) -> bool:
+    return PureWindowsPath(name).name.lower() in PYTHON_VC_RUNTIME
+
+
+def from_package_folder(source: str, package_roots: Iterable[str]) -> bool:
+    """Whether ``source`` (a file's path on the build machine) lies in a folder
+    inside one of ``package_roots`` (the build environment's site-packages
+    folders): a file of an installed package, not one PyInstaller found elsewhere
+    (System32, the Python installation)."""
+    path = PureWindowsPath(source)
+    for root in map(PureWindowsPath, package_roots):
+        if path.is_relative_to(root) and len(path.relative_to(root).parts) > 1:
+            return True
+    return False
 
 
 def leave_out(
-    binaries: Iterable[tuple[str, str, str]],
+    binaries: Iterable[tuple[str, str, str]], package_roots: Iterable[str]
 ) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
     """PyInstaller's ``binaries`` (``(name in the bundle, source, kind)``) without
     the ones the bundle leaves out, and the names of those, by why: the Universal
-    CRT DLLs (:func:`is_universal_crt`) and the Visual C++ runtime the Python build
-    does not include (:func:`is_left_out_vc_runtime`)."""
+    CRT DLLs (:func:`is_universal_crt`), and the Visual C++ runtime files that are
+    neither the Python build's nor a package's own (:func:`from_package_folder`
+    with ``package_roots``), such as System32's ``MSVCP140.dll`` (#54)."""
+    roots = list(package_roots)
     kept: list[tuple[str, str, str]] = []
     left_out: dict[str, list[str]] = {"universal_crt": [], "vc_runtime": []}
     for entry in binaries:
-        if is_universal_crt(entry[0]):
-            left_out["universal_crt"].append(entry[0])
-        elif is_left_out_vc_runtime(entry[0]):
-            left_out["vc_runtime"].append(entry[0])
+        name, source = entry[0], entry[1]
+        if is_universal_crt(name):
+            left_out["universal_crt"].append(name)
+        elif (
+            is_vc_runtime(name)
+            and not _is_python_vc_runtime(name)
+            and not from_package_folder(source, roots)
+        ):
+            left_out["vc_runtime"].append(name)
         else:
             kept.append(entry)
     return kept, {reason: sorted(names) for reason, names in left_out.items()}
+
+
+def _at_top(path: str) -> bool:
+    """Whether ``path`` (in the finished bundle folder) is directly in it or in
+    its :data:`CONTENTS` folder, where PyInstaller puts what no package holds."""
+    parts = PurePosixPath(path.replace("\\", "/")).parts
+    return len(parts) == 1 or (len(parts) == 2 and parts[0] == CONTENTS)
+
+
+def is_left_out_vc_runtime(path: str) -> bool:
+    """Whether ``path`` (a file's path in the finished bundle folder) is a Visual
+    C++ runtime file the bundle leaves out: one at its top (:func:`_at_top`),
+    which no package provides, other than the Python build's."""
+    return _at_top(path) and is_vc_runtime(path) and not _is_python_vc_runtime(path)
+
+
+def vc_import_problems(imports: Mapping[str, Iterable[str]], files: Iterable[str]) -> list[str]:
+    """What is wrong with the DLLs the bundled binaries import: ``imports`` maps
+    each binary (its path in the bundle folder) to the DLL names it imports
+    (:func:`pe_imports`), and ``files`` are the paths of every file in the
+    bundle. A Visual C++ runtime DLL imported by name must be one the bundle
+    provides: a copy it holds and does not leave out (:func:`is_left_out_vc_runtime`).
+    Otherwise Windows loads it from System32, where only the Visual C++
+    Redistributable puts it (#54)."""
+    provided = {
+        PureWindowsPath(path).name.lower()
+        for path in files
+        if is_vc_runtime(path) and not is_left_out_vc_runtime(path)
+    }
+    return [
+        f"{binary} imports {dll}, a Visual C++ runtime file the bundle does not carry: it"
+        " loads only where the Visual C++ Redistributable is installed; leave the module out"
+        " (bundle.py) or bundle a copy its package provides (#54)"
+        for binary in sorted(imports)
+        for dll in sorted(set(imports[binary]), key=str.lower)
+        if is_vc_runtime(dll) and dll.lower() not in provided
+    ]
+
+
+def pe_imports(path: Path) -> list[str]:
+    """The DLL names the PE file ``path`` imports, at load time or delay-loaded,
+    as its import tables spell them. Needs pefile (the build environment's)."""
+    import pefile
+
+    pe = pefile.PE(str(path), fast_load=True)
+    try:
+        pe.parse_data_directories(
+            directories=[
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
+            ],
+            import_dllnames_only=True,
+        )
+        entries = [
+            *getattr(pe, "DIRECTORY_ENTRY_IMPORT", []),
+            *getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []),
+        ]
+        return sorted({entry.dll.decode("ascii", "replace") for entry in entries}, key=str.lower)
+    finally:
+        pe.close()
+
+
+def bundle_imports(folder: Path) -> dict[str, list[str]]:
+    """Every PE file in the bundle ``folder`` (``.pyd``, ``.dll`` or ``.exe``, in
+    any case), by its path in it, with the DLL names it imports."""
+    return {
+        path.relative_to(folder).as_posix(): pe_imports(path)
+        for path in sorted(folder.rglob("*"))
+        if path.is_file() and path.suffix.lower() in (".pyd", ".dll", ".exe")
+    }
 
 
 def numeric_version(version: str) -> tuple[int, int, int, int]:
@@ -229,3 +343,22 @@ def iss_app_id(iss: str) -> str:
     if match is None:
         raise ValueError("proteia.iss fixes no AppId")
     return match.group(1)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``python bundle.py imports FOLDER OUT``: :func:`bundle_imports` of the
+    bundle ``FOLDER`` into the JSON file ``OUT``; build.py runs it with the build
+    environment's Python, which has pefile."""
+    parser = argparse.ArgumentParser(description="The DLLs a bundle's binaries import.")
+    parser.add_argument("command", choices=["imports"])
+    parser.add_argument("folder", type=Path)
+    parser.add_argument("out", type=Path)
+    args = parser.parse_args(argv)
+    imports = bundle_imports(args.folder)
+    args.out.write_text(json.dumps(imports, indent=1), encoding="utf-8")
+    print(f"bundle: the imports of {len(imports)} binaries in {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

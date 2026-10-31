@@ -8,8 +8,7 @@ runs the installer silently for the current user into ``FOLDER/app`` and:
    the uninstaller, the Start Menu shortcut, the uninstall entry);
 2. launches the installed app three times (``smoke.py``: the first launch of the
    new files is the cold start) and runs its self-test, whose numbers must equal
-   those of ``REPORT`` (the build's frozen self-test) when given, and which may
-   have loaded no Visual C++ runtime file from outside the installation (#54);
+   those of ``REPORT`` (the build's frozen self-test) when given;
 3. runs the installer again while Proteia runs: it must stop Proteia through
    Quit and install;
 4. runs the installer (told not to close applications) and the uninstaller
@@ -66,7 +65,7 @@ from typing import Any
 
 import bundle
 import smoke
-from build import compare_numbers, folder_size, vc_runtime_problem
+from build import compare_numbers, folder_size
 
 HERE = Path(__file__).resolve().parent
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
@@ -426,8 +425,6 @@ class Check:
             "steps": {step["name"]: step["ok"] for step in result.get("steps", [])},
         }
         self.expect(done.returncode == 0 and result.get("ok"), "the installed self-test failed")
-        problem = vc_runtime_problem(result)
-        self.expect(problem is None, f"the installed self-test: {problem}")
         if expect_numbers is not None:
             differences = compare_numbers(result.get("numbers", {}), expect_numbers)
             report["selftest"]["numbers_as_built"] = not differences

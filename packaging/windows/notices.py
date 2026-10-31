@@ -45,13 +45,14 @@ from dataclasses import dataclass, field
 from email.parser import BytesParser
 from email.policy import compat32
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 import bundle
 
 HERE = Path(__file__).resolve().parent
 SUPPLEMENTS = HERE / "licenses"
 NOTICES_FILE = "THIRD_PARTY_NOTICES.txt"
-CONTENTS = "_internal"  # PyInstaller's folder next to the executable
+CONTENTS = bundle.CONTENTS  # PyInstaller's folder next to the executable
 RULE = "=" * 78
 THIN = "-" * 78
 # Files in a .dist-info folder that are metadata, not license texts.
@@ -177,13 +178,13 @@ def audit(contents: Path, packages: Sequence[Package], stdlib: Iterable[str]) ->
 
 
 def vc_runtime_files(root: Path) -> list[str]:
-    """The Visual C++ runtime DLLs anywhere in the bundle, as paths from ``root``;
-    NumPy and SciPy carry copies under names of their own (``msvcp140-<hash>.dll``)."""
-    pattern = re.compile(r"^(vcruntime140(_1)?|msvcp140(_\w+)?)([-.][^\\/]*)?\.dll$", re.IGNORECASE)
+    """The Visual C++ runtime DLLs anywhere in the bundle, as paths from ``root``:
+    under Microsoft's names or a package's own name for its copy (NumPy's
+    ``msvcp140-<hash>.dll``), as ``bundle.VC_RUNTIME_COPIES`` names them."""
     return sorted(
         path.relative_to(root).as_posix()
-        for path in root.rglob("*.dll")
-        if pattern.match(path.name)
+        for path in root.rglob("*")
+        if path.is_file() and bundle.VC_RUNTIME_COPIES.match(path.name)
     )
 
 
@@ -197,12 +198,17 @@ def _same_file_in(folder: Path, file: Path) -> bool:
     return twin is not None and twin.is_file() and twin.read_bytes() == file.read_bytes()
 
 
-# The sources vc_runtime_sources gives a file the bundle may not carry (#54).
-FROM_SYSTEM = (
-    "from the build machine's System32 folder, where the Visual C++"
-    " Redistributable installs it; the Python build does not include it"
-)
-SOURCE_UNKNOWN = "source not identified"
+class VcSource(NamedTuple):
+    """A Visual C++ runtime file in the bundle and where it came from."""
+
+    name: str  # its path from the bundle folder
+    kind: str  # "wheel", "python", "system" or "unknown"
+    text: str  # where it came from, as the notices say it
+
+
+# The kinds of source whose copies the bundle carries: a package's wheel and the
+# Python build. A file from System32, or of unknown source, is refused (#54).
+CARRIED_KINDS = frozenset({"wheel", "python"})
 
 
 def vc_runtime_sources(
@@ -211,7 +217,7 @@ def vc_runtime_sources(
     packages: Sequence[Package],
     python_dir: Path,
     system_dir: Path,
-) -> list[tuple[str, str]]:
+) -> list[VcSource]:
     """Each of the Visual C++ runtime ``files`` (paths from ``root``) with where
     it came from: a package's wheel (a folder of the package in ``_internal``),
     the Python build (the same bytes in ``python_dir``, the interpreter's
@@ -223,26 +229,31 @@ def vc_runtime_sources(
         parts = PurePosixPath(name).parts
         owner = owners.get(parts[1]) if len(parts) > 2 and parts[0] == CONTENTS else None
         if owner is not None:
-            source = f"from the {owner.name} {owner.version} wheel (section 3)"
+            kind, text = "wheel", f"from the {owner.name} {owner.version} wheel (section 3)"
         elif _same_file_in(python_dir, root / name):
-            source = "from the Python runtime's Windows build (section 1)"
+            kind, text = "python", "from the Python runtime's Windows build (section 1)"
         elif _same_file_in(system_dir, root / name):
-            source = FROM_SYSTEM
+            kind, text = (
+                "system",
+                (
+                    "from the build machine's System32 folder, where the Visual C++"
+                    " Redistributable installs it; the Python build does not include it"
+                ),
+            )
         else:
-            source = SOURCE_UNKNOWN
-        sources.append((name, source))
+            kind, text = "unknown", "source not identified"
+        sources.append(VcSource(name, kind, text))
     return sources
 
 
-def foreign_vc_runtime(vc_files: Sequence[tuple[str, str]]) -> list[str]:
-    """The Visual C++ runtime files (``(path, source)``, as
-    :func:`vc_runtime_sources` gives them) that are neither the Python build's
-    nor a package's own copy, each with why."""
+def foreign_vc_runtime(vc_files: Sequence[VcSource]) -> list[str]:
+    """The Visual C++ runtime files (as :func:`vc_runtime_sources` gives them)
+    that are neither the Python build's nor a package's own copy, each with why."""
     return [
-        f"{name}: {source}; the bundle carries only the Python runtime's and the"
+        f"{entry.name}: {entry.text}; the bundle carries only the Python runtime's and the"
         " packages' own copies of the Visual C++ runtime (#54)"
-        for name, source in vc_files
-        if source in (FROM_SYSTEM, SOURCE_UNKNOWN)
+        for entry in vc_files
+        if entry.kind not in CARRIED_KINDS
     ]
 
 
@@ -367,7 +378,7 @@ def render(
     proteia_version: str,
     packages: Sequence[Package],
     runtime: Runtime,
-    vc_files: Sequence[tuple[str, str]],
+    vc_files: Sequence[VcSource],
     fonts: tuple[list[str], list[tuple[str, str]]],
     pyinstaller: tuple[str, str],
     freetype: Sequence[str],
@@ -392,7 +403,7 @@ def render(
     out += _item(
         f"1. Python runtime: CPython {runtime.version} (PSF-2.0), with {_libraries(runtime)}."
     )
-    out += _item("2. Microsoft Visual C++ runtime: " + ", ".join(n for n, _ in vc_files) + ".")
+    out += _item("2. Microsoft Visual C++ runtime: " + ", ".join(e.name for e in vc_files) + ".")
     out.append(f"3. Python packages ({len(packages)}):")
     width = max((len(f"{p.name} {p.version}") for p in packages), default=0)
     out += [f"     {f'{p.name} {p.version}':<{width}}  {p.license}" for p in packages]
@@ -425,9 +436,9 @@ def render(
         'Conditions for this Windows binary build") concern the Microsoft code in',
         "the Python build only. The files, and where each came from:",
     )
-    for name, source in vc_files:
-        out.append(f"  {name}")
-        out += textwrap.wrap(source, 78, initial_indent="     ", subsequent_indent="     ")
+    for entry in vc_files:
+        out.append(f"  {entry.name}")
+        out += textwrap.wrap(entry.text, 78, initial_indent="     ", subsequent_indent="     ")
     out.append("")
 
     out += [RULE, f"3. Python packages ({len(packages)})", RULE, ""]

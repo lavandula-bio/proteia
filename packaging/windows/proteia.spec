@@ -14,8 +14,10 @@
 #   mpl-data, the fonts the charts are drawn with among it);
 # - leaves out napari, Qt, tkinter and the build tools (bundle.EXCLUDES), the
 #   Universal CRT DLLs, which Windows 10 and later provide, and the Visual C++
-#   runtime files the Python build does not include (MSVCP140.dll), which
-#   PyInstaller would copy from the build machine's System32 (#54);
+#   runtime files that neither the Python build nor a package provides, which
+#   PyInstaller would copy from the build machine's System32 (MSVCP140.dll, #54),
+#   with the extension modules that import MSVCP140.dll and that the app never
+#   loads (bundle.MSVCP140_IMPORTERS);
 # - copies the metadata of every distribution the bundle takes code or data from:
 #   the record reads versions from it, and notices.py reads the license texts;
 #   the build stops if a bundled top-level name belongs to no distribution;
@@ -27,6 +29,7 @@ import importlib.metadata
 import json
 import os
 import sys
+import sysconfig
 
 sys.path.insert(0, SPECPATH)  # noqa: F821 (PyInstaller defines it)
 
@@ -56,12 +59,16 @@ a = Analysis(  # noqa: F821
     hookspath=[],
     hooksconfig={"matplotlib": {"backends": list(bundle.MATPLOTLIB_BACKENDS)}},
     runtime_hooks=[],
-    excludes=list(bundle.EXCLUDES),
+    # The MSVCP140.dll importers go too: the bundle does not carry that DLL (#54).
+    excludes=list(bundle.EXCLUDES + bundle.MSVCP140_IMPORTERS),
     noarchive=False,
     optimize=0,
 )
 
-a.binaries, left_out = bundle.leave_out(a.binaries)
+# A Visual C++ runtime file from a package's folder in the build environment's
+# site-packages is the package's own copy and stays; one found elsewhere goes.
+package_roots = {sysconfig.get_path("purelib"), sysconfig.get_path("platlib")}
+a.binaries, left_out = bundle.leave_out(a.binaries, package_roots)
 
 found, unknown = bundle.bundled_distributions(
     (name for name, _, _ in a.pure),
