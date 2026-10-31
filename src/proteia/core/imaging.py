@@ -594,7 +594,9 @@ def check_misnamed_tiff(path: str | os.PathLike[str]) -> None:
             return
         with tifffile.TiffFile(path) as tif:
             _require_single_image(tif.series, path.name)
-    except (ValueError, OSError):
+    except (ValueError, OSError, MemoryError, RecursionError):
+        # Running out of memory or stack is not a damaged file: it must not
+        # fall back to the suffix's reader, which takes the first image only.
         raise
     except Exception as exc:  # a damaged file: struct.error, ...
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc

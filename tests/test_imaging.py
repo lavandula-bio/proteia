@@ -1513,6 +1513,21 @@ def test_a_tiff_named_otherwise_whose_images_cannot_be_counted_is_a_value_error(
     assert not isinstance(info.value, imaging.NotSingleImageError)
 
 
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_running_out_of_memory_while_counting_is_not_a_damaged_file(tmp_path, monkeypatch, error):
+    # A damaged file is left to reading (a ValueError the import ignores); a
+    # MemoryError must not be, or a stack would be read as its first image.
+    path = tmp_path / "stack µ.png"
+    _stack_of_two()(path)
+
+    def run_out(*args, **kwargs):
+        raise error("no room")
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out)
+    with pytest.raises(error, match="^no room$"):
+        imaging.check_misnamed_tiff(path)
+
+
 def test_a_tiff_of_no_image_named_otherwise_is_refused_as_reading_refuses_a_tif(tmp_path):
     path = tmp_path / "empty.png"
     path.write_bytes(b"II*\x00" + bytes(4))  # the first page's offset is 0: no page
