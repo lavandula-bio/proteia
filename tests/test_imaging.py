@@ -10,6 +10,7 @@ import os
 import pickle
 import re
 import struct
+import sys
 from io import BytesIO
 from pathlib import Path
 
@@ -2342,3 +2343,186 @@ def test_reading_an_image_does_not_assess_whether_it_looks_processed(tmp_path, m
     assert _codes(loaded) == []
     assert loaded.palette  # for the import to assess
     assert not load_image(_write(tmp_path / "figure µ.tif", _white_clipped())).palette
+
+
+# --- Running out of memory or stack while reading (#233) ---
+
+
+def _files_to_read() -> dict[str, object]:
+    """Writers of the sound files the readers' steps are made to fail on, by name."""
+    gray = _gray(np.uint8, 255)
+    return {
+        "gray µ.tif": lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535)),
+        "gray lzw α.tif": lambda path: Image.fromarray(gray).save(path, compression="tiff_lzw"),
+        "gray β.png": lambda path: Image.fromarray(gray).save(path),
+        "palette µ.png": lambda path: _palette_png().save(path),
+        "palette α.tif": lambda path: _write(
+            path, gray, photometric="palette", colormap=_palette_map()
+        ),
+        # TIFFs named otherwise, whose images are counted and header read.
+        "gray tiff β.png": lambda path: tifffile.imwrite(path, gray),
+        "int8 µ.png": lambda path: tifffile.imwrite(path, _gray(np.int8, 127)),
+    }
+
+
+# Each step of each reader that reads the file, by case: the reader, the file
+# it reads, where reading it is made to fail (an object's attribute) and in
+# which function (None: wherever it is called). tifffile parses a TIFF and
+# decodes it (its series' asarray); Pillow decodes a TIFF tifffile cannot
+# (LZW), and opens every other file, whose pixels scikit-image decodes.
+_READING_STEPS = {
+    "read_file tifffile": (imaging.read_file, "gray µ.tif", "TiffPageSeries.asarray", None),
+    "read_file pillow tiff": (
+        imaging.read_file,
+        "gray lzw α.tif",
+        "Image.open",
+        "_read_tiff_with_pillow",
+    ),
+    "read_file pillow": (imaging.read_file, "gray β.png", "Image.open", "_read_other"),
+    "read_file scikit-image": (imaging.read_file, "gray β.png", "io.imread", None),
+    "converts_cmyk tifffile": (converts_cmyk, "gray µ.tif", "tifffile.TiffFile", "converts_cmyk"),
+    "converts_cmyk pillow": (converts_cmyk, "gray β.png", "Image.open", "_pillow_mode"),
+    "reads_as_palette": (reads_as_palette, "palette µ.png", "Image.open", "_pillow_mode"),
+    "file_colours tifffile": (file_colours, "palette α.tif", "tifffile.TiffFile", "_tiff_colours"),
+    "file_colours pillow": (file_colours, "palette µ.png", "Image.open", "_pillow_mode"),
+    "read_colours pixels": (read_colours, "gray β.png", "io.imread", None),
+    "read_colours colour map": (
+        read_colours,
+        "palette α.tif",
+        "tifffile.TiffFile",
+        "_tiff_colours",
+    ),
+    "check_misnamed_tiff": (
+        imaging.check_misnamed_tiff,
+        "gray tiff β.png",
+        "tifffile.TiffFile",
+        "check_misnamed_tiff",
+    ),
+    "ink_set tifffile": (imaging.ink_set, "gray µ.tif", "tifffile.TiffFile", "ink_set"),
+    "ink_set pillow": (imaging.ink_set, "gray β.png", "Image.open", "_pillow_mode"),
+    "declared_pixel_type": (
+        imaging.declared_pixel_type,
+        "int8 µ.png",
+        "tifffile.TiffFile",
+        "declared_pixel_type",
+    ),
+}
+_OWNERS = {
+    "TiffPageSeries": tifffile.TiffPageSeries,
+    "Image": Image,
+    "imaging": imaging,
+    "io": io,
+    "tifffile": tifffile,
+}
+
+
+def fail_reading(monkeypatch, where: str, caller: str | None, error: BaseException) -> list[str]:
+    """Make ``where`` (``"owner.attribute"``) raise ``error`` when called from
+    the function named ``caller`` (from anywhere if None): the names of the
+    functions it failed in."""
+    name, attribute = where.split(".")
+    owner = _OWNERS[name]
+    real = getattr(owner, attribute)
+    failed = []
+
+    def fail(*args, **kwargs):
+        name = sys._getframe(1).f_code.co_name
+        if caller is None or name == caller:
+            failed.append(name)
+            raise error
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(owner, attribute, fail)
+    return failed
+
+
+def _step(tmp_path: Path, case: str):
+    """The reader of ``case`` and the file it reads, written."""
+    reader, name, where, caller = _READING_STEPS[case]
+    path = tmp_path / name
+    _files_to_read()[name](path)
+    return reader, path, where, caller
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+@pytest.mark.parametrize("case", list(_READING_STEPS))
+def test_running_out_of_memory_or_stack_while_reading_raises_that_error(
+    tmp_path, monkeypatch, case, error
+):
+    # #233: five readers wrapped it as a damaged file ("not a readable
+    # image"), and reading a compressed TIFF as one Pillow cannot decode:
+    # running out of memory or stack says nothing of the file. As the header
+    # checks of #217, #224 and #230 (the last three cases).
+    reader, path, where, caller = _step(tmp_path, case)
+    reader(path)  # the file itself reads
+    injected = error("no room")
+    failed = fail_reading(monkeypatch, where, caller, injected)
+    with pytest.raises(error) as info:
+        reader(path)
+    assert info.value is injected
+    assert failed  # it ran out where the case says
+
+
+_DAMAGED = {
+    # Pillow's decoder error of a compressed TIFF: its own refusal.
+    "read_file pillow tiff": (
+        "gray lzw α.tif: LZW compression of this 6x8 uint8 MINISBLACK image cannot be decoded"
+        " by this installation; save the image as an uncompressed TIFF"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_READING_STEPS))
+def test_any_other_error_of_a_reading_step_is_a_damaged_file_naming_it(tmp_path, monkeypatch, case):
+    # #233: still so, in the same words, with the error as its cause.
+    reader, path, where, caller = _step(tmp_path, case)
+    injected = struct.error("bad bytes")
+    fail_reading(monkeypatch, where, caller, injected)
+    with pytest.raises(ValueError) as info:
+        reader(path)
+    assert type(info.value) is ValueError
+    assert str(info.value) == _DAMAGED.get(case, f"{path.name}: not a readable image (bad bytes)")
+    assert info.value.__cause__ is injected
+
+
+@pytest.mark.parametrize("error", [ValueError, OSError, FileNotFoundError])
+@pytest.mark.parametrize("case", [case for case in _READING_STEPS if case not in _DAMAGED])
+def test_a_value_or_os_error_of_a_reading_step_is_raised_as_it_is(
+    tmp_path, monkeypatch, case, error
+):
+    reader, path, where, caller = _step(tmp_path, case)
+    injected = error("as raised")
+    fail_reading(monkeypatch, where, caller, injected)
+    with pytest.raises(error) as info:
+        reader(path)
+    assert info.value is injected
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        imaging.read_file,
+        converts_cmyk,
+        file_colours,
+        read_colours,
+        imaging.ink_set,
+        imaging.declared_pixel_type,
+    ],
+)
+def test_a_truncated_tiff_keeps_the_words_each_reader_gives_it(tmp_path, reader):
+    # #233: the rule moved to one place; a damaged file's message is as before.
+    path = tmp_path / "truncated µ.tif"
+    path.write_bytes(b"II*\x00")
+    with pytest.raises(ValueError) as info:
+        reader(path)
+    assert str(info.value) == (
+        "truncated µ.tif: not a readable image (unpack requires a buffer of 4 bytes)"
+    )
+    assert type(info.value.__cause__) is struct.error
+    named_png = tmp_path / "truncated α.png"
+    named_png.write_bytes(b"II*\x00")
+    with pytest.raises(ValueError) as info:
+        imaging.check_misnamed_tiff(named_png)
+    assert str(info.value) == (
+        "truncated α.png: not a readable image (unpack requires a buffer of 4 bytes)"
+    )

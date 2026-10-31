@@ -1856,7 +1856,9 @@ def _processed_again(
     file cannot be read loses a ``looks_processed`` assessed for the old
     polarity, which would name the wrong limit, and keeps its other warnings:
     with no band to re-quantify, its polarity changes as before #127, and every
-    analysis of it is refused until the file is back."""
+    analysis of it is refused until the file is back. Running out of memory or
+    stack while reading it says nothing of the file: that error is raised, and
+    the polarity does not change (#233)."""
     try:
         if array is None:
             array = session.pixels(image.id, keep=False)

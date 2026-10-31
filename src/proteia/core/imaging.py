@@ -48,10 +48,11 @@ For display only, :func:`read_colours` reads a file in its own colours, and
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal, NamedTuple
@@ -158,6 +159,28 @@ UNTRUSTED_WARNINGS = frozenset({"lossy_format", "color_channels_differ", "cmyk_c
 
 def _warning(code: str, **fields: str) -> ImageWarning:
     return ImageWarning(code=code, message=WARNINGS[code].format(**fields))
+
+
+# Errors that say nothing of the file being read: running out of memory or of
+# stack. Every reader raises them as they are, never as a damaged file (#233),
+# so that an import neither refuses the file nor carries on without a check
+# for them (#217, #224, #230), and a polarity change does not drop a warning.
+_EXHAUSTED: Final = (MemoryError, RecursionError)
+
+
+@contextlib.contextmanager
+def _reading(path: Path) -> Iterator[None]:
+    """Read the file at ``path`` in the ``with`` block as every reader here
+    does: a ``ValueError`` or ``OSError`` is raised as it is, and so is
+    running out of memory or stack (:data:`_EXHAUSTED`); any other error is a
+    damaged file's (``struct.error``, ``SyntaxError`` from Pillow, Pillow's
+    size limit, ...), raised as a ``ValueError`` that names the file."""
+    try:
+        yield
+    except (ValueError, OSError, *_EXHAUSTED):
+        raise
+    except Exception as exc:
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
 
 
 @dataclass(frozen=True)
@@ -495,6 +518,8 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
             f"{path.name}: this compressed TIFF has more pixels than the compressed-TIFF"
             " reader accepts; save the image as an uncompressed TIFF"
         ) from exc
+    except _EXHAUSTED:  # not the decoder's: as every reader (_reading)
+        raise
     except Exception as exc:  # Pillow's decoder errors are not all OSError
         raise ValueError(refusal) from exc
     if not pixels.dtype.isnative:  # e.g. a big-endian ("MM") 16-bit file
@@ -530,21 +555,18 @@ def read_file(path: str | os.PathLike[str]) -> FilePixels:
     """Read a file: its pixels, whether it is lossy, how its CMYK was converted
     (None if it is not CMYK), and whether its pixels are a palette's colours (a
     palette PNG; a palette TIFF reads as its indices); every failure to read it
-    becomes a ``ValueError`` or ``OSError``, and so does a layout other than a
-    single image. Its pixels are not yet converted to the analysis array, so
-    that an import can refuse their type first (#224)."""
+    becomes a ``ValueError`` or ``OSError`` (:func:`_reading`), and so does a
+    layout other than a single image; running out of memory or stack raises
+    that error itself (#233). Its pixels are not yet converted to the
+    analysis array, so that an import can refuse their type first (#224)."""
     path = Path(path)
-    try:
+    with _reading(path):
         if path.suffix.lower() in TIFF_SUFFIXES:
             pixels, lossy, cmyk = _read_tiff(path)
             palette = False
         else:
             pixels, cmyk, palette = _read_other(path)
             lossy = path.suffix.lower() in LOSSY_SUFFIXES
-    except (ValueError, OSError):
-        raise
-    except Exception as exc:  # a damaged file: struct.error, SyntaxError from Pillow, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     _check_layout(pixels, path.name)
     return FilePixels(pixels, lossy, cmyk, palette)
 
@@ -587,18 +609,14 @@ def converts_cmyk(path: str | os.PathLike[str]) -> bool:
     ``cmyk_converted``), from its header alone: a separated TIFF, or a JPEG in
     CMYK. A TIFF in a colour space reading refuses raises
     :class:`UnsupportedColourSpaceError`, as reading it does; a file it cannot
-    read raises another ``ValueError``, or ``OSError``.
+    read raises another ``ValueError``, or ``OSError`` (:func:`_reading`).
     """
     path = Path(path)
-    try:
+    with _reading(path):
         if path.suffix.lower() in TIFF_SUFFIXES:
             with tifffile.TiffFile(path) as tif:
                 return _holds_cmyk(_image_series(tif, path.name)[0].keyframe, path.name)
         return _pillow_mode(path) == "CMYK"
-    except (ValueError, OSError):
-        raise
-    except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
 
 
 InkSet = Literal["cmyk", "other"]
@@ -642,22 +660,18 @@ def check_misnamed_tiff(path: str | os.PathLike[str]) -> None:
     associated alpha) or refuse (CIELAB). A file named ``.tif`` or ``.tiff``
     is not looked at: reading counts its images, so that it is parsed once.
     A file whose images it cannot count raises another ``ValueError``, or
-    ``OSError``.
+    ``OSError`` (:func:`_reading`); running out of memory or stack raises that
+    error itself: it must not fall back to the suffix's reader, which takes
+    the first image only (#217).
     """
     path = Path(path)
     if path.suffix.lower() in TIFF_SUFFIXES:
         return
-    try:
+    with _reading(path):
         if not _holds_tiff(path):
             return
         with tifffile.TiffFile(path) as tif:
             _require_single_image(tif.series, path.name)
-    except (ValueError, OSError, MemoryError, RecursionError):
-        # Running out of memory or stack is not a damaged file: it must not
-        # fall back to the suffix's reader, which takes the first image only.
-        raise
-    except Exception as exc:  # a damaged file: struct.error, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
 
 
 def ink_set(path: str | os.PathLike[str]) -> Inks | None:
@@ -678,11 +692,12 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
     another suffix, when the import counts them (:func:`check_misnamed_tiff`).
     Reading such a file still converts CMYK, for images imported before
     (:func:`load_image`). A file it cannot read raises ``ValueError`` or
-    ``OSError``; running out of memory or stack while reading the header
-    raises that error itself (#230).
+    ``OSError`` (:func:`_reading`); running out of memory or stack while
+    reading the header raises that error itself, so that the import does not
+    carry on without the ink check (#230).
     """
     path = Path(path)
-    try:
+    with _reading(path):
         if not _holds_tiff(path):
             # Read by Pillow (:func:`_read_other`), as its first image: never a stack.
             return Inks("cmyk", True, False) if _pillow_mode(path) == "CMYK" else None
@@ -690,28 +705,19 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
             if _first_page(tif, path.name).photometric != tifffile.PHOTOMETRIC.SEPARATED:
                 return None
             return _inks_of(_image_series(tif, path.name))
-    except (ValueError, OSError, MemoryError, RecursionError):
-        # Running out of memory or stack is not a damaged header: the import
-        # must not carry on without the ink check (as #217 and #224).
-        raise
-    except Exception as exc:  # a damaged file: struct.error, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
 
 
 def reads_as_palette(path: str | os.PathLike[str]) -> bool:
     """Whether reading the file gives a palette's colours
     (:attr:`LoadedImage.palette`), from its header alone: a palette PNG, or any
     other file Pillow opens as a palette; a TIFF's palette reads as its indices.
-    A file it cannot read raises ``ValueError`` or ``OSError``."""
+    A file it cannot read raises ``ValueError`` or ``OSError``
+    (:func:`_reading`)."""
     path = Path(path)
     if path.suffix.lower() in TIFF_SUFFIXES:
         return False
-    try:
+    with _reading(path):
         return _pillow_mode(path) in _PALETTE_MODES
-    except (ValueError, OSError):
-        raise
-    except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
 
 
 def _pillow_mode(path: Path) -> str:
@@ -823,10 +829,12 @@ def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
     for a TIFF of several images (a stack, a mask or a thumbnail before the
     image), which says nothing of the image: it is refused as several images
     (:func:`check_misnamed_tiff`, reading). A file it cannot read raises
-    ``ValueError`` or ``OSError``.
+    ``ValueError`` or ``OSError`` (:func:`_reading`); running out of memory
+    or stack raises that error itself, so that the import does not take the
+    file by the reader its suffix picks (#224).
     """
     path = Path(path)
-    try:
+    with _reading(path):
         if not _holds_tiff(path):
             return None
         with tifffile.TiffFile(path) as tif:
@@ -836,12 +844,6 @@ def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
             page = series[0].keyframe
             dtype, bits, sampleformat = page.dtype, int(page.bitspersample), page.sampleformat
             photometric = page.photometric
-    except (ValueError, OSError, MemoryError, RecursionError):
-        # Running out of memory or stack is not a damaged header: the import
-        # must not take the file by the reader its suffix picks (as #217).
-        raise
-    except Exception as exc:  # a damaged file: struct.error, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     if dtype is not None:
         if _depth_of(dtype) is not None:
             return None
@@ -1139,10 +1141,11 @@ def file_colours(path: str | os.PathLike[str]) -> FileColours | None:
     is not gray, as an 8-bit ImageJ image with a colour lookup table is saved.
     None otherwise: a gray file (a gray colour map too), or a TIFF in another
     colour space (CIELAB, YCbCr), which reading refuses. For display only.
-    Raises ``ValueError`` or ``OSError`` for a file it cannot read.
+    Raises ``ValueError`` or ``OSError`` for a file it cannot read
+    (:func:`_reading`).
     """
     path = Path(path)
-    try:
+    with _reading(path):
         if path.suffix.lower() in TIFF_SUFFIXES:
             photometric, colormap = _tiff_colours(path)
             if photometric in (tifffile.PHOTOMETRIC.RGB, tifffile.PHOTOMETRIC.SEPARATED):
@@ -1155,10 +1158,6 @@ def file_colours(path: str | os.PathLike[str]) -> FileColours | None:
                 return "palette"
             return None
         mode = _pillow_mode(path)
-    except (ValueError, OSError):
-        raise
-    except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     return "rgb" if mode in _RGB_MODES else None
 
 
@@ -1166,18 +1165,15 @@ def read_colours(path: str | os.PathLike[str]) -> np.ndarray:
     """A file's pixels in its own colours, for display only: as :func:`read_pixels`
     gives them (CMYK converted to red, green and blue), except that a palette
     TIFF's indices are looked up in its colour map (8-bit, 3 channels last), as
-    a viewer shows them. Analysis never uses it.
+    a viewer shows them. Analysis never uses it. Fails as :func:`read_file`
+    does (:func:`_reading`).
     """
     path = Path(path)
     pixels = read_pixels(path)
     if pixels.ndim != 2 or path.suffix.lower() not in TIFF_SUFFIXES:
         return pixels
-    try:
+    with _reading(path):
         photometric, colormap = _tiff_colours(path)
-    except (ValueError, OSError):
-        raise
-    except Exception as exc:
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     if photometric != tifffile.PHOTOMETRIC.PALETTE or colormap is None:
         return pixels
     # A TIFF colour map is 16-bit: its high byte is the 8-bit level.
