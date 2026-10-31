@@ -5,9 +5,9 @@ GUI-independent: the standard library plus the model (and pydantic, through its
 types). A project folder, which may have any name, holds::
 
     project.json                    the model (see "Canonical form" below)
-    project.schema1.json            project.json as it was before a migration from schema 1
+    project.schema2.json            project.json as it was before a migration from schema 2
                                     rewrote it (keep_backup; numbered if taken:
-                                    project.schema1 (2).json)
+                                    project.schema2 (2).json; schema1 for schema 1)
     images/img-2.tif                byte-identical copies of the imported files, named by id
     exports/                        created by save_project, for exported results:
     exports/lane-table.csv          the per-lane table
@@ -40,17 +40,20 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   never used: a library upgrade must not move the hash.
 * Sorted keys make the bytes independent of field order and of the insertion
   order of ``Lane.metadata``. The model sorts bands, not-detected records and
-  calibration points; the order of membranes, images and proteins is content
-  and changes the hash.
+  calibration points; the order of membranes, images, membrane areas, lane
+  tables, proteins and rows is content and changes the hash.
 * An optional field added before v0.1 is left out of every dump (``project.json``,
   :func:`content_document` and so the export record's ``content``) while its value
   is empty or its default, so adding it changes no project's bytes or hash. The
-  first case is ``Protein.undetected``: Proteia never writes ``"undetected": []``,
-  and a hand-edited file that holds it loads, hashes as if the key were absent and
-  is saved without it. The second is ``Protein.box_padding``, left out while it is
-  ``{"across": 0, "along": 0}``, likewise. The third is ``Band.possibly_clipped``
+  first case is ``Row.undetected`` (a protein's before schema 3): Proteia never
+  writes ``"undetected": []``, and a hand-edited file that holds it loads, hashes
+  as if the key were absent and is saved without it. The second is
+  ``Row.box_padding``, left out while it is ``{"across": 0, "along": 0}``,
+  likewise. The third is ``Arena.outline`` (#223), left out while ``null`` (the
+  whole image): every area an import or a migration makes has none. The fourth
+  is ``Band.possibly_clipped``
   (#112), left out while it is ``null``: only bands on a lossy, colour or CMYK
-  image of known bit depth have it. The fourth is in the molecular-weight
+  image of known bit depth have it. The fifth is in the molecular-weight
   calibration (#58): ``CalibrationPoint.x`` is left out while ``null``,
   ``CalibrationPoint.side`` while ``"left"`` and ``MwCalibration.ladder_kda``
   while empty, and in the band count (#58): ``Band.bands_found`` while
@@ -58,9 +61,10 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   move every existing project's hash, so every export would report
   ``content_changed_outside_log``.
 * The hash covers ``schema_version``, the background method, every id, the lane
-  table, the image records (and so the pixels, through each ``sha256``), the
-  calibrations, and the proteins with their bands (stored nets, backgrounds and
-  flags) and their not-detected records. It excludes ``next_id`` and the log
+  tables, the image records (and so the pixels, through each ``sha256``), the
+  membrane areas, the calibrations, and the proteins with their rows' bands
+  (stored nets, backgrounds and flags) and not-detected records. It excludes
+  ``next_id`` and the log
   (the history: equal content made at other times must hash equal), and the
   file's formatting. The project never stores its own hash; each log entry
   stores the hash of the content it left.
@@ -95,15 +99,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Final, NoReturn
+from typing import Any, BinaryIO, Final, NoReturn, TypeGuard
 
 from pydantic import TypeAdapter, ValidationError
+from pydantic_core import InitErrorDetails
 
 import proteia
 from proteia.core.model import (
     IMAGE_SUFFIXES,
     LEGACY_BACKGROUND_METHOD,
+    NEXT_ID_LIMIT,
     SCHEMA_VERSION,
+    UNKNOWN_IMAGE_ROWS,
     ImageId,
     ImageRef,
     LogEntry,
@@ -152,6 +159,19 @@ class ProjectError(Exception):
 class ProjectFormatError(ProjectError):
     """project.json is not UTF-8, not JSON, has a duplicate key or NaN/Infinity, is
     not an object, or fails validation (the pydantic ValidationError is __cause__)."""
+
+
+class TooManyIdsError(ProjectFormatError):
+    """An older project whose ids leave too little room below the id limit
+    (:data:`~proteia.core.model.NEXT_ID_LIMIT`) for the ids its conversion
+    adds. ``project`` names it in the message."""
+
+    def __init__(self, needed: int, project: str = PROJECT_FILE) -> None:
+        super().__init__(
+            f"{project} holds too many ids to convert: the conversion needs {needed} new"
+            f" ids, past the {NEXT_ID_LIMIT - 1} a project can number"
+        )
+        self.needed = needed
 
 
 class SchemaVersionError(ProjectFormatError):
@@ -330,13 +350,18 @@ def _parse(data: bytes) -> tuple[Project, int]:
             found=version,
             supported=SCHEMA_VERSION,
         )
-    if version < SCHEMA_VERSION:
-        raw = migrate(raw)
-
+    unknown_image_rows: frozenset[str] = frozenset()
     # The model knows only the latest schema; strict JSON mode keeps every type
     # exactly (no "340" for an int, no 0 for a bool), so load then save is a fixed point.
     try:
-        project = Project.model_validate_json(json.dumps(raw, ensure_ascii=False), strict=True)
+        if version < SCHEMA_VERSION:
+            raw = migrate(raw)  # a ValidationError for what it cannot convert unread
+            unknown_image_rows = _rows_on_no_area(raw)
+        project = Project.model_validate_json(
+            json.dumps(raw, ensure_ascii=False),
+            strict=True,
+            context={UNKNOWN_IMAGE_ROWS: unknown_image_rows},
+        )
     except ValidationError as exc:
         raise ProjectFormatError(f"project.json is not a valid project: {exc}") from exc
     return project, version
@@ -408,16 +433,221 @@ def _v1_content(content: dict[str, Any]) -> dict[str, Any]:
     return old
 
 
+# The keys of a schema-2 protein that schema 3 holds in its row.
+_ROW_KEYS: Final = ("box_size", "box_padding", "bands", "undetected")
+# The number an id ends in.
+_ID_NUMBER: Final = re.compile(r"-([0-9]+)\Z")
+
+
+def _highest_number(batch: dict[str, Any]) -> int:
+    """The highest number of an id a schema-2 batch holds (membranes, images,
+    proteins and bands), 0 for none, for :func:`_v2_to_v3`. An id that is not
+    text ending in a number is skipped: validation refuses it."""
+    held: list[object] = []
+    for membrane in _dicts(batch.get("membranes")):
+        held.append(membrane.get("id"))
+        held.extend(image.get("id") for image in _dicts(membrane.get("images")))
+    for protein in _dicts(batch.get("proteins")):
+        held.append(protein.get("id"))
+        held.extend(band.get("id") for band in _dicts(protein.get("bands")))
+    numbers = [
+        int(match.group(1))
+        for obj_id in held
+        if isinstance(obj_id, str) and (match := _ID_NUMBER.search(obj_id))
+    ]
+    return max(numbers, default=0)
+
+
+def _is_image_id(value: object) -> TypeGuard[str]:
+    try:
+        _IMAGE_ID.validate_python(value, strict=True)
+    except ValidationError:
+        return False
+    return True
+
+
+def _rows_on_no_area(doc: dict[str, Any]) -> frozenset[str]:
+    """The ids of the rows of a document :func:`_v2_to_v3` converted whose
+    area reference names no area of it: each holds the image reference of a
+    protein on no image of the file, which validation reads as such
+    (:data:`~proteia.core.model.UNKNOWN_IMAGE_ROWS`)."""
+    batch = doc.get("batch")
+    if not isinstance(batch, dict):
+        return frozenset()
+    areas = {
+        arena.get("id")
+        for membrane in _dicts(batch.get("membranes"))
+        for arena in _dicts(membrane.get("arenas"))
+    }
+    return frozenset(
+        row["id"]  # each drawn by the conversion
+        for protein in _dicts(batch.get("proteins"))
+        for row in _dicts(protein.get("rows"))
+        if isinstance(row.get("arena_id"), str) and row["arena_id"] not in areas
+    )
+
+
+def _schema_3_keys(batch: dict[str, Any]) -> list[tuple[tuple[str | int, ...], Any]]:
+    """Where a schema-2 batch holds a key that schema 3 added and its
+    conversion writes (the batch's ``images`` and ``lane_tables``, a
+    membrane's ``arenas`` and ``lane_table_id``, a protein's ``rows``), each
+    with its value, in the order schema-2 validation named them: a model's
+    own keys, as the file holds them, before those of the models it holds."""
+    found: list[tuple[tuple[str | int, ...], Any]] = [
+        (("batch", key), value) for key, value in batch.items() if key in ("images", "lane_tables")
+    ]
+    for kind, keys in (("membranes", ("arenas", "lane_table_id")), ("proteins", ("rows",))):
+        items = batch.get(kind)
+        for i, item in enumerate(items if isinstance(items, list) else []):
+            if isinstance(item, dict):
+                found += [
+                    (("batch", kind, i, key), value) for key, value in item.items() if key in keys
+                ]
+    return found
+
+
+def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
+    """Schema 2 to 3 (#223): the images kept once by the batch, each
+    membrane's area on each of its images, the lane table with an id, and each
+    protein's boxes in a row on the area of its image.
+
+    Every membrane stays a membrane, each of its images, in order, gets an
+    area covering the whole image (no outline) at angle 0, the lane table
+    becomes the project's one table, which every membrane uses, the
+    fold-change reference stays the batch's, and each protein gets one row on
+    the area of its image, holding its box size, padding, bands and
+    not-detected records as they were (a key left out stays left out). The new
+    ids come from ``next_id`` in that order: the table, the areas, the rows.
+    Pure JSON, on the copy :func:`migrate` passes.
+
+    A file schema 2 refused is refused with the messages schema 2 gave. One
+    that holds a key the conversion writes (:func:`_schema_3_keys`) is
+    refused before anything is written over: a ``ValidationError`` naming
+    each such key an extra input, where schema 2 named it (and alone: the
+    file's other faults are not listed with it). A part that is not the
+    shape it should be is left for validation to refuse. An image without an
+    image id gets no area. A ``next_id`` that is not a whole number above
+    every id held, up to :data:`~proteia.core.model.NEXT_ID_LIMIT`, is kept as
+    it is, and the new ids are numbered from 1: the id check meets an id the
+    file holds first (:meth:`~proteia.core.model.Project.iter_ids`). A
+    protein's reference to an image the file does not hold (or to no image
+    id at all) stays as its row's area reference, which :func:`_parse` then
+    has validated as the image reference it was (:func:`_rows_on_no_area`).
+    A file schema 2 opened whose ``next_id`` leaves no room below the limit
+    for the new ids raises :class:`TooManyIdsError`.
+    """
+    doc["schema_version"] = 3
+    next_id = doc.get("next_id", 1)
+    batch = doc.setdefault("batch", {})
+    if not isinstance(batch, dict):
+        return doc
+    if held := _schema_3_keys(batch):
+        lines: list[InitErrorDetails] = [
+            {"type": "extra_forbidden", "loc": loc, "input": value} for loc, value in held
+        ]
+        raise ValidationError.from_exception_data("Project", lines)
+    highest = _highest_number(batch)
+    # Whether next_id numbers the new ids: a whole number (not a bool) above
+    # every id held, within the limit.
+    usable = type(next_id) is int and highest < next_id <= NEXT_ID_LIMIT
+    counter = next_id if usable else 1
+
+    def new(prefix: str) -> str:
+        nonlocal counter
+        made = f"{prefix}-{counter}"
+        counter += 1
+        return made
+
+    table = {"id": new("lt"), "lanes": batch.pop("lanes", [])}
+    batch["lane_tables"] = [table]
+    images: list[Any] = []
+    arena_of: dict[str, str] = {}
+    for membrane in _dicts(batch.get("membranes")):
+        held = membrane.get("images", [])
+        if not isinstance(held, list):
+            continue  # left as it is, for validation to refuse
+        membrane.pop("images", None)
+        membrane["lane_table_id"] = table["id"]
+        membrane["arenas"] = arenas = []
+        for image in held:
+            images.append(image)  # whatever it holds: validation refuses what is no image
+            image_id = image.get("id") if isinstance(image, dict) else None
+            if not _is_image_id(image_id):
+                continue  # no image id: refused for that alone
+            arena = {
+                "id": new("arena"),
+                "image_id": image_id,
+                "angle_deg": 0.0,
+                "source": "whole_image",
+            }
+            arena_of[image_id] = arena["id"]
+            arenas.append(arena)
+    batch["images"] = images
+    for protein in _dicts(batch.get("proteins")):
+        row: dict[str, Any] = {"id": new("row")}
+        if "image_id" in protein:  # a missing one stays missing
+            image_id = protein.pop("image_id")
+            known = isinstance(image_id, str) and image_id in arena_of
+            # No image of the file: the reference is kept, to be refused.
+            row["arena_id"] = arena_of[image_id] if known else image_id
+        row.update((key, protein.pop(key)) for key in _ROW_KEYS if key in protein)
+        protein["rows"] = [row]
+    if usable:
+        if counter > NEXT_ID_LIMIT:
+            raise TooManyIdsError(counter - next_id)
+        doc["next_id"] = counter
+    return doc
+
+
+def _v2_content(content: dict[str, Any]) -> dict[str, Any]:
+    """A schema-3 content document (:func:`content_document`) as schema 2 held
+    the same content: the lanes of its one table, each membrane's images in the
+    order of its areas, and each protein's image, box size, padding, bands and
+    records from its one row; without the tables, areas and rows. Exact for a
+    migrated project, which holds one of each where :func:`_v2_to_v3` made them."""
+    old = {**content, "schema_version": 2}
+    batch = dict(content["batch"])
+    old["batch"] = batch
+    images = {image["id"]: image for image in batch.pop("images")}
+    tables = batch.pop("lane_tables")
+    batch["lanes"] = tables[0]["lanes"] if tables else []
+    image_of = {}
+    membranes = []
+    for membrane in batch["membranes"]:
+        for arena in membrane["arenas"]:
+            image_of[arena["id"]] = arena["image_id"]
+        membranes.append(
+            {
+                "id": membrane["id"],
+                "images": [images[arena["image_id"]] for arena in membrane["arenas"]],
+                "calibration": membrane["calibration"],
+            }
+        )
+    batch["membranes"] = membranes
+    proteins = []
+    for protein in batch["proteins"]:
+        [row] = protein["rows"]
+        held = {key: value for key, value in protein.items() if key != "rows"}
+        held["image_id"] = image_of[row["arena_id"]]
+        held.update((key, row[key]) for key in _ROW_KEYS if key in row)
+        proteins.append(held)
+    batch["proteins"] = proteins
+    return old
+
+
 # {n: a step from schema n to n + 1}. Before v0.1, an additive change (a new
 # optional field left out while empty, or a new enum value) does not bump; from
 # v0.1 on, every saved-form change bumps and registers a migration: it bumps
 # SCHEMA_VERSION and registers a step here (an additive change registers a step
 # that only bumps the number), and registers in _EARLIER_CONTENT how the content
 # of a project migrated from each older schema read in that schema.
-MIGRATIONS: Mapping[int, Migration] = {1: _v1_to_v2}
+MIGRATIONS: Mapping[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3}
 # {n: a latest-schema content document as schema n held it}: the migrate entry's
 # from_content_hash.
-_EARLIER_CONTENT: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {1: _v1_content}
+_EARLIER_CONTENT: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    1: lambda content: _v1_content(_v2_content(content)),
+    2: _v2_content,
+}
 
 
 def _migrated(
@@ -643,7 +873,10 @@ def read_project(
     file raises before it is written. Nothing else is written."""
     folder = Path(folder)
     data = (folder / PROJECT_FILE).read_bytes()
-    project, found = _parse(data)
+    try:
+        project, found = _parse(data)
+    except TooManyIdsError as exc:  # named by its folder, as the user knows it
+        raise TooManyIdsError(exc.needed, f"the project {folder.name!r}") from None
     if require_images:
         missing = _missing_images(project, folder)
         if missing:

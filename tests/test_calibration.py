@@ -46,6 +46,7 @@ from test_operations import (
     assert_mw_current,
     assert_nets_current,
     band_of,
+    boxes_of,
     cal_blot,
     cal_marker,
     cal_y,
@@ -53,7 +54,6 @@ from test_operations import (
     import_blot,
     noisy16,
     plant,
-    protein_of,
     reprobe_on,
 )
 
@@ -84,7 +84,7 @@ def points(c: Calibrated, side=None) -> list[tuple[str, float, float, str, float
 
 def fitted(c: Calibrated, image_id: str):
     batch = c.session.project.batch
-    return mwcal.calibration_for(batch.membrane_of(image_id), image_id)
+    return mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
 
 
 # --- Points from each source ---
@@ -456,7 +456,7 @@ def test_reprobe_group_gets_its_own_curve(tmp_path):
     ops.set_lanes(s, [ops.LaneInput(f"c{i}") for i in range(4)])
     band = ops.place_box(s, gapdh, CAL_LANES[0], CAL_ROW, lane_index=0, grow=True)
     # Read from the reprobe's strip: log-linear from 150 kDa at y 10 to 20 at y 190.
-    size = protein_of(s, gapdh).box_size
+    size = boxes_of(s, gapdh).box_size
     cy = band_of(s, band).box.y + size.height / 2
     expected = 150.0 * (20.0 / 150.0) ** ((cy - 10.0) / 180.0)
     assert math.isclose(band_of(s, band).apparent_mw, expected, rel_tol=1e-12)
@@ -1012,7 +1012,8 @@ def test_a_fit_past_the_largest_float_is_refused(tmp_path):
     )
     assert "too far apart" in str(error)
     assert json.dumps(
-        ops.calibration_fit(s.project.batch.membranes[0], c.blot).as_json(), allow_nan=False
+        ops.calibration_fit(s.project.batch, s.project.batch.membranes[0], c.blot).as_json(),
+        allow_nan=False,
     )
 
 
@@ -1172,7 +1173,7 @@ def test_set_ladder_points_is_one_step(tmp_path):
     }
     json.dumps(entry.params, allow_nan=False)
     # The apparent MWs follow the new curve.
-    assert all(band.apparent_mw is not None for band in protein_of(s, c.protein).bands)
+    assert all(band.apparent_mw is not None for band in boxes_of(s, c.protein).bands)
     assert_mw_current(s)
     assert_nets_current(s)
     # One undo takes the whole ruler back; redo applies it again.

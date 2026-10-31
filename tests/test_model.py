@@ -14,7 +14,13 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from conftest import as_legacy, make_project, make_project_with_undetected
+from conftest import (
+    as_legacy,
+    converted,
+    make_project,
+    make_project_with_undetected,
+    sample_doc,
+)
 from proteia.core import analyze, model
 from proteia.core.model import (
     DETECTING_SOURCES,
@@ -30,6 +36,7 @@ from proteia.core.model import (
     ImageRef,
     LadderSide,
     Lane,
+    LaneTable,
     LogEntry,
     Membrane,
     MwCalibration,
@@ -39,6 +46,7 @@ from proteia.core.model import (
     Protein,
     Region,
     Role,
+    Row,
     UndetectedBand,
     UndetectedReason,
     UnknownIdError,
@@ -76,9 +84,29 @@ def _set(obj, **fields) -> None:
         setattr(obj, name, value)
 
 
+# A protein's fields its row holds.
+_ROW_FIELDS = frozenset({"box_size", "box_padding", "bands", "undetected"})
+
+
+def _arena(project: Project, image_id: str):
+    """The membrane area on an image."""
+    [(_, arena)] = project.batch.arenas_on(image_id)
+    return arena
+
+
 def _edit(project: Project, obj_id: str, **fields) -> Project:
-    """Set fields of one object in place (no validation) and return the project."""
-    _set(_get(project, obj_id), **fields)
+    """Set fields of one object in place (no validation) and return the project.
+    A protein's box fields are set on its row, and its ``image_id`` moves its
+    row onto that image's area (an image with none: an unknown area)."""
+    obj = _get(project, obj_id)
+    if isinstance(obj, Protein):
+        row = project.batch.only_row(obj)
+        for name in [name for name in fields if name in _ROW_FIELDS]:
+            setattr(row, name, fields.pop(name))
+        if "image_id" in fields:
+            held = project.batch.arenas_on(fields.pop("image_id"))
+            row.arena_id = held[0][1].id if held else "arena-99"
+    _set(obj, **fields)
     return project
 
 
@@ -155,7 +183,7 @@ def test_sample_project_is_valid(project):
     # The target and its loading control sit on different membranes.
     target = batch.find_protein("prot-7")
     control = batch.find_protein(target.loading_control_ids[0])
-    assert batch.membrane_of(target.image_id) is not batch.membrane_of(control.image_id)
+    assert batch.membrane_of_protein(target) is not batch.membrane_of_protein(control)
 
 
 def test_empty_project_defaults():
@@ -165,7 +193,7 @@ def test_empty_project_defaults():
     assert list(empty.iter_ids()) == []
     # The Literal must follow SCHEMA_VERSION.
     assert get_args(Project.model_fields["schema_version"].annotation) == (SCHEMA_VERSION,)
-    assert SCHEMA_VERSION == 2  # #83: band backgrounds and the background method
+    assert SCHEMA_VERSION == 3  # #223: membrane areas, lane tables and rows
     assert empty.background_method == "ring_median_v1"  # a new project measures locally
 
 
@@ -179,7 +207,10 @@ def test_every_band_background_belongs_to_the_projects_method(project):
 
     # A legacy project: every band the image median's, with no spread.
     legacy = as_legacy(project)
-    assert {b.background_mode for p in legacy.batch.proteins for b in p.bands} == {"global_median"}
+    modes = {
+        b.background_mode for p in legacy.batch.proteins for b in legacy.batch.boxes_of(p).bands
+    }
+    assert modes == {"global_median"}
     with pytest.raises(ValidationError, match="does not belong to the project's background"):
         revalidate(project.model_copy(update={"background_method": "global_median"}))
     for field, value in (("background_level", 199.5), ("background_spread", 0.5)):
@@ -197,8 +228,7 @@ def test_field_defaults():
         id="prot-1",
         name="p53",
         role=Role.TARGET,
-        image_id="img-2",
-        box_size=BoxSize(width=4, height=4),
+        rows=[Row(id="row-1", arena_id="arena-2", box_size=BoxSize(width=4, height=4))],
     )
     assert protein.expected_band_count == 1
     assert protein.mw_tolerance == 0.10
@@ -232,7 +262,7 @@ def test_field_defaults():
     )
     assert (image.bit_depth, image.marker_image_id, image.import_warnings) == (None, None, [])
 
-    calibration = Membrane(id="mem-1").calibration
+    calibration = Membrane(id="mem-1", lane_table_id="lt-2").calibration
     assert (calibration.ladder, calibration.points, calibration.fit_quality) == (None, [], None)
     assert calibration.fit_method is FitMethod.LOG_LINEAR
 
@@ -286,7 +316,7 @@ def test_polarity_gives_the_dark_on_light_flag():
 
 def test_reprobe_is_another_image_of_the_same_membrane(project):
     batch = project.batch
-    assert batch.membrane_of(batch.find_protein("prot-9").image_id).id == "mem-1"
+    assert batch.membrane_of(batch.image_id_of(batch.find_protein("prot-9"))).id == "mem-1"
     revalidate(_edit(project, "prot-9", image_id="img-2"))
 
 
@@ -298,7 +328,7 @@ def test_band_in_undeclared_lane_rejected(project):
 @pytest.mark.parametrize("indices", [[0, 2], [1, 0], [0, 0]])
 def test_lane_indices_follow_list_order(indices):
     with pytest.raises(ValidationError, match="lane indices"):
-        Batch(lanes=[Lane(index=i, label="vehicle") for i in indices])
+        LaneTable(id="lt-1", lanes=[Lane(index=i, label="vehicle") for i in indices])
 
 
 def test_messages_number_lanes_from_1():
@@ -344,7 +374,7 @@ def test_lane_and_band_index_pair_unique():
         _edit(make_project(), "band-11", lane_index=0), "two bands in lane 1 with band index 0"
     )
     two_in_lane_0 = revalidate(_edit(make_project(), "band-11", lane_index=0, band_index=1))
-    bands = two_in_lane_0.batch.find_protein("prot-7").bands
+    bands = two_in_lane_0.batch.boxes_of(two_in_lane_0.batch.find_protein("prot-7")).bands
     assert [(b.id, b.lane_index, b.band_index) for b in bands[:2]] == [
         ("band-10", 0, 0),
         ("band-11", 0, 1),
@@ -354,19 +384,19 @@ def test_lane_and_band_index_pair_unique():
 def test_bands_and_points_are_canonically_ordered(project):
     batch = project.batch
     for protein in batch.proteins:
-        keys = [(b.lane_index, b.band_index) for b in protein.bands]
+        keys = [(b.lane_index, b.band_index) for b in batch.boxes_of(protein).bands]
         assert keys == sorted(keys)
     for membrane in batch.membranes:
         keys = [(p.y, p.mw, p.source.value, p.image_id) for p in membrane.calibration.points]
         assert keys == sorted(keys)
-    assert [b.id for b in batch.find_protein("prot-8").bands] == [
+    assert [b.id for b in batch.boxes_of(batch.find_protein("prot-8")).bands] == [
         f"band-{n}" for n in range(13, 17)
     ]
 
     # Another input order gives an equal model.
     doc = project.model_dump()
     for protein in doc["batch"]["proteins"]:
-        protein["bands"].reverse()
+        protein["rows"][0]["bands"].reverse()
     for membrane in doc["batch"]["membranes"]:
         membrane["calibration"]["points"].reverse()
     assert Project.model_validate(doc) == project
@@ -382,7 +412,7 @@ def test_reference_condition_must_be_a_lane_condition(project, reference, match)
 
 
 def test_protein_image_must_resolve(project):
-    _rejected(_edit(project, "prot-7", image_id="img-99"), "unknown image")
+    _rejected(_edit(project, "prot-7", image_id="img-99"), "unknown membrane area")
 
 
 def test_protein_on_visible_marker_image_rejected(project):
@@ -495,6 +525,12 @@ def test_marker_pairing(project, edit, match):
         pytest.param(lambda p: _set(_point(p), mw=0.0), "greater than 0", id="zero-mw"),
         # The lowest point: moving 250 kDa there would put it out of order.
         pytest.param(lambda p: _set(_point_at(p, 55), y=150.0), None, id="at-the-bottom"),
+        # The lowest point past the bottom: still in order, so only the bound refuses it.
+        pytest.param(
+            lambda p: _set(_point_at(p, 55), y=150.5),
+            "calibration point at y=150.5 is below the bottom of img-2",
+            id="lowest-below-bottom",
+        ),
         pytest.param(lambda p: _set(_point(p), x=341.0), "right of the edge", id="x-right-of-edge"),
         pytest.param(lambda p: _set(_point(p), x=340.0), None, id="x-at-the-edge"),
         pytest.param(
@@ -608,18 +644,21 @@ def test_calibration_messages_name_the_membrane_the_images_and_the_point():
 
 
 def test_register_groups(project):
+    batch = project.batch
     mem_1 = _get(project, "mem-1")
-    assert mem_1.register_groups() == [frozenset({"img-2", "img-3"}), frozenset({"img-4"})]
-    assert mem_1.group_of("img-2") == mem_1.group_of("img-3") == frozenset({"img-2", "img-3"})
-    assert mem_1.group_of("img-4") == frozenset({"img-4"})
-    assert _get(project, "mem-5").register_groups() == [frozenset({"img-6"})]
-    assert Membrane(id="mem-2").register_groups() == []
+    assert batch.register_groups(mem_1) == [frozenset({"img-2", "img-3"}), frozenset({"img-4"})]
+    pair = frozenset({"img-2", "img-3"})
+    assert batch.group_of(mem_1, "img-2") == batch.group_of(mem_1, "img-3") == pair
+    assert batch.group_of(mem_1, "img-4") == frozenset({"img-4"})
+    assert batch.register_groups(_get(project, "mem-5")) == [frozenset({"img-6"})]
+    assert batch.register_groups(Membrane(id="mem-2", lane_table_id="lt-19")) == []
     for unknown in ("img-6", "img-99"):  # on another membrane, or on none
         with pytest.raises(UnknownIdError):
-            mem_1.group_of(unknown)
+            batch.group_of(mem_1, unknown)
     # A marker shared by two chemiluminescence images: one group of three.
     shared = revalidate(_edit(project, "img-4", marker_image_id="img-3"))
-    assert _get(shared, "mem-1").register_groups() == [frozenset({"img-2", "img-3", "img-4"})]
+    trio = frozenset({"img-2", "img-3", "img-4"})
+    assert shared.batch.register_groups(_get(shared, "mem-1")) == [trio]
 
 
 def test_ladder_kda_rules():
@@ -676,24 +715,27 @@ def test_fit_quality_needs_two_points(project):
     ("edit", "match"),
     [
         *(
-            pytest.param(lambda p, bad=bad: _edit(p, "prot-7", image_id=bad), "pattern", id=bad)
+            pytest.param(
+                lambda p, bad=bad: _set(_arena(p, "img-2"), image_id=bad), "pattern", id=bad
+            )
             for bad in ["prot-7", "img-01", "img-0", "IMG-1", "img-1\n", "../img-1", "img-1.tif"]
         ),
         pytest.param(
-            lambda p: _edit(
-                _edit(p, "img-4", id="img-2", file="img-2.tif"), "prot-9", image_id="img-2"
-            ),
-            "duplicate id",
-            id="two-images-with-one-id",
-        ),
-        pytest.param(
-            lambda p: _edit(
-                _edit(p, "img-4", id="img-7", file="img-7.tif"), "prot-9", image_id="img-7"
+            lambda p: _set(
+                _arena(_edit(p, "img-4", id="img-7", file="img-7.tif"), "img-4"), image_id="img-7"
             ),
             "duplicate id",
             id="img-7-and-prot-7",
         ),
-        pytest.param(lambda p: _set(p, next_id=18), "next_id", id="number-not-below-next_id"),
+        pytest.param(
+            lambda p: _set(p.batch.only_row(_get(p, "prot-9")), id="row-24"),
+            "duplicate id",
+            id="two-rows-with-one-id",
+        ),
+        pytest.param(
+            lambda p: _set(_arena(p, "img-4"), id="lt-19"), "pattern", id="an-area-with-a-table-id"
+        ),
+        pytest.param(lambda p: _set(p, next_id=26), "next_id", id="number-not-below-next_id"),
     ],
 )
 def test_id_rules(project, edit, match):
@@ -702,14 +744,14 @@ def test_id_rules(project, edit, match):
 
 
 def test_new_id_is_sequential_and_never_reused(project):
-    assert project.new_id("prot") == "prot-19"
-    assert project.new_id("band") == "band-20"
+    assert project.new_id("prot") == "prot-27"
+    assert project.new_id("band") == "band-28"
 
     def remove_gapdh(draft: Project) -> None:
         draft.batch.proteins = [p for p in draft.batch.proteins if p.id != "prot-9"]
 
     project, _ = apply_change(project, remove_gapdh)
-    assert project.new_id("prot") == "prot-21"  # 9 is not reused
+    assert project.new_id("prot") == "prot-29"  # 9 is not reused
 
 
 @pytest.mark.parametrize(
@@ -781,13 +823,15 @@ def test_negative_zero_stored_as_positive_zero(project):
     ("locate", "key", "value"),
     [
         pytest.param(
-            lambda d: d["batch"]["proteins"][0]["bands"][0],
+            lambda d: d["batch"]["proteins"][0]["rows"][0]["bands"][0],
             "background",  # the old Band's background box
             {"x": 0, "y": 0},
             id="band",
         ),
         pytest.param(lambda d: d, "content_hash", "0" * 64, id="project"),
-        pytest.param(lambda d: d["batch"]["lanes"][0], "condition", "vehicle", id="lane"),
+        pytest.param(
+            lambda d: d["batch"]["lane_tables"][0]["lanes"][0], "condition", "vehicle", id="lane"
+        ),
     ],
 )
 def test_unknown_fields_rejected(project, locate, key, value):
@@ -807,18 +851,24 @@ def test_apply_change_returns_validated_copy(project):
                 id=protein_id,
                 name="p53",
                 role=Role.TARGET,
-                image_id="img-4",
-                box_size=BoxSize(width=24, height=14),
+                rows=[
+                    Row(
+                        id=draft.new_id("row"),
+                        arena_id="arena-22",
+                        box_size=BoxSize(width=24, height=14),
+                    )
+                ],
             )
         )
         return protein_id
 
     changed, protein_id = apply_change(project, add_p53)
-    assert protein_id == "prot-19"
+    assert protein_id == "prot-27"
     assert changed.batch.find_protein(protein_id).name == "p53"
-    assert changed.next_id == 20
+    assert changed.batch.image_id_of(changed.batch.find_protein(protein_id)) == "img-4"
+    assert changed.next_id == 29
     assert project == snapshot
-    assert project.next_id == 19
+    assert project.next_id == 27
 
 
 def test_apply_change_failure_leaves_original(project):
@@ -831,7 +881,7 @@ def test_apply_change_failure_leaves_original(project):
     with pytest.raises(ValidationError, match="overlap"):
         apply_change(project, move_onto_band_10)
     assert project == snapshot
-    assert project.next_id == 19
+    assert project.next_id == 27
 
 
 def test_lookup_of_unknown_id_raises(project):
@@ -949,16 +999,20 @@ def test_apply_change_shares_the_log(project):
     snapshot = project.model_copy(deep=True)
 
     def edit(draft: Project) -> str:
-        draft.batch.lanes.append(Lane(index=4, label="50 µM"))
+        draft.batch.only_lanes().append(Lane(index=4, label="50 µM"))
         draft.batch.find_protein("prot-9").name = "Gapdh"
         return draft.new_id("band")
 
     new, band_id = apply_change(project, edit)
-    assert band_id == "band-19"
+    assert band_id == "band-27"
     assert new.log is project.log
-    assert (new.next_id, len(new.batch.lanes), new.batch.proteins[2].name) == (20, 5, "Gapdh")
+    assert (new.next_id, len(new.batch.only_lanes()), new.batch.proteins[2].name) == (
+        28,
+        5,
+        "Gapdh",
+    )
     assert project == snapshot  # the batch edits and the new id never reach the original
-    assert project.next_id == 19
+    assert project.next_id == 27
 
     def rewrite_history(draft: Project) -> None:
         draft.log = ()
@@ -987,14 +1041,14 @@ def _record(**fields) -> dict:
 
 def _with_records(*records: dict, **protein_fields) -> Project:
     """The sample project with β-catenin's records (and fields) set, validated."""
-    doc = make_project().model_dump(mode="json")
+    doc = sample_doc()
     doc["batch"]["proteins"][0].update(undetected=list(records), **protein_fields)
-    return Project.model_validate(doc)
+    return converted(doc)
 
 
 def test_a_not_detected_record_is_accepted():
     project = _with_records(_record(snr=-3.5))  # the statistic may have any sign
-    [record] = project.batch.find_protein("prot-7").undetected
+    [record] = project.batch.boxes_of(project.batch.find_protein("prot-7")).undetected
     assert record == UndetectedBand(
         lane_index=2,
         band_index=0,
@@ -1009,21 +1063,27 @@ def test_a_not_detected_record_is_accepted():
     assert DETECTING_SOURCES == {ProposalSource.ROW_BOX, ProposalSource.MW_GUIDED}
     # Records have no ids: the id set and next_id are the sample project's.
     assert list(project.iter_ids()) == list(make_project().iter_ids())
-    assert project.next_id == 19
+    assert project.next_id == 27
     assert revalidate(project) == project
 
 
 def test_records_are_canonically_ordered():
     project = make_project_with_undetected()  # GAPDH's records given as lanes 3, 2
-    keys = [(u.lane_index, u.band_index) for u in project.batch.find_protein("prot-9").undetected]
+    keys = [
+        (u.lane_index, u.band_index)
+        for u in project.batch.boxes_of(project.batch.find_protein("prot-9")).undetected
+    ]
     assert keys == [(2, 0), (3, 0)]
     doc = project.model_dump()
-    doc["batch"]["proteins"][2]["undetected"].reverse()
+    doc["batch"]["proteins"][2]["rows"][0]["undetected"].reverse()
     assert Project.model_validate(doc) == project
     # Within a lane, by band index.
     given = [_record(band_index=1), _record(band_index=0)]
     two_bands = _with_records(*given, expected_band_count=2)
-    keys = [(u.lane_index, u.band_index) for u in two_bands.batch.find_protein("prot-7").undetected]
+    keys = [
+        (u.lane_index, u.band_index)
+        for u in two_bands.batch.boxes_of(two_bands.batch.find_protein("prot-7")).undetected
+    ]
     assert keys == [(2, 0), (2, 1)]
     assert _with_records(*reversed(given), expected_band_count=2) == two_bands
 
@@ -1047,13 +1107,14 @@ def test_a_duplicate_record_is_found_between_other_bands_records():
 def test_a_region_may_end_at_the_image_edge(region):
     # Regions are half-open, so x1 == width and y1 == height (img-2 is 340x150) fit.
     project = _with_records(_record(region=region))
-    [record] = project.batch.find_protein("prot-7").undetected
+    [record] = project.batch.boxes_of(project.batch.find_protein("prot-7")).undetected
     assert record.region.rect() == tuple(region.values())
     assert Project.model_validate_json(project.model_dump_json()) == project
 
 
 def test_negative_zero_snr_stored_as_positive_zero():
-    [record] = _with_records(_record(snr=-0.0)).batch.find_protein("prot-7").undetected
+    project = _with_records(_record(snr=-0.0))
+    [record] = project.batch.boxes_of(project.batch.find_protein("prot-7")).undetected
     assert math.copysign(1, record.snr) == 1
 
 
@@ -1147,7 +1208,7 @@ def test_an_empty_region_is_refused_with_one_message(corners):
 def test_a_band_one_record_may_sit_beside_a_band_zero_box():
     # Lane 0 holds band-10 (band index 0); two bands are expected.
     project = _with_records(_record(lane_index=0, band_index=1), expected_band_count=2)
-    [record] = project.batch.find_protein("prot-7").undetected
+    [record] = project.batch.boxes_of(project.batch.find_protein("prot-7")).undetected
     assert (record.lane_index, record.band_index) == (0, 1)
     # A record for the second band also refuses a band in its place.
     with pytest.raises(ValidationError, match="lane 1 has both a band"):
@@ -1159,7 +1220,7 @@ def test_placing_a_band_where_a_record_is_needs_the_record_dropped():
     project = _with_records(_record())
 
     def place_in_lane_2(draft: Project) -> None:
-        draft.batch.find_protein("prot-7").bands.append(
+        draft.batch.boxes_of(draft.batch.find_protein("prot-7")).bands.append(
             Band(
                 id=draft.new_id("band"),
                 lane_index=2,
@@ -1174,29 +1235,21 @@ def test_placing_a_band_where_a_record_is_needs_the_record_dropped():
 
     def place_and_drop(draft: Project) -> None:
         place_in_lane_2(draft)
-        draft.batch.find_protein("prot-7").undetected.clear()
+        draft.batch.boxes_of(draft.batch.find_protein("prot-7")).undetected.clear()
 
     placed, _ = apply_change(project, place_and_drop)
-    assert placed.batch.find_protein("prot-7").undetected == []
+    assert placed.batch.boxes_of(placed.batch.find_protein("prot-7")).undetected == []
 
 
 def test_dumps_leave_out_an_empty_record_list():
-    assert (
-        Protein(
-            id="prot-1",
-            name="p53",
-            role=Role.TARGET,
-            image_id="img-2",
-            box_size=BoxSize(width=4, height=4),
-        ).undetected
-        == []
-    )
+    assert Row(id="row-1", arena_id="arena-2", box_size=BoxSize(width=4, height=4)).undetected == []
     for mode in ("python", "json"):
         proteins = make_project().model_dump(mode=mode)["batch"]["proteins"]
-        assert ["undetected" in protein for protein in proteins] == [False, False, False]
+        assert ["undetected" in protein["rows"][0] for protein in proteins] == [False] * 3
         proteins = make_project_with_undetected().model_dump(mode=mode)["batch"]["proteins"]
-        assert ["undetected" in protein for protein in proteins] == [True, False, True]
-    assert proteins[0]["undetected"] == [
+        assert ["undetected" in protein["rows"][0] for protein in proteins] == [True, False, True]
+        assert all("undetected" not in protein for protein in proteins)
+    assert proteins[0]["rows"][0]["undetected"] == [
         {
             "lane_index": 2,
             "band_index": 0,
@@ -1213,49 +1266,44 @@ def test_dumps_leave_out_an_empty_record_list():
 
 
 def _with_padding(across: int = 0, along: int = 0, *, protein: str = "prot-8") -> dict:
-    """The sample project as project.json holds it, with a padding on one
-    protein (α-tubulin: 20x10 boxes on img-6, 200x100)."""
-    doc = make_project().model_dump(mode="json")
+    """The sample project as a schema-2 project.json holds it, with a padding
+    on one protein (α-tubulin: 20x10 boxes on img-6, 200x100)."""
+    doc = sample_doc()
     [held] = [p for p in doc["batch"]["proteins"] if p["id"] == protein]
     held["box_padding"] = {"across": across, "along": along}
     return doc
 
 
 def test_box_padding_is_left_out_while_zero():
-    protein = Protein(
-        id="prot-1",
-        name="p53",
-        role=Role.TARGET,
-        image_id="img-2",
-        box_size=BoxSize(width=4, height=4),
-    )
-    assert protein.box_padding == BoxPadding(across=0, along=0)
+    row = Row(id="row-1", arena_id="arena-2", box_size=BoxSize(width=4, height=4))
+    assert row.box_padding == BoxPadding(across=0, along=0)
     for mode in ("python", "json"):
-        assert "box_padding" not in protein.model_dump(mode=mode)
+        assert "box_padding" not in row.model_dump(mode=mode)
         proteins = make_project().model_dump(mode=mode)["batch"]["proteins"]
-        assert ["box_padding" in p for p in proteins] == [False, False, False]
+        assert ["box_padding" in p["rows"][0] for p in proteins] == [False, False, False]
         # An explicit zero padding (a hand-edited file) loads, and is dumped without it.
-        explicit = Project.model_validate(_with_padding())
+        explicit = converted(_with_padding())
         assert explicit == make_project()
-        assert "box_padding" not in explicit.model_dump(mode=mode)["batch"]["proteins"][1]
+        dumped = explicit.model_dump(mode=mode)["batch"]["proteins"][1]
+        assert "box_padding" not in dumped["rows"][0]
         # Any other padding is dumped, both directions.
-        padded = Project.model_validate(_with_padding(along=2))
+        padded = converted(_with_padding(along=2))
         dumped = padded.model_dump(mode=mode)["batch"]["proteins"]
-        assert [p.get("box_padding") for p in dumped] == [None, {"across": 0, "along": 2}, None]
+        held = [p["rows"][0].get("box_padding") for p in dumped]
+        assert held == [None, {"across": 0, "along": 2}, None]
 
 
 def test_box_padding_must_leave_a_fitted_size():
     def protein(across: int, along: int) -> Protein:
-        return Protein(
-            id="prot-4",
-            name="p53",
-            role=Role.TARGET,
-            image_id="img-2",
+        row = Row(
+            id="row-5",
+            arena_id="arena-2",
             box_size=BoxSize(width=20, height=10),
             box_padding=BoxPadding(across=across, along=along),
         )
+        return Protein(id="prot-4", name="p53", role=Role.TARGET, rows=[row])
 
-    assert protein(0, 4).fitted_size == BoxSize(width=20, height=2)
+    assert protein(0, 4).rows[0].fitted_size == BoxSize(width=20, height=2)
     with pytest.raises(ValidationError, match="fitted") as info:
         protein(0, 5)
     assert (
@@ -1263,11 +1311,11 @@ def test_box_padding_must_leave_a_fitted_size():
     ) in str(info.value)
     with pytest.raises(ValidationError, match="10 px of padding left and right and 6 px"):
         protein(10, 6)
-    assert protein(9, 0).fitted_size == BoxSize(width=2, height=10)
+    assert protein(9, 0).rows[0].fitted_size == BoxSize(width=2, height=10)
     # The same rule on a whole project, re-validated.
-    Project.model_validate(_with_padding(across=9, along=4))
+    converted(_with_padding(across=9, along=4))
     with pytest.raises(ValidationError, match="prot-8: box size 20x10 leaves no fitted size"):
-        Project.model_validate(_with_padding(along=5))
+        converted(_with_padding(along=5))
 
 
 @pytest.mark.parametrize(
@@ -1276,7 +1324,7 @@ def test_box_padding_must_leave_a_fitted_size():
 )
 def test_box_padding_is_not_negative(padding):
     doc = make_project().model_dump(mode="json")
-    doc["batch"]["proteins"][1]["box_padding"] = padding
+    doc["batch"]["proteins"][1]["rows"][0]["box_padding"] = padding
     with pytest.raises(ValidationError, match="box_padding"):
         Project.model_validate(doc)
     with pytest.raises(ValidationError, match="box_padding"):
@@ -1284,10 +1332,10 @@ def test_box_padding_is_not_negative(padding):
 
 
 def test_fitted_size_is_box_size_less_padding():
-    project = Project.model_validate(_with_padding(across=3, along=2))
-    tubulin = project.batch.find_protein("prot-8")
+    project = converted(_with_padding(across=3, along=2))
+    tubulin = project.batch.boxes_of(project.batch.find_protein("prot-8"))
     assert tubulin.box_size == BoxSize(width=20, height=10)  # the size quantified and stored
     assert tubulin.fitted_size == BoxSize(width=14, height=6)
     # Without a padding the two are the same size.
-    beta = project.batch.find_protein("prot-7")
+    beta = project.batch.boxes_of(project.batch.find_protein("prot-7"))
     assert beta.fitted_size == beta.box_size == BoxSize(width=24, height=14)

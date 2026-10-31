@@ -2,8 +2,11 @@
 """Shared fixtures: a sample project that exercises every part of the data model.
 
 :func:`make_project` builds it from plain dicts, the way ``project.json`` arrives,
-so the fixture itself passes through every validator. The non-ASCII names (µ, α,
-β) are on purpose: they travel through validation, the saved file and the hash.
+so the fixture itself passes through every validator. The dicts are those of a
+schema-2 file (:func:`sample_doc`), converted as an older file is when it is
+read (:func:`~proteia.core.storage.migrate`), so every test of the sample also
+runs the conversion. The non-ASCII names (µ, α, β) are on purpose: they travel
+through validation, the saved file and the hash.
 
 Layout: two membranes. ``mem-1`` holds a chemiluminescence image paired with its
 visible-light marker and a reprobe of the same blot; ``mem-5`` holds one JPEG on
@@ -33,7 +36,7 @@ import tifffile
 from pydantic import BaseModel
 
 from proteia.core.model import Project, apply_change
-from proteia.core.storage import image_path
+from proteia.core.storage import image_path, migrate
 
 
 class _NoBrowser:
@@ -127,9 +130,24 @@ def _band(band_id: str, lane: int, x: int, y: int, net: float, source: str, **fi
     }
 
 
+def converted(doc: dict) -> Project:
+    """The project an older ``project.json`` holding ``doc`` opens as: converted
+    to the current schema, then validated."""
+    return Project.model_validate(migrate(doc))
+
+
 def make_project() -> Project:
-    """A valid project with ids 1-18 in use and ``next_id`` 19."""
-    return Project.model_validate(_sample_doc())
+    """The sample project (:func:`sample_doc`), converted: ids 1-18 as the
+    schema-2 file held them, then its lane table ``lt-19``, the membrane areas
+    ``arena-20`` to ``arena-23`` (one per image) and the rows ``row-24`` to
+    ``row-26`` (one per protein); ``next_id`` 27."""
+    return converted(_sample_doc())
+
+
+def sample_doc() -> dict:
+    """The sample project as a schema-2 ``project.json`` holds it: ids 1-18 in
+    use and ``next_id`` 19."""
+    return _sample_doc()
 
 
 # The content hash schema 1 gave the sample project (sample_doc_v1): what the
@@ -144,9 +162,10 @@ def as_legacy(project: Project) -> Project:
 
     def change(draft: Project) -> None:
         draft.background_method = "global_median"
-        for protein in draft.batch.proteins:
-            level = draft.batch.find_image(protein.image_id).background
-            for band in protein.bands:
+        batch = draft.batch
+        for protein in batch.proteins:
+            level = batch.image_of(protein).background
+            for band in batch.boxes_of(protein).bands:
                 band.background_level = level
                 band.background_mode = "global_median"
                 band.background_spread = 0.0
@@ -196,7 +215,12 @@ def _undetected(lane: int, snr: float, region: tuple[int, int, int, int], **fiel
 
 
 def make_project_with_undetected() -> Project:
-    """:func:`make_project` with not-detected records: β-catenin in lane 2, where
+    """:func:`make_project` with not-detected records (:func:`undetected_doc`)."""
+    return converted(undetected_doc())
+
+
+def undetected_doc() -> dict:
+    """:func:`sample_doc` with not-detected records: β-catenin in lane 2, where
     it has no band, and GAPDH in lanes 2 and 3, given out of order (the model
     sorts them). GAPDH's lane-3 record comes from molecular-weight-guided
     detection, and its lane-2 record has a negative SNR."""
@@ -207,11 +231,16 @@ def make_project_with_undetected() -> Project:
         _undetected(3, 4.125, (138, 93, 168, 121), source="mw_guided"),
         _undetected(2, -0.75, (98, 93, 128, 121)),
     ]
-    return Project.model_validate(doc)
+    return doc
 
 
 def make_project_with_clashing_names() -> Project:
-    """:func:`make_project` with protein names whose lane-table columns would
+    """:func:`make_project` with clashing names (:func:`clashing_names_doc`)."""
+    return converted(clashing_names_doc())
+
+
+def clashing_names_doc() -> dict:
+    """:func:`sample_doc` with protein names whose lane-table columns would
     share a name, as a ``project.json`` may hold them (the operations refuse
     them): β-catenin named ``GAPDH`` and GAPDH named ``GAPDH clipped``, a target
     of α-tubulin, whose net column the first one's clipping column would name.
@@ -224,7 +253,7 @@ def make_project_with_clashing_names() -> Project:
     for protein, clipped_lane in ((first, 0), (second, 1)):
         for band in protein["bands"]:
             band["clipped"] = band["lane_index"] == clipped_lane
-    return Project.model_validate(doc)
+    return doc
 
 
 def _sample_doc_v1() -> dict:

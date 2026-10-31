@@ -299,7 +299,7 @@ def test_an_import_joins_the_membrane_it_names(client, tmp_path):
     assert images[reprobe["image_id"]] == membrane
     assert images[other["image_id"]] != membrane
     project = storage.load_project(client.root / "Blot")
-    assert [[i.id for i in m.images] for m in project.batch.membranes] == [
+    assert [[i.id for i in project.batch.images_of(m)] for m in project.batch.membranes] == [
         [image["id"], reprobe["image_id"]],
         [other["image_id"]],
     ]
@@ -935,7 +935,7 @@ def plant_records(client: Client, protein_id: str, *records: UndetectedBand, ban
     def change(draft: Project) -> None:
         protein = draft.batch.find_protein(protein_id)
         protein.expected_band_count = bands
-        protein.undetected.extend(records)
+        draft.batch.boxes_of(protein).undetected.extend(records)
 
     with session.transaction():
         project, _ = apply_change(session.project, change)
@@ -1114,7 +1114,7 @@ def test_quit_saves_unsaved_changes_first_or_refuses(client, tmp_path, monkeypat
     project_file.rmdir()
     assert client.call("POST", "/api/quit")[0] == 202
     saved = json.loads(project_file.read_text(encoding="utf-8"))
-    assert [lane["label"] for lane in saved["batch"]["lanes"]] == ["vehicle"]
+    assert [lane["label"] for lane in saved["batch"]["lane_tables"][0]["lanes"]] == ["vehicle"]
 
 
 @pytest.mark.parametrize("size", [[0, 10], [10, -5], [10], ["10", 10]])
@@ -1314,7 +1314,7 @@ def test_a_jpeg_project_flags_bands_possibly_over_exposed(client, tmp_path):
 
     def forget(draft: Project) -> None:
         for protein in draft.batch.proteins:
-            for band in protein.bands:
+            for band in draft.batch.boxes_of(protein).bands:
                 band.possibly_clipped = None
 
     with session.transaction():
@@ -2371,10 +2371,13 @@ def test_removing_a_protein_answers_its_cascade_and_drops_its_series(client, tmp
     assert len(before["results"]["sets"][0]["series"]) == 1
     band_ids = [band["id"] for band in protein_of(before, loading)["bands"]]
 
+    batch = client.workspace.current().project.batch
+    row = batch.only_row(batch.find_protein(loading)).id
+
     answer = client.ok("DELETE", f"/api/proteins/{loading}")
     assert set(answer) == {*CASCADE, "project", "results"}
     assert {name: answer[name] for name in CASCADE} == {
-        "removed": [loading, *band_ids],
+        "removed": [loading, row, *band_ids],
         "detached_targets": [target],  # it used the batch's only loading control
         "unpaired_images": [],
         "unfitted_membranes": [],
@@ -2394,11 +2397,15 @@ def test_removing_an_image_answers_the_whole_cascade(client, tmp_path):
     body = {"name": "γ-actin", "role": "target", "image_id": other["image_id"]}
     gamma = client.ok("POST", "/api/proteins", body)["protein_id"]
     band_ids = [band["id"] for p in (loading, target) for band in protein_of(before, p)["bands"]]
+    batch = client.workspace.current().project.batch
+    [(_, area)] = batch.arenas_on(image["id"])
+    rows = [batch.only_row(batch.find_protein(p)).id for p in (loading, target)]
 
     answer = client.ok("DELETE", f"/api/images/{image['id']}")
     assert set(answer) == {*CASCADE, "project", "results"}
+    gone = [image["id"], area.id, loading, target, *rows, *band_ids, image["membrane_id"]]
     assert {name: answer[name] for name in CASCADE} == {
-        "removed": [image["id"], loading, target, *band_ids, image["membrane_id"]],
+        "removed": gone,
         "detached_targets": [gamma],  # it used α-tubulin, the only loading control
         "unpaired_images": [],
         "unfitted_membranes": [],
@@ -2420,7 +2427,7 @@ def test_removing_a_marker_image_answers_the_pairing_and_the_fit_it_undid(client
 
     answer = client.ok("DELETE", "/api/images/img-3")
     assert {name: answer[name] for name in CASCADE} == {
-        "removed": ["img-3"],
+        "removed": ["img-3", "arena-21"],  # with its membrane area
         "detached_targets": [],
         "unpaired_images": ["img-2"],
         "unfitted_membranes": ["mem-1"],
@@ -2772,7 +2779,7 @@ def test_reopening_during_an_edit_leaves_one_session_saving_the_folder(tmp_path)
 
     saved = storage.load_project(session.folder)
     assert saved == session.project
-    assert [lane.label for lane in saved.batch.lanes] == ["vehicle"]
+    assert [lane.label for lane in saved.batch.only_lanes()] == ["vehicle"]
     assert [image.id for image in saved.batch.iter_images()] == stored
     images = session.folder / storage.IMAGES_DIR
     assert sorted(p.name for p in images.iterdir()) == [f"{gone}.tif", f"{stored[0]}.tif"]
@@ -2811,7 +2818,7 @@ def test_reopening_reads_the_open_project_again_once_changed_outside_proteia(cli
     stored = blot_upload(session, tmp_path, "stored β.tif")
     saved = storage.load_project(session.folder)
     assert saved == session.project
-    assert [lane.label for lane in saved.batch.lanes] == ["drug"]
+    assert [lane.label for lane in saved.batch.only_lanes()] == ["drug"]
     assert [image.id for image in saved.batch.iter_images()] == [
         imported["image_id"],
         newer,
@@ -2895,7 +2902,7 @@ def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
         operation.join(10)
     assert workspace.view(session)[0] == 1
     assert workspace.open("A µ") is session  # nothing holds it now: read again
-    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+    assert workspace.view(session)[0] == 2 and not session.project.batch.only_lanes()
 
     # Unsaved changes: the file is older than the session, not changed outside.
     def refuse(project: Project, folder: Path) -> Path:
@@ -2933,7 +2940,7 @@ def test_a_reopen_waits_for_a_short_read_and_then_reads_the_changed_file(tmp_pat
         assert workspace.open("A µ") is session  # waits for the read, then reads the file
     finally:
         read.join(10)
-    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+    assert workspace.view(session)[0] == 2 and not session.project.batch.only_lanes()
 
 
 def test_a_project_created_where_the_open_one_was_removed_keeps_the_files_it_stores(tmp_path):
@@ -3654,7 +3661,8 @@ def _loading_boxes(client: Client, target: str, loading: str) -> list[str]:
 def _unreadable_pixels(client: Client, target: str, loading: str) -> list[str]:
     """A non-finite pixel in the row, as a damaged file would read."""
     session = client.workspace.current()
-    image_id = session.project.batch.find_protein(target).image_id
+    batch = session.project.batch
+    image_id = batch.image_id_of(batch.find_protein(target))
     pixels = np.array(session.pixels(image_id), dtype=np.float64)
     pixels[TARGET_ROW, LANE_X[0] + 30] = np.nan
     pixels.flags.writeable = False
@@ -4524,7 +4532,7 @@ def test_a_project_read_again_refuses_its_earlier_opening(client, tmp_path):
         {"open": "Blot", "open_id": 2},
     )
     saved = storage.load_project(session.folder)
-    assert [lane.label for lane in saved.batch.lanes] == ["drug"]
+    assert [lane.label for lane in saved.batch.only_lanes()] == ["drug"]
 
 
 # --- A request runs within the opening it named (#134's review) ---
@@ -4705,13 +4713,15 @@ def test_a_request_made_while_a_reopen_waits_is_checked_against_the_opening_it_l
         asking, asked = _in_thread(later)
         asking.join(0.3)
         assert asking.is_alive()  # it waits for the reopen
-        assert workspace.view(session)[0] == 1 and session.project.batch.lanes  # nothing read
+        assert (
+            workspace.view(session)[0] == 1 and session.project.batch.only_lanes()
+        )  # nothing read
     for thread in (reopening, asking):
         thread.join(10)
         assert not thread.is_alive()
     assert reopened == [session]
     assert asked == [2]
-    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+    assert workspace.view(session)[0] == 2 and not session.project.batch.only_lanes()
 
 
 def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_path, monkeypatch):
@@ -4730,7 +4740,7 @@ def test_a_reopen_leaves_the_file_unread_while_a_request_runs_past_the_wait(tmp_
         with workspace.using(1) as again:  # nothing waits once the reopen has ended
             assert again is session
     assert workspace.open("A µ") is session  # nothing in use now: read again
-    assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+    assert workspace.view(session)[0] == 2 and not session.project.batch.only_lanes()
 
 
 # The routes on the open project that check the opening their request names as
@@ -5536,7 +5546,9 @@ def test_an_accept_imports_the_images_into_a_new_project_named_after_the_first(c
     assert (workspace["open"], workspace["handoffs"]) == ("β-actin 10 µM", [])
     # The project open before is saved and closed.
     assert (old.undo_step, old.redo_step) == (None, None)
-    assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["vehicle"]
+    assert [lane.label for lane in storage.load_project(old.folder).batch.only_lanes()] == [
+        "vehicle"
+    ]
 
 
 def test_an_accept_says_what_the_launches_refused(client, tmp_path, ticks):
@@ -5783,7 +5795,7 @@ def test_an_accept_while_the_open_project_cannot_be_saved_changes_nothing(
     project_file.rmdir()
     assert accept(client, handoff_id, files)["project"]["name"] == "a"
     saved = storage.load_project(client.root / "Blot")
-    assert [lane.label for lane in saved.batch.lanes] == ["vehicle"]
+    assert [lane.label for lane in saved.batch.only_lanes()] == ["vehicle"]
 
 
 @pytest.mark.parametrize("switch", ["create", "accept"])
@@ -5829,7 +5841,7 @@ def test_an_edit_made_while_a_switch_runs_is_saved_before_the_old_project_closes
     )
     assert "'First'" in payload["message"] and "'Blot'" in payload["message"]
     assert client.workspace.current() is old and old.dirty
-    assert [lane.label for lane in old.project.batch.lanes] == ["c1"]
+    assert [lane.label for lane in old.project.batch.only_lanes()] == ["c1"]
     assert client.ok("GET", "/api/workspace")["open"] == "Blot"
     created = storage.load_project(client.root / "First")  # complete, and closed
     assert len(list(created.batch.iter_images())) == (1 if switch == "accept" else 0)
@@ -5842,7 +5854,7 @@ def test_an_edit_made_while_a_switch_runs_is_saved_before_the_old_project_closes
     assert status == 201, payload
     assert payload["project"]["name"] == "Second"
     saved = storage.load_project(old.folder)
-    assert [lane.label for lane in saved.batch.lanes] == ["c1", "c2"]
+    assert [lane.label for lane in saved.batch.only_lanes()] == ["c1", "c2"]
     assert not old.dirty
 
 
@@ -5879,7 +5891,7 @@ def test_an_open_whose_old_project_cannot_be_saved_after_it_names_nothing_create
     monkeypatch.setattr(api.ops, "open_project", open_project)
     project_file.rmdir()
     assert client.ok("POST", "/api/projects/open", {"name": "Other"})["project"]["name"] == "Other"
-    assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["c1"]
+    assert [lane.label for lane in storage.load_project(old.folder).batch.only_lanes()] == ["c1"]
 
 
 def test_a_switch_waits_for_an_edit_running_on_the_old_project(tmp_path, monkeypatch):
@@ -5936,8 +5948,10 @@ def test_a_switch_waits_for_an_edit_running_on_the_old_project(tmp_path, monkeyp
     (error,) = errors
     assert error.created == "New"
     assert workspace.current() is old and old.dirty
-    assert [lane.label for lane in old.project.batch.lanes] == ["vehicle"]
-    assert storage.load_project(tmp_path / "root" / "New").batch.lanes == []  # created, closed
+    assert [lane.label for lane in old.project.batch.only_lanes()] == ["vehicle"]
+    assert (
+        storage.load_project(tmp_path / "root" / "New").batch.only_lanes() == []
+    )  # created, closed
 
 
 @pytest.mark.parametrize("saves", [True, False], ids=["saved", "logged"])
@@ -5970,7 +5984,9 @@ def test_an_edit_made_on_the_old_project_once_replaced_is_saved_after_the_close(
     logged = [record.getMessage() for record in caplog.records if record.name == api.__name__]
     if saves:
         assert not old.dirty and logged == []
-        assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["vehicle"]
+        assert [lane.label for lane in storage.load_project(old.folder).batch.only_lanes()] == [
+            "vehicle"
+        ]
     else:
         assert old.dirty
         (message,) = logged

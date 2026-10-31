@@ -202,6 +202,8 @@ from proteia.core.model import (
     IMAGE_SUFFIXES,
     LEGACY_BACKGROUND_METHOD,
     LOCAL_BACKGROUND_METHOD,
+    Arena,
+    ArenaSource,
     Band,
     Batch,
     Box,
@@ -215,6 +217,7 @@ from proteia.core.model import (
     ImageWarning,
     LadderSide,
     Lane,
+    LaneTable,
     Membrane,
     Polarity,
     Project,
@@ -223,6 +226,7 @@ from proteia.core.model import (
     Rect,
     Region,
     Role,
+    Row,
     UndetectedBand,
     UndetectedReason,
     UnknownIdError,
@@ -366,7 +370,9 @@ KEEP: Final = Keep.KEEP
 class Cascade:
     """What a removal took with it."""
 
-    removed: tuple[str, ...]  # every removed id: the object, then proteins, bands, membrane
+    # Every removed id: the object and its membrane areas, then the proteins,
+    # their rows and their bands, then the membrane.
+    removed: tuple[str, ...]
     detached_targets: tuple[str, ...]  # targets that lost a loading control
     unpaired_images: tuple[str, ...]  # images whose marker_image_id was cleared
     # calibration lost points: refitted, or left without a curve
@@ -482,9 +488,11 @@ class Restored:
 
     ``seq`` and ``action`` name the original change's log entry. The ids that
     went and came back are in the order :meth:`~proteia.core.model.Project.iter_ids`
-    gives: by kind (membranes, images, proteins, bands), each kind as stored
-    (images membrane by membrane, bands protein by protein and by lane), so not
-    sorted by id. Not-detected records, which have no ids, are listed by
+    gives: by kind, the kinds schema 2 held first (membranes, images,
+    proteins, bands), then those schema 3 added (lane tables, membrane areas,
+    rows), each kind as stored (images membrane by membrane, areas membrane by
+    membrane, bands and rows protein by protein, bands by lane), so not sorted
+    by id. Not-detected records, which have no ids, are listed by
     (protein id, lane index, band index), as stored. An object or record in
     both states whose fields changed (a moved box, a replaced record) is in no
     list.
@@ -833,11 +841,10 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     """
     batch = draft.batch
     image = batch.find_image(image_id)
-    placed = [
-        (batch.boxes_of(protein).box_size, band)
-        for protein in batch.proteins_on(image_id)
-        for band in batch.boxes_of(protein).bands
-    ]
+    placed: list[tuple[BoxSize, Band]] = []
+    for protein in batch.proteins_on(image_id):
+        boxes = batch.boxes_of(protein)
+        placed.extend((boxes.box_size, band) for band in boxes.bands)
     if not placed:
         return
     dark_on_light = image.polarity.dark_on_light
@@ -905,7 +912,7 @@ def _fits(project: Project) -> dict[str, _Fitted]:
     """Each image's register group, fitted, by image id."""
     fits: dict[str, _Fitted] = {}
     for membrane in project.batch.membranes:
-        for group, fitted in mwcal.calibrations(membrane).items():
+        for group, fitted in mwcal.calibrations(project.batch, membrane).items():
             fits.update(dict.fromkeys(group, fitted))
     return fits
 
@@ -947,7 +954,7 @@ def _fitted_before_58(membrane: Membrane, batch: Batch) -> bool:
         return False
     if (
         calibration.fit_quality is not None
-        or mwcal.fit_method(membrane) is not FitMethod.LOG_LINEAR
+        or mwcal.fit_method(batch, membrane) is not FitMethod.LOG_LINEAR
     ):
         return True
     images = {image.id for image in batch.images_of(membrane)}
@@ -1011,8 +1018,8 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
         if stored is not None and _fitted_before_58(stored, committed.batch):
             refitted_older.update(image.id for image in draft.batch.images_of(membrane))
         calibration = membrane.calibration
-        calibration.fit_method = mwcal.fit_method(membrane)
-        quality = mwcal.fit_quality(membrane)
+        calibration.fit_method = mwcal.fit_method(draft.batch, membrane)
+        quality = mwcal.fit_quality(draft.batch, membrane)
         if quality is not None and not math.isfinite(quality):
             raise _invalid(
                 f"membrane {membrane.id}: its calibration points' MWs are too far apart for"
@@ -1200,7 +1207,7 @@ def _count_cleared_by_tolerance(batch: Batch, protein: Protein) -> bool:
     one, the window is the row box's rows."""
     membrane = batch.membrane_of_protein(protein)
     return isinstance(
-        mwcal.calibration_for(membrane, batch.image_id_of(protein)), mwcal.Calibration
+        mwcal.calibration_for(batch, membrane, batch.image_id_of(protein)), mwcal.Calibration
     )
 
 
@@ -1405,8 +1412,12 @@ def import_image(
     recorded size, bit depth, background and warnings come from the stored copy,
     with ``looks_processed`` assessed for ``polarity``
     (:func:`~proteia.core.imaging.assess_processed`). Without ``membrane_id`` the
-    image starts a new membrane. ``kind`` and ``polarity`` are required (the
-    model has no silent default).
+    image starts a new membrane, numbered by the project's lane table (made,
+    empty, by the first import or lane table; logged as ``lane_table_id``); with
+    it, the image goes right after that membrane's images. Either way the
+    membrane's area on it is the whole image, at angle 0 (logged as
+    ``arena_id``). ``kind`` and ``polarity`` are required (the model has no
+    silent default).
 
     A file of printing inks, CMYK or other, is refused (``CMYK_IMAGE``, #207;
     :func:`_refuse_inks`): the message names it and says to save it as RGB or
@@ -1512,32 +1523,39 @@ def import_image(
             palette=loaded.palette,
         )
 
-        def change(draft: Project) -> str:
+        def change(draft: Project) -> tuple[str, str, str | None]:
             if draft.new_id("img") != image_id:  # the lock makes this impossible
                 raise RuntimeError(f"image id {image_id} changed while the file was stored")
+            batch = draft.batch
+            made = None
             if membrane_id is None:
-                membrane = Membrane(id=draft.new_id("mem"))
-                draft.batch.membranes.append(membrane)
+                new_membrane = draft.new_id("mem")
+                table, made = _lane_table(draft)
+                membrane = Membrane(id=new_membrane, lane_table_id=table.id)
+                batch.membranes.append(membrane)
             else:
-                membrane = next(m for m in draft.batch.membranes if m.id == membrane_id)
-            membrane.images.append(
-                ImageRef(
-                    id=image_id,
-                    file=stored.file,
-                    original_name=original_name,
-                    kind=kind,
-                    sha256=stored.sha256,
-                    width=loaded.width,
-                    height=loaded.height,
-                    bit_depth=loaded.bit_depth,
-                    polarity=polarity,
-                    background=background,
-                    import_warnings=warnings,
-                )
+                membrane = next(m for m in batch.membranes if m.id == membrane_id)
+            image = ImageRef(
+                id=image_id,
+                file=stored.file,
+                original_name=original_name,
+                kind=kind,
+                sha256=stored.sha256,
+                width=loaded.width,
+                height=loaded.height,
+                bit_depth=loaded.bit_depth,
+                polarity=polarity,
+                background=background,
+                import_warnings=warnings,
             )
-            return membrane.id
+            batch.images.insert(_image_slot(batch, membrane), image)
+            arena = Arena(
+                id=draft.new_id("arena"), image_id=image_id, source=ArenaSource.WHOLE_IMAGE
+            )
+            membrane.arenas.append(arena)
+            return membrane.id, arena.id, made
 
-        new, membrane_used = _prepare(session, change)
+        new, (membrane_used, arena_id, table_made) = _prepare(session, change)
         params = {
             "image_id": image_id,
             "membrane_id": membrane_used,
@@ -1546,7 +1564,10 @@ def import_image(
             "kind": kind.value,
             "polarity": polarity.value,
             "sha256": stored.sha256,  # keeps a removed image's provenance
+            "arena_id": arena_id,  # its membrane's area on it: the whole image
         }
+        if table_made is not None:
+            params["lane_table_id"] = table_made  # the project's lane table, made with it
         session._commit(
             new, action="import_image", params=params, add_pixels={image_id: loaded.array}
         )
@@ -1692,6 +1713,27 @@ def _refuse_pixel_type(original_name: str, pixels: PixelType | None) -> None:
     )
 
 
+def _lane_table(draft: Project) -> tuple[LaneTable, str | None]:
+    """The project's lane table, made (empty, with a new id) while it has none;
+    and its id when it was made here."""
+    tables = draft.batch.lane_tables
+    if tables:
+        return tables[0], None
+    table = LaneTable(id=draft.new_id("lt"))
+    tables.append(table)
+    return table, table.id
+
+
+def _image_slot(batch: Batch, membrane: Membrane) -> int:
+    """Where an image imported onto ``membrane`` goes in the batch's images:
+    right after the last image of that membrane or of one before it, so they
+    stay in membrane then image order."""
+    upto = next(i for i, m in enumerate(batch.membranes) if m is membrane) + 1
+    earlier = {arena.image_id for m in batch.membranes[:upto] for arena in m.arenas}
+    held = [i for i, image in enumerate(batch.images) if image.id in earlier]
+    return held[-1] + 1 if held else 0
+
+
 def _log_import(session: ProjectSession, image_id: str) -> None:
     """Log the warnings an image was imported with, and whether over-exposure
     can be checked on it."""
@@ -1739,7 +1781,9 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
         gone_ids = {p.id for p in gone}
         removed = [
             image_id,
+            *(arena.id for _, arena in batch.arenas_on(image_id)),
             *(p.id for p in gone),
+            *(batch.only_row(p).id for p in gone),
             *(b.id for p in gone for b in batch.boxes_of(p).bands),
         ]
         records: list[JsonValue] = [
@@ -1764,8 +1808,11 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
                 image.marker_image_id = None
                 unpaired.append(image.id)
 
+        # The image goes with its membrane's area on it (and the rows there,
+        # with the proteins above).
         membrane = batch.membrane_of(image_id)
-        membrane.images = [image for image in batch.images_of(membrane) if image.id != image_id]
+        membrane.arenas = [arena for arena in membrane.arenas if arena.image_id != image_id]
+        batch.images = [image for image in batch.images if image.id != image_id]
         unfitted = []
         calibration = membrane.calibration
         points = [point for point in calibration.points if point.image_id != image_id]
@@ -1888,11 +1935,12 @@ _SOURCE_KINDS: Final = {
 _MARKER_KINDS: Final = frozenset({ImageKind.VISIBLE_MARKER, ImageKind.MERGED})
 
 
-def calibration_fit(membrane: Membrane, image_id: str) -> CalibrationFit | None:
+def calibration_fit(batch: Batch, membrane: Membrane, image_id: str) -> CalibrationFit | None:
     """The calibration of the register group holding ``image_id`` on
-    ``membrane`` (:func:`~proteia.core.mwcal.calibration_for`), as the page
-    shows it and the calibration operations log it; None without a curve."""
-    fitted = mwcal.calibration_for(membrane, image_id)
+    ``membrane`` of ``batch`` (:func:`~proteia.core.mwcal.calibration_for`), as
+    the page shows it and the calibration operations log it; None without a
+    curve."""
+    fitted = mwcal.calibration_for(batch, membrane, image_id)
     if not isinstance(fitted, mwcal.Calibration):
         return None
     ladder_fits = []
@@ -1912,7 +1960,9 @@ def calibration_fit(membrane: Membrane, image_id: str) -> CalibrationFit | None:
         )
     disagreement = fitted.disagreement
     return CalibrationFit(
-        image_ids=tuple(image.id for image in membrane.images if image.id in fitted.group),
+        image_ids=tuple(
+            image.id for image in batch.images_of(membrane) if image.id in fitted.group
+        ),
         method=fitted.method.value,
         ladders=tuple(ladder_fits),
         range=(_display_mw(fitted.z_lo), _display_mw(fitted.z_hi)),
@@ -2170,7 +2220,8 @@ def _calibration_change(
     def change(draft: Project) -> _Calibrated:
         edit(draft)
         refresh = _refresh_mw(committed, draft)
-        return calibration_fit(draft.batch.membrane_of(image_id), image_id), refresh
+        batch = draft.batch
+        return calibration_fit(batch, batch.membrane_of(image_id), image_id), refresh
 
     def logged(result: _Calibrated) -> _Params:
         fit, refresh = result
@@ -2262,16 +2313,15 @@ def set_marker_image(
                 " its image pixel for pixel",
                 ids=(image_id, marker.id),
             )
-    # The batch with the link made, to check it: only the membrane is copied
-    # (its images with it), the rest shared and left as it is.
-    linked = membrane.model_copy(deep=True)
-    linked_batch = batch.model_copy(
-        update={"membranes": [linked if m is membrane else m for m in batch.membranes]}
+    # The batch with the link made, to check it: only the image is copied, the
+    # rest shared and left as it is.
+    relinked = image.model_copy(update={"marker_image_id": marker_image_id})
+    linked = batch.model_copy(
+        update={"images": [relinked if i is image else i for i in batch.iter_images()]}
     )
-    linked_batch.find_image(image_id).marker_image_id = marker_image_id
-    for group in linked_batch.register_groups(linked):
-        points = [p for p in linked.calibration.points if p.image_id in group]
-        refusal = _ladder_refusal(linked_batch, linked, group, points)
+    for group in linked.register_groups(membrane):
+        points = [p for p in membrane.calibration.points if p.image_id in group]
+        refusal = _ladder_refusal(linked, membrane, group, points)
         if refusal is not None:
             raise refusal
     previous = image.marker_image_id
@@ -2279,13 +2329,13 @@ def set_marker_image(
     def edit(draft: Project) -> None:
         draft.batch.find_image(image_id).marker_image_id = marker_image_id
 
-    group = linked_batch.group_of(linked, image_id)
+    group = linked.group_of(membrane, image_id)
     params = {
         "membrane_id": membrane.id,
         "image_id": image_id,
         "marker_image_id": marker_image_id,
         "previous": previous,
-        "group": _group_ids(linked_batch, linked, group),
+        "group": _group_ids(linked, membrane, group),
     }
     change, logged = _calibration_change(session, image_id, edit, params)
     return _calibration_update(_apply(session, "set_marker_image", change, logged))
@@ -2656,7 +2706,7 @@ def _proposal(
     reference = () if preset is None else tuple(band.kda for band in preset.reference)
     other = None
     if side is LadderSide.RIGHT:
-        fitted = mwcal.calibration_for(membrane, image.id)
+        fitted = mwcal.calibration_for(session.project.batch, membrane, image.id)
         if isinstance(fitted, mwcal.Calibration):
             other = next(
                 (ladder.curve for ladder in fitted.ladders if ladder.side is LadderSide.LEFT), None
@@ -2995,7 +3045,9 @@ def set_lanes(
     *,
     reference_condition: str | None | Keep = KEEP,
 ) -> LanesUpdate:
-    """Declare or replace the whole lane table; row i is lane i.
+    """Declare or replace the whole lane table; row i is lane i. It is the
+    project's one table, which every membrane uses; while there is none (no
+    image yet), the first table that holds a lane makes it (``lane_table_id``).
 
     Text is cleaned (:func:`~proteia.core.names.clean_text`). Look-alike spellings
     (equal NFKC key, e.g. the micro sign and Greek mu) are unified: where the new
@@ -3028,8 +3080,9 @@ def set_lanes(
         included.append(lane.included)
 
     batch = session.project.batch
-    conditions = unify_spellings(typed_conditions, existing=[lane.label for lane in batch.lanes])
-    samples = unify_spellings(typed_samples, existing=[lane.sample for lane in batch.lanes])
+    table_lanes = batch.only_lanes()
+    conditions = unify_spellings(typed_conditions, existing=[lane.label for lane in table_lanes])
+    samples = unify_spellings(typed_samples, existing=[lane.sample for lane in table_lanes])
     n = len(conditions)
     respelled = tuple(
         i
@@ -3057,29 +3110,34 @@ def set_lanes(
     else:
         reference = _condition(reference_condition, labels)
 
-    def change(draft: Project) -> list[dict[str, JsonValue]]:
-        old = draft.batch.lanes
-        draft.batch.lanes = [
-            Lane(
-                index=i,
-                label=conditions[i],
-                sample=samples[i],
-                included=included[i],
-                metadata=dict(old[i].metadata) if i < len(old) else {},
-            )
-            for i in range(n)
-        ]
+    def change(draft: Project) -> tuple[list[dict[str, JsonValue]], str | None]:
+        made = None
+        if n or draft.batch.lane_tables:  # an empty table is made only to hold lanes
+            table, made = _lane_table(draft)
+            old = table.lanes
+            table.lanes = [
+                Lane(
+                    index=i,
+                    label=conditions[i],
+                    sample=samples[i],
+                    included=included[i],
+                    metadata=dict(old[i].metadata) if i < len(old) else {},
+                )
+                for i in range(n)
+            ]
         draft.batch.reference_condition = reference
-        return [
+        # The project's one lane table numbers every protein's lanes.
+        dropped = [
             dropped
             for protein in draft.batch.proteins
             for dropped in _drop_undetected_where(
                 draft.batch, protein, lambda record: record.lane_index >= n
             )
         ]
+        return dropped, made
 
     # Only the rows that are new or differ from the committed table, as stored.
-    stored = [(lane.label, lane.sample, lane.included) for lane in batch.lanes]
+    stored = [(lane.label, lane.sample, lane.included) for lane in table_lanes]
     rows = list(zip(conditions, samples, included, strict=True))
     changed: list[JsonValue] = [
         {"index": i, "condition": condition, "sample": sample, "included": include}
@@ -3087,15 +3145,19 @@ def set_lanes(
         if i >= len(stored) or rows[i] != stored[i]
     ]
 
-    def params(dropped: list[dict[str, JsonValue]]) -> _Params:
-        return {
+    def params(result: tuple[list[dict[str, JsonValue]], str | None]) -> _Params:
+        dropped, made = result
+        logged: dict[str, JsonValue] = {
             "lane_count": n,
             "changed": changed,
             "reference_condition": reference,
             "dropped_undetected": dropped,
         }
+        if made is not None:
+            logged["lane_table_id"] = made  # the project's first lane table
+        return logged
 
-    dropped = _apply(session, "set_lanes", change, params)
+    dropped, _ = _apply(session, "set_lanes", change, params)
     keys = tuple((d["protein_id"], d["lane_index"], d["band_index"]) for d in dropped)
     return LanesUpdate(respelled=respelled, reference_cleared=cleared, dropped_undetected=keys)
 
@@ -3105,7 +3167,8 @@ def set_reference_condition(session: ProjectSession, condition: str | None) -> N
     """Choose the fold-change reference by its condition (the stored spelling is
     the lane's), or clear it with None."""
     batch = session.project.batch
-    reference = None if condition is None else _condition(condition, [x.label for x in batch.lanes])
+    labels = [lane.label for lane in batch.only_lanes()]
+    reference = None if condition is None else _condition(condition, labels)
 
     def change(draft: Project) -> None:
         draft.batch.reference_condition = reference
@@ -3136,9 +3199,10 @@ def add_protein(
     the first grown box replaces it. ``mw_tolerance`` is how far, as a share,
     an apparent MW may lie from the expected one and pass (#58; None: the
     model's default, 0.1, ±10%); it also sizes the band count's window. The
-    image cannot be changed later. Adding a second loading control writes the
-    first into the targets that used it without naming it, so their results
-    do not change.
+    protein's boxes go in its row on the image's membrane area (logged as
+    ``row_id``). The image cannot be changed later. Adding a second loading
+    control writes the first into the targets that used it without naming it,
+    so their results do not change.
     """
     batch = session.project.batch
     role = _member(Role, role, "role")
@@ -3158,27 +3222,29 @@ def add_protein(
     else:
         size = _fitting_size(box_size, image)
 
-    def change(draft: Project) -> tuple[str, list[str]]:
+    def change(draft: Project) -> tuple[str, str, list[str]]:
         pinned = _pin_single_loading_control(draft.batch) if role is Role.LOADING_CONTROL else []
         protein_id = draft.new_id("prot")
+        [(_, arena)] = draft.batch.arenas_on(image_id)
+        row = Row(id=draft.new_id("row"), arena_id=arena.id, box_size=size)
         added = Protein(
             id=protein_id,
             name=name,
             role=role,
-            image_id=image_id,
             loading_control_ids=controls,
             expected_mw=mw,
-            box_size=size,
+            rows=[row],
         )
         if tolerance is not None:
             added.mw_tolerance = tolerance
         draft.batch.proteins.append(added)
-        return protein_id, pinned
+        return protein_id, row.id, pinned
 
-    def params(result: tuple[str, list[str]]) -> _Params:
-        protein_id, pinned = result
+    def params(result: tuple[str, str, list[str]]) -> _Params:
+        protein_id, row_id, pinned = result
         return {
             "protein_id": protein_id,
+            "row_id": row_id,  # its row on the image's membrane area
             "name": name,
             "role": role.value,
             "image_id": image_id,
@@ -3191,7 +3257,7 @@ def add_protein(
             "pinned_targets": pinned,
         }
 
-    protein_id, _ = _apply(session, "add_protein", change, params)
+    protein_id, _, _ = _apply(session, "add_protein", change, params)
     return protein_id
 
 
@@ -3302,8 +3368,9 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
 
     def change(draft: Project) -> tuple[Cascade, list[JsonValue]]:
         batch = draft.batch
-        gone = batch.boxes_of(batch.find_protein(protein_id))
-        removed = (protein_id, *(band.id for band in gone.bands))
+        going = batch.find_protein(protein_id)
+        gone = batch.boxes_of(going)
+        removed = (protein_id, batch.only_row(going).id, *(band.id for band in gone.bands))
         records: list[JsonValue] = [_undetected_json(protein_id, u) for u in gone.undetected]
         implicit = set(_implicit_users(batch, protein_id))
         batch.proteins = [p for p in batch.proteins if p.id != protein_id]
@@ -4014,13 +4081,11 @@ def _misnumbered_lanes(
     pitch = lane_pitch(anchors.values())
     if pitch is None:  # no protein has two kept lanes
         return None
-    grown = {
-        b.id
-        for p in proteins
-        if batch.boxes_of(p).fitted_size.width > pitch
-        for b in batch.boxes_of(p).bands
-        if b.source is ProposalSource.CLICK
-    }
+    grown: set[str] = set()
+    for p in proteins:
+        boxes = batch.boxes_of(p)
+        if boxes.fitted_size.width > pitch:
+            grown.update(b.id for b in boxes.bands if b.source is ProposalSource.CLICK)
     if grown:
         anchors = anchors_of({*without, *grown})
     ways = {p.id: lanes_run_right_to_left(anchors[p.id]) for p in proteins}
@@ -4957,7 +5022,7 @@ def _place_row(
     replaced = [yielding[lane] for lane in rects if lane in yielding]
     removed = [yielding[lane] for lane in sorted(yielding) if lane not in rects]
     # Each band's count, in the window around the box it gets (#58, D10).
-    fitted = mwcal.calibration_for(batch.membrane_of(image.id), image.id)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of(image.id), image.id)
     counts = {
         lane.lane: _bands_found(lane, rects[lane.lane], fitted, protein.mw_tolerance, given, height)
         for lane in placed
@@ -5225,7 +5290,7 @@ def detect_mw_row(
     mws = (protein.expected_mw,)
     image = batch.image_of(protein)
     membrane = batch.membrane_of(image.id)
-    fitted = mwcal.calibration_for(membrane, image.id)
+    fitted = mwcal.calibration_for(batch, membrane, image.id)
     if isinstance(fitted, mwcal.NoCalibration):
         raise _no_calibration(batch, membrane, image, fitted)
     names = _group_names(batch, membrane, fitted.group)
@@ -5262,7 +5327,7 @@ def detect_mw_row(
         outside = exc.code == "outside_range"
         code = ErrorCode.MW_OUTSIDE_CALIBRATION if outside else ErrorCode.OUT_OF_IMAGE
         raise OperationError(code, str(exc), ids=(image.id,)) from exc
-    fit = calibration_fit(membrane, image.id)
+    fit = calibration_fit(batch, membrane, image.id)
     lead: dict[str, JsonValue] = {
         "expected_mws": list(mws),
         "mw_tolerance": protein.mw_tolerance,
@@ -5613,7 +5678,7 @@ def export_lane_table(session: ProjectSession) -> Path:
     """
     project = session.project  # one snapshot for both files
     batch = project.batch
-    if not batch.lanes:
+    if not batch.only_lanes():
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before exporting them")
     bad = storage.verify_images(project, session.folder)
     if bad:
@@ -5624,7 +5689,7 @@ def export_lane_table(session: ProjectSession) -> Path:
             ids=bad,
         )
     _refuse_outdated_nets(session, project)
-    conditions, samples, included = spine_axes(batch.lanes)
+    conditions, samples, included = spine_axes(batch.only_lanes())
     nets, clipped = results.lane_nets(batch), results.lane_clipped(batch)
     names = export.lane_columns([(p.id, p.name) for p in batch.proteins]).proteins
     table = lane_table_bytes(
@@ -5749,7 +5814,7 @@ def export_bundle(
     setting = _statistics(statistics)
     project = session.project  # one snapshot for every file
     batch = project.batch
-    if not batch.lanes:
+    if not batch.only_lanes():
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before exporting them")
     bad = storage.verify_images(project, session.folder)
     if bad:

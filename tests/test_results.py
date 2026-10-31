@@ -86,7 +86,7 @@ def _loading_ids(*ids: str) -> Callable[[Project], None]:
 def _lane(index: int, **fields) -> Callable[[Project], None]:
     def edit(draft: Project) -> None:
         for name, value in fields.items():
-            setattr(draft.batch.lanes[index], name, value)
+            setattr(draft.batch.only_lanes()[index], name, value)
 
     return edit
 
@@ -219,7 +219,7 @@ def test_reference_with_every_lane_excluded():
 def test_reference_without_a_value_in_one_series_only():
     # α-tubulin loses its vehicle bands: that series has no reference value.
     def drop_tubulin_vehicle_bands(draft: Project) -> None:
-        tubulin = draft.batch.find_protein("prot-8")
+        tubulin = draft.batch.boxes_of(draft.batch.find_protein("prot-8"))
         tubulin.bands = [b for b in tubulin.bands if b.lane_index > 1]
 
     batch = _batch(
@@ -301,10 +301,10 @@ def test_no_target_is_export_only():
 
 def test_no_lanes():
     def drop_lanes(draft: Project) -> None:
-        draft.batch.lanes = []
+        draft.batch.lane_tables[0].lanes = []
         draft.batch.reference_condition = None
         for protein in draft.batch.proteins:
-            protein.bands = []
+            draft.batch.boxes_of(protein).bands = []
 
     batch = _batch(drop_lanes)
     res = compute_results(batch, plot_conditions=["vehicle"])
@@ -329,7 +329,7 @@ def test_zero_loading_net_is_reported_where_the_target_has_a_value():
 def test_series_with_no_included_value():
     # Only lane 3 (excluded) keeps a β-catenin band.
     def keep_lane_3(draft: Project) -> None:
-        beta = draft.batch.find_protein("prot-7")
+        beta = draft.batch.boxes_of(draft.batch.find_protein("prot-7"))
         beta.bands = [b for b in beta.bands if b.lane_index == 3]
 
     res = compute_results(_batch(keep_lane_3, _reference(None)))
@@ -343,7 +343,7 @@ def test_series_with_no_included_value():
 def test_series_with_no_value_is_one_notice_even_with_a_reference():
     # The missing baseline follows from the missing values: one notice, not two.
     def keep_lane_3(draft: Project) -> None:
-        beta = draft.batch.find_protein("prot-7")
+        beta = draft.batch.boxes_of(draft.batch.find_protein("prot-7"))
         beta.bands = [b for b in beta.bands if b.lane_index == 3]
 
     res = compute_results(_batch(keep_lane_3))
@@ -415,7 +415,7 @@ def test_plot_conditions_must_not_be_one_string():
 
 def test_extra_bands_are_reported_and_not_quantified():
     def add_second_band(draft: Project) -> None:
-        beta = draft.batch.find_protein("prot-7")
+        beta = draft.batch.boxes_of(draft.batch.find_protein("prot-7"))
         beta.bands.append(
             Band(
                 id=draft.new_id("band"),
@@ -615,20 +615,25 @@ def _baseline_batch(reference: str | None) -> model.Batch:
             id=protein_id,
             name=name,
             role=role,
-            image_id=image.id,
-            box_size=BOX_SIZE,
-            bands=[
-                Band(
-                    id=f"band-{next(number)}",
-                    lane_index=i,
-                    box=_box(cx, ROW_Y[name]),
-                    net=nets[name][i],
-                    background_level=background["levels"]["dark_on_light"][name][i],
-                    background_mode=background["modes"]["dark_on_light"][name][i],
-                    background_spread=background["spreads"]["dark_on_light"][name][i],
-                    source=ProposalSource.MANUAL,
+            rows=[
+                model.Row(
+                    id=f"row-{int(protein_id.split('-')[1]) + 90}",
+                    arena_id="arena-2",
+                    box_size=BOX_SIZE,
+                    bands=[
+                        Band(
+                            id=f"band-{next(number)}",
+                            lane_index=i,
+                            box=_box(cx, ROW_Y[name]),
+                            net=nets[name][i],
+                            background_level=background["levels"]["dark_on_light"][name][i],
+                            background_mode=background["modes"]["dark_on_light"][name][i],
+                            background_spread=background["spreads"]["dark_on_light"][name][i],
+                            source=ProposalSource.MANUAL,
+                        )
+                        for i, cx in enumerate(LANE_X)
+                    ],
                 )
-                for i, cx in enumerate(LANE_X)
             ],
         )
         for protein_id, name, role in (
@@ -642,10 +647,12 @@ def _baseline_batch(reference: str | None) -> model.Batch:
             zip(CONDITIONS, SAMPLES, INCLUDED, strict=True)
         )
     ]
+    area = model.Arena(id="arena-2", image_id=image.id, source="whole_image")
     return model.Batch(
-        lanes=lanes,
+        images=[image],
+        lane_tables=[model.LaneTable(id="lt-1", lanes=lanes)],
         reference_condition=reference,
-        membranes=[Membrane(id="mem-1", images=[image])],
+        membranes=[Membrane(id="mem-1", lane_table_id="lt-1", arenas=[area])],
         proteins=proteins,
     )
 
@@ -860,7 +867,8 @@ def test_excluded_lanes_without_values_add_no_second_set():
     # A ladder or empty lane marked include=no removes no data point.
     def empty_lane_3(draft: Project) -> None:
         for protein in draft.batch.proteins:
-            protein.bands = [b for b in protein.bands if b.lane_index != 3]
+            boxes = draft.batch.boxes_of(protein)
+            boxes.bands = [b for b in boxes.bands if b.lane_index != 3]
 
     res = compute_results(_batch(empty_lane_3))
     assert res.excluded_lanes == [3]
@@ -872,8 +880,9 @@ def test_the_label_names_only_the_excluded_lanes_that_hold_values():
     # Lane 0 is emptied (a ladder) and excluded; lane 3, excluded, holds values.
     def ladder_in_lane_0(draft: Project) -> None:
         for protein in draft.batch.proteins:
-            protein.bands = [b for b in protein.bands if b.lane_index != 0]
-        draft.batch.lanes[0].included = False
+            boxes = draft.batch.boxes_of(protein)
+            boxes.bands = [b for b in boxes.bands if b.lane_index != 0]
+        draft.batch.only_lanes()[0].included = False
 
     res = compute_results(_batch(ladder_in_lane_0))
     assert res.excluded_lanes == [0, 3]  # both are left out of this set
@@ -927,7 +936,7 @@ def test_one_set_has_no_label_and_its_charts_no_subtitle():
 def _no_variation(draft: Project) -> None:
     """Every lane included and boxed, every β-catenin net 1000 and every α-tubulin
     net 2000: both conditions' fold-changes are exactly [1.0, 1.0]."""
-    beta = draft.batch.find_protein("prot-7")
+    beta = draft.batch.boxes_of(draft.batch.find_protein("prot-7"))
     beta.bands.append(
         Band(
             id=draft.new_id("band"),
@@ -940,9 +949,9 @@ def _no_variation(draft: Project) -> None:
     )
     for band in beta.bands:
         band.net = 1000.0
-    for band in draft.batch.find_protein("prot-8").bands:
+    for band in draft.batch.boxes_of(draft.batch.find_protein("prot-8")).bands:
         band.net = 2000.0
-    draft.batch.lanes[3].included = True
+    draft.batch.only_lanes()[3].included = True
 
 
 @pytest.mark.filterwarnings("ignore::RuntimeWarning")  # scipy, on values that do not vary
@@ -975,9 +984,11 @@ def test_an_exclusion_that_leaves_one_of_three_groups_with_one_sample_tests_the_
     baseline = _baseline_batch(REFERENCE)
     lanes = [
         lane.model_copy(update={"included": False}) if lane.index == 7 else lane
-        for lane in baseline.lanes
+        for lane in baseline.only_lanes()
     ]
-    res = compute_results(baseline.model_copy(update={"lanes": lanes}))
+    [table] = baseline.lane_tables
+    tables = [table.model_copy(update={"lanes": lanes})]
+    res = compute_results(baseline.model_copy(update={"lane_tables": tables}))
     assert res.label == "Excluding lanes 6, 8"
     [series] = res.series
     tested = compare(series.groups, StatisticsSetting(), ratio=True, reference=REFERENCE)
@@ -1100,7 +1111,7 @@ def _undetected(protein_id: str, *lanes: int, band_index: int = 0) -> Callable[[
     """Not-detected records for a protein in ``lanes``."""
 
     def edit(draft: Project) -> None:
-        protein = draft.batch.find_protein(protein_id)
+        protein = draft.batch.boxes_of(draft.batch.find_protein(protein_id))
         for lane in lanes:
             protein.undetected.append(
                 UndetectedBand(
@@ -1119,7 +1130,7 @@ def _undetected(protein_id: str, *lanes: int, band_index: int = 0) -> Callable[[
 
 def _no_bands(protein_id: str, *lanes: int) -> Callable[[Project], None]:
     def edit(draft: Project) -> None:
-        protein = draft.batch.find_protein(protein_id)
+        protein = draft.batch.boxes_of(draft.batch.find_protein(protein_id))
         protein.bands = [b for b in protein.bands if b.lane_index not in lanes]
 
     return edit
@@ -1148,9 +1159,9 @@ def test_detected_tells_a_band_from_a_record_from_nothing():
     assert lane_detected(band_one)["prot-9"] == [True, True, None, None]
 
     def no_lanes(draft: Project) -> None:
-        draft.batch.lanes, draft.batch.reference_condition = [], None
+        draft.batch.lane_tables[0].lanes, draft.batch.reference_condition = [], None
         for protein in draft.batch.proteins:
-            protein.bands = []
+            draft.batch.boxes_of(protein).bands = []
 
     assert lane_detected(_batch(no_lanes)) == {"prot-7": [], "prot-8": [], "prot-9": []}
     assert [column.detected for column in compute_results(_batch(no_lanes)).proteins] == [[]] * 3
@@ -1450,14 +1461,12 @@ def test_chart_test_is_the_core_test_of_the_value_kind():
 
 def _baseline_without(*lanes: int) -> model.Batch:
     baseline = _baseline_batch(REFERENCE)
-    return baseline.model_copy(
-        update={
-            "lanes": [
-                lane.model_copy(update={"included": False}) if lane.index in lanes else lane
-                for lane in baseline.lanes
-            ]
-        }
-    )
+    [table] = baseline.lane_tables
+    kept = [
+        lane.model_copy(update={"included": False}) if lane.index in lanes else lane
+        for lane in table.lanes
+    ]
+    return baseline.model_copy(update={"lane_tables": [table.model_copy(update={"lanes": kept})]})
 
 
 def test_conditions_left_out_of_a_test_are_a_warning():
@@ -1474,7 +1483,7 @@ def test_each_set_keeps_the_test_notices_of_its_own_charts():
     # charts leave it out. Shared notices are kept only in the first set, but a
     # test notice is about one set's chart: the all-lanes set keeps its own.
     batch = _baseline_batch(REFERENCE).model_copy(deep=True)
-    beta = batch.find_protein("prot-3")
+    beta = batch.boxes_of(batch.find_protein("prot-3"))
     beta.bands = [band for band in beta.bands if band.lane_index != 7]
     res = compute_results(batch)
     assert res.all_lanes is not None
@@ -1490,8 +1499,10 @@ def test_a_notice_about_one_series_names_its_target_then_its_loading_control():
     # notice under the series these ids name, not under every chart of α-tubulin.
     doc = _baseline_batch(REFERENCE).model_dump()
     beta = doc["proteins"][0]
+    [row] = beta["rows"]
+    bands = [{**band, "id": f"band-{50 + i}"} for i, band in enumerate(row["bands"][:7])]
     cyclin = {**beta, "id": "prot-5", "name": "Cyclin D1"}
-    cyclin["bands"] = [{**band, "id": f"band-{50 + i}"} for i, band in enumerate(beta["bands"][:7])]
+    cyclin["rows"] = [{**row, "id": "row-60", "bands": bands}]
     res = compute_results(
         model.Batch.model_validate({**doc, "proteins": [*doc["proteins"], cyclin]})
     )
@@ -1585,8 +1596,8 @@ def test_a_replicate_the_loading_control_misses_has_no_value_but_counts():
 
 def _with_a_ladder(batch: model.Batch, *, included: bool) -> model.Batch:
     """``batch`` with one more lane, ``Ladder``: no box and no record of any protein."""
-    ladder = Lane(index=len(batch.lanes), label="Ladder", included=included)
-    return batch.model_copy(update={"lanes": [*batch.lanes, ladder]})
+    ladder = Lane(index=len(batch.only_lanes()), label="Ladder", included=included)
+    return batch.model_copy(update={"lanes": [*batch.only_lanes(), ladder]})
 
 
 @pytest.mark.parametrize("included", [False, True])
@@ -1608,9 +1619,10 @@ def test_an_empty_lane_the_user_excluded_is_not_charted_in_all_lanes():
     # holds values, so the all-lanes set includes the ladder.
     def ladder_in_lane_0(draft: Project) -> None:
         for protein in draft.batch.proteins:
-            protein.bands = [b for b in protein.bands if b.lane_index != 0]
-        draft.batch.lanes[0].label = "Ladder"
-        draft.batch.lanes[0].included = False
+            boxes = draft.batch.boxes_of(protein)
+            boxes.bands = [b for b in boxes.bands if b.lane_index != 0]
+        draft.batch.only_lanes()[0].label = "Ladder"
+        draft.batch.only_lanes()[0].included = False
 
     res = compute_results(_batch(ladder_in_lane_0))
     for one in (res, res.all_lanes):
