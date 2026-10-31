@@ -71,8 +71,9 @@ the last failed save's message (null after a successful one), and
 ``save_error_code`` its code when it has one
 (:func:`~proteia.core.session.save_failure_code`): ``project_changed_outside``
 for a save refused because ``project.json`` was changed outside Proteia
-(#101), whose message says that opening the project again reads it; null for
-any other failure.
+(#101), whose message says that opening the project again reads it, and in
+which file of the project's folder Proteia kept its own version, which can
+be opened instead (or why it could not keep one); null for any other failure.
 """
 
 from __future__ import annotations

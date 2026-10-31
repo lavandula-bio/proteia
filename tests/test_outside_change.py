@@ -8,17 +8,26 @@ memory as after any failed save, and no image file is deleted as an orphan
 while the session cannot tell what the file on disk references. Opening the
 project again reads the version on disk.
 
+Both versions are kept: the refused save keeps the project as the session
+holds it in a copy in the folder, ``project.unsaved-<UTC time>.json``, which
+the message names, with how to open it instead; one copy per change outside
+Proteia, written again only when the project changed since. The image files a
+kept copy references survive every cleanup, and an import skips their ids.
+
 The outside version is made as a sync would make it: a copy of the folder,
 changed by a session of its own (importing an image only it references), is
 copied back over the open folder.
 """
 
 import codecs
+import dataclasses
+import errno
 import hashlib
 import logging
 import os
 import shutil
 import threading
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -26,7 +35,7 @@ import pytest
 from conftest import FakeClock
 from proteia.core import operations as ops
 from proteia.core import storage
-from proteia.core.model import BoxSize
+from proteia.core.model import BoxSize, Role
 from proteia.core.operations import ErrorCode, LaneInput, OperationError, ProjectSession
 from proteia.core.session import save_to_folder
 from proteia.core.storage import load_project
@@ -45,7 +54,9 @@ from test_operations import (
     session_on,
 )
 
-# The messages, word for word: the folder by name (test_operations.FOLDER), never its path.
+# The messages, word for word: the folder by name (test_operations.FOLDER), never
+# its path. These two are given where no save tried to keep a copy (an import
+# before any save, or storage alone).
 CHANGED = (
     "'專案 µ α β' was changed outside Proteia after Proteia last opened or saved it, so"
     " Proteia did not save over it: open the project again to read the version now on"
@@ -56,6 +67,68 @@ REMOVED = (
     " Proteia last opened or saved it, so Proteia did not write it again; put the file"
     " back to go on saving the project"
 )
+
+
+def changed_kept(copy: str) -> str:
+    """A refused save's message, the copy kept as ``copy``."""
+    return (
+        "'專案 µ α β' was changed outside Proteia after Proteia last opened or saved it, so"
+        " Proteia did not save over it and kept a copy of its own version in the project's"
+        f" folder as '{copy}': open the project again to read the version now on disk; to"
+        " open Proteia's version instead, rename that copy to project.json while Proteia"
+        " does not have the project open"
+    )
+
+
+def removed_kept(copy: str) -> str:
+    return (
+        "'專案 µ α β' was changed outside Proteia: its project.json was removed after"
+        " Proteia last opened or saved it, so Proteia did not write it again and kept a"
+        f" copy of its own version in the project's folder as '{copy}': put the file back"
+        " to go on saving the project; to open Proteia's version instead, rename that copy"
+        " to project.json while Proteia does not have the project open"
+    )
+
+
+def changed_not_kept(why: str) -> str:
+    """A refused save's message, the copy not written for ``why``."""
+    return (
+        "'專案 µ α β' was changed outside Proteia after Proteia last opened or saved it, so"
+        " Proteia did not save over it, and it could not keep a copy of its own version"
+        f" either ({why}): the changes not saved are kept only while the project stays"
+        " open; open the project again to read the version now on disk (the changes not"
+        " saved here are then dropped)"
+    )
+
+
+def removed_not_kept(why: str) -> str:
+    return (
+        "'專案 µ α β' was changed outside Proteia: its project.json was removed after"
+        " Proteia last opened or saved it, so Proteia did not write it again, and it could"
+        f" not keep a copy of its own version either ({why}): the changes not saved are"
+        " kept only while the project stays open; put the file back to go on saving the"
+        " project"
+    )
+
+
+# A clock that stays at noon, 2026-10-31 UTC: every copy is named for that second.
+NOON = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+COPY = "project.unsaved-20261031T120000Z.json"
+COPY_2 = "project.unsaved-20261031T120000Z (2).json"
+COPY_3 = "project.unsaved-20261031T120000Z (3).json"
+
+
+def at_noon() -> FakeClock:
+    return FakeClock(NOON, timedelta(0))
+
+
+def boxed_at_noon(tmp_path: Path) -> tuple[ProjectSession, str, str]:
+    """:func:`test_operations.boxed`, autosaving, with the clock at noon."""
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
+    image = import_blot(s, blot())
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    return s, image, protein
 
 
 def changed_outside(s: ProjectSession, tmp_path: Path) -> tuple[ProjectSession, str]:
@@ -71,15 +144,38 @@ def changed_outside(s: ProjectSession, tmp_path: Path) -> tuple[ProjectSession, 
     return remote, newer
 
 
+def older_restored(tmp_path: Path) -> tuple[ProjectSession, str]:
+    """A session at noon whose ``project.json`` is put back, outside Proteia, as
+    it was before two images were imported (an older copy restored): only the
+    session's version references img-4 and img-5. Returns it and its protein."""
+    s, image, protein = boxed_at_noon(tmp_path)
+    path = s.folder / storage.PROJECT_FILE
+    older = path.read_bytes()
+    membrane = s.project.batch.membrane_of(image).id
+    late = [import_blot(s, blot(), name, membrane_id=membrane) for name in ("late γ.tif", "δ.tif")]
+    assert (image, protein, late, s.project.next_id) == ("img-1", "prot-3", ["img-4", "img-5"], 6)
+    path.write_bytes(older)
+    return s, protein
+
+
+def copies(folder: Path) -> list[str]:
+    return sorted(path.name for path in folder.iterdir() if path.name.startswith("project.unsaved"))
+
+
 def temp_files(folder: Path) -> list[str]:
     return sorted(path.name for path in folder.iterdir() if path.name.endswith(".tmp"))
+
+
+def holds(path: Path, s: ProjectSession) -> bool:
+    """Whether ``path`` holds what saving ``s`` would write."""
+    return path.read_bytes() == storage.project_to_json(s.project)
 
 
 # --- the refusal ---
 
 
 def test_a_save_never_goes_over_a_project_json_changed_outside(tmp_path):
-    s, image, protein = boxed(tmp_path, save_to_folder)
+    s, image, protein = boxed_at_noon(tmp_path)
     _, newer = changed_outside(s, tmp_path)
     path = s.folder / storage.PROJECT_FILE
     outside = path.read_bytes()
@@ -88,7 +184,8 @@ def test_a_save_never_goes_over_a_project_json_changed_outside(tmp_path):
     assert band_of(s, band).lane_index == 0  # the edit is in memory
     assert s.dirty and isinstance(s.save_error, storage.ChangedOutsideError)
     assert isinstance(s.save_error, storage.ProjectError)  # handled as any failed save
-    assert str(s.save_error) == CHANGED and not s.save_error.removed
+    assert str(s.save_error) == changed_kept(COPY) and not s.save_error.removed
+    assert (s.save_error.kept, s.save_error.not_kept) == (COPY, None)
     assert str(tmp_path) not in str(s.save_error)
     assert path.read_bytes() == outside  # the outside version is kept
     # The cleanup after the save did not run: the image only it references is kept.
@@ -97,25 +194,73 @@ def test_a_save_never_goes_over_a_project_json_changed_outside(tmp_path):
 
     # The next change is refused too, and an explicit save says why.
     ops.set_box_size(s, protein, BoxSize(width=11, height=7))
-    assert s.dirty and str(s.save_error) == CHANGED
+    assert s.dirty and str(s.save_error) == changed_kept(COPY)
     with pytest.raises(storage.ChangedOutsideError, match="did not save over it"):
         ops.save(s)
     assert path.read_bytes() == outside
     assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
 
 
+def test_the_refused_save_keeps_the_project_in_a_copy_beside_the_file(tmp_path):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+
+    # Atomic: the copy is all there, its temp file gone; it reads back as the project.
+    assert copies(s.folder) == [COPY]
+    assert temp_files(s.folder) == []
+    assert holds(s.folder / COPY, s)
+    assert storage.project_from_json((s.folder / COPY).read_bytes()) == s.project
+
+
+def test_a_copy_is_durable_before_it_takes_its_name(tmp_path, monkeypatch):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    events: list[tuple[str, object]] = []
+    real_fsync, real_link = os.fsync, os.link
+
+    def fsync(fd: int) -> None:  # with the bytes written to the file by then
+        real_fsync(fd)
+        events.append(("fsync", os.fstat(fd).st_size))
+
+    def link(src, dst, **kwargs):
+        events.append(("link", Path(dst).name))
+        real_link(src, dst, **kwargs)
+
+    def fsync_dir(directory: Path) -> None:  # only noted: on POSIX it fsyncs the folder
+        events.append(("fsync_dir", Path(directory).name))
+
+    monkeypatch.setattr(storage.os, "fsync", fsync)
+    monkeypatch.setattr(storage.os, "link", link)
+    monkeypatch.setattr(storage, "_fsync_dir", fsync_dir)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    size = len(storage.project_to_json(s.project))
+    assert size < 8192  # less than a write buffer: unflushed bytes would not count
+    assert events == [("fsync", size), ("link", COPY), ("fsync_dir", "專案 µ α β")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_copy_is_as_readable_as_the_project_file(tmp_path):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    (s.folder / storage.PROJECT_FILE).chmod(0o640)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert (s.folder / COPY).stat().st_mode & 0o777 == 0o640
+
+
 def test_the_page_gets_the_refusal_as_a_code_with_its_message(tmp_path, monkeypatch):
-    s, _, protein = boxed(tmp_path, save_to_folder)
+    s, _, protein = boxed_at_noon(tmp_path)
     state = project_state(s.folder.name, s, s.project, open_id=1)
     assert (state["saved"], state["save_error"], state["save_error_code"]) == (True, None, None)
 
-    # Another failed save has a message and no code of its own.
+    # Another failed save has a message and no code of its own, and keeps no copy.
     lock = ReplaceLock(monkeypatch)
     lock.locked = True
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     state = project_state(s.folder.name, s, s.project, open_id=1)
     assert state["saved"] is False and state["save_error"]
     assert state["save_error_code"] is None
+    assert copies(s.folder) == []
     lock.locked = False
 
     changed_outside(s, tmp_path)
@@ -123,21 +268,23 @@ def test_the_page_gets_the_refusal_as_a_code_with_its_message(tmp_path, monkeypa
     state = project_state(s.folder.name, s, s.project, open_id=1)
     assert (state["saved"], state["save_error"], state["save_error_code"]) == (
         False,
-        CHANGED,
+        changed_kept(COPY),
         "project_changed_outside",
     )
 
 
 def test_a_removed_project_json_is_not_written_again(tmp_path):
-    s, _, protein = boxed(tmp_path, save_to_folder)
+    s, _, protein = boxed_at_noon(tmp_path)
     path = s.folder / storage.PROJECT_FILE
     saved = path.read_bytes()
     path.unlink()
 
     band = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     assert s.dirty and isinstance(s.save_error, storage.ChangedOutsideError)
-    assert str(s.save_error) == REMOVED and s.save_error.removed
+    assert str(s.save_error) == removed_kept(COPY) and s.save_error.removed
     assert not path.exists()
+    assert holds(s.folder / COPY, s)
+    kept = (s.folder / COPY).read_bytes()
 
     # The file Proteia last saved, put back: the next change saves both edits.
     path.write_bytes(saved)
@@ -145,18 +292,28 @@ def test_a_removed_project_json_is_not_written_again(tmp_path):
     assert (s.dirty, s.save_error) == (False, None)
     assert load_project(s.folder) == s.project
     assert load_project(s.folder).batch.find_band(band)[1].lane_index == 0
+    assert (s.folder / COPY).read_bytes() == kept  # never deleted, nor written again
+
+    # A later change outside Proteia is another: another copy, the first as it was.
+    path.write_bytes(b"{}")
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    assert str(s.save_error) == changed_kept(COPY_2)
+    assert (s.folder / COPY).read_bytes() == kept
+    assert holds(s.folder / COPY_2, s)
 
 
 def test_a_removed_project_folder_is_not_made_again(tmp_path):
     s = session_on(tmp_path, save_to_folder)  # no image: nothing else refuses the save
     shutil.rmtree(s.folder)
     ops.set_lanes(s, [LaneInput("vehicle")])
-    assert str(s.save_error) == REMOVED
-    assert not s.folder.exists()  # neither project.json nor images/ or exports/
+    assert str(s.save_error) == removed_not_kept("No such file or directory")
+    assert (s.save_error.kept, type(s.save_error.not_kept)) == (None, FileNotFoundError)
+    assert not s.folder.exists()  # neither project.json, a copy, images/ or exports/
+    assert s.dirty
 
 
 def test_a_file_replaced_while_the_save_writes_is_kept(tmp_path, monkeypatch):
-    s = session_on(tmp_path, save_to_folder)
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
     path = s.folder / storage.PROJECT_FILE
     outside = b'{"written": "outside Proteia"}\n'
     real_fsync = os.fsync
@@ -170,13 +327,14 @@ def test_a_file_replaced_while_the_save_writes_is_kept(tmp_path, monkeypatch):
 
     monkeypatch.setattr(storage.os, "fsync", fsync)
     ops.set_lanes(s, [LaneInput("vehicle")])
-    assert replaced and str(s.save_error) == CHANGED
+    assert replaced and str(s.save_error) == changed_kept(COPY)
     assert path.read_bytes() == outside
+    assert holds(s.folder / COPY, s)
     assert temp_files(s.folder) == []
 
 
 def test_a_file_replaced_while_a_replace_is_retried_is_kept(tmp_path, monkeypatch):
-    s = session_on(tmp_path, save_to_folder)
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
     path = s.folder / storage.PROJECT_FILE
     outside = b'{"written": "outside Proteia"}\n'
     real_replace = os.replace
@@ -192,7 +350,7 @@ def test_a_file_replaced_while_a_replace_is_retried_is_kept(tmp_path, monkeypatc
     monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
     monkeypatch.setattr(storage.os, "replace", replace)
     ops.set_lanes(s, [LaneInput("vehicle")])
-    assert tries and str(s.save_error) == CHANGED
+    assert tries and str(s.save_error) == changed_kept(COPY)
     assert path.read_bytes() == outside
     assert temp_files(s.folder) == []
 
@@ -206,13 +364,267 @@ def test_a_project_json_that_cannot_be_read_fails_the_save_as_a_file_error(tmp_p
     path.mkdir()  # cannot be read as a file (Windows refuses, POSIX says it is a folder)
 
     # An import goes on, deletes nothing while the file cannot be compared, and
-    # its save fails as a file error, kept in memory.
+    # its save fails as a file error, kept in memory, with no copy kept.
     newer = import_blot(s, blot(), "late γ.tif")
     assert s.project.batch.find_image(newer)
     assert s.dirty and isinstance(s.save_error, OSError)
     assert not isinstance(s.save_error, storage.ChangedOutsideError)
     assert leftover.exists()
     assert listing(s) == sorted([leftover.name, f"{image}.tif", f"{newer}.tif"])
+    assert copies(s.folder) == []
+
+
+# --- the copy, kept again ---
+
+
+def test_more_edits_after_the_refusal_update_the_one_copy(tmp_path):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    first = (s.folder / COPY).read_bytes()
+
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))
+    assert holds(s.folder / COPY, s) and (s.folder / COPY).read_bytes() != first
+    for move in (ops.undo, ops.redo, ops.undo):  # each a change, kept so
+        move(s)
+        assert str(s.save_error) == changed_kept(COPY)
+        assert holds(s.folder / COPY, s)
+    assert copies(s.folder) == [COPY]
+    assert temp_files(s.folder) == []
+
+
+def test_a_refusal_with_nothing_changed_since_the_copy_writes_nothing(tmp_path, monkeypatch):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    written: list[str] = []
+    real_temp = storage._temp_file
+
+    def temp_file(directory, name, suffix):
+        written.append(name)
+        return real_temp(directory, name, suffix)
+
+    monkeypatch.setattr(storage, "_temp_file", temp_file)
+    for _ in range(3):  # as quitting or switching saves first, each time
+        with pytest.raises(storage.ChangedOutsideError) as info:
+            ops.save(s)
+        assert str(info.value) == changed_kept(COPY)
+        assert s.save_error is info.value
+    assert written == []
+    assert copies(s.folder) == [COPY] and holds(s.folder / COPY, s)
+
+
+def test_a_copy_never_replaces_a_file_or_folder_of_its_name(tmp_path):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    (s.folder / COPY).write_bytes(b"mine")
+    (s.folder / COPY_2).mkdir()
+
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_kept(COPY_3)
+    assert copies(s.folder) == [COPY_2, COPY_3, COPY]
+    assert (s.folder / COPY).read_bytes() == b"mine" and (s.folder / COPY_2).is_dir()
+    assert holds(s.folder / COPY_3, s)
+
+
+def test_a_copy_name_taken_in_another_case_is_taken_where_names_ignore_case(tmp_path):
+    probe = tmp_path / "Probe"
+    probe.touch()
+    ignores_case = (tmp_path / "probe").exists()
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    shouting = s.folder / COPY.upper()
+    shouting.write_bytes(b"mine")
+
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    expected = COPY_2 if ignores_case else COPY
+    assert str(s.save_error) == changed_kept(expected)
+    assert shouting.read_bytes() == b"mine"
+    assert holds(s.folder / expected, s)
+
+
+def test_a_copy_changed_or_removed_outside_is_left_and_another_kept(tmp_path):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    (s.folder / COPY).write_bytes(b"edited by hand")
+
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))
+    assert str(s.save_error) == changed_kept(COPY_2)
+    assert (s.folder / COPY).read_bytes() == b"edited by hand"
+    assert holds(s.folder / COPY_2, s)
+
+    (s.folder / COPY_2).unlink()  # removed: the next refusal keeps it again
+    ops.set_box_size(s, protein, BoxSize(width=13, height=7))
+    assert str(s.save_error) == changed_kept(COPY_2)
+    assert holds(s.folder / COPY_2, s)
+    assert (s.folder / COPY).read_bytes() == b"edited by hand"
+
+
+def test_a_copy_edited_while_it_is_replaced_is_left_and_another_kept(tmp_path, monkeypatch):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    real_fsync = os.fsync
+    edited: list[int] = []
+
+    def fsync(fd: int) -> None:  # the new bytes are in the temp file: edit the copy now
+        real_fsync(fd)
+        if not edited:
+            edited.append(fd)
+            (s.folder / COPY).write_bytes(b"edited meanwhile")
+
+    monkeypatch.setattr(storage.os, "fsync", fsync)
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))
+    assert edited and str(s.save_error) == changed_kept(COPY_2)
+    assert (s.folder / COPY).read_bytes() == b"edited meanwhile"
+    assert holds(s.folder / COPY_2, s)
+    assert temp_files(s.folder) == []
+
+
+def test_where_the_file_system_has_no_hard_links_a_copy_is_renamed_into_place(
+    tmp_path, monkeypatch
+):
+    def link(src, dst, **kwargs):  # as FAT and exFAT answer
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    real_rename = os.rename
+    renamed: list[str] = []
+
+    def rename(src, dst, **kwargs):
+        renamed.append(Path(dst).name)
+        real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(storage.os, "link", link)
+    monkeypatch.setattr(storage.os, "rename", rename)
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    (s.folder / COPY).write_bytes(b"mine")  # taken: never renamed over, nor tried
+
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_kept(COPY_2)
+    assert renamed == [COPY_2]
+    assert (s.folder / COPY).read_bytes() == b"mine"
+    assert holds(s.folder / COPY_2, s)
+    assert temp_files(s.folder) == []
+
+
+def test_a_name_taken_while_a_copy_is_renamed_into_place_is_left(tmp_path, monkeypatch):
+    def link(src, dst, **kwargs):
+        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+    real_rename = os.rename
+    taken: list[str] = []
+
+    def rename(src, dst, **kwargs):
+        if not taken:  # another writer took the name in the instant between
+            taken.append(Path(dst).name)
+            Path(dst).write_bytes(b"theirs")
+            raise FileExistsError(errno.EEXIST, "File exists")
+        real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(storage.os, "link", link)
+    monkeypatch.setattr(storage.os, "rename", rename)
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert taken == [COPY] and str(s.save_error) == changed_kept(COPY_2)
+    assert (s.folder / COPY).read_bytes() == b"theirs"
+    assert holds(s.folder / COPY_2, s)
+
+
+# --- the copy, not kept ---
+
+
+@pytest.mark.parametrize(
+    ("error", "why"),
+    [
+        (OSError(errno.ENOSPC, "No space left on device"), "No space left on device"),
+        (PermissionError(errno.EACCES, "Permission denied"), "Permission denied"),  # read-only
+        (OSError("a reason without a system message"), "OSError"),
+    ],
+)
+def test_a_copy_that_cannot_be_written_is_said_and_the_change_stays_in_memory(
+    tmp_path, monkeypatch, error, why
+):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    outside = (s.folder / storage.PROJECT_FILE).read_bytes()
+    real_temp = storage._temp_file
+
+    def temp_file(directory, name, suffix):
+        if name.startswith("project.unsaved-"):
+            raise error
+        return real_temp(directory, name, suffix)
+
+    monkeypatch.setattr(storage, "_temp_file", temp_file)
+    band = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_not_kept(why)
+    assert (s.save_error.kept, s.save_error.not_kept) == (None, error)
+    assert s.dirty and band_of(s, band).lane_index == 0
+    assert copies(s.folder) == [] and temp_files(s.folder) == []
+    assert (s.folder / storage.PROJECT_FILE).read_bytes() == outside
+
+    # Once it can be written, the next refusal keeps it.
+    monkeypatch.undo()
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))
+    assert str(s.save_error) == changed_kept(COPY)
+    assert holds(s.folder / COPY, s)
+
+
+def test_a_removed_file_whose_copy_cannot_be_written_says_both(tmp_path, monkeypatch):
+    s, _, protein = boxed_at_noon(tmp_path)
+    (s.folder / storage.PROJECT_FILE).unlink()
+
+    def temp_file(directory, name, suffix):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(storage, "_temp_file", temp_file)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == removed_not_kept("Permission denied")
+    assert copies(s.folder) == []
+
+
+def test_a_copy_whose_path_would_be_too_long_is_not_written(tmp_path, monkeypatch):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    # The temp file a copy is written through: its name is the longest.
+    temp = os.path.join(os.path.abspath(s.folder), f".{COPY}.{'x' * 8}.tmp")
+    length = len(temp.encode("utf-16-le")) // 2
+
+    monkeypatch.setattr(storage, "PATH_LIMIT", length - 1)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_not_kept("the project folder's path is too long for it")
+    assert copies(s.folder) == [] and temp_files(s.folder) == []
+
+    monkeypatch.setattr(storage, "PATH_LIMIT", length)  # it just fits
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))
+    assert str(s.save_error) == changed_kept(COPY)
+
+
+def test_a_copy_held_open_keeps_its_last_version_and_is_updated_later(tmp_path, monkeypatch):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    first = (s.folder / COPY).read_bytes()
+    real_replace = os.replace
+
+    def replace(src, dst, **kwargs):  # a reader holds it, as on Windows
+        if Path(dst).name == COPY:
+            raise PermissionError(13, "held by another process", str(dst))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
+    monkeypatch.setattr(storage.os, "replace", replace)
+    ops.set_box_size(s, protein, BoxSize(width=11, height=7))
+    assert str(s.save_error) == changed_not_kept("held by another process")
+    assert (s.folder / COPY).read_bytes() == first
+    assert copies(s.folder) == [COPY] and temp_files(s.folder) == []
+
+    monkeypatch.undo()  # released: the copy is brought up to date
+    ops.set_box_size(s, protein, BoxSize(width=13, height=7))
+    assert str(s.save_error) == changed_kept(COPY)
+    assert copies(s.folder) == [COPY] and holds(s.folder / COPY, s)
 
 
 # --- what goes on working ---
@@ -241,6 +653,36 @@ def test_saves_in_a_row_and_from_two_threads_each_go_over_the_last(tmp_path):
     assert (s.dirty, s.save_error) == (False, None)
     assert load_project(s.folder) == s.project
     assert len(s.project.log) == 11  # created, then ten edits, each saved
+    assert copies(s.folder) == []
+
+
+def test_refused_saves_and_closes_from_two_threads_keep_one_copy_and_every_image(tmp_path):
+    s, image, protein = boxed_at_noon(tmp_path)
+    _, newer = changed_outside(s, tmp_path)
+    errors: list[BaseException] = []
+
+    def run(step) -> None:
+        try:
+            for i in range(5):
+                step(i)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(
+            target=run,
+            args=(lambda i: ops.set_box_size(s, protein, BoxSize(width=11 + 2 * i, height=7)),),
+        ),
+        threading.Thread(target=run, args=(lambda i: s.close(),)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    assert str(s.save_error) == changed_kept(COPY)
+    assert copies(s.folder) == [COPY] and holds(s.folder / COPY, s)
+    assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
 
 
 def test_a_save_right_after_opening_a_hand_edited_file_goes_over_it(tmp_path):
@@ -279,15 +721,15 @@ def test_an_open_holds_the_bytes_it_read_and_saves_over_them_only(tmp_path, monk
     path.write_bytes(read)
 
     _replaced_while_read(monkeypatch, path, outside)
-    opened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
+    opened = ops.open_project(s.folder, autosave=save_to_folder, clock=at_noon())
     monkeypatch.undo()
     assert [lane.label for lane in opened.project.batch.lanes] == ["vehicle"]
     ops.set_lanes(opened, [LaneInput("dose")])
-    assert str(opened.save_error) == CHANGED and path.read_bytes() == outside
+    assert str(opened.save_error) == changed_kept(COPY) and path.read_bytes() == outside
 
 
 def test_a_reload_holds_the_bytes_it_read_and_saves_over_them_only(tmp_path, monkeypatch, caplog):
-    s = session_on(tmp_path, save_to_folder)
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
     ops.set_lanes(s, [LaneInput("vehicle")])
     path = s.folder / storage.PROJECT_FILE
     read = path.read_bytes()
@@ -302,20 +744,21 @@ def test_a_reload_holds_the_bytes_it_read_and_saves_over_them_only(tmp_path, mon
     monkeypatch.undo()
     assert [lane.label for lane in s.project.batch.lanes] == ["vehicle"]
     ops.set_lanes(s, [LaneInput("dose")])
-    assert str(s.save_error) == CHANGED and path.read_bytes() == outside
+    assert str(s.save_error) == changed_kept(COPY) and path.read_bytes() == outside
 
 
 # --- opening the project again ---
 
 
 def test_opening_again_after_the_refusal_reads_the_version_on_disk(tmp_path, caplog):
-    s, image, protein = boxed(tmp_path, save_to_folder)
+    s, image, protein = boxed_at_noon(tmp_path)
     remote, newer = changed_outside(s, tmp_path)
     path = s.folder / storage.PROJECT_FILE
     # The synced copy as a Windows editor left it: other bytes, the same project.
     path.write_bytes(codecs.BOM_UTF8 + path.read_bytes().replace(b"\n", b"\r\n"))
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-    assert str(s.save_error) == CHANGED
+    assert str(s.save_error) == changed_kept(COPY)
+    kept = (s.folder / COPY).read_bytes()
 
     caplog.set_level(logging.INFO, logger="proteia.core.session")
     caplog.clear()
@@ -323,7 +766,7 @@ def test_opening_again_after_the_refusal_reads_the_version_on_disk(tmp_path, cap
     assert [(r.levelname, r.getMessage()) for r in caplog.records][0] == (
         "WARNING",
         "in '專案 µ α β': dropped the changes that could not be saved, as its project.json"
-        " was changed outside Proteia",
+        " was changed outside Proteia; they are kept in 'project.unsaved-20261031T120000Z.json'",
     )
     assert s.project == remote.project
     assert (s.dirty, s.save_error, s.undo_step, s.last_action) == (False, None, None, None)
@@ -333,14 +776,45 @@ def test_opening_again_after_the_refusal_reads_the_version_on_disk(tmp_path, cap
     assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
     assert s.project.batch.find_image(newer).polarity == LIGHT
     assert not s.reload()
+    assert (s.folder / COPY).read_bytes() == kept  # left as it was
+
+    # A change outside Proteia after the reload is another: another copy.
+    path.write_bytes(b"{}")
+    ops.set_polarity(s, newer, DARK)
+    assert str(s.save_error) == changed_kept(COPY_2)
+    assert (s.folder / COPY).read_bytes() == kept
+
+
+def test_opening_again_when_no_copy_could_be_kept_says_the_changes_are_dropped(
+    tmp_path, monkeypatch, caplog
+):
+    s, _, protein = boxed_at_noon(tmp_path)
+    changed_outside(s, tmp_path)
+
+    def temp_file(directory, name, suffix):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(storage, "_temp_file", temp_file)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_not_kept("No space left on device")
+    caplog.set_level(logging.WARNING, logger="proteia.core.session")
+    caplog.clear()
+    assert s.reload()
+    assert [(r.levelname, r.getMessage()) for r in caplog.records] == [
+        (
+            "WARNING",
+            "in '專案 µ α β': dropped the changes that could not be saved, as its"
+            " project.json was changed outside Proteia",
+        )
+    ]
 
 
 def test_opening_again_reads_even_a_file_that_holds_the_unsaved_project(tmp_path):
-    s = session_on(tmp_path, save_to_folder)
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
     path = s.folder / storage.PROJECT_FILE
     path.write_bytes(b"{}")  # changed outside Proteia
     ops.set_lanes(s, [LaneInput("vehicle")])
-    assert str(s.save_error) == CHANGED
+    assert str(s.save_error) == changed_kept(COPY)
     # Then the file is made to hold exactly what saving the session would write.
     path.write_bytes(storage.project_to_json(s.project))
 
@@ -363,6 +837,37 @@ def test_opening_again_with_changes_unsaved_for_another_reason_reads_nothing(tmp
     assert s.project is project and s.dirty
 
 
+def test_the_kept_copy_renamed_to_project_json_opens_as_proteia_held_it(tmp_path):
+    s, protein = older_restored(tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_kept(COPY)
+    held = s.project
+
+    # Opened again, the older version is read; then, Proteia no longer having
+    # the project open, the copy is renamed and opened: with its images.
+    assert s.reload() and [i.id for i in s.project.batch.iter_images()] == ["img-1"]
+    s.close()
+    os.replace(s.folder / COPY, s.folder / storage.PROJECT_FILE)
+    opened = ops.open_project(s.folder, autosave=save_to_folder, clock=at_noon())
+    assert opened.project == held
+    ops.set_polarity(opened, "img-5", LIGHT)  # its pixels read, and it saves
+    assert (opened.dirty, opened.save_error) == (False, None)
+    assert listing(opened) == ["img-1.tif", "img-4.tif", "img-5.tif"]
+
+
+def test_after_a_removal_the_kept_copy_renamed_to_project_json_opens(tmp_path):
+    s, _, protein = boxed_at_noon(tmp_path)
+    path = s.folder / storage.PROJECT_FILE
+    path.unlink()
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == removed_kept(COPY)
+    held = s.project
+
+    (s.folder / COPY).rename(path)  # Proteia stopped with the change unsaved
+    opened = ops.open_project(s.folder, autosave=save_to_folder, clock=at_noon())
+    assert opened.project == held
+
+
 # --- no image file is deleted ---
 
 
@@ -383,10 +888,142 @@ def test_an_import_after_a_change_outside_is_refused_before_touching_images(tmp_
     with pytest.raises(OperationError) as info:
         import_blot(s, blot(), "late γ.tif", DARK)
     assert info.value.code is ErrorCode.PROJECT_CHANGED_OUTSIDE
-    assert str(info.value) == CHANGED
+    assert str(info.value) == CHANGED  # no save was refused: no copy to name
     assert s.project is project and not s.dirty
     assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
     assert (s.folder / storage.PROJECT_FILE).read_bytes() == before
+    assert copies(s.folder) == []
+
+
+def test_an_import_after_a_refused_save_names_the_copy_it_kept(tmp_path):
+    s, image, protein = boxed_at_noon(tmp_path)
+    _, newer = changed_outside(s, tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+
+    with pytest.raises(OperationError) as info:
+        import_blot(s, blot(), "late γ.tif", DARK)
+    assert info.value.code is ErrorCode.PROJECT_CHANGED_OUTSIDE
+    assert str(info.value) == changed_kept(COPY)
+    assert listing(s) == sorted([f"{image}.tif", f"{newer}.tif"])
+
+
+def test_images_only_a_kept_copy_references_survive_every_cleanup(tmp_path):
+    s, protein = older_restored(tmp_path)
+    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert str(s.save_error) == changed_kept(COPY)
+    every = ["img-1.tif", "img-4.tif", "img-5.tif"]
+
+    assert s.reload()  # opened again: the older version, which has only img-1
+    assert [image.id for image in s.project.batch.iter_images()] == ["img-1"]
+    assert s.project.next_id == 4
+    ops.set_lanes(s, [LaneInput("vehicle")])  # saved: the cleanup after a save
+    assert (s.dirty, s.save_error) == (False, None)
+    assert listing(s) == every
+    s.close()  # the cleanup on close
+    assert listing(s) == every
+
+    # The cleanup before an import keeps them, and the import skips their ids.
+    image = import_blot(s, blot(), "new ε.tif")
+    assert image == "img-6" and s.project.log[-1].params["image_id"] == "img-6"
+    assert s.project.batch.membrane_of(image).id == "mem-7" and s.project.next_id == 8
+    assert listing(s) == [*every, "img-6.tif"]
+
+    # So does the first save of a session that opens the folder afresh.
+    s.close()
+    again = ops.open_project(s.folder, autosave=save_to_folder, clock=at_noon())
+    ops.set_lanes(again, [LaneInput("drug")])
+    assert (again.dirty, again.save_error) == (False, None)
+    assert listing(again) == [*every, "img-6.tif"]
+
+
+def test_an_import_takes_next_id_when_no_kept_copy_holds_it(tmp_path):
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
+    other = session_on(tmp_path / "other", save_to_folder)
+    import_blot(other, blot())  # a project of img-1 only, next_id 3
+    data = (other.folder / storage.PROJECT_FILE).read_bytes()
+    (s.folder / "project.unsaved-20261030T000000Z.json").write_bytes(data)
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    assert s.project.next_id == 1
+    assert s.image_number() == 2  # img-1 is the copy's
+    assert s.project.next_id == 1  # unchanged by asking
+    image = import_blot(s, blot())
+    assert (image, s.project.batch.membrane_of(image).id) == ("img-2", "mem-3")
+    image = import_blot(s, blot(), "β.tif")
+    assert image == "img-4"  # next_id, which no copy holds
+
+
+def test_a_kept_copy_that_does_not_read_as_a_project_keeps_nothing_and_stays(tmp_path, caplog):
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
+    image = import_blot(s, blot())
+    valid = s.folder / "project.unsaved-20261031T000000Z.json"
+    valid.write_bytes((s.folder / storage.PROJECT_FILE).read_bytes())  # references img-1
+    invalid = s.folder / "project.unsaved-20261030T000000Z.json"  # read first
+    cut = b'{"batch": {"membranes": [{"images": [{"file": "img-9.tif"'  # cut short
+    invalid.write_bytes(cut)
+    caplog.set_level(logging.WARNING, logger="proteia.core.session")
+    ops.set_lanes(s, [LaneInput("vehicle")])  # a save that leaves no orphan reads no copy
+    assert caplog.records == []
+    leftover = s.folder / storage.IMAGES_DIR / "img-9.tif"
+    leftover.write_bytes(b"left by a crash")
+    ops.remove_image(s, image)
+    caplog.clear()
+
+    s.close()  # the history is gone: img-1 only the valid copy keeps
+    assert listing(s) == [f"{image}.tif"]
+    assert invalid.read_bytes() == cut and valid.is_file()
+    assert [(r.levelname, r.getMessage()) for r in caplog.records] == [
+        (
+            "WARNING",
+            "in '專案 µ α β': 'project.unsaved-20261030T000000Z.json' does not read as a"
+            " project, so no image file is kept for it (the file itself is left as it is)",
+        )
+    ]
+
+
+def test_while_a_kept_copy_cannot_be_read_no_image_file_is_deleted(tmp_path, monkeypatch, caplog):
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
+    (s.folder / COPY).write_bytes(b"{}")
+    leftover = s.folder / storage.IMAGES_DIR / "img-1.tif"
+    leftover.parent.mkdir(exist_ok=True)
+    leftover.write_bytes(b"left by a crash")
+    real_read = Path.read_bytes
+
+    def read_bytes(self):  # held by another program, as Windows refuses
+        if storage.is_unsaved(self.name):
+            raise PermissionError(13, "held by another process", str(self))
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    caplog.set_level(logging.WARNING, logger="proteia.core.session")
+    caplog.clear()
+    ops.set_lanes(s, [LaneInput("vehicle")])  # saved: the cleanup after a save
+    assert (s.dirty, s.save_error) == (False, None)
+    assert leftover.exists()
+    assert [(r.levelname, r.getMessage()) for r in caplog.records] == [
+        (
+            "WARNING",
+            "in '專案 µ α β': no image file was deleted, as the copies of the project kept in"
+            " its folder could not be read",
+        )
+    ]
+    assert s.image_number() == 1  # unknown: next_id, and the leftover refuses it
+    with pytest.raises(OperationError) as info:
+        import_blot(s, blot())
+    assert info.value.code is ErrorCode.LEFTOVER_FILE
+
+
+def test_a_temp_file_of_a_copy_is_no_copy(tmp_path, caplog):
+    s = session_on(tmp_path, save_to_folder, clock=at_noon())
+    temp = s.folder / f".{COPY}.abcd1234.tmp"  # left by a crash while a copy was written
+    temp.write_bytes(b'{"batch": "img-1.tif"')
+    leftover = s.folder / storage.IMAGES_DIR / "img-1.tif"
+    leftover.parent.mkdir(exist_ok=True)
+    leftover.write_bytes(b"left by a crash")
+    caplog.set_level(logging.WARNING, logger="proteia.core.session")
+    caplog.clear()
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    assert not leftover.exists() and temp.exists()
+    assert caplog.records == []
 
 
 # --- storage ---
@@ -408,6 +1045,7 @@ def test_save_project_over_writes_only_over_the_file_it_names(tmp_path):
         with pytest.raises(storage.ChangedOutsideError) as info:
             storage.save_project_over(project, folder, expect=expect)
         assert str(info.value) == CHANGED
+        assert (info.value.kept, info.value.not_kept) == (None, None)
     path.unlink()
     with pytest.raises(storage.ChangedOutsideError) as info:
         storage.save_project_over(project, folder, expect=digest)
@@ -426,3 +1064,60 @@ def test_read_project_reads_the_bytes_it_is_given(tmp_path):
     ops.set_lanes(session, [LaneInput("drug")])
     project, migrated = storage.read_project(session.folder, data=data)
     assert [lane.label for lane in project.batch.lanes] == ["vehicle"] and not migrated
+
+
+def test_the_names_of_kept_copies():
+    taipei = timezone(timedelta(hours=8))
+    assert (
+        storage.unsaved_name(datetime(2026, 10, 31, 20, 0, 5, 999000, tzinfo=taipei))
+        == "project.unsaved-20261031T120005Z.json"
+    )
+    assert storage.unsaved_name(NOON, 2) == COPY_2
+    names = [
+        COPY,
+        COPY_2,
+        "PROJECT.UNSAVED-20261031T120000Z.JSON",
+        "project.unsaved-mine.json",
+        f".{COPY}.abcd1234.tmp",
+        f"{COPY}.tmp",
+        "my project.unsaved-20261031T120000Z.json",
+        "project.unsaved.json",
+        "project.json",
+        "project.schema1.json",
+    ]
+    assert [name for name in names if storage.is_unsaved(name)] == names[:4]
+
+
+def test_unsaved_references_reads_each_copy_as_a_project(tmp_path):
+    s = session_on(tmp_path, save_to_folder)
+    import_blot(s, blot())
+    data = (s.folder / storage.PROJECT_FILE).read_bytes()  # references img-1.tif
+    folder = s.folder
+    assert storage.unsaved_references(folder) == storage.KeptReferences(frozenset(), ())
+    (folder / "project.unsaved-a.json").write_bytes(b"[]")  # JSON, not a project
+    (folder / "project.unsaved-b.json").write_bytes(b"not JSON")
+    (folder / "project.unsaved-c.json").write_bytes(data)
+    (folder / "project.unsaved-d.json").mkdir()  # a folder: no copy
+    (folder / "project.schema1.json").write_bytes(b"[]")  # a backup: no copy
+    found = storage.unsaved_references(folder)
+    assert found == storage.KeptReferences(
+        frozenset({"img-1.tif"}), ("project.unsaved-a.json", "project.unsaved-b.json")
+    )
+    assert storage.unsaved_references(tmp_path / "gone") is None
+
+
+def test_a_kept_copy_and_what_copies_reference_are_values():
+    kept = storage.KeptCopy(COPY, "0" * 64)
+    found = storage.KeptReferences(frozenset({"img-1.tif"}), ())
+    for value, field in ((kept, "name"), (found, "files")):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(value, field, None)
+    assert len({kept, storage.KeptCopy(COPY, "0" * 64), found}) == 2
+
+
+def test_file_sha256_is_none_for_what_is_no_readable_file(tmp_path):
+    path = tmp_path / "α.bin"
+    path.write_bytes(b"bytes")
+    assert storage.file_sha256(path) == hashlib.sha256(b"bytes").hexdigest()
+    assert storage.file_sha256(tmp_path / "gone") is None
+    assert storage.file_sha256(tmp_path) is None  # a folder

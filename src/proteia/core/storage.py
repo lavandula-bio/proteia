@@ -8,6 +8,10 @@ types). A project folder, which may have any name, holds::
     project.schema1.json            project.json as it was before a migration from schema 1
                                     rewrote it (keep_backup; numbered if taken:
                                     project.schema1 (2).json)
+    project.unsaved-20261031T120000Z.json
+                                    the open project's own version, kept when its
+                                    project.json was changed outside Proteia (#101:
+                                    keep_unsaved; numbered if taken: ...Z (2).json)
     images/img-2.tif                byte-identical copies of the imported files, named by id
     exports/                        created by save_project, for exported results:
     exports/lane-table.csv          the per-lane table
@@ -27,6 +31,9 @@ keeps (:class:`~proteia.core.session.ProjectSession`), none of which holds the
 id the import takes. A session saves only over the ``project.json`` it last
 read or wrote (:func:`save_project_over`, by its SHA-256): one changed outside
 Proteia meanwhile, by a synced or restored copy, is never saved over (#101).
+The session then keeps its own version beside it (:func:`keep_unsaved`), and
+the image files such a kept copy references are never deleted as orphans
+(:func:`unsaved_references`), so either version can be opened.
 
 Canonical form. ``project.json`` is ``json.dumps`` of the re-validated model's
 JSON-mode dump with sorted keys, ``indent=1``, ``ensure_ascii=False`` and
@@ -87,6 +94,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import functools
 import hashlib
 import json
@@ -119,6 +127,9 @@ from proteia.core.model import (
 PROJECT_FILE: Final = "project.json"
 # project.schema<N>.json: a project.json of schema N kept before its migration.
 BACKUP_PREFIX: Final = "project.schema"
+# project.unsaved-<UTC time>.json: an open project's own version, kept when its
+# project.json was changed outside Proteia (#101).
+UNSAVED_PREFIX: Final = "project.unsaved-"
 IMAGES_DIR: Final = "images"
 EXPORTS_DIR: Final = "exports"
 # Top-level keys left out of the content hash: bookkeeping and history, not content.
@@ -179,23 +190,62 @@ class ChangedOutsideError(ProjectError):
     replaced, edited or removed (``removed``) outside Proteia since, as by a
     synced or restored copy (#101). :func:`save_project_over` refuses so, and
     writes nothing. The message names the project by its folder's name, never
-    its path, and says what to do."""
+    its path, and says what to do.
 
-    def __init__(self, name: str, *, removed: bool) -> None:
+    A session that refuses a save so keeps a copy of its own version in the
+    project's folder (:func:`keep_unsaved`): ``kept`` is that file's name, which
+    the message gives with how to open it; ``not_kept`` the ``OSError`` that
+    kept it from being written, whose reason the message gives. Both are None
+    where no copy was tried (storage alone, or an import's refusal before any
+    save)."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        removed: bool,
+        kept: str | None = None,
+        not_kept: OSError | None = None,
+    ) -> None:
         if removed:
-            message = (
+            what = (
                 f"{name!r} was changed outside Proteia: its {PROJECT_FILE} was removed after"
-                " Proteia last opened or saved it, so Proteia did not write it again; put the"
-                " file back to go on saving the project"
+                " Proteia last opened or saved it, so Proteia did not write it again"
             )
+            then, dropped = "put the file back to go on saving the project", ""
         else:
-            message = (
+            what = (
                 f"{name!r} was changed outside Proteia after Proteia last opened or saved it,"
-                " so Proteia did not save over it: open the project again to read the version"
-                " now on disk (the changes not saved here are then dropped)"
+                " so Proteia did not save over it"
             )
+            then = "open the project again to read the version now on disk"
+            dropped = " (the changes not saved here are then dropped)"
+        if kept is not None:
+            message = (
+                f"{what} and kept a copy of its own version in the project's folder as"
+                f" {kept!r}: {then}; to open Proteia's version instead, rename that copy to"
+                f" {PROJECT_FILE} while Proteia does not have the project open"
+            )
+        elif not_kept is not None:
+            message = (
+                f"{what}, and it could not keep a copy of its own version either"
+                f" ({_why(not_kept)}): the changes not saved are kept only while the project"
+                f" stays open; {then}{dropped}"
+            )
+        elif removed:
+            message = f"{what}; {then}"
+        else:
+            message = f"{what}: {then}{dropped}"
         super().__init__(message)
         self.removed = removed
+        self.kept = kept
+        self.not_kept = not_kept
+
+
+def _why(exc: OSError) -> str:
+    """Why ``exc`` happened in words, without the path it names: its system
+    message (``strerror``), or its type's name where it has none."""
+    return exc.strerror or type(exc).__name__
 
 
 class BackupError(OSError):
@@ -781,10 +831,9 @@ def keep_backup(folder: str | os.PathLike[str], data: bytes, schema: int) -> str
                 return name
             number += 1
     except OSError as exc:
-        why = exc.strerror or type(exc).__name__
         raise BackupError(
             f"{folder.name!r} was saved by an older Proteia (schema {schema}), and a copy"
-            f" of its {PROJECT_FILE} could not be kept before updating it ({why});"
+            f" of its {PROJECT_FILE} could not be kept before updating it ({_why(exc)});"
             " nothing was changed"
         ) from exc
 
@@ -852,6 +901,168 @@ def backup_references(folder: str | os.PathLike[str]) -> frozenset[str] | None:
     return frozenset(names)
 
 
+@dataclass(frozen=True)
+class KeptCopy:
+    """A copy of an open project's own version that :func:`keep_unsaved` kept."""
+
+    name: str  # in the project's folder
+    sha256: str  # of the bytes written there
+
+
+@dataclass(frozen=True)
+class KeptReferences:
+    """What the kept copies in a project's folder reference
+    (:func:`unsaved_references`)."""
+
+    files: frozenset[str]  # the image files of the copies that read as a project
+    invalid: tuple[str, ...]  # the copies that do not, by name, sorted
+
+
+def unsaved_name(when: datetime, number: int = 1) -> str:
+    """The name of the ``number``-th copy kept at ``when`` (:func:`keep_unsaved`):
+    ``project.unsaved-20261031T120000Z.json``, the time in UTC to the second,
+    then ``project.unsaved-20261031T120000Z (2).json`` and so on, numbered as
+    backups are."""
+    stem = f"{UNSAVED_PREFIX}{when.astimezone(UTC):%Y%m%dT%H%M%SZ}"
+    return f"{stem}.json" if number == 1 else f"{stem} ({number}).json"
+
+
+def is_unsaved(name: str) -> bool:
+    """Whether a file named ``name`` in a project folder is taken for a kept copy
+    (``project.unsaved-*.json``, in any case, as Windows compares names). The
+    temp file a copy is written through starts with a dot, so it is not."""
+    lower = name.lower()
+    return lower.startswith(UNSAVED_PREFIX) and lower.endswith(".json")
+
+
+def file_sha256(path: Path) -> str | None:
+    """The SHA-256 of the bytes of the file ``path``; None if it is not a file or
+    cannot be read."""
+    try:
+        with path.open("rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest()
+    except OSError:
+        return None
+
+
+class _CopyChanged(Exception):
+    """The copy :func:`keep_unsaved` was to replace no longer holds the bytes
+    written there."""
+
+
+def _holds_sha256(path: Path, digest: str) -> None:
+    if file_sha256(path) != digest:
+        raise _CopyChanged
+
+
+def keep_unsaved(
+    folder: str | os.PathLike[str],
+    data: bytes,
+    *,
+    clock: Callable[[], datetime],
+    previous: KeptCopy | None = None,
+) -> KeptCopy:
+    """Keep ``data``, the ``project.json`` bytes of an open project's own
+    version, in a file of its folder, beside a ``project.json`` changed outside
+    Proteia that it may not be saved over (#101); return the copy.
+
+    ``previous`` is the copy kept last for the same change outside Proteia.
+    While its file holds ``data``, nothing is written; while it holds the bytes
+    written there, they are replaced by ``data`` (:func:`write_atomic`, checked
+    again right before the replace), and the copy keeps its name. Otherwise, as
+    when it was renamed, removed or edited since, ``data`` goes into a new file:
+    the first :func:`unsaved_name` at ``clock()`` that nothing has, written
+    durably into a temp file and only then given that name, if nothing has it
+    yet, so a file is never replaced and a reader sees the whole copy or none.
+
+    The folder is never created. An ``OSError`` propagates, leaving no new file
+    (``previous`` as it was), and so does one, before anything is written, for
+    a name too long for the file system (:func:`name_fits`)."""
+    folder = Path(folder)
+    digest = hashlib.sha256(data).hexdigest()
+    if previous is not None:
+        path = folder / previous.name
+        held = file_sha256(path)
+        if held == digest:
+            return KeptCopy(previous.name, digest)
+        if held == previous.sha256:
+            try:
+                write_atomic(path, data, check=functools.partial(_holds_sha256, path, held))
+            except _CopyChanged:
+                pass  # edited meanwhile: kept as it is, and data goes into a new file
+            else:
+                return KeptCopy(previous.name, digest)
+    when = clock()
+    # The temp file's name is the longest: a number adds fewer characters.
+    if not name_fits(folder, unsaved_name(when)):
+        raise OSError(errno.ENAMETOOLONG, "the project folder's path is too long for it")
+    mode = _file_mode(folder / PROJECT_FILE)  # as readable as the project file
+    fd, tmp = _temp_file(folder, unsaved_name(when), ".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            tmp.chmod(mode)
+        number = 1
+        while not _link_new(tmp, folder / unsaved_name(when, number)):
+            number += 1
+        _fsync_dir(folder)
+    finally:
+        with contextlib.suppress(OSError):  # gone already after a rename
+            tmp.unlink()
+    return KeptCopy(unsaved_name(when, number), digest)
+
+
+def _link_new(tmp: Path, path: Path) -> bool:
+    """Give the file ``tmp`` the name ``path`` too, unless something has that
+    name: False then. A hard link, which never replaces a file; where the file
+    system has none (FAT, exFAT, some network shares), a rename, once nothing
+    has the name (Windows' rename refuses a name taken; elsewhere a name taken
+    in the instant between is replaced)."""
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        return False
+    except OSError:
+        if os.path.lexists(path):
+            return False
+        try:
+            os.rename(tmp, path)
+        except FileExistsError:
+            return False
+    return True
+
+
+def unsaved_references(folder: str | os.PathLike[str]) -> KeptReferences | None:
+    """The image files that the kept copies in ``folder`` (:func:`is_unsaved`)
+    reference, each read as a project (of this schema or one this Proteia
+    migrates), and the copies that do not read as one, which reference nothing:
+    no file they may name is kept for them. None when the folder cannot be
+    listed or a copy cannot be read, as what they reference is then unknown.
+
+    The orphan cleanup deletes none of those files, so a kept copy, renamed to
+    ``project.json``, opens with its images
+    (:class:`~proteia.core.session.ProjectSession`)."""
+    files: set[str] = set()
+    invalid: list[str] = []
+    try:
+        for path in sorted(Path(folder).iterdir()):
+            if not (is_unsaved(path.name) and path.is_file()):
+                continue
+            data = path.read_bytes()
+            try:
+                project, _ = _parse(data)
+            except ProjectError:
+                invalid.append(path.name)
+                continue
+            files.update(image.file for image in project.batch.iter_images())
+    except OSError:
+        return None
+    return KeptReferences(frozenset(files), tuple(invalid))
+
+
 def store_image(
     folder: str | os.PathLike[str],
     image_id: str,
@@ -917,9 +1128,10 @@ def orphan_files(project: Project, folder: str | os.PathLike[str]) -> list[Path]
     ``.part``/``.tmp`` files, and images whose id the project may hand out again.
     Others are the files of images removed or undone in the open session, which
     it keeps while its undo history can bring them back, files the saved
-    ``project.json`` still references, or files with an id below ``next_id``
+    ``project.json`` still references, files with an id below ``next_id``
     that a backup of an older ``project.json`` names
-    (:func:`backup_references`). The session deletes
+    (:func:`backup_references`), or files a kept copy of the project
+    references (:func:`unsaved_references`). The session deletes
     only the rest, before an import and after a save
     (:class:`~proteia.core.session.ProjectSession`).
     """

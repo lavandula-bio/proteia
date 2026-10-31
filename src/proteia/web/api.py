@@ -230,7 +230,10 @@ listed now) 409, ``handoff_not_found`` 404, and ``nothing_imported`` 422
 the one open, which stays open, and ``detail.cause`` when the failed save has
 a code: ``project_changed_outside`` when the open project's ``project.json``
 was changed outside Proteia since Proteia last opened or saved it (#101), so
-it was not saved over; opening that project again reads it. An import (``POST
+it was not saved over; opening that project again reads it. The project as
+Proteia held it is kept in a copy in its folder, which the message names by
+file name, with how to open it instead (or why it could not be kept:
+:meth:`~proteia.core.session.ProjectSession.save`). An import (``POST
 /api/images``) then is refused as ``project_changed_outside`` 422, before
 anything is stored. An edit is answered as made, its failed save in the
 state's ``save_error`` and ``save_error_code`` (:mod:`proteia.web.state`).
@@ -1016,7 +1019,8 @@ class Workspace:
         replaced by the older file: the next change or quitting saves them;
         unless the save was refused because the file was changed outside
         Proteia (#101), whose message says that opening the project again reads
-        it: then it is read, and they are dropped. The
+        it: then it is read, and they are dropped (the copy the refusal kept of
+        the project, which the message names, stays). The
         requests using the session (:meth:`using`: an edit, or a read such as a
         preview), and then an operation running on it, are waited for, up to
         :data:`REOPEN_WAIT_S` in all, before the file is checked: after an

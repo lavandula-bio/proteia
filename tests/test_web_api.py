@@ -2868,10 +2868,15 @@ def test_a_reopen_waits_for_a_short_read_and_then_reads_the_changed_file(tmp_pat
     assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
 
 
+# The project's own version is kept as this copy, named for the time of the
+# refused save (the client's FakeClock, from 08:00:00Z, one second a call).
+KEPT_COPY = "project.unsaved-20260926T080004Z.json"
 CHANGED_OUTSIDE = (
     "'Blot µ' was changed outside Proteia after Proteia last opened or saved it, so"
-    " Proteia did not save over it: open the project again to read the version now on"
-    " disk (the changes not saved here are then dropped)"
+    " Proteia did not save over it and kept a copy of its own version in the project's"
+    " folder as 'project.unsaved-20260926T080004Z.json': open the project again to read"
+    " the version now on disk; to open Proteia's version instead, rename that copy to"
+    " project.json while Proteia does not have the project open"
 )
 
 
@@ -2883,7 +2888,8 @@ def test_a_save_refused_after_a_change_outside_reaches_the_page_until_a_reopen(c
     client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "drug"}]})
     project_file.write_bytes(backup)  # a previous version restored (#101)
 
-    # The edit is made, its save refused: the state says why, with a code.
+    # The edit is made, its save refused: the state says why, with a code, and
+    # where the project as Proteia holds it was kept.
     shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "dose α"}]})["project"]
     assert [lane["condition"] for lane in shown["lanes"]] == ["dose α"]
     assert (shown["saved"], shown["save_error"], shown["save_error_code"]) == (
@@ -2891,7 +2897,11 @@ def test_a_save_refused_after_a_change_outside_reaches_the_page_until_a_reopen(c
         CHANGED_OUTSIDE,
         "project_changed_outside",
     )
+    assert str(client.root) not in shown["save_error"]
     assert project_file.read_bytes() == backup
+    copy = client.root / "Blot µ" / KEPT_COPY
+    kept = json.loads(copy.read_text(encoding="utf-8"))
+    assert [lane["label"] for lane in kept["batch"]["lanes"]] == ["dose α"]
 
     # An import is refused before anything is stored.
     images = client.root / "Blot µ" / storage.IMAGES_DIR
@@ -2913,6 +2923,7 @@ def test_a_save_refused_after_a_change_outside_reaches_the_page_until_a_reopen(c
     assert client.call("POST", "/api/quit") == (409, not_saved)
     assert client.call("POST", "/api/projects", {"name": "Other"}) == (409, not_saved)
     assert not (client.root / "Other").exists()
+    kept_bytes = copy.read_bytes()  # those saves found nothing new to keep
 
     # Opening it again reads the version on disk, under a new opening.
     reopened = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})["project"]
@@ -2927,6 +2938,30 @@ def test_a_save_refused_after_a_change_outside_reaches_the_page_until_a_reopen(c
     saved = json.loads(project_file.read_text(encoding="utf-8"))
     assert [lane["label"] for lane in saved["batch"]["lanes"]] == ["vehicle µ"]
     client.ok("POST", "/api/projects", {"name": "Other"})
+    assert sorted(p.name for p in copy.parent.glob("project.unsaved-*")) == [KEPT_COPY]
+    assert copy.read_bytes() == kept_bytes
+
+
+def test_an_image_only_the_kept_copy_references_survives_a_reopen_and_a_switch(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot µ"})
+    folder = client.root / "Blot µ"
+    project_file = folder / storage.PROJECT_FILE
+    older = project_file.read_bytes()
+    status, answer = upload(client, blot_bytes(tmp_path))
+    assert status == 201, answer
+    image = f"{answer['image_id']}.tif"
+    project_file.write_bytes(older)  # a version without the image restored (#101)
+
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    assert shown["save_error_code"] == "project_changed_outside"
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})["project"]
+    assert reopened["images"] == []  # the version on disk
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "drug"}]})  # saved, then cleaned
+    client.ok("POST", "/api/projects", {"name": "Other"})  # the switch closes it
+    assert [p.name for p in (folder / storage.IMAGES_DIR).iterdir()] == [image]
+    (copy,) = folder.glob("project.unsaved-*.json")
+    kept = json.loads(copy.read_text(encoding="utf-8"))
+    assert [i["file"] for m in kept["batch"]["membranes"] for i in m["images"]] == [image]
 
 
 def test_a_project_created_where_the_open_one_was_removed_keeps_the_files_it_stores(tmp_path):
