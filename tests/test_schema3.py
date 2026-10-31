@@ -1169,6 +1169,43 @@ def test_undo_after_migration_restores_migrated_state(tmp_path):
         s.close()
 
 
+def _page_counts(batch, ids) -> tuple[int, int, int]:
+    """What the page counts in a list of ids (app.js ``counts``): the images,
+    proteins and boxes of ``batch`` it names."""
+    named = set(ids)
+    bands = [b for p in batch.proteins for b in batch.boxes_of(p).bands]
+    return (
+        sum(i.id in named for i in batch.iter_images()),
+        sum(p.id in named for p in batch.proteins),
+        sum(b.id in named for b in bands),
+    )
+
+
+def test_a_removal_lists_the_areas_and_rows_it_takes(tmp_path):
+    # A removal's cascade and log name every id that went, as an undo lists
+    # them back (object, its areas, proteins, their rows, bands, membrane).
+    s = session_on(tmp_path)
+    first = import_blot(s, blot())  # img-1, mem-2, lt-3, arena-4
+    second = import_blot(s, blot(), "B.tif", membrane_id="mem-2")  # img-5, arena-6
+    target = ops.add_protein(s, "β-catenin", Role.TARGET, first)  # prot-7, row-8
+    ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, second)  # prot-9, row-10
+    gone = ops.remove_protein(s, target)
+    assert gone.removed == ("prot-7", "row-8")
+    assert s.project.log[-1].params["removed"] == ["prot-7", "row-8"]
+    assert sorted(ops.undo(s).restored) == sorted(gone.removed)
+    before = s.project.batch
+    cascade = ops.remove_image(s, second)
+    assert cascade.removed == ("img-5", "arena-6", "prot-9", "row-10")
+    assert s.project.log[-1].params["removed"] == list(cascade.removed)
+    assert sorted(ops.undo(s).restored) == sorted(cascade.removed)
+    # The page counts the same: one image and one protein.
+    assert _page_counts(before, cascade.removed) == (1, 1, 0)
+    ops.remove_image(s, second)
+    last = ops.remove_image(s, first)  # the membrane goes with its last image
+    assert last.removed == ("img-1", "arena-4", "prot-7", "row-8", "mem-2")
+    assert sorted(ops.undo(s).restored) == sorted(last.removed)
+
+
 def test_the_page_counts_the_same_after_an_undo(tmp_path):
     # The new kinds' ids in an undo's lists name nothing the page counts
     # (images, proteins, boxes): it reports what it reported before.

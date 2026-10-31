@@ -206,10 +206,12 @@ def test_undo_of_a_removal_lists_the_cascade_it_brings_back(tmp_path):
     before = s.project
     cascade = ops.remove_image(s, "img-6")  # α-tubulin's image, with its membrane
     removal = s.project.log[-1]
-    gone = ("mem-5", "img-6", "prot-8", "band-13", "band-14", "band-15", "band-16")
-    assert sorted(gone) == sorted(cascade.removed)
-    # With the image went its membrane area, and with the protein its row.
-    back = ("mem-5", "img-6", "prot-8", *gone[3:], "arena-23", "row-25")
+    # With the image went its membrane area, and with the protein its row:
+    # the cascade lists what the undo brings back.
+    bands = ("band-13", "band-14", "band-15", "band-16")
+    gone = ("img-6", "arena-23", "prot-8", "row-25", *bands, "mem-5")
+    assert cascade.removed == gone
+    back = ("mem-5", "img-6", "prot-8", *bands, "arena-23", "row-25")
 
     assert ops.undo(s) == Restored(
         seq=removal.seq,

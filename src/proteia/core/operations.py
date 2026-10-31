@@ -370,7 +370,9 @@ KEEP: Final = Keep.KEEP
 class Cascade:
     """What a removal took with it."""
 
-    removed: tuple[str, ...]  # every removed id: the object, then proteins, bands, membrane
+    # Every removed id: the object and its membrane areas, then the proteins,
+    # their rows and their bands, then the membrane.
+    removed: tuple[str, ...]
     detached_targets: tuple[str, ...]  # targets that lost a loading control
     unpaired_images: tuple[str, ...]  # images whose marker_image_id was cleared
     # calibration lost points: refitted, or left without a curve
@@ -1777,7 +1779,9 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
         gone_ids = {p.id for p in gone}
         removed = [
             image_id,
+            *(arena.id for _, arena in batch.arenas_on(image_id)),
             *(p.id for p in gone),
+            *(batch.only_row(p).id for p in gone),
             *(b.id for p in gone for b in batch.boxes_of(p).bands),
         ]
         records: list[JsonValue] = [
@@ -3362,8 +3366,9 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
 
     def change(draft: Project) -> tuple[Cascade, list[JsonValue]]:
         batch = draft.batch
-        gone = batch.boxes_of(batch.find_protein(protein_id))
-        removed = (protein_id, *(band.id for band in gone.bands))
+        going = batch.find_protein(protein_id)
+        gone = batch.boxes_of(going)
+        removed = (protein_id, batch.only_row(going).id, *(band.id for band in gone.bands))
         records: list[JsonValue] = [_undetected_json(protein_id, u) for u in gone.undetected]
         implicit = set(_implicit_users(batch, protein_id))
         batch.proteins = [p for p in batch.proteins if p.id != protein_id]

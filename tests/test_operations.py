@@ -1433,7 +1433,17 @@ def test_remove_image_cascade(tmp_path):
     s = open_sample(tmp_path / "tubulin")
     cascade = ops.remove_image(s, "img-6")
     assert cascade == Cascade(
-        removed=("img-6", "prot-8", "band-13", "band-14", "band-15", "band-16", "mem-5"),
+        removed=(
+            "img-6",
+            "arena-23",
+            "prot-8",
+            "row-25",
+            "band-13",
+            "band-14",
+            "band-15",
+            "band-16",
+            "mem-5",
+        ),
         detached_targets=("prot-7",),
         unpaired_images=(),
         unfitted_membranes=(),
@@ -1459,7 +1469,7 @@ def test_remove_image_cascade(tmp_path):
     s = open_sample(tmp_path / "marker")
     cascade = ops.remove_image(s, "img-3")
     assert cascade == Cascade(
-        removed=("img-3",),
+        removed=("img-3", "arena-21"),
         detached_targets=(),
         unpaired_images=("img-2",),
         unfitted_membranes=("mem-1",),
@@ -3710,8 +3720,9 @@ def test_add_protein(tmp_path):
         if error is OperationError:
             assert info.value.code is expected, overrides
 
+    row = s.project.batch.only_row(protein_of(s, target)).id
     removed = ops.remove_protein(s, target)
-    assert removed.removed == (target,)
+    assert removed.removed == (target, row)
     again = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     number = int(again.rsplit("-", 1)[1])
     assert number > int(target.rsplit("-", 1)[1])  # ids increase and never return
@@ -3752,9 +3763,10 @@ def test_edit_and_remove_protein(tmp_path):
         ops.place_box(s, tubulin, NARROW_X, ROW, lane_index=0, grow=True),
         ops.place_box(s, tubulin, WIDE_X, ROW, lane_index=1, grow=True),
     ]
+    row = s.project.batch.only_row(protein_of(s, tubulin)).id
     cascade = ops.remove_protein(s, tubulin)
     assert cascade == Cascade(
-        removed=(tubulin, *bands),
+        removed=(tubulin, row, *bands),
         detached_targets=(beta, gapdh),
         unpaired_images=(),
         unfitted_membranes=(),
@@ -5424,7 +5436,7 @@ LOGGED_STEPS = [
         "remove_protein",
         lambda s: {
             "protein_id": "prot-9",
-            "removed": ["prot-9"],
+            "removed": ["prot-9", "row-10"],
             "detached_targets": ["prot-7", "prot-13"],
             "unpaired_images": [],
             "unfitted_membranes": [],
@@ -5614,7 +5626,18 @@ LOGGED_STEPS = [
         "remove_image",
         lambda s: {
             "image_id": "img-1",
-            "removed": ["img-1", "prot-7", "prot-11", "prot-13", "band-17", "band-19"],
+            "removed": [
+                "img-1",
+                "arena-4",
+                "prot-7",
+                "prot-11",
+                "prot-13",
+                "row-8",
+                "row-12",
+                "row-14",
+                "band-17",
+                "band-19",
+            ],
             "detached_targets": [],
             "unpaired_images": [],
             "unfitted_membranes": [],
@@ -6243,7 +6266,7 @@ def test_removals_take_the_records_along(tmp_path):
     assert _keys(s, "prot-9") == [(2, 0), (3, 0)]
     gapdh = _records_json(s, "prot-9")
     cascade = ops.remove_protein(s, "prot-9")  # GAPDH: records only in lanes 2 and 3
-    assert cascade.removed == ("prot-9", "band-17", "band-18")  # records have no ids
+    assert cascade.removed == ("prot-9", "row-26", "band-17", "band-18")  # records: no ids
     # The log keeps them whole, since they have no ids to name them by.
     assert s.project.log[-1].params == {
         "protein_id": "prot-9",
@@ -6252,7 +6275,15 @@ def test_removals_take_the_records_along(tmp_path):
     }
     beta = _records_json(s, "prot-7")
     cascade = ops.remove_image(s, "img-2")  # β-catenin, with its lane-2 record
-    assert cascade.removed == ("img-2", "prot-7", "band-10", "band-11", "band-12")
+    assert cascade.removed == (
+        "img-2",
+        "arena-20",
+        "prot-7",
+        "row-24",
+        "band-10",
+        "band-11",
+        "band-12",
+    )
     assert s.project.log[-1].params == {
         "image_id": "img-2",
         **_listed(cascade),

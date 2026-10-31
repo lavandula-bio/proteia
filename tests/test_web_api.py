@@ -2371,10 +2371,13 @@ def test_removing_a_protein_answers_its_cascade_and_drops_its_series(client, tmp
     assert len(before["results"]["sets"][0]["series"]) == 1
     band_ids = [band["id"] for band in protein_of(before, loading)["bands"]]
 
+    batch = client.workspace.current().project.batch
+    row = batch.only_row(batch.find_protein(loading)).id
+
     answer = client.ok("DELETE", f"/api/proteins/{loading}")
     assert set(answer) == {*CASCADE, "project", "results"}
     assert {name: answer[name] for name in CASCADE} == {
-        "removed": [loading, *band_ids],
+        "removed": [loading, row, *band_ids],
         "detached_targets": [target],  # it used the batch's only loading control
         "unpaired_images": [],
         "unfitted_membranes": [],
@@ -2394,11 +2397,15 @@ def test_removing_an_image_answers_the_whole_cascade(client, tmp_path):
     body = {"name": "γ-actin", "role": "target", "image_id": other["image_id"]}
     gamma = client.ok("POST", "/api/proteins", body)["protein_id"]
     band_ids = [band["id"] for p in (loading, target) for band in protein_of(before, p)["bands"]]
+    batch = client.workspace.current().project.batch
+    [(_, area)] = batch.arenas_on(image["id"])
+    rows = [batch.only_row(batch.find_protein(p)).id for p in (loading, target)]
 
     answer = client.ok("DELETE", f"/api/images/{image['id']}")
     assert set(answer) == {*CASCADE, "project", "results"}
+    gone = [image["id"], area.id, loading, target, *rows, *band_ids, image["membrane_id"]]
     assert {name: answer[name] for name in CASCADE} == {
-        "removed": [image["id"], loading, target, *band_ids, image["membrane_id"]],
+        "removed": gone,
         "detached_targets": [gamma],  # it used α-tubulin, the only loading control
         "unpaired_images": [],
         "unfitted_membranes": [],
@@ -2420,7 +2427,7 @@ def test_removing_a_marker_image_answers_the_pairing_and_the_fit_it_undid(client
 
     answer = client.ok("DELETE", "/api/images/img-3")
     assert {name: answer[name] for name in CASCADE} == {
-        "removed": ["img-3"],
+        "removed": ["img-3", "arena-21"],  # with its membrane area
         "detached_targets": [],
         "unpaired_images": ["img-2"],
         "unfitted_membranes": ["mem-1"],
