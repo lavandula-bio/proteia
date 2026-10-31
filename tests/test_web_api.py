@@ -363,6 +363,44 @@ def test_an_import_warns_of_an_image_that_looks_like_a_processed_figure(client):
     assert answer["project"]["images"][0]["warnings"] == [warning]
 
 
+def duplicate_notices(answer: dict) -> list[dict]:
+    """The answer's duplicate_images notes (#216), of each result set."""
+    sets = answer["results"]["sets"]
+    return [n for one in sets for n in one["notices"] if n["code"] == "duplicate_images"]
+
+
+def test_an_import_of_a_file_already_in_the_project_answers_a_note_naming_both(client, tmp_path):
+    # #216: worked out from the images the project holds, in every answer;
+    # no image stores it.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    data = blot_bytes(tmp_path)
+    status, first = upload(client, data, name="β-actin 10 µM.tif")
+    assert status == 201, first
+    assert duplicate_notices(first) == []
+    status, answer = upload(client, data, name="copy α.tif")
+    assert status == 201, answer
+    ids = [first["image_id"], answer["image_id"]]
+    note = {
+        "code": "duplicate_images",
+        "level": "info",
+        "message": "'β-actin 10 µM.tif' and 'copy α.tif' are the same file (identical bytes)."
+        " If one should be a different image, import that image's file; a copy imported on"
+        " purpose needs no change",
+        "protein_ids": [],
+        "lane_indices": [],
+        "conditions": [],
+        "image_ids": ids,
+    }
+    assert duplicate_notices(answer) == [note]
+    assert [image["warnings"] for image in answer["project"]["images"]] == [[], []]
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    assert duplicate_notices(client.ok("POST", "/api/projects/open", {"name": "Blot"})) == [note]
+    assert duplicate_notices(client.ok("GET", "/api/project")) == [note]
+    assert duplicate_notices(client.ok("DELETE", f"/api/images/{ids[1]}")) == []
+    assert duplicate_notices(client.ok("POST", "/api/undo")) == [note]
+    assert duplicate_notices(client.ok("POST", "/api/redo")) == []
+
+
 def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
     image_id, _ = ready(client, tmp_path)
     answer = client.ok("PUT", f"/api/images/{image_id}/polarity", {"polarity": "light_on_dark"})
