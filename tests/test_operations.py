@@ -6252,7 +6252,7 @@ def test_dropping_records_asks_the_predicate_once_per_record(tmp_path):
         asked.append(u.lane_index)
         return u.lane_index == 1
 
-    dropped = ops._drop_undetected_where(draft.batch.find_protein(protein), drop)
+    dropped = ops._drop_undetected_where(draft.batch, draft.batch.find_protein(protein), drop)
     assert asked == [0, 1, 2]
     assert dropped == [_record_json(protein, _record(1))]
     assert [u.lane_index for u in draft.batch.find_protein(protein).undetected] == [0, 2]

@@ -54,7 +54,7 @@ import math
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Protocol
 
 from pydantic import (
     AfterValidator,
@@ -796,6 +796,20 @@ class Protein(_Model):
         return self
 
 
+class Boxes(Protocol):
+    """A protein's boxes as :meth:`Batch.boxes_of` gives them, to read and
+    write: their quantified size and padding, the bands, and the not-detected
+    records; nothing else of the protein."""
+
+    box_size: BoxSize
+    box_padding: BoxPadding
+    bands: list[Band]
+    undetected: list[UndetectedBand]
+
+    @property
+    def fitted_size(self) -> BoxSize: ...
+
+
 # --- History ---
 
 
@@ -828,10 +842,23 @@ class Batch(_Model):
     membranes: list[Membrane] = Field(default_factory=list)
     proteins: list[Protein] = Field(default_factory=list)
 
+    # --- Access points (#222) ---
+    # Code outside this module reads a membrane's images and register groups,
+    # the lanes, and a protein's image, membrane and boxes through these, one
+    # per concept, so that a change of the stored shape changes them and not
+    # their readers. Each is a plain read of the fields above: a membrane
+    # holds its images, the batch one lane table, and a protein its image and
+    # its boxes. tests/test_accessors.py lists any access that goes around them.
+
     def iter_images(self) -> Iterator[ImageRef]:
         """Every image of every membrane, in membrane then image order."""
         for membrane in self.membranes:
             yield from membrane.images
+
+    def images_of(self, membrane: Membrane) -> list[ImageRef]:
+        """A membrane's images, in its order (the stored list: read it, do not
+        change it)."""
+        return membrane.images
 
     def find_image(self, image_id: str) -> ImageRef:
         for image in self.iter_images():
@@ -844,6 +871,41 @@ class Batch(_Model):
             if any(image.id == image_id for image in membrane.images):
                 return membrane
         raise UnknownIdError(f"unknown image {image_id!r}")
+
+    def register_groups(self, membrane: Membrane) -> list[frozenset[str]]:
+        """A membrane's register groups (:meth:`Membrane.register_groups`)."""
+        return membrane.register_groups()
+
+    def group_of(self, membrane: Membrane, image_id: str) -> frozenset[str]:
+        """The register group of ``membrane`` holding ``image_id``;
+        ``UnknownIdError`` if it is not on the membrane."""
+        return membrane.group_of(image_id)
+
+    def lanes_of_protein(self, protein: Protein) -> list[Lane]:
+        """The lanes a protein's bands and records index: the batch's lane table."""
+        return self.lanes
+
+    def image_id_of(self, protein: Protein) -> str:
+        """The id of the image a protein is quantified on, with no lookup."""
+        return protein.image_id
+
+    def image_of(self, protein: Protein) -> ImageRef:
+        """The image a protein is quantified on (a lookup: where only its id
+        is needed, :meth:`image_id_of`)."""
+        return self.find_image(protein.image_id)
+
+    def membrane_of_protein(self, protein: Protein) -> Membrane:
+        """The membrane of the image a protein is quantified on."""
+        return self.membrane_of(protein.image_id)
+
+    def proteins_on(self, image_id: str) -> list[Protein]:
+        """The proteins quantified on an image, in batch order; [] for none."""
+        return [protein for protein in self.proteins if protein.image_id == image_id]
+
+    def boxes_of(self, protein: Protein) -> Boxes:
+        """A protein's boxes, to read and write (:class:`Boxes`). They are
+        held by the protein itself."""
+        return protein
 
     def find_protein(self, protein_id: str) -> Protein:
         for protein in self.proteins:

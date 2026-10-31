@@ -2135,7 +2135,7 @@ def _check_ruler_scope(session: ProjectSession, image_id: str, body: LadderPoint
     membrane = batch.membrane_of(image_id)
     if body.ladder_kda is not None and not _same_ladder(membrane, body.ladder_kda):
         raise CalibrationChangedError("ladder_kda")
-    if body.group is not None and set(body.group) != membrane.group_of(image_id):
+    if body.group is not None and set(body.group) != batch.group_of(membrane, image_id):
         raise CalibrationChangedError("group")
 
 
