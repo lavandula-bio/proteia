@@ -184,6 +184,7 @@ from proteia.core.imaging import (
     InkSet,
     NotSingleImageError,
     assess_processed,
+    check_misnamed_tiff,
     clipping_depth,
     ink_set,
     load_image,
@@ -1396,6 +1397,12 @@ def import_image(
     read; inks it does not see (after a first image of none) are refused as
     reading finds them, and so is, failing closed, any file reading converts
     from CMYK. Images imported converted before keep being read so.
+
+    A TIFF of several images named with another suffix (``.png``, ``.jpg``)
+    is refused as reading refuses one named .tif (#215,
+    :func:`_count_misnamed_tiff`): Pillow, which reads it by its suffix,
+    would take its first image only. A single image keeps that reader, and
+    images imported before keep being read so.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1435,6 +1442,7 @@ def import_image(
     try:
         _refuse_inks(original_name, _header_inks(path))
         try:
+            _count_misnamed_tiff(path)
             loaded = load_image(path)
         except (ValueError, OSError) as exc:
             if isinstance(exc, NotSingleImageError):
@@ -1537,6 +1545,21 @@ def _header_inks(path: Path) -> Inks | None:
         return ink_set(path)
     except (ValueError, OSError):
         return None
+
+
+def _count_misnamed_tiff(path: Path) -> None:
+    """Refuse (:class:`~proteia.core.imaging.NotSingleImageError`) the stored
+    copy at ``path`` if it is a TIFF named with another suffix that does not
+    hold a single image (:func:`~proteia.core.imaging.check_misnamed_tiff`,
+    #215), as reading refuses one named .tif; nothing if its images cannot be
+    counted, as reading the file then says why, by the reader its suffix
+    picks."""
+    try:
+        check_misnamed_tiff(path)
+    except NotSingleImageError:
+        raise
+    except (ValueError, OSError):
+        return
 
 
 def _refuse_inks(original_name: str, inks: Inks | None) -> None:

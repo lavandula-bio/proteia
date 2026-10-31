@@ -1367,6 +1367,184 @@ def test_the_header_of_a_tiff_with_no_image_says_so(tmp_path, monkeypatch):
             check(separated)
 
 
+# --- A TIFF named with another suffix (#215) ---
+
+
+def _stack_of_two(**options):
+    """A writer of a TIFF stack of two unlike 8-bit gray images."""
+    gray = _gray(np.uint8, 255)
+    return lambda path: tifffile.imwrite(path, np.stack([gray, gray[::-1]]), **options)
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg", ".jpeg", ".PNG"])
+@pytest.mark.parametrize(
+    ("options", "signature"),
+    [
+        ({}, b"II*\x00"),
+        ({"byteorder": ">"}, b"MM\x00*"),
+        ({"bigtiff": True}, b"II+\x00"),
+        ({"bigtiff": True, "byteorder": ">"}, b"MM\x00+"),
+    ],
+    ids=["classic", "big-endian", "bigtiff", "big-endian-bigtiff"],
+)
+def test_a_tiff_of_several_images_named_otherwise_is_refused_as_reading_refuses_a_tif(
+    tmp_path, options, signature, suffix
+):
+    # Told by its first bytes, whatever its suffix: Pillow, which reads a file
+    # by its suffix, would take its first image and drop the other.
+    path = tmp_path / f"stack µ{suffix}"
+    _stack_of_two(**options)(path)
+    assert path.read_bytes()[:4] == signature
+    named_tif = tmp_path / "stack µ.tif"
+    named_tif.write_bytes(path.read_bytes())
+    with pytest.raises(imaging.NotSingleImageError) as read:
+        load_image(named_tif)
+    with pytest.raises(imaging.NotSingleImageError) as counted:
+        imaging.check_misnamed_tiff(path)
+    assert str(counted.value) == str(read.value).replace("stack µ.tif", path.name)
+    assert str(counted.value) == (
+        f"stack µ{suffix}: holds 1 image series with axes 'QYX'; only a single 2-D gray or"
+        " color image can be quantified (stacks and multi-channel composites are not supported)"
+    )
+    assert counted.value.inks is read.value.inks is None
+
+
+@pytest.mark.parametrize(
+    ("write", "inks"),
+    [
+        (_pages((_gray(np.uint8, 255), {}), (_inks(_rgb8()), _INKS)), ("cmyk", False, False)),
+        (_pages((_gray(np.uint8, 255), {}), (_inks(_rgb8()), _SPOT)), ("other", False, False)),
+        (
+            _pages((_gray(np.uint8, 255), {}), (_inks(_rgb8().astype(np.uint16) * 257), _INKS)),
+            ("cmyk", False, True),
+        ),
+        (
+            _pages(
+                (_rgb8()[::2, ::2], {"photometric": "rgb", "subfiletype": 1}),
+                (_inks(_rgb8()), _INKS),
+            ),
+            ("cmyk", False, False),
+        ),
+    ],
+    ids=["gray-then-cmyk", "gray-then-spot", "gray-then-16-bit-cmyk", "rgb-thumbnail-then-cmyk"],
+)
+def test_counting_the_images_of_a_tiff_named_otherwise_says_its_inks_as_reading_does(
+    tmp_path, write, inks
+):
+    # The header check looks at the first page only; the inks of a later
+    # image are found when the images are counted, so that the import can
+    # name both problems, as for a .tif.
+    path = tmp_path / "several µ.jpg"
+    write(path)
+    with pytest.raises(imaging.NotSingleImageError, match=r"^several µ\.jpg: holds 2 ") as info:
+        imaging.check_misnamed_tiff(path)
+    assert info.value.inks == inks
+
+
+def _apng(path: Path) -> None:
+    frames = [Image.fromarray(_gray(np.uint8, 255)), Image.fromarray(_gray(np.uint8, 255)[::-1])]
+    frames[0].save(path, format="PNG", save_all=True, append_images=frames[1:])
+
+
+@pytest.mark.parametrize(
+    ("name", "write", "builds"),
+    [
+        # Named .tif or .tiff, reading counts its images: not parsed twice.
+        ("stack.tif", _stack_of_two(), 0),
+        ("stack.TIFF", _stack_of_two(), 0),
+        # Not a TIFF: only its first bytes are read.
+        ("gray.png", lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path), 0),
+        ("gray.jpg", lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path), 0),
+        ("frames.png", _apng, 0),
+        ("rgb.tif.png", lambda path: Image.fromarray(_rgb8()).save(path, format="PNG"), 0),
+        # A single image, which keeps the reader its suffix picks.
+        ("gray tiff.png", lambda path: tifffile.imwrite(path, _gray(np.uint16, 65535)), 1),
+        (
+            "white is zero.jpg",
+            lambda path: tifffile.imwrite(path, _gray(np.uint8, 255), photometric="miniswhite"),
+            1,
+        ),
+        (
+            "palette.jpeg",
+            lambda path: tifffile.imwrite(
+                path, _gray(np.uint8, 255), photometric="palette", colormap=_palette_map()
+            ),
+            1,
+        ),
+        ("lab.png", lambda path: tifffile.imwrite(path, _rgb8(), photometric="cielab"), 1),
+        ("cmyk.png", _separated(_inks(_rgb8())), 1),
+        (
+            "thumbnail.png",
+            _pages(
+                (_gray(np.uint8, 255), {}), (_gray(np.uint8, 255)[::2, ::2], {"subfiletype": 1})
+            ),
+            1,
+        ),
+    ],
+)
+def test_only_a_tiff_named_otherwise_has_its_images_counted(
+    tmp_path, monkeypatch, name, write, builds
+):
+    path = tmp_path / name
+    write(path)
+    built = _counting_series(monkeypatch)
+    assert imaging.check_misnamed_tiff(path) is None
+    assert len(built) == builds
+
+
+@pytest.mark.parametrize(
+    ("data", "words"),
+    [
+        (b"II*\x00", r"^damaged µ\.png: not a readable image \("),
+        (b"II*\x00\x08\x00\x00\x00" + b"\xff" * 40, "suspicious number of tags"),
+    ],
+    ids=["signature-only", "damaged-page"],
+)
+def test_a_tiff_named_otherwise_whose_images_cannot_be_counted_is_a_value_error(
+    tmp_path, data, words
+):
+    # So that the import leaves it to reading, which says why it cannot read it.
+    path = tmp_path / "damaged µ.png"
+    with pytest.raises(FileNotFoundError):  # as the system says it, not rewrapped
+        imaging.check_misnamed_tiff(path)
+    path.write_bytes(data)
+    with pytest.raises(ValueError, match=words) as info:
+        imaging.check_misnamed_tiff(path)
+    assert not isinstance(info.value, imaging.NotSingleImageError)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_running_out_of_memory_while_counting_is_not_a_damaged_file(tmp_path, monkeypatch, error):
+    # A damaged file is left to reading (a ValueError the import ignores); a
+    # MemoryError must not be, or a stack would be read as its first image.
+    path = tmp_path / "stack µ.png"
+    _stack_of_two()(path)
+
+    def run_out(*args, **kwargs):
+        raise error("no room")
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out)
+    with pytest.raises(error, match="^no room$"):
+        imaging.check_misnamed_tiff(path)
+
+
+def test_a_tiff_of_no_image_named_otherwise_is_refused_as_reading_refuses_a_tif(tmp_path):
+    path = tmp_path / "empty.png"
+    path.write_bytes(b"II*\x00" + bytes(4))  # the first page's offset is 0: no page
+    with pytest.raises(
+        imaging.NotSingleImageError, match=r"^empty\.png: holds 0 image series with axes '';"
+    ):
+        imaging.check_misnamed_tiff(path)
+
+
+def test_reading_a_tiff_of_several_images_named_otherwise_takes_its_first_as_before(tmp_path):
+    # #215 refuses it on import only: reading, for the images imported before,
+    # still picks the reader by the suffix.
+    path = tmp_path / "stack µ.png"
+    _stack_of_two()(path)
+    np.testing.assert_array_equal(load_image(path).array, _gray(np.uint8, 255))
+
+
 # --- Processed figures (#127) ---
 
 
