@@ -3331,27 +3331,58 @@ def test_a_header_that_cannot_be_read_leaves_the_reading_to_say_why(tmp_path):
         assert str(error).startswith(f"cannot read {name!r}: ")
 
 
+# What a refusal says when an operation runs out of memory, or of stack,
+# reading a file before it changes anything (#233), by the error.
+_RAN_OUT = {
+    MemoryError: (
+        "Proteia ran out of memory reading {!r}: close other programs and try again; if the"
+        " file is very large, save a smaller copy of the image (such as one cropped to the"
+        " blot) and import that"
+    ),
+    RecursionError: (
+        "Proteia ran out of stack reading {!r}: save a new copy of the image (such as one"
+        " cropped to the blot) and import that"
+    ),
+}
+
+
+def _refused_for_running_out(
+    refused: OperationError, name: str, injected: BaseException, ids: tuple[str, ...] = ()
+) -> None:
+    """``refused`` is the refusal of a read of the file named ``name`` that
+    ran out (``injected``, its cause), naming the file and what to do."""
+    assert (refused.code, refused.ids, refused.detail) == (ErrorCode.UNREADABLE_IMAGE, ids, None)
+    assert str(refused) == _RAN_OUT[type(injected)].format(name)
+    assert refused.__cause__ is injected
+
+
+def test_a_refusal_for_running_out_names_the_file_and_what_to_do():
+    # Literal, so that a change of words is a change of this test.
+    assert _RAN_OUT[MemoryError].format("gel µ.tif") == (
+        "Proteia ran out of memory reading 'gel µ.tif': close other programs and try again; if"
+        " the file is very large, save a smaller copy of the image (such as one cropped to the"
+        " blot) and import that"
+    )
+    assert _RAN_OUT[RecursionError].format("gel µ.tif") == (
+        "Proteia ran out of stack reading 'gel µ.tif': save a new copy of the image (such as one"
+        " cropped to the blot) and import that"
+    )
+
+
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])
 def test_running_out_of_memory_on_the_header_check_imports_nothing(tmp_path, monkeypatch, error):
     # #224 review 2: had the header check taken it for a damaged header, the
     # import would have read this signed 8-bit TIFF named .png by Pillow, as
-    # unsigned 8-bit, and imported it with its negative values wrong.
-    real = tifffile.TiffFile
-
-    def run_out_in_the_header_check(*args, **kwargs):
-        if sys._getframe(1).f_code.co_name == "declared_pixel_type":
-            raise error("no room")
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out_in_the_header_check)
+    # unsigned 8-bit, and imported it with its negative values wrong. #233
+    # review: it is refused, saying so, rather than answered as a crash.
+    injected = error("no room")
+    fail_reading(monkeypatch, "tifffile.TiffFile", "declared_pixel_type", injected)
     s = session_on(tmp_path)
     source = io.BytesIO(_tiff_bytes((blot() >> 9).astype(np.int8) - 64))
-    raised = _imports_nothing(
-        s,
-        lambda: ops.import_image(s, source, "int8 µ.png", kind=CHEMI, polarity=DARK),
-        raises=error,
+    refused = _imports_nothing(
+        s, lambda: ops.import_image(s, source, "int8 µ.png", kind=CHEMI, polarity=DARK)
     )
-    assert str(raised) == "no room"
+    _refused_for_running_out(refused, "int8 µ.png", injected)
     assert (_stored_files(s), s.project.next_id) == ([], 1)
 
 
@@ -3370,27 +3401,19 @@ def _gray_files() -> dict[str, bytes]:
 @pytest.mark.parametrize("name", list(_gray_files()))
 def test_running_out_of_memory_on_the_ink_check_imports_nothing(tmp_path, monkeypatch, name, error):
     # #230: the ink check took it for a damaged header, and the import carried
-    # on without it and imported the file. It stops instead, and stores
-    # nothing: no image, no stored copy, project.json as it was.
-    def run_out_in_the_ink_check(real):
-        def read(*args, **kwargs):
-            if sys._getframe(1).f_code.co_name == "ink_set":
-                raise error("no room")
-            return real(*args, **kwargs)
-
-        return read
-
-    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out_in_the_ink_check(tifffile.TiffFile))
-    monkeypatch.setattr(imaging, "_pillow_mode", run_out_in_the_ink_check(imaging._pillow_mode))
+    # on without it and imported the file. It is refused instead (#233
+    # review), and stores nothing: no image, no stored copy, project.json as
+    # it was.
+    injected = error("no room")
+    fail_reading(monkeypatch, "tifffile.TiffFile", "ink_set", injected)
+    fail_reading(monkeypatch, "imaging._pillow_mode", "ink_set", injected)
     s = session_on(tmp_path, save_to_folder)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
     data = _gray_files()[name]
-    raised = _imports_nothing(
-        s,
-        lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK),
-        raises=error,
+    refused = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
     )
-    assert str(raised) == "no room"
+    _refused_for_running_out(refused, name, injected)
     assert s.dirty is False
     assert (_stored_files(s), s.project.next_id) == ([], 1)
     assert (s.folder / storage.PROJECT_FILE).read_bytes() == saved
@@ -3403,8 +3426,8 @@ def _read_on_import() -> dict[str, tuple[bytes, str, str | None]]:
     """Files an import takes, by name, and the step of reading them that an
     import is made to run out in (:func:`test_imaging.fail_reading`): the
     pixels tifffile decodes, those Pillow decodes of an LZW TIFF, those
-    scikit-image decodes of a PNG, and the images counted of a TIFF named
-    .png (#215)."""
+    scikit-image decodes of a PNG, the images counted of a TIFF named .png
+    (#215), and the background measured on the pixels read."""
     from PIL import Image
 
     gray = Image.fromarray((blot() >> 8).astype(np.uint8))
@@ -3417,6 +3440,7 @@ def _read_on_import() -> dict[str, tuple[bytes, str, str | None]]:
         ),
         "gray β.png": (_encoded(gray, "PNG").read(), "io.imread", None),
         "gray tiff µ.png": (_tiff_bytes(blot()), "tifffile.TiffFile", "check_misnamed_tiff"),
+        "measured α.tif": (_tiff_bytes(blot()), "ops.estimate_background", None),
     }
 
 
@@ -3425,19 +3449,18 @@ def _read_on_import() -> dict[str, tuple[bytes, str, str | None]]:
 def test_running_out_of_memory_while_reading_imports_nothing(tmp_path, monkeypatch, name, error):
     # #233: reading took it for a damaged file, and the import refused the
     # file as one it cannot read ("img-1.tif: not a readable image (no
-    # room)"). It stops with that error and stores nothing, as when a header
-    # check runs out (#224, #230); the misnamed TIFF's count did so (#215).
+    # room)"). #233 review: the import is refused for running out, naming
+    # the file and what to do, and stores nothing; done (memory freed), the
+    # same file imports.
     data, where, caller = _read_on_import()[name]
     s = session_on(tmp_path, save_to_folder)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
     injected = error("no room")
     failed = fail_reading(monkeypatch, where, caller, injected)
-    raised = _imports_nothing(
-        s,
-        lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK),
-        raises=error,
+    refused = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
     )
-    assert raised is injected
+    _refused_for_running_out(refused, name, injected)
     assert failed  # it ran out where the case says
     assert s.dirty is False
     assert (_stored_files(s), s.project.next_id) == ([], 1)
@@ -3446,28 +3469,58 @@ def test_running_out_of_memory_while_reading_imports_nothing(tmp_path, monkeypat
     assert ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK) == "img-1"
 
 
+def _declaring(width: int, height: int) -> bytes:
+    """A small 16-bit TIFF whose header declares ``width`` x ``height`` pixels
+    in one strip: far more than the file holds, or than memory can."""
+    data = bytearray(_tiff_bytes(np.zeros((6, 8), dtype=np.uint16)))
+    (ifd,) = struct.unpack_from("<I", data, 4)
+    (count,) = struct.unpack_from("<H", data, ifd)
+    declared = {256: width, 257: height, 278: height}  # ImageWidth, ImageLength, RowsPerStrip
+    for index in range(count):
+        at = ifd + 2 + 12 * index
+        tag, _, number = struct.unpack_from("<HHI", data, at)
+        if tag in declared and number == 1:
+            data[at : at + 12] = struct.pack("<HHII", tag, 4, 1, declared.pop(tag))
+    assert 256 not in declared and 257 not in declared
+    return bytes(data)
+
+
+def test_a_tiff_declaring_more_pixels_than_memory_holds_is_refused_on_import(tmp_path):
+    # #233 review: a file can run reading out of memory every time. Its
+    # header reads (16777216 x 16777216 16-bit pixels: 512 TiB); its pixels
+    # cannot be allocated, which was a crash (500) since #233, and "not a
+    # readable image" before. The smaller copy the refusal asks for imports.
+    s = session_on(tmp_path)
+    huge = _declaring(2**24, 2**24)
+    refused = _imports_nothing(
+        s,
+        lambda: ops.import_image(s, io.BytesIO(huge), "huge scan µ.tif", kind=CHEMI, polarity=DARK),
+    )
+    assert (refused.code, str(refused)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        _RAN_OUT[MemoryError].format("huge scan µ.tif"),
+    )
+    assert isinstance(refused.__cause__, MemoryError)
+    cropped = _tiff_bytes(blot()[10:50, 20:140])
+    image_id = ops.import_image(
+        s, io.BytesIO(cropped), "huge scan cropped α.tif", kind=CHEMI, polarity=DARK
+    )
+    assert s.project.batch.find_image(image_id).width == 120
+
+
 # Where a polarity change is made to run out, by case (as fail_reading takes
-# it): decoding the stored file's pixels, reading its header for a colour
-# space Proteia no longer reads (the session's outdated_reading), and reading
-# whether it is a palette (_processed_again).
+# it): decoding the stored file's pixels (the session's read of them), and
+# reading whether it is a palette (_processed_again).
 _POLARITY_READS = {
     "pixels": ("io.imread", None),
-    "colour space": ("imaging._pillow_mode", "converts_cmyk"),
     "palette": ("imaging._pillow_mode", "reads_as_palette"),
 }
 
 
-@pytest.mark.parametrize("error", [MemoryError, RecursionError])
-@pytest.mark.parametrize("bands", [False, True], ids=["no band", "a band"])
-@pytest.mark.parametrize("case", list(_POLARITY_READS))
-def test_running_out_of_memory_on_a_polarity_change_changes_nothing(
-    tmp_path, monkeypatch, case, bands, error
-):
-    # #233 (#235 review): the polarity change took it for a file it cannot
-    # read: it changed the polarity and dropped the looks_processed warning
-    # (no band), or refused the file as unreadable (a band); a header read
-    # for a colour space was taken for no answer. It stops with that error
-    # instead, and changes nothing.
+def _figure_reopened(tmp_path: Path, *, bands: bool) -> tuple[ProjectSession, str]:
+    """A figure PNG that looks processed for its polarity (dark on light),
+    with a band on it or none, in a project saved and opened again, so that
+    nothing of it is read yet: the session and the image's id."""
     from PIL import Image
 
     s = session_on(tmp_path, save_to_folder)
@@ -3478,14 +3531,28 @@ def test_running_out_of_memory_on_a_polarity_change_changes_nothing(
         protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
         ops.place_box(s, protein, NARROW_X, 20, lane_index=0, grow=False)
     assert processed(s, image) is not None
-    reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
+    return ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock()), image
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+@pytest.mark.parametrize("bands", [False, True], ids=["no band", "a band"])
+@pytest.mark.parametrize("case", list(_POLARITY_READS))
+def test_running_out_of_memory_on_a_polarity_change_refuses_it(
+    tmp_path, monkeypatch, case, bands, error
+):
+    # #233 (#235 review): the polarity change took it for a file it cannot
+    # read: it changed the polarity and dropped the looks_processed warning
+    # (no band), or refused the file as unreadable (a band). #233 review: it
+    # is refused for running out, naming the image as imported, and changes
+    # nothing; done (memory freed), the polarity changes.
+    reopened, image = _figure_reopened(tmp_path, bands=bands)
     saved = (reopened.folder / storage.PROJECT_FILE).read_bytes()
     before, steps = reopened.project, reopened.history_steps
     injected = error("no room")
     failed = fail_reading(monkeypatch, *_POLARITY_READS[case], injected)
-    with pytest.raises(error) as info:
+    with pytest.raises(OperationError) as info:
         ops.set_polarity(reopened, image, LIGHT)
-    assert info.value is injected
+    _refused_for_running_out(info.value, "figure µ.png", injected, ids=(image,))
     assert failed  # it ran out where the case says
     assert (reopened.project is before, reopened.history_steps, reopened.dirty) == (
         True,
@@ -3493,6 +3560,7 @@ def test_running_out_of_memory_on_a_polarity_change_changes_nothing(
         False,
     )
     assert (reopened.folder / storage.PROJECT_FILE).read_bytes() == saved
+    assert reopened._pixels == {}  # the refused operation's reads are not kept
     monkeypatch.undo()  # the polarity itself changes
     ops.set_polarity(reopened, image, LIGHT)
     assert reopened.project.batch.find_image(image).polarity is LIGHT
@@ -3500,14 +3568,64 @@ def test_running_out_of_memory_on_a_polarity_change_changes_nothing(
 
 
 @pytest.mark.parametrize("error", [MemoryError, RecursionError])
-def test_running_out_of_memory_on_a_header_read_for_results_or_the_page_raises_it(
+@pytest.mark.parametrize("bands", [False, True], ids=["no band", "a band"])
+def test_running_out_on_the_colour_space_header_of_a_polarity_change_leaves_it_unchecked(
+    tmp_path, monkeypatch, bands, error
+):
+    # #233 review: whether the image's numbers come from a reading no longer
+    # made is a check of its header (outdated_reading) that answers None when
+    # the header cannot be read, as it did before #233 for running out: the
+    # pixels are read and the polarity changes; the next read checks again.
+    reopened, image = _figure_reopened(tmp_path, bands=bands)
+    failed = fail_reading(monkeypatch, "imaging._pillow_mode", "converts_cmyk", error("no room"))
+    ops.set_polarity(reopened, image, LIGHT)
+    assert failed == ["converts_cmyk"]
+    assert reopened.project.batch.find_image(image).polarity is LIGHT
+    assert processed(reopened, image) is None  # assessed from the pixels read
+    assert reopened._headers == {}  # no answer kept
+    monkeypatch.undo()
+    ref = reopened.project.batch.find_image(image)
+    assert reopened.outdated_reading(ref) is None
+    assert reopened._headers == {(image, ref.sha256): False}
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_running_out_reading_an_images_pixels_refuses_the_operation(tmp_path, monkeypatch, error):
+    # #233 review: an operation that needs the pixels (placing a box), or a
+    # display of them (the original colours), is refused for running out,
+    # naming the image as imported, as it was refused as unreadable before
+    # #233; nothing changes, and no pixels are kept.
+    s = session_on(tmp_path, save_to_folder)
+    image = import_blot(s, blot(), "β-actin µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    protein = ops.add_protein(s, "β-actin", Role.TARGET, image)
+    reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
+    before = reopened.project
+    injected = error("no room")
+    fail_reading(monkeypatch, "TiffPageSeries.asarray", None, injected)
+    for read in (
+        lambda: ops.place_box(reopened, protein, NARROW_X, ROW, lane_index=0, grow=True),
+        lambda: reopened.colour_pixels(image),
+        lambda: reopened.pixels(image),
+    ):
+        with pytest.raises(OperationError) as info:
+            read()
+        _refused_for_running_out(info.value, "β-actin µ.tif", injected, ids=(image,))
+    assert (reopened.project is before, reopened._pixels) == (True, {})
+    monkeypatch.undo()
+    ops.place_box(reopened, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    assert_nets_current(reopened)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_running_out_on_a_header_read_for_results_or_the_page_answers_as_unread(
     tmp_path, monkeypatch, error
 ):
-    # #233: the header reads of a stored file for the results (whether its
-    # nets come from a reading no longer made, which an export refuses) and
-    # for the page (whether it has colour to show) took it for a file they
-    # cannot read and answered None: no warning on such nets. They raise the
-    # error, and keep no answer, so the next read gives one.
+    # #233 review: the header reads of a stored file for the results (whether
+    # its nets come from a reading no longer made) and for the page (whether
+    # it has colour to show) run after an edit has committed. They answer as
+    # for a header they cannot read, as before #233 (None: no notice, no
+    # colour), and keep no answer, so the next read gives one.
     from PIL import Image
 
     s = session_on(tmp_path, save_to_folder)
@@ -3519,19 +3637,16 @@ def test_running_out_of_memory_on_a_header_read_for_results_or_the_page_raises_i
     ops.place_box(s, protein, NARROW_X, 20, lane_index=0, grow=False)
     reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
     ref = reopened.project.batch.find_image(image)
-    for caller, read in (
-        ("converts_cmyk", lambda: ops.compute(reopened)),
-        ("file_colours", lambda: reopened.file_colours(ref)),
-    ):
-        injected = error("no room")
-        failed = fail_reading(monkeypatch, "imaging._pillow_mode", caller, injected)
-        with pytest.raises(error) as info:
-            read()
-        assert (info.value is injected, failed) == (True, [caller])
-        monkeypatch.undo()
-    assert (reopened._headers, reopened._file_colours) == ({}, {})
-    notices = ops.compute(reopened).notices  # read again: nothing outdated
+    injected = error("no room")
+    failed = fail_reading(monkeypatch, "imaging._pillow_mode", "converts_cmyk", injected)
+    fail_reading(monkeypatch, "Image.open", "_pillow_mode", injected)  # file_colours' read
+    assert reopened.outdated_reading(ref) is None
+    notices = ops.compute(reopened).notices
     assert [n for n in notices if n.code is NoticeCode.OUTDATED_READING] == []
+    assert reopened.file_colours(ref) is None
+    assert failed and (reopened._headers, reopened._file_colours) == ({}, {})
+    monkeypatch.undo()
+    assert reopened.outdated_reading(ref) is None  # read again: nothing outdated
     assert reopened._headers == {(image, ref.sha256): False}
     assert reopened.file_colours(ref) == "rgb"
 

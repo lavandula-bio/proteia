@@ -162,22 +162,25 @@ def _warning(code: str, **fields: str) -> ImageWarning:
 
 
 # Errors that say nothing of the file being read: running out of memory or of
-# stack. Every reader raises them as they are, never as a damaged file (#233),
-# so that an import neither refuses the file nor carries on without a check
-# for them (#217, #224, #230), and a polarity change does not drop a warning.
-_EXHAUSTED: Final = (MemoryError, RecursionError)
+# stack. Every reader raises them as they are, never as a damaged file (#233);
+# what then happens is its caller's: an operation that needs the read before
+# it changes anything refuses, naming the file and what to do
+# (:class:`~proteia.core.session.ReadingRanOutError`), and a read after an
+# edit has committed, or for display only, answers as for a file it cannot
+# read.
+EXHAUSTED: Final = (MemoryError, RecursionError)
 
 
 @contextlib.contextmanager
 def _reading(path: Path) -> Iterator[None]:
     """Read the file at ``path`` in the ``with`` block as every reader here
     does: a ``ValueError`` or ``OSError`` is raised as it is, and so is
-    running out of memory or stack (:data:`_EXHAUSTED`); any other error is a
+    running out of memory or stack (:data:`EXHAUSTED`); any other error is a
     damaged file's (``struct.error``, ``SyntaxError`` from Pillow, Pillow's
     size limit, ...), raised as a ``ValueError`` that names the file."""
     try:
         yield
-    except (ValueError, OSError, *_EXHAUSTED):
+    except (ValueError, OSError, *EXHAUSTED):
         raise
     except Exception as exc:
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
@@ -545,7 +548,9 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
             f"{path.name}: this compressed TIFF has more pixels than the compressed-TIFF"
             " reader accepts; save the image as an uncompressed TIFF"
         ) from exc
-    except _EXHAUSTED:  # not the decoder's: as every reader (_reading)
+    except EXHAUSTED:
+        # Not the decoder's, as in every reader (_reading, which this cannot
+        # use: here a ValueError or OSError is Pillow's refusal too).
         raise
     except Exception as exc:  # Pillow's decoder errors are not all OSError
         raise ValueError(refusal) from exc

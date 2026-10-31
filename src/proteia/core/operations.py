@@ -179,6 +179,7 @@ from proteia.core.export import (
 )
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
+    EXHAUSTED,
     SEVERAL_IMAGES,
     SINGLE_IMAGE_ONLY,
     UNTRUSTED_WARNINGS,
@@ -268,6 +269,7 @@ from proteia.core.session import (
     ErrorCode,
     OperationError,
     ProjectSession,
+    ReadingRanOutError,
     new_project,
     open_project,
 )
@@ -1442,6 +1444,12 @@ def import_image(
     again; of 1-bit pixels, that it holds no gray levels and the original is
     needed. Images imported before, with their ``unknown_bit_depth`` warning,
     keep being read so.
+
+    Running out of memory or of stack before the image is recorded (reading
+    its header or pixels, counting its images, measuring it) refuses the file
+    (``UNREADABLE_IMAGE``, :class:`~proteia.core.session.ReadingRanOutError`,
+    #233), naming it as offered and what to do; nothing is stored. A file can
+    do so every time: one whose header declares more pixels than memory holds.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1551,12 +1559,14 @@ def import_image(
             new, action="import_image", params=params, add_pixels={image_id: loaded.array}
         )
         _log_import(session, image_id)
-    except BaseException:
+    except BaseException as exc:
         # _commit can raise before committing (a bad clock or params) or after
         # (a hook bug): keep the file only if the committed project uses it.
         if all(image.id != image_id for image in session.project.batch.iter_images()):
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
+            if isinstance(exc, EXHAUSTED):  # nothing imported: refused (#233)
+                raise ReadingRanOutError(original_name, exc) from exc
         raise
     return image_id
 
@@ -1858,12 +1868,17 @@ def _processed_again(
     polarity, which would name the wrong limit, and keeps its other warnings:
     with no band to re-quantify, its polarity changes as before #127, and every
     analysis of it is refused until the file is back. Running out of memory or
-    stack while reading it says nothing of the file: that error is raised, and
-    the polarity does not change (#233)."""
+    stack while reading it says nothing of the file: the polarity change is
+    refused (:class:`~proteia.core.session.ReadingRanOutError`, #233) and
+    changes nothing."""
     try:
         if array is None:
             array = session.pixels(image.id, keep=False)
         palette = reads_as_palette(storage.image_path(session.folder, image))
+    except EXHAUSTED as exc:
+        raise ReadingRanOutError(image.original_name, exc, ids=(image.id,)) from exc
+    except ReadingRanOutError:
+        raise
     except (OperationError, ValueError, OSError):
         return [w for w in image.import_warnings if w.code != "looks_processed"]
     return assess_processed(

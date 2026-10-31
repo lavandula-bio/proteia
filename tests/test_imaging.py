@@ -23,6 +23,7 @@ from skimage import io
 from conftest import lzw_encode, synthetic_blot, write_lzw_tiff
 from proteia import samples
 from proteia.core import imaging
+from proteia.core import operations as ops
 from proteia.core.imaging import (
     UNTRUSTED_WARNINGS,
     WARNINGS,
@@ -2773,6 +2774,7 @@ _OWNERS = {
     "Image": Image,
     "imaging": imaging,
     "io": io,
+    "ops": ops,
     "tifffile": tifffile,
 }
 

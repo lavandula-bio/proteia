@@ -80,6 +80,7 @@ from pydantic import JsonValue
 import proteia
 from proteia.core import storage
 from proteia.core.imaging import (
+    EXHAUSTED,
     FileColours,
     UnsupportedColourSpaceError,
     converts_cmyk,
@@ -207,6 +208,30 @@ class OperationError(ValueError):
         self.code = code
         self.ids: tuple[str, ...] = tuple(ids)  # the objects involved, e.g. an overlapped band
         self.detail: dict[str, JsonValue] | None = None if detail is None else dict(detail)
+
+
+class ReadingRanOutError(OperationError):
+    """An operation refused (``UNREADABLE_IMAGE``) because reading a file it
+    needs, before it changes anything, ran out of memory or of stack
+    (``exhausted``, one of :data:`~proteia.core.imaging.EXHAUSTED`, raised
+    as its cause), #233: the message names the file as the user chose it
+    (``name``) and says what to do. Running out says nothing of the file, so
+    it is never called a damaged one, and a check that answers for a file it
+    cannot read does not answer for this."""
+
+    def __init__(self, name: str, exhausted: BaseException, *, ids: Sequence[str] = ()) -> None:
+        if isinstance(exhausted, RecursionError):
+            message = (
+                f"Proteia ran out of stack reading {name!r}: save a new copy of the image (such"
+                " as one cropped to the blot) and import that"
+            )
+        else:
+            message = (
+                f"Proteia ran out of memory reading {name!r}: close other programs and try"
+                " again; if the file is very large, save a smaller copy of the image (such as"
+                " one cropped to the blot) and import that"
+            )
+        super().__init__(ErrorCode.UNREADABLE_IMAGE, message, ids=ids)
 
 
 AutosaveHook = Callable[["ProjectSession"], None]
@@ -462,7 +487,9 @@ class ProjectSession:
         ``IMAGE_FILE_CHANGED`` (the file is missing, its bytes no longer match the
         recorded SHA-256, or its shape differs) or ``UNREADABLE_IMAGE`` (it
         cannot be decoded, or its stored numbers come from a reading this version
-        no longer makes, which the message says: :meth:`outdated_reading`).
+        no longer makes, which the message says: :meth:`outdated_reading`; or
+        reading it ran out of memory or of stack, :class:`ReadingRanOutError`,
+        #233). No other error of reading the file gets out.
         """
         with self.lock:
             cached = self._pixels.get(image_id)
@@ -513,7 +540,12 @@ class ProjectSession:
 
         From the header (:func:`~proteia.core.imaging.converts_cmyk`), read once
         per image record (id and SHA-256), without the lock, as
-        :meth:`file_colours` reads it."""
+        :meth:`file_colours` reads it. No error of reading the header gets out:
+        a header that cannot be read, and one whose reading runs out of memory
+        or of stack, answer None and keep no answer, so the next call reads it
+        again. The results and the state read it after an edit has committed,
+        which must not fail for it (#233; before #233 running out was a
+        ``ValueError`` here too)."""
         key = (image.id, image.sha256)
         header = self._headers.get(key)
         if header is None:
@@ -521,7 +553,7 @@ class ProjectSession:
                 header = converts_cmyk(storage.image_path(self._folder, image))
             except UnsupportedColourSpaceError as exc:
                 header = exc.problem
-            except (ValueError, OSError):
+            except (ValueError, OSError, *EXHAUSTED):
                 return None
             self._headers[key] = header
         return _outdated_reading(image, header)
@@ -530,16 +562,18 @@ class ProjectSession:
         """How the image's stored file holds colour
         (:func:`~proteia.core.imaging.file_colours`), read from its header once
         per image record (id and SHA-256); None while the file cannot be read,
-        and the next call reads it again. Never waits for the lock, so a state
-        is drawn while an operation runs: Proteia writes a stored file once, on
-        import, and never changes it (a file changed outside Proteia is refused
-        when its pixels are read)."""
+        or its reading runs out of memory or of stack (#233), and the next call
+        reads it again: no error of reading it gets out, as it is read for
+        display only, after an edit has committed. Never waits for the lock, so
+        a state is drawn while an operation runs: Proteia writes a stored file
+        once, on import, and never changes it (a file changed outside Proteia
+        is refused when its pixels are read)."""
         key = (image.id, image.sha256)
         if key in self._file_colours:
             return self._file_colours[key]
         try:
             colours = file_colours(storage.image_path(self._folder, image))
-        except (ValueError, OSError):
+        except (ValueError, OSError, *EXHAUSTED):
             return None
         self._file_colours[key] = colours
         return colours
@@ -549,7 +583,8 @@ class ProjectSession:
         recorded SHA-256; its first two dimensions must be the recorded height
         and width. A colour space reading refuses is refused with what that
         means for the image (:meth:`outdated_reading`), which names it as it was
-        imported. Called with the lock held."""
+        imported, and so is running out of memory or of stack reading it
+        (:class:`ReadingRanOutError`). Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -576,6 +611,8 @@ class ProjectSession:
             raise OperationError(ErrorCode.UNREADABLE_IMAGE, message, ids=(image_id,)) from exc
         except (ValueError, OSError) as exc:
             raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
+        except EXHAUSTED as exc:
+            raise ReadingRanOutError(image.original_name, exc, ids=(image_id,)) from exc
         if pixels.shape[:2] != (image.height, image.width):
             raise OperationError(
                 ErrorCode.IMAGE_FILE_CHANGED,

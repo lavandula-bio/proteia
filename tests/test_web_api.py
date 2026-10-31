@@ -73,6 +73,7 @@ from test_operations import (
     CAL_RIGHT_X,
     CAL_TILT,
     CAL_W,
+    _declaring,
     cal_blot,
     cal_marker,
     cal_y,
@@ -761,6 +762,20 @@ def test_an_image_in_a_colour_space_proteia_does_not_convert_is_refused(client, 
     assert client.ok("GET", "/api/project")["project"]["images"] == []
 
 
+def test_a_tiff_declaring_more_pixels_than_memory_holds_is_refused_not_a_crash(client):
+    # #233 review: its pixels cannot be allocated, every time; the upload is
+    # refused, saying so and what to do, where it was answered 500.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, answer = upload(client, _declaring(2**24, 2**24), name="huge scan µ.tif")
+    assert (status, answer["code"], answer["ids"]) == (422, "unreadable_image", [])
+    assert answer["message"] == (
+        "Proteia ran out of memory reading 'huge scan µ.tif': close other programs and try"
+        " again; if the file is very large, save a smaller copy of the image (such as one"
+        " cropped to the blot) and import that"
+    )
+    assert client.ok("GET", "/api/project")["project"]["images"] == []
+
+
 def test_the_state_reads_a_file_header_once_and_only_where_colour_can_hide(tmp_path, monkeypatch):
     workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
     session = workspace.create("A")
@@ -797,6 +812,51 @@ def test_the_state_reads_a_file_header_once_and_only_where_colour_can_hide(tmp_p
 
 
 # --- Boxes ---
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_an_edit_whose_reads_after_it_run_out_of_memory_is_saved_and_answered(
+    client, tmp_path, monkeypatch, error
+):
+    # #233 review: the answer to an edit reads the stored file's header after
+    # the edit committed: whether its nets come from a reading no longer made
+    # (the results), and whether it has colour to show (the state). Running
+    # out there was raised, and the route answered 500 with the edit saved.
+    # Both answer as for a header they cannot read, as before #233.
+    image_id, protein = ready(client, tmp_path)
+    client.ok(
+        "POST", "/api/boxes", {"protein_id": protein, "x": LANE_X[1], "y": ROW, "lane_index": 1}
+    )
+    session = client.workspace.current()
+    session._headers.clear()  # nothing of the header known: read after the edit
+    session._file_colours.clear()
+    failed = []
+    real = tifffile.TiffFile
+
+    def run_out(*args, **kwargs):
+        caller = sys._getframe(1).f_code.co_name
+        if caller in ("converts_cmyk", "_tiff_colours"):
+            failed.append(caller)
+            raise error("no room")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tifffile, "TiffFile", run_out)
+    lanes = [{"condition": f"renamed {i} µ"} for i in range(len(LANE_X))]
+    answer = client.ok("PUT", "/api/lanes", {"lanes": lanes})
+    assert sorted(set(failed)) == ["_tiff_colours", "converts_cmyk"]
+    assert [lane["condition"] for lane in answer["project"]["lanes"]] == [
+        f"renamed {i} µ" for i in range(len(LANE_X))
+    ]
+    saved = json.loads((client.root / "Blot" / storage.PROJECT_FILE).read_text(encoding="utf-8"))
+    assert saved["log"][-1]["action"] == "set_lanes"
+    assert [lane["label"] for lane in saved["batch"]["lanes"]] == [
+        f"renamed {i} µ" for i in range(len(LANE_X))
+    ]
+    assert (session._headers, session._file_colours) == ({}, {})  # read again next time
+    monkeypatch.undo()
+    client.ok("GET", "/api/project")  # the state reads the header again; the results are kept
+    sha256 = session.project.batch.find_image(image_id).sha256
+    assert session._file_colours == {(image_id, sha256): None}  # a gray TIFF: no colour
 
 
 def test_boxes_are_exchanged_in_image_pixels(client, tmp_path):
