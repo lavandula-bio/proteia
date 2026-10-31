@@ -363,14 +363,14 @@ def test_an_import_warns_of_an_image_that_looks_like_a_processed_figure(client):
 
 
 def duplicate_notices(answer: dict) -> list[dict]:
-    """The answer's notices of images of one file (#216), of each result set."""
-    codes = ("duplicate_images", "duplicate_images_measured")
-    return [n for one in answer["results"]["sets"] for n in one["notices"] if n["code"] in codes]
+    """The answer's duplicate_images notes (#216), of each result set."""
+    sets = answer["results"]["sets"]
+    return [n for one in sets for n in one["notices"] if n["code"] == "duplicate_images"]
 
 
 def test_an_import_of_a_file_already_in_the_project_answers_a_note_naming_both(client, tmp_path):
     # #216: worked out from the images the project holds, in every answer;
-    # no image stores it. Neither copy is boxed yet: a note.
+    # no image stores it.
     client.ok("POST", "/api/projects", {"name": "Blot"})
     data = blot_bytes(tmp_path)
     status, first = upload(client, data, name="β-actin 10 µM.tif")
@@ -382,10 +382,9 @@ def test_an_import_of_a_file_already_in_the_project_answers_a_note_naming_both(c
     note = {
         "code": "duplicate_images",
         "level": "info",
-        "message": "'β-actin 10 µM.tif' and 'copy α.tif' are the same file (identical bytes),"
-        " on 2 membranes: a band boxed on both would be counted twice. If one should be a"
-        " different image, import that image's file; nothing needs to change for a copy"
-        " imported on purpose",
+        "message": "'β-actin 10 µM.tif' and 'copy α.tif' are the same file (identical bytes)."
+        " If one should be a different image, import that image's file; a copy imported on"
+        " purpose needs no change",
         "protein_ids": [],
         "lane_indices": [],
         "conditions": [],

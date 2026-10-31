@@ -72,14 +72,11 @@ smaller box's area (#208); it is read from the stored boxes, never stored.
 
 A file may be imported more than once, under any name and into any membrane
 (#216). Each group of images with the same ``sha256`` (the same file bytes)
-that can hold bands (a visible-light marker cannot) gets one notice, which
-names them, counts their membranes and gives a next step that removes
-nothing: a ``duplicate_images_measured`` warning when two or more of them are
-measured, since a band measured on two of them is counted twice, else a
-``duplicate_images`` note. It is read from the stored images and proteins,
-never stored, once per computation: removing a copy or its boxes, undo and
-redo update it, and a project saved before shows it when opened. The same
-pixels saved another way are other bytes, and are not found.
+gets one ``duplicate_images`` note, which names them and gives a next step
+that removes nothing; a marker image holding no protein is left out. It is
+read from the stored images, never stored, once per computation: removing a
+copy, undo and redo update it, and a project saved before shows it when
+opened. The same pixels saved another way are other bytes, and are not found.
 
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
@@ -208,10 +205,9 @@ class NoticeCode(StrEnum):
     LADDERS_DISAGREE = "ladders_disagree"
     # Per register group: a ladder side marked but not used, and why.
     LADDER_SIDE_IGNORED = "ladder_side_ignored"
-    # #216. Per group of images that can hold bands whose files have the same
-    # bytes (one sha256), on any membranes, read from the stored images and
-    # never stored: two or more of them measured (a warning), or not (a note).
-    DUPLICATE_IMAGES_MEASURED = "duplicate_images_measured"
+    # #216. Per group of images whose files have the same bytes (one sha256),
+    # on any membranes, but for markers holding no protein: a note, read from
+    # the stored images and never stored.
     DUPLICATE_IMAGES = "duplicate_images"
 
 
@@ -267,8 +263,8 @@ SERIES_NOTICE_CODES = frozenset(
 )
 # The background modes of a ring cut short (quantify.band_backgrounds).
 _FALLBACK_MODES = frozenset({"asymmetric", "image"})
-# A notice of images of one file names each image of a group of up to this
-# many; that of a bigger group names its first image and counts the others (#216).
+# A duplicate_images note names each image of a group of up to this many; that
+# of a bigger group names its first image and counts the others (#216).
 NAMED_COPIES: Final = 3
 # What makes imaging.clipping_depth distrust an image, besides an unknown bit
 # depth: its import warnings, as the clipping_not_checked and possibly_clipped
@@ -528,36 +524,35 @@ def share_words(shared: int, smaller: int) -> str:
 
 
 def _duplicate_notices(batch: model.Batch) -> list[Notice]:
-    """The notices of images of one file (#216): one per group of two or more
-    images that can hold bands (every kind but the visible-light marker, on
-    which the model takes no protein; kept in step by a test) with the same
-    ``sha256`` (one file's bytes, under any names and on any membranes), by
-    the place of each group's first image in the image list (membrane then
-    image order, as the page lists images). A ``duplicate_images_measured``
-    warning when two or more of them are measured (hold a box or a
-    not-detected record of any protein), since a band measured on two of them
-    is counted twice; with one or none measured, a ``duplicate_images`` note.
+    """The ``duplicate_images`` notes (#216): one per group of two or more
+    images with the same ``sha256`` (one file's bytes, under any names and on
+    any membranes), by the place of each group's first image in the image
+    list (:meth:`~proteia.core.model.Batch.iter_images`, the order the page
+    lists images in). Left out of the groups: a visible-light marker image,
+    on which the model takes no protein (kept in step by a test), and an
+    image another image takes as its marker (a merged image) that holds no
+    protein. A note states the fact and a next step that removes nothing.
 
-    Each names its images in list order: each one, up to
-    :data:`NAMED_COPIES`; past it, the first and how many more. An image is
-    its file name, quoted, and where another image of the project (of any
-    kind, as the list shows them all) has the same name, as written, its place
-    in the list, from 1: ``'blot.tif' (image 3)``. So no two images a notice
-    names read alike. It counts their membranes, and its next step removes
-    nothing. It compares bytes, not pixels: the same pixels saved another way
-    are not found."""
+    It names the images in list order: each one, up to :data:`NAMED_COPIES`;
+    past it, the first and how many more. An image is its file name, quoted as
+    the notices quote names (as Python writes a string), and where another
+    image of the project (of any kind: the list shows them all) has the same
+    name, as written, its place in the list, from 1: ``'blot.tif' (image
+    3)``. So no two images a note names read alike. It compares bytes, not
+    pixels: the same pixels saved another way are not found."""
+    markers = {image.marker_image_id for image in batch.iter_images()}
+    held = {protein.image_id for protein in batch.proteins}
     place: dict[str, int] = {}
-    on: dict[str, str] = {}
     names: Counter[str] = Counter()
     groups: dict[str, list[model.ImageRef]] = {}
-    for membrane in batch.membranes:
-        for image in membrane.images:
-            place[image.id] = len(place) + 1
-            on[image.id] = membrane.id
-            names[image.original_name] += 1
-            if image.kind is not model.ImageKind.VISIBLE_MARKER:  # it can hold bands
-                groups.setdefault(image.sha256, []).append(image)
-    measured = {p.image_id for p in batch.proteins if p.bands or p.undetected}
+    for number, image in enumerate(batch.iter_images(), start=1):
+        place[image.id] = number
+        names[image.original_name] += 1
+        if image.kind is model.ImageKind.VISIBLE_MARKER:
+            continue  # no protein may be on it
+        if image.id in markers and image.id not in held:
+            continue  # another image's marker, holding no protein
+        groups.setdefault(image.sha256, []).append(image)
 
     def named(image: model.ImageRef) -> str:
         shared = names[image.original_name] > 1
@@ -565,39 +560,22 @@ def _duplicate_notices(batch: model.Batch) -> list[Notice]:
 
     notices = []
     for images in groups.values():
-        n = len(images)
-        if n < 2:
+        if len(images) < 2:
             continue
-        if n <= NAMED_COPIES:
+        if len(images) <= NAMED_COPIES:
             who = in_words([named(image) for image in images])
         else:
-            who = f"{named(images[0])} and {n - 1} more copies"
-        membranes = len({on[image.id] for image in images})
-        where = "one membrane" if membranes == 1 else f"{membranes} membranes"
-        both, times = ("both", "twice") if n == 2 else ("more than one of them", "more than once")
-        k = sum(image.id in measured for image in images)
-        if k < 2:
-            code = NoticeCode.DUPLICATE_IMAGES
-            message = (
-                f"{who} are the same file (identical bytes), on {where}: a band boxed on"
-                f" {both} would be counted {times}. If one should be a different image,"
-                " import that image's file; nothing needs to change for a copy imported on"
-                " purpose"
+            who = f"{named(images[0])} and {len(images) - 1} more copies"
+        notices.append(
+            Notice(
+                code=NoticeCode.DUPLICATE_IMAGES,
+                level=_level(NoticeCode.DUPLICATE_IMAGES),
+                message=f"{who} are the same file (identical bytes). If one should be a"
+                " different image, import that image's file; a copy imported on purpose"
+                " needs no change",
+                image_ids=tuple(image.id for image in images),
             )
-        else:
-            if k < n:
-                are = f"{k} of them are"
-            else:
-                are = "both are" if n == 2 else f"all {n} are"
-            code = NoticeCode.DUPLICATE_IMAGES_MEASURED
-            message = (
-                f"{who} are the same file (identical bytes), on {where}, and {are} measured:"
-                f" a band measured on {both} is counted {times}. Check that no band is"
-                f" measured on {both}; if one should be a different image, import that"
-                " image's file"
-            )
-        ids = tuple(image.id for image in images)
-        notices.append(Notice(code=code, level=_level(code), message=message, image_ids=ids))
+        )
     return notices
 
 
@@ -1486,7 +1464,7 @@ def compute_results(
     value (a ladder, an empty lane) change nothing, so they add no second set.
     Notices the two sets share are kept only in the first, but for those about
     a set's charts (:data:`TEST_NOTICE_CODES`), which each set keeps: the two
-    sets test on their own. The notices of images of one file are about the
+    sets test on their own. The notes of images of one file are about the
     images, not the lanes (:func:`_duplicate_notices`, #216): computed once and
     given to the returned set only, first. Two sets are labelled
     (see :class:`Results`); one set has no label. A chart with a plotted group
