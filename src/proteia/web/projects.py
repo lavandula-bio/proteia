@@ -28,7 +28,7 @@ from typing import Final
 from proteia.core import storage
 from proteia.core.model import format_timestamp
 from proteia.core.names import TextError, clean_text, name_key
-from proteia.core.session import Clock, ProjectSession, new_project, utc_now
+from proteia.core.session import Clock, OperationError, ProjectSession, new_project, utc_now
 
 ROOT_NAME: Final = "Proteia"
 MAX_NAME: Final = 100  # characters; well inside every file system's limit
@@ -211,12 +211,18 @@ def free_name(root: Path, name: object, *, existing: Iterable[str] | None = None
 
 
 def create_project(root: Path, name: object, *, clock: Clock = utc_now) -> ProjectSession:
-    """Create the project ``name`` in ``root`` and open it."""
+    """Create the project ``name`` in ``root`` and open it;
+    :class:`ProjectExistsError` if its folder exists, or is made meanwhile and
+    is not empty (another program writing a ``project.json`` there)."""
     text = project_name(name)
+    taken = ProjectExistsError(f"a project named {text!r} already exists")
     if _existing(root, text) is not None:
-        raise ProjectExistsError(f"a project named {text!r} already exists")
+        raise taken
     root.mkdir(parents=True, exist_ok=True)
-    return new_project(root / text, clock=clock)
+    try:
+        return new_project(root / text, clock=clock)
+    except OperationError as exc:  # FOLDER_NOT_EMPTY: the only refusal new_project has
+        raise taken from exc
 
 
 def create_set_up(
@@ -259,10 +265,17 @@ def project_folder(root: Path, name: object) -> Path:
     ``name`` as stored (:func:`project_name`), else ignoring case and look-alike
     spellings (:func:`_existing`); :class:`ProjectNotFoundError` if it holds no
     project."""
-    folder = _existing(root, project_name(name))
+    folder = named_folder(root, name)
     if folder is None or not (folder / storage.PROJECT_FILE).is_file():
         raise ProjectNotFoundError(f"no project named {name!r}")
     return folder
+
+
+def named_folder(root: Path, name: object) -> Path | None:
+    """The folder in ``root`` that ``name`` names, as :func:`project_folder`
+    finds it, whatever it holds (a project whose ``project.json`` was removed,
+    too); None if there is none."""
+    return _existing(root, project_name(name))
 
 
 def reveal(folder: Path) -> None:

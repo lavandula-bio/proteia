@@ -654,16 +654,16 @@ class ProjectSession:
             self._saved_files = _referenced_files(project)
             self.dirty = False
             self.save_error = None
-            self._remove_orphans()
+            self._remove_orphans(checked=True)  # the file just written: not read again
             return self._folder / storage.PROJECT_FILE
 
     def _keep_copy(
-        self, project: Project, refused: storage.ChangedOutsideError
+        self, project: Project, refused: storage.ChangedOutsideError, *, reopening: bool = False
     ) -> storage.ChangedOutsideError:
         """Keep ``project`` in a copy beside the ``project.json`` whose save was
         ``refused`` (:func:`~proteia.core.storage.keep_unsaved`), and return the
-        refusal naming it, or saying why it could not be kept. Called with the
-        lock held."""
+        refusal naming it, or saying why it could not be kept (``reopening``: as
+        opening the project again says it). Called with the lock held."""
         name = self._folder.name
         try:
             kept = storage.keep_unsaved(
@@ -673,16 +673,62 @@ class ProjectSession:
                 previous=self._kept,
             )
         except OSError as exc:
-            return storage.ChangedOutsideError(name, removed=refused.removed, not_kept=exc)
+            return storage.ChangedOutsideError(
+                name, removed=refused.removed, not_kept=exc, reopening=reopening
+            )
         self._kept = kept
-        return storage.ChangedOutsideError(name, removed=refused.removed, kept=kept.name)
+        return storage.ChangedOutsideError(
+            name, removed=refused.removed, kept=kept.name, reopening=reopening
+        )
+
+    def refusal(self, refused: storage.ChangedOutsideError) -> storage.ChangedOutsideError:
+        """``refused`` (``project.json`` changed or removed outside Proteia, as it
+        is now), told as a refused save tells it when the session has changes not
+        saved: with the copy they are kept in, kept now if no copy holds them
+        yet (:meth:`_keep_copy`), or why none could be. What an operation that
+        does not save, such as an import, refuses with. Called with the lock
+        held."""
+        if not self.dirty:
+            return refused
+        return self._keep_copy(self._project, refused)
 
     def check_file(self) -> None:
         """:class:`~proteia.core.storage.ChangedOutsideError` unless
         ``project.json`` is still the file this session last read or wrote
-        (:func:`~proteia.core.storage.check_unchanged`); an ``OSError`` reading it
-        propagates. Called with the lock held."""
-        storage.check_unchanged(self._folder, self._file_digest)
+        (:func:`~proteia.core.storage.check_unchanged`), or holds the project as
+        it is open in other bytes, which it then takes for that file
+        (:meth:`_adopt`); an ``OSError`` reading it propagates. Called with the
+        lock held."""
+        try:
+            storage.check_unchanged(self._folder, self._file_digest)
+        except storage.ChangedOutsideError as exc:
+            try:
+                data = (self._folder / storage.PROJECT_FILE).read_bytes()
+            except OSError:  # removed, or unreadable since: refused as found
+                raise exc from None
+            if not self._adopt(data):
+                raise
+
+    def _adopt(self, data: bytes) -> bool:
+        """Take ``data``, the bytes of ``project.json`` changed outside Proteia,
+        for the file this session last read or wrote if they hold the project as
+        it is open, in any form (:func:`~proteia.core.storage.holds_project`: an
+        editor's or a sync's copy, or a kept copy renamed to it): then nothing
+        is unsaved, the last refusal is over, and the next save goes over it
+        (#101). Whether they did. Called with the lock held."""
+        if not storage.holds_project(data, self._project):
+            return False
+        self._file_digest = hashlib.sha256(data).hexdigest()
+        self._saved_files = _referenced_files(self._project)
+        self._kept = None
+        self.dirty = False
+        self.save_error = None
+        _log.info(
+            "in %r: its project.json, changed outside Proteia, holds the project as it is"
+            " open, so Proteia takes it for the file it saved",
+            self._folder.name,
+        )
+        return True
 
     def _commit(
         self,
@@ -891,9 +937,20 @@ class ProjectSession:
         that opening the project again reads it): then it is read, whatever it
         holds, and the changes not saved are dropped (and logged so, with the
         copy that refusal kept them in). The copy is left as it is; a later
-        refusal keeps another. ``OSError``
-        (a missing file too, or a backup of a file of an older schema that
-        cannot be kept: :class:`~proteia.core.storage.BackupError`) and the
+        refusal keeps another.
+
+        Nothing is read, and False returned, while the file is the one this
+        session last read or wrote (#101): its digest, as when the file was put
+        back or the change outside reverted, which ends a refusal (changes not
+        saved are saved over it now; a failure is recorded in ``save_error``,
+        as after any save); or while it holds the project as it is open in
+        other bytes, which it then takes for that file (:meth:`_adopt`). A
+        ``project.json`` removed refuses it with a
+        :class:`~proteia.core.storage.ChangedOutsideError` that says what to
+        do, once the project as it is open is kept in a copy beside it
+        (:meth:`_keep_copy`; or it says why it could not be), the session as it
+        was. Any other ``OSError`` (or a backup of a file of an older schema
+        that cannot be kept: :class:`~proteia.core.storage.BackupError`) and the
         :class:`~proteia.core.storage.ProjectError` family propagate, with the
         session as it was.
         """
@@ -904,8 +961,21 @@ class ProjectSession:
                 return False
             # The copy the refusal kept the changes in, if it could keep one.
             kept = error.kept if isinstance(error, storage.ChangedOutsideError) else None
-            saved = (self._folder / storage.PROJECT_FILE).read_bytes()
-            if not self.dirty and saved == storage.project_to_json(self._project):
+            try:
+                saved = (self._folder / storage.PROJECT_FILE).read_bytes()
+            except FileNotFoundError:
+                gone = storage.ChangedOutsideError(self._folder.name, removed=True)
+                raise self._keep_copy(self._project, gone, reopening=True) from None
+            if hashlib.sha256(saved).hexdigest() == self._file_digest:
+                if refused:
+                    self.save_error = None
+                if self.dirty:  # kept, as the file is the one they go over
+                    try:
+                        self.save()
+                    except (OSError, storage.ProjectError):
+                        pass  # recorded in save_error, as after any failed save
+                return False
+            if self._adopt(saved):
                 return False
             project, migrated = storage.read_project(
                 self._folder, clock=self.clock, backup=True, data=saved
@@ -955,7 +1025,9 @@ class ProjectSession:
         """The files of every image a state in the undo history references."""
         return frozenset(file for state in self._states for _, file in state.images)
 
-    def _remove_orphans(self) -> None:
+    def _remove_orphans(
+        self, *, checked: bool = False, kept: tuple[storage.KeptReferences | None] | None = None
+    ) -> None:
         """Delete unreferenced Proteia files in ``images/`` that neither the saved
         ``project.json``, nor a state in the undo history, nor a backup of an
         older ``project.json`` references (best effort: a file held open on
@@ -969,18 +1041,22 @@ class ProjectSession:
         below ``next_id``, as what it names is unknown.
 
         Nothing is deleted unless ``project.json`` is the file this session last
-        read or wrote (:meth:`check_file`): what one changed outside Proteia
+        read or wrote (:meth:`check_file`; ``checked``: a save that just wrote
+        it, which does not read it again): what one changed outside Proteia
         references is unknown, and so it is while the file cannot be read.
 
         Nor is any file a kept copy of the project references
-        (:func:`~proteia.core.storage.unsaved_references`, read only when a
-        file would go), whatever its id; nothing is, while one cannot be read.
-        A copy that does not read as a project keeps nothing; it is logged, and
-        left as it is."""
-        try:
-            self.check_file()
-        except (OSError, storage.ChangedOutsideError):
-            return
+        (:func:`~proteia.core.storage.unsaved_references`), whatever its id,
+        even one it only names (a copy that does not read as a project, which
+        is logged and left as it is); nothing is, while one cannot be read.
+        The copies are read only when a file would go, unless ``kept`` holds
+        what they reference, read already for the operation (a 1-tuple: None in
+        it means unknown)."""
+        if not checked:
+            try:
+                self.check_file()
+            except (OSError, storage.ChangedOutsideError):
+                return
         referenced = self._saved_files | _referenced_files(self._project) | self._retained_files()
         keep = {name.lower() for name in referenced}
         orphans = [
@@ -1002,46 +1078,45 @@ class ProjectSession:
         doomed = [path for path in orphans if path not in spared]
         if not doomed:  # the kept copies are read only then
             return
-        copied = self._kept_files()
-        if copied is None:
-            return
-        for path in doomed:
-            if path.name.lower() not in copied:
-                with contextlib.suppress(OSError):
-                    path.unlink()
-
-    def _kept_files(self) -> frozenset[str] | None:
-        """The image files the kept copies in the folder reference
-        (:func:`~proteia.core.storage.unsaved_references`), in lower case; None,
-        and logged, while what they reference is unknown. Each copy that does not
-        read as a project is logged."""
-        found = storage.unsaved_references(self._folder)
+        found = self.kept_references() if kept is None else kept[0]
         if found is None:
             _log.warning(
                 "in %r: no image file was deleted, as the copies of the project kept in its"
                 " folder could not be read",
                 self._folder.name,
             )
-            return None
-        for name in found.invalid:
+            return
+        copied = {name.lower() for name in found.files}
+        for path in doomed:
+            if path.name.lower() not in copied:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+    def kept_references(self) -> storage.KeptReferences | None:
+        """What the kept copies in the folder reference
+        (:func:`~proteia.core.storage.unsaved_references`); None while that is
+        unknown. Each copy that does not read as a project is logged. Called
+        with the lock held."""
+        found = storage.unsaved_references(self._folder)
+        for name in found.invalid if found is not None else ():
             _log.warning(
-                "in %r: %r does not read as a project, so no image file is kept for it (the file"
-                " itself is left as it is)",
+                "in %r: %r does not read as a project, so the image files its text names are"
+                " kept for it (the file itself is left as it is)",
                 self._folder.name,
                 name,
             )
-        return frozenset(name.lower() for name in found.files)
+        return found
 
-    def image_number(self) -> int:
+    def image_number(self, kept: tuple[storage.KeptReferences | None] | None = None) -> int:
         """The number of the id an image imported now takes: ``next_id``, unless
         an image file a kept copy of the project references
-        (:func:`~proteia.core.storage.unsaved_references`) holds it, as when an
-        older ``project.json`` was read since that copy was kept: then the first
-        number above it that none holds, so the import never takes a file such
-        a copy needs. ``next_id`` while what they reference is unknown. Called
-        with the lock held."""
+        (:meth:`kept_references`; ``kept``: read already, as for
+        :meth:`_remove_orphans`) holds it, as when an older ``project.json`` was
+        read since that copy was kept: then the first number above it that none
+        holds, so the import never takes a file such a copy needs. ``next_id``
+        while what they reference is unknown. Called with the lock held."""
         number = self._project.next_id
-        found = storage.unsaved_references(self._folder)
+        found = self.kept_references() if kept is None else kept[0]
         if found is None:
             return number
         held = {int(match[1]) for name in found.files if (match := _IMAGE_FILE.match(name))}
@@ -1064,15 +1139,17 @@ def new_project(
     """Create an empty project in ``folder`` and open it.
 
     ``folder`` must not exist or must be an empty directory (orphan cleanup deletes
-    files in ``images/``); otherwise ``FOLDER_NOT_EMPTY``. ``project.json``,
-    ``images/`` and ``exports/`` are written at once; an ``OSError`` propagates.
-    The log starts with one ``new_project`` entry.
+    files in ``images/``); otherwise ``FOLDER_NOT_EMPTY``, and so if another
+    program writes a ``project.json`` there meanwhile, which is left as it is.
+    ``project.json``, ``images/`` and ``exports/`` are written at once; an
+    ``OSError`` propagates. The log starts with one ``new_project`` entry.
     """
     path = Path(folder)
+    not_empty = OperationError(
+        ErrorCode.FOLDER_NOT_EMPTY, f"{path} exists and is not an empty folder"
+    )
     if path.exists() and (not path.is_dir() or any(path.iterdir())):
-        raise OperationError(
-            ErrorCode.FOLDER_NOT_EMPTY, f"{path} exists and is not an empty folder"
-        )
+        raise not_empty
     created = _entry(
         seq=1,
         action="new_project",
@@ -1081,7 +1158,10 @@ def new_project(
         clock=clock,
     )
     project = Project(log=(created,))
-    digest = storage.save_project_over(project, path, expect=None)
+    try:
+        digest = storage.save_project_over(project, path, expect=None)
+    except storage.ChangedOutsideError as exc:
+        raise not_empty from exc
     _log_entry(path, created)
     return ProjectSession(
         project, path, autosave=autosave, saved_files=(), file_digest=digest, clock=clock

@@ -619,7 +619,9 @@ async function switchTo(path, name, json, { closes = null } = {}) {
 
 // Create or open a project from the Projects dialog (switchTo), which closes
 // once the project is shown; what went wrong is said in the dialog. Gives the
-// answer once the project is shown, or null.
+// answer once the project is shown, or null. The status line says where the
+// changes of the project closed are kept, when they could not be saved (the
+// answer's notice), else it is emptied.
 async function openProject(path, name, json) {
   if (opening !== null) {
     return null;
@@ -632,7 +634,7 @@ async function openProject(path, name, json) {
       return null;
     }
     $("projects-dialog").close();
-    showStatus("");
+    showStatus(answer.notice || "");
     return answer;
   } catch (error) {
     $("projects-error").textContent = error.message;
@@ -1085,7 +1087,7 @@ async function importHandoff() {
     projects.close();
   }
   const said = answer
-    ? importedText(answer)
+    ? [answer.notice, importedText(answer)].filter(Boolean).join(" ")
     : `Imported ${images} into a new project, but another project was opened meanwhile.`;
   showStatus(said);
   checkAgain(said); // the next images waiting, if any
@@ -1262,8 +1264,13 @@ async function openSample() {
     .filter(Boolean)
     .map((protein) => protein.name);
   showStatus(
-    "For each protein, choose it on the left and drag across its row to box its bands" +
-      ` (rows from the top: ${names.join(", ")}); the table and charts fill in.`,
+    [
+      answer.notice,
+      "For each protein, choose it on the left and drag across its row to box its bands" +
+        ` (rows from the top: ${names.join(", ")}); the table and charts fill in.`,
+    ]
+      .filter(Boolean)
+      .join(" "),
   );
 }
 
@@ -3044,8 +3051,13 @@ $("quit").addEventListener("click", async () => {
     return;
   }
   try {
-    await request("POST", "/api/quit");
-    showStatus("Proteia has stopped. You can close this tab.");
+    // Its notice: where changes that could not be saved are kept.
+    const stopped = await request("POST", "/api/quit", { answer: true });
+    showStatus(
+      ["Proteia has stopped. You can close this tab.", stopped && stopped.notice]
+        .filter(Boolean)
+        .join(" "),
+    );
     $("workspace").hidden = true;
     $("quit").hidden = true;
     $("diagnostics").hidden = true;

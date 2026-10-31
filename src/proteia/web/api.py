@@ -296,7 +296,7 @@ from proteia.core.session import (
     save_failure_code,
     utc_now,
 )
-from proteia.core.storage import ProjectError
+from proteia.core.storage import ChangedOutsideError, ProjectError
 from proteia.web import cloudsync, diagnostics, handoff, logs, projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.handoff import HandoffView, Inbox, Refusal
@@ -430,6 +430,22 @@ def _not_saved(exc: Exception) -> UnsavedChangesError:
     """The open project could not be saved (``exc``), and nothing was made."""
     return UnsavedChangesError(
         f"the open project could not be saved: {exc}", cause=save_failure_code(exc)
+    )
+
+
+def _kept_notice(session: ProjectSession, exc: Exception) -> str | None:
+    """What to say of ``session`` closed although its changes could not be
+    saved (``exc``): where they are kept, when its save was refused as its
+    ``project.json`` was changed outside Proteia and a copy of the project
+    keeps them (:class:`~proteia.core.storage.ChangedOutsideError` ``kept``),
+    so they are safe (#101). None otherwise: they are not, and it stays open."""
+    if not isinstance(exc, ChangedOutsideError) or exc.kept is None:
+        return None
+    name = session.folder.name
+    return (
+        f"{name!r} was closed with changes that could not be saved, as its project.json"
+        f" was changed outside Proteia: they are kept in {exc.kept!r} in its folder; to go"
+        f" on from them, rename that copy to project.json, then open {name!r}"
     )
 
 
@@ -584,6 +600,9 @@ class Workspace:
         self._in_use: dict[ProjectSession, int] = {}
         # The open session while a reopen may read it again: none starts using it then.
         self._reopening: ProjectSession | None = None
+        # What a switch that opened a session says of the project it closed, for
+        # its answer (closed_notice): where its changes not saved were kept.
+        self._notices: weakref.WeakKeyDictionary[ProjectSession, str] = weakref.WeakKeyDictionary()
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
         # (image id, SHA-256, original colours) -> preview PNG, least recently shown first.
@@ -748,18 +767,47 @@ class Workspace:
             return self._session
 
     @staticmethod
-    def _save(session: ProjectSession) -> None:
+    def _save_or_keep(session: ProjectSession) -> str | None:
+        """Save ``session``: None once saved; the notice of where its changes are
+        kept when they could not be saved but a copy keeps them, so that it may
+        close (:func:`_kept_notice`); the save's error otherwise."""
         try:
             session.save()
         except (OSError, ProjectError) as exc:
+            notice = _kept_notice(session, exc)
+            if notice is None:
+                raise
+            return notice
+        return None
+
+    @classmethod
+    def _save(cls, session: ProjectSession) -> str | None:
+        """:meth:`_save_or_keep`, its error as :class:`UnsavedChangesError`."""
+        try:
+            return cls._save_or_keep(session)
+        except (OSError, ProjectError) as exc:
             raise _not_saved(exc) from exc
 
-    def flush(self) -> None:
+    def flush(self) -> str | None:
         """Save the open project if it has unsaved changes (an autosave failed);
-        :class:`UnsavedChangesError` if that fails again."""
+        :class:`UnsavedChangesError` if that fails again, unless a copy keeps
+        them (:func:`_kept_notice`, #101): then the notice that says where, also
+        logged, for quitting goes on. None when nothing is left unsaved."""
         session = self._peek()
+        notice = None
         if session is not None and session.dirty:
-            self._save(session)
+            notice = self._save(session)
+        if notice is not None:
+            _log.warning("%s", notice)
+        return notice
+
+    def closed_notice(self, session: ProjectSession) -> dict[str, str]:
+        """For the answer of the switch that opened ``session`` (once): its
+        ``notice`` of where the changes of the project it closed are kept, when
+        they could not be saved (:meth:`_switch`); nothing otherwise."""
+        with self._lock:
+            notice = self._notices.pop(session, None)
+        return {} if notice is None else {"notice": notice}
 
     def _switch(
         self,
@@ -792,7 +840,12 @@ class Workspace:
         Opening the open project never switches (:meth:`open`), but a project
         created where the open one's folder was removed outside Proteia does.
         Saving, opening and closing run outside the lock readers take. Called
-        with the switch lock held."""
+        with the switch lock held.
+
+        Changes that could not be saved as the old one's ``project.json`` was
+        changed outside Proteia, but that a copy of the project keeps, are safe
+        (#101): the switch goes on, and the notice that says where they are,
+        logged, is kept for the answer (:meth:`closed_notice`)."""
         old = self._peek()
         if old is not None and old.dirty:
             self._save(old)
@@ -801,13 +854,14 @@ class Workspace:
             self._opened(session)
             return session
         shared = _same_folder(old.folder, session.folder, unknown=True)
+        notice = None
         if shared:  # without waiting for a request running on the old one
             self._opened(session)
         else:
             with old.lock:
                 if old.dirty:
                     try:
-                        old.save()
+                        notice = self._save_or_keep(old)
                     except (OSError, ProjectError) as exc:
                         session.close(remove_files=False)
                         if created is None:
@@ -828,6 +882,10 @@ class Workspace:
                 _log.warning(
                     "%r was closed with changes that could not be saved: %s", old.folder.name, exc
                 )
+        if notice is not None:
+            _log.warning("%s", notice)
+            with self._lock:
+                self._notices[session] = notice
         return session
 
     def _opened(self, session: ProjectSession) -> None:
@@ -1020,7 +1078,10 @@ class Workspace:
         unless the save was refused because the file was changed outside
         Proteia (#101), whose message says that opening the project again reads
         it: then it is read, and they are dropped (the copy the refusal kept of
-        the project, which the message names, stays). The
+        the project, which the message names, stays). Its ``project.json``
+        removed refuses the open (:class:`~proteia.core.storage.ChangedOutsideError`,
+        answered as ``project_changed_outside``), once the project is kept in a
+        copy, with what to do: put the file back, or rename that copy. The
         requests using the session (:meth:`using`: an edit, or a read such as a
         preview), and then an operation running on it, are waited for, up to
         :data:`REOPEN_WAIT_S` in all, before the file is checked: after an
@@ -1031,9 +1092,14 @@ class Workspace:
         two folders are one (the open one is gone), the open is a switch, whose
         close deletes nothing."""
         with self._switching:
-            folder = projects.project_folder(self.root, name)
+            named = projects.named_folder(self.root, name)  # its project.json may be gone
             session = self._peek()
-            if session is None or not _same_folder(session.folder, folder, unknown=False):
+            if (
+                session is None
+                or named is None
+                or not _same_folder(session.folder, named, unknown=False)
+            ):
+                folder = projects.project_folder(self.root, name)
                 return self._switch(
                     lambda: ops.open_project(folder, clock=self.clock), created=None
                 )
@@ -1814,7 +1880,9 @@ def accept_handoff(
         handoff_id, body.name, _file_choices(body.files), opening=opening
     )
     with workspace.answering(session):
-        return _answer(workspace, session, handoff=_accepted(accepted))
+        return _answer(
+            workspace, session, handoff=_accepted(accepted), **workspace.closed_notice(session)
+        )
 
 
 def _file_choices(files: list[AcceptFileBody]) -> list[FileChoice]:
@@ -1857,9 +1925,13 @@ def discard_handoff(handoff_id: str, body: DiscardBody, workspace: WorkspaceDep)
 
 @router.post("/projects", status_code=201)
 def create_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Create the project and open it. ``notice`` (only then): where the
+    changes of the project it closed are kept, as they could not be saved
+    (:meth:`Workspace.closed_notice`); so too for the other routes that open a
+    project in place of another (sample, open, accept)."""
     session = workspace.create(body.name)
     with workspace.answering(session):
-        return _answer(workspace, session)
+        return _answer(workspace, session, **workspace.closed_notice(session))
 
 
 @router.post("/projects/sample", status_code=201)
@@ -1870,14 +1942,19 @@ def create_sample_project(workspace: WorkspaceDep) -> dict[str, Any]:
     the truth table's name in the project folder and each protein's row."""
     session = workspace.create_sample()
     with workspace.answering(session):
-        return _answer(workspace, session, sample=sample_project.sample_payload(session.project))
+        return _answer(
+            workspace,
+            session,
+            sample=sample_project.sample_payload(session.project),
+            **workspace.closed_notice(session),
+        )
 
 
 @router.post("/projects/open")
 def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
     session = workspace.open(body.name)
     with workspace.answering(session):
-        return _answer(workspace, session)
+        return _answer(workspace, session, **workspace.closed_notice(session))
 
 
 @router.get("/project")
@@ -2634,6 +2711,8 @@ def install(app: FastAPI, workspace: Workspace) -> None:
             409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
         ),
         UnsavedChangesError: lambda e: _error(409, "unsaved_changes", str(e), detail=e.detail()),
+        # Opening the open project again with its project.json removed (#101).
+        ChangedOutsideError: lambda e: _error(409, "project_changed_outside", str(e)),
         UploadTooLargeError: lambda e: _error(413, "image_too_large", str(e)),
         NothingImportedError: lambda e: _error(
             422,

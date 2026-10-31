@@ -1722,6 +1722,23 @@ def _function(script: str, head: str) -> tuple[int, str]:
     return start, script[start : script.index("\n}\n", start) + 2]
 
 
+def test_the_page_says_where_changes_are_kept_when_it_closes_their_project():
+    # #101: a switch or a quit goes on once a copy keeps the changes a save
+    # refused (project.json changed outside Proteia); the answer's notice says
+    # where, in the status line, before what the page says anyway.
+    app = _code("app.js")
+    _, opens = _function(app, "async function openProject(")
+    assert '$("projects-dialog").close();\n    showStatus(answer.notice || "");' in opens
+    _, sample = _function(app, "async function openSample(")
+    assert 'showStatus(\n    [\n      answer.notice,\n      "For each protein' in sample
+    assert '? [answer.notice, importedText(answer)].filter(Boolean).join(" ")' in app
+    asked = 'const stopped = await request("POST", "/api/quit", { answer: true });'
+    quits = app[app.index(asked) :]
+    assert quits.index(
+        '["Proteia has stopped. You can close this tab.", stopped && stopped.notice]'
+    ) < quits.index('$("workspace").hidden = true;')
+
+
 def test_the_export_writes_a_notice_as_a_sentence_as_the_page_does():
     # A notice's message is a clause; the page's Checks list shows it through
     # dom.js sentence() and the bundle's README through export._sentence (#208).
@@ -2046,7 +2063,7 @@ def test_the_page_finds_images_waiting_at_start_on_focus_and_before_quitting():
     quit_press = app[app.index('$("quit").addEventListener("click"') :].split("\n});\n", 1)[0]
     shown = quit_press.index('takeListing(workspace, { show: "asked" });')
     assert quit_press.index("readWorkspace()") < shown < quit_press.index("return;", shown)
-    assert shown < quit_press.index('request("POST", "/api/quit")')
+    assert shown < quit_press.index('request("POST", "/api/quit", { answer: true })')
     # While the hand-off shown may still grow, or another tab's import holds
     # it, the listing is read every 2 s; not while this page's own import or
     # discard of it is awaited.

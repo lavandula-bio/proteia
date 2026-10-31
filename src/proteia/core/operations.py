@@ -1408,9 +1408,11 @@ def import_image(
     (changed outside Proteia), the import is refused
     (``PROJECT_CHANGED_OUTSIDE``, with the message a save gets) before it
     stores a file or deletes an orphan: what that file references is unknown.
-    The message is the last refused save's, which names the copy it kept of
-    the project (:meth:`~proteia.core.session.ProjectSession.save`), when a
-    save was refused so.
+    The message says whether the file was edited or removed, as it is now,
+    and, with changes not saved, the copy they are kept in, as a refused save
+    says it (:meth:`~proteia.core.session.ProjectSession.refusal`). A file
+    that holds the project as it is open, in other bytes, is taken for the
+    one it last read or wrote, and the import goes on.
 
     The image takes the id ``next_id`` gives, unless the file of an image a
     kept copy of the project references holds it: then the first one after
@@ -1440,14 +1442,14 @@ def import_image(
     try:
         session.check_file()
     except storage.ChangedOutsideError as exc:
-        refused = session.save_error  # names the copy a refused save kept, if one was
-        message = str(refused if isinstance(refused, storage.ChangedOutsideError) else exc)
-        raise OperationError(ErrorCode.PROJECT_CHANGED_OUTSIDE, message) from exc
+        refused = session.refusal(exc)  # as the file is now, with the copy of changes not saved
+        raise OperationError(ErrorCode.PROJECT_CHANGED_OUTSIDE, str(refused)) from exc
     except OSError:
         pass
-    session._remove_orphans()
+    kept = (session.kept_references(),)  # read once, for the cleanup and the id
+    session._remove_orphans(kept=kept)
     # The id the change below will take: past those a kept copy's images hold.
-    number = session.image_number()
+    number = session.image_number(kept)
     image_id = f"img-{number}"
     try:
         stored = storage.store_image(

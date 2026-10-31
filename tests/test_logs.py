@@ -345,7 +345,8 @@ def test_a_project_read_again_logs_it(log, client):
     client.ok("POST", "/api/projects", {"name": "Blot"})
     project_file = log.root / "Blot" / storage.PROJECT_FILE
     doc = json.loads(project_file.read_text(encoding="utf-8"))
-    project_file.write_text(json.dumps(doc, indent=1), encoding="utf-8")  # rewritten outside
+    doc["next_id"] += 5  # changed outside, in content (a mere rewrite is taken as saved: #101)
+    project_file.write_text(json.dumps(doc, indent=1), encoding="utf-8")
     client.ok("POST", "/api/projects/open", {"name": "Blot"})
     assert (
         "read 'Blot' again, as its project.json was changed outside Proteia: 0 images,"
@@ -566,6 +567,30 @@ def test_unsaved_changes_at_the_stop_reach_the_log_and_the_console_once(
     err = capsys.readouterr().err
     assert err.count("Proteia stopped, but ") == 1
     assert err.startswith("Proteia stopped, but the open project could not be saved: ")
+
+
+def test_unsaved_changes_kept_in_a_copy_at_the_stop_are_said_where_once(log, client, capsys):
+    # Its project.json removed outside Proteia (#101): the save is refused, and
+    # a copy keeps the project, so the stop goes on and says where.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    folder = log.root / "Blot"
+    (folder / storage.PROJECT_FILE).unlink()
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    (copy,) = sorted(path.name for path in folder.glob("project.unsaved-*.json"))
+    capsys.readouterr()
+    client.instance.stop()
+    client.thread.join(10)
+    assert not client.thread.is_alive()
+
+    notice = (
+        "'Blot' was closed with changes that could not be saved, as its project.json was"
+        f" changed outside Proteia: they are kept in {copy!r} in its folder; to go on from"
+        " them, rename that copy to project.json, then open 'Blot'"
+    )
+    assert log.messages("WARNING")[-1] == notice
+    err = capsys.readouterr().err
+    assert err.count("Proteia stopped") == 1 and f"Proteia stopped. {notice}\n" in err
+    assert not spelled(log.root).search(log.text())
 
 
 def test_refusals_anyone_can_cause_cannot_push_the_history_out(log):
