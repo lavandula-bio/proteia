@@ -26,9 +26,12 @@ YCbCr, ...) is refused with the colour space's name rather than read wrong.
 
 ``bit_depth`` is the container depth of unsigned integer data (8 or 16), which
 sets the detector limit for the over-exposure check. Other pixel types (float,
-32-bit) have no fixed limit, so their depth is ``None`` and the import records a
-warning. Problems found on import become :class:`~proteia.core.model.ImageWarning`
-records, which the project keeps with the image. One of them, ``looks_processed``
+32-bit) have no fixed limit, so their depth is ``None`` and reading records an
+``unknown_bit_depth`` warning. Since #224 an import refuses them
+(:func:`~proteia.core.operations.import_image`): reading one still takes it,
+for the images imported before. Problems found on import become
+:class:`~proteia.core.model.ImageWarning` records, which the project keeps with
+the image. One of them, ``looks_processed``
 (#127), says that the image looks like a figure prepared for display rather than
 a raw scan, and why; it is a warning only, and changes no analysis. It depends on
 the image's polarity, so reading a file does not assess it: the import does
@@ -89,9 +92,10 @@ _INK_SET, _NUMBER_OF_INKS, _INK_SET_CMYK = 332, 334, 1
 # Warning codes and messages recorded on import. Each but looks_processed turns
 # the over-exposure check off (clipping_depth), and its message says so. Since
 # #207 an import refuses CMYK, so only images imported before hold
-# cmyk_converted, whose message names how the colours were converted: one of
-# CMYK_CONVERSIONS; the looks_processed message names the signals that fired
-# (processed_signals), joined by semicolons.
+# cmyk_converted, and since #224 a file of unknown bit depth, so only they hold
+# unknown_bit_depth. The cmyk_converted message names how the colours were
+# converted: one of CMYK_CONVERSIONS; the looks_processed message names the
+# signals that fired (processed_signals), joined by semicolons.
 WARNINGS = {
     "lossy_format": (
         "JPEG-type compression can change pixel values, so over-exposure cannot be"
@@ -503,7 +507,9 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
 
     A CMYK JPEG is decoded by Pillow, which reads an Adobe JPEG's inverted inks
     the right way up, and converted with the ICC profile it embeds, if any;
-    anything else goes through scikit-image.
+    anything else goes through scikit-image. Its pixels come in the machine's
+    byte order, so that a 16-bit TIFF in big-endian order named .png, which
+    Pillow reads in the file's, has its bit depth (#224).
     """
     from PIL import Image
 
@@ -519,7 +525,10 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
     if inks is None:
         from skimage import io
 
-        return io.imread(path), None, palette
+        pixels = io.imread(path)
+        if not pixels.dtype.isnative:
+            pixels = pixels.astype(pixels.dtype.newbyteorder("="))
+        return pixels, None, palette
     rgb, how = _cmyk_to_rgb(inks, profile)
     return rgb, how, False
 

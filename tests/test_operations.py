@@ -192,6 +192,21 @@ def import_blot(
         )
 
 
+def import_before_224(
+    session: ProjectSession,
+    pixels: np.ndarray,
+    name: str = "β-actin 10 µM.tif",
+    polarity: Polarity = DARK,
+    **options,
+) -> str:
+    """:func:`import_blot` as Proteia imported before #224, which took a file
+    whose pixels have no fixed range (floating point, or integers other than
+    unsigned 8 or 16 bits) with an unknown_bit_depth warning: the same import
+    without its refusal. The image's id."""
+    with mock.patch.object(ops, "_refuse_pixel_type", lambda name, loaded: None):
+        return import_blot(session, pixels, name, polarity, **options)
+
+
 def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None = None) -> None:
     """The operations' invariant: every stored net, background (level, mode,
     spread) and clipping flag (exact or possible) equals, exactly, its value recomputed from the
@@ -1311,7 +1326,7 @@ def test_import_records_the_stored_file(tmp_path):
     with pytest.raises(ValueError):
         array[0, 0] = 0.0
 
-    float_id = import_blot(s, pixels.astype(np.float64), "float α.tif")
+    float_id = import_before_224(s, pixels.astype(np.float64), "float α.tif")  # as before #224
     float_image = s.project.batch.find_image(float_id)
     assert float_image.bit_depth is None
     assert [w.code for w in float_image.import_warnings] == ["unknown_bit_depth"]
@@ -2779,6 +2794,248 @@ def test_file_colours_read_the_header_once_per_image_without_the_lock(tmp_path, 
     assert reads == [path, path]  # kept once read
 
 
+# --- pixel types with no fixed range (#224) ---
+
+
+def _unknown_depth_sources() -> dict[str, tuple[str, np.ndarray]]:
+    """Single-image TIFFs of :func:`blot` whose pixels have no fixed range, as
+    an import took them before #224 (with an unknown_bit_depth warning), by
+    the name of the protein measured on each: floating point (ImageJ's 32-bit
+    type), 32-bit integers and signed 16-bit integers."""
+    pixels = blot()
+    return {
+        "float µ": ("32-bit µ.tif", (pixels / 65535).astype(np.float32)),
+        "uint32 α": ("uint32 α.tif", pixels.astype(np.uint32) * 3),
+        "int16 β": ("int16 β.tif", (pixels // 2).astype(np.int16)),
+    }
+
+
+def _bilevel_png() -> io.BytesIO:
+    from PIL import Image
+
+    return _encoded(Image.fromarray(blot() < 40000), "PNG")
+
+
+def _lzw_float() -> io.BytesIO:
+    from PIL import Image
+
+    return _encoded(
+        Image.fromarray((blot() / 65535).astype(np.float32)), "TIFF", compression="tiff_lzw"
+    )
+
+
+# Files whose pixels have no fixed range, which an import refuses (#224), by
+# the name they are offered under: what the refusal says they hold, and the
+# copy it asks for.
+_SIXTEEN, _UNSIGNED = "a 16-bit TIFF", "an unsigned 16-bit TIFF"
+_UNKNOWN_DEPTH_FILES = {
+    "32-bit µ.tif": (
+        lambda: _tiff_bytes((blot() / 65535).astype(np.float32)),
+        "floating-point",
+        _SIXTEEN,
+    ),
+    "double α.tif": (lambda: _tiff_bytes(blot().astype(np.float64)), "floating-point", _SIXTEEN),
+    "half β.tif": (lambda: _tiff_bytes(blot().astype(np.float16)), "floating-point", _SIXTEEN),
+    "big-endian.TIF": (
+        lambda: _tiff_bytes(blot().astype(">f4"), byteorder=">"),
+        "floating-point",
+        _SIXTEEN,
+    ),
+    "rgb float.tif": (
+        lambda: _tiff_bytes(np.dstack([blot() / 65535] * 3).astype(np.float32), photometric="rgb"),
+        "floating-point",
+        _SIXTEEN,
+    ),
+    "lzw float.tiff": (lambda: _lzw_float().getvalue(), "floating-point", _SIXTEEN),
+    # What the file holds decides, not its suffix: a TIFF named .png.
+    "float named.png": (
+        lambda: _tiff_bytes((blot() / 65535).astype(np.float32)),
+        "floating-point",
+        _SIXTEEN,
+    ),
+    "complex.tif": (lambda: _tiff_bytes(blot().astype(np.complex64)), "complex-valued", _SIXTEEN),
+    "uint32.tif": (lambda: _tiff_bytes(blot().astype(np.uint32)), "32-bit integer", _SIXTEEN),
+    "uint64.tif": (lambda: _tiff_bytes(blot().astype(np.uint64)), "64-bit integer", _SIXTEEN),
+    "int32.tif": (
+        lambda: _tiff_bytes(blot().astype(np.int32)),
+        "signed 32-bit integer",
+        _UNSIGNED,
+    ),
+    "int16.tif": (
+        lambda: _tiff_bytes((blot() // 2).astype(np.int16)),
+        "signed 16-bit integer",
+        _UNSIGNED,
+    ),
+    "int8.tif": (
+        lambda: _tiff_bytes((blot() >> 9).astype(np.int8)),
+        "signed 8-bit integer",
+        _UNSIGNED,
+    ),
+    "bilevel.tif": (lambda: _tiff_bytes(blot() < 40000, bitspersample=1), "1-bit", _SIXTEEN),
+    "bilevel.png": (lambda: _bilevel_png().getvalue(), "1-bit", _SIXTEEN),
+}
+
+
+# Reading a complex file casts it to real before the import refuses it.
+@pytest.mark.filterwarnings("ignore:Casting complex values to real")
+@pytest.mark.parametrize("name", list(_UNKNOWN_DEPTH_FILES))
+def test_a_file_of_unknown_bit_depth_is_refused_on_import_naming_it_and_what_to_do(tmp_path, name):
+    # #224: its pixels have no fixed range, so over-exposure could not be
+    # checked on it; until #224 an import took it with an unknown_bit_depth
+    # warning. The refusal names the file as offered and its pixel type, and
+    # changes nothing (no stored file, no autosave).
+    recorder = Recorder()
+    s = session_on(tmp_path, recorder)
+    data, what, copy = _UNKNOWN_DEPTH_FILES[name]
+    source = io.BytesIO(data())
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
+    )
+    assert (error.code, error.ids, error.detail) == (ErrorCode.UNSUPPORTED_PIXEL_TYPE, (), None)
+    assert str(error) == (
+        f"{name!r} holds {what} pixels, which Proteia does not import: save it as {copy}"
+        " and import it again"
+    )
+    assert _stored_files(s) == []
+    assert s.project.next_id == 1
+    assert recorder.actions == []
+
+
+@pytest.mark.parametrize(("suffix", "warnings"), [(".png", []), (".jpg", ["lossy_format"])])
+def test_a_big_endian_16_bit_tiff_named_otherwise_is_imported_with_its_bit_depth(
+    tmp_path, suffix, warnings
+):
+    # Not refused for its pixel type (#224): Pillow, which reads it by its
+    # suffix, keeps the file's byte order, and its pixels are still 16 bits
+    # unsigned, whose over-exposure is checked. Its depth was unknown before,
+    # so its bands' backgrounds were not measured as those of the same file
+    # named .tif; now they are, and so are its nets.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    nets, images = [], []
+    for name in (f"big-endian µ{suffix}", "big-endian µ.tif"):
+        data = io.BytesIO(_tiff_bytes(blot(), byteorder=">"))
+        image_id = ops.import_image(s, data, name, kind=CHEMI, polarity=DARK)
+        np.testing.assert_array_equal(s.pixels(image_id), blot().astype(np.float64))
+        protein = ops.add_protein(s, f"{name} β", Role.TARGET, image_id)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+        nets.append([band.net for band in s.project.batch.find_protein(protein).bands])
+        images.append(s.project.batch.find_image(image_id))
+    assert (images[0].bit_depth, [w.code for w in images[0].import_warnings]) == (16, warnings)
+    assert nets[0] == nets[1]
+    # origin/main (1bf6d4a) measured 798900.0 in lane 1 on it named .png.
+    assert nets[0] == pytest.approx([798893.2142857142, 1555767.3913043481], rel=1e-12)
+
+
+def test_a_pixel_type_no_reader_gives_is_named_as_numpy_names_it():
+    # Readers give unsigned, signed, floating-point, complex or 1-bit pixels;
+    # a refusal of any other kind names it rather than failing on it.
+    assert ops._pixel_type(np.dtype("m8[s]")) == "timedelta64[s]"
+    assert ops._pixel_type(np.dtype(np.uint32)) == "32-bit integer"
+
+
+def test_a_floating_point_tiff_is_refused_in_the_words_of_224(tmp_path):
+    s = session_on(tmp_path)
+    error = _imports_nothing(
+        s, lambda: import_blot(s, (blot() / 65535).astype(np.float32), "32-bit µ.tif")
+    )
+    assert str(error) == (
+        "'32-bit µ.tif' holds floating-point pixels, which Proteia does not import: save it"
+        " as a 16-bit TIFF and import it again"
+    )
+    assert error.code == "unsupported_pixel_type"  # the value clients see
+
+
+@pytest.mark.parametrize(
+    ("name", "pixels", "copy"),
+    [
+        # ImageJ's 16-bit conversion of its 32-bit type scales to the range.
+        ("32-bit µ.tif", (blot() / 65535).astype(np.float32), lambda p: np.rint(p * 65535)),
+        ("uint32 α.tif", blot().astype(np.uint32) * 3, lambda p: p // 3),
+        # A signed image saved unsigned is moved up by 32768.
+        ("int16 β.tif", (blot() // 2 - 16384).astype(np.int16), lambda p: p.astype(int) + 32768),
+    ],
+)
+def test_a_file_refused_for_its_pixel_type_imports_once_saved_as_16_bit(
+    tmp_path, name, pixels, copy
+):
+    # The refusal's next step done literally: the same pixels saved as a
+    # 16-bit TIFF (unsigned) import, with a known bit depth and no warning.
+    s = session_on(tmp_path)
+    _imports_nothing(s, lambda: import_blot(s, pixels, name))
+    sixteen = copy(pixels).astype(np.uint16)
+    image_id = import_blot(s, sixteen, name)
+    image = s.project.batch.find_image(image_id)
+    assert (image.bit_depth, image.import_warnings) == (16, [])
+    np.testing.assert_array_equal(s.pixels(image_id), sixteen.astype(np.float64))
+    assert image_id == "img-1"  # the refusal took no id
+
+
+# The nets origin/main (1bf6d4a) measured on the images of
+# _unknown_depth_sources, imported as an import took them before #224, by
+# protein: lanes 1 and 2; and their backgrounds.
+NETS_BEFORE_224 = {
+    "float µ": [12.190430879592896, 23.73929762840271],
+    "uint32 α": [2396700.0, 4667277.391304346],
+    "int16 β": [399466.0, 777855.4000000001],
+}
+BACKGROUNDS_BEFORE_224 = {
+    "32-bit µ.tif": 0.7629510760307312,
+    "uint32 α.tif": 150000.0,
+    "int16 β.tif": 25000.0,
+}
+UNKNOWN_DEPTH = "The pixel type has no fixed detector range, so over-exposure cannot be checked."
+
+
+def test_a_project_with_images_of_unknown_depth_imported_before_224_opens_with_its_nets(
+    tmp_path,
+):
+    # #224 refuses such files on import only, not in the reader that opens
+    # stored images: images imported before keep opening, showing and
+    # measuring as they did, with their warning, and opening and measuring
+    # rewrites nothing.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    for protein_name, (name, pixels) in _unknown_depth_sources().items():
+        image_id = import_before_224(s, pixels, name)
+        protein = ops.add_protein(s, protein_name, Role.TARGET, image_id)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    s.save()
+    folder = s.folder
+    saved = (folder / "project.json").read_bytes()
+    measured = _nets(s)
+    reopened = ops.open_project(folder, autosave=save_to_folder, clock=FakeClock())
+    assert not reopened.dirty
+    nets = _nets(reopened)
+    assert nets == measured
+    for protein, expected in NETS_BEFORE_224.items():
+        assert nets[protein] == pytest.approx(expected, rel=1e-12)
+    images = {i.original_name: i for i in reopened.project.batch.iter_images()}
+    assert {
+        name: (i.bit_depth, [(w.code, w.message) for w in i.import_warnings])
+        for name, i in images.items()
+    } == {name: (None, [("unknown_bit_depth", UNKNOWN_DEPTH)]) for name in BACKGROUNDS_BEFORE_224}
+    for name, background in BACKGROUNDS_BEFORE_224.items():
+        assert images[name].background == pytest.approx(background, rel=1e-12)
+    assert all(reopened.outdated_reading(i) is None for i in images.values())
+    assert_nets_current(reopened)  # measured again from the stored files: the same nets
+    for image in images.values():  # shown as before: gray, the stored size
+        assert reopened.colour_pixels(image.id).shape == (H, W)
+    notices = [
+        n for n in ops.compute(reopened).notices if n.code is NoticeCode.CLIPPING_NOT_CHECKED
+    ]
+    assert len(notices) == 3
+    assert all("its image has an unknown bit depth" in n.message for n in notices)
+    assert (folder / "project.json").read_bytes() == saved
+    # A box placed now measures on the same reading.
+    protein = next(p.id for p in reopened.project.batch.proteins if p.name == "float µ")
+    ops.remove_box(reopened, reopened.project.batch.find_protein(protein).bands[1].id)
+    ops.place_box(reopened, protein, WIDE_X, ROW, lane_index=1, grow=True)
+    assert _nets(reopened)["float µ"] == pytest.approx(NETS_BEFORE_224["float µ"], rel=1e-12)
+
+
 # --- lanes and the reference ---
 
 
@@ -3573,10 +3830,11 @@ def test_operations_measure_fold_changes_near_the_truth(tmp_path, membrane, limi
 
 
 def _parity_session(tmp_path: Path, pixels: np.ndarray, polarity: Polarity) -> ProjectSession:
-    """The regression baseline's blot imported as a float64 TIFF, with its lane
-    table and its fixed boxes placed through the operations."""
+    """The regression baseline's blot imported as a float64 TIFF, as an import
+    took one before #224 refused it, with its lane table and its fixed boxes
+    placed through the operations."""
     s = session_on(tmp_path)
-    image = import_blot(s, pixels, "β-catenin α-tubulin 10 µM.tif", polarity)
+    image = import_before_224(s, pixels, "β-catenin α-tubulin 10 µM.tif", polarity)
     lanes = [
         LaneInput(condition, sample, included)
         for condition, sample, included in zip(CONDITIONS, SAMPLES, INCLUDED, strict=True)
@@ -4084,7 +4342,8 @@ def test_placed_boxes_carry_the_clipping_flag(tmp_path):
 def test_an_image_without_a_detector_limit_is_not_checked(tmp_path):
     s = session_on(tmp_path)
     pixels = synthetic_blot((LANE_H, LANE_W), [(lane_x(0), LANE_ROW, 6.0, 3.0, 60000.0)])
-    image = import_blot(s, pixels.astype(np.float64))  # a float TIFF: bit depth unknown
+    # A float TIFF, bit depth unknown, as imported before #224 refused it.
+    image = import_before_224(s, pixels.astype(np.float64))
     ops.set_lanes(s, [LaneInput("c0")])
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     band = ops.place_box(s, protein, lane_x(0), LANE_ROW, lane_index=0, grow=False)
@@ -4301,9 +4560,10 @@ def test_no_possible_flag_where_the_exact_check_runs(tmp_path, pixels):
 
 def test_an_image_of_unknown_depth_is_not_assessed(tmp_path):
     # A float image has no range limit: neither check runs, and only the
-    # clipping_not_checked notice speaks for its bands.
+    # clipping_not_checked notice speaks for its bands. An import refuses one
+    # since #224; one imported before keeps being measured so.
     s = session_on(tmp_path)
-    image = import_blot(s, possible_truth().astype(np.float64))
+    image = import_before_224(s, possible_truth().astype(np.float64))
     _, band_ids = six_boxes(s, image)
     assert flags(s, band_ids) == ([None] * 6, [None] * 6)
     codes = [n.code for n in ops.compute(s).notices]
@@ -4450,8 +4710,8 @@ def test_images_the_possible_check_does_not_run_on_are_never_unassessed(tmp_path
     s = session_on(tmp_path)
     if pixels == "png8":
         image = import_encoded(s, "blot.png", Image.fromarray(possible_gray8()))
-    else:
-        image = import_blot(s, possible_truth().astype(np.float64))
+    else:  # as imported before #224 refused it
+        image = import_before_224(s, possible_truth().astype(np.float64))
     six_boxes(s, image)
     assert ops.unassessed_images(s.project.batch) == []
     assert not [n for n in ops.compute(s).notices if n.message.endswith(REQUANTIFY_HINT)]
@@ -6332,8 +6592,10 @@ def test_a_hollow_band_is_over_exposed_where_the_image_s_limit_is_known(tmp_path
     if stored == "jpeg":
         gray8 = np.clip(np.round(case.image * 200.0 / MEMBRANE), 0.0, 255.0).astype(np.uint8)
         image = import_jpeg(s, gray8, 75)
-    else:
-        image = import_blot(s, case.image.astype(np.uint16 if stored == "uint16" else np.float64))
+    elif stored == "uint16":
+        image = import_blot(s, case.image.astype(np.uint16))
+    else:  # as imported before #224 refused it
+        image = import_before_224(s, case.image.astype(np.float64))
     ops.set_lanes(s, _lane_inputs(case.n_lanes, ()))
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     placement = ops.detect_row_boxes(s, protein, case.row)

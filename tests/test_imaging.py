@@ -340,6 +340,22 @@ def _rgb8() -> np.ndarray:
     return np.stack([gray, gray // 2, gray // 3], axis=-1)
 
 
+@pytest.mark.parametrize("suffix", [".png", ".jpg"])
+def test_a_big_endian_16_bit_tiff_named_otherwise_has_its_bit_depth(tmp_path, suffix):
+    # Pillow, which reads a TIFF named .png or .jpg by its suffix, keeps a
+    # big-endian file's byte order; reading gives the machine's, so the file
+    # has its 16 bits. Its depth was unknown before, which an import now
+    # refuses (#224).
+    pixels = _gray(np.uint16, 65535)
+    path = tmp_path / f"big-endian µ{suffix}"
+    tifffile.imwrite(path, pixels.astype(">u2"), byteorder=">")
+    loaded = load_image(path)
+    np.testing.assert_array_equal(loaded.pixels, pixels)
+    assert loaded.pixels.dtype.isnative
+    assert loaded.bit_depth == 16
+    assert _codes(loaded) == (["lossy_format"] if suffix == ".jpg" else [])
+
+
 @pytest.mark.parametrize(
     ("pixels", "depth", "compression"),
     [

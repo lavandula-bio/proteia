@@ -182,6 +182,7 @@ from proteia.core.imaging import (
     UNTRUSTED_WARNINGS,
     Inks,
     InkSet,
+    LoadedImage,
     NotSingleImageError,
     assess_processed,
     check_misnamed_tiff,
@@ -1403,6 +1404,13 @@ def import_image(
     :func:`_count_misnamed_tiff`): Pillow, which reads it by its suffix,
     would take its first image only. A single image keeps that reader, and
     images imported before keep being read so.
+
+    A file whose pixels have no fixed range is refused (``UNSUPPORTED_PIXEL_TYPE``,
+    #224; :func:`_refuse_pixel_type`): floating point (ImageJ's 32-bit type),
+    or integers other than unsigned 8 or 16 bits, on which over-exposure cannot
+    be checked. The message names the file and its pixel type and says to save
+    it as a 16-bit TIFF and import it again. Images imported before, with their
+    ``unknown_bit_depth`` warning, keep being read so.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1455,6 +1463,7 @@ def import_image(
             # never imported converted. Reading drops an alpha channel, so the
             # copy asked for is uncompressed by its bit depth alone.
             _refuse_inks(original_name, Inks("cmyk", True, loaded.bit_depth != 8))
+        _refuse_pixel_type(original_name, loaded)
         background = estimate_background(loaded.array)
         warnings = assess_processed(
             loaded.warnings,
@@ -1582,6 +1591,40 @@ def _refuse_inks(original_name: str, inks: Inks | None) -> None:
             "several_images": not inks.single_image,
             "uncompressed_copy": inks.uncompressed_copy,
         },
+    )
+
+
+# How a refusal names the pixels of a file whose bit depth is unknown (#224), by
+# their numpy kind; integers are named by their width and sign (_pixel_type).
+_PIXEL_KINDS: Final = {"f": "floating-point", "c": "complex-valued", "b": "1-bit"}
+
+
+def _pixel_type(dtype: np.dtype) -> str:
+    """How a refusal names pixels of ``dtype``: ``floating-point``, ``32-bit
+    integer``, ``signed 16-bit integer``, ...; a kind no reader gives by
+    numpy's name for it."""
+    if dtype.kind in "iu":
+        width = f"{dtype.itemsize * 8}-bit integer"
+        return f"signed {width}" if dtype.kind == "i" else width
+    return _PIXEL_KINDS.get(dtype.kind, dtype.name)
+
+
+def _refuse_pixel_type(original_name: str, loaded: LoadedImage) -> None:
+    """Refuse (``UNSUPPORTED_PIXEL_TYPE``) the file offered as ``original_name``
+    if its pixels, as ``loaded`` from it, have no fixed range: their bit depth
+    is unknown (:func:`~proteia.core.imaging.bit_depth_of`), so over-exposure
+    cannot be checked on them. Until #224 an import took such a file with an
+    ``unknown_bit_depth`` warning; reading still does, for the images imported
+    so. The copy to save is a 16-bit TIFF, unsigned for signed integers, which
+    an import takes."""
+    if loaded.bit_depth is not None:
+        return
+    dtype = loaded.pixels.dtype
+    copy = "an unsigned 16-bit TIFF" if dtype.kind == "i" else "a 16-bit TIFF"
+    raise OperationError(
+        ErrorCode.UNSUPPORTED_PIXEL_TYPE,
+        f"{original_name!r} holds {_pixel_type(dtype)} pixels, which Proteia does not"
+        f" import: save it as {copy} and import it again",
     )
 
 
