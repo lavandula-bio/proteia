@@ -513,6 +513,16 @@ def test_a_not_detected_region_outside_its_area_is_invalid():
     )
 
 
+def test_box_and_record_centres_are_read_down_the_image_too():
+    # GAPDH's boxes (y 100-114) and records (y 93-121) on img-4 are centred at
+    # y 107; an area from y 100 holds them, but not a centre read higher up.
+    doc = _v3(undetected_doc())
+    _arena(doc, "arena-22").update(outline={"x0": 0, "y0": 100, "x1": 153, "y1": 150})
+    project_from_json(_encode(doc))
+    _arena(doc, "arena-22")["outline"]["y0"] = 108
+    assert "protein prot-9: the centre of band-17's box lies outside" in _refusal(doc)
+
+
 def test_a_calibration_point_outside_its_area_is_invalid():
     # mem-5's strip edges on img-6 (200x100) at y 0 and 100, with no x: read at
     # the outline's centre x. α-tubulin's boxes there are centred at y 45.
@@ -524,6 +534,22 @@ def test_a_calibration_point_outside_its_area_is_invalid():
         "membrane mem-5: calibration point at y=0.0 on img-6 lies outside its membrane area"
         " arena-23" in _refusal(doc)
     )
+
+
+def test_a_mark_across_the_width_is_read_on_the_outline_middle():
+    # mem-5's strip edges (y 0 and 100, no x) on img-6 under an outline over its
+    # right half, x 100-200, on its top and bottom edges: read at x 150, inside;
+    # read at the outline's centre y (50), or the image's middle (100), they
+    # would lie left of it or on its edge. (α-tubulin, boxed on the left, goes.)
+    doc = _v3()
+    doc["batch"]["proteins"].pop(1)
+    for protein in doc["batch"]["proteins"]:
+        protein["loading_control_ids"] = []
+    _arena(doc, "arena-23").update(outline={"x0": 101, "y0": 0, "x1": 199, "y1": 100})
+    project = project_from_json(_encode(doc))
+    [_, arena] = project.batch.find_arena("arena-23")
+    assert arena.outline.centre == (150.0, 50.0)
+    assert not arena.contains(project.batch.find_image("img-6"), 50.0, 0.0)
 
 
 def test_a_calibration_point_with_x_is_read_where_it_was_marked():
@@ -700,6 +726,21 @@ def test_a_turned_square_holds_its_turned_corner():
     assert square.contains(image, 5, 5 + reach - 1e-6)
     assert not square.contains(image, 5, 5 + reach + 1e-6)
     assert not square.contains(image, 0.5, 0.5)  # an unturned corner falls outside
+    # 6 px right of or below the centre: 4.24 px along each turned side, inside
+    # (a turn that divided by the cosine would put them 8.49 px out).
+    for x, y in ((11, 5), (5, 11), (-1, 5), (5, -1)):
+        assert square.contains(image, x, y), (x, y)
+
+
+def test_the_edge_is_kept_up_to_a_billionth_of_a_pixel():
+    # Centred at 0, a point 1e-9 px past the edge lies exactly on the bound
+    # (half the side plus 1e-9): still in; 2e-9 px past, out.
+    image = _image()
+    square = _area((-10, -10, 10, 10))
+    for x, y in ((10 + 1e-9, 0), (0, 10 + 1e-9), (-10 - 1e-9, 0), (0, -10 - 1e-9)):
+        assert square.contains(image, x, y), (x, y)
+    for x, y in ((10 + 1.2e-9, 0), (0, 10 + 1.2e-9)):
+        assert not square.contains(image, x, y), (x, y)
 
 
 # --- The operations write the new ids ---

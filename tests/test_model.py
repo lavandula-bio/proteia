@@ -525,6 +525,12 @@ def test_marker_pairing(project, edit, match):
         pytest.param(lambda p: _set(_point(p), mw=0.0), "greater than 0", id="zero-mw"),
         # The lowest point: moving 250 kDa there would put it out of order.
         pytest.param(lambda p: _set(_point_at(p, 55), y=150.0), None, id="at-the-bottom"),
+        # The lowest point past the bottom: still in order, so only the bound refuses it.
+        pytest.param(
+            lambda p: _set(_point_at(p, 55), y=150.5),
+            "calibration point at y=150.5 is below the bottom of img-2",
+            id="lowest-below-bottom",
+        ),
         pytest.param(lambda p: _set(_point(p), x=341.0), "right of the edge", id="x-right-of-edge"),
         pytest.param(lambda p: _set(_point(p), x=340.0), None, id="x-at-the-edge"),
         pytest.param(
