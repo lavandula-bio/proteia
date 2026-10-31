@@ -179,6 +179,8 @@ from proteia.core.export import (
 )
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
+    SEVERAL_IMAGES,
+    SINGLE_IMAGE_ONLY,
     UNTRUSTED_WARNINGS,
     Inks,
     InkSet,
@@ -1406,7 +1408,10 @@ def import_image(
     is refused as reading refuses one named .tif (#215,
     :func:`_count_misnamed_tiff`): Pillow, which reads it by its suffix,
     would take its first image only. A single image keeps that reader, and
-    images imported before keep being read so.
+    images imported before keep being read so. Either refusal names the file
+    as it was offered, says that it holds more than one image (or none), and
+    says to save one of its images as its own file and import it again
+    (#220; :meth:`~proteia.core.imaging.NotSingleImageError.refusal`).
 
     A file whose pixels have no fixed range is refused (``UNSUPPORTED_PIXEL_TYPE``,
     #224; :func:`_refuse_pixel_type`): floating point (ImageJ's 32-bit type),
@@ -1465,9 +1470,11 @@ def import_image(
         try:
             _count_misnamed_tiff(path)
             read = read_file(path)
+        except NotSingleImageError as exc:
+            _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
+            # Named as chosen, not as stored, whatever the suffix (#220).
+            raise OperationError(ErrorCode.UNREADABLE_IMAGE, exc.refusal(original_name)) from exc
         except (ValueError, OSError) as exc:
-            if isinstance(exc, NotSingleImageError):
-                _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
             raise OperationError(
                 ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
             ) from exc
@@ -1553,11 +1560,9 @@ _INK_REFUSALS: Final[dict[InkSet, str]] = {
     ),
 }
 # A file of inks that reading would refuse as a stack too: the refusal names
-# both, so that the copy the user saves imports.
-_SEVERAL_IMAGES: Final = (
-    "; it also holds more than one image (a stack or a multi-channel composite), and"
-    " only a single image can be quantified"
-)
+# both, so that the copy the user saves imports; in the words of reading's
+# refusal of several images (NotSingleImageError).
+_SEVERAL_IMAGES: Final = f"; it also holds {SEVERAL_IMAGES}, and {SINGLE_IMAGE_ONLY}"
 # What to save, by whether the copy must be uncompressed to be read (a 16-bit
 # RGB or an RGBA TIFF is read only uncompressed; Inks.uncompressed_copy).
 _COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grayscale TIFF"}

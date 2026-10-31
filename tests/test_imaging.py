@@ -134,8 +134,13 @@ def test_multi_page_tiff_is_refused(tmp_path):
     with tifffile.TiffWriter(path) as tif:
         for page in stack:
             tif.write(page)
-    with pytest.raises(ValueError, match="stacks"):
+    with pytest.raises(ValueError) as info:
         read_pixels(path)
+    assert str(info.value) == (
+        "'stack.tif' holds more than one image (a stack or a multi-channel composite), which"
+        " Proteia does not import: only a single image can be quantified; save one of its"
+        " images as its own file and import it again"
+    )
 
 
 @pytest.mark.parametrize("shape", [(4, 5, 5), (4, 5, 6), (2, 4, 5, 3)])
@@ -320,8 +325,13 @@ def test_multi_channel_composite_is_refused(tmp_path):
     path = tmp_path / "composite.tif"
     data = np.zeros((3, 6, 8), dtype=np.uint16)
     tifffile.imwrite(path, data, photometric="minisblack", metadata={"axes": "CYX"})
-    with pytest.raises(ValueError, match="composites"):
+    with pytest.raises(ValueError) as info:
         read_pixels(path)
+    assert str(info.value) == (
+        "'composite.tif' holds more than one image (a stack or a multi-channel composite),"
+        " which Proteia does not import: only a single image can be quantified; save one of"
+        " its images as its own file and import it again"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1520,7 +1530,9 @@ def test_reading_takes_a_file_of_inks_as_one_image_as_its_ink_set_says(tmp_path)
     spots = tmp_path / "spot then cmyk 16.tif"
     _pages((_inks(_rgb8()), _SPOT), (_inks(_rgb8().astype(np.uint16) * 257), _INKS))(spots)
     for path in (stack, two_sizes, spots):
-        with pytest.raises(ValueError, match="stacks and multi-channel composites") as info:
+        with pytest.raises(
+            ValueError, match=f"^{re.escape(repr(path.name))} holds more than one image "
+        ) as info:
             load_image(path)
         assert info.value.inks == imaging.ink_set(path)
     assert info.value.inks == ("other", False, True)
@@ -1579,13 +1591,13 @@ def test_reading_a_tiff_of_several_images_says_its_inks(tmp_path, write, inks):
     # so that the import can name both problems.
     path = tmp_path / "several µ.tif"
     write(path)
-    with pytest.raises(
-        imaging.NotSingleImageError,
-        match=r"^several µ\.tif: holds \d image series with axes '\w+'; only a single 2-D gray"
-        r" or color image can be quantified \(stacks and multi-channel composites are not"
-        r" supported\)$",
-    ) as info:
+    with pytest.raises(imaging.NotSingleImageError) as info:
         load_image(path)
+    assert str(info.value) == (
+        "'several µ.tif' holds more than one image (a stack or a multi-channel composite),"
+        " which Proteia does not import: only a single image can be quantified; save one of"
+        " its images as its own file and import it again"
+    )
     assert info.value.inks == inks
 
 
@@ -1649,8 +1661,12 @@ def test_the_header_of_a_tiff_with_no_image_says_so(tmp_path, monkeypatch):
     for check in (imaging.ink_set, converts_cmyk, file_colours):
         with pytest.raises(ValueError, match=r"^empty\.tif: holds no image$"):
             check(empty)
-    with pytest.raises(ValueError, match=r"^empty\.tif: holds 0 image series with axes '';"):
+    with pytest.raises(imaging.NotSingleImageError) as info:
         load_image(empty)  # no single image either
+    assert str(info.value) == (
+        "'empty.tif' holds no image, so there is nothing to quantify: save the image as its own"
+        " file and import it again"
+    )
     separated = tmp_path / "no series.tif"
     _separated(_inks(_rgb8()))(separated)
     monkeypatch.setattr(tifffile.TiffFile, "series", property(lambda self: []))
@@ -1695,8 +1711,9 @@ def test_a_tiff_of_several_images_named_otherwise_is_refused_as_reading_refuses_
         imaging.check_misnamed_tiff(path)
     assert str(counted.value) == str(read.value).replace("stack µ.tif", path.name)
     assert str(counted.value) == (
-        f"stack µ{suffix}: holds 1 image series with axes 'QYX'; only a single 2-D gray or"
-        " color image can be quantified (stacks and multi-channel composites are not supported)"
+        f"'stack µ{suffix}' holds more than one image (a stack or a multi-channel composite),"
+        " which Proteia does not import: only a single image can be quantified; save one of"
+        " its images as its own file and import it again"
     )
     assert counted.value.inks is read.value.inks is None
 
@@ -1728,7 +1745,9 @@ def test_counting_the_images_of_a_tiff_named_otherwise_says_its_inks_as_reading_
     # name both problems, as for a .tif.
     path = tmp_path / "several µ.jpg"
     write(path)
-    with pytest.raises(imaging.NotSingleImageError, match=r"^several µ\.jpg: holds 2 ") as info:
+    with pytest.raises(
+        imaging.NotSingleImageError, match=r"^'several µ\.jpg' holds more than one image "
+    ) as info:
         imaging.check_misnamed_tiff(path)
     assert info.value.inks == inks
 
@@ -1823,10 +1842,43 @@ def test_running_out_of_memory_while_counting_is_not_a_damaged_file(tmp_path, mo
 def test_a_tiff_of_no_image_named_otherwise_is_refused_as_reading_refuses_a_tif(tmp_path):
     path = tmp_path / "empty.png"
     path.write_bytes(b"II*\x00" + bytes(4))  # the first page's offset is 0: no page
-    with pytest.raises(
-        imaging.NotSingleImageError, match=r"^empty\.png: holds 0 image series with axes '';"
-    ):
+    with pytest.raises(imaging.NotSingleImageError) as info:
         imaging.check_misnamed_tiff(path)
+    assert str(info.value) == (
+        "'empty.png' holds no image, so there is nothing to quantify: save the image as its own"
+        " file and import it again"
+    )
+
+
+@pytest.mark.parametrize(
+    ("write", "no_image"),
+    [
+        (_stack_of_two(), False),
+        (_pages((_gray(np.uint8, 255), {}), (_gray(np.uint8, 255)[:3, :4], {})), False),
+        (lambda path: path.write_bytes(b"II*\x00" + bytes(4)), True),
+    ],
+    ids=["stack", "two-sizes", "no-image"],
+)
+def test_the_refusal_of_a_tiff_that_is_not_a_single_image_can_name_the_file_otherwise(
+    tmp_path, write, no_image
+):
+    # #220: reading names the file it reads (the stored copy, on import); the
+    # import names it as the user chose it, in the same words.
+    path = tmp_path / "img-1.tif"
+    write(path)
+    with pytest.raises(imaging.NotSingleImageError) as info:
+        load_image(path)
+    assert info.value.no_image is no_image
+    chosen = "β-actin 10 µM α.tif"
+    assert info.value.refusal(chosen) == str(info.value).replace("'img-1.tif'", repr(chosen))
+    assert info.value.refusal(chosen) == (
+        "'β-actin 10 µM α.tif' holds no image, so there is nothing to quantify: save the image"
+        " as its own file and import it again"
+        if no_image
+        else "'β-actin 10 µM α.tif' holds more than one image (a stack or a multi-channel"
+        " composite), which Proteia does not import: only a single image can be quantified;"
+        " save one of its images as its own file and import it again"
+    )
 
 
 def test_reading_a_tiff_of_several_images_named_otherwise_takes_its_first_as_before(tmp_path):
