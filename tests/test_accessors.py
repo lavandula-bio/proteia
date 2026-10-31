@@ -26,7 +26,22 @@ from pathlib import Path
 import pytest
 
 from conftest import make_project
-from proteia.core.model import Project, UnknownIdError
+from proteia.core import operations as ops
+from proteia.core.model import Box, ImageKind, Project, UnknownIdError
+from proteia.core.operations import ErrorCode, OperationError
+from proteia.core.project import lane_anchors
+from proteia.web import state
+from test_operations import (
+    NARROW_X,
+    ROW,
+    band_of,
+    boxed,
+    cal_blot,
+    cal_marker,
+    calibrated,
+    import_blot,
+    plant,
+)
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "proteia"
 
@@ -159,6 +174,98 @@ def test_find_band():
     for unknown in ("band-99", "prot-7"):
         with pytest.raises(UnknownIdError):
             batch.find_band(unknown)
+
+
+# --- Readers moved onto the accessors, pinned where no test pinned them ---
+
+
+def test_lane_anchors_leave_out_boxes_touching_an_edge():
+    # β-catenin's lane-4 box (24 px wide) on the 340 px img-2, at each edge and
+    # one pixel inside it.
+    found = {}
+    for x in (0, 1, 315, 316):
+        batch = make_project().batch
+        batch.find_band("band-12")[1].box = Box(x=x, y=43)
+        found[x] = lane_anchors(batch, batch.find_image("img-2"))
+    kept = [(30.0, 0), (70.0, 1)]
+    assert found == {0: kept, 1: [*kept, (13.0, 3)], 315: [*kept, (327.0, 3)], 316: kept}
+
+
+def test_missing_lanes_sit_on_the_row_of_the_first_bands():
+    batch = make_project().batch
+    beta = batch.find_protein("prot-7")  # boxes 14 px high at y=43 in lanes 1, 2 and 4
+    anchors = lane_anchors(batch, batch.find_image("img-2"))
+    assert state._missing_lanes(batch, beta, anchors, None) == [
+        {"lane_index": 2, "x": 110.0, "y": 50.0}
+    ]
+
+
+def test_an_older_fit_is_read_from_the_bands_of_its_own_membrane():
+    # mem-5 has no point, so no curve: a #58 build leaves log_linear there. Only
+    # an MW on its own image's bands tells of a fit from before #58, not
+    # β-catenin's MW on mem-1.
+    doc = make_project().model_dump(mode="json")
+    doc["batch"]["membranes"][1]["calibration"] = {}
+    batch = Project.model_validate(doc).batch
+    mem_5 = batch.membranes[1]
+    assert ops._fitted_before_58(mem_5, batch) is False
+    batch.find_band("band-13")[1].apparent_mw = 50.0  # α-tubulin, on img-6
+    assert ops._fitted_before_58(mem_5, batch) is True
+
+
+@pytest.mark.parametrize(("width", "refused"), [(20, True), (21, False)])
+def test_a_click_box_as_wide_as_the_lane_pitch_shows_its_lane(width, refused):
+    # β-catenin's row boxes on img-2 at centres 30, 50 and 70 (a pitch of 20 px);
+    # GAPDH's box grown from a click in lane 2, centred 12 px off that lane's
+    # column. Only a box wider than the pitch is left out of the check.
+    doc = make_project().model_dump(mode="json")
+    beta, _, gapdh = doc["batch"]["proteins"]
+    beta["box_size"] = {"width": 10, "height": 14}
+    for band, x in zip(beta["bands"], (25, 45, 65), strict=True):
+        band.update(box={"x": x, "y": 43}, source="row_box", manually_edited=False)
+        band["lane_index"] = {"band-10": 0, "band-11": 1, "band-12": 2}[band["id"]]
+    gapdh["image_id"] = "img-2"
+    gapdh["box_size"] = {"width": width, "height": 14}
+    gapdh["bands"] = [
+        {**gapdh["bands"][0], "lane_index": 1, "box": {"x": 62 - width // 2, "y": 80}}
+    ]
+    batch = Project.model_validate(doc).batch
+    error = ops._misnumbered_lanes(batch, batch.find_image("img-2"), ())
+    if not refused:
+        assert error is None
+        return
+    assert error is not None and error.code is ErrorCode.ROW_LANES_UNCLEAR
+    assert error.ids == ("band-11", "band-17")
+
+
+def test_a_marker_of_another_membrane_or_kind_is_refused_in_its_own_words(tmp_path):
+    c = calibrated(tmp_path, sides=())
+    s = c.session
+    other = import_blot(s, cal_marker(), "other membrane.tif", kind=ImageKind.VISIBLE_MARKER)
+    second = import_blot(s, cal_blot(), "second chemi.tif", membrane_id=c.membrane)
+    for marker in (other, second):
+        before = s.project
+        with pytest.raises(OperationError) as info:
+            ops.set_marker_image(s, c.blot, marker)
+        assert info.value.code is ErrorCode.INVALID_INPUT
+        assert str(info.value) == (
+            f"{marker} is not a visible-light marker or merged image of membrane {c.membrane}"
+        )
+        assert info.value.ids == (marker,)
+        assert s.project is before
+
+
+def test_a_padding_reports_the_change_of_a_net_under_one(tmp_path):
+    s, _, beta = boxed(tmp_path)
+    band_id = ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
+
+    def faint(draft: Project) -> None:
+        draft.batch.find_band(band_id)[1].net = 0.5
+
+    plant(s, faint)
+    change = ops.set_box_padding(s, beta, across=1)
+    ratio = band_of(s, band_id).net / 0.5 - 1
+    assert change.net_change == (ratio, ratio)
 
 
 # --- No reader around them ---
