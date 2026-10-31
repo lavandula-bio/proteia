@@ -1,0 +1,313 @@
+{
+ "calibration": [
+  {
+   "groups": [
+    {
+     "fit": {
+      "disagreement": null,
+      "disagreement_infinite": false,
+      "disagreement_mw": null,
+      "ignored": [],
+      "image_ids": ["img-1", "img-3"],
+      "ladders": [
+       {
+        "points": 3,
+        "predicted_mw": 68.89875533311566,
+        "quality": 0.015983520479579072,
+        "quality_infinite": false,
+        "range": [27.80148821534985, 163.66030353324183],
+        "side": "left",
+        "two_point": false,
+        "worst_mw": 70.0,
+        "x": 12.0
+       }
+      ],
+      "method": "log_linear_piecewise",
+      "offset_px": null,
+      "range": [27.80148821534985, 163.66030353324183],
+      "tilt_deg": null
+     },
+     "image_ids": ["img-1", "img-3"]
+    }
+   ],
+   "membrane_id": "mem-2"
+  },
+  {
+   "groups": [
+    {
+     "fit": null,
+     "image_ids": ["img-4"]
+    }
+   ],
+   "membrane_id": "mem-5"
+  }
+ ],
+ "fresh_changes": [],
+ "history_issues": [],
+ "lane_tables": [
+  {
+   "csv": "lane,condition,sample,include,β-catenin,β-catenin clipped,α-tubulin,α-tubulin clipped,β-catenin ÷ α-tubulin normalized,β-catenin ÷ α-tubulin fold change vs vehicle\r\n1,vehicle,V1,yes,1333176.75,no,1680941.0,no,0.793113,1.043727\r\n2,vehicle,V2,yes,1167998.5,no,1607355.0,no,0.726659,0.956273\r\n3,10 µM,A1,yes,1696784.5,no,1767351.0,no,0.960072,1.263442\r\n4,10 µM,A2,yes,1515603.5,no,1642149.0,no,0.922939,1.214576\r\n",
+   "label": null,
+   "near_midpoint": []
+  }
+ ],
+ "plotted": [
+  {
+   "charts": [
+    {
+     "bars": [
+      {
+       "error": 0.03455393234701433,
+       "geometric_mean": 1.2387680624809594,
+       "geometric_sd_factor": 1.028284601697068,
+       "label": "10 µM",
+       "lane_indices": [2, 3],
+       "mean": 1.2390089990565651,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.2634423189358002, 1.2145756791773301]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {},
+     "statement": ["Bars: mean ± SD; points: replicates", "No test: a test needs two conditions or more"],
+     "subtitle": null,
+     "test": null,
+     "test_name": null,
+     "test_note": "no test: a test needs two conditions or more",
+     "test_p": null,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    }
+   ],
+   "label": null,
+   "notices": [
+    {
+     "code": "reference_not_plotted",
+     "conditions": ["vehicle"],
+     "image_ids": [],
+     "lane_indices": [],
+     "level": "info",
+     "message": "the reference condition 'vehicle' is not plotted; fold-changes are still relative to it",
+     "protein_ids": []
+    }
+   ],
+   "plot_conditions": ["10 µM"]
+  }
+ ],
+ "results": {
+  "all_lanes": null,
+  "error_type": "SD",
+  "excluded_lanes": [],
+  "label": null,
+  "lanes": [
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 0,
+    "sample": "V1"
+   },
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 1,
+    "sample": "V2"
+   },
+   {
+    "condition": "10 µM",
+    "included": true,
+    "index": 2,
+    "sample": "A1"
+   },
+   {
+    "condition": "10 µM",
+    "included": true,
+    "index": 3,
+    "sample": "A2"
+   }
+  ],
+  "method": "mean",
+  "notices": [],
+  "plot_conditions": null,
+  "proteins": [
+   {
+    "apparent_mw": [92.11861326748509, 92.11861326748509, 92.11861326748509, 92.11861326748509],
+    "band_ids": ["band-7", "band-8", "band-9", "band-10"],
+    "bands_found": [1, 1, 1, 1],
+    "calibration": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "tilt_deg": null,
+     "two_ladders": false
+    },
+    "clipped": [false, false, false, false],
+    "count_check": ["passed", "passed", "passed", "passed"],
+    "detected": [true, true, true, true],
+    "expected_mws": [92.0],
+    "image_id": "img-1",
+    "mw_check": ["passed", "passed", "passed", "passed"],
+    "mw_not_run": null,
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "nets": [1333176.75, 1167998.5, 1696784.5, 1515603.5],
+    "possibly_clipped": [null, null, null, null],
+    "protein_id": "prot-6",
+    "role": "target"
+   },
+   {
+    "apparent_mw": [null, null, null, null],
+    "band_ids": ["band-12", "band-13", "band-14", "band-15"],
+    "bands_found": [null, null, null, null],
+    "calibration": null,
+    "clipped": [false, false, false, false],
+    "count_check": ["not_run", "not_run", "not_run", "not_run"],
+    "detected": [true, true, true, true],
+    "expected_mws": [],
+    "image_id": "img-4",
+    "mw_check": ["not_run", "not_run", "not_run", "not_run"],
+    "mw_not_run": "no_expected_mw",
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "nets": [1680941.0, 1607355.0, 1767351.0, 1642149.0],
+    "possibly_clipped": [null, null, null, null],
+    "protein_id": "prot-11",
+    "role": "loading control"
+   }
+  ],
+  "reference_condition": "vehicle",
+  "series": [
+   {
+    "averaged": [],
+    "baseline": 0.7598860273320347,
+    "chart": {
+     "bars": [
+      {
+       "error": 0.06183892141047153,
+       "geometric_mean": 0.9990435295318192,
+       "geometric_sd_factor": 1.0638329526779415,
+       "label": "vehicle",
+       "lane_indices": [0, 1],
+       "mean": 1.0,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.0437267206706065, 0.9562732793293937]
+      },
+      {
+       "error": 0.03455393234701433,
+       "geometric_mean": 1.2387680624809594,
+       "geometric_sd_factor": 1.028284601697068,
+       "label": "10 µM",
+       "lane_indices": [2, 3],
+       "mean": 1.2390089990565651,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.2634423189358002, 1.2145756791773301]
+      }
+     ],
+     "comparisons": [
+      {
+       "group_a": "vehicle",
+       "group_b": "10 µM",
+       "p_value": 0.046361221814640315
+      }
+     ],
+     "coverage": [
+      {
+       "label": "vehicle",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      },
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {
+      "all_pairs": 0.3333333333333333,
+      "vs_reference": 0.3333333333333333
+     },
+     "statement": ["Bars: mean ± SD; points: replicates", "Student's t-test on log values: p = 0.0464", "Tested: both conditions"],
+     "subtitle": null,
+     "test": {
+      "adjustment": "none",
+      "chosen": {
+       "comparisons": "auto",
+       "family": "auto",
+       "scale": "auto"
+      },
+      "comparisons": "all_pairs",
+      "covered": ["vehicle", "10 µM"],
+      "design": "independent",
+      "family": "pooled",
+      "id": "student_t",
+      "method": null,
+      "min_attainable_p": null,
+      "name": "Student's t-test",
+      "notes": [],
+      "omnibus": null,
+      "p_value": 0.046361221814640315,
+      "pairwise": [
+       {
+        "estimate": 1.239954041903942,
+        "group_a": "vehicle",
+        "group_b": "10 µM",
+        "p_value": 0.046361221814640315
+       }
+      ],
+      "reasons": ["ratios: log scale", "equal n: pooled variance", "2 conditions: all pairs"],
+      "reference": null,
+      "scale": "log",
+      "statistic": -4.481251624598258
+     },
+     "test_name": "student_t",
+     "test_note": null,
+     "test_p": 0.046361221814640315,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    },
+    "fold_change": [1.0437267206706065, 0.9562732793293937, 1.2634423189358002, 1.2145756791773301],
+    "groups": {
+     "10 µM": [1.2634423189358002, 1.2145756791773301],
+     "vehicle": [1.0437267206706065, 0.9562732793293937]
+    },
+    "loading": "α-tubulin",
+    "loading_id": "prot-11",
+    "normalized": [0.7931133513906794, 0.7266587032733901, 0.9600721644992987, 0.9229390877441693],
+    "target": "β-catenin",
+    "target_id": "prot-6",
+    "undetected": {},
+    "value_kind": "fold_change"
+   }
+  ],
+  "statistics": {
+   "comparisons": "auto",
+   "family": "auto",
+   "scale": "auto"
+  },
+  "tier": "fold_change"
+ }
+}

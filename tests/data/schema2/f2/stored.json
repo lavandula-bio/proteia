@@ -1,0 +1,1078 @@
+{
+ "background_method": "ring_median_v1",
+ "batch": {
+  "lanes": [
+   {
+    "included": true,
+    "index": 0,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V1"
+   },
+   {
+    "included": true,
+    "index": 1,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V2"
+   },
+   {
+    "included": true,
+    "index": 2,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V3"
+   },
+   {
+    "included": true,
+    "index": 3,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A1"
+   },
+   {
+    "included": true,
+    "index": 4,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A2"
+   },
+   {
+    "included": true,
+    "index": 5,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A3"
+   }
+  ],
+  "membranes": [
+   {
+    "calibration": {
+     "fit_method": "log_linear",
+     "fit_quality": null,
+     "ladder": null,
+     "ladder_kda": [],
+     "points": []
+    },
+    "id": "mem-2",
+    "images": [
+     {
+      "background": 219.0,
+      "bit_depth": 8,
+      "file": "img-1.jpg",
+      "height": 80,
+      "id": "img-1",
+      "import_warnings": [
+       {
+        "code": "lossy_format",
+        "message": "JPEG-type compression can change pixel values, so over-exposure cannot be checked; quantify an uncompressed or losslessly compressed original if you have it."
+       }
+      ],
+      "kind": "chemiluminescence",
+      "marker_image_id": null,
+      "original_name": "J lossy β.jpg",
+      "polarity": "dark_on_light",
+      "sha256": "24c5c023ddf28b69a9ab75df3ac932d48b9d4dfd14e3f080a8a010872f5ece7a",
+      "width": 120
+     }
+    ]
+   },
+   {
+    "calibration": {
+     "fit_method": "log_linear",
+     "fit_quality": null,
+     "ladder": null,
+     "ladder_kda": [],
+     "points": []
+    },
+    "id": "mem-4",
+    "images": [
+     {
+      "background": 193.66666666666666,
+      "bit_depth": 8,
+      "file": "img-3.png",
+      "height": 80,
+      "id": "img-3",
+      "import_warnings": [
+       {
+        "code": "color_channels_differ",
+        "message": "The red, green and blue channels differ; they were averaged into one gray channel, so over-exposure cannot be checked."
+       }
+      ],
+      "kind": "chemiluminescence",
+      "marker_image_id": null,
+      "original_name": "C colour α.png",
+      "polarity": "dark_on_light",
+      "sha256": "5eb4924e01e6bdcb025023d25f8c0b45af304d3cc16daeb36eff9a67954e24da",
+      "width": 120
+     }
+    ]
+   }
+  ],
+  "proteins": [
+   {
+    "bands": [
+     {
+      "apparent_mw": null,
+      "background_level": 219.125,
+      "background_mode": "symmetric",
+      "background_spread": 0.07363994849501543,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 9,
+       "y": 25
+      },
+      "clipped": null,
+      "id": "band-6",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 8717.0,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 219.02083333333334,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 27,
+       "y": 25
+      },
+      "clipped": null,
+      "id": "band-7",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 9988.5,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 218.7,
+      "background_mode": "symmetric",
+      "background_spread": 0.18672900996850483,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 45,
+       "y": 25
+      },
+      "clipped": null,
+      "id": "band-8",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 19604.0,
+      "possibly_clipped": true,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 219.18867924528303,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 63,
+       "y": 25
+      },
+      "clipped": null,
+      "id": "band-9",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 7972.641509433966,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 219.37719298245614,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 81,
+       "y": 25
+      },
+      "clipped": null,
+      "id": "band-10",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 9571.263157894735,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 219.864406779661,
+      "background_mode": "symmetric",
+      "background_spread": 0.21886053673031958,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 99,
+       "y": 25
+      },
+      "clipped": null,
+      "id": "band-11",
+      "lane_index": 5,
+      "manually_edited": false,
+      "net": 9280.728813559324,
+      "possibly_clipped": false,
+      "source": "manual"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-5",
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "role": "target",
+    "undetected": []
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": null,
+      "background_level": 194.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 9,
+       "y": 21
+      },
+      "clipped": null,
+      "id": "band-13",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 5286.333333333333,
+      "possibly_clipped": false,
+      "source": "click"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 27,
+       "y": 21
+      },
+      "clipped": null,
+      "id": "band-14",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 5563.333333333333,
+      "possibly_clipped": false,
+      "source": "click"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 45,
+       "y": 21
+      },
+      "clipped": null,
+      "id": "band-15",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 4960.333333333334,
+      "possibly_clipped": false,
+      "source": "click"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 193.66666666666666,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 63,
+       "y": 21
+      },
+      "clipped": null,
+      "id": "band-16",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 5867.0,
+      "possibly_clipped": false,
+      "source": "click"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 193.66666666666666,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 81,
+       "y": 21
+      },
+      "clipped": null,
+      "id": "band-17",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 5362.333333333332,
+      "possibly_clipped": false,
+      "source": "click"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 99,
+       "y": 21
+      },
+      "clipped": null,
+      "id": "band-18",
+      "lane_index": 5,
+      "manually_edited": false,
+      "net": 5177.666666666667,
+      "possibly_clipped": false,
+      "source": "click"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-12",
+    "image_id": "img-3",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "role": "loading control",
+    "undetected": []
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": null,
+      "background_level": 194.33333333333334,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 9,
+       "y": 45
+      },
+      "clipped": null,
+      "id": "band-20",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 3798.666666666668,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.33333333333334,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 27,
+       "y": 45
+      },
+      "clipped": null,
+      "id": "band-21",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 4482.333333333336,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 45,
+       "y": 45
+      },
+      "clipped": null,
+      "id": "band-22",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 4093.0,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 63,
+       "y": 27
+      },
+      "clipped": null,
+      "id": "band-23",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 3744.333333333334,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.33333333333334,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 81,
+       "y": 45
+      },
+      "clipped": null,
+      "id": "band-24",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 4766.333333333336,
+      "possibly_clipped": false,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 194.66666666666666,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 99,
+       "y": 45
+      },
+      "clipped": null,
+      "id": "band-25",
+      "lane_index": 5,
+      "manually_edited": false,
+      "net": 4625.999999999998,
+      "possibly_clipped": false,
+      "source": "manual"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-19",
+    "image_id": "img-3",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "p53 µ",
+    "role": "target",
+    "undetected": []
+   }
+  ],
+  "reference_condition": "vehicle"
+ },
+ "built_at": "05b4af5b08e51b450436e9446651f5650bff48e4",
+ "case": "f2",
+ "content_hash": "5b5bf8ab0587aa4b104ba27c8fb0a3cdb4b1cbcb1a1054392c589ab5867523c6",
+ "log": [
+  {
+   "action": "new_project",
+   "content_hash": "f6ab14dda115562f0f767894caa17ffd8ab5558fa2ba16be7d9650b4727fdb36",
+   "params": {},
+   "seq": 1,
+   "time": "2026-10-31T09:00:00.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "import_image",
+   "content_hash": "4b22bfd51031afdf83e0d0b8e04fcdcc44fd7daafa36f949bac45ce12593c0ba",
+   "params": {
+    "image_id": "img-1",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-2",
+    "new_membrane": true,
+    "original_name": "J lossy β.jpg",
+    "polarity": "dark_on_light",
+    "sha256": "24c5c023ddf28b69a9ab75df3ac932d48b9d4dfd14e3f080a8a010872f5ece7a"
+   },
+   "seq": 2,
+   "time": "2026-10-31T09:00:01.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "import_image",
+   "content_hash": "56b88848a791e8ff0417a6f589598208731ecb98e4f71e2cb85984c6245e18f6",
+   "params": {
+    "image_id": "img-3",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-4",
+    "new_membrane": true,
+    "original_name": "C colour α.png",
+    "polarity": "dark_on_light",
+    "sha256": "5eb4924e01e6bdcb025023d25f8c0b45af304d3cc16daeb36eff9a67954e24da"
+   },
+   "seq": 3,
+   "time": "2026-10-31T09:00:02.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_lanes",
+   "content_hash": "87c7a140017434bc0a481584cfdda29f62adc5f4a481f96cb33cdc1c933efcf0",
+   "params": {
+    "changed": [
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 0,
+      "sample": "V1"
+     },
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 1,
+      "sample": "V2"
+     },
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 2,
+      "sample": "V3"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 3,
+      "sample": "A1"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 4,
+      "sample": "A2"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 5,
+      "sample": "A3"
+     }
+    ],
+    "dropped_undetected": [],
+    "lane_count": 6,
+    "reference_condition": "vehicle"
+   },
+   "seq": 4,
+   "time": "2026-10-31T09:00:03.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "f466217ba12bb21ce4e8e0d9bdbdce07c28b17311dd36c1a12ba5ed6cde3cf73",
+   "params": {
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_mw": null,
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "pinned_targets": [],
+    "protein_id": "prot-5",
+    "role": "target"
+   },
+   "seq": 5,
+   "time": "2026-10-31T09:00:04.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "3b8ebc72e0f9bd7ac9bc71b30e3d66b8dacb4e331830b1437c3400f40929e13f",
+   "params": {
+    "band_id": "band-6",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 0,
+    "lane_proposed": false,
+    "protein_id": "prot-5",
+    "rect": [9, 25, 21, 35],
+    "replaced_undetected": null,
+    "x": 15,
+    "y": 30
+   },
+   "seq": 6,
+   "time": "2026-10-31T09:00:05.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "768aa47e7371e8115627540f67ed965a32caf8defeef648ff6b22998d7ff5664",
+   "params": {
+    "band_id": "band-7",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 1,
+    "lane_proposed": false,
+    "protein_id": "prot-5",
+    "rect": [27, 25, 39, 35],
+    "replaced_undetected": null,
+    "x": 33,
+    "y": 30
+   },
+   "seq": 7,
+   "time": "2026-10-31T09:00:06.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "f8e68b9609ee4725f4e598fea0b2c368fd285e705884207e883eece9a43ce8bc",
+   "params": {
+    "band_id": "band-8",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 2,
+    "lane_proposed": false,
+    "protein_id": "prot-5",
+    "rect": [45, 25, 57, 35],
+    "replaced_undetected": null,
+    "x": 51,
+    "y": 30
+   },
+   "seq": 8,
+   "time": "2026-10-31T09:00:07.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "eb0c1ac34ad550edfb7e68b29db87fa0000c0cd600c3db0b8f8547964e259973",
+   "params": {
+    "band_id": "band-9",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 3,
+    "lane_proposed": false,
+    "protein_id": "prot-5",
+    "rect": [63, 25, 75, 35],
+    "replaced_undetected": null,
+    "x": 69,
+    "y": 30
+   },
+   "seq": 9,
+   "time": "2026-10-31T09:00:08.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "fc4cd4952e3e86300e9b50faed35a9ba9048ee0f111d1c472a3aac62f691966e",
+   "params": {
+    "band_id": "band-10",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 4,
+    "lane_proposed": false,
+    "protein_id": "prot-5",
+    "rect": [81, 25, 93, 35],
+    "replaced_undetected": null,
+    "x": 87,
+    "y": 30
+   },
+   "seq": 10,
+   "time": "2026-10-31T09:00:09.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "eddb4ad6bff17f7aece9920c8fee8d2306f13d194aa458d7cf04f99b54230298",
+   "params": {
+    "band_id": "band-11",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 5,
+    "lane_proposed": false,
+    "protein_id": "prot-5",
+    "rect": [99, 25, 111, 35],
+    "replaced_undetected": null,
+    "x": 105,
+    "y": 30
+   },
+   "seq": 11,
+   "time": "2026-10-31T09:00:10.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "fe95b311bd59644b1c52cf83b3ddaeb0269491a45c5f721e74d538093f7f6e98",
+   "params": {
+    "box_size": {
+     "height": 6,
+     "width": 15
+    },
+    "expected_mw": null,
+    "image_id": "img-3",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "pinned_targets": [],
+    "protein_id": "prot-12",
+    "role": "loading control"
+   },
+   "seq": 12,
+   "time": "2026-10-31T09:00:11.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "4b29cbb314e1adc553e6c737bcb83c48c6cb0915436bea10ed7023daaa47aae6",
+   "params": {
+    "band_id": "band-13",
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "grow": true,
+    "lane_index": 0,
+    "lane_proposed": false,
+    "protein_id": "prot-12",
+    "rect": [9, 21, 21, 29],
+    "replaced_undetected": null,
+    "x": 15,
+    "y": 25
+   },
+   "seq": 13,
+   "time": "2026-10-31T09:00:12.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "537244d080fc00b218f2ac974e8af06d6dcc67670b60117287dad42f8ce8e0c4",
+   "params": {
+    "band_id": "band-14",
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "grow": true,
+    "lane_index": 1,
+    "lane_proposed": false,
+    "protein_id": "prot-12",
+    "rect": [27, 21, 39, 29],
+    "replaced_undetected": null,
+    "x": 33,
+    "y": 25
+   },
+   "seq": 14,
+   "time": "2026-10-31T09:00:13.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "ed891d3d4de88354174e92ccb3ef3099180291fba9601d56e934a821644ad387",
+   "params": {
+    "band_id": "band-15",
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "grow": true,
+    "lane_index": 2,
+    "lane_proposed": false,
+    "protein_id": "prot-12",
+    "rect": [45, 21, 57, 29],
+    "replaced_undetected": null,
+    "x": 51,
+    "y": 25
+   },
+   "seq": 15,
+   "time": "2026-10-31T09:00:14.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "1f24693044c865cd2eac57335fe5f434073166538d1dd0c90444ad9bd5667a5a",
+   "params": {
+    "band_id": "band-16",
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "grow": true,
+    "lane_index": 3,
+    "lane_proposed": false,
+    "protein_id": "prot-12",
+    "rect": [63, 21, 75, 29],
+    "replaced_undetected": null,
+    "x": 69,
+    "y": 25
+   },
+   "seq": 16,
+   "time": "2026-10-31T09:00:15.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "103475c33c75fa5cc165ad178c31bf73e925a6a86b7a52f90c6f1fbead482642",
+   "params": {
+    "band_id": "band-17",
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "grow": true,
+    "lane_index": 4,
+    "lane_proposed": false,
+    "protein_id": "prot-12",
+    "rect": [81, 21, 93, 29],
+    "replaced_undetected": null,
+    "x": 87,
+    "y": 25
+   },
+   "seq": 17,
+   "time": "2026-10-31T09:00:16.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "f4c9f1a0fd9a0205fcb6434d15525aba5c6bc3caa15458aa1bd8bdcc594f349c",
+   "params": {
+    "band_id": "band-18",
+    "box_size": {
+     "height": 8,
+     "width": 12
+    },
+    "grow": true,
+    "lane_index": 5,
+    "lane_proposed": false,
+    "protein_id": "prot-12",
+    "rect": [99, 21, 111, 29],
+    "replaced_undetected": null,
+    "x": 105,
+    "y": 25
+   },
+   "seq": 18,
+   "time": "2026-10-31T09:00:17.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "6e5883fa4452be8d83285cc0577b710d1025422bd482c7a481e550e5cb4d3c59",
+   "params": {
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_mw": null,
+    "image_id": "img-3",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "p53 µ",
+    "pinned_targets": [],
+    "protein_id": "prot-19",
+    "role": "target"
+   },
+   "seq": 19,
+   "time": "2026-10-31T09:00:18.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "7fc0ef13b550f6654fdb2e98def212b420f62b6b3fc0e33cc04d1d664965067a",
+   "params": {
+    "band_id": "band-20",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 0,
+    "lane_proposed": false,
+    "protein_id": "prot-19",
+    "rect": [9, 45, 21, 55],
+    "replaced_undetected": null,
+    "x": 15,
+    "y": 50
+   },
+   "seq": 20,
+   "time": "2026-10-31T09:00:19.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "3977edfbaf612637f7433b65b7e14e8eff168ad55b429d7c0afdbdb0adf5d625",
+   "params": {
+    "band_id": "band-21",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 1,
+    "lane_proposed": false,
+    "protein_id": "prot-19",
+    "rect": [27, 45, 39, 55],
+    "replaced_undetected": null,
+    "x": 33,
+    "y": 50
+   },
+   "seq": 21,
+   "time": "2026-10-31T09:00:20.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "2764e1d585a939ef79aaf2edd7f584637c6c151493bb19402c848a34e1d5ed31",
+   "params": {
+    "band_id": "band-22",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 2,
+    "lane_proposed": false,
+    "protein_id": "prot-19",
+    "rect": [45, 45, 57, 55],
+    "replaced_undetected": null,
+    "x": 51,
+    "y": 50
+   },
+   "seq": 22,
+   "time": "2026-10-31T09:00:21.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "5d057a26d3eb40ba937f7a231f865b55525185465ba7941e785e013f7cb48ccc",
+   "params": {
+    "band_id": "band-23",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 3,
+    "lane_proposed": false,
+    "protein_id": "prot-19",
+    "rect": [63, 27, 75, 37],
+    "replaced_undetected": null,
+    "x": 69,
+    "y": 32
+   },
+   "seq": 23,
+   "time": "2026-10-31T09:00:22.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "ac7c0192c46661fc965729cb182a8a28fb79ca17b28497c63e768c9aad7d52ef",
+   "params": {
+    "band_id": "band-24",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 4,
+    "lane_proposed": false,
+    "protein_id": "prot-19",
+    "rect": [81, 45, 93, 55],
+    "replaced_undetected": null,
+    "x": 87,
+    "y": 50
+   },
+   "seq": 24,
+   "time": "2026-10-31T09:00:23.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "5b5bf8ab0587aa4b104ba27c8fb0a3cdb4b1cbcb1a1054392c589ab5867523c6",
+   "params": {
+    "band_id": "band-25",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 5,
+    "lane_proposed": false,
+    "protein_id": "prot-19",
+    "rect": [99, 45, 111, 55],
+    "replaced_undetected": null,
+    "x": 105,
+    "y": 50
+   },
+   "seq": 25,
+   "time": "2026-10-31T09:00:24.000Z",
+   "version": "0.1.0.dev0"
+  }
+ ],
+ "next_id": 26,
+ "project_sha256": "585a9fcbda9a1c1b799df0a1dbb66342f042d660d2a792690d325b8b6448cd8e",
+ "version": "0.1.0.dev0"
+}

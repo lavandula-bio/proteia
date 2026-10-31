@@ -1,0 +1,1260 @@
+{
+ "calibration": [
+  {
+   "groups": [
+    {
+     "fit": {
+      "disagreement": 0.0,
+      "disagreement_infinite": false,
+      "disagreement_mw": 130.0,
+      "ignored": [],
+      "image_ids": ["img-1", "img-4"],
+      "ladders": [
+       {
+        "points": 3,
+        "predicted_mw": 70.00283602100326,
+        "quality": 4.051294439555431e-05,
+        "quality_infinite": false,
+        "range": [27.80148821534985, 163.66030353324183],
+        "side": "left",
+        "two_point": false,
+        "worst_mw": 70.0,
+        "x": 8.0
+       },
+       {
+        "points": 3,
+        "predicted_mw": 70.00283602100326,
+        "quality": 4.051294439555431e-05,
+        "quality_infinite": false,
+        "range": [27.80148821534985, 163.66030353324183],
+        "side": "right",
+        "two_point": false,
+        "worst_mw": 70.0,
+        "x": 152.0
+       }
+      ],
+      "method": "log_linear_piecewise",
+      "offset_px": 3.0,
+      "range": [27.80148821534985, 163.66030353324183],
+      "tilt_deg": 1.193489423982035
+     },
+     "image_ids": ["img-1", "img-4"]
+    },
+    {
+     "fit": {
+      "disagreement": null,
+      "disagreement_infinite": false,
+      "disagreement_mw": null,
+      "ignored": [],
+      "image_ids": ["img-3"],
+      "ladders": [
+       {
+        "points": 2,
+        "predicted_mw": null,
+        "quality": null,
+        "quality_infinite": false,
+        "range": [19.85820586810704, 125.89254117941675],
+        "side": "left",
+        "two_point": true,
+        "worst_mw": null,
+        "x": 8.0
+       }
+      ],
+      "method": "log_linear_piecewise",
+      "offset_px": null,
+      "range": [19.85820586810704, 125.89254117941675],
+      "tilt_deg": null
+     },
+     "image_ids": ["img-3"]
+    }
+   ],
+   "membrane_id": "mem-2"
+  },
+  {
+   "groups": [
+    {
+     "fit": {
+      "disagreement": null,
+      "disagreement_infinite": false,
+      "disagreement_mw": null,
+      "ignored": [],
+      "image_ids": ["img-5"],
+      "ladders": [
+       {
+        "points": 2,
+        "predicted_mw": null,
+        "quality": null,
+        "quality_infinite": false,
+        "range": [35.0, 70.00000000000001],
+        "side": "left",
+        "two_point": true,
+        "worst_mw": null,
+        "x": 70.0
+       }
+      ],
+      "method": "log_linear_piecewise",
+      "offset_px": null,
+      "range": [35.0, 70.00000000000001],
+      "tilt_deg": null
+     },
+     "image_ids": ["img-5"]
+    }
+   ],
+   "membrane_id": "mem-6"
+  }
+ ],
+ "fresh_changes": [],
+ "history_issues": [],
+ "lane_tables": [
+  {
+   "csv": "lane,condition,sample,include,β-catenin,β-catenin clipped,α-tubulin,α-tubulin clipped,GAPDH,GAPDH clipped,p53 µ,p53 µ clipped,β-catenin ÷ α-tubulin normalized,β-catenin ÷ α-tubulin fold change vs vehicle,p53 µ ÷ GAPDH normalized,p53 µ ÷ GAPDH fold change vs vehicle\r\n1,vehicle,V1,yes,1204193.0,no,1127981.0,no,1760074.0,no,772083.0,no,1.067565,1.037574,0.438665,0.910127\r\n2,vehicle,V1,yes,1373704.5,no,1204605.0,no,1679846.0,no,946075.0,no,1.140378,1.108341,0.563192,1.168491\r\n3,vehicle,V2,yes,1040546.75,no,1090905.0,no,1865756.0,no,863912.0,no,0.953838,0.927042,0.463036,0.960691\r\n4,10 µM,A1,yes,1551905.0,no,1167774.0,no,5092459.0,yes,1034086.0,no,1.328943,1.291609,0.203062,0.421307\r\n5,10 µM,A2,yes,1716843.0,no,1242262.0,no,1781453.0,no,1108104.0,no,1.38203,1.343205,0.622023,1.290551\r\n6,10 µM,A3,no,1292218.0,no,1054992.0,no,1606209.0,no,,,1.22486,1.190451,,\r\n7,50 µM,B1,yes,,,1187163.2,no,,,818364.0,no,,,,\r\n8,50 µM,B2,yes,1441392.0,no,1145040.0,no,1784837.0,no,896478.0,no,1.258814,1.22345,0.502274,1.042102\r\n",
+   "label": "Excluding lane 6",
+   "near_midpoint": []
+  },
+  {
+   "csv": "lane,condition,sample,include,β-catenin,β-catenin clipped,α-tubulin,α-tubulin clipped,GAPDH,GAPDH clipped,p53 µ,p53 µ clipped,β-catenin ÷ α-tubulin normalized,β-catenin ÷ α-tubulin fold change vs vehicle,p53 µ ÷ GAPDH normalized,p53 µ ÷ GAPDH fold change vs vehicle\r\n1,vehicle,V1,yes,1204193.0,no,1127981.0,no,1760074.0,no,772083.0,no,1.067565,1.037574,0.438665,0.910127\r\n2,vehicle,V1,yes,1373704.5,no,1204605.0,no,1679846.0,no,946075.0,no,1.140378,1.108341,0.563192,1.168491\r\n3,vehicle,V2,yes,1040546.75,no,1090905.0,no,1865756.0,no,863912.0,no,0.953838,0.927042,0.463036,0.960691\r\n4,10 µM,A1,yes,1551905.0,no,1167774.0,no,5092459.0,yes,1034086.0,no,1.328943,1.291609,0.203062,0.421307\r\n5,10 µM,A2,yes,1716843.0,no,1242262.0,no,1781453.0,no,1108104.0,no,1.38203,1.343205,0.622023,1.290551\r\n6,10 µM,A3,yes,1292218.0,no,1054992.0,no,1606209.0,no,,,1.22486,1.190451,,\r\n7,50 µM,B1,yes,,,1187163.2,no,,,818364.0,no,,,,\r\n8,50 µM,B2,yes,1441392.0,no,1145040.0,no,1784837.0,no,896478.0,no,1.258814,1.22345,0.502274,1.042102\r\n",
+   "label": "All lanes",
+   "near_midpoint": []
+  }
+ ],
+ "plotted": [
+  {
+   "charts": [
+    {
+     "bars": [
+      {
+       "error": 0.036483484211599436,
+       "geometric_mean": 1.317154482064239,
+       "geometric_sd_factor": 1.0280840686901527,
+       "label": "10 µM",
+       "lane_indices": [3, 4],
+       "mean": 1.3174070942317044,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.29160937514437, 1.3432048133190386]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {},
+     "statement": ["Bars: mean ± SD; points: replicates", "No test: a test needs two conditions or more"],
+     "subtitle": "Excluding lane 6",
+     "test": null,
+     "test_name": null,
+     "test_note": "no test: a test needs two conditions or more",
+     "test_p": null,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    },
+    {
+     "bars": [
+      {
+       "error": 0.6146488071919944,
+       "geometric_mean": 0.7373721511177962,
+       "geometric_sd_factor": 2.206881831494321,
+       "label": "10 µM",
+       "lane_indices": [3, 4],
+       "mean": 0.8559288915180728,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [0.42130655190439076, 1.2905512311317549]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {},
+     "statement": ["Bars: mean ± SD; points: replicates", "No test: a test needs two conditions or more"],
+     "subtitle": "Excluding lane 6",
+     "test": null,
+     "test_name": null,
+     "test_note": "no test: a test needs two conditions or more",
+     "test_p": null,
+     "title": "p53 µ fold-change vs vehicle  (/GAPDH)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    }
+   ],
+   "label": "Excluding lane 6",
+   "notices": [
+    {
+     "code": "clipped",
+     "conditions": [],
+     "image_ids": [],
+     "lane_indices": [3],
+     "level": "warning",
+     "message": "'GAPDH' is over-exposed in lane 4: pixels at the detector limit make its net an under-estimate, and a saturated band next to it may have merged into the same box, which then holds both bands and its net may be too high; shorten the exposure and image the membrane again; the lane stays included",
+     "protein_ids": ["prot-24"]
+    },
+    {
+     "code": "below_detection",
+     "conditions": ["50 µM"],
+     "image_ids": [],
+     "lane_indices": [6],
+     "level": "warning",
+     "message": "'β-catenin' was not detected in lane 7 (below the detection limit): that lane has no value and is left out of the statistics",
+     "protein_ids": ["prot-7"]
+    },
+    {
+     "code": "calibration_two_points",
+     "conditions": [],
+     "image_ids": ["img-3"],
+     "lane_indices": [],
+     "level": "info",
+     "message": "the calibration of img-3 rests on two points (ladder bands at 100 and 25 kDa): apparent MWs are less reliable",
+     "protein_ids": ["prot-32"]
+    },
+    {
+     "code": "calibration_two_points",
+     "conditions": [],
+     "image_ids": ["img-5"],
+     "lane_indices": [],
+     "level": "info",
+     "message": "the calibration of img-5 rests on two points (strip edges at 70 and 35 kDa): apparent MWs are less reliable",
+     "protein_ids": ["prot-15"]
+    },
+    {
+     "code": "reference_not_plotted",
+     "conditions": ["vehicle"],
+     "image_ids": [],
+     "lane_indices": [],
+     "level": "info",
+     "message": "the reference condition 'vehicle' is not plotted; fold-changes are still relative to it",
+     "protein_ids": []
+    },
+    {
+     "code": "technical_repeats",
+     "conditions": ["vehicle"],
+     "image_ids": [],
+     "lane_indices": [],
+     "level": "info",
+     "message": "averaged 1 sample(s) with technical repeats (repeats do not count as n)",
+     "protein_ids": []
+    }
+   ],
+   "plot_conditions": ["10 µM"]
+  },
+  {
+   "charts": [
+    {
+     "bars": [
+      {
+       "error": 0.07770553185539004,
+       "geometric_mean": 1.2734883274027056,
+       "geometric_sd_factor": 1.0635271267854698,
+       "label": "10 µM",
+       "lane_indices": [3, 4, 5],
+       "mean": 1.2750883538171631,
+       "n": 3,
+       "not_detected_lanes": [],
+       "points": [1.29160937514437, 1.3432048133190386, 1.19045087298808]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 3,
+       "not_detected": 0,
+       "replicates": 3,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {},
+     "statement": ["Bars: mean ± SD; points: replicates", "No test: a test needs two conditions or more"],
+     "subtitle": "All lanes",
+     "test": null,
+     "test_name": null,
+     "test_note": "no test: a test needs two conditions or more",
+     "test_p": null,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    },
+    {
+     "bars": [
+      {
+       "error": null,
+       "geometric_mean": null,
+       "geometric_sd_factor": null,
+       "label": "10 µM",
+       "lane_indices": [3, 4],
+       "mean": null,
+       "n": 2,
+       "not_detected_lanes": [5],
+       "points": [0.42130655190439076, 1.2905512311317549]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "10 µM",
+       "left_out": "not_detected",
+       "n": 2,
+       "not_detected": 1,
+       "replicates": 3,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {},
+     "statement": ["Bars: mean ± SD; points: replicates; open circles: not detected", "No test: fewer than 2 conditions to test; not tested: '10 µM' (1 of 3 not detected)"],
+     "subtitle": "All lanes",
+     "test": null,
+     "test_name": null,
+     "test_note": "no test: fewer than 2 conditions to test; not tested: '10 µM' (1 of 3 not detected)",
+     "test_p": null,
+     "title": "p53 µ fold-change vs vehicle  (/GAPDH)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    }
+   ],
+   "label": "All lanes",
+   "notices": [
+    {
+     "code": "below_detection",
+     "conditions": ["10 µM"],
+     "image_ids": [],
+     "lane_indices": [5],
+     "level": "warning",
+     "message": "'p53 µ' was not detected in lane 6 (below the detection limit): that lane has no value and is left out of the statistics",
+     "protein_ids": ["prot-32"]
+    }
+   ],
+   "plot_conditions": ["10 µM"]
+  }
+ ],
+ "results": {
+  "all_lanes": {
+   "all_lanes": null,
+   "error_type": "SD",
+   "excluded_lanes": [],
+   "label": "All lanes",
+   "lanes": [
+    {
+     "condition": "vehicle",
+     "included": true,
+     "index": 0,
+     "sample": "V1"
+    },
+    {
+     "condition": "vehicle",
+     "included": true,
+     "index": 1,
+     "sample": "V1"
+    },
+    {
+     "condition": "vehicle",
+     "included": true,
+     "index": 2,
+     "sample": "V2"
+    },
+    {
+     "condition": "10 µM",
+     "included": true,
+     "index": 3,
+     "sample": "A1"
+    },
+    {
+     "condition": "10 µM",
+     "included": true,
+     "index": 4,
+     "sample": "A2"
+    },
+    {
+     "condition": "10 µM",
+     "included": true,
+     "index": 5,
+     "sample": "A3"
+    },
+    {
+     "condition": "50 µM",
+     "included": true,
+     "index": 6,
+     "sample": "B1"
+    },
+    {
+     "condition": "50 µM",
+     "included": true,
+     "index": 7,
+     "sample": "B2"
+    }
+   ],
+   "method": "mean",
+   "notices": [
+    {
+     "code": "below_detection",
+     "conditions": ["10 µM"],
+     "image_ids": [],
+     "lane_indices": [5],
+     "level": "warning",
+     "message": "'p53 µ' was not detected in lane 6 (below the detection limit): that lane has no value and is left out of the statistics",
+     "protein_ids": ["prot-32"]
+    },
+    {
+     "code": "conditions_not_tested",
+     "conditions": ["50 µM"],
+     "image_ids": [],
+     "lane_indices": [],
+     "level": "warning",
+     "message": "'β-catenin' / 'α-tubulin': '50 µM' (1 of 2 not detected) is not in the test",
+     "protein_ids": ["prot-7", "prot-15"]
+    }
+   ],
+   "plot_conditions": null,
+   "proteins": [
+    {
+     "apparent_mw": [92.10279165856014, 92.8808283377197, 91.28326756866167, 92.10279165856014, 92.8808283377197, 91.28326756866167, null, 92.8808283377197],
+     "band_ids": ["band-8", "band-9", "band-10", "band-11", "band-12", "band-13", null, "band-14"],
+     "bands_found": [1, 1, 1, 1, 1, 1, null, 1],
+     "calibration": {
+      "disagreement": 0.0,
+      "disagreement_infinite": false,
+      "disagreement_mw": 130.0,
+      "tilt_deg": 1.193489423982035,
+      "two_ladders": true
+     },
+     "clipped": [false, false, false, false, false, false, null, false],
+     "count_check": ["passed", "passed", "passed", "passed", "passed", "passed", null, "passed"],
+     "detected": [true, true, true, true, true, true, false, true],
+     "expected_mws": [92.0],
+     "image_id": "img-1",
+     "mw_check": ["passed", "passed", "passed", "passed", "passed", "passed", null, "passed"],
+     "mw_not_run": null,
+     "mw_tolerance": 0.1,
+     "name": "β-catenin",
+     "nets": [1204192.9999999993, 1373704.5, 1040546.75, 1551905.0, 1716843.0, 1292218.0, null, 1441392.0],
+     "possibly_clipped": [null, null, null, null, null, null, null, null],
+     "protein_id": "prot-7",
+     "role": "target"
+    },
+    {
+     "apparent_mw": [49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336],
+     "band_ids": ["band-16", "band-17", "band-18", "band-19", "band-20", "band-21", "band-22", "band-23"],
+     "bands_found": [null, null, null, null, null, null, null, null],
+     "calibration": {
+      "disagreement": null,
+      "disagreement_infinite": false,
+      "disagreement_mw": null,
+      "tilt_deg": null,
+      "two_ladders": false
+     },
+     "clipped": [false, false, false, false, false, false, false, false],
+     "count_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run"],
+     "detected": [true, true, true, true, true, true, true, true],
+     "expected_mws": [],
+     "image_id": "img-5",
+     "mw_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run"],
+     "mw_not_run": "no_expected_mw",
+     "mw_tolerance": 0.1,
+     "name": "α-tubulin",
+     "nets": [1127981.0, 1204605.0, 1090905.0, 1167774.0, 1242262.0, 1054992.0, 1187163.2, 1145040.0],
+     "possibly_clipped": [null, null, null, null, null, null, null, null],
+     "protein_id": "prot-15",
+     "role": "loading control"
+    },
+    {
+     "apparent_mw": [36.197566755935654, 35.59374715392786, 35.89438728684749, 36.197566755935654, 35.59374715392786, 35.89438728684749, null, 35.59374715392786],
+     "band_ids": ["band-25", "band-26", "band-27", "band-28", "band-29", "band-30", null, "band-31"],
+     "bands_found": [null, null, null, null, null, null, null, null],
+     "calibration": {
+      "disagreement": 0.0,
+      "disagreement_infinite": false,
+      "disagreement_mw": 130.0,
+      "tilt_deg": 1.193489423982035,
+      "two_ladders": true
+     },
+     "clipped": [false, false, false, true, false, false, null, false],
+     "count_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", null, "not_run"],
+     "detected": [true, true, true, true, true, true, null, true],
+     "expected_mws": [],
+     "image_id": "img-1",
+     "mw_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", null, "not_run"],
+     "mw_not_run": "no_expected_mw",
+     "mw_tolerance": 0.1,
+     "name": "GAPDH",
+     "nets": [1760074.0, 1679846.0, 1865756.0, 5092459.0, 1781453.0, 1606209.0, null, 1784837.0],
+     "possibly_clipped": [null, null, null, null, null, null, null, null],
+     "protein_id": "prot-24",
+     "role": "loading control"
+    },
+    {
+     "apparent_mw": [52.850902028069015, 52.850902028069015, 52.850902028069015, 52.850902028069015, 52.850902028069015, null, 52.850902028069015, 52.850902028069015],
+     "band_ids": ["band-33", "band-34", "band-35", "band-36", "band-37", null, "band-38", "band-39"],
+     "bands_found": [1, 1, 1, 1, 1, null, 1, 1],
+     "calibration": {
+      "disagreement": null,
+      "disagreement_infinite": false,
+      "disagreement_mw": null,
+      "tilt_deg": null,
+      "two_ladders": false
+     },
+     "clipped": [false, false, false, false, false, null, false, false],
+     "count_check": ["passed", "passed", "passed", "passed", "passed", null, "passed", "passed"],
+     "detected": [true, true, true, true, true, false, true, true],
+     "expected_mws": [53.0],
+     "image_id": "img-3",
+     "mw_check": ["passed", "passed", "passed", "passed", "passed", null, "passed", "passed"],
+     "mw_not_run": null,
+     "mw_tolerance": 0.1,
+     "name": "p53 µ",
+     "nets": [772083.0000000002, 946075.0, 863912.0, 1034086.0, 1108104.0, null, 818364.0, 896478.0],
+     "possibly_clipped": [null, null, null, null, null, null, null, null],
+     "protein_id": "prot-32",
+     "role": "target"
+    }
+   ],
+   "reference_condition": "vehicle",
+   "series": [
+    {
+     "averaged": [
+      ["vehicle", "V1"]
+     ],
+     "baseline": 1.0289046786123766,
+     "chart": {
+      "bars": [
+       {
+        "error": 0.10317785405872594,
+        "geometric_mean": 0.9973350315796182,
+        "geometric_sd_factor": 1.1088922091134135,
+        "label": "vehicle",
+        "lane_indices": [0, 2],
+        "mean": 1.0,
+        "n": 2,
+        "not_detected_lanes": [],
+        "points": [1.072957760273201, 0.9270422397267989]
+       },
+       {
+        "error": 0.07770553185539004,
+        "geometric_mean": 1.2734883274027056,
+        "geometric_sd_factor": 1.0635271267854698,
+        "label": "10 µM",
+        "lane_indices": [3, 4, 5],
+        "mean": 1.2750883538171631,
+        "n": 3,
+        "not_detected_lanes": [],
+        "points": [1.29160937514437, 1.3432048133190386, 1.19045087298808]
+       },
+       {
+        "error": null,
+        "geometric_mean": null,
+        "geometric_sd_factor": null,
+        "label": "50 µM",
+        "lane_indices": [7],
+        "mean": null,
+        "n": 1,
+        "not_detected_lanes": [6],
+        "points": [1.2234502301960788]
+       }
+      ],
+      "comparisons": [],
+      "coverage": [
+       {
+        "label": "vehicle",
+        "left_out": null,
+        "n": 2,
+        "not_detected": 0,
+        "replicates": 2,
+        "tested": true
+       },
+       {
+        "label": "10 µM",
+        "left_out": null,
+        "n": 3,
+        "not_detected": 0,
+        "replicates": 3,
+        "tested": true
+       },
+       {
+        "label": "50 µM",
+        "left_out": "not_detected",
+        "n": 1,
+        "not_detected": 1,
+        "replicates": 2,
+        "tested": false
+       }
+      ],
+      "error_type": "SD",
+      "rank_min_p": {
+       "all_pairs": 0.2,
+       "vs_reference": 0.2
+      },
+      "statement": ["Bars: mean ± SD; points: replicates; open circles: not detected", "Welch's t-test on log values: p = 0.134", "Not tested: '50 µM' (1 of 2 not detected)"],
+      "subtitle": "All lanes",
+      "test": {
+       "adjustment": "none",
+       "chosen": {
+        "comparisons": "auto",
+        "family": "auto",
+        "scale": "auto"
+       },
+       "comparisons": "all_pairs",
+       "covered": ["vehicle", "10 µM"],
+       "design": "independent",
+       "family": "welch",
+       "id": "welch_t",
+       "method": null,
+       "min_attainable_p": null,
+       "name": "Welch's t-test",
+       "notes": [],
+       "omnibus": null,
+       "p_value": 0.13434575827523218,
+       "pairwise": [
+        {
+         "estimate": 1.2768912021326526,
+         "group_a": "vehicle",
+         "group_b": "10 µM",
+         "p_value": 0.13434575827523218
+        }
+       ],
+       "reasons": ["ratios: log scale", "unequal n: Welch", "2 conditions: all pairs"],
+       "reference": null,
+       "scale": "log",
+       "statistic": -3.0072752202915685
+      },
+      "test_name": "welch_t",
+      "test_note": "'50 µM' (1 of 2 not detected) is not in the test",
+      "test_p": 0.13434575827523218,
+      "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+      "value_kind": "fold_change",
+      "x_label": "Condition",
+      "y_label": "Fold change vs control"
+     },
+     "fold_change": [1.037574218526635, 1.1083413020197672, 0.9270422397267989, 1.29160937514437, 1.3432048133190386, 1.19045087298808, null, 1.2234502301960788],
+     "groups": {
+      "10 µM": [1.29160937514437, 1.3432048133190386, 1.19045087298808],
+      "50 µM": [1.2234502301960788],
+      "vehicle": [1.072957760273201, 0.9270422397267989]
+     },
+     "loading": "α-tubulin",
+     "loading_id": "prot-15",
+     "normalized": [1.067564967849635, 1.1403775511474716, 0.9538380977261998, 1.3289429290256505, 1.3820297167586226, 1.2248604728756236, null, 1.2588136658981346],
+     "target": "β-catenin",
+     "target_id": "prot-7",
+     "undetected": {
+      "50 µM": [6]
+     },
+     "value_kind": "fold_change"
+    },
+    {
+     "averaged": [
+      ["vehicle", "V1"]
+     ],
+     "baseline": 0.4819820941082643,
+     "chart": {
+      "bars": [
+       {
+        "error": 0.055591217059878274,
+        "geometric_mean": 0.9992271054634679,
+        "geometric_sd_factor": 1.057195742575921,
+        "label": "vehicle",
+        "lane_indices": [0, 2],
+        "mean": 0.9999999999999999,
+        "n": 2,
+        "not_detected_lanes": [],
+        "points": [1.039308926557453, 0.9606910734425467]
+       },
+       {
+        "error": null,
+        "geometric_mean": null,
+        "geometric_sd_factor": null,
+        "label": "10 µM",
+        "lane_indices": [3, 4],
+        "mean": null,
+        "n": 2,
+        "not_detected_lanes": [5],
+        "points": [0.42130655190439076, 1.2905512311317549]
+       },
+       {
+        "error": 0.0,
+        "geometric_mean": 1.042101861304367,
+        "geometric_sd_factor": null,
+        "label": "50 µM",
+        "lane_indices": [7],
+        "mean": 1.042101861304367,
+        "n": 1,
+        "not_detected_lanes": [],
+        "points": [1.042101861304367]
+       }
+      ],
+      "comparisons": [],
+      "coverage": [
+       {
+        "label": "vehicle",
+        "left_out": null,
+        "n": 2,
+        "not_detected": 0,
+        "replicates": 2,
+        "tested": false
+       },
+       {
+        "label": "10 µM",
+        "left_out": "not_detected",
+        "n": 2,
+        "not_detected": 1,
+        "replicates": 3,
+        "tested": false
+       },
+       {
+        "label": "50 µM",
+        "left_out": "fewer_than_2",
+        "n": 1,
+        "not_detected": 0,
+        "replicates": 2,
+        "tested": false
+       }
+      ],
+      "error_type": "SD",
+      "rank_min_p": {},
+      "statement": ["Bars: mean ± SD; points: replicates; open circles: not detected", "No test: fewer than 2 conditions to test; not tested: '10 µM' (1 of 3 not detected), '50 µM' (n = 1)"],
+      "subtitle": "All lanes",
+      "test": null,
+      "test_name": null,
+      "test_note": "no test: fewer than 2 conditions to test; not tested: '10 µM' (1 of 3 not detected), '50 µM' (n = 1)",
+      "test_p": null,
+      "title": "p53 µ fold-change vs vehicle  (/GAPDH)",
+      "value_kind": "fold_change",
+      "x_label": "Condition",
+      "y_label": "Fold change vs control"
+     },
+     "fold_change": [0.910127335054287, 1.1684905180606195, 0.9606910734425467, 0.42130655190439076, 1.2905512311317549, null, null, 1.042101861304367],
+     "groups": {
+      "10 µM": [0.42130655190439076, 1.2905512311317549],
+      "50 µM": [1.042101861304367],
+      "vehicle": [1.039308926557453, 0.9606910734425467]
+     },
+     "loading": "GAPDH",
+     "loading_id": "prot-24",
+     "normalized": [0.4386650788546392, 0.563191506840508, 0.463035895368955, 0.2030622141484104, 0.6220225849348818, null, null, 0.5022744373855988],
+     "target": "p53 µ",
+     "target_id": "prot-32",
+     "undetected": {
+      "10 µM": [5]
+     },
+     "value_kind": "fold_change"
+    }
+   ],
+   "statistics": {
+    "comparisons": "auto",
+    "family": "auto",
+    "scale": "auto"
+   },
+   "tier": "fold_change"
+  },
+  "error_type": "SD",
+  "excluded_lanes": [5],
+  "label": "Excluding lane 6",
+  "lanes": [
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 0,
+    "sample": "V1"
+   },
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 1,
+    "sample": "V1"
+   },
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 2,
+    "sample": "V2"
+   },
+   {
+    "condition": "10 µM",
+    "included": true,
+    "index": 3,
+    "sample": "A1"
+   },
+   {
+    "condition": "10 µM",
+    "included": true,
+    "index": 4,
+    "sample": "A2"
+   },
+   {
+    "condition": "10 µM",
+    "included": false,
+    "index": 5,
+    "sample": "A3"
+   },
+   {
+    "condition": "50 µM",
+    "included": true,
+    "index": 6,
+    "sample": "B1"
+   },
+   {
+    "condition": "50 µM",
+    "included": true,
+    "index": 7,
+    "sample": "B2"
+   }
+  ],
+  "method": "mean",
+  "notices": [
+   {
+    "code": "clipped",
+    "conditions": [],
+    "image_ids": [],
+    "lane_indices": [3],
+    "level": "warning",
+    "message": "'GAPDH' is over-exposed in lane 4: pixels at the detector limit make its net an under-estimate, and a saturated band next to it may have merged into the same box, which then holds both bands and its net may be too high; shorten the exposure and image the membrane again; the lane stays included",
+    "protein_ids": ["prot-24"]
+   },
+   {
+    "code": "below_detection",
+    "conditions": ["50 µM"],
+    "image_ids": [],
+    "lane_indices": [6],
+    "level": "warning",
+    "message": "'β-catenin' was not detected in lane 7 (below the detection limit): that lane has no value and is left out of the statistics",
+    "protein_ids": ["prot-7"]
+   },
+   {
+    "code": "calibration_two_points",
+    "conditions": [],
+    "image_ids": ["img-3"],
+    "lane_indices": [],
+    "level": "info",
+    "message": "the calibration of img-3 rests on two points (ladder bands at 100 and 25 kDa): apparent MWs are less reliable",
+    "protein_ids": ["prot-32"]
+   },
+   {
+    "code": "calibration_two_points",
+    "conditions": [],
+    "image_ids": ["img-5"],
+    "lane_indices": [],
+    "level": "info",
+    "message": "the calibration of img-5 rests on two points (strip edges at 70 and 35 kDa): apparent MWs are less reliable",
+    "protein_ids": ["prot-15"]
+   },
+   {
+    "code": "conditions_not_tested",
+    "conditions": ["50 µM"],
+    "image_ids": [],
+    "lane_indices": [],
+    "level": "warning",
+    "message": "'β-catenin' / 'α-tubulin': '50 µM' (1 of 2 not detected) is not in the test",
+    "protein_ids": ["prot-7", "prot-15"]
+   },
+   {
+    "code": "conditions_not_tested",
+    "conditions": ["50 µM"],
+    "image_ids": [],
+    "lane_indices": [],
+    "level": "warning",
+    "message": "'p53 µ' / 'GAPDH': '50 µM' (n = 1) is not in the test",
+    "protein_ids": ["prot-32", "prot-24"]
+   },
+   {
+    "code": "technical_repeats",
+    "conditions": ["vehicle"],
+    "image_ids": [],
+    "lane_indices": [],
+    "level": "info",
+    "message": "averaged 1 sample(s) with technical repeats (repeats do not count as n)",
+    "protein_ids": []
+   }
+  ],
+  "plot_conditions": null,
+  "proteins": [
+   {
+    "apparent_mw": [92.10279165856014, 92.8808283377197, 91.28326756866167, 92.10279165856014, 92.8808283377197, 91.28326756866167, null, 92.8808283377197],
+    "band_ids": ["band-8", "band-9", "band-10", "band-11", "band-12", "band-13", null, "band-14"],
+    "bands_found": [1, 1, 1, 1, 1, 1, null, 1],
+    "calibration": {
+     "disagreement": 0.0,
+     "disagreement_infinite": false,
+     "disagreement_mw": 130.0,
+     "tilt_deg": 1.193489423982035,
+     "two_ladders": true
+    },
+    "clipped": [false, false, false, false, false, false, null, false],
+    "count_check": ["passed", "passed", "passed", "passed", "passed", "passed", null, "passed"],
+    "detected": [true, true, true, true, true, true, false, true],
+    "expected_mws": [92.0],
+    "image_id": "img-1",
+    "mw_check": ["passed", "passed", "passed", "passed", "passed", "passed", null, "passed"],
+    "mw_not_run": null,
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "nets": [1204192.9999999993, 1373704.5, 1040546.75, 1551905.0, 1716843.0, 1292218.0, null, 1441392.0],
+    "possibly_clipped": [null, null, null, null, null, null, null, null],
+    "protein_id": "prot-7",
+    "role": "target"
+   },
+   {
+    "apparent_mw": [49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336, 49.497474683058336],
+    "band_ids": ["band-16", "band-17", "band-18", "band-19", "band-20", "band-21", "band-22", "band-23"],
+    "bands_found": [null, null, null, null, null, null, null, null],
+    "calibration": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "tilt_deg": null,
+     "two_ladders": false
+    },
+    "clipped": [false, false, false, false, false, false, false, false],
+    "count_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run"],
+    "detected": [true, true, true, true, true, true, true, true],
+    "expected_mws": [],
+    "image_id": "img-5",
+    "mw_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run", "not_run"],
+    "mw_not_run": "no_expected_mw",
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "nets": [1127981.0, 1204605.0, 1090905.0, 1167774.0, 1242262.0, 1054992.0, 1187163.2, 1145040.0],
+    "possibly_clipped": [null, null, null, null, null, null, null, null],
+    "protein_id": "prot-15",
+    "role": "loading control"
+   },
+   {
+    "apparent_mw": [36.197566755935654, 35.59374715392786, 35.89438728684749, 36.197566755935654, 35.59374715392786, 35.89438728684749, null, 35.59374715392786],
+    "band_ids": ["band-25", "band-26", "band-27", "band-28", "band-29", "band-30", null, "band-31"],
+    "bands_found": [null, null, null, null, null, null, null, null],
+    "calibration": {
+     "disagreement": 0.0,
+     "disagreement_infinite": false,
+     "disagreement_mw": 130.0,
+     "tilt_deg": 1.193489423982035,
+     "two_ladders": true
+    },
+    "clipped": [false, false, false, true, false, false, null, false],
+    "count_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", null, "not_run"],
+    "detected": [true, true, true, true, true, true, null, true],
+    "expected_mws": [],
+    "image_id": "img-1",
+    "mw_check": ["not_run", "not_run", "not_run", "not_run", "not_run", "not_run", null, "not_run"],
+    "mw_not_run": "no_expected_mw",
+    "mw_tolerance": 0.1,
+    "name": "GAPDH",
+    "nets": [1760074.0, 1679846.0, 1865756.0, 5092459.0, 1781453.0, 1606209.0, null, 1784837.0],
+    "possibly_clipped": [null, null, null, null, null, null, null, null],
+    "protein_id": "prot-24",
+    "role": "loading control"
+   },
+   {
+    "apparent_mw": [52.850902028069015, 52.850902028069015, 52.850902028069015, 52.850902028069015, 52.850902028069015, null, 52.850902028069015, 52.850902028069015],
+    "band_ids": ["band-33", "band-34", "band-35", "band-36", "band-37", null, "band-38", "band-39"],
+    "bands_found": [1, 1, 1, 1, 1, null, 1, 1],
+    "calibration": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "tilt_deg": null,
+     "two_ladders": false
+    },
+    "clipped": [false, false, false, false, false, null, false, false],
+    "count_check": ["passed", "passed", "passed", "passed", "passed", null, "passed", "passed"],
+    "detected": [true, true, true, true, true, false, true, true],
+    "expected_mws": [53.0],
+    "image_id": "img-3",
+    "mw_check": ["passed", "passed", "passed", "passed", "passed", null, "passed", "passed"],
+    "mw_not_run": null,
+    "mw_tolerance": 0.1,
+    "name": "p53 µ",
+    "nets": [772083.0000000002, 946075.0, 863912.0, 1034086.0, 1108104.0, null, 818364.0, 896478.0],
+    "possibly_clipped": [null, null, null, null, null, null, null, null],
+    "protein_id": "prot-32",
+    "role": "target"
+   }
+  ],
+  "reference_condition": "vehicle",
+  "series": [
+   {
+    "averaged": [
+     ["vehicle", "V1"]
+    ],
+    "baseline": 1.0289046786123766,
+    "chart": {
+     "bars": [
+      {
+       "error": 0.10317785405872594,
+       "geometric_mean": 0.9973350315796182,
+       "geometric_sd_factor": 1.1088922091134135,
+       "label": "vehicle",
+       "lane_indices": [0, 2],
+       "mean": 1.0,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.072957760273201, 0.9270422397267989]
+      },
+      {
+       "error": 0.036483484211599436,
+       "geometric_mean": 1.317154482064239,
+       "geometric_sd_factor": 1.0280840686901527,
+       "label": "10 µM",
+       "lane_indices": [3, 4],
+       "mean": 1.3174070942317044,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.29160937514437, 1.3432048133190386]
+      },
+      {
+       "error": null,
+       "geometric_mean": null,
+       "geometric_sd_factor": null,
+       "label": "50 µM",
+       "lane_indices": [7],
+       "mean": null,
+       "n": 1,
+       "not_detected_lanes": [6],
+       "points": [1.2234502301960788]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "vehicle",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      },
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      },
+      {
+       "label": "50 µM",
+       "left_out": "not_detected",
+       "n": 1,
+       "not_detected": 1,
+       "replicates": 2,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {
+      "all_pairs": 0.3333333333333333,
+      "vs_reference": 0.3333333333333333
+     },
+     "statement": ["Bars: mean ± SD; points: replicates; open circles: not detected", "Student's t-test on log values: p = 0.0667", "Not tested: '50 µM' (1 of 2 not detected)"],
+     "subtitle": "Excluding lane 6",
+     "test": {
+      "adjustment": "none",
+      "chosen": {
+       "comparisons": "auto",
+       "family": "auto",
+       "scale": "auto"
+      },
+      "comparisons": "all_pairs",
+      "covered": ["vehicle", "10 µM"],
+      "design": "independent",
+      "family": "pooled",
+      "id": "student_t",
+      "method": null,
+      "min_attainable_p": null,
+      "name": "Student's t-test",
+      "notes": [],
+      "omnibus": null,
+      "p_value": 0.06668841935625956,
+      "pairwise": [
+       {
+        "estimate": 1.320674036665571,
+        "group_a": "vehicle",
+        "group_b": "10 µM",
+        "p_value": 0.06668841935625956
+       }
+      ],
+      "reasons": ["ratios: log scale", "equal n: pooled variance", "2 conditions: all pairs"],
+      "reference": null,
+      "scale": "log",
+      "statistic": -3.675915456095588
+     },
+     "test_name": "student_t",
+     "test_note": "'50 µM' (1 of 2 not detected) is not in the test",
+     "test_p": 0.06668841935625956,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    },
+    "fold_change": [1.037574218526635, 1.1083413020197672, 0.9270422397267989, 1.29160937514437, 1.3432048133190386, 1.19045087298808, null, 1.2234502301960788],
+    "groups": {
+     "10 µM": [1.29160937514437, 1.3432048133190386],
+     "50 µM": [1.2234502301960788],
+     "vehicle": [1.072957760273201, 0.9270422397267989]
+    },
+    "loading": "α-tubulin",
+    "loading_id": "prot-15",
+    "normalized": [1.067564967849635, 1.1403775511474716, 0.9538380977261998, 1.3289429290256505, 1.3820297167586226, 1.2248604728756236, null, 1.2588136658981346],
+    "target": "β-catenin",
+    "target_id": "prot-7",
+    "undetected": {
+     "50 µM": [6]
+    },
+    "value_kind": "fold_change"
+   },
+   {
+    "averaged": [
+     ["vehicle", "V1"]
+    ],
+    "baseline": 0.4819820941082643,
+    "chart": {
+     "bars": [
+      {
+       "error": 0.055591217059878274,
+       "geometric_mean": 0.9992271054634679,
+       "geometric_sd_factor": 1.057195742575921,
+       "label": "vehicle",
+       "lane_indices": [0, 2],
+       "mean": 0.9999999999999999,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.039308926557453, 0.9606910734425467]
+      },
+      {
+       "error": 0.6146488071919944,
+       "geometric_mean": 0.7373721511177962,
+       "geometric_sd_factor": 2.206881831494321,
+       "label": "10 µM",
+       "lane_indices": [3, 4],
+       "mean": 0.8559288915180728,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [0.42130655190439076, 1.2905512311317549]
+      },
+      {
+       "error": 0.0,
+       "geometric_mean": 1.042101861304367,
+       "geometric_sd_factor": null,
+       "label": "50 µM",
+       "lane_indices": [7],
+       "mean": 1.042101861304367,
+       "n": 1,
+       "not_detected_lanes": [],
+       "points": [1.042101861304367]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "vehicle",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      },
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      },
+      {
+       "label": "50 µM",
+       "left_out": "fewer_than_2",
+       "n": 1,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {
+      "all_pairs": 0.3333333333333333,
+      "vs_reference": 0.3333333333333333
+     },
+     "statement": ["Bars: mean ± SD; points: replicates", "Student's t-test on log values: p = 0.642", "Not tested: '50 µM' (n = 1)"],
+     "subtitle": "Excluding lane 6",
+     "test": {
+      "adjustment": "none",
+      "chosen": {
+       "comparisons": "auto",
+       "family": "auto",
+       "scale": "auto"
+      },
+      "comparisons": "all_pairs",
+      "covered": ["vehicle", "10 µM"],
+      "design": "independent",
+      "family": "pooled",
+      "id": "student_t",
+      "method": null,
+      "min_attainable_p": null,
+      "name": "Student's t-test",
+      "notes": [],
+      "omnibus": null,
+      "p_value": 0.642369761267228,
+      "pairwise": [
+       {
+        "estimate": 0.7379425028465211,
+        "group_a": "vehicle",
+        "group_b": "10 µM",
+        "p_value": 0.642369761267228
+       }
+      ],
+      "reasons": ["ratios: log scale", "equal n: pooled variance", "2 conditions: all pairs"],
+      "reference": null,
+      "scale": "log",
+      "statistic": 0.5415841361840994
+     },
+     "test_name": "student_t",
+     "test_note": "'50 µM' (n = 1) is not in the test",
+     "test_p": 0.642369761267228,
+     "title": "p53 µ fold-change vs vehicle  (/GAPDH)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    },
+    "fold_change": [0.910127335054287, 1.1684905180606195, 0.9606910734425467, 0.42130655190439076, 1.2905512311317549, null, null, 1.042101861304367],
+    "groups": {
+     "10 µM": [0.42130655190439076, 1.2905512311317549],
+     "50 µM": [1.042101861304367],
+     "vehicle": [1.039308926557453, 0.9606910734425467]
+    },
+    "loading": "GAPDH",
+    "loading_id": "prot-24",
+    "normalized": [0.4386650788546392, 0.563191506840508, 0.463035895368955, 0.2030622141484104, 0.6220225849348818, null, null, 0.5022744373855988],
+    "target": "p53 µ",
+    "target_id": "prot-32",
+    "undetected": {},
+    "value_kind": "fold_change"
+   }
+  ],
+  "statistics": {
+   "comparisons": "auto",
+   "family": "auto",
+   "scale": "auto"
+  },
+  "tier": "fold_change"
+ }
+}
