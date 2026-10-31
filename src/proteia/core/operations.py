@@ -180,6 +180,7 @@ from proteia.core.export import (
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
     UNTRUSTED_WARNINGS,
+    WARNINGS,
     Inks,
     InkSet,
     NotSingleImageError,
@@ -1396,6 +1397,11 @@ def import_image(
     read; inks it does not see (after a first image of none) are refused as
     reading finds them, and so is, failing closed, any file reading converts
     from CMYK. Images imported converted before keep being read so.
+
+    A file whose bytes an image of the project already holds (the same
+    ``sha256``) imports as any other, with a ``duplicate_file`` warning first
+    among its warnings that names each such image and its membrane
+    (:func:`_duplicate_file`, #216).
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1465,6 +1471,7 @@ def import_image(
                 draft.batch.membranes.append(membrane)
             else:
                 membrane = next(m for m in draft.batch.membranes if m.id == membrane_id)
+            duplicate = _duplicate_file(draft.batch, stored.sha256, membrane.id)
             membrane.images.append(
                 ImageRef(
                     id=image_id,
@@ -1477,7 +1484,7 @@ def import_image(
                     bit_depth=loaded.bit_depth,
                     polarity=polarity,
                     background=background,
-                    import_warnings=warnings,
+                    import_warnings=[*duplicate, *warnings],
                 )
             )
             return membrane.id
@@ -1560,6 +1567,33 @@ def _refuse_inks(original_name: str, inks: Inks | None) -> None:
             "uncompressed_copy": inks.uncompressed_copy,
         },
     )
+
+
+def _duplicate_file(batch: Batch, sha256: str, membrane_id: str) -> list[ImageWarning]:
+    """The ``duplicate_file`` warning of a file whose bytes have the SHA-256
+    ``sha256``, imported into the membrane ``membrane_id``, alone in a list;
+    empty when no image of ``batch`` holds those bytes. It names each image
+    that does, in the order of the image list, with its membrane: this one, or
+    another, named by its first image as the import's Membrane choice names it
+    (unless the image is that first one). It compares bytes, not pixels: the
+    same pixels saved another way are not found (#216)."""
+    images = []
+    for membrane in batch.membranes:
+        for image in membrane.images:
+            if image.sha256 != sha256:
+                continue
+            first = membrane.images[0]
+            if membrane.id == membrane_id:
+                where = "on this membrane"
+            elif image.id == first.id:
+                where = "on another membrane"
+            else:
+                where = f"on another membrane (the membrane of {first.original_name!r})"
+            images.append(f"{image.original_name!r} {where}")
+    if not images:
+        return []
+    message = WARNINGS["duplicate_file"].format(images=in_words(images))
+    return [ImageWarning(code="duplicate_file", message=message)]
 
 
 def _log_import(session: ProjectSession, image_id: str) -> None:

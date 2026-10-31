@@ -1335,6 +1335,240 @@ def test_import_into_an_existing_membrane(tmp_path):
     assert listing(s) == files and s.project.next_id == next_id
 
 
+# --- #216: a file whose bytes an image of the project already holds ---
+
+
+def same_bytes_as(images: str) -> str:
+    """The duplicate_file warning's message, naming ``images``."""
+    return (
+        f"When this file was imported, its bytes were identical to those of {images}: the"
+        " same image may be quantified more than once. Remove this image unless you meant"
+        " to import the file again."
+    )
+
+
+def import_copy(
+    s: ProjectSession,
+    data: bytes,
+    name: str,
+    polarity: Polarity = DARK,
+    *,
+    membrane_id: str | None = None,
+) -> str:
+    """Import ``data`` as the file ``name``: the same bytes under any name."""
+    return ops.import_image(
+        s, io.BytesIO(data), name, kind=CHEMI, polarity=polarity, membrane_id=membrane_id
+    )
+
+
+def warnings_of(s: ProjectSession, image_id: str) -> list[tuple[str, str]]:
+    return [(w.code, w.message) for w in s.project.batch.find_image(image_id).import_warnings]
+
+
+def nudged(pixels: np.ndarray) -> np.ndarray:
+    """``pixels`` with one pixel a level darker: other bytes, almost the same image."""
+    other = pixels.copy()
+    other[0, 0] -= 1
+    return other
+
+
+def test_the_same_bytes_under_another_name_import_with_a_warning_naming_the_image(tmp_path, caplog):
+    s = session_on(tmp_path)
+    data = write_tiff(tmp_path / "sources" / "blot.tif", blot()).read_bytes()
+    first = import_copy(s, data, "β-actin 10 µM.tif")
+    assert warnings_of(s, first) == []
+    membrane = s.project.batch.membrane_of(first).id
+    with caplog.at_level("INFO", logger=ops.__name__):
+        copy = import_copy(s, data, "reprobe β.tif", membrane_id=membrane)
+    # It imports as any file does, into the membrane asked for.
+    [only] = s.project.batch.membranes
+    assert [image.id for image in only.images] == [first, copy]
+    expected = same_bytes_as("'β-actin 10 µM.tif' on this membrane")
+    assert warnings_of(s, copy) == [("duplicate_file", expected)]
+    assert f"was imported with a warning, duplicate_file: {expected}" in caplog.text
+    # A warning only: the over-exposure check still runs on the copy, and the
+    # image it names is left as it was.
+    image = s.project.batch.find_image(copy)
+    assert clipping_depth(image.bit_depth, image.import_warnings) == 16
+    assert warnings_of(s, first) == []
+
+
+def test_the_same_bytes_in_other_membranes_name_the_membrane_of_each_image(tmp_path):
+    s = session_on(tmp_path)
+    pixels = blot()
+    data = write_tiff(tmp_path / "sources" / "blot.tif", pixels).read_bytes()
+    other = write_tiff(tmp_path / "sources" / "other.tif", nudged(pixels)).read_bytes()
+    first = import_copy(s, data, "β-actin 10 µM.tif")
+    marker = import_copy(s, other, "GAPDH α.tif")
+    mem_first, mem_marker = (m.id for m in s.project.batch.membranes)
+    # The first image of a membrane names it, as the import's Membrane choice does.
+    later = import_copy(s, data, "copy 1.tif", membrane_id=mem_marker)
+    assert warnings_of(s, later) == [
+        ("duplicate_file", same_bytes_as("'β-actin 10 µM.tif' on another membrane"))
+    ]
+    again = import_copy(s, data, "copy 2.tif", membrane_id=mem_first)
+    assert warnings_of(s, again) == [
+        (
+            "duplicate_file",
+            same_bytes_as(
+                "'β-actin 10 µM.tif' on this membrane and 'copy 1.tif' on another membrane"
+                " (the membrane of 'GAPDH α.tif')"
+            ),
+        )
+    ]
+    # Every image with those bytes, in the order of the image list (membrane by
+    # membrane), not in the order they were imported; on a new membrane, every
+    # one is on another membrane.
+    last = import_copy(s, data, "copy 3.tif")
+    assert warnings_of(s, last) == [
+        (
+            "duplicate_file",
+            same_bytes_as(
+                "'β-actin 10 µM.tif' on another membrane, 'copy 2.tif' on another membrane"
+                " (the membrane of 'β-actin 10 µM.tif') and 'copy 1.tif' on another membrane"
+                " (the membrane of 'GAPDH α.tif')"
+            ),
+        )
+    ]
+    assert warnings_of(s, first) == warnings_of(s, marker) == []
+
+
+def test_a_file_of_other_bytes_gets_no_warning_even_under_the_same_name(tmp_path):
+    s = session_on(tmp_path)
+    pixels = blot()
+    name = "blot µ.tif"
+    first = import_copy(s, write_tiff(tmp_path / "a" / name, pixels).read_bytes(), name)
+    membrane = s.project.batch.membrane_of(first).id
+    one_pixel = write_tiff(tmp_path / "b" / name, nudged(pixels)).read_bytes()
+    assert warnings_of(s, import_copy(s, one_pixel, name, membrane_id=membrane)) == []
+    # The check compares bytes, not pixels: the same pixels saved another way
+    # (compressed) are not found.
+    resaved = tmp_path / "c" / name
+    resaved.parent.mkdir()
+    tifffile.imwrite(resaved, pixels, compression="zlib")
+    copy = import_copy(s, resaved.read_bytes(), name)
+    np.testing.assert_array_equal(s.pixels(copy), s.pixels(first))
+    assert warnings_of(s, copy) == []
+    assert all(image.import_warnings == [] for image in s.project.batch.iter_images())
+
+
+def test_the_warning_stays_with_the_image_like_the_other_import_warnings(tmp_path):
+    s = session_on(tmp_path, save_to_folder)
+    figure = write_tiff(tmp_path / "sources" / "figure.tif", rows_at(255, np.uint8, 0.2, 90))
+    data = figure.read_bytes()
+    first = import_copy(s, data, "figure α.tif")
+    assert [code for code, _ in warnings_of(s, first)] == ["looks_processed"]
+    membrane = s.project.batch.membrane_of(first).id
+    copy = import_copy(s, data, "figure β.tif", membrane_id=membrane)
+    duplicate = ("duplicate_file", same_bytes_as("'figure α.tif' on this membrane"))
+    # First, before the file's own warnings; looks_processed stays last.
+    assert [code for code, _ in warnings_of(s, copy)] == ["duplicate_file", "looks_processed"]
+    assert warnings_of(s, copy)[0] == duplicate
+    # A polarity change assesses looks_processed again and keeps it.
+    ops.set_polarity(s, copy, LIGHT)
+    assert warnings_of(s, copy) == [duplicate]
+    ops.set_polarity(s, copy, DARK)
+    assert [code for code, _ in warnings_of(s, copy)] == ["duplicate_file", "looks_processed"]
+    # It is saved with the image, so a reopened project shows it again.
+    reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
+    assert warnings_of(reopened, copy) == warnings_of(s, copy)
+    state = project_state(reopened.folder.name, reopened, reopened.project, open_id=1)
+    shown = {image["id"]: image["warnings"] for image in state["images"]}
+    assert shown[copy][0] == {"code": duplicate[0], "message": duplicate[1]}
+    assert shown[first] == [{"code": "looks_processed", "message": warnings_of(s, first)[0][1]}]
+    # A polarity change on an image whose file is gone keeps it too.
+    (reopened.folder / "images" / f"{copy}.tif").unlink()
+    ops.set_polarity(reopened, copy, LIGHT)
+    assert warnings_of(reopened, copy) == [duplicate]
+
+
+def test_the_warning_says_what_the_project_held_when_the_file_was_imported(tmp_path):
+    s = session_on(tmp_path)
+    data = write_tiff(tmp_path / "sources" / "blot.tif", blot()).read_bytes()
+    first = import_copy(s, data, "β-actin 10 µM.tif")
+    copy = import_copy(s, data, "reprobe β.tif", membrane_id="mem-2")
+    duplicate = ("duplicate_file", same_bytes_as("'β-actin 10 µM.tif' on this membrane"))
+    # Removing the image it names leaves it: the bytes were the same when imported.
+    ops.remove_image(s, first)
+    assert warnings_of(s, copy) == [duplicate]
+    ops.undo(s)
+    # Its next step: removing the copy leaves one image with those bytes.
+    ops.remove_image(s, copy)
+    sha = s.project.batch.find_image(first).sha256
+    assert [image.id for image in s.project.batch.iter_images() if image.sha256 == sha] == [first]
+    ops.undo(s)
+    assert warnings_of(s, copy) == [duplicate]
+    # Undone, the import takes its warning with it; redone, it is back.
+    ops.undo(s)
+    assert [image.id for image in s.project.batch.iter_images()] == [first]
+    ops.redo(s)
+    assert warnings_of(s, copy) == [duplicate]
+    # An image removed before an import is not compared: only the copy is
+    # left, the first image of its membrane now.
+    ops.remove_image(s, first)
+    third = import_copy(s, data, "again γ.tif")
+    assert warnings_of(s, third) == [
+        ("duplicate_file", same_bytes_as("'reprobe β.tif' on another membrane"))
+    ]
+
+
+def test_an_import_compares_the_images_of_a_project_saved_before_the_warning(tmp_path):
+    # A project an older build saved (schema 1, before #83): its images hold
+    # no duplicate_file warning, and opening it gives them none. Its
+    # 'reprobe β.tif' is a real TIFF; the other files are stand-ins, which
+    # the import never reads.
+    data = write_tiff(tmp_path / "sources" / "reprobe.tif", blot()).read_bytes()
+    doc = sample_doc_v1()
+    reprobe = doc["batch"]["membranes"][0]["images"][2]
+    assert (reprobe["id"], reprobe["original_name"]) == ("img-4", "reprobe β.tif")
+    reprobe["sha256"] = hashlib.sha256(data).hexdigest()
+    folder = tmp_path / FOLDER
+    write_image_files(folder, make_project())
+    (folder / "images" / "img-4.tif").write_bytes(data)
+    (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
+    s = ops.open_project(folder, autosave=save_to_folder, clock=FakeClock())
+    old = {image.id: image.import_warnings for image in s.project.batch.iter_images()}
+    assert {i: [w.code for w in warnings] for i, warnings in old.items()} == {
+        "img-2": [],
+        "img-3": [],
+        "img-4": [],
+        "img-6": ["lossy_format"],
+    }
+    copy = import_copy(s, data, "copy γ.tif")
+    expected = same_bytes_as(
+        "'reprobe β.tif' on another membrane (the membrane of 'β-actin 10 µM.tif')"
+    )
+    assert warnings_of(s, copy) == [("duplicate_file", expected)]
+    into = import_copy(s, data, "copy δ.tif", membrane_id="mem-5")
+    assert warnings_of(s, into) == [
+        (
+            "duplicate_file",
+            same_bytes_as(
+                "'reprobe β.tif' on another membrane (the membrane of 'β-actin 10 µM.tif')"
+                " and 'copy γ.tif' on another membrane"
+            ),
+        )
+    ]
+    assert {i: s.project.batch.find_image(i).import_warnings for i in old} == old
+    # Saved, it loads as it was and saves to the same bytes again; exports
+    # record it with the rest of the project.
+    saved = (folder / storage.PROJECT_FILE).read_bytes()
+    assert saved.count(b'"duplicate_file"') == 2
+    loaded = load_project(folder)
+    assert loaded == s.project and content_hash(loaded) == content_hash(s.project)
+    again = tmp_path / "again"
+    write_image_files(again, loaded)
+    assert storage.save_project(loaded, again).read_bytes() == saved
+    ops.export_lane_table(s)
+    exported = json.loads((folder / storage.EXPORTS_DIR / ops.LANE_TABLE_RECORD_FILE).read_bytes())
+    images = {
+        image["id"]: image["import_warnings"]
+        for membrane in exported["content"]["batch"]["membranes"]
+        for image in membrane["images"]
+    }
+    assert images[copy] == [{"code": "duplicate_file", "message": expected}]
+
+
 @pytest.mark.parametrize(
     ("name", "data", "max_bytes", "code"),
     [
