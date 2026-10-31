@@ -11,7 +11,7 @@ so a band peaking on row r lies at y = r + 0.5, as a box centre does.
 
 Register groups. The images of a membrane whose pixel rows line up, a
 chemiluminescence image and the marker image it is linked to, form a register
-group (:meth:`~proteia.core.model.Membrane.register_groups`). Each group is
+group (:meth:`~proteia.core.model.Batch.register_groups`). Each group is
 fitted from its own points (D4); a group has one ladder, or two.
 
 One ladder. log10(MW) is linear in y between neighbouring points, and the end
@@ -74,6 +74,7 @@ import numpy as np
 from pydantic import JsonValue
 
 from proteia.core.model import (
+    Batch,
     CalibrationPoint,
     CalibrationPointSource,
     FitMethod,
@@ -474,36 +475,39 @@ def _fit(membrane: Membrane, group: frozenset[str]) -> Calibration | NoCalibrati
     )
 
 
-def calibration_for(membrane: Membrane, image_id: str) -> Calibration | NoCalibration:
-    """The image's register group, fitted piecewise. A side with at least
-    MIN_LADDER_POINTS points is a ladder. A side with fewer, or a right side that
-    shares fewer than MIN_SHARED_MWS MWs with the left, is not used
-    (``Calibration.ignored``). No ladder at all gives ``NoCalibration`` with
-    ``"no_points"`` or ``"one_point"``. UnknownIdError if the image is not on the
-    membrane."""
-    return _fit(membrane, membrane.group_of(image_id))
+def calibration_for(batch: Batch, membrane: Membrane, image_id: str) -> Calibration | NoCalibration:
+    """The register group of ``membrane`` (of ``batch``) holding the image,
+    fitted piecewise. A side with at least MIN_LADDER_POINTS points is a
+    ladder. A side with fewer, or a right side that shares fewer than
+    MIN_SHARED_MWS MWs with the left, is not used (``Calibration.ignored``). No
+    ladder at all gives ``NoCalibration`` with ``"no_points"`` or
+    ``"one_point"``. UnknownIdError if the image is not on the membrane."""
+    return _fit(membrane, batch.group_of(membrane, image_id))
 
 
-def calibrations(membrane: Membrane) -> dict[frozenset[str], Calibration | NoCalibration]:
-    """Every register group of the membrane, fitted, in the order of their first image."""
-    return {group: _fit(membrane, group) for group in membrane.register_groups()}
+def calibrations(
+    batch: Batch, membrane: Membrane
+) -> dict[frozenset[str], Calibration | NoCalibration]:
+    """Every register group of the membrane (of ``batch``), fitted, in the
+    order of their first image."""
+    return {group: _fit(membrane, group) for group in batch.register_groups(membrane)}
 
 
-def fit_quality(membrane: Membrane) -> float | None:
+def fit_quality(batch: Batch, membrane: Membrane) -> float | None:
     """The worst ladder's quality over every register group: what
     ``MwCalibration.fit_quality`` stores. None when no ladder has three points."""
     values = [
         fitted.quality.value
-        for fitted in calibrations(membrane).values()
+        for fitted in calibrations(batch, membrane).values()
         if isinstance(fitted, Calibration) and fitted.quality is not None
     ]
     return max(values, default=None)
 
 
-def fit_method(membrane: Membrane) -> FitMethod:
+def fit_method(batch: Batch, membrane: Membrane) -> FitMethod:
     """``DEFAULT_FIT_METHOD`` when a register group has a curve, else ``LOG_LINEAR``
     (the model's default: nothing fitted)."""
-    if any(isinstance(fitted, Calibration) for fitted in calibrations(membrane).values()):
+    if any(isinstance(fitted, Calibration) for fitted in calibrations(batch, membrane).values()):
         return DEFAULT_FIT_METHOD
     return FitMethod.LOG_LINEAR
 

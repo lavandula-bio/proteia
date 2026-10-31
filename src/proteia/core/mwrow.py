@@ -305,7 +305,9 @@ def placed_on_add(batch: Batch, protein: Protein) -> bool:
     expects one band at a known MW, and its image has a curve."""
     if protein.expected_mw is None or protein.expected_band_count != 1:
         return False
-    fitted = mwcal.calibration_for(batch.membrane_of_protein(protein), batch.image_id_of(protein))
+    fitted = mwcal.calibration_for(
+        batch, batch.membrane_of_protein(protein), batch.image_id_of(protein)
+    )
     return isinstance(fitted, mwcal.Calibration)
 
 
@@ -331,7 +333,7 @@ def predict(batch: Batch, protein: Protein) -> Prediction | None:
     if not placed_on_add(batch, protein) or protein.expected_mw is None:
         return None
     image = batch.image_of(protein)
-    fitted = mwcal.calibration_for(batch.membrane_of(image.id), image.id)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of(image.id), image.id)
     if not isinstance(fitted, mwcal.Calibration):  # never: placed_on_add found the curve
         return None
     mws = (protein.expected_mw,)

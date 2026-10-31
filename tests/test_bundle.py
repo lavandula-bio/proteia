@@ -144,7 +144,7 @@ def test_one_result_set_gives_one_table_and_unlabelled_charts(tmp_path):
     project = make_project()
 
     def include_every_lane(draft: Project) -> None:
-        for lane in draft.batch.lanes:
+        for lane in draft.batch.only_lanes():
             lane.included = True
 
     s = open_sample(tmp_path, project=apply_change(project, include_every_lane)[0])
@@ -212,7 +212,7 @@ def test_each_sets_files_hold_that_sets_own_values(tmp_path):
     # exclusions forms its fold changes against lane 1 alone, the all-lanes set
     # against lanes 1 and 2, so each file has numbers of its own to share (#71).
     def exclude_a_reference_lane(draft: Project) -> None:
-        draft.batch.lanes[1].included = False
+        draft.batch.only_lanes()[1].included = False
 
     s = open_sample(tmp_path, project=apply_change(make_project(), exclude_a_reference_lane)[0])
     bundle = ops.export_bundle(s, formats=["svg"])
@@ -591,7 +591,7 @@ def test_the_readme_explains_replicates_not_detected(tmp_path):
     def undetected(draft: Project) -> None:
         from proteia.core.model import ProposalSource, Region, UndetectedBand, UndetectedReason
 
-        beta = draft.batch.find_protein("prot-7")
+        beta = draft.batch.boxes_of(draft.batch.find_protein("prot-7"))
         beta.bands = [b for b in beta.bands if b.lane_index != 3]
         beta.undetected.append(
             UndetectedBand(
@@ -632,8 +632,9 @@ OVERLAPS = [
 
 def overlapping_sample() -> Project:
     def change(draft: Project) -> None:
-        gapdh = draft.batch.find_protein("prot-9")
-        gapdh.image_id = "img-2"
+        gapdh = draft.batch.boxes_of(draft.batch.find_protein("prot-9"))
+        [(_, arena)] = draft.batch.arenas_on("img-2")
+        gapdh.arena_id = arena.id  # its row onto img-2
         box = gapdh.bands[0].box  # lane 1's, at (18, 100)
         box.x, box.y = 34, 43  # (34, 43, 58, 57) over β-catenin's (18, 43, 42, 57)
 
@@ -719,7 +720,7 @@ def test_the_readme_lists_the_checks_before_the_files(tmp_path):
 
 def test_the_readme_of_one_set_says_nothing_of_the_all_lanes_set(tmp_path):
     def included(draft: Project) -> None:
-        draft.batch.lanes[3].included = True
+        draft.batch.only_lanes()[3].included = True
 
     s = open_sample(tmp_path, project=apply_change(overlapping_sample(), included)[0])
     assert ops.compute(s).all_lanes is None

@@ -21,9 +21,10 @@ import numpy as np
 import pytest
 
 from conftest import make_project, make_project_with_undetected, synthetic_blot
-from proteia.core import mwcal, results
+from proteia.core import model, mwcal, results
 from proteia.core import operations as ops
 from proteia.core.model import (
+    Arena,
     Band,
     Batch,
     Box,
@@ -34,6 +35,7 @@ from proteia.core.model import (
     ImageRef,
     LadderSide,
     Lane,
+    LaneTable,
     Membrane,
     MwCalibration,
     Polarity,
@@ -54,6 +56,7 @@ from test_operations import (
     MARKER_BAND,
     RIGHT,
     band_of,
+    boxes_of,
     calibrated,
     import_blot,
     lane_bands,
@@ -161,11 +164,16 @@ def blot(
     """A project of one membrane, mem-9: ``img-1`` holding ``points``, ``img-2`` linked
     to it holding the proteins ``rows``, eight lanes (``excluded`` ones
     include=no)."""
+    images = [
+        _image("img-1", ImageKind.VISIBLE_MARKER, width, height),
+        _image("img-2", ImageKind.CHEMILUMINESCENCE, width, height, marker_image_id="img-1"),
+    ]
     membrane = Membrane(
         id="mem-9",
-        images=[
-            _image("img-1", ImageKind.VISIBLE_MARKER, width, height),
-            _image("img-2", ImageKind.CHEMILUMINESCENCE, width, height, marker_image_id="img-1"),
+        lane_table_id="lt-901",
+        arenas=[
+            Arena(id="arena-902", image_id="img-1", source="whole_image"),
+            Arena(id="arena-903", image_id="img-2", source="whole_image"),
         ],
         calibration=MwCalibration(
             ladder=ladder_key,
@@ -173,7 +181,8 @@ def blot(
             points=list(points),
         ),
     )
-    fitted = mwcal.calibration_for(membrane, "img-2")
+    held = Batch(images=images, lane_tables=[LaneTable(id="lt-901")], membranes=[membrane])
+    fitted = mwcal.calibration_for(held, membrane, "img-2")
     proteins = []
     number = 10
     for k, row in enumerate(rows):
@@ -200,18 +209,23 @@ def blot(
                 id=f"prot-{3 + k}",
                 name=row.name,
                 role=Role.TARGET,
-                image_id="img-2",
                 expected_mw=row.expected,
                 expected_band_count=row.expected_count,
-                box_size=SIZE,
-                bands=bands,
+                rows=[
+                    model.Row(id=f"row-{910 + k}", arena_id="arena-903", box_size=SIZE, bands=bands)
+                ],
                 **extra,
             )
         )
     lanes = [Lane(index=i, label=f"c{i}", included=i not in excluded) for i in range(8)]
     project = Project(
-        next_id=number,
-        batch=Batch(lanes=lanes, membranes=[membrane], proteins=proteins),
+        next_id=max(number, 1000),  # above the lane table's, the areas' and the rows' ids
+        batch=Batch(
+            images=images,
+            lane_tables=[LaneTable(id="lt-901", lanes=lanes)],
+            membranes=[membrane],
+            proteins=proteins,
+        ),
     )
     return revalidate(project)
 
@@ -429,7 +443,8 @@ def test_count_not_run_for_click_and_moved_box():
     assert column.count_check == ["not_run"] * 8
     assert of(res, NoticeCode.BAND_COUNT) == []
     # The model keeps a count to a detector's box nobody edited.
-    [band] = blot(ladder(X_LEFT), Row("β-catenin", 92, lanes=(0,))).batch.proteins[0].bands
+    batch = blot(ladder(X_LEFT), Row("β-catenin", 92, lanes=(0,))).batch
+    [band] = batch.boxes_of(batch.proteins[0]).bands
     doc = band.model_dump()
     for edit in ({"manually_edited": True}, {"source": "click"}, {"source": "manual"}):
         with pytest.raises(ValueError, match="comes from a detector's box that nobody edited"):
@@ -519,7 +534,8 @@ def test_poor_fit_states_the_share_it_compares(at, label, share):
     # The notice fires on |label / its neighbours' MW − 1| > FIT_WARN, and
     # states that share: never a figure within the threshold.
     points = ladder(X_LEFT, at=(100, at, 30), labels=(100, label, 30))
-    [ladder_fit] = mwcal.calibration_for(blot(points).batch.membranes[0], "img-2").ladders
+    batch = blot(points).batch
+    [ladder_fit] = mwcal.calibration_for(batch, batch.membranes[0], "img-2").ladders
     assert ladder_fit.quality.value > mwcal.FIT_WARN
     [notice] = of(
         compute_results(blot(points, Row("β-catenin", 92)).batch), NoticeCode.CALIBRATION_POOR_FIT
@@ -574,6 +590,10 @@ def test_rows_tilted_reads_only_detector_boxes_nobody_edited():
     ):
         res = compute_results(blot(ladder(X_LEFT, 1.0), row).batch)
         assert of(res, NoticeCode.ROWS_TILTED) == [], row
+    # As many as TILT_MIN_LANES are enough (spread across the blot).
+    enough = dataclasses.replace(tilted, lanes=(0, 2, 5, 7))
+    res = compute_results(blot(ladder(X_LEFT, 1.0), enough).batch)
+    assert [n.code for n in of(res, NoticeCode.ROWS_TILTED)] == [NoticeCode.ROWS_TILTED]
     # Without an expected MW, the line at the boxes' median apparent MW.
     unexpected = dataclasses.replace(tilted, expected=None)
     res = compute_results(blot(ladder(X_LEFT, 1.0), unexpected).batch)
@@ -862,7 +882,7 @@ def test_count_window_ignores_neighbour_protein(tmp_path):
     assert NoticeCode.BAND_COUNT not in codes(res)
     # Without a curve, LC3-I's count reads its row box, which holds LC3-II.
     ops.clear_calibration(s, marker)
-    assert all(b.bands_found is None for b in protein_of(s, first).bands)  # cleared
+    assert all(b.bands_found is None for b in boxes_of(s, first).bands)  # cleared
     ops.detect_row_boxes(s, first, LC3_ROW)
     assert [b.bands_found for b in lane_bands(s, first).values()] == [2] * 4
     [notice] = of(ops.compute(s), NoticeCode.BAND_COUNT)
@@ -901,14 +921,14 @@ def test_band_counts_follow_their_boxes(tmp_path):
     assert ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX).band_ids == placement.band_ids
     assert s.project is before
     # Resizing and padding keep the counts: the boxes' centres stay.
-    fitted = protein_of(s, c.protein).fitted_size
+    fitted = boxes_of(s, c.protein).fitted_size
     ops.set_box_size(s, c.protein, BoxSize(width=fitted.width + 2, height=fitted.height + 2))
     ops.set_box_padding(s, c.protein, across=1, along=1)
     ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(len(CAL_LANES) + 1)])
     assert _counts(s, c.protein) == counted
     # A box moved or given another lane by hand loses its count.
     bands = lane_bands(s, c.protein)
-    size = protein_of(s, c.protein).box_size
+    size = boxes_of(s, c.protein).box_size
     x0, y0, x1, y1 = bands[1].box.rect(size)
     ops.move_box(s, bands[1].id, (x0 + 2, y0 + 1, x1 + 2, y1 + 1))
     ops.set_box_lane(s, bands[3].id, 4)

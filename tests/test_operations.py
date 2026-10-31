@@ -222,7 +222,12 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
     for image in batch.iter_images():
         if only is not None and image.id not in only:
             continue
-        placed = [(p, b) for p in batch.proteins if p.image_id == image.id for b in p.bands]
+        placed = [  # each band with its protein's boxes (their size)
+            (batch.boxes_of(p), b)
+            for p in batch.proteins
+            if batch.image_id_of(p) == image.id
+            for b in batch.boxes_of(p).bands
+        ]
         if not placed:
             continue
         pixels = session.pixels(image.id)
@@ -272,10 +277,11 @@ def expected_mw(session: ProjectSession, band_id: str) -> float | None:
     its range."""
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
-    fitted = mwcal.calibration_for(batch.membrane_of(protein.image_id), protein.image_id)
+    image_id = batch.image_id_of(protein)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
     if not isinstance(fitted, mwcal.Calibration):
         return None
-    size = protein.box_size
+    size = batch.boxes_of(protein).box_size
     return fitted.mw_at(band.box.x + size.width / 2, band.box.y + size.height / 2)
 
 
@@ -288,10 +294,10 @@ def assert_mw_current(session: ProjectSession) -> None:
     batch = session.project.batch
     for membrane in batch.membranes:
         calibration = membrane.calibration
-        assert calibration.fit_method is mwcal.fit_method(membrane), membrane.id
-        assert calibration.fit_quality == mwcal.fit_quality(membrane), membrane.id
+        assert calibration.fit_method is mwcal.fit_method(batch, membrane), membrane.id
+        assert calibration.fit_quality == mwcal.fit_quality(batch, membrane), membrane.id
     for protein in batch.proteins:
-        for band in protein.bands:
+        for band in batch.boxes_of(protein).bands:
             assert band.apparent_mw == expected_mw(session, band.id), band.id
 
 
@@ -328,6 +334,18 @@ def protein_of(session: ProjectSession, protein_id: str):
     return session.project.batch.find_protein(protein_id)
 
 
+def image_of(session: ProjectSession, protein_id: str) -> str:
+    """The id of the image a protein is quantified on."""
+    batch = session.project.batch
+    return batch.image_id_of(batch.find_protein(protein_id))
+
+
+def boxes_of(session: ProjectSession, protein_id: str):
+    """A protein's boxes in the committed project (its row)."""
+    batch = session.project.batch
+    return batch.boxes_of(batch.find_protein(protein_id))
+
+
 def _listed(cascade: Cascade) -> dict[str, list[str]]:
     """A cascade as its log entry records it: every field a list of ids."""
     return {name: list(ids) for name, ids in dataclasses.asdict(cascade).items()}
@@ -345,15 +363,18 @@ def plant_58_fit(session: ProjectSession, membrane_id: str) -> None:
     counts as a change to the curve of every image of it."""
 
     def change(draft: Project) -> None:
-        membrane = next(m for m in draft.batch.membranes if m.id == membrane_id)
-        membrane.calibration.fit_method = mwcal.fit_method(membrane)
-        membrane.calibration.fit_quality = mwcal.fit_quality(membrane)
-        images = {image.id for image in membrane.images}
-        for protein in draft.batch.proteins:
-            if protein.image_id in images:
-                fitted = mwcal.calibration_for(membrane, protein.image_id)
-                for band in protein.bands:
-                    band.apparent_mw = ops._apparent_mw(fitted, band.box, protein.box_size)
+        batch = draft.batch
+        membrane = next(m for m in batch.membranes if m.id == membrane_id)
+        membrane.calibration.fit_method = mwcal.fit_method(batch, membrane)
+        membrane.calibration.fit_quality = mwcal.fit_quality(batch, membrane)
+        images = {image.id for image in batch.images_of(membrane)}
+        for protein in batch.proteins:
+            image_id = batch.image_id_of(protein)
+            if image_id in images:
+                fitted = mwcal.calibration_for(batch, membrane, image_id)
+                boxes = batch.boxes_of(protein)
+                for band in boxes.bands:
+                    band.apparent_mw = ops._apparent_mw(fitted, band.box, boxes.box_size)
 
     plant(session, change)
 
@@ -365,7 +386,7 @@ def plant_legacy(session: ProjectSession) -> None:
     arrays = {
         image.id: session.pixels(image.id)
         for image in batch.iter_images()
-        if any(p.bands for p in batch.proteins if p.image_id == image.id)
+        if any(batch.boxes_of(p).bands for p in batch.proteins if batch.image_id_of(p) == image.id)
     }
 
     def change(draft: Project) -> None:
@@ -545,7 +566,7 @@ def test_autosave_hook_runs_once_after_each_change(tmp_path):
     with pytest.raises(OperationError):
         ops.place_box(s, protein, W, 0, lane_index=1, grow=False)  # refused: outside
     ops.move_box(s, band, (50, 20, 70, 40))
-    ops.move_box(s, band, band_of(s, band).box.rect(protein_of(s, protein).box_size))  # no-op
+    ops.move_box(s, band, band_of(s, band).box.rect(boxes_of(s, protein).box_size))  # no-op
     ops.set_box_size(s, protein, BoxSize(width=12, height=6))
     ops.set_box_size(s, protein, BoxSize(width=12, height=6))  # no-op
     ops.set_polarity(s, image, LIGHT)
@@ -604,7 +625,7 @@ def test_failed_autosave_keeps_the_edit_in_memory(tmp_path, replace_lock):
 
     replace_lock.locked = True
     ops.move_box(s, band, (50, 20, 70, 40))  # returns normally
-    size = protein_of(s, protein).box_size
+    size = boxes_of(s, protein).box_size
     assert band_of(s, band).box.rect(size) == boxes.centered_rect(60, 30, size, W, H)
     assert s.dirty
     assert isinstance(s.save_error, PermissionError)
@@ -745,7 +766,7 @@ def test_opening_a_schema_1_project_keeps_its_project_json_first(tmp_path):
     migrated = s.project.log[-1]
     assert migrated.params == {
         "from_schema": 1,
-        "to_schema": 2,
+        "to_schema": 3,
         "from_content_hash": V1_CONTENT_HASH,
         "backup": BACKUP,
     }
@@ -929,16 +950,16 @@ def test_the_cleanup_keeps_every_image_file_a_backup_names(tmp_path, monkeypatch
 
 def test_the_cleanup_keeps_an_image_file_named_in_any_backup(tmp_path):
     folder = v1_folder(tmp_path)
-    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved: next_id 19
+    s = ops.open_project(folder, clock=FakeClock())  # migrated and saved: next_id 27
     images = folder / "images"
-    for name in ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-19.tif", "img-25.tif"):
+    for name in ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-27.tif", "img-33.tif"):
         (images / name).write_bytes(b"an image no project.json references")
     # A backup is read as bytes, whatever its schema, even one that no longer
     # loads; its name is compared ignoring case, as Windows does. Only an id
-    # below next_id is kept: a backup's images hold no other (a migration keeps
-    # next_id, and the project only raises it), and the next import takes 19.
+    # below next_id is kept: a backup's images hold no other (a migration only
+    # raises next_id, and so does the project), and the next import takes 27.
     (folder / "Project.Schema3 (2).json").write_bytes(
-        b'{"broken": "img-7.tif", img-8.tiff, img-19.tif, img-25.tif'
+        b'{"broken": "img-7.tif", img-8.tiff, img-27.tif, img-33.tif'
     )
     ops.set_reference_condition(s, None)  # saved, then cleaned up
     assert listing(s) == [
@@ -965,16 +986,16 @@ def test_a_stored_name_in_a_backup_s_text_never_blocks_the_next_import(tmp_path)
     folder = v1_folder(tmp_path)
     path = folder / storage.PROJECT_FILE
     doc = json.loads(path.read_bytes())
-    doc["batch"]["membranes"][0]["images"][0]["original_name"] = "Blot IMG-19.TIF"
+    doc["batch"]["membranes"][0]["images"][0]["original_name"] = "Blot IMG-27.TIF"
     path.write_bytes(storage.document_bytes(doc))
-    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 19
-    assert b"IMG-19.TIF" in (folder / BACKUP).read_bytes()
+    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 27
+    assert b"IMG-27.TIF" in (folder / BACKUP).read_bytes()
     _crash_after_an_import(folder)
-    leftover = folder / "images" / "img-19.tif"
+    leftover = folder / "images" / "img-27.tif"
     assert leftover.exists()
 
     s = ops.open_project(folder, clock=FakeClock())
-    assert import_blot(s, blot(), "β.tif") == "img-19"
+    assert import_blot(s, blot(), "β.tif") == "img-27"
     assert load_project(folder) == s.project
     assert leftover.read_bytes() == (folder.parent / "sources" / "β.tif").read_bytes()
 
@@ -983,8 +1004,8 @@ def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, mon
     # What such a backup names is unknown, so the cleanup keeps every file it
     # could name: none at or above next_id, which no backup's image holds.
     folder = v1_folder(tmp_path)
-    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 19
-    _crash_after_an_import(folder)  # img-19.tif left behind
+    ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 27
+    _crash_after_an_import(folder)  # img-27.tif left behind
     below = folder / "images" / "img-5.tif"
     below.write_bytes(b"an image no project.json references")
     read_bytes = Path.read_bytes
@@ -997,7 +1018,7 @@ def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, mon
     s = ops.open_project(folder, clock=FakeClock())
     with monkeypatch.context() as patch:
         patch.setattr(Path, "read_bytes", locked)
-        assert import_blot(s, blot(), "β.tif") == "img-19"  # saved, then cleaned up
+        assert import_blot(s, blot(), "β.tif") == "img-27"  # saved, then cleaned up
         assert below.exists()
     # Once the backup can be read, it does not name img-5: the file goes.
     ops.set_reference_condition(s, None)
@@ -1144,8 +1165,8 @@ def test_refused_operation_changes_nothing(tmp_path, setup, call, code):
 def test_no_op_logs_nothing(tmp_path):
     s, recorder, ids = _refusal_scene(tmp_path)
     before = s.project
-    lanes = before.batch.lanes
-    target = before.batch.find_protein(ids["target"])
+    lanes = before.batch.only_lanes()
+    target = before.batch.boxes_of(before.batch.find_protein(ids["target"]))
     ops.set_lanes(s, [LaneInput(lane.label, lane.sample, lane.included) for lane in lanes])
     ops.move_box(s, ids["a"], before.batch.find_band(ids["a"])[1].box.rect(target.box_size))
     ops.set_box_size(s, ids["target"], target.box_size)
@@ -1292,7 +1313,9 @@ def test_parallel_operations_get_distinct_ids(tmp_path):
         thread.join()
     assert len(set(ids)) == 8 and None not in ids
     assert {p.id for p in s.project.batch.proteins} == set(ids)
-    assert s.project.next_id == start + 8
+    rows = {s.project.batch.only_row(p).id for p in s.project.batch.proteins}
+    assert len(rows) == 8 and not rows & set(ids)
+    assert s.project.next_id == start + 16  # each protein and its row
     assert load_project(s.folder) == s.project
     log = s.project.log
     assert [entry.seq for entry in log] == list(range(1, len(log) + 1))
@@ -1311,7 +1334,7 @@ def test_import_records_the_stored_file(tmp_path):
     assert image_id == "img-1"
     [membrane] = s.project.batch.membranes
     assert membrane.id == "mem-2"
-    [image] = membrane.images
+    [image] = s.project.batch.images_of(membrane)
     source = (tmp_path / "sources" / name).read_bytes()
     stored = s.folder / "images" / "img-1.tif"
     assert stored.read_bytes() == source
@@ -1344,7 +1367,7 @@ def test_import_into_an_existing_membrane(tmp_path):
     membrane = s.project.batch.membrane_of(first).id
     second = import_blot(s, blot(), "reprobe β.tif", membrane_id=membrane)
     [only] = s.project.batch.membranes
-    assert [image.id for image in only.images] == [first, second]
+    assert [image.id for image in s.project.batch.images_of(only)] == [first, second]
 
     files, next_id = listing(s), s.project.next_id
     with pytest.raises(UnknownIdError):
@@ -1412,7 +1435,17 @@ def test_remove_image_cascade(tmp_path):
     s = open_sample(tmp_path / "tubulin")
     cascade = ops.remove_image(s, "img-6")
     assert cascade == Cascade(
-        removed=("img-6", "prot-8", "band-13", "band-14", "band-15", "band-16", "mem-5"),
+        removed=(
+            "img-6",
+            "arena-23",
+            "prot-8",
+            "row-25",
+            "band-13",
+            "band-14",
+            "band-15",
+            "band-16",
+            "mem-5",
+        ),
         detached_targets=("prot-7",),
         unpaired_images=(),
         unfitted_membranes=(),
@@ -1438,7 +1471,7 @@ def test_remove_image_cascade(tmp_path):
     s = open_sample(tmp_path / "marker")
     cascade = ops.remove_image(s, "img-3")
     assert cascade == Cascade(
-        removed=("img-3",),
+        removed=("img-3", "arena-21"),
         detached_targets=(),
         unpaired_images=("img-2",),
         unfitted_membranes=("mem-1",),
@@ -1473,21 +1506,21 @@ def test_set_polarity_recomputes_the_nets_on_that_image(tmp_path):
 
     def mark_clipped(draft: Project) -> None:  # a stale flag the polarity change must redo
         for protein in draft.batch.proteins:
-            for band in protein.bands:
+            for band in draft.batch.boxes_of(protein).bands:
                 band.clipped = True
 
     plant(s, mark_clipped)
     background = s.project.batch.find_image(bright).background
-    dark_bands = protein_of(s, on_dark).bands
+    dark_bands = boxes_of(s, on_dark).bands
 
     ops.set_polarity(s, bright, LIGHT)
     image = s.project.batch.find_image(bright)
     assert image.polarity is LIGHT and image.background == background
-    for band in protein_of(s, on_bright).bands:
+    for band in boxes_of(s, on_bright).bands:
         assert band.net > 0  # bright bands now read as signal
         assert band.clipped is False  # recomputed for the new polarity (16-bit, below 65535)
     assert_nets_current(s, only=[bright])  # every band on it, the other signal direction
-    assert protein_of(s, on_dark).bands == dark_bands  # the other image is untouched
+    assert boxes_of(s, on_dark).bands == dark_bands  # the other image is untouched
 
 
 # --- The looks_processed warning at import and on a polarity change (#127) ---
@@ -3068,7 +3101,7 @@ def test_a_cmyk_file_with_alpha_saved_as_an_uncompressed_tiff_is_imported(tmp_pa
         assert (image.bit_depth, [w.code for w in image.import_warnings]) == (8, warnings)
         protein = ops.add_protein(s, f"β-actin {named}", Role.TARGET, image_id)
         ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-        nets.append([band.net for band in s.project.batch.find_protein(protein).bands])
+        nets.append([band.net for band in boxes_of(s, protein).bands])
     assert nets[0] == nets[1]
     assert_nets_current(s)
 
@@ -3140,7 +3173,7 @@ def test_a_compressed_tiff_with_unassociated_alpha_imports_as_its_uncompressed_c
         protein = ops.add_protein(s, f"β-actin {path.stem}", Role.TARGET, image_id)
         ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
         ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
-        bands = s.project.batch.find_protein(protein).bands
+        bands = boxes_of(s, protein).bands
         measured.append(
             (
                 (image.width, image.height, image.bit_depth, image.background),
@@ -3248,7 +3281,8 @@ def _project_before_207(s: ProjectSession, imports) -> None:
 
 
 def _nets(s: ProjectSession) -> dict[str, list[float | None]]:
-    return {p.name: [b.net for b in p.bands] for p in s.project.batch.proteins}
+    batch = s.project.batch
+    return {p.name: [b.net for b in batch.boxes_of(p).bands] for p in batch.proteins}
 
 
 def test_a_project_with_cmyk_images_imported_before_207_opens_with_its_nets(tmp_path):
@@ -3284,7 +3318,10 @@ def test_a_project_with_cmyk_images_imported_before_207_opens_with_its_nets(tmp_
     assert (folder / "project.json").read_bytes() == saved
     # A box placed now measures on the same reading.
     protein = next(p.id for p in reopened.project.batch.proteins if p.name == "cmyk 16 α")
-    ops.remove_box(reopened, reopened.project.batch.find_protein(protein).bands[1].id)
+    ops.remove_box(
+        reopened,
+        reopened.project.batch.boxes_of(reopened.project.batch.find_protein(protein)).bands[1].id,
+    )
     ops.place_box(reopened, protein, WIDE_X, ROW, lane_index=1, grow=True)
     assert _nets(reopened)["cmyk 16 α"] == pytest.approx(NETS_BEFORE_207["cmyk 16 α"], rel=1e-12)
 
@@ -3956,7 +3993,12 @@ def test_a_big_endian_16_bit_tiff_named_otherwise_is_imported_with_its_bit_depth
         protein = ops.add_protein(s, f"{name} β", Role.TARGET, image_id)
         ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
         ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
-        nets.append([band.net for band in s.project.batch.find_protein(protein).bands])
+        nets.append(
+            [
+                band.net
+                for band in s.project.batch.boxes_of(s.project.batch.find_protein(protein)).bands
+            ]
+        )
         images.append(s.project.batch.find_image(image_id))
     assert (images[0].bit_depth, [w.code for w in images[0].import_warnings]) == (16, warnings)
     assert nets[0] == nets[1]
@@ -4074,7 +4116,10 @@ def test_a_project_with_images_of_unknown_depth_imported_before_224_opens_with_i
     assert (folder / "project.json").read_bytes() == saved
     # A box placed now measures on the same reading.
     protein = next(p.id for p in reopened.project.batch.proteins if p.name == "float µ")
-    ops.remove_box(reopened, reopened.project.batch.find_protein(protein).bands[1].id)
+    ops.remove_box(
+        reopened,
+        reopened.project.batch.boxes_of(reopened.project.batch.find_protein(protein)).bands[1].id,
+    )
     ops.place_box(reopened, protein, WIDE_X, ROW, lane_index=1, grow=True)
     assert _nets(reopened)["float µ"] == pytest.approx(NETS_BEFORE_224["float µ"], rel=1e-12)
 
@@ -4104,7 +4149,7 @@ def test_set_lanes(tmp_path):
         ],
     )
     assert update == LanesUpdate(respelled=(), reference_cleared=False)
-    lanes = s.project.batch.lanes
+    lanes = s.project.batch.only_lanes()
     assert [lane.label for lane in lanes] == ["vehicle", "vehicle", "10 µM", "10 µM"]
     assert [lane.sample for lane in lanes] == ["v1", "v2", None, "a2"]
     assert lanes[3].metadata == {"dose": "10 µM", "day": "1"}  # kept
@@ -4112,7 +4157,7 @@ def test_set_lanes(tmp_path):
     # A look-alike of a stored condition takes the stored spelling.
     update = ops.set_lanes(s, _four("vehicle", "vehicle", last=f"10 {MU}M"))
     assert update.respelled == (3,)
-    assert s.project.batch.lanes[3].label == f"10 {MICRO}M"
+    assert s.project.batch.only_lanes()[3].label == f"10 {MICRO}M"
     ops.set_lanes(s, [*_four("vehicle", "vehicle")[:3], LaneInput(f"10 {MU}M", "a2")])
     [series] = ops.compute(s).series
     assert list(series.groups) == ["vehicle", f"10 {MICRO}M"]  # one group, not two
@@ -4133,13 +4178,13 @@ def test_set_lanes(tmp_path):
     assert info.value.code is ErrorCode.LANES_IN_USE
     assert info.value.ids == ("band-12", "band-16")
     ops.set_lanes(s, [*_four("vehicle", "vehicle"), LaneInput("50 µM", "b1")])
-    assert len(s.project.batch.lanes) == 5
+    assert len(s.project.batch.only_lanes()) == 5
     # Without the boxes in lane 3 (removed with their proteins' others: removing
     # one box re-quantifies the rest, and the sample's images are no pixels).
     ops.clear_boxes(s, "prot-7")
     ops.clear_boxes(s, "prot-8")
     ops.set_lanes(s, _four("vehicle", "vehicle")[:3])
-    assert len(s.project.batch.lanes) == 3
+    assert len(s.project.batch.only_lanes()) == 3
 
 
 def test_reference_follows_the_lane_table(tmp_path):
@@ -4219,7 +4264,7 @@ def test_add_protein(tmp_path):
     target = ops.add_protein(
         s, "β-catenin", Role.TARGET, image, expected_mw=92, loading_control_ids=[loading]
     )
-    assert protein_of(s, loading).box_size == boxes.initial_box_size(W, H)
+    assert boxes_of(s, loading).box_size == boxes.initial_box_size(W, H)
     added = protein_of(s, target)
     assert (added.expected_mw, added.loading_control_ids) == (92.0, [loading])
     assert [p.id for p in s.project.batch.proteins] == [loading, target]  # appended last
@@ -4245,8 +4290,9 @@ def test_add_protein(tmp_path):
         if error is OperationError:
             assert info.value.code is expected, overrides
 
+    row = s.project.batch.only_row(protein_of(s, target)).id
     removed = ops.remove_protein(s, target)
-    assert removed.removed == (target,)
+    assert removed.removed == (target, row)
     again = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     number = int(again.rsplit("-", 1)[1])
     assert number > int(target.rsplit("-", 1)[1])  # ids increase and never return
@@ -4287,9 +4333,10 @@ def test_edit_and_remove_protein(tmp_path):
         ops.place_box(s, tubulin, NARROW_X, ROW, lane_index=0, grow=True),
         ops.place_box(s, tubulin, WIDE_X, ROW, lane_index=1, grow=True),
     ]
+    row = s.project.batch.only_row(protein_of(s, tubulin)).id
     cascade = ops.remove_protein(s, tubulin)
     assert cascade == Cascade(
-        removed=(tubulin, *bands),
+        removed=(tubulin, row, *bands),
         detached_targets=(beta, gapdh),
         unpaired_images=(),
         unfitted_membranes=(),
@@ -4308,7 +4355,7 @@ def test_first_click_sets_the_box_size(tmp_path):
     grown = grow_box(pixels, (NARROW_X, ROW), s.project.batch.find_image(image).background)
     assert grown is not None
     band_id = ops.place_box(s, protein, NARROW_X, ROW, lane_index=1, grow=True)
-    placed = protein_of(s, protein)
+    placed = boxes_of(s, protein)
     size = BoxSize(width=grown[2] - grown[0], height=grown[3] - grown[1])
     assert placed.box_size == size  # replaces the add_protein default
     assert size != boxes.initial_box_size(W, H)
@@ -4325,12 +4372,12 @@ def test_first_click_sets_the_box_size(tmp_path):
 def test_a_wider_band_grows_every_box(tmp_path):
     s, _, protein = boxed(tmp_path)
     first = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-    old_size = protein_of(s, protein).box_size
+    old_size = boxes_of(s, protein).box_size
     old = band_of(s, first)
     x0, y0, x1, y1 = old.box.rect(old_size)
 
     second = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
-    size = protein_of(s, protein).box_size
+    size = boxes_of(s, protein).box_size
     assert size.width > old_size.width and size.height == old_size.height
     moved = band_of(s, first)
     nx0, ny0, nx1, ny1 = moved.box.rect(size)
@@ -4343,12 +4390,12 @@ def test_a_wider_band_grows_every_box(tmp_path):
 
 def test_fixed_box_is_clamped_into_the_image(tmp_path):
     s, _, protein = boxed(tmp_path)
-    size = protein_of(s, protein).box_size
+    size = boxes_of(s, protein).box_size
     band_id = ops.place_box(s, protein, W - 2, ROW, lane_index=2, grow=False)
     band = band_of(s, band_id)
     assert band.box == Box(x=W - size.width, y=ROW - size.height // 2)
     assert band.source is ProposalSource.MANUAL
-    assert protein_of(s, protein).box_size == size
+    assert boxes_of(s, protein).box_size == size
     assert_nets_current(s)
 
 
@@ -4359,12 +4406,12 @@ def test_move_box_reads_the_rect_by_its_centre(tmp_path):
 
     def calibrate(draft: Project) -> None:  # MWs where the image has no curve
         for protein in draft.batch.proteins:
-            for band in protein.bands:
+            for band in draft.batch.boxes_of(protein).bands:
                 band.apparent_mw = 55.0
 
     plant(s, calibrate)
     untouched = band_of(s, b)
-    size = protein_of(s, protein).box_size
+    size = boxes_of(s, protein).box_size
 
     ops.move_box(s, a, (30, 44, 10, 20))  # corners in any order; a 20x24 rect centred (20, 32)
     moved = band_of(s, a)
@@ -4373,7 +4420,7 @@ def test_move_box_reads_the_rect_by_its_centre(tmp_path):
     assert moved.lane_index == 0  # never derived from x
     assert moved.apparent_mw is None  # recomputed at its new centre: no curve there
     assert band_of(s, b) == untouched  # bit-identical, apparent MW kept
-    assert protein_of(s, protein).box_size == size
+    assert boxes_of(s, protein).box_size == size
     assert_nets_current(s)
 
 
@@ -4381,10 +4428,10 @@ def test_set_box_size_recentres_and_requantifies(tmp_path):
     s, _, protein = boxed(tmp_path)
     for x, lane in ((NARROW_X, 0), (WIDE_X, 1)):
         ops.place_box(s, protein, x, ROW, lane_index=lane, grow=True)
-    old = protein_of(s, protein)
+    old = boxes_of(s, protein)
     size = BoxSize(width=24, height=9)
     ops.set_box_size(s, protein, size)
-    resized = protein_of(s, protein)
+    resized = boxes_of(s, protein)
     assert resized.box_size == size
     expected = boxes.resize_all(
         [band.box.rect(old.box_size) for band in old.bands], size, width=W, height=H
@@ -4409,9 +4456,9 @@ def test_remove_box_keeps_the_size_and_the_other_boxes(tmp_path):
     s, _, protein = boxed(tmp_path)
     a = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     b = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
-    before = protein_of(s, protein)
+    before = boxes_of(s, protein)
     ops.remove_box(s, a)
-    after = protein_of(s, protein)
+    after = boxes_of(s, protein)
     assert after.box_size == before.box_size
     assert after.bands == [band for band in before.bands if band.id == b]
 
@@ -4478,7 +4525,12 @@ def measured(band: Band) -> list:
 
 def _bands_on_image(s: ProjectSession, image_id: str) -> list[str]:
     batch = s.project.batch
-    return [b.id for p in batch.proteins if p.image_id == image_id for b in p.bands]
+    return [
+        b.id
+        for p in batch.proteins
+        if batch.image_id_of(p) == image_id
+        for b in batch.boxes_of(p).bands
+    ]
 
 
 def test_a_box_of_another_protein_moves_a_neighbours_net_in_the_same_change(tmp_path):
@@ -4574,16 +4626,16 @@ def test_every_box_writer_requantifies_the_whole_image(tmp_path):
         ("clear_boxes", lambda: ops.clear_boxes(s, b)),
     ]
     for action, step in steps:
-        before = [measured(band) for band in protein_of(s, a).bands]
+        before = [measured(band) for band in boxes_of(s, a).bands]
         step()  # an edit of GAPDH's boxes only
         assert s.project.log[-1].action == action
-        after = [measured(band) for band in protein_of(s, a).bands]
+        after = [measured(band) for band in boxes_of(s, a).bands]
         assert after != before, action  # β-catenin's bands are measured again
         assert_nets_current(s)
     ops.place_box(s, b, 62, ROW, lane_index=2, grow=False)
-    before = [measured(band) for band in protein_of(s, a).bands]
+    before = [measured(band) for band in boxes_of(s, a).bands]
     ops.remove_protein(s, b)
-    assert [measured(band) for band in protein_of(s, a).bands] != before
+    assert [measured(band) for band in boxes_of(s, a).bands] != before
     assert_nets_current(s)
     ops.set_polarity(s, image, LIGHT)
     assert_nets_current(s)
@@ -4598,7 +4650,11 @@ def _pick(rng: np.random.Generator, items: Sequence):
 
 
 def _band_ids(s: ProjectSession) -> list[str]:
-    return [band.id for protein in s.project.batch.proteins for band in protein.bands]
+    return [
+        band.id
+        for protein in s.project.batch.proteins
+        for band in s.project.batch.boxes_of(protein).bands
+    ]
 
 
 def _protein_ids(s: ProjectSession) -> list[str]:
@@ -4614,7 +4670,7 @@ def _step_place(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> N
 
 def _step_move(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
     protein, band = s.project.batch.find_band(_pick(rng, _band_ids(s)))
-    x0, y0, x1, y1 = band.box.rect(protein.box_size)
+    x0, y0, x1, y1 = band.box.rect(s.project.batch.boxes_of(protein).box_size)
     dx, dy = int(rng.integers(-12, 13)), int(rng.integers(-10, 11))
     ops.move_box(s, band.id, (x0 + dx, y0 + dy, x1 + dx, y1 + dy))
 
@@ -4728,11 +4784,11 @@ def test_a_legacy_project_keeps_the_image_median_through_its_edits(tmp_path):
     s, _, proteins = legacy_scene(tmp_path)
     assert s.project.background_method == "global_median"
     for protein in s.project.batch.proteins:
-        median = s.project.batch.find_image(protein.image_id).background
-        for band in protein.bands:
+        median = s.project.batch.image_of(protein).background
+        for band in s.project.batch.boxes_of(protein).bands:
             assert (band.background_level, band.background_mode) == (median, "global_median")
     assert_nets_current(s)  # the legacy invariant: the median, each pixel floored
-    [first, *_] = protein_of(s, proteins[0]).bands
+    [first, *_] = boxes_of(s, proteins[0]).bands
     ops.move_box(s, first.id, (60, 20, 76, 28))
     ops.set_box_size(s, proteins[0], BoxSize(width=18, height=8))
     assert s.project.background_method == "global_median"  # edits never switch it
@@ -4743,7 +4799,11 @@ def test_a_legacy_project_keeps_the_image_median_through_its_edits(tmp_path):
 
 def test_requantify_switches_a_legacy_project_to_the_local_background(tmp_path):
     s, images, _ = legacy_scene(tmp_path)
-    legacy = {band.id: band.net for p in s.project.batch.proteins for band in p.bands}
+    legacy = {
+        band.id: band.net
+        for p in s.project.batch.proteins
+        for band in s.project.batch.boxes_of(p).bands
+    }
 
     assert ops.requantify(s) == tuple(images)  # the images with bands, in order
     entry = s.project.log[-1]
@@ -4753,7 +4813,7 @@ def test_requantify_switches_a_legacy_project_to_the_local_background(tmp_path):
     )
     assert entry.content_hash == content_hash(s.project)
     assert s.project.background_method == "ring_median_v1"
-    bands = [band for p in s.project.batch.proteins for band in p.bands]
+    bands = [band for p in s.project.batch.proteins for band in s.project.batch.boxes_of(p).bands]
     assert all(band.net != legacy[band.id] for band in bands)
     assert {band.background_mode for band in bands} <= {"symmetric", "asymmetric", "image"}
     assert_nets_current(s)
@@ -4767,7 +4827,9 @@ def test_requantify_switches_a_legacy_project_to_the_local_background(tmp_path):
 
     ops.undo(s)  # the switch taken back whole: the legacy nets, not recomputed
     assert s.project.background_method == "global_median"
-    assert {b.id: b.net for p in s.project.batch.proteins for b in p.bands} == legacy
+    assert {
+        b.id: b.net for p in s.project.batch.proteins for b in s.project.batch.boxes_of(p).bands
+    } == legacy
     assert_nets_current(s)
 
 
@@ -4803,25 +4865,28 @@ def test_requantify_switches_a_legacy_project_without_boxes(tmp_path):
 
 def test_a_schema_1_project_opens_with_its_nets_until_requantified(tmp_path):
     s, _, proteins = legacy_scene(tmp_path)
-    nets = {band.id: band.net for p in s.project.batch.proteins for band in p.bands}
-    # Its project.json as a schema-1 build wrote it (without a log, here).
+    nets = {
+        band.id: band.net
+        for p in s.project.batch.proteins
+        for band in s.project.batch.boxes_of(p).bands
+    }
+    # Its project.json as a schema-1 build wrote it (without a log, here): its
+    # content as schema 1 held it.
     path = s.folder / storage.PROJECT_FILE
-    doc = json.loads(path.read_bytes())
-    del doc["background_method"]
-    doc.update(schema_version=1, log=[])
-    for protein in doc["batch"]["proteins"]:
-        for band in protein["bands"]:
-            for name in ("background_level", "background_mode", "background_spread"):
-                del band[name]
+    doc = storage._EARLIER_CONTENT[1](storage.content_document(s.project))
+    assert doc["schema_version"] == 1 and "background_method" not in doc
+    doc.update(next_id=s.project.next_id, log=[])
     path.write_bytes(storage.document_bytes(doc))
 
     reopened = ops.open_project(s.folder, clock=FakeClock())
     project = reopened.project
     assert [entry.action for entry in project.log] == ["migrate"]
     assert project.background_method == "global_median"
-    assert {b.id: b.net for p in project.batch.proteins for b in p.bands} == nets
+    assert {
+        b.id: b.net for p in project.batch.proteins for b in project.batch.boxes_of(p).bands
+    } == nets
     assert_nets_current(reopened)  # the stored nets are what the pixels give
-    [first, *_] = protein_of(reopened, proteins[0]).bands
+    [first, *_] = boxes_of(reopened, proteins[0]).bands
     ops.move_box(reopened, first.id, (60, 20, 76, 28))  # still the median's
     assert_nets_current(reopened)
     ops.requantify(reopened)
@@ -4894,7 +4959,10 @@ def _parity_session(tmp_path: Path, pixels: np.ndarray, polarity: Polarity) -> P
 def _stored_backgrounds(s: ProjectSession) -> list[list]:
     """Each protein's stored band backgrounds, by lane: (level, mode, spread)."""
     return [
-        [[b.background_level, b.background_mode, b.background_spread] for b in protein.bands]
+        [
+            [b.background_level, b.background_mode, b.background_spread]
+            for b in s.project.batch.boxes_of(protein).bands
+        ]
         for protein in s.project.batch.proteins
     ]
 
@@ -5300,9 +5368,9 @@ def test_a_seed_click_at_the_edge_is_proposed_from_the_band(tmp_path):
     ops.place_box(s, protein, lane_x(1), LANE_ROW, lane_index=1, grow=False)
     ops.place_box(s, protein, lane_x(3), 8, lane_index=3, grow=False)  # another row
     band = ops.place_box(s, protein, lane_x(5), LANE_ROW, grow=True)
-    assert band_of(s, band).box.x + protein_of(s, protein).box_size.width == LANE_W
+    assert band_of(s, band).box.x + boxes_of(s, protein).box_size.width == LANE_W
     assert band_of(s, band).lane_index == 5
-    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image_of(s, protein))
     # In a row of its own below: inside the target's wide boxes, two proteins'
     # boxes would measure one band (#114).
     ops.place_box(s, other, lane_x(0), LANE_ROW + 20, lane_index=0, grow=False)
@@ -5318,7 +5386,7 @@ def test_a_box_dragged_out_of_order_does_not_capture_other_lanes(tmp_path):
         for lane in (0, 1, 2, 3)
     }
     ops.move_box(s, bands[2], (lane_x(5) - 5, 20, lane_x(5) + 5, 40))  # lane 2 dragged right
-    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, protein_of(s, protein).image_id)
+    other = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image_of(s, protein))
     band = ops.place_box(s, other, lane_x(4), LANE_ROW, grow=False)
     assert band_of(s, band).lane_index == 4
 
@@ -5475,7 +5543,7 @@ def import_encoded(
 
 def six_boxes(s: ProjectSession, image: str, role: Role = Role.TARGET) -> tuple[str, list[str]]:
     """A protein on ``image`` with a fixed-size box on each of the six bands."""
-    if not s.project.batch.lanes:
+    if not s.project.batch.only_lanes():
         ops.set_lanes(s, [LaneInput(f"c{i}") for i in range(6)])
     name = "β-catenin" if role is Role.TARGET else "GAPDH"
     protein = ops.add_protein(s, name, role, image, box_size=POSSIBLE_BOX)
@@ -5650,7 +5718,7 @@ def test_a_band_edit_fills_the_flag_of_a_project_saved_before_it(tmp_path):
     protein, band_ids = six_boxes(s, image)
 
     def forget(draft: Project) -> None:
-        for band in draft.batch.find_protein(protein).bands:
+        for band in draft.batch.boxes_of(draft.batch.find_protein(protein)).bands:
             band.possibly_clipped = None
 
     plant(s, forget)
@@ -5699,7 +5767,7 @@ def test_requantify_assesses_the_bands_of_a_project_saved_before_it(tmp_path):
     loading, loading_ids = six_boxes(s, assessed, Role.LOADING_CONTROL)
 
     def forget(draft: Project) -> None:
-        for band in draft.batch.find_protein(target).bands:
+        for band in draft.batch.boxes_of(draft.batch.find_protein(target)).bands:
             band.possibly_clipped = None
 
     plant(s, forget)
@@ -5782,20 +5850,21 @@ def _file_sha256(s: ProjectSession, file: str) -> str:
 
 def _rect_of(s: ProjectSession, band_id: str) -> list[int]:
     protein, band = s.project.batch.find_band(band_id)
-    return list(band.box.rect(protein.box_size))
+    return list(band.box.rect(s.project.batch.boxes_of(protein).box_size))
 
 
 def _size_of(s: ProjectSession, protein_id: str) -> dict[str, int]:
-    size = s.project.batch.find_protein(protein_id).box_size
+    size = s.project.batch.boxes_of(s.project.batch.find_protein(protein_id)).box_size
     return {"width": size.width, "height": size.height}
 
 
-def _protein(protein_id: str, name: str, role: str, image_id: str, **fields) -> dict:
+def _protein(protein_id: str, row_id: str, name: str, role: str, image_id: str, **fields) -> dict:
     """add_protein's params with its defaults (no expected MW, the default MW
     tolerance, no loading controls, the initial box size of the blot, nothing
-    pinned)."""
+    pinned), and its row's id."""
     return {
         "protein_id": protein_id,
+        "row_id": row_id,
         "name": name,
         "role": role,
         "image_id": image_id,
@@ -5812,15 +5881,16 @@ def _plant_step_records(s: ProjectSession) -> None:
     """:data:`LOGGED_STEPS`' not-detected records, in one planted change."""
 
     def change(draft: Project) -> None:
-        draft.batch.find_protein("prot-4").undetected.append(_record(2))
-        draft.batch.find_protein("prot-8").undetected.append(_record(1))
+        draft.batch.boxes_of(draft.batch.find_protein("prot-7")).undetected.append(_record(2))
+        draft.batch.boxes_of(draft.batch.find_protein("prot-15")).undetected.append(_record(1))
 
     plant(s, change)
 
 
 # Every logged operation, as (call, action, the params it must log). ``expected``
 # reads the session after the call, for values the pixels decide (grown rects).
-# Ids follow the one counter: img-1, mem-2, img-3, then proteins and bands.
+# Ids follow the one counter: img-1, mem-2, the lane table lt-3 and the area
+# arena-4; img-5 and its area arena-6; then each protein and its row, and bands.
 LOGGED_STEPS = [
     (
         lambda s: import_blot(s, blot(), "β-actin 10 µM.tif"),
@@ -5833,19 +5903,22 @@ LOGGED_STEPS = [
             "kind": "chemiluminescence",
             "polarity": "dark_on_light",
             "sha256": _file_sha256(s, "img-1.tif"),
+            "arena_id": "arena-4",
+            "lane_table_id": "lt-3",
         },
     ),
     (
         lambda s: import_blot(s, blot(), "reprobe β.tif", LIGHT, membrane_id="mem-2"),
         "import_image",
         lambda s: {
-            "image_id": "img-3",
+            "image_id": "img-5",
             "membrane_id": "mem-2",
             "new_membrane": False,
             "original_name": "reprobe β.tif",
             "kind": "chemiluminescence",
             "polarity": "light_on_dark",
-            "sha256": _file_sha256(s, "img-3.tif"),
+            "sha256": _file_sha256(s, "img-5.tif"),
+            "arena_id": "arena-6",
         },
     ),
     (
@@ -5894,45 +5967,47 @@ LOGGED_STEPS = [
     (
         lambda s: ops.add_protein(s, " β-catenin ", Role.TARGET, "img-1", expected_mw=92),
         "add_protein",
-        lambda s: _protein("prot-4", "β-catenin", "target", "img-1", expected_mw=92.0),
+        lambda s: _protein("prot-7", "row-8", "β-catenin", "target", "img-1", expected_mw=92.0),
     ),
     (
-        lambda s: ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, "img-3"),
+        lambda s: ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, "img-5"),
         "add_protein",
-        lambda s: _protein("prot-5", "GAPDH", "loading control", "img-3"),
+        lambda s: _protein("prot-9", "row-10", "GAPDH", "loading control", "img-5"),
     ),
     (
         lambda s: ops.add_protein(s, "p53", Role.TARGET, "img-1"),
         "add_protein",
-        lambda s: _protein("prot-6", "p53", "target", "img-1"),
+        lambda s: _protein("prot-11", "row-12", "p53", "target", "img-1"),
     ),
     (
         # A target becomes the second loading control: β-catenin, which used GAPDH
         # implicitly, is pinned to it. p53 itself is not listed, and its name,
         # typed the same once cleaned, is not a change.
-        lambda s: ops.edit_protein(s, "prot-6", name=" p53 ", role=Role.LOADING_CONTROL),
+        lambda s: ops.edit_protein(s, "prot-11", name=" p53 ", role=Role.LOADING_CONTROL),
         "edit_protein",
         lambda s: {
-            "protein_id": "prot-6",
-            "pinned_targets": ["prot-4"],
+            "protein_id": "prot-11",
+            "pinned_targets": ["prot-7"],
             "role": "loading control",
             "dropped_undetected": [],
         },
     ),
     (
         lambda s: ops.add_protein(
-            s, "β-actin", Role.TARGET, "img-1", loading_control_ids=["prot-5"]
+            s, "β-actin", Role.TARGET, "img-1", loading_control_ids=["prot-9"]
         ),
         "add_protein",
-        lambda s: _protein("prot-7", "β-actin", "target", "img-1", loading_control_ids=["prot-5"]),
+        lambda s: _protein(
+            "prot-13", "row-14", "β-actin", "target", "img-1", loading_control_ids=["prot-9"]
+        ),
     ),
     (
-        lambda s: ops.remove_protein(s, "prot-5"),
+        lambda s: ops.remove_protein(s, "prot-9"),
         "remove_protein",
         lambda s: {
-            "protein_id": "prot-5",
-            "removed": ["prot-5"],
-            "detached_targets": ["prot-4", "prot-7"],
+            "protein_id": "prot-9",
+            "removed": ["prot-9", "row-10"],
+            "detached_targets": ["prot-7", "prot-13"],
             "unpaired_images": [],
             "unfitted_membranes": [],
             "removed_undetected": [],
@@ -5941,24 +6016,25 @@ LOGGED_STEPS = [
     (
         # A second loading control is added: the targets using p53 implicitly are pinned.
         lambda s: ops.add_protein(
-            s, "α-tubulin", Role.LOADING_CONTROL, "img-3", box_size=BoxSize(width=10, height=6)
+            s, "α-tubulin", Role.LOADING_CONTROL, "img-5", box_size=BoxSize(width=10, height=6)
         ),
         "add_protein",
         lambda s: _protein(
-            "prot-8",
+            "prot-15",
+            "row-16",
             "α-tubulin",
             "loading control",
-            "img-3",
+            "img-5",
             box_size={"width": 10, "height": 6},
-            pinned_targets=["prot-4", "prot-7"],
+            pinned_targets=["prot-7", "prot-13"],
         ),
     ),
     (
         # A target turned into a loading control loses its list: an implicit change.
-        lambda s: ops.edit_protein(s, "prot-7", role=Role.LOADING_CONTROL, expected_mw=42),
+        lambda s: ops.edit_protein(s, "prot-13", role=Role.LOADING_CONTROL, expected_mw=42),
         "edit_protein",
         lambda s: {
-            "protein_id": "prot-7",
+            "protein_id": "prot-13",
             "pinned_targets": [],
             "role": "loading control",
             "expected_mw": 42.0,
@@ -5967,75 +6043,75 @@ LOGGED_STEPS = [
         },
     ),
     (
-        lambda s: ops.place_box(s, "prot-4", NARROW_X, ROW, lane_index=0, grow=True),
+        lambda s: ops.place_box(s, "prot-7", NARROW_X, ROW, lane_index=0, grow=True),
         "place_box",
         lambda s: {
-            "band_id": "band-9",
-            "protein_id": "prot-4",
+            "band_id": "band-17",
+            "protein_id": "prot-7",
             "x": NARROW_X,
             "y": ROW,
             "grow": True,
             "lane_index": 0,
             "lane_proposed": False,
-            "rect": _rect_of(s, "band-9"),
-            "box_size": _size_of(s, "prot-4"),  # the first seed click sets it
+            "rect": _rect_of(s, "band-17"),
+            "box_size": _size_of(s, "prot-7"),  # the first seed click sets it
             "replaced_undetected": None,
         },
     ),
     (
-        lambda s: ops.place_box(s, "prot-4", WIDE_X, ROW, lane_index=1, grow=True),
+        lambda s: ops.place_box(s, "prot-7", WIDE_X, ROW, lane_index=1, grow=True),
         "place_box",
         lambda s: {
-            "band_id": "band-10",
-            "protein_id": "prot-4",
+            "band_id": "band-18",
+            "protein_id": "prot-7",
             "x": WIDE_X,
             "y": ROW,
             "grow": True,
             "lane_index": 1,
             "lane_proposed": False,
-            "rect": _rect_of(s, "band-10"),
-            "box_size": _size_of(s, "prot-4"),  # grown by the wide band
+            "rect": _rect_of(s, "band-18"),
+            "box_size": _size_of(s, "prot-7"),  # grown by the wide band
             "replaced_undetected": None,
         },
     ),
     (
-        lambda s: ops.place_box(s, "prot-4", 150, ROW, grow=False),
+        lambda s: ops.place_box(s, "prot-7", 150, ROW, grow=False),
         "place_box",
         lambda s: {
-            "band_id": "band-11",
-            "protein_id": "prot-4",
+            "band_id": "band-19",
+            "protein_id": "prot-7",
             "x": 150,
             "y": ROW,
             "grow": False,
             "lane_index": 2,  # proposed from the two boxes before
             "lane_proposed": True,
-            "rect": list(boxes.centered_rect(150, ROW, protein_of(s, "prot-4").box_size, W, H)),
-            "box_size": _size_of(s, "prot-4"),
+            "rect": list(boxes.centered_rect(150, ROW, boxes_of(s, "prot-7").box_size, W, H)),
+            "box_size": _size_of(s, "prot-7"),
             "replaced_undetected": None,
         },
     ),
     (
-        lambda s: ops.move_box(s, "band-9", (30, 44, 10, 20)),
+        lambda s: ops.move_box(s, "band-17", (30, 44, 10, 20)),
         "move_box",
         lambda s: {  # after the centre snap, not as dragged
-            "band_id": "band-9",
-            "rect": list(boxes.centered_rect(20, 32, protein_of(s, "prot-4").box_size, W, H)),
+            "band_id": "band-17",
+            "rect": list(boxes.centered_rect(20, 32, boxes_of(s, "prot-7").box_size, W, H)),
         },
     ),
     (
-        lambda s: ops.set_box_size(s, "prot-4", BoxSize(width=12, height=6)),
+        lambda s: ops.set_box_size(s, "prot-7", BoxSize(width=12, height=6)),
         "set_box_size",
         lambda s: {
-            "protein_id": "prot-4",
+            "protein_id": "prot-7",
             "box_size": {"width": 12, "height": 6},
             "fitted_size": {"width": 12, "height": 6},  # no padding yet: the same size
         },
     ),
     (
-        lambda s: ops.set_box_padding(s, "prot-4", across=2, along=3),
+        lambda s: ops.set_box_padding(s, "prot-7", across=2, along=3),
         "set_box_padding",
         lambda s: {
-            "protein_id": "prot-4",
+            "protein_id": "prot-7",
             "box_padding": {"across": 2, "along": 3},
             "box_size": {"width": 16, "height": 12},  # the fitted 12x6 plus the padding
         },
@@ -6057,16 +6133,16 @@ LOGGED_STEPS = [
         lambda s: {"from": "global_median", "to": "ring_median_v1", "images": ["img-1"]},
     ),
     (
-        lambda s: ops.remove_box(s, "band-10"),
+        lambda s: ops.remove_box(s, "band-18"),
         "remove_box",
-        lambda s: {"band_id": "band-10", "protein_id": "prot-4", "lane_index": 1},
+        lambda s: {"band_id": "band-18", "protein_id": "prot-7", "lane_index": 1},
     ),
     (
-        lambda s: ops.set_box_lane(s, "band-11", 1),  # into the lane band-10 left
+        lambda s: ops.set_box_lane(s, "band-19", 1),  # into the lane band-18 left
         "set_box_lane",
         lambda s: {
-            "band_id": "band-11",
-            "protein_id": "prot-4",
+            "band_id": "band-19",
+            "protein_id": "prot-7",
             "from_lane": 2,
             "lane_index": 1,
             "replaced_undetected": None,
@@ -6080,21 +6156,21 @@ LOGGED_STEPS = [
         lambda s: {},
     ),
     (
-        lambda s: ops.remove_undetected(s, "prot-4", 2),
+        lambda s: ops.remove_undetected(s, "prot-7", 2),
         "remove_undetected",
         lambda s: {
-            "protein_id": "prot-4",
+            "protein_id": "prot-7",
             "lane_index": 2,
             "band_index": 0,
-            "removed": _record_json("prot-4", _record(2)),
+            "removed": _record_json("prot-7", _record(2)),
         },
     ),
     (
-        lambda s: ops.place_box(s, "prot-8", NARROW_X, ROW, lane_index=0, grow=False),
+        lambda s: ops.place_box(s, "prot-15", NARROW_X, ROW, lane_index=0, grow=False),
         "place_box",
         lambda s: {
-            "band_id": "band-12",
-            "protein_id": "prot-8",
+            "band_id": "band-20",
+            "protein_id": "prot-15",
             "x": NARROW_X,
             "y": ROW,
             "grow": False,
@@ -6106,13 +6182,13 @@ LOGGED_STEPS = [
         },
     ),
     (
-        lambda s: ops.clear_boxes(s, "prot-8"),
+        lambda s: ops.clear_boxes(s, "prot-15"),
         "clear_boxes",
         lambda s: {
-            "protein_id": "prot-8",
-            "removed": ["band-12"],
+            "protein_id": "prot-15",
+            "removed": ["band-20"],
             "lane_indices": [0],
-            "dropped_undetected": [_record_json("prot-8", _record(1))],
+            "dropped_undetected": [_record_json("prot-15", _record(1))],
         },
     ),
     (
@@ -6120,7 +6196,18 @@ LOGGED_STEPS = [
         "remove_image",
         lambda s: {
             "image_id": "img-1",
-            "removed": ["img-1", "prot-4", "prot-6", "prot-7", "band-9", "band-11"],
+            "removed": [
+                "img-1",
+                "arena-4",
+                "prot-7",
+                "prot-11",
+                "prot-13",
+                "row-8",
+                "row-12",
+                "row-14",
+                "band-17",
+                "band-19",
+            ],
             "detached_targets": [],
             "unpaired_images": [],
             "unfitted_membranes": [],
@@ -6492,7 +6579,7 @@ def plant_records(
     def change(draft: Project) -> None:
         protein = draft.batch.find_protein(protein_id)
         protein.expected_band_count = bands
-        protein.undetected.extend(records)
+        draft.batch.boxes_of(protein).undetected.extend(records)
 
     plant(session, change)
 
@@ -6512,7 +6599,7 @@ def _record_json(protein_id: str, u: UndetectedBand) -> dict:
 
 
 def _keys(session: ProjectSession, protein_id: str) -> list[tuple[int, int]]:
-    return [(u.lane_index, u.band_index) for u in protein_of(session, protein_id).undetected]
+    return [(u.lane_index, u.band_index) for u in boxes_of(session, protein_id).undetected]
 
 
 def test_place_box_replaces_the_record_in_its_lane(tmp_path):
@@ -6590,11 +6677,11 @@ def test_set_polarity_drops_the_records_on_that_image(tmp_path):
     plant_records(s, beta, *beta_records)
     plant_records(s, gapdh, gapdh_record)
     plant_records(s, tubulin, _record(2))
-    kept = protein_of(s, tubulin).undetected
+    kept = boxes_of(s, tubulin).undetected
 
     ops.set_polarity(s, first, LIGHT)
     assert (_keys(s, beta), _keys(s, gapdh)) == ([], [])
-    assert protein_of(s, tubulin).undetected == kept  # another image's records stay
+    assert boxes_of(s, tubulin).undetected == kept  # another image's records stay
     assert s.project.log[-1].params == {
         "image_id": first,
         "polarity": "light_on_dark",
@@ -6733,15 +6820,15 @@ def test_move_and_resize_keep_the_records(tmp_path):
     s, _, protein = boxed(tmp_path)
     band = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     plant_records(s, protein, _record(2))
-    kept = protein_of(s, protein).undetected
+    kept = boxes_of(s, protein).undetected
     ops.move_box(s, band, (30, 22, 50, 38))
     ops.set_box_size(s, protein, BoxSize(width=12, height=6))
     ops.edit_protein(s, protein, name="β-catenin (E-5)", expected_mw=92)
-    assert protein_of(s, protein).undetected == kept
+    assert boxes_of(s, protein).undetected == kept
 
 
 def _records_json(session: ProjectSession, protein_id: str) -> list[dict]:
-    return [_record_json(protein_id, u) for u in protein_of(session, protein_id).undetected]
+    return [_record_json(protein_id, u) for u in boxes_of(session, protein_id).undetected]
 
 
 def test_removals_take_the_records_along(tmp_path):
@@ -6749,7 +6836,7 @@ def test_removals_take_the_records_along(tmp_path):
     assert _keys(s, "prot-9") == [(2, 0), (3, 0)]
     gapdh = _records_json(s, "prot-9")
     cascade = ops.remove_protein(s, "prot-9")  # GAPDH: records only in lanes 2 and 3
-    assert cascade.removed == ("prot-9", "band-17", "band-18")  # records have no ids
+    assert cascade.removed == ("prot-9", "row-26", "band-17", "band-18")  # records: no ids
     # The log keeps them whole, since they have no ids to name them by.
     assert s.project.log[-1].params == {
         "protein_id": "prot-9",
@@ -6758,14 +6845,22 @@ def test_removals_take_the_records_along(tmp_path):
     }
     beta = _records_json(s, "prot-7")
     cascade = ops.remove_image(s, "img-2")  # β-catenin, with its lane-2 record
-    assert cascade.removed == ("img-2", "prot-7", "band-10", "band-11", "band-12")
+    assert cascade.removed == (
+        "img-2",
+        "arena-20",
+        "prot-7",
+        "row-24",
+        "band-10",
+        "band-11",
+        "band-12",
+    )
     assert s.project.log[-1].params == {
         "image_id": "img-2",
         **_listed(cascade),
         "removed_undetected": beta,
         "dropped_undetected": [],
     }
-    assert all(not p.undetected for p in s.project.batch.proteins)
+    assert all(not s.project.batch.boxes_of(p).undetected for p in s.project.batch.proteins)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
     assert b'"undetected"' not in saved  # an empty list is never written
     assert load_project(s.folder) == s.project
@@ -6858,7 +6953,9 @@ def test_a_calibration_change_drops_the_membranes_mw_guided_records(tmp_path):
     # β-catenin (img-2, linked to the marker img-3): its lane-2 record, MW-guided.
 
     def guided(draft: Project) -> None:
-        draft.batch.find_protein("prot-7").undetected[0].source = ProposalSource.MW_GUIDED
+        draft.batch.boxes_of(draft.batch.find_protein("prot-7")).undetected[
+            0
+        ].source = ProposalSource.MW_GUIDED
 
     plant(s, guided)
     [beta_guided] = _records_json(s, "prot-7")
@@ -6894,7 +6991,9 @@ def test_a_calibration_change_drops_the_membranes_mw_guided_records(tmp_path):
     s = open_sample(tmp_path / "reprobe", project=make_project_with_undetected())
 
     def guided(draft: Project) -> None:
-        draft.batch.find_protein("prot-7").undetected[0].source = ProposalSource.MW_GUIDED
+        draft.batch.boxes_of(draft.batch.find_protein("prot-7")).undetected[
+            0
+        ].source = ProposalSource.MW_GUIDED
 
     plant(s, guided)
     gapdh = _records_json(s, "prot-9")
@@ -6922,7 +7021,9 @@ def test_dropping_records_asks_the_predicate_once_per_record(tmp_path):
     dropped = ops._drop_undetected_where(draft.batch, draft.batch.find_protein(protein), drop)
     assert asked == [0, 1, 2]
     assert dropped == [_record_json(protein, _record(1))]
-    assert [u.lane_index for u in draft.batch.find_protein(protein).undetected] == [0, 2]
+    assert [
+        u.lane_index for u in draft.batch.boxes_of(draft.batch.find_protein(protein)).undetected
+    ] == [0, 2]
 
 
 # --- #51: committing a dragged row ---
@@ -6964,11 +7065,11 @@ def detected(s: ProjectSession, protein_id: str, row) -> RowDetection:
     """What detection finds in ``row`` on the stored pixels, called as the
     operation calls it."""
     batch = s.project.batch
-    image = batch.find_image(batch.find_protein(protein_id).image_id)
+    image = batch.image_of(batch.find_protein(protein_id))
     return rowdetect.detect_row(
         s.pixels(image.id),
         row,
-        len(batch.lanes),
+        len(batch.only_lanes()),
         background=image.background,
         dark_on_light=image.polarity.dark_on_light,
         saturated_at=saturation_level(
@@ -6981,11 +7082,11 @@ def detected(s: ProjectSession, protein_id: str, row) -> RowDetection:
 
 def lane_bands(s: ProjectSession, protein_id: str) -> dict[int, Band]:
     """The protein's band-index-0 boxes by lane."""
-    return {b.lane_index: b for b in protein_of(s, protein_id).bands if b.band_index == 0}
+    return {b.lane_index: b for b in boxes_of(s, protein_id).bands if b.band_index == 0}
 
 
 def rects_by_lane(s: ProjectSession, protein_id: str) -> dict[int, tuple[int, int, int, int]]:
-    size = protein_of(s, protein_id).box_size
+    size = boxes_of(s, protein_id).box_size
     return {lane: band.box.rect(size) for lane, band in lane_bands(s, protein_id).items()}
 
 
@@ -6997,7 +7098,7 @@ def at_lane(case: RowCase, lane: int) -> tuple[int, int]:
 def edit_by_hand(s: ProjectSession, band_id: str, *, to: tuple[int, int] | None = None) -> None:
     """Move a box 1 px to the right, or centre it on ``to``: the user edited it."""
     protein, band = s.project.batch.find_band(band_id)
-    x0, y0, x1, y1 = band.box.rect(protein.box_size)
+    x0, y0, x1, y1 = band.box.rect(s.project.batch.boxes_of(protein).box_size)
     rect = (x0 + 1, y0, x1 + 1, y1) if to is None else (*to, *to)
     ops.move_box(s, band_id, rect)
     assert band_of(s, band_id).manually_edited
@@ -7072,7 +7173,7 @@ def test_a_row_places_one_box_per_lane(tmp_path, name):
     placement = ops.detect_row_boxes(s, protein, case.row)
     bands = lane_bands(s, protein)
     assert rects_by_lane(s, protein) == dict(enumerate(found.slots))
-    assert protein_of(s, protein).box_size == found.size
+    assert boxes_of(s, protein).box_size == found.size
     for band in bands.values():
         assert (band.source, band.manually_edited, band.apparent_mw) == (
             ProposalSource.ROW_BOX,
@@ -7111,7 +7212,7 @@ def test_lanes_without_a_band_get_a_not_detected_record(tmp_path):
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert sorted(lane_bands(s, protein)) == [1, 2, 4, 5]
-    records = protein_of(s, protein).undetected
+    records = boxes_of(s, protein).undetected
     assert [(u.lane_index, u.band_index) for u in records] == [(0, 0), (3, 0)]
     for u in records:
         lane = found.lanes[u.lane_index]
@@ -7167,7 +7268,7 @@ def test_other_empty_lanes_are_left_not_measured(tmp_path, key, lane, reason):
     plant_records(s, protein, old)
 
     placement = ops.detect_row_boxes(s, protein, case.row)
-    assert protein_of(s, protein).undetected == []
+    assert boxes_of(s, protein).undetected == []
     assert sorted(lane_bands(s, protein)) == [i for i in range(6) if i != lane]
     assert placement.band_ids[lane] is None
     assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), (lane,))
@@ -7223,7 +7324,7 @@ def test_one_band_writes_no_record_at_slots_that_rest_on_it(tmp_path, placed, ro
 
     placement = ops.detect_row_boxes(s, protein, row)
     assert sorted(lane_bands(s, protein)) == [3]
-    assert protein_of(s, protein).undetected == []
+    assert boxes_of(s, protein).undetected == []
     assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), OTHER_LANES)
     assert placement.unlocated_lanes == OTHER_LANES
     assert [lane for lane, *_ in placement.empty] == list(OTHER_LANES)
@@ -7266,12 +7367,12 @@ def test_a_box_the_user_placed_where_no_band_is_found_is_kept(tmp_path, key, lan
     assert placement.kept_lanes == (lane,)
     assert (placement.replaced_band_ids, placement.removed_band_ids) == ((), ())
     assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), ())
-    assert protein_of(s, protein).undetected == []
+    assert boxes_of(s, protein).undetected == []
     [(empty_lane, empty_reason, _, _)] = placement.empty
     assert (empty_lane, empty_reason) == (lane, reason)
     # The box survives, so the size only grows; it stays on its own centre.
     size = BoxSize(width=found.size.width, height=30)
-    assert placement.box_size == protein_of(s, protein).box_size == size
+    assert placement.box_size == boxes_of(s, protein).box_size == size
     assert tuple(_rect_of(s, box)) == centred(s, image, before, size)
     rects = rects_by_lane(s, protein)
     for other, rect in enumerate(found.slots):
@@ -7313,7 +7414,7 @@ def test_a_detectors_box_where_no_band_is_found_goes(tmp_path, key, lane, reason
     assert placement.unmeasured_lanes == (() if recorded else (lane,))
     assert _keys(s, protein) == [(i, 0) for i in recorded]
     # Nothing survives, so the size is this detection's.
-    assert placement.box_size == protein_of(s, protein).box_size == found.size
+    assert placement.box_size == boxes_of(s, protein).box_size == found.size
     assert s.project.log[-1].params["removed_band_ids"] == [box]
     assert ops.compute(s).proteins[0].detected[lane] is (False if recorded else None)
 
@@ -7346,7 +7447,7 @@ def test_a_record_from_any_detector_gives_way(tmp_path):
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert placement.unmeasured_lanes == (4,)
-    assert protein_of(s, protein).undetected == []
+    assert boxes_of(s, protein).undetected == []
     assert s.project.log[-1].params["dropped_undetected"] == [_record_json(protein, old)]
 
 
@@ -7385,7 +7486,7 @@ def test_a_row_leaves_the_other_proteins_on_its_image_alone(tmp_path):
         x, y = at_lane(case, lane)
         ops.place_box(s, other, x, y + 8, lane_index=lane, grow=False)
     plant_records(s, other, _record(0))
-    before = protein_of(s, other)
+    before, before_boxes = protein_of(s, other), boxes_of(s, other)
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert None not in placement.band_ids
@@ -7399,12 +7500,14 @@ def test_a_row_leaves_the_other_proteins_on_its_image_alone(tmp_path):
         "clipped",
         "possibly_clipped",
     }
-    after = protein_of(s, other)
-    assert after.model_dump(exclude={"bands"}) == before.model_dump(exclude={"bands"})
-    assert [b.model_dump(exclude=measured) for b in after.bands] == [
-        b.model_dump(exclude=measured) for b in before.bands
+    after, after_boxes = protein_of(s, other), boxes_of(s, other)
+    assert after.model_dump(exclude={"rows"}) == before.model_dump(exclude={"rows"})
+    kept = after_boxes.model_dump(exclude={"bands"})
+    assert kept == before_boxes.model_dump(exclude={"bands"})
+    assert [b.model_dump(exclude=measured) for b in after_boxes.bands] == [
+        b.model_dump(exclude=measured) for b in before_boxes.bands
     ]
-    assert [b.net for b in after.bands] != [b.net for b in before.bands]
+    assert [b.net for b in after_boxes.bands] != [b.net for b in before_boxes.bands]
     assert_nets_current(s)
 
 
@@ -7435,11 +7538,11 @@ def test_a_row_replaces_boxes_nobody_edited(tmp_path):
     # Lane 2: nothing reaches the detection limit; the box an earlier detection
     # placed goes, a record comes.
     assert 2 not in bands and placement.band_ids[2] is None
-    assert [u.lane_index for u in protein_of(s, protein).undetected] == [2]
+    assert [u.lane_index for u in boxes_of(s, protein).undetected] == [2]
     # Lane 3: the record gives way to the band found there.
     assert bands[3].id == placement.band_ids[3] not in (clicked, fixed, guided, dropped)
     # Nothing survives, so the size and the boxes are this detection's.
-    assert protein_of(s, protein).box_size == found.size
+    assert boxes_of(s, protein).box_size == found.size
     assert rects_by_lane(s, protein) == {i: r for i, r in enumerate(found.slots) if r}
     assert (placement.replaced_band_ids, placement.removed_band_ids) == (
         (clicked, fixed, guided),
@@ -7463,7 +7566,7 @@ def test_a_hand_edited_box_is_kept_and_reported(tmp_path):
     edit_by_hand(s, on_band)
     edit_by_hand(s, on_empty)
     before = {band_id: tuple(_rect_of(s, band_id)) for band_id in (on_band, on_empty)}
-    old_size = protein_of(s, protein).box_size
+    old_size = boxes_of(s, protein).box_size
     found = detected(s, protein, case.row)
 
     placement = ops.detect_row_boxes(s, protein, case.row)
@@ -7474,7 +7577,7 @@ def test_a_hand_edited_box_is_kept_and_reported(tmp_path):
     assert (bands[1].source, bands[2].source) == (ProposalSource.CLICK, ProposalSource.MANUAL)
     assert bands[1].manually_edited and bands[2].manually_edited
     # A kept box's lane gets no record, even where nothing was detected.
-    assert protein_of(s, protein).undetected == []
+    assert boxes_of(s, protein).undetected == []
     assert (placement.undetected_lanes, placement.unmeasured_lanes) == ((), ())
     assert placement.empty[0][:2] == (2, "no_band")
     # Boxes survive, so the size only grows; they stay on their own centres.
@@ -7482,7 +7585,7 @@ def test_a_hand_edited_box_is_kept_and_reported(tmp_path):
         width=max(old_size.width, found.size.width),
         height=max(old_size.height, found.size.height),
     )
-    assert protein_of(s, protein).box_size == placement.box_size == size
+    assert boxes_of(s, protein).box_size == placement.box_size == size
     for band_id, rect in before.items():
         assert tuple(_rect_of(s, band_id)) == centred(s, image, rect, size)
     rects = rects_by_lane(s, protein)
@@ -7502,7 +7605,7 @@ def test_the_size_only_grows_while_a_box_survives(tmp_path):
 
     placement = ops.detect_row_boxes(s, protein, case.row)
     size = BoxSize(width=found.size.width, height=20)  # the larger of each
-    assert placement.box_size == protein_of(s, protein).box_size == size
+    assert placement.box_size == boxes_of(s, protein).box_size == size
     rects = rects_by_lane(s, protein)
     logged = s.project.log[-1].params["lanes"]
     for lane in range(1, 6):
@@ -7534,7 +7637,7 @@ def test_a_row_whose_bands_all_have_edited_boxes_grows_them_and_records(tmp_path
     placement = ops.detect_row_boxes(s, protein, case.row)
     assert placement.band_ids == tuple(ids.get(lane) for lane in range(6))  # the kept boxes
     assert placement.kept_lanes == (0, 1, 3, 4, 5)
-    assert placement.box_size == protein_of(s, protein).box_size == size
+    assert placement.box_size == boxes_of(s, protein).box_size == size
     assert rects_by_lane(s, protein) == {
         lane: centred(s, image, rect, size) for lane, rect in before.items()
     }
@@ -7564,7 +7667,7 @@ def test_another_bands_box_and_record_are_left_alone(tmp_path):
     assert band_of(s, other).band_index == 1 and other not in placement.band_ids
     assert placement.band_ids[0] is not None
     assert _keys(s, protein) == [(2, 0), (2, 1)]
-    assert protein_of(s, protein).undetected[1] == second
+    assert boxes_of(s, protein).undetected[1] == second
     size = BoxSize(width=max(40, found.size.width), height=16)
     assert placement.box_size == size
     assert placement.kept_lanes == ()  # only band-index-0 boxes are kept or replaced
@@ -7588,7 +7691,7 @@ def test_a_second_drag_corrects_the_first(tmp_path):
 
     second = ops.detect_row_boxes(s, protein, right)
     assert second.band_ids == second.replaced_band_ids == first.band_ids  # replaced in place
-    assert protein_of(s, protein).box_size == second.box_size == found.size
+    assert boxes_of(s, protein).box_size == second.box_size == found.size
     assert rects_by_lane(s, protein) == dict(enumerate(found.slots))
     assert_nets_current(s)
 
@@ -7645,7 +7748,7 @@ def test_a_hollow_band_is_over_exposed_where_the_image_s_limit_is_known(tmp_path
     assert placement.flags == (("hollow_band",) if hollow else ())
     assert any(note.startswith("lane 2: a hollow band") for note in placement.notes) is hollow
     assert s.project.log[-1].params["flags"] == list(placement.flags)
-    assert len([b for b in protein_of(s, protein).bands if b.lane_index == 1]) == 1
+    assert len([b for b in boxes_of(s, protein).bands if b.lane_index == 1]) == 1
 
 
 def test_the_row_commit_logs_every_lane(tmp_path):
@@ -7665,7 +7768,7 @@ def test_the_row_commit_logs_every_lane(tmp_path):
     # Each lane's box after the commit: replaced in place, new, or kept (lane 4).
     ids = [replaced, f"band-{next_id}", None, f"band-{next_id + 1}", kept, f"band-{next_id + 2}"]
     assert placement.band_ids == tuple(ids)
-    [written] = protein_of(s, protein).undetected
+    [written] = boxes_of(s, protein).undetected
     lanes = [
         {
             "band_id": band_id,
@@ -7759,7 +7862,7 @@ def test_a_first_row_over_a_neighbouring_panel_is_placed_with_its_lanes_doubtful
     params = s.project.log[-1].params
     assert (params["flags"], params["notes"]) == (["doubtful_lanes"], list(found.notes))
     ops.undo(s)
-    assert protein_of(s, protein).bands == []
+    assert boxes_of(s, protein).bands == []
 
 
 def test_lanes_on_the_image_that_check_the_reading_drop_the_doubt(tmp_path):
@@ -8507,7 +8610,7 @@ def test_a_row_off_the_lanes_on_its_image_names_the_boxes_that_placed_them(tmp_p
     with pytest.raises(OperationError) as info:
         ops.detect_row_boxes(s, protein, shifted(case, 70))
     assert (info.value.code, str(info.value)) == (ErrorCode.ROW_LANES_UNCLEAR, OFF_LANES)
-    others = tuple(b.id for b in protein_of(s, other).bands)
+    others = tuple(b.id for b in boxes_of(s, other).bands)
     assert len(others) == 2
     assert info.value.ids == (clicked, *others)  # proteins in order, then their boxes
     assert s.project is before
@@ -8648,7 +8751,7 @@ def test_a_row_on_lanes_numbered_right_to_left_reads_them_right_to_left(tmp_path
     }
     empty = [n - 1 - lane.lane for lane in found.lanes if lane.reason == "no_band"]
     assert list(placement.undetected_lanes) == sorted(empty)
-    assert [u.lane_index for u in protein_of(s, protein).undetected] == sorted(empty)
+    assert [u.lane_index for u in boxes_of(s, protein).undetected] == sorted(empty)
     assert placement.right_to_left
     entry = s.project.log[-1]
     assert entry.params["right_to_left"] is True
@@ -8722,7 +8825,7 @@ def test_lane_anchors_of_some_bands_only(tmp_path):
     assert sorted(mine + others) == sorted(lane_anchors(batch, ref))
     assert lane_anchors(batch, ref, without=own, only=own) == []
     # The ids of the same anchors, in the same order.
-    lanes = {b.id: b.lane_index for p in batch.proteins for b in p.bands}
+    lanes = {b.id: b.lane_index for p in batch.proteins for b in batch.boxes_of(p).bands}
     for kwargs in ({}, {"only": own}, {"without": own}):
         ids = lane_anchor_ids(batch, ref, **kwargs)
         assert [lanes[i] for i in ids] == [lane for _, lane in lane_anchors(batch, ref, **kwargs)]
@@ -8942,7 +9045,7 @@ def test_clicks_padded_wider_than_the_lane_pitch_count_among_the_lanes_numbered(
         lane = n - 1 - true if mirrored else true
         ops.place_box(s, actin, *at_lane(case, true), lane_index=lane, grow=True)
     ops.set_box_padding(s, actin, across=16)
-    grown = protein_of(s, actin)
+    grown = boxes_of(s, actin)
     assert grown.fitted_size.width < 69 and grown.box_size.width > 71
     gapdh = other_protein_in_lanes(s, image, case, (1, 3, 5), mirrored=not mirrored)
     names = ("'GAPDH'", "'actin'") if mirrored else ("'actin'", "'GAPDH'")
@@ -9029,7 +9132,7 @@ def test_fixed_boxes_wider_than_the_lane_pitch_count_among_the_lanes_numbered(
     gapdh = other_protein_in_lanes(s, image, case, (2, 3, 5))
     for true, lane in ((5, 0), (1, 4)):
         ops.place_box(s, protein, *at_lane(case, true), lane_index=lane, grow=False)
-    assert protein_of(s, protein).box_size.width > 48
+    assert boxes_of(s, protein).box_size.width > 48
     message = both_ways("'GAPDH'", "'β-catenin'")
     assert numbering_refused(s, protein, case.row, message, monkeypatch) == (gapdh, protein)
 
@@ -9391,10 +9494,10 @@ def test_a_row_reports_the_nets_it_changed_of_other_proteins_on_its_image(tmp_pa
     for lane in (1, 2):
         x, y = at_lane(case, lane)
         ops.place_box(s, other, x, y + 8, lane_index=lane, grow=False)
-    before = {b.id: b.net for b in protein_of(s, other).bands}
+    before = {b.id: b.net for b in boxes_of(s, other).bands}
 
     placement = ops.detect_row_boxes(s, protein, case.row)
-    after = {b.id: b.net for b in protein_of(s, other).bands}
+    after = {b.id: b.net for b in boxes_of(s, other).bands}
     changed = tuple((i, before[i], after[i]) for i in before if after[i] != before[i])
     assert changed and placement.remeasured == changed
     band_id, change = placement.largest_change
@@ -9549,7 +9652,7 @@ def test_a_row_dragged_over_another_proteins_row_is_refused_naming_its_boxes(
 ):
     s, loading, target = two_rows_session(tmp_path)
     ids = {"loading": loading, "target": target}
-    covered = [band.id for band in protein_of(s, ids[other]).bands]
+    covered = [band.id for band in boxes_of(s, ids[other]).bands]
     error = covered_refusal(s, lambda: ops.detect_row_boxes(s, ids[dragged], row))
     assert error.ids == tuple(covered)
     assert str(error) == (
@@ -9611,7 +9714,7 @@ def test_a_box_over_half_of_another_proteins_box_or_less_is_placed(tmp_path):
     s, loading, target = two_rows_session(tmp_path)
     size = BoxSize(width=44, height=12)
     ops.set_box_size(s, loading, size)
-    for band in list(protein_of(s, target).bands):
+    for band in list(boxes_of(s, target).bands):
         ops.remove_box(s, band.id)
     ops.set_box_size(s, target, size)
     x0, y0, x1, y1 = rects_by_lane(s, loading)[1]
@@ -9656,7 +9759,7 @@ def test_a_box_wholly_inside_a_larger_box_of_another_protein_is_refused(tmp_path
     # loading control's size dropped on one of them.
     s, loading, target = two_rows_session(tmp_path)
     ops.set_box_size(s, target, BoxSize(width=53, height=22))
-    targets = [band.id for band in protein_of(s, target).bands]
+    targets = [band.id for band in boxes_of(s, target).bands]
     results = ops.compute(s)
     error = covered_refusal(s, lambda: ops.detect_row_boxes(s, loading, OWN_ROW))
     assert error.ids == tuple(targets)
@@ -9673,7 +9776,7 @@ def test_a_box_size_over_another_proteins_boxes_is_refused(tmp_path):
     # target's, 40 px below: refused, the target's fold changes as they were.
     # At 80 px high they cover half of each: placed.
     s, loading, target = two_rows_session(tmp_path)
-    targets = tuple(band.id for band in protein_of(s, target).bands)
+    targets = tuple(band.id for band in boxes_of(s, target).bands)
     results = ops.compute(s)
     error = covered_refusal(s, lambda: ops.set_box_size(s, loading, BoxSize(width=44, height=100)))
     assert error.ids == targets
@@ -9684,7 +9787,7 @@ def test_a_box_size_over_another_proteins_boxes_is_refused(tmp_path):
     )
     assert ops.compute(s) == results
     ops.set_box_size(s, loading, BoxSize(width=44, height=80))
-    assert protein_of(s, loading).box_size == BoxSize(width=44, height=80)
+    assert boxes_of(s, loading).box_size == BoxSize(width=44, height=80)
     # 6 of the target's 12 rows in each lane: half, noted (#208).
     assert overlap_messages(s) == both_overlap("in lanes 1, 2, 3, 4, 5, 6 by 50%", lanes=6)
 
@@ -9717,11 +9820,11 @@ def test_a_click_that_grows_boxes_over_another_proteins_is_refused(tmp_path):
     # loading control's other boxes, grown to that around their centres,
     # would reach down over the target's. Refused.
     s, loading, target = two_rows_session(tmp_path, SMEARED)
-    assert protein_of(s, loading).box_size == BoxSize(width=44, height=17)
+    assert boxes_of(s, loading).box_size == BoxSize(width=44, height=17)
     ops.remove_box(s, lane_bands(s, loading)[0].id)
     x, y = round(SMEARED.lane_cx[0]), round(SMEARED.lane_cy[0] - 80)
     error = covered_refusal(s, lambda: ops.place_box(s, loading, x, y, lane_index=0, grow=True))
-    assert error.ids == tuple(band.id for band in protein_of(s, target).bands)[1:]
+    assert error.ids == tuple(band.id for band in boxes_of(s, target).bands)[1:]
     assert str(error) == (
         "at the box size 44x96 this band needs, boxes of 'GAPDH' would overlap the boxes of"
         " 'β-catenin' in lanes 2, 3, 4, 5, 6 by more than 50% of the smaller box's area: two"
@@ -9734,13 +9837,13 @@ def test_a_row_that_grows_its_kept_boxes_over_another_proteins_is_refused(tmp_pa
     # row box over its row whose bands need boxes 100 px high: the kept
     # boxes, grown to that, would reach down over the target's.
     s, loading, target = two_rows_session(tmp_path)
-    for band in list(protein_of(s, loading).bands):
+    for band in list(boxes_of(s, loading).bands):
         edit_by_hand(s, band.id)
     found = detected(s, loading, ABOVE_ROW)
     tall = dataclasses.replace(found, size=BoxSize(width=44, height=100))
     monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: tall)
     error = covered_refusal(s, lambda: ops.detect_row_boxes(s, loading, ABOVE_ROW))
-    assert error.ids == tuple(band.id for band in protein_of(s, target).bands)
+    assert error.ids == tuple(band.id for band in boxes_of(s, target).bands)
     assert str(error) == (
         "at the box size 44x100 the row needs, the boxes of 'GAPDH' it keeps would overlap"
         " the boxes of 'β-catenin' in lanes 1, 2, 3, 4, 5, 6 by more than 50% of the smaller"
@@ -9756,14 +9859,14 @@ def test_a_row_that_grows_its_kept_boxes_over_half_of_another_proteins_or_less_i
     # target's 44x12 in each lane (258 of 528 px, 49%). Placed, and noted
     # (#208).
     s, loading, target = two_rows_session(tmp_path)
-    for band in list(protein_of(s, loading).bands):
+    for band in list(boxes_of(s, loading).bands):
         edit_by_hand(s, band.id)
     found = detected(s, loading, ABOVE_ROW)
     tall = dataclasses.replace(found, size=BoxSize(width=44, height=80))
     monkeypatch.setattr(rowdetect, "detect_row", lambda *args, **kwargs: tall)
     assert overlap_messages(s) == []
     ops.detect_row_boxes(s, loading, ABOVE_ROW)
-    assert protein_of(s, loading).box_size.height == 80
+    assert boxes_of(s, loading).box_size.height == 80
     assert overlap_messages(s) == both_overlap("in lanes 1, 2, 3, 4, 5, 6 by 49%", lanes=6)
 
 
@@ -9916,13 +10019,13 @@ def padded_row(tmp_path: Path, hook=None) -> tuple[ProjectSession, str, str]:
     size 44x12, no padding yet."""
     s, image, protein = row_session(tmp_path, PAD_CASE, hook=hook)
     ops.detect_row_boxes(s, protein, PAD_CASE.row)
-    assert protein_of(s, protein).box_size == BoxSize(width=44, height=12)
+    assert boxes_of(s, protein).box_size == BoxSize(width=44, height=12)
     return s, image, protein
 
 
 def rects_of(s: ProjectSession, protein_id: str) -> list[tuple[int, int, int, int]]:
     """The protein's boxes, as stored (by lane, then band index)."""
-    protein = protein_of(s, protein_id)
+    protein = boxes_of(s, protein_id)
     return [band.box.rect(protein.box_size) for band in protein.bands]
 
 
@@ -9933,11 +10036,11 @@ def grown_by(rect: Sequence[int], across: int, along: int) -> tuple[int, int, in
 
 def test_set_box_padding_grows_each_box_by_the_padding_around_its_centre(tmp_path):
     s, _, protein = padded_row(tmp_path)
-    before = protein_of(s, protein)
+    before = boxes_of(s, protein)
     old = rects_of(s, protein)
 
     change = ops.set_box_padding(s, protein, across=3, along=5)
-    after = protein_of(s, protein)
+    after = boxes_of(s, protein)
     assert after.box_padding == BoxPadding(across=3, along=5)
     assert after.fitted_size == before.box_size == BoxSize(width=44, height=12)  # kept
     assert after.box_size == BoxSize(width=50, height=22)
@@ -9971,7 +10074,7 @@ def test_set_box_padding_grows_each_box_by_the_padding_around_its_centre(tmp_pat
 
     # Lowered to nothing, every box and every net is what it was.
     ops.set_box_padding(s, protein, across=0, along=0)
-    assert protein_of(s, protein) == before
+    assert boxes_of(s, protein) == before
 
 
 def test_set_box_padding_same_is_a_noop(tmp_path):
@@ -10005,12 +10108,12 @@ def test_set_box_padding_keeps_a_field_left_out(tmp_path):
     s, _, protein = padded_row(tmp_path)
     ops.set_box_padding(s, protein, across=2, along=3)
     ops.set_box_padding(s, protein, along=1)  # as a form that sends one direction
-    assert protein_of(s, protein).box_padding == BoxPadding(across=2, along=1)
+    assert boxes_of(s, protein).box_padding == BoxPadding(across=2, along=1)
     # The log names both directions as they took effect, the kept one too.
     assert s.project.log[-1].params["box_padding"] == {"across": 2, "along": 1}
     ops.set_box_padding(s, protein, across=0)
-    assert protein_of(s, protein).box_padding == BoxPadding(across=0, along=1)
-    assert protein_of(s, protein).box_size == BoxSize(width=44, height=14)
+    assert boxes_of(s, protein).box_padding == BoxPadding(across=0, along=1)
+    assert boxes_of(s, protein).box_size == BoxSize(width=44, height=14)
 
 
 def _padding_scene(tmp_path: Path) -> tuple[ProjectSession, Recorder, dict[str, str]]:
@@ -10040,8 +10143,8 @@ def _stack_a_second_band(s: ProjectSession, ids: dict[str, str]) -> None:
     def change(draft: Project) -> None:
         beta = draft.batch.find_protein(ids["beta"])
         beta.expected_band_count = 2
-        [first] = [band for band in beta.bands if band.lane_index == 0]
-        beta.bands.append(
+        [first] = [band for band in draft.batch.boxes_of(beta).bands if band.lane_index == 0]
+        draft.batch.boxes_of(beta).bands.append(
             Band(
                 id=draft.new_id("band"),
                 lane_index=0,
@@ -10059,7 +10162,7 @@ def _beta_boxes(*keys: tuple[int, int]):
     """The ids of β-catenin's boxes at these (lane, band index), as a refusal names them."""
 
     def named(s: ProjectSession, ids: dict[str, str]) -> tuple[str, ...]:
-        found = {(b.lane_index, b.band_index): b.id for b in protein_of(s, ids["beta"]).bands}
+        found = {(b.lane_index, b.band_index): b.id for b in boxes_of(s, ids["beta"]).bands}
         return tuple(found[key] for key in keys)
 
     return named
@@ -10243,7 +10346,7 @@ def test_a_row_keeps_a_padding_above_half(tmp_path):
     # than half of it, and nothing is refused or rewritten.
     ops.clear_boxes(s, protein)
     ops.detect_row_boxes(s, protein, PAD_CASE.row)
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     assert (beta.fitted_size, beta.box_padding) == (
         BoxSize(width=44, height=12),
         BoxPadding(along=10),
@@ -10260,7 +10363,7 @@ def test_a_row_keeps_a_padding_above_half(tmp_path):
     # A larger fitted size, though still under twice the padding, is not refused.
     ops.set_box_size(s, protein, BoxSize(width=44, height=14))
     ops.set_box_padding(s, protein, along=8)  # lowered, though still above half: accepted
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     assert (beta.fitted_size, beta.box_padding) == (
         BoxSize(width=44, height=14),
         BoxPadding(along=8),
@@ -10300,7 +10403,7 @@ def test_set_box_size_refuses_a_shrink_under_twice_the_padding(tmp_path):
         " of it; lower that padding to 4 px or less first, or type a width of at least 10"
     )
     ops.set_box_size(s, protein, BoxSize(width=10, height=14))
-    assert protein_of(s, protein).box_size == BoxSize(width=20, height=28)
+    assert boxes_of(s, protein).box_size == BoxSize(width=20, height=28)
 
 
 def test_set_box_size_without_a_box_asks_only_for_a_larger_size(tmp_path):
@@ -10330,7 +10433,7 @@ def test_set_box_size_without_a_box_asks_only_for_a_larger_size(tmp_path):
         ops.set_box_padding(s, protein, along=4)
     # What the refusal asks for is accepted.
     ops.set_box_size(s, protein, BoxSize(width=44, height=14))
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     assert (beta.fitted_size, beta.box_padding) == (
         BoxSize(width=44, height=14),
         BoxPadding(along=6),
@@ -10345,13 +10448,13 @@ def test_a_typed_fitted_size_lasts_until_a_seed_click_on_no_box(tmp_path):
     typed = BoxSize(width=30, height=20)
     ops.set_box_size(s, protein, typed)  # before any box
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
-    assert protein_of(s, protein).fitted_size == typed
+    assert boxes_of(s, protein).fitted_size == typed
     ops.set_box_padding(s, protein, along=2)
     ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)  # needs 19x5
-    assert protein_of(s, protein).fitted_size == typed
+    assert boxes_of(s, protein).fitted_size == typed
     ops.clear_boxes(s, protein)
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)  # needs 9x5
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     assert (beta.fitted_size, beta.box_padding) == (BoxSize(width=9, height=5), BoxPadding(along=2))
     assert_nets_current(s)
 
@@ -10361,7 +10464,7 @@ def test_set_box_size_sets_the_fitted_size_under_padding(tmp_path):
     ops.set_box_padding(s, protein, across=2, along=5)
     old = rects_of(s, protein)
     ops.set_box_size(s, protein, BoxSize(width=40, height=14))
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     assert (beta.fitted_size, beta.box_padding, beta.box_size) == (
         BoxSize(width=40, height=14),
         BoxPadding(across=2, along=5),
@@ -10408,7 +10511,7 @@ def test_set_box_padding_reports_net_change_edge_and_overlap(tmp_path):
     s, image, beta = boxed(tmp_path)
     ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
     edge = ops.place_box(s, beta, W - 2, ROW, lane_index=2, grow=False)
-    size = protein_of(s, beta).box_size
+    size = boxes_of(s, beta).box_size
     assert size == BoxSize(width=9, height=5)
     assert band_of(s, edge).box.rect(size) == (W - 9, 28, W, 33)
     small = BoxSize(width=6, height=5)
@@ -10428,7 +10531,7 @@ def test_set_box_padding_reports_net_change_edge_and_overlap(tmp_path):
     assert change.edge_shifted == (edge,)
     assert change.overlapping == (beside,)  # other proteins' boxes may overlap: reported
     # Its nets: the edge box's, on the background, is 0 before and left out.
-    [band] = [b for b in before.find_protein(beta).bands if b.net > 0]
+    [band] = [b for b in before.boxes_of(before.find_protein(beta)).bands if b.net > 0]
     ratio = band_of(s, band.id).net / band.net - 1
     assert change.net_change == (ratio, ratio)
     # GAPDH's ring leaves out the grown box: its net moved, reported as a row reports it.
@@ -10530,7 +10633,7 @@ def test_padding_survives_clear_then_row(tmp_path):
     ops.set_box_padding(s, protein, across=3, along=4)
     padded = rects_of(s, protein)
     ops.clear_boxes(s, protein)
-    assert protein_of(s, protein).box_padding == BoxPadding(across=3, along=4)  # kept
+    assert boxes_of(s, protein).box_padding == BoxPadding(across=3, along=4)  # kept
     placement = ops.detect_row_boxes(s, protein, PAD_CASE.row)
     assert placement.box_size == BoxSize(width=50, height=20)
     assert rects_of(s, protein) == padded  # the same boxes, under new ids
@@ -10544,7 +10647,7 @@ def test_row_with_padding_places_detector_boxes_grown_by_it(tmp_path):
     ops.set_box_padding(s, protein, across=2, along=5)
     ops.clear_boxes(s, protein)
     ops.detect_row_boxes(s, protein, PAD_CASE.row)
-    assert protein_of(s, protein).fitted_size == found.size  # the detector's size
+    assert boxes_of(s, protein).fitted_size == found.size  # the detector's size
     assert rects_by_lane(s, protein) == {
         lane.lane: grown_by(lane.rect, 2, 5) for lane in found.lanes
     }
@@ -10557,11 +10660,11 @@ def test_click_grow_keeps_the_padding(tmp_path):
     wide = grow_box(s.pixels(image), (WIDE_X, ROW), background)
     first = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     ops.set_box_padding(s, protein, across=1, along=2)
-    assert band_of(s, first).box.rect(protein_of(s, protein).box_size) == grown_by(narrow, 1, 2)
+    assert band_of(s, first).box.rect(boxes_of(s, protein).box_size) == grown_by(narrow, 1, 2)
 
     # A wider band grows the fitted size to its own, and the padding stays.
     second = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     fitted = BoxSize(width=wide[2] - wide[0], height=wide[3] - wide[1])
     assert fitted.width > narrow[2] - narrow[0]
     assert (beta.fitted_size, beta.box_padding) == (fitted, BoxPadding(across=1, along=2))
@@ -10572,7 +10675,7 @@ def test_click_grow_keeps_the_padding(tmp_path):
     # The first box after a clear sets the fitted size afresh, padded.
     ops.clear_boxes(s, protein)
     third = ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-    beta = protein_of(s, protein)
+    beta = boxes_of(s, protein)
     assert beta.fitted_size == BoxSize(width=narrow[2] - narrow[0], height=narrow[3] - narrow[1])
     assert band_of(s, third).box.rect(beta.box_size) == grown_by(narrow, 1, 2)
 
@@ -10581,10 +10684,10 @@ def test_a_fixed_box_takes_the_padded_size(tmp_path):
     s, _, protein = boxed(tmp_path)
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
     ops.set_box_padding(s, protein, along=2)
-    size = protein_of(s, protein).box_size
+    size = boxes_of(s, protein).box_size
     band_id = ops.place_box(s, protein, 70, ROW, lane_index=1, grow=False)
     assert band_of(s, band_id).box.rect(size) == boxes.centered_rect(70, ROW, size, W, H)
-    assert protein_of(s, protein).box_size == size == BoxSize(width=9, height=9)
+    assert boxes_of(s, protein).box_size == size == BoxSize(width=9, height=9)
     assert_nets_current(s)
 
 
@@ -10608,8 +10711,8 @@ def test_row_refusal_names_the_padding_not_kept_boxes(tmp_path):
     # Lowered to what fits, the row places its boxes, padded.
     ops.set_box_padding(s, protein, across=11)
     ops.detect_row_boxes(s, protein, PAD_CASE.row)
-    assert protein_of(s, protein).box_size == BoxSize(width=66, height=12)
-    assert len(protein_of(s, protein).bands) == PAD_CASE.n_lanes
+    assert boxes_of(s, protein).box_size == BoxSize(width=66, height=12)
+    assert len(boxes_of(s, protein).bands) == PAD_CASE.n_lanes
 
 
 def _padded_kept_pair(s: ProjectSession, ids: dict[str, str]) -> None:
@@ -10644,10 +10747,10 @@ def test_a_row_refused_for_its_kept_boxes_names_the_padding(tmp_path):
     assert s.project is committed
     assert recorder.actions == []
     # Lowered as it asks, the row keeps both boxes and places the others, padded.
-    kept = [band.id for band in protein_of(s, ids["protein"]).bands]
+    kept = [band.id for band in boxes_of(s, ids["protein"]).bands]
     ops.set_box_padding(s, ids["protein"], across=2)
     ops.detect_row_boxes(s, ids["protein"], SCENE.row)
-    beta = protein_of(s, ids["protein"])
+    beta = boxes_of(s, ids["protein"])
     assert beta.box_size == BoxSize(width=48, height=12)
     assert set(kept) < {band.id for band in beta.bands}
     assert_nets_current(s)
@@ -10655,7 +10758,8 @@ def test_a_row_refused_for_its_kept_boxes_names_the_padding(tmp_path):
 
 def _step_pad(s: ProjectSession, rng: np.random.Generator, case: RowCase) -> None:
     """A padding of 0 to 3 px each way on a protein with boxes."""
-    protein = _pick(rng, [p.id for p in s.project.batch.proteins if p.bands])
+    batch = s.project.batch
+    protein = _pick(rng, [p.id for p in batch.proteins if batch.boxes_of(p).bands])
     across, along = (int(v) for v in rng.integers(0, 4, size=2))
     ops.set_box_padding(s, protein, across=across, along=along)
 
@@ -10680,14 +10784,15 @@ def test_random_edits_keep_the_padding_and_the_nets(tmp_path, seed):
     rng.shuffle(schedule)
     for name in schedule:
         before = s.project
-        paddings = {p.id: p.box_padding for p in before.batch.proteins}
+        paddings = {p.id: before.batch.boxes_of(p).box_padding for p in before.batch.proteins}
         try:
             steps[name](s, rng, PAD_CASE)
         except (OperationError, UnknownIdError):
             assert s.project is before, name  # a refusal changes nothing
         if name not in {"set_box_padding", "undo", "redo"}:
             for protein in s.project.batch.proteins:
-                assert protein.box_padding == paddings.get(protein.id, BoxPadding()), name
+                padding = s.project.batch.boxes_of(protein).box_padding
+                assert padding == paddings.get(protein.id, BoxPadding()), name
         assert s.project.log[-1].content_hash == content_hash(s.project), name
         assert_nets_current(s)
     padded = [e for e in s.project.log if e.action == "set_box_padding"]
@@ -10873,14 +10978,14 @@ def test_mw_current_after_each_operation(tmp_path):
         lambda: ops.place_box(s, c.protein, lanes[1], CAL_ROW, lane_index=1, grow=False),
     )
     step("detect_row_boxes", lambda: ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX))
-    assert all(band.apparent_mw is not None for band in protein_of(s, c.protein).bands)
+    assert all(band.apparent_mw is not None for band in boxes_of(s, c.protein).bands)
     # The same row placed by its expected MW, between the ladders: in place, MW-guided.
     step("detect_mw_row", lambda: ops.detect_mw_row(s, c.protein))
-    assert {band.source for band in protein_of(s, c.protein).bands} == {ProposalSource.MW_GUIDED}
+    assert {band.source for band in boxes_of(s, c.protein).bands} == {ProposalSource.MW_GUIDED}
     moved = lane_bands(s, c.protein)[2]
-    x0, y0, x1, y1 = moved.box.rect(protein_of(s, c.protein).box_size)
+    x0, y0, x1, y1 = moved.box.rect(boxes_of(s, c.protein).box_size)
     step("move_box", lambda: ops.move_box(s, moved.id, (x0 + 2, y0 + 3, x1 + 2, y1 + 3)))
-    fitted = protein_of(s, c.protein).fitted_size
+    fitted = boxes_of(s, c.protein).fitted_size
     size = BoxSize(width=fitted.width + 2, height=fitted.height + 3)
     step("set_box_size", lambda: ops.set_box_size(s, c.protein, size))
     step("set_box_padding", lambda: ops.set_box_padding(s, c.protein, across=1, along=2))
@@ -10899,7 +11004,7 @@ def test_mw_current_after_each_operation(tmp_path):
     step("remove_calibration_point", lambda: ops.remove_calibration_point(s, c.marker, 10))
     step("set_ladder", lambda: ops.set_ladder(s, c.membrane, "our ladder", kda=[250, 100, 15]))
     step("set_marker_image", lambda: ops.set_marker_image(s, c.blot, None))
-    assert all(band.apparent_mw is None for band in protein_of(s, c.protein).bands)
+    assert all(band.apparent_mw is None for band in boxes_of(s, c.protein).bands)
     step("set_marker_image", lambda: ops.set_marker_image(s, c.blot, c.marker))
     step("clear_calibration", lambda: ops.clear_calibration(s, c.marker, side=RIGHT))
     right = [(cal_y(kda, CAL_RIGHT_X), kda) for kda in CAL_KDA[:5]]
@@ -10921,7 +11026,7 @@ def test_two_ladder_apparent_mw_uses_box_x(tmp_path):
     c = calibrated(tmp_path)
     s = c.session
     ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
-    size = protein_of(s, c.protein).box_size
+    size = boxes_of(s, c.protein).box_size
     mws = []
     for _, band in sorted(lane_bands(s, c.protein).items()):
         cx, cy = band.box.x + size.width / 2, band.box.y + size.height / 2
@@ -10931,14 +11036,14 @@ def test_two_ladder_apparent_mw_uses_box_x(tmp_path):
     # The row lies level while the protein line slopes down to the right, so at
     # one height a lane further right reads heavier.
     assert mws == sorted(mws) and len(set(mws)) == len(mws)
-    fit = ops.calibration_fit(s.project.batch.membranes[0], c.blot)
+    fit = ops.calibration_fit(s.project.batch, s.project.batch.membranes[0], c.blot)
     assert fit is not None and fit.image_ids == (c.blot, c.marker)
     assert [ladder.side for ladder in fit.ladders] == ["left", "right"]
     assert math.isclose(fit.offset_px, CAL_TILT, rel_tol=1e-9)
     assert math.isclose(fit.tilt_deg, math.degrees(math.atan2(CAL_TILT, 420.0)), rel_tol=1e-9)
     # One ladder: the line is level, and every lane reads one MW at one height.
     ops.clear_calibration(s, c.blot, side=RIGHT)
-    assert len({band.apparent_mw for band in protein_of(s, c.protein).bands}) == 1
+    assert len({band.apparent_mw for band in boxes_of(s, c.protein).bands}) == 1
     assert_mw_current(s)
 
 
@@ -10971,14 +11076,14 @@ def test_set_box_size_keeps_apparent_mw(tmp_path):
     c = calibrated(tmp_path)
     s = c.session
     ops.detect_row_boxes(s, c.protein, CAL_ROW_BOX)
-    before = {b.id: b.apparent_mw for b in protein_of(s, c.protein).bands}
-    fitted = protein_of(s, c.protein).fitted_size
+    before = {b.id: b.apparent_mw for b in boxes_of(s, c.protein).bands}
+    fitted = boxes_of(s, c.protein).fitted_size
     # Each box grows by 2 px each way around its centre: the same centre, the same MW.
     ops.set_box_size(s, c.protein, BoxSize(width=fitted.width + 4, height=fitted.height + 4))
-    assert {b.id: b.apparent_mw for b in protein_of(s, c.protein).bands} == before
+    assert {b.id: b.apparent_mw for b in boxes_of(s, c.protein).bands} == before
     # One more row of height moves each centre by half a pixel: recomputed.
     ops.set_box_size(s, c.protein, BoxSize(width=fitted.width + 4, height=fitted.height + 5))
-    after = {b.id: b.apparent_mw for b in protein_of(s, c.protein).bands}
+    after = {b.id: b.apparent_mw for b in boxes_of(s, c.protein).bands}
     assert all(after[band_id] != mw for band_id, mw in before.items())
     assert_mw_current(s)
 
@@ -11040,17 +11145,21 @@ def test_remove_image_refits_remaining_groups(tmp_path):
         x=CAL_LEFT_X,
         snap=False,
     )
-    reprobe_mw = band_of(s, protein_of(s, gapdh).bands[0].id).apparent_mw
+    reprobe_mw = band_of(s, boxes_of(s, gapdh).bands[0].id).apparent_mw
     before = s.project.batch.membranes[0].calibration.fit_quality
 
     cascade = ops.remove_image(s, c.blot)
     assert cascade.unfitted_membranes == (c.membrane,)
     calibration = s.project.batch.membranes[0].calibration
     assert calibration.fit_method is FitMethod.LOG_LINEAR_PIECEWISE
-    assert calibration.fit_quality == mwcal.fit_quality(s.project.batch.membranes[0]) != before
+    assert (
+        calibration.fit_quality
+        == mwcal.fit_quality(s.project.batch, s.project.batch.membranes[0])
+        != before
+    )
     assert len(calibration.points) == len(CAL_KDA) + 3  # the marker's and the reprobe's
     # The reprobe's curve did not change: its MW is the one it had.
-    assert band_of(s, protein_of(s, gapdh).bands[0].id).apparent_mw == reprobe_mw
+    assert band_of(s, boxes_of(s, gapdh).bands[0].id).apparent_mw == reprobe_mw
     assert s.project.log[-1].params["dropped_undetected"] == []
     assert_mw_current(s)
 
@@ -11075,7 +11184,7 @@ def test_refitting_a_pre_58_calibration_rewrites_every_mw_on_its_membrane(tmp_pa
     assert first.dropped_undetected == (("prot-7", 2, 0),)
     mem_1, mem_5 = s.project.batch.membranes
     assert mem_1.calibration.fit_method is FitMethod.LOG_LINEAR_PIECEWISE
-    assert mem_1.calibration.fit_quality == mwcal.fit_quality(mem_1)
+    assert mem_1.calibration.fit_quality == mwcal.fit_quality(s.project.batch, mem_1)
     assert band_of(s, "band-12").apparent_mw == expected_mw(s, "band-12") != stored
     assert _keys(s, "prot-7") == []
     # mem-5, untouched, keeps what it holds.
@@ -11116,8 +11225,8 @@ def test_undo_restores_calibration_and_mws(tmp_path):
     ops.edit_calibration_point(s, c.marker, 70, side=RIGHT, y=cal_y(70, CAL_RIGHT_X) + 2.0)
     after = s.project
     assert after.batch.membranes != before.batch.membranes
-    assert [b.apparent_mw for b in protein_of(s, c.protein).bands] != [
-        b.apparent_mw for b in before.batch.find_protein(c.protein).bands
+    assert [b.apparent_mw for b in boxes_of(s, c.protein).bands] != [
+        b.apparent_mw for b in before.batch.boxes_of(before.batch.find_protein(c.protein)).bands
     ]
     done = ops.undo(s)
     assert (done.action, s.project.batch) == ("edit_calibration_point", before.batch)

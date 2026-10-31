@@ -43,8 +43,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from conftest import sample_doc
 from proteia.core import operations as ops
-from proteia.core import storage
+from proteia.core import record, storage
 
 DATA = Path(__file__).parent / "data" / "schema2"
 FROZEN = "05b4af5b08e51b450436e9446651f5650bff48e4"
@@ -278,7 +279,8 @@ def _drop_param(i: int, name: str):
 
 
 def _drop_last_entry(project):
-    project.log = project.log[:-1]
+    # The last entry before the one that converted the project on opening.
+    project.log = (*project.log[:-2], project.log[-1])
 
 
 # Values besides the bands and calibrations, each changed in an opened project
@@ -286,34 +288,44 @@ def _drop_last_entry(project):
 DEGRADED = {
     "undetected_reason": (
         "f1",
-        _set((("batch", "proteins", 3, "undetected", 0, "reason"), _OtherReason.OFF_ROW)),
+        _set(
+            (("batch", "proteins", 3, "rows", 0, "undetected", 0, "reason"), _OtherReason.OFF_ROW)
+        ),
         "$.batch.proteins[3].undetected[0].reason",
     ),
     "warning_code": (
         "f2",
-        _set((("batch", "membranes", 1, "images", 0, "import_warnings", 0, "code"), "lossy")),
+        _set((("batch", "images", 1, "import_warnings", 0, "code"), "lossy")),
         "$.batch.membranes[1].images[0].import_warnings[0].code",
     ),
     "warning_message": (
         "f2",
-        _set((("batch", "membranes", 0, "images", 0, "import_warnings", 0, "message"), "JPEG.")),
+        _set((("batch", "images", 0, "import_warnings", 0, "message"), "JPEG.")),
         "$.batch.membranes[0].images[0].import_warnings[0].message",
     ),
-    "lane_index": ("f1", _set((("batch", "lanes", 7, "index"), 8)), "$.batch.lanes[7].index"),
+    "lane_index": (
+        "f1",
+        _set((("batch", "lane_tables", 0, "lanes", 7, "index"), 8)),
+        "$.batch.lanes[7].index",
+    ),
     "lane_label": (
         "f1",
-        _set((("batch", "lanes", 0, "label"), "Vehicle")),
+        _set((("batch", "lane_tables", 0, "lanes", 0, "label"), "Vehicle")),
         "$.batch.lanes[0].label",
     ),
-    "lane_sample": ("f1", _set((("batch", "lanes", 1, "sample"), None)), "$.batch.lanes[1].sample"),
+    "lane_sample": (
+        "f1",
+        _set((("batch", "lane_tables", 0, "lanes", 1, "sample"), None)),
+        "$.batch.lanes[1].sample",
+    ),
     "lane_included": (
         "f1",
-        _set((("batch", "lanes", 5, "included"), True)),
+        _set((("batch", "lane_tables", 0, "lanes", 5, "included"), True)),
         "$.batch.lanes[5].included",
     ),
     "lane_metadata": (
         "f1",
-        _set((("batch", "lanes", 2, "metadata"), {"dose": "0"})),
+        _set((("batch", "lane_tables", 0, "lanes", 2, "metadata"), {"dose": "0"})),
         "$.batch.lanes[2].metadata.dose",
     ),
     "next_id": ("f3", _set((("next_id",), 17)), "$.next_id"),
@@ -466,10 +478,20 @@ def test_changes():
     assert changes([1, 2, 3], [0, 2, 4]) == [["$[0]", 1, 0], ["$[2]", 3, 4]]
 
 
-def test_fresh_changes(projects):
-    # The frozen project stands in for a fresh build that stores its values.
+@pytest.fixture(scope="module")
+def fresh(tmp_path_factory) -> dict:
+    """f1 and f3 built afresh by the current build from their frozen image
+    files, built once."""
+    work = tmp_path_factory.mktemp("schema2-fresh")
+    return {
+        case: fixtures.build(work / case, case, files=fixtures.frozen_sources(DATA / case))
+        for case in ("f1", "f3")
+    }
+
+
+def test_fresh_changes(fresh):
     golden = _golden("f3", "stored.json")
-    project = projects["f3"].model_copy(deep=True)
+    project = fresh["f3"].model_copy(deep=True)
     assert fixtures.fresh_changes(golden, project) == []
     # A fresh build's log entries are compared without their hashes and versions.
     _log_entry(19, content_hash="0" * 64, version="9")(project)
@@ -478,8 +500,8 @@ def test_fresh_changes(projects):
     assert fixtures.fresh_changes(golden, project) == [
         ["$.log[19].time", "2026-10-31T09:00:19.000Z", "2026-10-31T09:00:19.001Z"]
     ]
-    project = projects["f3"].model_copy(deep=True)
-    band = project.batch.proteins[1].bands[2]
+    project = fresh["f3"].model_copy(deep=True)
+    band = project.batch.proteins[1].rows[0].bands[2]
     net = band.net
     band.net = net * (1 + 1e-13)  # within the derived tolerance
     assert fixtures.fresh_changes(golden, project) == []
@@ -1101,7 +1123,10 @@ def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys, derived):
                 del entry["content_hash"]
         assert fixtures.differences(frozen, stored, rel_tol=1e-12) == []
         assert (out / case / "derived.json").read_bytes() == fixtures.canonical_json(derived[case])
-        assert sorted(p.name for p in (out / case / "images").iterdir()) == sorted(
+        # Named by the ids this build drew, read as the schema-2 build drew them.
+        new = fixtures.new_numbers(storage.load_project(out / case))
+        written = [p.name for p in (out / case / "images").iterdir()]
+        assert sorted(fixtures.renumbered(written, new)) == sorted(
             p.name for p in (DATA / case / "images").iterdir()
         )
     assert list(tmp_path.iterdir()) == [out]  # its temporary folder is gone
@@ -1370,3 +1395,336 @@ def test_f3_holds_an_undo_and_redo_history_with_a_removed_image():
     assert len(batch["membranes"][0]["calibration"]["points"]) == 3
     beta = batch["proteins"][0]
     assert beta["name"] == "β-catenin" and all(b["apparent_mw"] for b in beta["bands"])
+
+
+# --- The conversion to schema 3 (#223) ---
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_the_conversion_maps_back_to_the_frozen_content(case, projects):
+    # Every stored value and its order survived: the converted content, read
+    # back as schema 2 held it, hashes as the frozen file's content did.
+    content = storage.content_document(projects[case])
+    earlier = storage._EARLIER_CONTENT[2](content)
+    assert storage.document_hash(earlier) == _golden(case, "stored.json")["content_hash"]
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_the_conversion_is_logged_with_its_backup(case, tmp_path):
+    folder = tmp_path / case
+    fixtures.copy_project(DATA / case, folder)
+    frozen = _golden(case, "stored.json")
+    session = ops.open_project(folder, autosave=None)
+    try:
+        project = session.project
+        assert fixtures.migration_issues(frozen, project) == []
+        entry = project.log[-1]
+        assert entry.params == {
+            "from_schema": 2,
+            "to_schema": 3,
+            "from_content_hash": frozen["log"][-1]["content_hash"],
+            "backup": "project.schema2.json",
+        }
+        assert record.history_issues(project) == []
+    finally:
+        session.close()
+    assert (folder / "project.schema2.json").read_bytes() == (
+        DATA / case / "project.json"
+    ).read_bytes()
+
+
+def test_the_conversion_writes_no_outline_and_its_ids_follow_next_id(projects):
+    project = projects["f1"]
+    frozen = _golden("f1", "stored.json")
+    batch = project.batch
+    assert all(a.outline is None for m in batch.membranes for a in m.arenas)
+    content = storage.content_document(project)
+    assert all("outline" not in a for m in content["batch"]["membranes"] for a in m["arenas"])
+    # After every id the frozen file held: the table, the areas, then the rows.
+    first = frozen["next_id"]
+    drawn = [i for i in project.iter_ids() if i.split("-")[0] in fixtures.NEW_KINDS]
+    assert drawn == [
+        f"lt-{first}",
+        *(f"arena-{first + 1 + i}" for i in range(4)),
+        *(f"row-{first + 5 + i}" for i in range(4)),
+    ]
+    assert project.next_id == first + 9
+
+
+def _migrate_entry(project, **params):
+    """``project`` with its last log entry's params updated."""
+    log = list(project.log)
+    log[-1] = log[-1].model_copy(update={"params": {**log[-1].params, **params}})
+    return project.model_copy(update={"log": tuple(log)})
+
+
+def test_migration_issues_catch_a_wrong_conversion_entry(projects):
+    frozen = _golden("f3", "stored.json")
+    project = projects["f3"]
+    assert fixtures.migration_issues(frozen, project) == []
+    wrong = _migrate_entry(project, from_content_hash="0" * 64)
+    assert fixtures.migration_issues(frozen, wrong) == [
+        f"from_content_hash: {'0' * 64!r} != {frozen['content_hash']!r}"
+    ]
+    assert fixtures.migration_issues(frozen, _migrate_entry(project, from_schema=1)) == [
+        "from_schema: 1 != 2"
+    ]
+    log = list(project.log)
+    log[-1] = log[-1].model_copy(update={"content_hash": "0" * 64})
+    stale = project.model_copy(update={"log": tuple(log)})
+    assert fixtures.migration_issues(frozen, stale) == ["content_hash: not the converted project's"]
+    dropped = project.model_copy(update={"log": project.log[:-1]})
+    assert fixtures.migration_issues(frozen, dropped) == [
+        "the log does not end with the conversion to schema 3"
+    ]
+
+
+# Each rule that reads a schema-3 project back as schema 2, degraded: (rule,
+# the degraded function, the cases a stored or fresh comparison then fails on).
+def _off_by_one_renumbering(value, new):
+    return _real_renumbered(value, new[1:])  # one new number too few: ids one too high
+
+
+def _over_dropped_ids(entries):
+    # Drops a band id from every list too (an undo that brought one back).
+    dropped = _real_without_new_ids(entries)
+    return [
+        {
+            **entry,
+            "params": {
+                key: [v for v in value if not str(v).startswith("band-")]
+                if isinstance(value, list)
+                else value
+                for key, value in entry["params"].items()
+            },
+        }
+        for entry in dropped
+    ]
+
+
+_real_renumbered = fixtures.renumbered
+_real_without_new_ids = fixtures.without_new_ids
+DEGRADED_RULES = {
+    "renumbered_off_by_one": ("renumbered", _off_by_one_renumbering),
+    "renumbered_not_at_all": ("renumbered", lambda value, new: value),
+    "next_id_off_by_one": ("schema2_next_id", lambda next_id, new: next_id - len(new) + 1),
+    "next_id_kept": ("schema2_next_id", lambda next_id, new: next_id),
+    "new_params_kept": ("without_new_params", lambda entries: entries),
+    "new_ids_kept": ("without_new_ids", lambda entries: entries),
+    "a_band_id_dropped_from_an_undo_list": ("without_new_ids", _over_dropped_ids),
+    "migration_not_split": ("split_migration", lambda log: (list(log), None)),
+    "last_entry_always_split": ("split_migration", lambda log: (list(log[:-1]), log[-1])),
+}
+
+
+@pytest.mark.parametrize("name", DEGRADED_RULES)
+def test_each_reading_rule_is_needed(name, projects, fresh, monkeypatch):
+    # Undegraded, the opened f3, its fresh build and the literal values all
+    # read back as schema 2 held them.
+    golden = _golden("f3", "stored.json")
+    assert fixtures.stored_differences(golden, projects["f3"]) == []
+    assert fixtures.fresh_changes(golden, fresh["f3"]) == []
+    assert _literal_rule_failures() == []
+    rule, degraded = DEGRADED_RULES[name]
+    monkeypatch.setattr(fixtures, rule, degraded)
+    found = [
+        *fixtures.stored_differences(golden, projects["f3"]),
+        *(str(change) for change in fixtures.fresh_changes(golden, fresh["f3"])),
+        *_literal_rule_failures(),
+    ]
+    assert found, name
+
+
+# Ids a build drew: lt-3, arena-4 (with img-1 and mem-2), arena-6 (with
+# img-5) and row-8 (with prot-7); a schema-2 build drew img-1, mem-2, img-3,
+# prot-4 and band-5 for the same.
+NEW = [3, 4, 6, 8]
+
+
+def _literal_rule_failures() -> list[str]:
+    """Which reading rule gives another value than schema 2 held, on literal
+    values: its name, once each."""
+    failures = []
+    if fixtures.schema2_next_id(12, NEW) != 8:
+        failures.append("schema2_next_id")
+    given = ["img-5", "img-5.tif", "prot-7", "mem-2", "band-9", "arena-6", "x img-5", "lt-3"]
+    held = ["img-3", "img-3.tif", "prot-4", "mem-2", "band-5", "arena-6", "x img-5", "lt-3"]
+    if fixtures.renumbered({"ids": given}, NEW) != {"ids": held}:
+        failures.append("renumbered")
+    made = {"image_id": "img-1", "arena_id": "arena-4", "lane_table_id": "lt-3", "row_id": "row-8"}
+    if fixtures.without_new_params([{"seq": 2, "params": made}]) != [
+        {"seq": 2, "params": {"image_id": "img-1"}}
+    ]:
+        failures.append("without_new_params")
+    undo = {
+        "returns_to_seq": 1,
+        "restored": ["mem-2", "img-1", "arena-4", "prot-7", "row-8", "band-9"],
+        "undetected_restored": [["prot-7", 0, 0]],
+    }
+    if fixtures.without_new_ids([{"seq": 9, "params": undo}]) != [
+        {"seq": 9, "params": {**undo, "restored": ["mem-2", "img-1", "prot-7", "band-9"]}}
+    ]:
+        failures.append("without_new_ids")
+    return failures
+
+
+def _relabelled(project, renames: dict[str, str], next_id: int | None = None):
+    """``project`` with these ids renamed everywhere (its log too), and each
+    renamed image's file with it, validated."""
+    renames = dict(renames)
+    for image in project.batch.iter_images():
+        if image.id in renames:
+            renames[image.file] = renames[image.id] + image.file[len(image.id) :]
+
+    def renamed(value):
+        if isinstance(value, dict):
+            return {key: renamed(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [renamed(item) for item in value]
+        return renames.get(value, value) if isinstance(value, str) else value
+
+    doc = renamed(project.model_dump(mode="json"))
+    if next_id is not None:
+        doc["next_id"] = next_id
+    return type(project).model_validate(doc)
+
+
+def test_allocation_issues_catch_new_ids_drawn_elsewhere(fresh):
+    project = fresh["f3"]
+    assert fixtures.allocation_issues(project) == []
+    batch = project.batch
+    beta = batch.proteins[0]
+    row = batch.only_row(beta).id
+    last = project.next_id
+    # The row drawn after the protein's bands (last), not right after it.
+    late_row = _relabelled(project, {row: f"row-{last}"}, next_id=last + 1)
+    [issue] = fixtures.allocation_issues(late_row)
+    assert issue[:2] == [f"$.allocation.row-{last}", beta.id] and issue[2] != beta.id
+    # An image's area drawn before the image.
+    arena = batch.membranes[0].arenas[0]
+    early = _relabelled(project, {arena.id: "arena-98", arena.image_id: "img-99"}, next_id=100)
+    assert [issue[0] for issue in fixtures.allocation_issues(early)] == ["$.allocation.arena-98"]
+    # Something else drawn between an image and its area.
+    other = batch.membranes[1].arenas[0]
+    between = _relabelled(project, {other.id: f"arena-{last}"}, next_id=last + 1)
+    assert [issue[0] for issue in fixtures.allocation_issues(between)] == [
+        f"$.allocation.arena-{last}"
+    ]
+
+
+def test_fresh_changes_catch_images_drawn_out_of_order(fresh):
+    # The frozen kinds' ids drawn in another order: two images swapped.
+    golden = _golden("f3", "stored.json")
+    project = fresh["f3"]
+    first, second = (image.id for image in list(project.batch.iter_images())[:2])
+    swapped = _relabelled(project, {first: second, second: first})
+    assert fixtures.fresh_changes(golden, swapped) != []
+
+
+def _degraded_conversion(kind: str):
+    """The conversion to schema 3 with one thing done wrong."""
+    real = storage._v2_to_v3
+
+    def step(doc):
+        given = doc.get("next_id", 1)
+        out = real(doc)
+        batch = out["batch"]
+        images = {image["id"]: image for image in batch["images"]}
+        if kind == "areas_reversed":
+            for membrane in batch["membranes"]:
+                membrane["arenas"].reverse()
+        elif kind == "row_on_the_first_area":
+            first = {
+                arena["id"]: membrane["arenas"][0]["id"]
+                for membrane in batch["membranes"]
+                for arena in membrane["arenas"]
+            }
+            for protein in batch["proteins"]:
+                protein["rows"][0]["arena_id"] = first[protein["rows"][0]["arena_id"]]
+        elif kind == "reference_dropped":
+            batch["reference_condition"] = None
+        elif kind in ("padding_dropped", "undetected_dropped"):
+            key = kind.removesuffix("_dropped").replace("padding", "box_padding")
+            for protein in batch["proteins"]:
+                protein["rows"][0].pop(key, None)
+        elif kind == "lane_metadata_dropped":
+            for lane in batch["lane_tables"][0]["lanes"]:
+                lane["metadata"] = {}
+        elif kind == "next_id_kept":
+            out["next_id"] = given
+        elif kind == "outline_written":
+            for membrane in batch["membranes"]:
+                for arena in membrane["arenas"]:
+                    image = images[arena["image_id"]]
+                    arena["outline"] = {
+                        "x0": 0,
+                        "y0": 0,
+                        "x1": image["width"],
+                        "y1": image["height"],
+                    }
+        elif kind == "marker_link_dropped":
+            for image in batch["images"]:
+                image["marker_image_id"] = None
+        return out
+
+    return step
+
+
+CONVERSION_DEFECTS = (
+    "areas_reversed",
+    "row_on_the_first_area",
+    "reference_dropped",
+    "padding_dropped",
+    "undetected_dropped",
+    "lane_metadata_dropped",
+    "next_id_kept",
+    "outline_written",
+    "marker_link_dropped",
+)
+
+
+def _conversion_findings(case: str, folder: Path) -> list[str]:
+    """Which of the conversion's checks fail on ``case`` (a frozen fixture,
+    or ``sample``, the conftest sample as a schema-2 file) opened from
+    ``folder``: opening, the content mapped back, the stored values, no
+    outline, and the conversion's entry."""
+    if case == "sample":
+        data = storage.document_bytes(sample_doc())
+        try:
+            project = storage.project_from_json(data)
+        except storage.ProjectFormatError:
+            return ["opens"]
+        frozen = {
+            "content_hash": "d667c01c0856fa2c7f8b046729995b0c50cf9f11c2481b11f817599eb206b6d6"
+        }
+        found = []
+    else:
+        fixtures.copy_project(DATA / case, folder)
+        frozen = _golden(case, "stored.json")
+        try:
+            session = ops.open_project(folder, autosave=None)
+        except storage.ProjectFormatError:
+            return ["opens"]
+        project = session.project
+        session.close()
+        found = ["values"] if fixtures.stored_differences(frozen, project) else []
+    content = storage.content_document(project)
+    if storage.document_hash(storage._EARLIER_CONTENT[2](content)) != frozen["content_hash"]:
+        found.append("inverse")
+    if any("outline" in a for m in content["batch"]["membranes"] for a in m["arenas"]):
+        found.append("no_outline")
+    if case != "sample" and fixtures.migration_issues(frozen, project):
+        found.append("history")
+    return found
+
+
+def test_the_conversion_checks_pass_the_conversion(tmp_path):
+    for case in ("f1", "sample"):
+        assert _conversion_findings(case, tmp_path / case) == [], case
+
+
+@pytest.mark.parametrize("kind", CONVERSION_DEFECTS)
+def test_each_defect_of_the_conversion_fails_a_check(kind, tmp_path, monkeypatch):
+    monkeypatch.setitem(storage.MIGRATIONS, 2, _degraded_conversion(kind))
+    found = {case: _conversion_findings(case, tmp_path / case) for case in ("f1", "sample")}
+    assert any(found.values()), (kind, found)

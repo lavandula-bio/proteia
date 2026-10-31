@@ -1120,15 +1120,15 @@ def _rows_tilted(
     xs: list[float] = []
     ys: list[float] = []
     for protein in proteins:
-        boxes = _tilt_boxes(protein, joined[protein.id], included)
-        if len(boxes) < TILT_MIN_LANES:
+        bands = _tilt_boxes(protein, joined[protein.id], included)
+        if len(bands) < TILT_MIN_LANES:
             continue
         size = batch.boxes_of(protein).box_size
-        reference = _tilt_reference(fitted, protein, boxes)
+        reference = _tilt_reference(fitted, protein, bands)
         if reference is None:
             continue
         points: list[tuple[float, float, float]] = []
-        for band in boxes:
+        for band in bands:
             cx, cy = band.box.x + size.width / 2, band.box.y + size.height / 2
             line = fitted.y_at(reference, cx)
             if line is not None:
@@ -1206,7 +1206,7 @@ def _mw_notices(
         if any(band is not None and included[i] for i, band in enumerate(joined[protein.id]))
     }
     for membrane in batch.membranes:
-        for group, fitted in mwcal.calibrations(membrane).items():
+        for group, fitted in mwcal.calibrations(batch, membrane).items():
             on = tuple(protein.id for protein in boxed if image_ids[protein.id] in group)
             if in_set.intersection(on) and isinstance(fitted, mwcal.Calibration):
                 _calibration_notices(batch, membrane, group, fitted, on, note)
@@ -1519,7 +1519,7 @@ def compute_results(
     per_protein = lane_nets(batch).values()
     removed = [  # the excluded lanes that hold a value: what the exclusion changes
         lane.index
-        for lane in batch.lanes
+        for lane in batch.only_lanes()
         if not lane.included and any(nets[lane.index] is not None for nets in per_protein)
     ]
     copies = _duplicate_notices(batch)  # #216: of the images, so of the returned set only
@@ -1528,7 +1528,18 @@ def compute_results(
         return results.model_copy(update={"notices": [*copies, *results.notices]})
     results = one_set(batch, set_label=f"Excluding {lanes_phrase(removed)}")
     every_lane = batch.model_copy(
-        update={"lanes": [lane.model_copy(update={"included": True}) for lane in batch.lanes]}
+        update={
+            "lane_tables": [
+                table.model_copy(
+                    update={
+                        "lanes": [
+                            lane.model_copy(update={"included": True}) for lane in table.lanes
+                        ]
+                    }
+                )
+                for table in batch.lane_tables
+            ]
+        }
     )
     all_lanes = one_set(every_lane, set_label="All lanes")
     own = [
@@ -1573,7 +1584,8 @@ def _compute(
     """
     if isinstance(plot_conditions, str):
         raise TypeError("plot_conditions is a collection of condition labels, not one label")
-    n = len(batch.lanes)
+    table = batch.only_lanes()
+    n = len(table)
     ref = batch.reference_condition
     notices: list[Notice] = []
 
@@ -1583,16 +1595,19 @@ def _compute(
     # 1. The lane rows and the raw table, and what the model lacks.
     lanes = [
         LaneRow(index=lane.index, condition=lane.label, sample=lane.sample, included=lane.included)
-        for lane in batch.lanes
+        for lane in table
     ]
+    # Every protein's lanes are the project's one table's; per-table results come with the
+    # lane-table issue.
     joined = {protein.id: _join(batch, protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
-    # Each protein's image, read once, and its calibration (#58), from the stored points.
+    # Each protein's image, read once, and each image's calibration (#58), fitted
+    # once from the stored points.
     image_ids = {p.id: batch.image_id_of(p) for p in batch.proteins}
     fits = {
-        image_ids[p.id]: mwcal.calibration_for(batch.membrane_of(image_ids[p.id]), image_ids[p.id])
-        for p in batch.proteins
+        image_id: mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
+        for image_id in dict.fromkeys(image_ids.values())
     }
     columns = [
         ProteinColumn(
@@ -1689,7 +1704,7 @@ def _compute(
         )
 
     # 3-4. The lane axes, and what the model accepts on purpose but the user should see.
-    conditions, samples, included = spine_axes(batch.lanes)
+    conditions, samples, included = spine_axes(table)
     for column in columns:  # over-exposed bands in lanes this set includes
         over = tuple(i for i, flag in enumerate(column.clipped) if flag and included[i])
         if over:
@@ -1702,11 +1717,12 @@ def _compute(
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
+    images = {image.id: image for image in batch.iter_images()}
     for protein in batch.proteins:  # bands likely over-exposed, where that cannot be checked
-        image = batch.image_of(protein)
+        image = images[image_ids[protein.id]]
         _possibly_clipped(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # bands not checked for that, in lanes this set includes
-        image = batch.image_of(protein)
+        image = images[image_ids[protein.id]]
         _clipping_not_checked(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # backgrounds to check, in lanes this set includes
         _background_notices(batch, protein, joined[protein.id], included, note)

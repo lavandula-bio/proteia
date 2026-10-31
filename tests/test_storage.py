@@ -156,14 +156,15 @@ def test_project_json_encoding(tmp_path):
     assert "β-catenin".encode() in data
     assert b"\xc2\xb5" in data  # µ as raw UTF-8
     assert b"\\u" not in data
-    assert b'"schema_version": 2' in data
+    assert b'"schema_version": 3' in data
 
 
 def test_empty_project_bytes_exact():
     assert project_to_json(Project()) == (
-        b'{\n "background_method": "ring_median_v1",\n "batch": {\n  "lanes": [],\n'
-        b'  "membranes": [],\n  "proteins": [],\n  "reference_condition": null\n },\n'
-        b' "log": [],\n "next_id": 1,\n "schema_version": 2\n}\n'
+        b'{\n "background_method": "ring_median_v1",\n "batch": {\n  "images": [],\n'
+        b'  "lane_tables": [],\n  "membranes": [],\n  "proteins": [],\n'
+        b'  "reference_condition": null\n },\n "log": [],\n "next_id": 1,\n'
+        b' "schema_version": 3\n}\n'
     )
 
 
@@ -177,10 +178,13 @@ def test_content_hash_is_pinned():
     files to CRLF. It did not move when the action log was added: the log is not
     content, and the hash leaves it out. It moved with schema 2 (#83), which added
     the background method and each band's background fields; schema 1 gave
-    ``conftest.V1_CONTENT_HASH``.
+    ``conftest.V1_CONTENT_HASH``. It moved again with schema 3 (#223), which keeps
+    the images in the batch and adds the membrane areas, the lane table's id and
+    the rows; schema 2 gave d667c01c..., which the converted content maps back
+    to exactly (``test_schema3``).
     """
     assert content_hash(make_project()) == (
-        "d667c01c0856fa2c7f8b046729995b0c50cf9f11c2481b11f817599eb206b6d6"
+        "03f1180db8177dbbecbce9456708ab1afe7abac8a44dc3dc911ad02c98fe7724"
     )
 
 
@@ -205,32 +209,32 @@ def test_content_bytes_are_what_the_hash_covers():
 def test_project_from_content_restores_the_content_with_the_given_next_id_and_log():
     project = _logged(make_project_with_undetected(), {"action": "new_project"})
     data = storage.content_bytes(project)
-    restored = storage.project_from_content(data, next_id=25, log=project.log)
+    restored = storage.project_from_content(data, next_id=30, log=project.log)
     assert restored.log is project.log  # shared, not copied or validated again
-    assert restored.next_id == 25
+    assert restored.next_id == 30
     assert restored.model_copy(update={"next_id": project.next_id}) == project
     assert storage.content_bytes(restored) == data
-    assert project_to_json(storage.project_from_content(data, next_id=19, log=project.log)) == (
+    assert project_to_json(storage.project_from_content(data, next_id=27, log=project.log)) == (
         project_to_json(project)
     )
 
     # Validated strictly, as project_from_json validates a file.
     for edit in (
-        lambda d: d["batch"]["lanes"][0].update(included=0),
+        lambda d: d["batch"]["lane_tables"][0]["lanes"][0].update(included=0),
         lambda d: d["batch"].update(notes="x"),
     ):
         doc = json.loads(data)
         edit(doc)
         with pytest.raises(ValidationError):
-            storage.project_from_content(canonical_json(doc), next_id=19, log=())
+            storage.project_from_content(canonical_json(doc), next_id=27, log=())
     with pytest.raises(ValidationError):  # an id at or above next_id
-        storage.project_from_content(data, next_id=18, log=())
+        storage.project_from_content(data, next_id=26, log=())
     # A repeated key is refused as such, not left to model validation (the last
     # value would otherwise win, and this one is valid).
     repeated = data.replace(b"{", b'{"schema_version":1,', 1)
     assert repeated.count(b'"schema_version"') == 2
     with pytest.raises(ValueError, match="duplicate key 'schema_version'") as info:
-        storage.project_from_content(repeated, next_id=19, log=())
+        storage.project_from_content(repeated, next_id=27, log=())
     assert not isinstance(info.value, ValidationError)
 
 
@@ -246,8 +250,8 @@ def test_content_hash_ignores_representation(tmp_path):
 
     doc = project.model_dump()
     for protein in doc["batch"]["proteins"]:
-        protein["bands"].reverse()
-    lane = doc["batch"]["lanes"][3]
+        protein["rows"][0]["bands"].reverse()
+    lane = doc["batch"]["lane_tables"][0]["lanes"][3]
     lane["metadata"] = dict(reversed(lane["metadata"].items()))
     assert content_hash(Project.model_validate(doc)) == expected
 
@@ -267,7 +271,7 @@ def _band(project: Project, band_id: str) -> Band:
     "change",
     [
         pytest.param(lambda p: setattr(_band(p, "band-10"), "box", Box(x=19, y=43)), id="box"),
-        pytest.param(lambda p: setattr(p.batch.lanes[1], "included", False), id="included"),
+        pytest.param(lambda p: setattr(p.batch.only_lanes()[1], "included", False), id="included"),
         pytest.param(
             lambda p: setattr(p.batch.find_image("img-2"), "polarity", Polarity.LIGHT_ON_DARK),
             id="polarity",
@@ -307,8 +311,9 @@ def test_content_hash_with_records_is_pinned():
     """The content hash of the sample project with not-detected records: the records
     are content. Regenerate it on the same terms as the pinned hash above."""
     assert content_hash(make_project_with_undetected()) == (
-        # 805e1f12d680a4466887a9f53e52e6405dc960ebde5334ea94b0bda7719389b4 under schema 1
-        "dcef6f3deed6968ef3251c79f6ad1350a7771b25ac8d633dbab822fd37824529"
+        # 805e1f12d680a4466887a9f53e52e6405dc960ebde5334ea94b0bda7719389b4 under schema 1,
+        # dcef6f3deed6968ef3251c79f6ad1350a7771b25ac8d633dbab822fd37824529 under schema 2
+        "ec60f7a7cf40dca7dc76f362adaea12b10f6f37700c3913f360c32eb44846992"
     )
 
 
@@ -328,9 +333,9 @@ def test_records_round_trip_and_resave_byte_identically(tmp_path):
 def test_an_empty_record_list_is_never_written():
     project = make_project()
     doc = _doc(project)
-    assert all("undetected" not in protein for protein in doc["batch"]["proteins"])
+    assert all("undetected" not in protein["rows"][0] for protein in doc["batch"]["proteins"])
     for protein in doc["batch"]["proteins"]:
-        protein["undetected"] = []  # a hand-edited file: loads, and is saved without it
+        protein["rows"][0]["undetected"] = []  # a hand-edited file: loads, saved without it
     loaded = project_from_json(_encode(doc))
     assert loaded == project
     assert content_hash(loaded) == content_hash(project)
@@ -342,7 +347,7 @@ def test_an_empty_record_list_is_never_written():
 
 
 def _gapdh_records(p: Project) -> list:
-    return p.batch.find_protein("prot-9").undetected
+    return p.batch.boxes_of(p.batch.find_protein("prot-9")).undetected
 
 
 def _swap_record_lanes(p: Project) -> None:
@@ -355,7 +360,9 @@ def _swap_record_lanes(p: Project) -> None:
     [
         pytest.param(_swap_record_lanes, id="lane_index"),
         pytest.param(
-            lambda p: setattr(p.batch.find_protein("prot-7").undetected[0], "band_index", 1),
+            lambda p: setattr(
+                p.batch.boxes_of(p.batch.find_protein("prot-7")).undetected[0], "band_index", 1
+            ),
             id="band_index",
         ),
         pytest.param(
@@ -388,10 +395,11 @@ def test_record_order_does_not_change_the_hash():
     # A second band's record in β-catenin's lane 2: order within a lane counts too.
     beta = doc["batch"]["proteins"][0]
     beta["expected_band_count"] = 2
-    beta["undetected"].append({**beta["undetected"][0], "band_index": 1})
+    records = beta["rows"][0]["undetected"]
+    records.append({**records[0], "band_index": 1})
     project = Project.model_validate(doc)
     for protein in doc["batch"]["proteins"]:
-        protein.get("undetected", []).reverse()
+        protein["rows"][0].get("undetected", []).reverse()
     assert content_hash(Project.model_validate(doc)) == content_hash(project)
 
 
@@ -404,7 +412,9 @@ def _padded(across: int, along: int) -> Project:
     project, _ = apply_change(
         make_project(),
         lambda p: setattr(
-            p.batch.find_protein("prot-8"), "box_padding", BoxPadding(across=across, along=along)
+            p.batch.boxes_of(p.batch.find_protein("prot-8")),
+            "box_padding",
+            BoxPadding(across=across, along=along),
         ),
     )
     return project
@@ -415,14 +425,14 @@ def test_padding_round_trips_and_resaves_byte_identical(tmp_path):
     first = _saved(tmp_path / "a", project)
     data = first.read_bytes()
     assert data.count(b'"box_padding"') == 1  # α-tubulin's; the others have none
-    saved = json.loads(data)["batch"]["proteins"][1]
+    saved = json.loads(data)["batch"]["proteins"][1]["rows"][0]
     assert (saved["box_size"], saved["box_padding"]) == (
         {"width": 20, "height": 10},  # the size quantified
         {"across": 3, "along": 2},
     )
     loaded = load_project(tmp_path / "a")
     assert loaded == project
-    assert loaded.batch.find_protein("prot-8").fitted_size.model_dump() == {
+    assert loaded.batch.boxes_of(loaded.batch.find_protein("prot-8")).fitted_size.model_dump() == {
         "width": 14,
         "height": 6,
     }
@@ -438,16 +448,16 @@ def test_padding_moves_the_content_hash():
     hashes = {content_hash(_padded(across, along)) for across, along in [(1, 0), (0, 1), (1, 1)]}
     assert len(hashes) == 3
     assert plain not in hashes
-    assert "box_padding" in content_document(_padded(0, 1))["batch"]["proteins"][1]
+    assert "box_padding" in content_document(_padded(0, 1))["batch"]["proteins"][1]["rows"][0]
 
 
 def test_a_zero_padding_is_never_written():
     project = make_project()
     doc = _doc(project)
-    assert all("box_padding" not in protein for protein in doc["batch"]["proteins"])
+    assert all("box_padding" not in protein["rows"][0] for protein in doc["batch"]["proteins"])
     for protein in doc["batch"]["proteins"]:
         # A hand-edited file: loads, hashes as if the key were absent, and is saved without it.
-        protein["box_padding"] = {"across": 0, "along": 0}
+        protein["rows"][0]["box_padding"] = {"across": 0, "along": 0}
     loaded = project_from_json(_encode(doc))
     assert loaded == project
     assert content_hash(loaded) == content_hash(project)
@@ -491,7 +501,7 @@ def test_possible_flags_move_the_content_hash():
 def test_an_unset_possible_flag_is_never_written():
     project = make_project()
     doc = _doc(project)
-    bands = [band for protein in doc["batch"]["proteins"] for band in protein["bands"]]
+    bands = [b for protein in doc["batch"]["proteins"] for b in protein["rows"][0]["bands"]]
     assert all("possibly_clipped" not in band for band in bands)
     for band in bands:
         # A hand-edited file: loads, hashes as if the key were absent, and is saved without it.
@@ -534,7 +544,7 @@ def test_a_null_band_count_keeps_the_bytes_and_hash():
     project = make_project()
     doc = _doc(project)
     for protein in doc["batch"]["proteins"]:
-        for band in protein["bands"]:
+        for band in protein["rows"][0]["bands"]:
             assert "bands_found" not in band
             band["bands_found"] = None  # a hand-edited file
     loaded = project_from_json(_encode(doc))
@@ -552,7 +562,7 @@ def test_a_band_count_round_trips(tmp_path):
     [band] = [
         band
         for protein in json.loads(data)["batch"]["proteins"]
-        for band in protein["bands"]
+        for band in protein["rows"][0]["bands"]
         if band["id"] == "band-11"
     ]
     assert band["bands_found"] == 2
@@ -679,8 +689,9 @@ def test_document_bytes_rules():
 
 def _spine(project: Project) -> list:
     """Every protein's nets scattered into the lane spine by stored lane index."""
-    positioned = [[(b.lane_index, b.net) for b in p.bands] for p in project.batch.proteins]
-    return join_to_spine(positioned, len(project.batch.lanes))
+    batch = project.batch
+    positioned = [[(b.lane_index, b.net) for b in batch.boxes_of(p).bands] for p in batch.proteins]
+    return join_to_spine(positioned, len(project.batch.only_lanes()))
 
 
 def test_numbers_survive_round_trip_exactly(tmp_path):
@@ -688,7 +699,8 @@ def test_numbers_survive_round_trip_exactly(tmp_path):
     values = [net for nets in nets_by_polarity.values() for row in nets.values() for net in row]
     values += [0.1, 1e-7, 1e16, 5e-324, sys.float_info.max]
     project = make_project()
-    band_ids = [band.id for protein in project.batch.proteins for band in protein.bands]
+    batch = project.batch
+    band_ids = [band.id for protein in batch.proteins for band in batch.boxes_of(protein).bands]
 
     # Nine bands per round: set their nets, save, load, compare bit for bit.
     for start in range(0, len(values), len(band_ids)):
@@ -765,7 +777,7 @@ def test_load_accepts_bom_and_crlf():
 
 def test_load_wraps_invalid_content():
     doc = _doc(make_project())
-    bands = doc["batch"]["proteins"][0]["bands"]
+    bands = doc["batch"]["proteins"][0]["rows"][0]["bands"]
     bands[1]["box"] = dict(bands[0]["box"])
     with pytest.raises(ProjectFormatError, match="overlap") as info:
         project_from_json(_encode(doc))
@@ -776,7 +788,7 @@ def test_load_errors_number_lanes_from_1():
     # Opening shows the message to the user, who counts lanes from 1: the
     # file's lane_index 0 is lane 1.
     doc = _doc(make_project())
-    bands = doc["batch"]["proteins"][0]["bands"]
+    bands = doc["batch"]["proteins"][0]["rows"][0]["bands"]
     bands[1]["lane_index"] = bands[0]["lane_index"] = 0
     with pytest.raises(ProjectFormatError) as info:
         project_from_json(_encode(doc))
@@ -786,11 +798,13 @@ def test_load_errors_number_lanes_from_1():
 @pytest.mark.parametrize(
     "edit",
     [
+        pytest.param(lambda d: d["batch"]["images"][0].update(width="340"), id="str-int"),
         pytest.param(
-            lambda d: d["batch"]["membranes"][0]["images"][0].update(width="340"), id="str-int"
+            lambda d: d["batch"]["lane_tables"][0]["lanes"][0].update(included=0), id="int-bool"
         ),
-        pytest.param(lambda d: d["batch"]["lanes"][0].update(included=0), id="int-bool"),
-        pytest.param(lambda d: d["batch"]["lanes"][1].update(index=1.0), id="float-int"),
+        pytest.param(
+            lambda d: d["batch"]["lane_tables"][0]["lanes"][1].update(index=1.0), id="float-int"
+        ),
         pytest.param(lambda d: d["batch"].update(notes="x"), id="unknown-key"),
     ],
 )
@@ -828,7 +842,7 @@ def test_migrate_chain():
 
 
 def test_migrations_cover_every_older_version():
-    assert set(MIGRATIONS) == set(range(1, SCHEMA_VERSION)) == {1}
+    assert set(MIGRATIONS) == set(range(1, SCHEMA_VERSION)) == {1, 2}
 
 
 # --- Schema 1 to 2 (#83): the band backgrounds ---
@@ -855,13 +869,13 @@ def _v1_file(*, log: bool = True) -> dict:
 def test_a_schema_1_project_migrates_with_its_nets_unchanged():
     doc = _v1_file()
     project = project_from_json(_encode(doc), clock=FakeClock())
-    assert (project.schema_version, project.background_method) == (2, "global_median")
+    assert (project.schema_version, project.background_method) == (3, "global_median")
     v1_nets = {
         band["id"]: band["net"] for protein in doc["batch"]["proteins"] for band in protein["bands"]
     }
     for protein in project.batch.proteins:
-        median = project.batch.find_image(protein.image_id).background
-        for band in protein.bands:
+        median = project.batch.image_of(protein).background
+        for band in project.batch.boxes_of(protein).bands:
             assert band.net == v1_nets[band.id]  # exact: the nets stay what they were
             assert (band.background_level, band.background_mode, band.background_spread) == (
                 median,
@@ -879,7 +893,7 @@ def test_a_schema_1_project_migrates_with_its_nets_unchanged():
     # it, rebuilt exactly), and left the migrated content.
     assert migrated.params == {
         "from_schema": 1,
-        "to_schema": 2,
+        "to_schema": 3,
         "from_content_hash": V1_CONTENT_HASH,
     }
     assert migrated.content_hash == content_hash(project)
@@ -894,7 +908,7 @@ def test_a_migrated_project_is_saved_in_the_new_schema_once(tmp_path):
     assert [entry.action for entry in loaded.log] == ["new_project", "migrate"] and migrated
     assert (folder / storage.PROJECT_FILE).read_bytes() == document_bytes(_v1_file())  # untouched
     path = _saved(folder, loaded)
-    assert b'"schema_version": 2' in path.read_bytes()
+    assert b'"schema_version": 3' in path.read_bytes()
     again, migrated = read_project(folder)
     assert again == loaded and not migrated  # no second migration, no second entry
     assert load_project(folder) == again
@@ -1053,7 +1067,7 @@ def test_save_revalidates_in_place_edits(tmp_path):
     path = _saved(tmp_path, project)
     before = path.read_bytes()
     # Onto band-10's box, bypassing apply_change.
-    project.batch.find_protein("prot-7").bands.append(
+    project.batch.boxes_of(project.batch.find_protein("prot-7")).bands.append(
         Band(
             id="band-19",
             lane_index=2,

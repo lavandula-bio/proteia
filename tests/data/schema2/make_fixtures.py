@@ -52,7 +52,11 @@ dependencies, and a change that would need another ``stored.json`` changes
 what old projects store. The stored values are compared by value
 (:func:`stored_differences`), never through a hash of the content in the
 build's own shape, so a project held in another shape with every value
-intact still matches.
+intact still matches. The build now reads schema 3 (#223): opening a frozen
+project converts it, and :func:`stored_values` reads it back as the schema-2
+file held it (the ids and params schema 3 added taken out, one rule each),
+while :func:`migration_issues` checks the conversion's own log entry and
+:func:`allocation_issues` where a fresh build drew the new ids.
 
 ``derived.json`` holds what the build under test derives from the frozen
 project (:func:`derived_output`): the results with their notices, and with
@@ -75,14 +79,16 @@ and divisions only, and integer noise from fixed seeds, so their pixels are
 the same on every platform. The fresh build imports the frozen image files
 (an import copies them byte for byte), so no encoder takes part in it.
 
-Frozen at 05b4af5 by copying this file and ``derive.py`` into a checkout of
-that commit, synced with ``uv sync --locked``, and running ``--write-frozen``
-there; ``--out DIR`` writes elsewhere, to rebuild them for a comparison.
+Frozen at 05b4af5 by copying this file (as #221 committed it, which read the
+schema-2 shape) and ``derive.py`` into a checkout of that commit, synced with
+``uv sync --locked``, and running ``--write-frozen`` there; ``--out DIR``
+writes elsewhere, to rebuild them for a comparison.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import hashlib
 import importlib.metadata
@@ -98,7 +104,7 @@ import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from unittest import mock
 
 import numpy as np
@@ -110,6 +116,7 @@ from proteia.core import export, record, results, storage
 from proteia.core import operations as ops
 from proteia.core.model import (
     Band,
+    Batch,
     BoxSize,
     CalibrationPointSource,
     ImageKind,
@@ -497,23 +504,35 @@ def copy_project(source: Path, target: Path) -> None:
 
 def stored_values(project: Project) -> dict[str, Any]:
     """Every value ``project`` stores but its schema version, in stored
-    order, under the names of the schema-2 file: the background method, the
-    next id, the batch (its lanes and reference, each membrane with its images
+    order, as the schema-2 file held them: the background method, the next
+    id, the batch (its lanes and reference, each membrane with its images
     and calibration, each protein with its boxes and not-detected records)
     and the log. A default the file leaves out (no padding, no record, no
-    band count, a left-hand point) is written out here."""
+    band count, a left-hand point) is written out here.
+
+    The build reads schema 3 (#223), which keeps the images in the batch,
+    gives each membrane an area on each of its images, the lane table an id
+    and each protein its boxes in a row. Read through the batch's accessors,
+    those values are the schema-2 ones; the ids schema 3 added are taken out
+    as the schema-2 build never drew them (:func:`schema2_next_id`,
+    :func:`renumbered`, :func:`without_new_params`, :func:`without_new_ids`),
+    and the entry that converted the project, last in its log, is left for
+    :func:`migration_issues` (:func:`split_migration`)."""
     batch = project.batch
-    return {
+    new = new_numbers(project)
+    log, _ = split_migration(project.log)
+    values = {
         "background_method": project.background_method,
-        "next_id": project.next_id,
+        "next_id": schema2_next_id(project.next_id, new),
         "batch": {
-            "lanes": [_lane(lane) for lane in batch.lanes],
+            "lanes": [_lane(lane) for lane in batch.only_lanes()],
             "reference_condition": batch.reference_condition,
-            "membranes": [_membrane(membrane) for membrane in batch.membranes],
-            "proteins": [_protein(protein) for protein in batch.proteins],
+            "membranes": [_membrane(batch, membrane) for membrane in batch.membranes],
+            "proteins": [_protein(batch, protein) for protein in batch.proteins],
         },
-        "log": [_entry(entry) for entry in project.log],
+        "log": without_new_ids(without_new_params([_entry(entry) for entry in log])),
     }
+    return renumbered(values, new)
 
 
 def _lane(lane: Lane) -> dict[str, Any]:
@@ -545,11 +564,11 @@ def _image(image: ImageRef) -> dict[str, Any]:
     }
 
 
-def _membrane(membrane: Membrane) -> dict[str, Any]:
+def _membrane(batch: Batch, membrane: Membrane) -> dict[str, Any]:
     calibration = membrane.calibration
     return {
         "id": membrane.id,
-        "images": [_image(image) for image in membrane.images],
+        "images": [_image(image) for image in batch.images_of(membrane)],
         "calibration": {
             "ladder": calibration.ladder,
             "ladder_kda": list(calibration.ladder_kda),
@@ -570,23 +589,24 @@ def _membrane(membrane: Membrane) -> dict[str, Any]:
     }
 
 
-def _protein(protein: Protein) -> dict[str, Any]:
+def _protein(batch: Batch, protein: Protein) -> dict[str, Any]:
+    boxes = batch.boxes_of(protein)
     return {
         "id": protein.id,
         "name": protein.name,
         "role": protein.role.value,
-        "image_id": protein.image_id,
+        "image_id": batch.image_id_of(protein),
         "loading_control_ids": list(protein.loading_control_ids),
         "expected_mw": protein.expected_mw,
         "expected_band_count": protein.expected_band_count,
         "mw_tolerance": protein.mw_tolerance,
-        "box_size": {"width": protein.box_size.width, "height": protein.box_size.height},
+        "box_size": {"width": boxes.box_size.width, "height": boxes.box_size.height},
         "box_padding": {
-            "across": protein.box_padding.across,
-            "along": protein.box_padding.along,
+            "across": boxes.box_padding.across,
+            "along": boxes.box_padding.along,
         },
-        "bands": [_band(band) for band in protein.bands],
-        "undetected": [_undetected(record) for record in protein.undetected],
+        "bands": [_band(band) for band in boxes.bands],
+        "undetected": [_undetected(record) for record in boxes.undetected],
     }
 
 
@@ -635,6 +655,147 @@ def _entry(entry: LogEntry) -> dict[str, Any]:
     }
 
 
+# --- Schema 3 (#223) read as schema 2 ---
+#
+# Schema 3 draws the ids of its new kinds (the lane table, each membrane area,
+# each row) from the counter the schema-2 kinds share: a conversion after
+# every id the file held, a build as it goes (an import draws its image's id,
+# a new membrane's, the lane table's while there is none, then its area's;
+# adding a protein, its id then its row's). Each rule below takes out one
+# trace of them, so that what is left is what the schema-2 build stored.
+
+NEW_KINDS: Final = ("lt", "arena", "row")
+# The log params schema 3 added: the area an import made, the row adding a
+# protein made, and the lane table an import or the lane table's declaration
+# made.
+NEW_PARAMS: Final = ("arena_id", "row_id", "lane_table_id")
+_ANY_ID: Final = re.compile(r"(mem|img|prot|band|lt|arena|row)-([1-9][0-9]*)")
+# A schema-2 kind's id, or an image's file, which its id names.
+_OLD_ID: Final = re.compile(r"(mem|img|prot|band)-([1-9][0-9]*)((?:\.[a-z]+)?)")
+
+
+def _new_in(value: Any) -> set[int]:
+    """The numbers of the new kinds' ids anywhere in a JSON value."""
+    if isinstance(value, dict):
+        return {n for item in value.values() for n in _new_in(item)}
+    if isinstance(value, list):
+        return {n for item in value for n in _new_in(item)}
+    found = _ANY_ID.fullmatch(value) if isinstance(value, str) else None
+    return {int(found[2])} if found and found[1] in NEW_KINDS else set()
+
+
+def new_numbers(project: Project) -> list[int]:
+    """The numbers of every id of a new kind the project holds or its log
+    names, ascending."""
+    held = {int(i.rsplit("-", 1)[1]) for i in project.iter_ids() if i.split("-")[0] in NEW_KINDS}
+    return sorted(held | {n for entry in project.log for n in _new_in(dict(entry.params))})
+
+
+def schema2_next_id(next_id: int, new: Sequence[int]) -> int:
+    """The next id as the schema-2 file held it: ``next_id`` less the
+    numbers drawn for the new kinds (``new``)."""
+    return next_id - len(new)
+
+
+def renumbered(value: Any, new: Sequence[int]) -> Any:
+    """A JSON value with every id of a schema-2 kind (and an image's file,
+    named by its id) numbered as the schema-2 build drew it: less the numbers
+    of ``new`` below it. The relative order of the schema-2 kinds' ids is
+    kept, so a build that drew them in another order still differs."""
+    if isinstance(value, dict):
+        return {key: renumbered(item, new) for key, item in value.items()}
+    if isinstance(value, list):
+        return [renumbered(item, new) for item in value]
+    found = _OLD_ID.fullmatch(value) if isinstance(value, str) else None
+    if found is None:
+        return value
+    number = int(found[2])
+    return f"{found[1]}-{number - bisect.bisect_left(new, number)}{found[3]}"
+
+
+def without_new_params(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Log entries (as :func:`_entry` gives them) without the params schema 3
+    added (:data:`NEW_PARAMS`)."""
+    return [
+        {**entry, "params": {k: v for k, v in entry["params"].items() if k not in NEW_PARAMS}}
+        for entry in entries
+    ]
+
+
+def without_new_ids(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Log entries without the new kinds' ids in their params' lists of ids
+    (what an undo or a redo removed and restored)."""
+
+    def kept(value: Any) -> Any:
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return [item for item in value if not _new_in(item)]
+        return value
+
+    return [
+        {**entry, "params": {key: kept(value) for key, value in entry["params"].items()}}
+        for entry in entries
+    ]
+
+
+def split_migration(log: Sequence[LogEntry]) -> tuple[list[LogEntry], LogEntry | None]:
+    """The log without its last entry when that entry converted the project
+    to schema 3 (opening a frozen project appends it), and that entry."""
+    if log and log[-1].action == "migrate" and log[-1].params.get("to_schema") == 3:
+        return list(log[:-1]), log[-1]
+    return list(log), None
+
+
+def migration_issues(frozen: Mapping[str, Any], project: Project) -> list[str]:
+    """What is wrong with the conversion of a frozen project (``frozen``, its
+    ``stored.json``) to schema 3, as the entry it left says: the log must end
+    with it, from schema 2 to 3, starting from the content hash the frozen
+    log ends with and leaving the project's own; [] when nothing is."""
+    _, entry = split_migration(project.log)
+    if entry is None:
+        return ["the log does not end with the conversion to schema 3"]
+    params = entry.params
+    issues = [
+        f"{key}: {params.get(key)!r} != {value!r}"
+        for key, value in (
+            ("from_schema", 2),
+            ("to_schema", 3),
+            ("from_content_hash", frozen["content_hash"]),
+        )
+        if params.get(key) != value
+    ]
+    if entry.content_hash != storage.content_hash(project):
+        issues.append("content_hash: not the converted project's")
+    return issues
+
+
+def allocation_issues(project: Project) -> list[list[Any]]:
+    """Where a build drew a new kind's id elsewhere than next to its object,
+    one ``[path, what it should follow, what it follows]`` each: a row right
+    after its protein; an area after its image, with only its membrane or a
+    lane table between them. Together with :func:`renumbered`, which keeps
+    the schema-2 kinds' order, this pins every id a build draws."""
+    batch = project.batch
+    named = {int(i.rsplit("-", 1)[1]): i for i in project.iter_ids()}
+
+    def number(object_id: str) -> int:
+        return int(object_id.rsplit("-", 1)[1])
+
+    found: list[list[Any]] = []
+    for protein in batch.proteins:
+        for row in protein.rows:
+            before = named.get(number(row.id) - 1)
+            if before != protein.id:
+                found.append([f"$.allocation.{row.id}", protein.id, before])
+    tables = {table.id for table in batch.lane_tables}
+    for membrane in batch.membranes:
+        for arena in membrane.arenas:
+            first, last = number(arena.image_id), number(arena.id)
+            between = [named.get(n) for n in range(first + 1, last)]
+            if last < first or any(i != membrane.id and i not in tables for i in between):
+                found.append([f"$.allocation.{arena.id}", arena.image_id, between])
+    return found
+
+
 def stored_differences(golden: Mapping[str, Any], project: Project) -> list[str]:
     """Where the values ``project`` stores differ from those of a
     ``stored.json`` (``golden``), exactly (:func:`differences`); what
@@ -662,8 +823,10 @@ def fresh_changes(frozen: Mapping[str, Any], project: Project) -> list[list[Any]
     """How the values a fresh build (``project``) stores differ from the
     frozen ones (``frozen``, a ``stored.json``), by :func:`changes`; what
     ``frozen`` records about the fixture (:data:`FROZEN_ONLY`) and, in each
-    log entry, :data:`NOT_IN_FRESH_LOG` are left out. Empty while the
-    operations store the numbers they stored at 05b4af5."""
+    log entry, :data:`NOT_IN_FRESH_LOG` are left out; then where the build
+    drew a new kind's id (:func:`allocation_issues`). Empty while the
+    operations store the numbers they stored at 05b4af5, and draw their ids
+    as they did then."""
 
     def compared(values: Mapping[str, Any]) -> dict[str, Any]:
         kept = {key: value for key, value in values.items() if key not in FROZEN_ONLY}
@@ -674,7 +837,7 @@ def fresh_changes(frozen: Mapping[str, Any], project: Project) -> list[list[Any]
         return kept
 
     fresh = json.loads(canonical_json(stored_values(project)))
-    return changes(compared(frozen), compared(fresh))
+    return changes(compared(frozen), compared(fresh)) + allocation_issues(project)
 
 
 # --- What the build derives from it ---
@@ -761,9 +924,10 @@ def _calibration(batch) -> list[dict[str, Any]]:
     shown = []
     for membrane in batch.membranes:
         groups = []
-        for group in membrane.register_groups():
-            image_ids = [image.id for image in membrane.images if image.id in group]
-            fit = ops.calibration_fit(membrane, image_ids[0])
+        images = batch.images_of(membrane)
+        for group in batch.register_groups(membrane):
+            image_ids = [image.id for image in images if image.id in group]
+            fit = ops.calibration_fit(batch, membrane, image_ids[0])
             groups.append({"image_ids": image_ids, "fit": None if fit is None else fit.as_json()})
         shown.append({"membrane_id": membrane.id, "groups": groups})
     return shown
