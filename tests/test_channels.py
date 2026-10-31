@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measuring a colour image on one of its channels (#206): the stored choice
 and the images it may be made for, reading an image on a channel, the
-over-exposure checks' trust in one channel, and the operation that sets it
-(and what undo, a polarity change, row detection and a seed click do with it).
+over-exposure checks' trust in one channel, the operation that sets it (and
+what undo, a polarity change, row detection and a seed click do with it), its
+route, the state the page reads and the previews.
 
 The images are synthetic: bands in the green channel alone, light on dark as a
 fluorescence scan, or dark on a light membrane, with or without one lane
@@ -12,6 +13,7 @@ red, green and blue until a channel is chosen for it.
 """
 
 import contextlib
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +46,8 @@ from proteia.core.model import (
 from proteia.core.operations import ErrorCode, LaneInput, OperationError
 from proteia.core.quantify import band_backgrounds, quantify_nets, to_grayscale
 from proteia.core.session import save_to_folder
+from proteia.web import api
+from proteia.web.state import preview_png, project_state
 from test_operations import (
     Recorder,
     _before_207,
@@ -1096,3 +1100,126 @@ def test_a_chosen_channel_is_saved_and_read_back(tmp_path):
     assert stored(reopened, image).measured_channel is BLUE
     assert np.array_equal(reopened.pixels(image), rgb[..., 2])
     assert_nets_current(reopened)
+
+
+# --- The state the page reads ---
+
+
+def test_the_state_says_what_each_image_is_measured_on(tmp_path):
+    s = session_on(tmp_path)
+    gray = import_pixels(s, colour_blot()[..., 1], "gray µ.tif")
+    colour = import_pixels(s, colour_blot(), "GFP α.tif")
+    marker = import_pixels(s, colour_blot(dark=True), "marker β.png", DARK, kind=MARKER)
+
+    def channels() -> dict:
+        state = project_state("p", s, s.project, open_id=1)
+        return {image["id"]: image["channel"] for image in state["images"]}
+
+    older = {"measured": "mean", "source": None, "offered": True}
+    assert channels() == {
+        gray: None,
+        colour: older,
+        marker: {"measured": "mean", "source": None, "offered": False},
+    }
+    ops.set_channel(s, colour, GREEN)
+    assert channels()[colour] == {"measured": "green", "source": "chosen", "offered": True}
+    ops.set_channel(s, colour, MEAN)
+    assert channels()[colour] == {"measured": "mean", "source": "chosen", "offered": True}
+
+
+# --- Previews ---
+
+
+def _workspace(tmp_path: Path) -> tuple[api.Workspace, ops.ProjectSession]:
+    workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
+    return workspace, workspace.create("A µ")
+
+
+def test_the_preview_shows_the_channel_measured(tmp_path):
+    workspace, session = _workspace(tmp_path)
+    rgb = colour_blot(crosstalk=0.4)
+    image = import_pixels(session, rgb, "GFP µ.tif")
+    mean = workspace.preview(session, image)
+    assert mean == preview_png(rgb.mean(axis=-1))
+    ops.set_channel(session, image, GREEN)
+    green = workspace.preview(session, image)
+    assert green == preview_png(rgb[..., 1].astype(np.float64)) != mean
+    ops.undo(session)
+    assert workspace.preview(session, image) == mean
+    ops.redo(session)
+    assert workspace.preview(session, image) == green
+    original = workspace.preview(session, image, original=True)
+    assert original not in (mean, green)  # the file's own colours, whatever is measured
+
+
+def test_a_preview_is_kept_under_the_channel_it_was_drawn_from(tmp_path, monkeypatch):
+    # A preview drawn while a channel change commits is kept under the channel
+    # its pixels are of, so that after undo the mean's preview is the mean's.
+    workspace, session = _workspace(tmp_path)
+    rgb = colour_blot(crosstalk=0.4)
+    image = import_pixels(session, rgb, "GFP µ.tif")
+    real = session.pixels
+    inside, release = threading.Event(), threading.Event()
+
+    def slow(image_id: str, *, keep: bool = True) -> np.ndarray:
+        inside.set()
+        assert release.wait(10)
+        return real(image_id, keep=keep)
+
+    monkeypatch.setattr(session, "pixels", slow)
+    drawn: list[bytes] = []
+    reader = threading.Thread(target=lambda: drawn.append(workspace.preview(session, image)))
+    reader.start()
+    assert inside.wait(10)
+    changer = threading.Thread(target=ops.set_channel, args=(session, image, GREEN))
+    changer.start()
+    changer.join(0.5)
+    release.set()
+    reader.join(10)
+    changer.join(10)
+    monkeypatch.setattr(session, "pixels", real)
+    mean = preview_png(rgb.mean(axis=-1))
+    assert drawn == [mean]
+    assert stored(session, image).measured_channel is GREEN
+    assert workspace.preview(session, image) == preview_png(rgb[..., 1].astype(np.float64))
+    ops.undo(session)
+    assert workspace.preview(session, image) == mean
+
+
+def test_a_preview_asked_before_a_channel_change_is_kept_under_the_new_one(tmp_path, monkeypatch):
+    # The change commits after the request read the project, before it read
+    # the pixels: the preview drawn is the new channel's, and kept under it.
+    workspace, session = _workspace(tmp_path)
+    rgb = colour_blot(crosstalk=0.4)
+    image = import_pixels(session, rgb, "GFP µ.tif")
+    real = workspace._lock
+    inside, release = threading.Event(), threading.Event()
+
+    class Gate:
+        """The workspace's lock, held up the first time the request takes it:
+        once it has made the preview's key."""
+
+        def __enter__(self):
+            if not inside.is_set():
+                inside.set()
+                assert release.wait(10)
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    monkeypatch.setattr(workspace, "_lock", Gate())
+    drawn: list[bytes] = []
+    reader = threading.Thread(target=lambda: drawn.append(workspace.preview(session, image)))
+    reader.start()
+    assert inside.wait(10)
+    ops.set_channel(session, image, GREEN)
+    release.set()
+    reader.join(10)
+    monkeypatch.setattr(workspace, "_lock", real)
+    green = preview_png(rgb[..., 1].astype(np.float64))
+    assert drawn == [green]
+    ops.undo(session)
+    assert workspace.preview(session, image) == preview_png(rgb.mean(axis=-1))
+    ops.redo(session)
+    assert workspace.preview(session, image) == green
