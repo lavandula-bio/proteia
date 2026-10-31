@@ -1,757 +1,2262 @@
 {
  "background_method": "ring_median_v1",
+ "batch": {
+  "lanes": [
+   {
+    "included": true,
+    "index": 0,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V1"
+   },
+   {
+    "included": true,
+    "index": 1,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V1"
+   },
+   {
+    "included": true,
+    "index": 2,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V2"
+   },
+   {
+    "included": true,
+    "index": 3,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A1"
+   },
+   {
+    "included": true,
+    "index": 4,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A2"
+   },
+   {
+    "included": false,
+    "index": 5,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A3"
+   },
+   {
+    "included": true,
+    "index": 6,
+    "label": "50 µM",
+    "metadata": {},
+    "sample": "B1"
+   },
+   {
+    "included": true,
+    "index": 7,
+    "label": "50 µM",
+    "metadata": {},
+    "sample": "B2"
+   }
+  ],
+  "membranes": [
+   {
+    "calibration": {
+     "fit_method": "log_linear_piecewise",
+     "fit_quality": 4.051294439555431e-05,
+     "ladder": "pageruler_plus/tris_glycine",
+     "ladder_kda": [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0, 10.0],
+     "points": [
+      {
+       "image_id": "img-4",
+       "mw": 130.0,
+       "side": "left",
+       "source": "visible_marker",
+       "x": 8.0,
+       "y": 10.0
+      },
+      {
+       "image_id": "img-3",
+       "mw": 100.0,
+       "side": "left",
+       "source": "chemiluminescence_marker",
+       "x": 8.0,
+       "y": 15.0
+      },
+      {
+       "image_id": "img-4",
+       "mw": 70.0,
+       "side": "left",
+       "source": "visible_marker",
+       "x": 8.0,
+       "y": 34.53
+      },
+      {
+       "image_id": "img-4",
+       "mw": 35.0,
+       "side": "left",
+       "source": "visible_marker",
+       "x": 8.0,
+       "y": 62.0
+      },
+      {
+       "image_id": "img-3",
+       "mw": 25.0,
+       "side": "left",
+       "source": "chemiluminescence_marker",
+       "x": 8.0,
+       "y": 65.0
+      },
+      {
+       "image_id": "img-4",
+       "mw": 130.0,
+       "side": "right",
+       "source": "visible_marker",
+       "x": 152.0,
+       "y": 13.0
+      },
+      {
+       "image_id": "img-4",
+       "mw": 70.0,
+       "side": "right",
+       "source": "visible_marker",
+       "x": 152.0,
+       "y": 37.53
+      },
+      {
+       "image_id": "img-4",
+       "mw": 35.0,
+       "side": "right",
+       "source": "visible_marker",
+       "x": 152.0,
+       "y": 65.0
+      }
+     ]
+    },
+    "id": "mem-2",
+    "images": [
+     {
+      "background": 49846.0,
+      "bit_depth": 16,
+      "file": "img-1.tif",
+      "height": 80,
+      "id": "img-1",
+      "import_warnings": [],
+      "kind": "chemiluminescence",
+      "marker_image_id": "img-4",
+      "original_name": "E1 β-catenin 10 s.tif",
+      "polarity": "dark_on_light",
+      "sha256": "3ee893eff9abf9f0f867a4ef1bde388b56adce3f2d44416eeed21ec034f2080f",
+      "width": 160
+     },
+     {
+      "background": 47969.0,
+      "bit_depth": 16,
+      "file": "img-3.tif",
+      "height": 80,
+      "id": "img-3",
+      "import_warnings": [],
+      "kind": "chemiluminescence",
+      "marker_image_id": null,
+      "original_name": "E2 p53 µ 60 s.tif",
+      "polarity": "dark_on_light",
+      "sha256": "998a1dfb3646b02f027edf9cd8797f365d6ad811bef091c93d5c14777c56a60c",
+      "width": 160
+     },
+     {
+      "background": 205.0,
+      "bit_depth": 8,
+      "file": "img-4.png",
+      "height": 80,
+      "id": "img-4",
+      "import_warnings": [],
+      "kind": "visible_marker",
+      "marker_image_id": null,
+      "original_name": "M marker.png",
+      "polarity": "dark_on_light",
+      "sha256": "a076434a5149177b1986f3c05e924968b7e4eb29ba271639b44f1b6a226690f3",
+      "width": 160
+     }
+    ]
+   },
+   {
+    "calibration": {
+     "fit_method": "log_linear_piecewise",
+     "fit_quality": null,
+     "ladder": null,
+     "ladder_kda": [],
+     "points": [
+      {
+       "image_id": "img-5",
+       "mw": 70.0,
+       "side": "left",
+       "source": "strip_edge",
+       "x": 70.0,
+       "y": 8.0
+      },
+      {
+       "image_id": "img-5",
+       "mw": 35.0,
+       "side": "left",
+       "source": "strip_edge",
+       "x": 70.0,
+       "y": 64.0
+      }
+     ]
+    },
+    "id": "mem-6",
+    "images": [
+     {
+      "background": 3045.0,
+      "bit_depth": 16,
+      "file": "img-5.tif",
+      "height": 72,
+      "id": "img-5",
+      "import_warnings": [],
+      "kind": "chemiluminescence",
+      "marker_image_id": null,
+      "original_name": "E3 α-tubulin.tif",
+      "polarity": "light_on_dark",
+      "sha256": "d59d9bf308b8604d52c20080c4d25b918849bdea02bdc3796253b060fb786193",
+      "width": 150
+     }
+    ]
+   }
+  ],
+  "proteins": [
+   {
+    "bands": [
+     {
+      "apparent_mw": 92.10279165856014,
+      "background_level": 49912.166666666664,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 17,
+       "y": 19
+      },
+      "clipped": false,
+      "id": "band-8",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1204192.9999999993,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.8808283377197,
+      "background_level": 49898.25,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 33,
+       "y": 19
+      },
+      "clipped": false,
+      "id": "band-9",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1373704.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 91.28326756866167,
+      "background_level": 49893.625,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 48,
+       "y": 20
+      },
+      "clipped": false,
+      "id": "band-10",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1040546.75,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.10279165856014,
+      "background_level": 49865.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 65,
+       "y": 20
+      },
+      "clipped": false,
+      "id": "band-11",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1551905.0,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.8808283377197,
+      "background_level": 49876.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 81,
+       "y": 20
+      },
+      "clipped": false,
+      "id": "band-12",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 1716843.0,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 91.28326756866167,
+      "background_level": 49916.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 96,
+       "y": 21
+      },
+      "clipped": false,
+      "id": "band-13",
+      "lane_index": 5,
+      "manually_edited": false,
+      "net": 1292218.0,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.8808283377197,
+      "background_level": 49945.5,
+      "background_mode": "symmetric",
+      "background_spread": 66.68867723815409,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 129,
+       "y": 21
+      },
+      "clipped": false,
+      "id": "band-14",
+      "lane_index": 7,
+      "manually_edited": false,
+      "net": 1441392.0,
+      "possibly_clipped": null,
+      "source": "row_box"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 10,
+     "width": 15
+    },
+    "expected_band_count": 1,
+    "expected_mw": 92.0,
+    "id": "prot-7",
+    "image_id": "img-1",
+    "loading_control_ids": ["prot-15"],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "role": "target",
+    "undetected": [
+     {
+      "band_index": 0,
+      "lane_index": 6,
+      "reason": "below_detection_limit",
+      "region": {
+       "x0": 114,
+       "x1": 125,
+       "y0": 14,
+       "y1": 36
+      },
+      "snr": 4.086641039129963,
+      "source": "row_box",
+      "threshold": 6.0
+     }
+    ]
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3035.625,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 13,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-16",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1127981.0,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3051.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 29,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-17",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1204605.0,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3054.3333333333335,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 45,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-18",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1090905.0,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3056.1666666666665,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 61,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-19",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1167774.0,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3048.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 77,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-20",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 1242262.0,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3046.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 93,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-21",
+      "lane_index": 5,
+      "manually_edited": false,
+      "net": 1054992.0,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3053.1,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 109,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-22",
+      "lane_index": 6,
+      "manually_edited": false,
+      "net": 1187163.2,
+      "possibly_clipped": null,
+      "source": "click"
+     },
+     {
+      "apparent_mw": 49.497474683058336,
+      "background_level": 3035.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 125,
+       "y": 30
+      },
+      "clipped": false,
+      "id": "band-23",
+      "lane_index": 7,
+      "manually_edited": false,
+      "net": 1145040.0,
+      "possibly_clipped": null,
+      "source": "click"
+     }
+    ],
+    "box_padding": {
+     "across": 2,
+     "along": 1
+    },
+    "box_size": {
+     "height": 12,
+     "width": 14
+    },
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-15",
+    "image_id": "img-5",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "role": "loading control",
+    "undetected": []
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": 36.197566755935654,
+      "background_level": 49885.5,
+      "background_mode": "symmetric",
+      "background_spread": 50.673251903356146,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 18,
+       "y": 56
+      },
+      "clipped": false,
+      "id": "band-25",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1760074.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": 35.59374715392786,
+      "background_level": 49850.75,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 34,
+       "y": 57
+      },
+      "clipped": false,
+      "id": "band-26",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1679846.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": 35.89438728684749,
+      "background_level": 49816.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 50,
+       "y": 57
+      },
+      "clipped": false,
+      "id": "band-27",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1865756.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": 36.197566755935654,
+      "background_level": 49736.75,
+      "background_mode": "symmetric",
+      "background_spread": 407.5139442304959,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 66,
+       "y": 57
+      },
+      "clipped": true,
+      "id": "band-28",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 5092459.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": 35.59374715392786,
+      "background_level": 49847.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 82,
+       "y": 58
+      },
+      "clipped": false,
+      "id": "band-29",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 1781453.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": 35.89438728684749,
+      "background_level": 49849.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 98,
+       "y": 58
+      },
+      "clipped": false,
+      "id": "band-30",
+      "lane_index": 5,
+      "manually_edited": false,
+      "net": 1606209.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": 35.59374715392786,
+      "background_level": 49812.0,
+      "background_mode": "symmetric",
+      "background_spread": 27.053269377874642,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 130,
+       "y": 59
+      },
+      "clipped": false,
+      "id": "band-31",
+      "lane_index": 7,
+      "manually_edited": false,
+      "net": 1784837.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-24",
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "GAPDH",
+    "role": "loading control",
+    "undetected": []
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47937.833333333336,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 17,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-33",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 772083.0000000002,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     },
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47915.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 33,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-34",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 946075.0,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     },
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47916.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 48,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-35",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 863912.0,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     },
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47901.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 65,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-36",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1034086.0,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     },
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47928.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 81,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-37",
+      "lane_index": 4,
+      "manually_edited": false,
+      "net": 1108104.0,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     },
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47952.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 113,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-38",
+      "lane_index": 6,
+      "manually_edited": false,
+      "net": 818364.0,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     },
+     {
+      "apparent_mw": 52.850902028069015,
+      "background_level": 47951.0,
+      "background_mode": "symmetric",
+      "background_spread": 21.427120477670833,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 129,
+       "y": 33
+      },
+      "clipped": false,
+      "id": "band-39",
+      "lane_index": 7,
+      "manually_edited": false,
+      "net": 896478.0,
+      "possibly_clipped": null,
+      "source": "mw_guided"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 10,
+     "width": 15
+    },
+    "expected_band_count": 1,
+    "expected_mw": 53.0,
+    "id": "prot-32",
+    "image_id": "img-3",
+    "loading_control_ids": ["prot-24"],
+    "mw_tolerance": 0.1,
+    "name": "p53 µ",
+    "role": "target",
+    "undetected": [
+     {
+      "band_index": 0,
+      "lane_index": 5,
+      "reason": "below_detection_limit",
+      "region": {
+       "x0": 99,
+       "x1": 109,
+       "y0": 25,
+       "y1": 51
+      },
+      "snr": 2.0900332641670336,
+      "source": "mw_guided",
+      "threshold": 6.0
+     }
+    ]
+   }
+  ],
+  "reference_condition": "vehicle"
+ },
  "built_at": "05b4af5b08e51b450436e9446651f5650bff48e4",
+ "case": "f1",
  "content_hash": "6ff3690fa6a9b59395a51501bf59b0bd1ae636cdd5e5f667a483949fc72f27a7",
- "images": [
+ "log": [
   {
-   "background": 49846.0,
-   "bit_depth": 16,
-   "file": "img-1.tif",
-   "id": "img-1",
-   "import_warnings": [],
-   "kind": "chemiluminescence",
-   "marker_image_id": "img-4",
-   "original_name": "E1 β-catenin 10 s.tif",
-   "polarity": "dark_on_light",
-   "sha256": "3ee893eff9abf9f0f867a4ef1bde388b56adce3f2d44416eeed21ec034f2080f",
-   "size": [160, 80]
+   "action": "new_project",
+   "content_hash": "f6ab14dda115562f0f767894caa17ffd8ab5558fa2ba16be7d9650b4727fdb36",
+   "params": {},
+   "seq": 1,
+   "time": "2026-10-31T09:00:00.000Z",
+   "version": "0.1.0.dev0"
   },
   {
-   "background": 47969.0,
-   "bit_depth": 16,
-   "file": "img-3.tif",
-   "id": "img-3",
-   "import_warnings": [],
-   "kind": "chemiluminescence",
-   "marker_image_id": null,
-   "original_name": "E2 p53 µ 60 s.tif",
-   "polarity": "dark_on_light",
-   "sha256": "998a1dfb3646b02f027edf9cd8797f365d6ad811bef091c93d5c14777c56a60c",
-   "size": [160, 80]
+   "action": "import_image",
+   "content_hash": "82415a7acfe52e42d0f79062b8ccbd5f36998a2c27e80b8f6ad2928c807d3b25",
+   "params": {
+    "image_id": "img-1",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-2",
+    "new_membrane": true,
+    "original_name": "E1 β-catenin 10 s.tif",
+    "polarity": "dark_on_light",
+    "sha256": "3ee893eff9abf9f0f867a4ef1bde388b56adce3f2d44416eeed21ec034f2080f"
+   },
+   "seq": 2,
+   "time": "2026-10-31T09:00:01.000Z",
+   "version": "0.1.0.dev0"
   },
   {
-   "background": 205.0,
-   "bit_depth": 8,
-   "file": "img-4.png",
-   "id": "img-4",
-   "import_warnings": [],
-   "kind": "visible_marker",
-   "marker_image_id": null,
-   "original_name": "M marker.png",
-   "polarity": "dark_on_light",
-   "sha256": "a076434a5149177b1986f3c05e924968b7e4eb29ba271639b44f1b6a226690f3",
-   "size": [160, 80]
+   "action": "import_image",
+   "content_hash": "44a5e76109d143f3929550fb80bd62611eba4e3b66ff07c1dcb88b2e0a412bb2",
+   "params": {
+    "image_id": "img-3",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-2",
+    "new_membrane": false,
+    "original_name": "E2 p53 µ 60 s.tif",
+    "polarity": "dark_on_light",
+    "sha256": "998a1dfb3646b02f027edf9cd8797f365d6ad811bef091c93d5c14777c56a60c"
+   },
+   "seq": 3,
+   "time": "2026-10-31T09:00:02.000Z",
+   "version": "0.1.0.dev0"
   },
   {
-   "background": 3045.0,
-   "bit_depth": 16,
-   "file": "img-5.tif",
-   "id": "img-5",
-   "import_warnings": [],
-   "kind": "chemiluminescence",
-   "marker_image_id": null,
-   "original_name": "E3 α-tubulin.tif",
-   "polarity": "light_on_dark",
-   "sha256": "d59d9bf308b8604d52c20080c4d25b918849bdea02bdc3796253b060fb786193",
-   "size": [150, 72]
+   "action": "import_image",
+   "content_hash": "450f3e8cb50a843766fba67009a61c4b13455c4f7a3a18ef5fb18e971564f00e",
+   "params": {
+    "image_id": "img-4",
+    "kind": "visible_marker",
+    "membrane_id": "mem-2",
+    "new_membrane": false,
+    "original_name": "M marker.png",
+    "polarity": "dark_on_light",
+    "sha256": "a076434a5149177b1986f3c05e924968b7e4eb29ba271639b44f1b6a226690f3"
+   },
+   "seq": 4,
+   "time": "2026-10-31T09:00:03.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "import_image",
+   "content_hash": "8f4f359638511bfab84b382d02da4aac7c8a1466e8a4ecf1cfb3b15169e869a6",
+   "params": {
+    "image_id": "img-5",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-6",
+    "new_membrane": true,
+    "original_name": "E3 α-tubulin.tif",
+    "polarity": "light_on_dark",
+    "sha256": "d59d9bf308b8604d52c20080c4d25b918849bdea02bdc3796253b060fb786193"
+   },
+   "seq": 5,
+   "time": "2026-10-31T09:00:04.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_marker_image",
+   "content_hash": "5d9ae8ffbb3b78a9f346e827e42b5985a0f023a78017770708cc229738ffbc3b",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-1", "img-4"],
+    "image_id": "img-1",
+    "marker_image_id": "img-4",
+    "membrane_id": "mem-2",
+    "previous": null
+   },
+   "seq": 6,
+   "time": "2026-10-31T09:00:05.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_ladder",
+   "content_hash": "c120fc6f6d9e06ef442abbbe5a28f91628c32e4d497f4c1fe09f2cd2a4b74cbf",
+   "params": {
+    "kda": [250, 130, 100, 70, 55, 35, 25, 15, 10],
+    "ladder": "pageruler_plus/tris_glycine",
+    "membrane_id": "mem-2"
+   },
+   "seq": 7,
+   "time": "2026-10-31T09:00:06.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "0fbc8cd7ee2372431bdffe71e650c8c0182d82ba2d0fc842fdede3beb9781396",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-1", "img-4"],
+    "image_id": "img-4",
+    "membrane_id": "mem-2",
+    "mw": 130.0,
+    "side": "left",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 8.0,
+    "y": 10.0,
+    "y_given": 10.0
+   },
+   "seq": 8,
+   "time": "2026-10-31T09:00:07.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "bf1d5e6643f922fb0cf231baf08dbac4fa34b1b12525f912447ecbddf0adfa9e",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-1", "img-4"],
+    "image_id": "img-4",
+    "membrane_id": "mem-2",
+    "mw": 130.0,
+    "side": "right",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 152.0,
+    "y": 13.0,
+    "y_given": 13.0
+   },
+   "seq": 9,
+   "time": "2026-10-31T09:00:08.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "5a6d1a45907666f63bb71675fa8388d0621adf6be355082adca02952d1e67085",
+   "params": {
+    "curves_changed": ["img-1", "img-4"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "ignored": [
+      ["right", "one_point"]
+     ],
+     "image_ids": ["img-1", "img-4"],
+     "ladders": [
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [55.602976430699705, 163.66030353324183],
+       "side": "left",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 8.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": null,
+     "range": [55.602976430699705, 163.66030353324183],
+     "tilt_deg": null
+    },
+    "group": ["img-1", "img-4"],
+    "image_id": "img-4",
+    "membrane_id": "mem-2",
+    "mw": 70.0,
+    "side": "left",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 8.0,
+    "y": 34.53,
+    "y_given": 34.53
+   },
+   "seq": 10,
+   "time": "2026-10-31T09:00:09.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "8c1d9ba5a6b7b506f546f08dbc4eb3eeac0803581dc1a5576d09d4dcbb24f664",
+   "params": {
+    "curves_changed": ["img-1", "img-4"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": 0.0,
+     "disagreement_infinite": false,
+     "disagreement_mw": 130.0,
+     "ignored": [],
+     "image_ids": ["img-1", "img-4"],
+     "ladders": [
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [55.602976430699705, 163.66030353324183],
+       "side": "left",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 8.0
+      },
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [55.602976430699705, 163.66030353324183],
+       "side": "right",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 152.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": 3.0,
+     "range": [55.602976430699705, 163.66030353324183],
+     "tilt_deg": 1.193489423982035
+    },
+    "group": ["img-1", "img-4"],
+    "image_id": "img-4",
+    "membrane_id": "mem-2",
+    "mw": 70.0,
+    "side": "right",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 152.0,
+    "y": 37.53,
+    "y_given": 37.53
+   },
+   "seq": 11,
+   "time": "2026-10-31T09:00:10.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "5d9eb0042c499e481eb971b80f2c0e662bb2b9f3a9e0545a500d2089d66b1a74",
+   "params": {
+    "curves_changed": ["img-1", "img-4"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": 0.0,
+     "disagreement_infinite": false,
+     "disagreement_mw": 130.0,
+     "ignored": [],
+     "image_ids": ["img-1", "img-4"],
+     "ladders": [
+      {
+       "points": 3,
+       "predicted_mw": 70.00283602100326,
+       "quality": 4.051294439555431e-05,
+       "quality_infinite": false,
+       "range": [27.80148821534985, 163.66030353324183],
+       "side": "left",
+       "two_point": false,
+       "worst_mw": 70.0,
+       "x": 8.0
+      },
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [55.602976430699705, 163.66030353324183],
+       "side": "right",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 152.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": 3.0,
+     "range": [55.602976430699705, 163.66030353324183],
+     "tilt_deg": 1.193489423982035
+    },
+    "group": ["img-1", "img-4"],
+    "image_id": "img-4",
+    "membrane_id": "mem-2",
+    "mw": 35.0,
+    "side": "left",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 8.0,
+    "y": 62.0,
+    "y_given": 62.0
+   },
+   "seq": 12,
+   "time": "2026-10-31T09:00:11.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "676a13fde7e3b9d9c0e4322134eb47c910ac2a0cce11d9281e771619e72ec571",
+   "params": {
+    "curves_changed": ["img-1", "img-4"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": 0.0,
+     "disagreement_infinite": false,
+     "disagreement_mw": 130.0,
+     "ignored": [],
+     "image_ids": ["img-1", "img-4"],
+     "ladders": [
+      {
+       "points": 3,
+       "predicted_mw": 70.00283602100326,
+       "quality": 4.051294439555431e-05,
+       "quality_infinite": false,
+       "range": [27.80148821534985, 163.66030353324183],
+       "side": "left",
+       "two_point": false,
+       "worst_mw": 70.0,
+       "x": 8.0
+      },
+      {
+       "points": 3,
+       "predicted_mw": 70.00283602100326,
+       "quality": 4.051294439555431e-05,
+       "quality_infinite": false,
+       "range": [27.80148821534985, 163.66030353324183],
+       "side": "right",
+       "two_point": false,
+       "worst_mw": 70.0,
+       "x": 152.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": 3.0,
+     "range": [27.80148821534985, 163.66030353324183],
+     "tilt_deg": 1.193489423982035
+    },
+    "group": ["img-1", "img-4"],
+    "image_id": "img-4",
+    "membrane_id": "mem-2",
+    "mw": 35.0,
+    "side": "right",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 152.0,
+    "y": 65.0,
+    "y_given": 65.0
+   },
+   "seq": 13,
+   "time": "2026-10-31T09:00:12.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "a09ba1b3cdf7d4e00a604f120321a66811eff809145206940eb598e59a2b21f6",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-3"],
+    "image_id": "img-3",
+    "membrane_id": "mem-2",
+    "mw": 100.0,
+    "side": "left",
+    "snapped": false,
+    "source": "chemiluminescence_marker",
+    "x": 8.0,
+    "y": 15.0,
+    "y_given": 15.0
+   },
+   "seq": 14,
+   "time": "2026-10-31T09:00:13.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "4fc49e5ac0b8386899e5e45d6cec2f025800b2faacf054e3e63e904ccc3accce",
+   "params": {
+    "curves_changed": ["img-3"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "ignored": [],
+     "image_ids": ["img-3"],
+     "ladders": [
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [19.85820586810704, 125.89254117941675],
+       "side": "left",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 8.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": null,
+     "range": [19.85820586810704, 125.89254117941675],
+     "tilt_deg": null
+    },
+    "group": ["img-3"],
+    "image_id": "img-3",
+    "membrane_id": "mem-2",
+    "mw": 25.0,
+    "side": "left",
+    "snapped": false,
+    "source": "chemiluminescence_marker",
+    "x": 8.0,
+    "y": 65.0,
+    "y_given": 65.0
+   },
+   "seq": 15,
+   "time": "2026-10-31T09:00:14.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "fffe2fe7e414783d1c7b02ed3f504b2da437913c21ffc86810250af7082eeb2f",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-5"],
+    "image_id": "img-5",
+    "membrane_id": "mem-6",
+    "mw": 70.0,
+    "side": "left",
+    "snapped": false,
+    "source": "strip_edge",
+    "x": 70.0,
+    "y": 8.0,
+    "y_given": 8.0
+   },
+   "seq": 16,
+   "time": "2026-10-31T09:00:15.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "62df49cf24396fe02172ef69be0b6b287c2675d2d12f295f553efc6a7c5964b9",
+   "params": {
+    "curves_changed": ["img-5"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "ignored": [],
+     "image_ids": ["img-5"],
+     "ladders": [
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [35.0, 70.00000000000001],
+       "side": "left",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 70.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": null,
+     "range": [35.0, 70.00000000000001],
+     "tilt_deg": null
+    },
+    "group": ["img-5"],
+    "image_id": "img-5",
+    "membrane_id": "mem-6",
+    "mw": 35.0,
+    "side": "left",
+    "snapped": false,
+    "source": "strip_edge",
+    "x": 70.0,
+    "y": 64.0,
+    "y_given": 64.0
+   },
+   "seq": 17,
+   "time": "2026-10-31T09:00:16.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_lanes",
+   "content_hash": "cbe68ac8cd0acdf93ec3cd75fbbc056e95e0d7b3916a0b268cdc40ce9c671ab9",
+   "params": {
+    "changed": [
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 0,
+      "sample": "V1"
+     },
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 1,
+      "sample": "V1"
+     },
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 2,
+      "sample": "V2"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 3,
+      "sample": "A1"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 4,
+      "sample": "A2"
+     },
+     {
+      "condition": "10 µM",
+      "included": false,
+      "index": 5,
+      "sample": "A3"
+     },
+     {
+      "condition": "50 µM",
+      "included": true,
+      "index": 6,
+      "sample": "B1"
+     },
+     {
+      "condition": "50 µM",
+      "included": true,
+      "index": 7,
+      "sample": "B2"
+     }
+    ],
+    "dropped_undetected": [],
+    "lane_count": 8,
+    "reference_condition": "vehicle"
+   },
+   "seq": 18,
+   "time": "2026-10-31T09:00:17.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "51918b3c47db1c1f964ae0c618f521c7b6a646e3fcda6fd2322de3afc79080ac",
+   "params": {
+    "box_size": {
+     "height": 6,
+     "width": 20
+    },
+    "expected_mw": 92.0,
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "pinned_targets": [],
+    "protein_id": "prot-7",
+    "role": "target"
+   },
+   "seq": 19,
+   "time": "2026-10-31T09:00:18.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "detect_row_boxes",
+   "content_hash": "f5bb0f7222dbbbc041d34c86a5c390a3c9b71abbd4cfd70cc9553188ca126dc4",
+   "params": {
+    "box_size": {
+     "height": 10,
+     "width": 15
+    },
+    "dropped_undetected": [],
+    "flags": [],
+    "kept_lanes": [],
+    "lanes": [
+     {
+      "band_id": "band-8",
+      "expected_x": 24.0,
+      "reason": "band",
+      "rect": [17, 19, 32, 29],
+      "snr": 156.35
+     },
+     {
+      "band_id": "band-9",
+      "expected_x": 40.0,
+      "reason": "band",
+      "rect": [33, 19, 48, 29],
+      "snr": 180.32
+     },
+     {
+      "band_id": "band-10",
+      "expected_x": 55.5,
+      "reason": "band",
+      "rect": [48, 20, 63, 30],
+      "snr": 134.9
+     },
+     {
+      "band_id": "band-11",
+      "expected_x": 72.0,
+      "reason": "band",
+      "rect": [65, 20, 80, 30],
+      "snr": 203.3
+     },
+     {
+      "band_id": "band-12",
+      "expected_x": 88.0,
+      "reason": "band",
+      "rect": [81, 20, 96, 30],
+      "snr": 227.11
+     },
+     {
+      "band_id": "band-13",
+      "expected_x": 103.5,
+      "reason": "band",
+      "rect": [96, 21, 111, 31],
+      "snr": 170.1
+     },
+     {
+      "band_id": null,
+      "expected_x": 119.8,
+      "reason": "no_band",
+      "rect": null,
+      "snr": 4.09
+     },
+     {
+      "band_id": "band-14",
+      "expected_x": 136.0,
+      "reason": "band",
+      "rect": [129, 21, 144, 31],
+      "snr": 193.06
+     }
+    ],
+    "noise": 87.44227200203709,
+    "notes": [],
+    "pitch": 16.005000000000006,
+    "protein_id": "prot-7",
+    "removed_band_ids": [],
+    "replaced_band_ids": [],
+    "right_to_left": false,
+    "row": [14, 14, 146, 36],
+    "saturated_at": 0.0,
+    "settings": {
+     "ambiguity_margin": 4.0,
+     "apart_doubt": 0.6,
+     "bg_clip_k": 3.0,
+     "bg_guard": [0.5, 0.25],
+     "bg_guard_min": 2,
+     "bg_iter": 30,
+     "bg_min_keep": 0.1,
+     "bg_min_pixels": 200,
+     "bg_warn_k": 3.0,
+     "cell_seed": 0.25,
+     "cut_level": 0.3,
+     "despeckle_min": 3,
+     "detect_k": 6.0,
+     "edge_hump": 0.5,
+     "empty_window": 0.3,
+     "end_doubt": 1.5,
+     "end_hi": 1.0,
+     "end_lo": 0.1,
+     "end_sym_tol": 0.25,
+     "end_tol": 0.1,
+     "envelope_half": 0.5,
+     "envelope_min": 2,
+     "extent_level": 0.3,
+     "fit_max_pixels": 20000,
+     "flat_edge": 0.8,
+     "gap_frac": 0.1,
+     "gap_search": 1,
+     "hollow_pixels": 5,
+     "join_rows": 0.5,
+     "lanes_doubt": 0.5,
+     "line_flat": 0.8,
+     "line_px": 4,
+     "line_span": 2.0,
+     "membrane_shift_k": 6.0,
+     "membrane_spread_k": 1.5,
+     "min_box": 2,
+     "min_fit": 16,
+     "min_width_pitch": 0.15,
+     "min_width_px": 7,
+     "near_peaks": 1.5,
+     "noise_floor_frac": 0.001,
+     "noise_k": 3.0,
+     "pitch_doubt": 0.3,
+     "pitch_prior_tol": 0.25,
+     "pitch_range": [0.55, 1.3],
+     "pitch_refine": 0.04,
+     "pitch_steps": [0.05, 0.01],
+     "q_window": 2,
+     "reduce_mass": 0.25,
+     "rel_threshold": 0.3,
+     "row_line_k": 0.75,
+     "row_line_min": 4,
+     "row_line_tol": 0.25,
+     "row_line_tol_px": 3.0,
+     "row_min_keep": 3,
+     "row_min_rows": 5,
+     "row_smile": 2.0,
+     "row_walk_tol": 0.02,
+     "run_lane_min": 0.6,
+     "second_share": 0.25,
+     "single_max_width": 1.25,
+     "size_guard": 2.0,
+     "size_rule": "max_guarded",
+     "smooth": [3, 5],
+     "spacing_tol": 0.15,
+     "split_penalty": 1.0,
+     "tail_q": 97.5,
+     "valley_frac": 0.75
+    },
+    "undetected_written": [
+     {
+      "band_index": 0,
+      "lane_index": 6,
+      "protein_id": "prot-7",
+      "reason": "below_detection_limit",
+      "region": [114, 14, 125, 36],
+      "snr": 4.086641039129963,
+      "source": "row_box",
+      "threshold": 6.0
+     }
+    ],
+    "unlocated_lanes": []
+   },
+   "seq": 20,
+   "time": "2026-10-31T09:00:19.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "a8b26c27ce141cb2c9c54fc96ed40c8dca10ea4fa2e6e230daa1dc7e6245c233",
+   "params": {
+    "box_size": {
+     "height": 6,
+     "width": 18
+    },
+    "expected_mw": null,
+    "image_id": "img-5",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "pinned_targets": [],
+    "protein_id": "prot-15",
+    "role": "loading control"
+   },
+   "seq": 21,
+   "time": "2026-10-31T09:00:20.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "c634bdebc61bf5e72af65ff99a49d3799295aa38ccd66dcee432d9e7290a24ca",
+   "params": {
+    "band_id": "band-16",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 0,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [15, 31, 25, 41],
+    "replaced_undetected": null,
+    "x": 20,
+    "y": 36
+   },
+   "seq": 22,
+   "time": "2026-10-31T09:00:21.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "3e910758c2ed3f8cdd181b958ddb0a0a4987bb2de7ae05da90cf5c3af51640c5",
+   "params": {
+    "band_id": "band-17",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 1,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [31, 31, 41, 41],
+    "replaced_undetected": null,
+    "x": 36,
+    "y": 36
+   },
+   "seq": 23,
+   "time": "2026-10-31T09:00:22.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "84eb5c8773f04979e63a2e76b537c7a1f31e2fa9a5b91d5008f85e682b35b5e2",
+   "params": {
+    "band_id": "band-18",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 2,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [47, 31, 57, 41],
+    "replaced_undetected": null,
+    "x": 52,
+    "y": 36
+   },
+   "seq": 24,
+   "time": "2026-10-31T09:00:23.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "9fc0822e81045950325bbf1c78c3991efad7dd5ddea682c3ec233ae1b9351f61",
+   "params": {
+    "band_id": "band-19",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 3,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [63, 31, 73, 41],
+    "replaced_undetected": null,
+    "x": 68,
+    "y": 36
+   },
+   "seq": 25,
+   "time": "2026-10-31T09:00:24.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "db4c4faa177b97fc0f29d852a7254cb3c4e732499c2b950a49cc63c2c9cbf192",
+   "params": {
+    "band_id": "band-20",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 4,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [79, 31, 89, 41],
+    "replaced_undetected": null,
+    "x": 84,
+    "y": 36
+   },
+   "seq": 26,
+   "time": "2026-10-31T09:00:25.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "ee66bf733a36c91502085ab98c3c61c1af38b613a6cf3cbd9c8d7c05c18470dc",
+   "params": {
+    "band_id": "band-21",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 5,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [95, 31, 105, 41],
+    "replaced_undetected": null,
+    "x": 100,
+    "y": 36
+   },
+   "seq": 27,
+   "time": "2026-10-31T09:00:26.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "9da86a916e534474e6e9428e301cffa6c0083571066ff41ec71515525c92a9bc",
+   "params": {
+    "band_id": "band-22",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 6,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [111, 31, 121, 41],
+    "replaced_undetected": null,
+    "x": 116,
+    "y": 36
+   },
+   "seq": 28,
+   "time": "2026-10-31T09:00:27.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "679287e59f6b6187a4e4569b1ab42e251271da917273533bcdec58ab39a2f5bb",
+   "params": {
+    "band_id": "band-23",
+    "box_size": {
+     "height": 10,
+     "width": 10
+    },
+    "grow": true,
+    "lane_index": 7,
+    "lane_proposed": false,
+    "protein_id": "prot-15",
+    "rect": [127, 31, 137, 41],
+    "replaced_undetected": null,
+    "x": 132,
+    "y": 36
+   },
+   "seq": 29,
+   "time": "2026-10-31T09:00:28.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_box_padding",
+   "content_hash": "d38e87a71456baaaf3ba060aee576cee26dbeafa7acaa49e9c0d7b2436284191",
+   "params": {
+    "box_padding": {
+     "across": 2,
+     "along": 1
+    },
+    "box_size": {
+     "height": 12,
+     "width": 14
+    },
+    "protein_id": "prot-15"
+   },
+   "seq": 30,
+   "time": "2026-10-31T09:00:29.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "89af02837b259287c2ab924f6e42737251791a074c6219166573fc2044377f83",
+   "params": {
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_mw": null,
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "GAPDH",
+    "pinned_targets": ["prot-7"],
+    "protein_id": "prot-24",
+    "role": "loading control"
+   },
+   "seq": 31,
+   "time": "2026-10-31T09:00:30.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "d4956e3400f8c702de78c4ea9d8b434842d84b80d9ec2e23f08fc977dea38e72",
+   "params": {
+    "band_id": "band-25",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 0,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [18, 56, 30, 66],
+    "replaced_undetected": null,
+    "x": 24,
+    "y": 61
+   },
+   "seq": 32,
+   "time": "2026-10-31T09:00:31.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "57619bc93a4920a04aa9a00bb7d92ae8588b09f5267281df726691bd0ac02c41",
+   "params": {
+    "band_id": "band-26",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 1,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [34, 57, 46, 67],
+    "replaced_undetected": null,
+    "x": 40,
+    "y": 62
+   },
+   "seq": 33,
+   "time": "2026-10-31T09:00:32.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "bb468fd7b3b98b7e5b0b92d8b316216b4d1f1a6967b3539efa663d588700b2ec",
+   "params": {
+    "band_id": "band-27",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 2,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [50, 57, 62, 67],
+    "replaced_undetected": null,
+    "x": 56,
+    "y": 62
+   },
+   "seq": 34,
+   "time": "2026-10-31T09:00:33.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "acb3982db220068c2550342e4347eddf4bce10d6e18c7895076c019f36d512ba",
+   "params": {
+    "band_id": "band-28",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 3,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [66, 57, 78, 67],
+    "replaced_undetected": null,
+    "x": 72,
+    "y": 62
+   },
+   "seq": 35,
+   "time": "2026-10-31T09:00:34.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "cf7016d960c4e056ee726f18c6761b18cedaa5f76a87ea35dd1b007b346cc419",
+   "params": {
+    "band_id": "band-29",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 4,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [82, 58, 94, 68],
+    "replaced_undetected": null,
+    "x": 88,
+    "y": 63
+   },
+   "seq": 36,
+   "time": "2026-10-31T09:00:35.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "8342948153877c2c0c5c7be977076e96f988a00f9f7b2522e24ecdcfc998c549",
+   "params": {
+    "band_id": "band-30",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 5,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [98, 58, 110, 68],
+    "replaced_undetected": null,
+    "x": 104,
+    "y": 63
+   },
+   "seq": 37,
+   "time": "2026-10-31T09:00:36.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "ebbeff2f2f057e9e356da9eb59228989688381ea1073b21517c85231e2daf4ea",
+   "params": {
+    "band_id": "band-31",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 7,
+    "lane_proposed": false,
+    "protein_id": "prot-24",
+    "rect": [130, 59, 142, 69],
+    "replaced_undetected": null,
+    "x": 136,
+    "y": 64
+   },
+   "seq": 38,
+   "time": "2026-10-31T09:00:37.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "aa83fc6ba10afa04d8923e20411538ced7340d9171c14ec07c718809b8cc88cf",
+   "params": {
+    "box_size": {
+     "height": 6,
+     "width": 20
+    },
+    "expected_mw": 53.0,
+    "image_id": "img-3",
+    "loading_control_ids": ["prot-24"],
+    "mw_tolerance": 0.1,
+    "name": "p53 µ",
+    "pinned_targets": [],
+    "protein_id": "prot-32",
+    "role": "target"
+   },
+   "seq": 39,
+   "time": "2026-10-31T09:00:38.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "detect_mw_row",
+   "content_hash": "6ff3690fa6a9b59395a51501bf59b0bd1ae636cdd5e5f667a483949fc72f27a7",
+   "params": {
+    "anchor_ids": [],
+    "anchor_image_id": null,
+    "box_size": {
+     "height": 10,
+     "width": 15
+    },
+    "dropped_undetected": [],
+    "expected_mws": [53.0],
+    "expected_y": [37.9],
+    "fit": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "ignored": [],
+     "image_ids": ["img-3"],
+     "ladders": [
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [19.85820586810704, 125.89254117941675],
+       "side": "left",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 8.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": null,
+     "range": [19.85820586810704, 125.89254117941675],
+     "tilt_deg": null
+    },
+    "flags": [],
+    "kept_lanes": [],
+    "lanes": [
+     {
+      "band_id": "band-33",
+      "expected_x": 24.0,
+      "reason": "band",
+      "rect": [17, 33, 32, 43],
+      "snr": 147.58
+     },
+     {
+      "band_id": "band-34",
+      "expected_x": 40.0,
+      "reason": "band",
+      "rect": [33, 33, 48, 43],
+      "snr": 180.85
+     },
+     {
+      "band_id": "band-35",
+      "expected_x": 55.5,
+      "reason": "band",
+      "rect": [48, 33, 63, 43],
+      "snr": 164.82
+     },
+     {
+      "band_id": "band-36",
+      "expected_x": 72.0,
+      "reason": "band",
+      "rect": [65, 33, 80, 43],
+      "snr": 198.43
+     },
+     {
+      "band_id": "band-37",
+      "expected_x": 88.0,
+      "reason": "band",
+      "rect": [81, 33, 96, 43],
+      "snr": 214.27
+     },
+     {
+      "band_id": null,
+      "expected_x": 104.0,
+      "reason": "no_band",
+      "rect": null,
+      "snr": 2.09
+     },
+     {
+      "band_id": "band-38",
+      "expected_x": 120.0,
+      "reason": "band",
+      "rect": [113, 33, 128, 43],
+      "snr": 156.43
+     },
+     {
+      "band_id": "band-39",
+      "expected_x": 136.0,
+      "reason": "band",
+      "rect": [129, 33, 144, 43],
+      "snr": 173.37
+     }
+    ],
+    "m_bot": 44.16666666666665,
+    "m_top": 63.599999999999994,
+    "margin": 6.0,
+    "mw_tolerance": 0.1,
+    "noise": 59.95125013361488,
+    "notes": [],
+    "pitch": 16.005000000000006,
+    "protein_id": "prot-32",
+    "removed_band_ids": [],
+    "replaced_band_ids": [],
+    "right_to_left": false,
+    "row": [14, 25, 146, 51],
+    "saturated_at": 0.0,
+    "search_factor": 2.0,
+    "settings": {
+     "ambiguity_margin": 4.0,
+     "apart_doubt": 0.6,
+     "bg_clip_k": 3.0,
+     "bg_guard": [0.5, 0.25],
+     "bg_guard_min": 2,
+     "bg_iter": 30,
+     "bg_min_keep": 0.1,
+     "bg_min_pixels": 200,
+     "bg_warn_k": 3.0,
+     "cell_seed": 0.25,
+     "cut_level": 0.3,
+     "despeckle_min": 3,
+     "detect_k": 6.0,
+     "edge_hump": 0.5,
+     "empty_window": 0.3,
+     "end_doubt": 1.5,
+     "end_hi": 1.0,
+     "end_lo": 0.1,
+     "end_sym_tol": 0.25,
+     "end_tol": 0.1,
+     "envelope_half": 0.5,
+     "envelope_min": 2,
+     "extent_level": 0.3,
+     "fit_max_pixels": 20000,
+     "flat_edge": 0.8,
+     "gap_frac": 0.1,
+     "gap_search": 1,
+     "hollow_pixels": 5,
+     "join_rows": 0.5,
+     "lanes_doubt": 0.5,
+     "line_flat": 0.8,
+     "line_px": 4,
+     "line_span": 2.0,
+     "membrane_shift_k": 6.0,
+     "membrane_spread_k": 1.5,
+     "min_box": 2,
+     "min_fit": 16,
+     "min_width_pitch": 0.15,
+     "min_width_px": 7,
+     "near_peaks": 1.5,
+     "noise_floor_frac": 0.001,
+     "noise_k": 3.0,
+     "pitch_doubt": 0.3,
+     "pitch_prior_tol": 0.25,
+     "pitch_range": [0.55, 1.3],
+     "pitch_refine": 0.04,
+     "pitch_steps": [0.05, 0.01],
+     "q_window": 2,
+     "reduce_mass": 0.25,
+     "rel_threshold": 0.3,
+     "row_line_k": 0.75,
+     "row_line_min": 4,
+     "row_line_tol": 0.25,
+     "row_line_tol_px": 3.0,
+     "row_min_keep": 3,
+     "row_min_rows": 5,
+     "row_smile": 2.0,
+     "row_walk_tol": 0.02,
+     "run_lane_min": 0.6,
+     "second_share": 0.25,
+     "single_max_width": 1.25,
+     "size_guard": 2.0,
+     "size_rule": "max_guarded",
+     "smooth": [3, 5],
+     "spacing_tol": 0.15,
+     "split_penalty": 1.0,
+     "tail_q": 97.5,
+     "valley_frac": 0.75
+    },
+    "shift_ends": [0, 0],
+    "slope_deg": 0.0,
+    "span": [14, 146],
+    "span_from": "given",
+    "tilt_deg": null,
+    "two_ladders": false,
+    "undetected_written": [
+     {
+      "band_index": 0,
+      "lane_index": 5,
+      "protein_id": "prot-32",
+      "reason": "below_detection_limit",
+      "region": [99, 25, 109, 51],
+      "snr": 2.0900332641670336,
+      "source": "mw_guided",
+      "threshold": 6.0
+     }
+    ],
+    "unlocated_lanes": []
+   },
+   "seq": 40,
+   "time": "2026-10-31T09:00:39.000Z",
+   "version": "0.1.0.dev0"
   }
  ],
- "lanes": [
-  {
-   "included": true,
-   "label": "vehicle",
-   "metadata": {},
-   "sample": "V1"
-  },
-  {
-   "included": true,
-   "label": "vehicle",
-   "metadata": {},
-   "sample": "V1"
-  },
-  {
-   "included": true,
-   "label": "vehicle",
-   "metadata": {},
-   "sample": "V2"
-  },
-  {
-   "included": true,
-   "label": "10 µM",
-   "metadata": {},
-   "sample": "A1"
-  },
-  {
-   "included": true,
-   "label": "10 µM",
-   "metadata": {},
-   "sample": "A2"
-  },
-  {
-   "included": false,
-   "label": "10 µM",
-   "metadata": {},
-   "sample": "A3"
-  },
-  {
-   "included": true,
-   "label": "50 µM",
-   "metadata": {},
-   "sample": "B1"
-  },
-  {
-   "included": true,
-   "label": "50 µM",
-   "metadata": {},
-   "sample": "B2"
-  }
- ],
- "membranes": [
-  {
-   "fit_method": "log_linear_piecewise",
-   "fit_quality": 4.051294439555431e-05,
-   "id": "mem-2",
-   "image_ids": ["img-1", "img-3", "img-4"],
-   "ladder": "pageruler_plus/tris_glycine",
-   "ladder_kda": [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0, 10.0],
-   "points": [
-    {
-     "image_id": "img-4",
-     "mw": 130.0,
-     "side": "left",
-     "source": "visible_marker",
-     "x": 8.0,
-     "y": 10.0
-    },
-    {
-     "image_id": "img-3",
-     "mw": 100.0,
-     "side": "left",
-     "source": "chemiluminescence_marker",
-     "x": 8.0,
-     "y": 15.0
-    },
-    {
-     "image_id": "img-4",
-     "mw": 70.0,
-     "side": "left",
-     "source": "visible_marker",
-     "x": 8.0,
-     "y": 34.53
-    },
-    {
-     "image_id": "img-4",
-     "mw": 35.0,
-     "side": "left",
-     "source": "visible_marker",
-     "x": 8.0,
-     "y": 62.0
-    },
-    {
-     "image_id": "img-3",
-     "mw": 25.0,
-     "side": "left",
-     "source": "chemiluminescence_marker",
-     "x": 8.0,
-     "y": 65.0
-    },
-    {
-     "image_id": "img-4",
-     "mw": 130.0,
-     "side": "right",
-     "source": "visible_marker",
-     "x": 152.0,
-     "y": 13.0
-    },
-    {
-     "image_id": "img-4",
-     "mw": 70.0,
-     "side": "right",
-     "source": "visible_marker",
-     "x": 152.0,
-     "y": 37.53
-    },
-    {
-     "image_id": "img-4",
-     "mw": 35.0,
-     "side": "right",
-     "source": "visible_marker",
-     "x": 152.0,
-     "y": 65.0
-    }
-   ]
-  },
-  {
-   "fit_method": "log_linear_piecewise",
-   "fit_quality": null,
-   "id": "mem-6",
-   "image_ids": ["img-5"],
-   "ladder": null,
-   "ladder_kda": [],
-   "points": [
-    {
-     "image_id": "img-5",
-     "mw": 70.0,
-     "side": "left",
-     "source": "strip_edge",
-     "x": 70.0,
-     "y": 8.0
-    },
-    {
-     "image_id": "img-5",
-     "mw": 35.0,
-     "side": "left",
-     "source": "strip_edge",
-     "x": 70.0,
-     "y": 64.0
-    }
-   ]
-  }
- ],
- "proteins": [
-  {
-   "bands": [
-    {
-     "apparent_mw": 92.10279165856014,
-     "background_level": 49912.166666666664,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [17, 19],
-     "clipped": false,
-     "id": "band-8",
-     "lane_index": 0,
-     "manually_edited": false,
-     "net": 1204192.9999999993,
-     "possibly_clipped": null,
-     "source": "row_box"
-    },
-    {
-     "apparent_mw": 92.8808283377197,
-     "background_level": 49898.25,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [33, 19],
-     "clipped": false,
-     "id": "band-9",
-     "lane_index": 1,
-     "manually_edited": false,
-     "net": 1373704.5,
-     "possibly_clipped": null,
-     "source": "row_box"
-    },
-    {
-     "apparent_mw": 91.28326756866167,
-     "background_level": 49893.625,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [48, 20],
-     "clipped": false,
-     "id": "band-10",
-     "lane_index": 2,
-     "manually_edited": false,
-     "net": 1040546.75,
-     "possibly_clipped": null,
-     "source": "row_box"
-    },
-    {
-     "apparent_mw": 92.10279165856014,
-     "background_level": 49865.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [65, 20],
-     "clipped": false,
-     "id": "band-11",
-     "lane_index": 3,
-     "manually_edited": false,
-     "net": 1551905.0,
-     "possibly_clipped": null,
-     "source": "row_box"
-    },
-    {
-     "apparent_mw": 92.8808283377197,
-     "background_level": 49876.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [81, 20],
-     "clipped": false,
-     "id": "band-12",
-     "lane_index": 4,
-     "manually_edited": false,
-     "net": 1716843.0,
-     "possibly_clipped": null,
-     "source": "row_box"
-    },
-    {
-     "apparent_mw": 91.28326756866167,
-     "background_level": 49916.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [96, 21],
-     "clipped": false,
-     "id": "band-13",
-     "lane_index": 5,
-     "manually_edited": false,
-     "net": 1292218.0,
-     "possibly_clipped": null,
-     "source": "row_box"
-    },
-    {
-     "apparent_mw": 92.8808283377197,
-     "background_level": 49945.5,
-     "background_mode": "symmetric",
-     "background_spread": 66.68867723815409,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [129, 21],
-     "clipped": false,
-     "id": "band-14",
-     "lane_index": 7,
-     "manually_edited": false,
-     "net": 1441392.0,
-     "possibly_clipped": null,
-     "source": "row_box"
-    }
-   ],
-   "box_padding": [0, 0],
-   "box_size": [15, 10],
-   "expected_band_count": 1,
-   "expected_mw": 92.0,
-   "id": "prot-7",
-   "image_id": "img-1",
-   "loading_control_ids": ["prot-15"],
-   "mw_tolerance": 0.1,
-   "name": "β-catenin",
-   "role": "target",
-   "undetected": [
-    {
-     "band_index": 0,
-     "lane_index": 6,
-     "region": [114, 14, 125, 36],
-     "snr": 4.086641039129963,
-     "source": "row_box",
-     "threshold": 6.0
-    }
-   ]
-  },
-  {
-   "bands": [
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3035.625,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [13, 30],
-     "clipped": false,
-     "id": "band-16",
-     "lane_index": 0,
-     "manually_edited": false,
-     "net": 1127981.0,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3051.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [29, 30],
-     "clipped": false,
-     "id": "band-17",
-     "lane_index": 1,
-     "manually_edited": false,
-     "net": 1204605.0,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3054.3333333333335,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [45, 30],
-     "clipped": false,
-     "id": "band-18",
-     "lane_index": 2,
-     "manually_edited": false,
-     "net": 1090905.0,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3056.1666666666665,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [61, 30],
-     "clipped": false,
-     "id": "band-19",
-     "lane_index": 3,
-     "manually_edited": false,
-     "net": 1167774.0,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3048.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [77, 30],
-     "clipped": false,
-     "id": "band-20",
-     "lane_index": 4,
-     "manually_edited": false,
-     "net": 1242262.0,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3046.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [93, 30],
-     "clipped": false,
-     "id": "band-21",
-     "lane_index": 5,
-     "manually_edited": false,
-     "net": 1054992.0,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3053.1,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [109, 30],
-     "clipped": false,
-     "id": "band-22",
-     "lane_index": 6,
-     "manually_edited": false,
-     "net": 1187163.2,
-     "possibly_clipped": null,
-     "source": "click"
-    },
-    {
-     "apparent_mw": 49.497474683058336,
-     "background_level": 3035.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [125, 30],
-     "clipped": false,
-     "id": "band-23",
-     "lane_index": 7,
-     "manually_edited": false,
-     "net": 1145040.0,
-     "possibly_clipped": null,
-     "source": "click"
-    }
-   ],
-   "box_padding": [2, 1],
-   "box_size": [14, 12],
-   "expected_band_count": 1,
-   "expected_mw": null,
-   "id": "prot-15",
-   "image_id": "img-5",
-   "loading_control_ids": [],
-   "mw_tolerance": 0.1,
-   "name": "α-tubulin",
-   "role": "loading control",
-   "undetected": []
-  },
-  {
-   "bands": [
-    {
-     "apparent_mw": 36.197566755935654,
-     "background_level": 49885.5,
-     "background_mode": "symmetric",
-     "background_spread": 50.673251903356146,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [18, 56],
-     "clipped": false,
-     "id": "band-25",
-     "lane_index": 0,
-     "manually_edited": false,
-     "net": 1760074.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    },
-    {
-     "apparent_mw": 35.59374715392786,
-     "background_level": 49850.75,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [34, 57],
-     "clipped": false,
-     "id": "band-26",
-     "lane_index": 1,
-     "manually_edited": false,
-     "net": 1679846.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    },
-    {
-     "apparent_mw": 35.89438728684749,
-     "background_level": 49816.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [50, 57],
-     "clipped": false,
-     "id": "band-27",
-     "lane_index": 2,
-     "manually_edited": false,
-     "net": 1865756.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    },
-    {
-     "apparent_mw": 36.197566755935654,
-     "background_level": 49736.75,
-     "background_mode": "symmetric",
-     "background_spread": 407.5139442304959,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [66, 57],
-     "clipped": true,
-     "id": "band-28",
-     "lane_index": 3,
-     "manually_edited": false,
-     "net": 5092459.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    },
-    {
-     "apparent_mw": 35.59374715392786,
-     "background_level": 49847.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [82, 58],
-     "clipped": false,
-     "id": "band-29",
-     "lane_index": 4,
-     "manually_edited": false,
-     "net": 1781453.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    },
-    {
-     "apparent_mw": 35.89438728684749,
-     "background_level": 49849.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [98, 58],
-     "clipped": false,
-     "id": "band-30",
-     "lane_index": 5,
-     "manually_edited": false,
-     "net": 1606209.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    },
-    {
-     "apparent_mw": 35.59374715392786,
-     "background_level": 49812.0,
-     "background_mode": "symmetric",
-     "background_spread": 27.053269377874642,
-     "band_index": 0,
-     "bands_found": null,
-     "box": [130, 59],
-     "clipped": false,
-     "id": "band-31",
-     "lane_index": 7,
-     "manually_edited": false,
-     "net": 1784837.0,
-     "possibly_clipped": null,
-     "source": "manual"
-    }
-   ],
-   "box_padding": [0, 0],
-   "box_size": [12, 10],
-   "expected_band_count": 1,
-   "expected_mw": null,
-   "id": "prot-24",
-   "image_id": "img-1",
-   "loading_control_ids": [],
-   "mw_tolerance": 0.1,
-   "name": "GAPDH",
-   "role": "loading control",
-   "undetected": []
-  },
-  {
-   "bands": [
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47937.833333333336,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [17, 33],
-     "clipped": false,
-     "id": "band-33",
-     "lane_index": 0,
-     "manually_edited": false,
-     "net": 772083.0000000002,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    },
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47915.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [33, 33],
-     "clipped": false,
-     "id": "band-34",
-     "lane_index": 1,
-     "manually_edited": false,
-     "net": 946075.0,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    },
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47916.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [48, 33],
-     "clipped": false,
-     "id": "band-35",
-     "lane_index": 2,
-     "manually_edited": false,
-     "net": 863912.0,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    },
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47901.5,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [65, 33],
-     "clipped": false,
-     "id": "band-36",
-     "lane_index": 3,
-     "manually_edited": false,
-     "net": 1034086.0,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    },
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47928.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [81, 33],
-     "clipped": false,
-     "id": "band-37",
-     "lane_index": 4,
-     "manually_edited": false,
-     "net": 1108104.0,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    },
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47952.0,
-     "background_mode": "symmetric",
-     "background_spread": 0.0,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [113, 33],
-     "clipped": false,
-     "id": "band-38",
-     "lane_index": 6,
-     "manually_edited": false,
-     "net": 818364.0,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    },
-    {
-     "apparent_mw": 52.850902028069015,
-     "background_level": 47951.0,
-     "background_mode": "symmetric",
-     "background_spread": 21.427120477670833,
-     "band_index": 0,
-     "bands_found": 1,
-     "box": [129, 33],
-     "clipped": false,
-     "id": "band-39",
-     "lane_index": 7,
-     "manually_edited": false,
-     "net": 896478.0,
-     "possibly_clipped": null,
-     "source": "mw_guided"
-    }
-   ],
-   "box_padding": [0, 0],
-   "box_size": [15, 10],
-   "expected_band_count": 1,
-   "expected_mw": 53.0,
-   "id": "prot-32",
-   "image_id": "img-3",
-   "loading_control_ids": ["prot-24"],
-   "mw_tolerance": 0.1,
-   "name": "p53 µ",
-   "role": "target",
-   "undetected": [
-    {
-     "band_index": 0,
-     "lane_index": 5,
-     "region": [99, 25, 109, 51],
-     "snr": 2.0900332641670336,
-     "source": "mw_guided",
-     "threshold": 6.0
-    }
-   ]
-  }
- ],
- "reference_condition": "vehicle",
+ "next_id": 40,
+ "project_sha256": "c790ff6a4edd1248b34ae02a37e4f958473aa32fcc6edd567742e6f3fd1d5830",
  "version": "0.1.0.dev0"
 }

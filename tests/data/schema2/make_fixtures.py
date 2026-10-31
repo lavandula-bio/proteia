@@ -34,30 +34,40 @@ Each case folder (``f1``, ``f2``, ``f3``) holds a project as 05b4af5 wrote it
   S and takes the ladder and with it β-catenin's apparent MWs; the removal is
   undone, redone and undone again, so the undo and redo entries check out.
 
-``stored.json`` holds every value the project stores (:func:`stored_values`):
-the lane table and its reference; each image's file, kind, polarity, marker
-link, recorded size, depth, background and import warnings; each membrane's
-ladder, calibration points, fit method and quality; each protein's settings
-and boxes, with every band's net, background level, mode and spread,
-clipping flags, apparent MW and band count, and its not-detected records;
-and the content hash. It was written once, at 05b4af5 (``built_at``), and is
-never written again: ``--write-frozen`` refuses at any other commit, and a
-change that would need another ``stored.json`` changes what old projects
-store.
+``stored.json`` holds every value the project stores but its schema version
+(:func:`stored_values`), under the names of the schema-2 file: the background
+method and the next id; each lane (index, label, sample, inclusion,
+metadata) and the reference; each membrane's images (file, names, kind,
+polarity, marker link, hash, recorded size, depth, background, and each
+import warning's code and message) and calibration (ladder, points, fit
+method and quality); each protein's settings and boxes, with every band's
+net, background level, mode and spread, clipping flags, apparent MW and band
+count, and its not-detected records with their reasons; and every log entry
+whole. It also records what it was written from (:data:`FROZEN_ONLY`): its
+case, the commit and version that built it, the SHA-256 of the frozen
+``project.json`` and the content hash at schema 2. It was written once, at
+05b4af5 (``built_at``), and is never written again: ``--write-frozen``
+refuses at any other commit or with any other build or installed
+dependencies, and a change that would need another ``stored.json`` changes
+what old projects store. The stored values are compared by value
+(:func:`stored_differences`), never through a hash of the content in the
+build's own shape, so a project held in another shape with every value
+intact still matches.
 
 ``derived.json`` holds what the build under test derives from the frozen
 project (:func:`derived_output`): the results with their notices, and with
 ``10 µM`` plotted alone what that changes (the notices and each chart); each
 result set's lane table, as an export writes it; each register group's
-calibration fit, as the page shows it; the history check; and the stored
-values and log of a fresh build of the same project from the same image
-files (:func:`build`). It describes current behaviour. A pull request that
-means to change it runs, at its own commit,
+calibration fit, as the page shows it; the history check; and how the
+values a fresh build of the same project from the same image files stores
+differ from the frozen ones (:func:`build`, :func:`fresh_changes`: not at
+all, while the operations keep their numbers). It describes current
+behaviour. A pull request that means to change it runs, at its own commit,
 
     uv run python tests/data/schema2/make_fixtures.py --refresh-derived
 
 which rewrites only the ``derived.json`` files, commits the diff and says why
-in its description. ``derive.py`` prints one case's derived output as
+in its description. ``derive.py`` prints a fixture's derived output as
 canonical JSON, to compare two builds exactly on one machine.
 
 The images are drawn here from fixed numbers with additions, multiplications
@@ -66,21 +76,25 @@ the same on every platform. The fresh build imports the frozen image files
 (an import copies them byte for byte), so no encoder takes part in it.
 
 Frozen at 05b4af5 by copying this file and ``derive.py`` into a checkout of
-that commit and running ``--write-frozen`` there; ``--out DIR`` writes
-elsewhere, to rebuild them for a comparison.
+that commit, synced with ``uv sync --locked``, and running ``--write-frozen``
+there; ``--out DIR`` writes elsewhere, to rebuild them for a comparison.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import importlib.metadata
 import io
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -95,13 +109,20 @@ import proteia
 from proteia.core import export, record, results, storage
 from proteia.core import operations as ops
 from proteia.core.model import (
+    Band,
     BoxSize,
     CalibrationPointSource,
     ImageKind,
+    ImageRef,
     LadderSide,
+    Lane,
+    LogEntry,
+    Membrane,
     Polarity,
     Project,
+    Protein,
     Role,
+    UndetectedBand,
 )
 from proteia.core.operations import LaneInput
 
@@ -109,9 +130,15 @@ HERE = Path(__file__).resolve().parent
 FROZEN_COMMIT = "05b4af5b08e51b450436e9446651f5650bff48e4"
 CASES = ("f1", "f2", "f3")
 REFRESH_COMMAND = "uv run python tests/data/schema2/make_fixtures.py --refresh-derived"
-# The fresh build's stored values leave out what only the frozen file has, and
-# the content hash, which a last-bit difference of any float changes whole.
-NOT_IN_FRESH = ("built_at", "version", "content_hash")
+# What stored.json records about the fixture rather than a value its project
+# stores: the case, the commit and version that built it, the SHA-256 of its
+# project.json, and its content hash at schema 2 (a hash of the content in the
+# schema-2 shape, which a change of shape changes whole).
+FROZEN_ONLY = ("case", "built_at", "version", "project_sha256", "content_hash")
+# What a fresh build's log entries leave out: the content hash, which a
+# last-bit difference of any float changes whole, and the version, which a
+# release changes with no change of behaviour.
+NOT_IN_FRESH_LOG = ("content_hash", "version")
 REL_TOL = 1e-12  # derived floats, relative
 PLOTTED = "10 µM"
 
@@ -469,115 +496,185 @@ def copy_project(source: Path, target: Path) -> None:
 
 
 def stored_values(project: Project) -> dict[str, Any]:
-    """Every value the project stores, in stored order, by what it belongs
-    to: the lane table, each image, each membrane with its calibration, and
-    each protein with its boxes and not-detected records; and the content
-    hash."""
+    """Every value ``project`` stores but its schema version, in stored
+    order, under the names of the schema-2 file: the background method, the
+    next id, the batch (its lanes and reference, each membrane with its images
+    and calibration, each protein with its boxes and not-detected records)
+    and the log. A default the file leaves out (no padding, no record, no
+    band count, a left-hand point) is written out here."""
     batch = project.batch
     return {
-        "content_hash": storage.content_hash(project),
         "background_method": project.background_method,
-        "lanes": [
-            {
-                "label": lane.label,
-                "sample": lane.sample,
-                "included": lane.included,
-                "metadata": dict(lane.metadata),
-            }
-            for lane in batch.lanes
-        ],
-        "reference_condition": batch.reference_condition,
-        "images": [
-            {
-                "id": image.id,
-                "file": image.file,
-                "original_name": image.original_name,
-                "kind": image.kind.value,
-                "polarity": image.polarity.value,
-                "marker_image_id": image.marker_image_id,
-                "sha256": image.sha256,
-                "size": [image.width, image.height],
-                "bit_depth": image.bit_depth,
-                "background": image.background,
-                "import_warnings": [w.code for w in image.import_warnings],
-            }
-            for image in batch.iter_images()
-        ],
-        "membranes": [
-            {
-                "id": membrane.id,
-                "image_ids": [image.id for image in membrane.images],
-                "ladder": membrane.calibration.ladder,
-                "ladder_kda": list(membrane.calibration.ladder_kda),
-                "points": [
-                    {
-                        "image_id": point.image_id,
-                        "side": point.side.value,
-                        "mw": point.mw,
-                        "y": point.y,
-                        "x": point.x,
-                        "source": point.source.value,
-                    }
-                    for point in membrane.calibration.points
-                ],
-                "fit_method": membrane.calibration.fit_method.value,
-                "fit_quality": membrane.calibration.fit_quality,
-            }
-            for membrane in batch.membranes
-        ],
-        "proteins": [
-            {
-                "id": protein.id,
-                "name": protein.name,
-                "role": protein.role.value,
-                "image_id": protein.image_id,
-                "loading_control_ids": list(protein.loading_control_ids),
-                "expected_mw": protein.expected_mw,
-                "expected_band_count": protein.expected_band_count,
-                "mw_tolerance": protein.mw_tolerance,
-                "box_size": [protein.box_size.width, protein.box_size.height],
-                "box_padding": [protein.box_padding.across, protein.box_padding.along],
-                "bands": [
-                    {
-                        "id": band.id,
-                        "lane_index": band.lane_index,
-                        "band_index": band.band_index,
-                        "box": [band.box.x, band.box.y],
-                        "source": band.source.value,
-                        "manually_edited": band.manually_edited,
-                        "net": band.net,
-                        "background_level": band.background_level,
-                        "background_mode": band.background_mode,
-                        "background_spread": band.background_spread,
-                        "clipped": band.clipped,
-                        "possibly_clipped": band.possibly_clipped,
-                        "apparent_mw": band.apparent_mw,
-                        "bands_found": band.bands_found,
-                    }
-                    for band in protein.bands
-                ],
-                "undetected": [
-                    {
-                        "lane_index": u.lane_index,
-                        "band_index": u.band_index,
-                        "snr": u.snr,
-                        "threshold": u.threshold,
-                        "region": list(u.region.rect()),
-                        "source": u.source.value,
-                    }
-                    for u in protein.undetected
-                ],
-            }
-            for protein in batch.proteins
+        "next_id": project.next_id,
+        "batch": {
+            "lanes": [_lane(lane) for lane in batch.lanes],
+            "reference_condition": batch.reference_condition,
+            "membranes": [_membrane(membrane) for membrane in batch.membranes],
+            "proteins": [_protein(protein) for protein in batch.proteins],
+        },
+        "log": [_entry(entry) for entry in project.log],
+    }
+
+
+def _lane(lane: Lane) -> dict[str, Any]:
+    return {
+        "index": lane.index,
+        "label": lane.label,
+        "sample": lane.sample,
+        "included": lane.included,
+        "metadata": dict(lane.metadata),
+    }
+
+
+def _image(image: ImageRef) -> dict[str, Any]:
+    return {
+        "id": image.id,
+        "file": image.file,
+        "original_name": image.original_name,
+        "kind": image.kind.value,
+        "marker_image_id": image.marker_image_id,
+        "sha256": image.sha256,
+        "width": image.width,
+        "height": image.height,
+        "bit_depth": image.bit_depth,
+        "polarity": image.polarity.value,
+        "background": image.background,
+        "import_warnings": [
+            {"code": warning.code, "message": warning.message} for warning in image.import_warnings
         ],
     }
 
 
-def fresh_values(project: Project) -> dict[str, Any]:
-    """What ``derived.json`` keeps of a fresh build: its stored values but
-    those in :data:`NOT_IN_FRESH`, and each log entry's seq, time and action."""
-    kept = {k: v for k, v in stored_values(project).items() if k not in NOT_IN_FRESH}
-    return {**kept, "log": [[entry.seq, entry.time, entry.action] for entry in project.log]}
+def _membrane(membrane: Membrane) -> dict[str, Any]:
+    calibration = membrane.calibration
+    return {
+        "id": membrane.id,
+        "images": [_image(image) for image in membrane.images],
+        "calibration": {
+            "ladder": calibration.ladder,
+            "ladder_kda": list(calibration.ladder_kda),
+            "points": [
+                {
+                    "image_id": point.image_id,
+                    "y": point.y,
+                    "mw": point.mw,
+                    "source": point.source.value,
+                    "x": point.x,
+                    "side": point.side.value,
+                }
+                for point in calibration.points
+            ],
+            "fit_method": calibration.fit_method.value,
+            "fit_quality": calibration.fit_quality,
+        },
+    }
+
+
+def _protein(protein: Protein) -> dict[str, Any]:
+    return {
+        "id": protein.id,
+        "name": protein.name,
+        "role": protein.role.value,
+        "image_id": protein.image_id,
+        "loading_control_ids": list(protein.loading_control_ids),
+        "expected_mw": protein.expected_mw,
+        "expected_band_count": protein.expected_band_count,
+        "mw_tolerance": protein.mw_tolerance,
+        "box_size": {"width": protein.box_size.width, "height": protein.box_size.height},
+        "box_padding": {
+            "across": protein.box_padding.across,
+            "along": protein.box_padding.along,
+        },
+        "bands": [_band(band) for band in protein.bands],
+        "undetected": [_undetected(record) for record in protein.undetected],
+    }
+
+
+def _band(band: Band) -> dict[str, Any]:
+    return {
+        "id": band.id,
+        "lane_index": band.lane_index,
+        "band_index": band.band_index,
+        "box": {"x": band.box.x, "y": band.box.y},
+        "net": band.net,
+        "background_level": band.background_level,
+        "background_mode": band.background_mode,
+        "background_spread": band.background_spread,
+        "apparent_mw": band.apparent_mw,
+        "bands_found": band.bands_found,
+        "clipped": band.clipped,
+        "possibly_clipped": band.possibly_clipped,
+        "source": band.source.value,
+        "manually_edited": band.manually_edited,
+    }
+
+
+def _undetected(record: UndetectedBand) -> dict[str, Any]:
+    region = record.region
+    return {
+        "lane_index": record.lane_index,
+        "band_index": record.band_index,
+        "reason": record.reason.value,
+        "snr": record.snr,
+        "threshold": record.threshold,
+        "region": {"x0": region.x0, "y0": region.y0, "x1": region.x1, "y1": region.y1},
+        "source": record.source.value,
+    }
+
+
+def _entry(entry: LogEntry) -> dict[str, Any]:
+    # The time comes from the build's clock and the version is the frozen
+    # build's: both are stored values like any other.
+    return {
+        "seq": entry.seq,
+        "time": entry.time,
+        "action": entry.action,
+        "version": entry.version,
+        "params": dict(entry.params),
+        "content_hash": entry.content_hash,
+    }
+
+
+def stored_differences(golden: Mapping[str, Any], project: Project) -> list[str]:
+    """Where the values ``project`` stores differ from those of a
+    ``stored.json`` (``golden``), exactly (:func:`differences`); what
+    ``golden`` records about the fixture itself (:data:`FROZEN_ONLY`) is left
+    out. No hash of the content in the build's own shape takes part, so a
+    project held in another shape with every value intact matches."""
+    expected = {key: value for key, value in golden.items() if key not in FROZEN_ONLY}
+    return differences(expected, json.loads(canonical_json(stored_values(project))))
+
+
+def changes(old: Any, new: Any, path: str = "$") -> list[list[Any]]:
+    """Where the JSON value ``new`` differs from ``old``, one ``[path, old
+    part, new part]`` each: a value that differs (a float, beyond
+    :data:`REL_TOL` relative), or whole, an object whose keys or a list whose
+    length differ."""
+    if isinstance(old, dict) and isinstance(new, dict) and old.keys() == new.keys():
+        return [found for key in old for found in changes(old[key], new[key], f"{path}.{key}")]
+    if isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
+        pairs = enumerate(zip(old, new, strict=True))
+        return [found for i, (a, b) in pairs for found in changes(a, b, f"{path}[{i}]")]
+    return [[path, old, new]] if differences(old, new, rel_tol=REL_TOL) else []
+
+
+def fresh_changes(frozen: Mapping[str, Any], project: Project) -> list[list[Any]]:
+    """How the values a fresh build (``project``) stores differ from the
+    frozen ones (``frozen``, a ``stored.json``), by :func:`changes`; what
+    ``frozen`` records about the fixture (:data:`FROZEN_ONLY`) and, in each
+    log entry, :data:`NOT_IN_FRESH_LOG` are left out. Empty while the
+    operations store the numbers they stored at 05b4af5."""
+
+    def compared(values: Mapping[str, Any]) -> dict[str, Any]:
+        kept = {key: value for key, value in values.items() if key not in FROZEN_ONLY}
+        kept["log"] = [
+            {key: value for key, value in entry.items() if key not in NOT_IN_FRESH_LOG}
+            for entry in kept["log"]
+        ]
+        return kept
+
+    fresh = json.loads(canonical_json(stored_values(project)))
+    return changes(compared(frozen), compared(fresh))
 
 
 # --- What the build derives from it ---
@@ -619,13 +716,18 @@ def midpoint_cells(text: str, unrounded: Mapping[int, str]) -> list[list[int]]:
     return sorted(near)
 
 
+def _result_sets(computed: results.Results) -> list[results.Results]:
+    """The result sets an export writes: the included lanes, then all lanes
+    when excluded lanes hold values."""
+    return [computed] if computed.all_lanes is None else [computed, computed.all_lanes]
+
+
 def _lane_tables(computed: results.Results) -> list[dict[str, Any]]:
     """Each result set's lane table as an export writes it, with the cells
     whose value lies within :data:`REL_TOL` of a rounding midpoint."""
-    sets = [computed] if computed.all_lanes is None else [computed, computed.all_lanes]
     columns = export.result_columns(computed)
     tables = []
-    for one in sets:
+    for one in _result_sets(computed):
         unrounded = {}
         for name in ("LANE_TABLE_DECIMALS", "LANE_TABLE_RATIO_DECIMALS"):
             decimals = getattr(export, name)
@@ -640,9 +742,8 @@ def _lane_tables(computed: results.Results) -> list[dict[str, Any]]:
 def _plotted(computed: results.Results) -> list[dict[str, Any]]:
     """What plotting some conditions only changes, in each result set: the
     conditions plotted, the notices and each series' chart."""
-    sets = [computed] if computed.all_lanes is None else [computed, computed.all_lanes]
     shown = []
-    for one in sets:
+    for one in _result_sets(computed):
         dump = one.model_dump(mode="json")
         shown.append(
             {
@@ -668,29 +769,50 @@ def _calibration(batch) -> list[dict[str, Any]]:
     return shown
 
 
-def derived_output(case: str, work: Path, *, root: Path = HERE) -> dict[str, Any]:
-    """What the running build derives from the frozen project ``root/case``,
-    as plain JSON values. ``work`` (new or empty) takes a copy of it, opened
-    there (and migrated in memory, if the build reads a newer schema), and a
-    fresh build of it from its image files."""
-    folder = Path(root) / case
-    work = Path(work)
+def case_of(folder: Path) -> str:
+    """The case of the fixture in ``folder``, as its ``stored.json`` names it
+    (whatever the folder's name); ``ValueError`` if it names none."""
+    path = Path(folder) / "stored.json"
+    try:
+        frozen = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read the case of {folder}: {exc}") from exc
+    case = frozen.get("case") if isinstance(frozen, dict) else None
+    if not isinstance(case, str) or case not in _STEPS:
+        raise ValueError(f"{path} names no case of {', '.join(CASES)}: {case!r}")
+    return case
+
+
+def derived_output(folder: Path, work: Path, case: str | None = None) -> dict[str, Any]:
+    """What the running build derives from the frozen project in ``folder``,
+    as plain JSON values; ``fresh_changes`` are those of a fresh build of it
+    from its image files (:func:`fresh_changes`). ``case`` says how to build
+    it; by default it is the one the fixture names (:func:`case_of`).
+    ``work`` (new or empty) takes a copy of the project, opened there (and
+    migrated in memory, if the build reads a newer schema), and the fresh
+    build."""
+    folder, work = Path(folder), Path(work)
+    case = case_of(folder) if case is None else case
+    frozen = json.loads((folder / "stored.json").read_text(encoding="utf-8"))
     copied = work / "copy"
     copy_project(folder, copied)
     session = ops.open_project(copied, autosave=None)
-    project = session.project
-    batch = project.batch
-    computed = results.compute_results(batch)
-    plotted = results.compute_results(batch, plot_conditions=[PLOTTED])
+    try:
+        project = session.project
+        batch = project.batch
+        computed = results.compute_results(batch)
+        plotted = results.compute_results(batch, plot_conditions=[PLOTTED])
+        output = {
+            "results": computed.model_dump(mode="json"),
+            "plotted": _plotted(plotted),
+            "lane_tables": _lane_tables(computed),
+            "calibration": _calibration(batch),
+            "history_issues": record.history_issues(project),
+        }
+    finally:
+        session.close()
     fresh = build(work / "fresh", case, files=frozen_sources(folder))
-    output = {
-        "results": computed.model_dump(mode="json"),
-        "plotted": _plotted(plotted),
-        "lane_tables": _lane_tables(computed),
-        "calibration": _calibration(batch),
-        "history_issues": record.history_issues(project),
-        "fresh": fresh_values(fresh),
-    }
+    output["fresh_changes"] = fresh_changes(frozen, fresh)
     return json.loads(canonical_json(output))
 
 
@@ -826,10 +948,81 @@ def check_derived(golden: dict[str, Any], actual: dict[str, Any], case: str) -> 
 # --- The commands ---
 
 
-def frozen_refusal(*, head: str, changes: str, module: Path, toplevel: Path) -> str | None:
+def _normalized(name: str) -> str:
+    """A distribution's name as a lock file writes it (PEP 503)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def installed_versions() -> dict[str, str]:
+    """The version of each distribution the running interpreter finds, by
+    normalized name (the first one found on ``sys.path``, as imports do)."""
+    versions: dict[str, str] = {}
+    for distribution in importlib.metadata.distributions():
+        versions.setdefault(_normalized(distribution.metadata["Name"]), distribution.version)
+    return versions
+
+
+def lock_mismatches(
+    lock_text: str, installed: Mapping[str, str], project: str = "proteia"
+) -> list[str]:
+    """The runtime dependencies of ``project`` locked in ``lock_text`` (a
+    ``uv.lock``) that ``installed`` (name -> version) does not hold at a
+    locked version, one line each. They are the project's own dependencies
+    (not its dependency groups) and theirs, with the extras they ask for. One
+    that only a marker asks for (say, on one platform) may be missing, but
+    when installed it must be at its locked version."""
+    have = {_normalized(name): version for name, version in installed.items()}
+    locked: dict[str, list[dict[str, Any]]] = {}
+    for package in tomllib.loads(lock_text).get("package", []):
+        locked.setdefault(_normalized(package["name"]), []).append(package)
+    root = _normalized(project)
+    if root not in locked:
+        return [f"{project}: not in uv.lock"]
+    required: dict[str, bool] = {}  # name -> must be installed
+    seen: set[tuple[str, bool, tuple[str, ...]]] = set()
+    todo: list[tuple[str, bool, tuple[str, ...]]] = [(root, True, ())]
+    while todo:
+        name, must, extras = todo.pop()
+        if (name, must, extras) in seen:
+            continue
+        seen.add((name, must, extras))
+        required[name] = required.get(name, False) or must
+        for package in locked.get(name, []):
+            asked = list(package.get("dependencies", []))
+            for extra in extras:
+                asked += package.get("optional-dependencies", {}).get(extra, [])
+            for dependency in asked:
+                todo.append(
+                    (
+                        _normalized(dependency["name"]),
+                        must and "marker" not in dependency,
+                        tuple(dependency.get("extra", ())),
+                    )
+                )
+    found = []
+    for name in sorted(required.keys() - {root}):
+        versions = [package["version"] for package in locked.get(name, [])]
+        version = have.get(name)
+        if version in versions or (version is None and not required[name]):
+            continue
+        found.append(
+            f"{name}: locked {' or '.join(versions) or 'nowhere'}, installed {version or 'nowhere'}"
+        )
+    return found
+
+
+def frozen_refusal(
+    *,
+    head: str,
+    changes: str,
+    module: Path,
+    toplevel: Path,
+    mismatched: Sequence[str] = (),
+) -> str | None:
     """Why the frozen files may not be written here, or None: only in a
-    checkout at :data:`FROZEN_COMMIT` whose build has no local change and is
-    the one imported."""
+    checkout at :data:`FROZEN_COMMIT` whose build has no local change, is
+    the one imported, and runs on the dependencies its ``uv.lock`` locks
+    (``mismatched``: :func:`lock_mismatches`)."""
     if head != FROZEN_COMMIT:
         return (
             f"this checkout is at {head}, not at {FROZEN_COMMIT}: the frozen files are written"
@@ -839,6 +1032,11 @@ def frozen_refusal(*, head: str, changes: str, module: Path, toplevel: Path) -> 
         return f"the build has local changes, so it is not {FROZEN_COMMIT}:\n{changes}"
     if not Path(module).resolve().is_relative_to((Path(toplevel) / "src").resolve()):
         return f"proteia is imported from {module}, not from {toplevel / 'src'}"
+    if mismatched:
+        return (
+            "the installed dependencies are not those uv.lock locks (run uv sync --locked):\n  "
+            + "\n  ".join(mismatched)
+        )
     return None
 
 
@@ -861,10 +1059,18 @@ def _refusal_here() -> str | None:
             "pyproject.toml",
             "uv.lock",
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        return f"cannot tell whether this checkout is at {FROZEN_COMMIT}: {exc}"
+        lock_text = (toplevel / "uv.lock").read_text(encoding="utf-8")
+        mismatched = lock_mismatches(lock_text, installed_versions())
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+        return (
+            f"cannot tell whether this checkout is at {FROZEN_COMMIT}: {type(exc).__name__}: {exc}"
+        )
     return frozen_refusal(
-        head=head, changes=changes, module=Path(proteia.__file__), toplevel=toplevel
+        head=head,
+        changes=changes,
+        module=Path(proteia.__file__),
+        toplevel=toplevel,
+        mismatched=mismatched,
     )
 
 
@@ -891,11 +1097,19 @@ def write_frozen(out: Path) -> None:
         for case in CASES:
             folder = out / case
             built = build(folder, case)
-            frozen = {"built_at": head, "version": proteia.__version__, **stored_values(built)}
+            frozen = {
+                "case": case,
+                "built_at": head,
+                "version": proteia.__version__,
+                "project_sha256": hashlib.sha256(
+                    (folder / storage.PROJECT_FILE).read_bytes()
+                ).hexdigest(),
+                "content_hash": storage.content_hash(built),
+                **stored_values(built),
+            }
             _write(folder / "stored.json", frozen)
-            derived = derived_output(case, Path(tmp) / case, root=out)
-            fresh = json.loads(canonical_json(fresh_values(built)))
-            if differences(fresh, derived["fresh"]):  # never: one build, one machine
+            derived = derived_output(folder, Path(tmp) / case, case)
+            if derived["fresh_changes"]:  # never: one build, one machine
                 raise Refused(f"{case}: a second build of it stores other values")
             _write(folder / "derived.json", derived)
             print(f"wrote {case}")
@@ -906,15 +1120,12 @@ def refresh_derived(root: Path, work: Path) -> None:
     project, with the running build (``work``, new or empty, takes the
     copies); nothing else is written under ``root``."""
     for case in CASES:
-        derived = derived_output(case, Path(work) / case, root=root)
+        derived = derived_output(Path(root) / case, Path(work) / case, case)
         _write(Path(root) / case / "derived.json", derived)
         print(f"refreshed {case}/derived.json")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="backslashreplace")  # a console of any code page
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     command = parser.add_mutually_exclusive_group(required=True)
     command.add_argument("--write-frozen", action="store_true", help="only at 05b4af5, once")
@@ -934,4 +1145,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")  # a console of any code page
     sys.exit(main())

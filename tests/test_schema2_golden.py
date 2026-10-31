@@ -5,18 +5,21 @@ what the current build derives from them.
 ``tests/data/schema2/<case>/`` holds three small projects built through the
 operations on synthetic images (``make_fixtures.py`` says what each holds):
 ``project.json`` and ``images/`` as 05b4af5 wrote them; ``stored.json``, every
-stored value they hold, written once at that commit and never again; and
-``derived.json``, what the current build derives from them (the results with
-their notices, the exported lane tables, the calibration fits as the page
-shows them, the history check, and the stored values and log of a fresh build
-of the same project from the same image files).
+value they store (and the hashes of the files it was written from), written
+once at that commit and never again; and ``derived.json``, what the current
+build derives from them (the results with their notices, the exported lane
+tables, the calibration fits as the page shows them, the history check, and
+how the values a fresh build of the same project from the same image files
+stores differ from the frozen ones: not at all, so far).
 
 Stored values are copied, never recomputed, so they match exactly on every
-platform. Derived floats pass through logarithms and statistics functions that
-may differ in the last bits between platforms: they match within a relative
-1e-12, and a lane-table cell may be one unit off in its last decimal only where
-the golden marks its value as within 1e-12 of a rounding midpoint. Text,
-integers, booleans, None, keys and list order match exactly.
+platform; they are compared value by value, never through a hash of the
+content in the build's own shape, so a project held in another shape with every
+value intact matches. Derived floats pass through logarithms and statistics
+functions that may differ in the last bits between platforms: they match
+within a relative 1e-12, and a lane-table cell may be one unit off in its last
+decimal only where the golden marks its value as within 1e-12 of a rounding
+midpoint. Text, integers, booleans, None, keys and list order match exactly.
 
 A pull request that means to change the derived output refreshes it with
 ``make_fixtures.REFRESH_COMMAND`` and says why in its description; the frozen
@@ -26,18 +29,22 @@ files never change.
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
+from enum import StrEnum
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from proteia.core import operations as ops
+from proteia.core import storage
 
 DATA = Path(__file__).parent / "data" / "schema2"
 FROZEN = "05b4af5b08e51b450436e9446651f5650bff48e4"
@@ -45,6 +52,17 @@ FROZEN = "05b4af5b08e51b450436e9446651f5650bff48e4"
 # (measured: at most 8 levels, 1.64 on average), not another drawing (another
 # noise seed: 12 levels, 2.46-2.51 on average).
 JPEG_MAX_ERROR, JPEG_MEAN_ERROR = 10, 1.9
+# The defaults the schema-2 file leaves out and stored.json writes out, by
+# path without list positions.
+WRITTEN_OUT = {
+    "$.batch.membranes[].calibration.ladder_kda": [],
+    "$.batch.membranes[].calibration.points[].side": "left",
+    "$.batch.proteins[].box_padding.across": 0,
+    "$.batch.proteins[].box_padding.along": 0,
+    "$.batch.proteins[].bands[].bands_found": None,
+    "$.batch.proteins[].bands[].possibly_clipped": None,
+    "$.batch.proteins[].undetected": [],
+}
 
 
 def _load(name: str):
@@ -68,14 +86,70 @@ def _golden(case: str, name: str) -> dict:
 def derived(tmp_path_factory) -> dict[str, dict]:
     """Each case's derived output from the current build, computed once."""
     work = tmp_path_factory.mktemp("schema2-derived")
-    return {case: fixtures.derived_output(case, work / case, root=DATA) for case in CASES}
+    return {case: fixtures.derived_output(DATA / case, work / case) for case in CASES}
 
 
-def _opened(case: str, tmp_path: Path):
-    """A copy of the frozen project, opened without autosave."""
-    folder = tmp_path / case
-    fixtures.copy_project(DATA / case, folder)
-    return ops.open_project(folder, autosave=None)
+@pytest.fixture(scope="module")
+def projects(tmp_path_factory) -> dict:
+    """Each frozen project as the current build opens it, read once."""
+    work = tmp_path_factory.mktemp("schema2-opened")
+    opened = {}
+    for case in CASES:
+        fixtures.copy_project(DATA / case, work / case)
+        session = ops.open_project(work / case, autosave=None)
+        try:
+            opened[case] = session.project
+        finally:
+            session.close()
+    return opened
+
+
+def _stored_differences(case: str, folder: Path) -> list[str]:
+    """Where the values the project in ``folder`` stores, opened as Proteia
+    opens a project, differ from ``case``'s ``stored.json``."""
+    session = ops.open_project(folder, autosave=None)
+    try:
+        return fixtures.stored_differences(_golden(case, "stored.json"), session.project)
+    finally:
+        session.close()
+
+
+def _paths(found: list[str]) -> list[str]:
+    """Where each difference is, without what it is."""
+    return [line.split(": ", 1)[0] for line in found]
+
+
+def _leaves(value, path: str = "$"):
+    """``(path, value)`` for each value in a JSON value that holds no other
+    (an empty object or list is one), in order."""
+    if isinstance(value, dict) and value:
+        for key, item in value.items():
+            yield from _leaves(item, f"{path}.{key}")
+    elif isinstance(value, list) and value:
+        for i, item in enumerate(value):
+            yield from _leaves(item, f"{path}[{i}]")
+    else:
+        yield path, value
+
+
+def _intact_issues(folder: Path, stored: dict) -> list[str]:
+    """What in the fixture in ``folder`` is not as its ``stored.json``
+    (``stored``) records it was written: the bytes of ``project.json``, those of
+    each image file, and the content hash its log ends with."""
+    issues = []
+    data = (folder / "project.json").read_bytes()
+    if hashlib.sha256(data).hexdigest() != stored["project_sha256"]:
+        issues.append("project.json")
+    images = {i["file"]: i["sha256"] for m in stored["batch"]["membranes"] for i in m["images"]}
+    found = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (folder / "images").iterdir()
+    }
+    if found != images:
+        issues.append("images")
+    if json.loads(data)["log"][-1]["content_hash"] != stored["content_hash"]:
+        issues.append("content hash")
+    return issues
 
 
 # --- The frozen files ---
@@ -91,22 +165,336 @@ def test_frozen_fixtures_are_built_at_05b4af5(case):
     stored = _golden(case, "stored.json")
     assert stored["built_at"] == FROZEN
     assert stored["version"] == "0.1.0.dev0"
+    assert stored["case"] == case
     project = json.loads((DATA / case / "project.json").read_text(encoding="utf-8"))
     assert project["schema_version"] == 2
     assert {entry["version"] for entry in project["log"]} == {"0.1.0.dev0"}
 
 
 @pytest.mark.parametrize("case", CASES)
+def test_frozen_files_are_intact(case):
+    assert _intact_issues(DATA / case, _golden(case, "stored.json")) == []
+
+
+def test_intact_check_reads_every_frozen_file(tmp_path):
+    stored = _golden("f3", "stored.json")
+    image = tmp_path / "image"
+    fixtures.copy_project(DATA / "f3", image)
+    last = sorted((image / "images").iterdir())[-1]
+    data = last.read_bytes()
+    last.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+    assert _intact_issues(image, stored) == ["images"]
+    extra = tmp_path / "extra"
+    fixtures.copy_project(DATA / "f3", extra)
+    (extra / "images" / "img-9.png").write_bytes(b"")
+    assert _intact_issues(extra, stored) == ["images"]
+    hashed = tmp_path / "hashed"
+    fixtures.copy_project(DATA / "f3", hashed)
+    path = hashed / "project.json"
+    text = path.read_text(encoding="utf-8")
+    # The state before the removal, and each undo back to it; the last one changes.
+    assert text.count(stored["content_hash"]) == 3
+    changed = text[::-1].replace(stored["content_hash"][::-1], "0" * 64, 1)[::-1]
+    path.write_text(changed, encoding="utf-8", newline="\n")
+    assert _intact_issues(hashed, stored) == ["project.json", "content hash"]
+
+
+@pytest.mark.parametrize("case", CASES)
 def test_stored_golden_matches(case, tmp_path):
-    session = _opened(case, tmp_path)
+    fixtures.copy_project(DATA / case, tmp_path / case)
+    assert _stored_differences(case, tmp_path / case) == []
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_stored_json_holds_every_value_of_the_frozen_file(case):
+    # Every value of project.json but its schema version is in stored.json at
+    # the same place; stored.json holds nothing else but the defaults the file
+    # leaves out and what it records about the fixture itself.
+    project = json.loads((DATA / case / "project.json").read_text(encoding="utf-8"))
+    assert project.pop("schema_version") == 2
+    held = dict(_leaves(_golden(case, "stored.json")))
+    in_file = dict(_leaves(project))
+    assert len(in_file) > 600
+    assert [
+        p for p, v in in_file.items() if p not in held or fixtures.differences(v, held[p])
+    ] == []
+    extra = {path: value for path, value in held.items() if path not in in_file}
+    about_fixture = {path for path in extra if path[2:] in fixtures.FROZEN_ONLY}
+    assert about_fixture == {f"$.{key}" for key in fixtures.FROZEN_ONLY}
+    defaults = {re.sub(r"\[\d+\]", "[]", p): v for p, v in extra.items() if p not in about_fixture}
+    assert set(defaults) <= set(WRITTEN_OUT)
+    assert [p for p, v in defaults.items() if fixtures.differences(WRITTEN_OUT[p], v)] == []
+
+
+def test_stored_values_cover_every_written_out_default():
+    # Each default stored.json writes out is left out of some frozen file.
+    seen = set()
+    for case in CASES:
+        project = json.loads((DATA / case / "project.json").read_text(encoding="utf-8"))
+        in_file = dict(_leaves(project))
+        for path, _ in _leaves(_golden(case, "stored.json")):
+            if path not in in_file:
+                seen.add(re.sub(r"\[\d+\]", "[]", path))
+    assert set(WRITTEN_OUT) <= seen
+
+
+class _OtherReason(StrEnum):
+    """A not-detected reason the schema-2 build does not know."""
+
+    OFF_ROW = "off_expected_row"
+
+
+def _set(*steps):
+    """A change of a project: set each ``(path, value)``, a path of attribute
+    names and list positions from the project."""
+
+    def change(project):
+        for path, value in steps:
+            target = project
+            for step in path[:-1]:
+                target = target[step] if isinstance(step, int) else getattr(target, step)
+            setattr(target, path[-1], value)
+
+    return change
+
+
+def _log_entry(i: int, **update):
+    """A change of a project: its log entry ``i`` with ``update``."""
+
+    def change(project):
+        log = list(project.log)
+        log[i] = log[i].model_copy(update=update)
+        project.log = tuple(log)
+
+    return change
+
+
+def _drop_param(i: int, name: str):
+    def change(project):
+        params = {k: v for k, v in project.log[i].params.items() if k != name}
+        _log_entry(i, params=params)(project)
+
+    return change
+
+
+def _drop_last_entry(project):
+    project.log = project.log[:-1]
+
+
+# Values besides the bands and calibrations, each changed in an opened project
+# as a migration could leave it: (case, change, where it is caught).
+DEGRADED = {
+    "undetected_reason": (
+        "f1",
+        _set((("batch", "proteins", 3, "undetected", 0, "reason"), _OtherReason.OFF_ROW)),
+        "$.batch.proteins[3].undetected[0].reason",
+    ),
+    "warning_code": (
+        "f2",
+        _set((("batch", "membranes", 1, "images", 0, "import_warnings", 0, "code"), "lossy")),
+        "$.batch.membranes[1].images[0].import_warnings[0].code",
+    ),
+    "warning_message": (
+        "f2",
+        _set((("batch", "membranes", 0, "images", 0, "import_warnings", 0, "message"), "JPEG.")),
+        "$.batch.membranes[0].images[0].import_warnings[0].message",
+    ),
+    "lane_index": ("f1", _set((("batch", "lanes", 7, "index"), 8)), "$.batch.lanes[7].index"),
+    "lane_label": (
+        "f1",
+        _set((("batch", "lanes", 0, "label"), "Vehicle")),
+        "$.batch.lanes[0].label",
+    ),
+    "lane_sample": ("f1", _set((("batch", "lanes", 1, "sample"), None)), "$.batch.lanes[1].sample"),
+    "lane_included": (
+        "f1",
+        _set((("batch", "lanes", 5, "included"), True)),
+        "$.batch.lanes[5].included",
+    ),
+    "lane_metadata": (
+        "f1",
+        _set((("batch", "lanes", 2, "metadata"), {"dose": "0"})),
+        "$.batch.lanes[2].metadata.dose",
+    ),
+    "next_id": ("f3", _set((("next_id",), 17)), "$.next_id"),
+    "log_seq": ("f3", _log_entry(19, seq=21), "$.log[19].seq"),
+    "log_time": ("f3", _log_entry(19, time="2026-10-31T09:00:19.001Z"), "$.log[19].time"),
+    "log_action": ("f3", _log_entry(19, action="undo"), "$.log[19].action"),
+    "log_version": ("f3", _log_entry(19, version="0.1.0"), "$.log[19].version"),
+    "log_params": ("f3", _drop_param(19, "returns_to_seq"), "$.log[19].params.returns_to_seq"),
+    "log_content_hash": ("f3", _log_entry(19, content_hash="0" * 64), "$.log[19].content_hash"),
+    "log_entry_dropped": ("f3", _drop_last_entry, "$.log"),
+}
+
+
+@pytest.mark.parametrize("name", DEGRADED)
+def test_stored_check_catches_a_degraded_value(name, projects):
+    case, change, where = DEGRADED[name]
     golden = _golden(case, "stored.json")
-    expected = {k: v for k, v in golden.items() if k not in ("built_at", "version")}
-    assert fixtures.differences(expected, fixtures.stored_values(session.project)) == []
+    project = projects[case].model_copy(deep=True)
+    assert fixtures.stored_differences(golden, project) == []
+    change(project)
+    assert _paths(fixtures.stored_differences(golden, project)) == [where]
+
+
+def _write_reshaped(folder: Path, change=None) -> None:
+    """Rewrite the project in ``folder`` in another shape, with every value
+    intact: each object's keys in reverse order, and each default the file
+    leaves out written out; then ``change`` the JSON, if given."""
+
+    def reversed_keys(value):
+        if isinstance(value, dict):
+            return {key: reversed_keys(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reversed_keys(item) for item in value]
+        return value
+
+    path = folder / "project.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    for membrane in doc["batch"]["membranes"]:
+        membrane["calibration"].setdefault("ladder_kda", [])
+        for point in membrane["calibration"]["points"]:
+            point.setdefault("side", "left")
+    for protein in doc["batch"]["proteins"]:
+        protein.setdefault("box_padding", {"across": 0, "along": 0})
+        protein.setdefault("undetected", [])
+        for band in protein["bands"]:
+            band.setdefault("bands_found", None)
+            band.setdefault("possibly_clipped", None)
+    if change is not None:
+        change(doc)
+    text = json.dumps(reversed_keys(doc), ensure_ascii=False, indent=2)
+    path.write_text(text + "\n", encoding="utf-8", newline="\n")
+
+
+def test_stored_check_passes_a_reshaped_project_with_every_value(tmp_path, monkeypatch):
+    folder = tmp_path / "f1"
+    fixtures.copy_project(DATA / "f1", folder)
+    _write_reshaped(folder)
+    stored = _golden("f1", "stored.json")
+    assert _intact_issues(folder, stored) == ["project.json"]  # not the frozen bytes
+    # Held in another shape, the content hashes otherwise, as after a migration.
+    monkeypatch.setattr(storage, "content_hash", lambda project: "0" * 64)
+    assert _stored_differences("f1", folder) == []
+
+
+def _drop(*path):
+    def change(doc):
+        target = doc
+        for step in path[:-1]:
+            target = target[step]
+        del target[path[-1]]
+
+    return change
+
+
+def _none(*path):
+    def change(doc):
+        target = doc
+        for step in path[:-1]:
+            target = target[step]
+        target[path[-1]] = None
+
+    return change
+
+
+# A value a migration could drop, in a reshaped project: (case, change, where
+# it is caught).
+DROPPED = {
+    "reference_condition": (
+        "f1",
+        _none("batch", "reference_condition"),
+        ["$.batch.reference_condition"],
+    ),
+    "box_padding": (
+        "f1",
+        _drop("batch", "proteins", 1, "box_padding"),
+        ["$.batch.proteins[1].box_padding.across", "$.batch.proteins[1].box_padding.along"],
+    ),
+    "undetected": (
+        "f1",
+        _drop("batch", "proteins", 0, "undetected"),
+        ["$.batch.proteins[0].undetected"],
+    ),
+    "marker_link": (
+        "f1",
+        _none("batch", "membranes", 0, "images", 0, "marker_image_id"),
+        ["$.batch.membranes[0].images[0].marker_image_id"],
+    ),
+    "import_warnings": (
+        "f2",
+        _drop("batch", "membranes", 1, "images", 0, "import_warnings"),
+        ["$.batch.membranes[1].images[0].import_warnings"],
+    ),
+    "log_param": (
+        "f2",
+        _drop("log", 1, "params", "original_name"),
+        ["$.log[1].params.original_name"],
+    ),
+}
+
+
+@pytest.mark.parametrize("name", DROPPED)
+def test_stored_check_catches_a_dropped_value(name, tmp_path):
+    case, change, where = DROPPED[name]
+    folder = tmp_path / case
+    fixtures.copy_project(DATA / case, folder)
+    _write_reshaped(folder, change)
+    assert _paths(_stored_differences(case, folder)) == where
 
 
 @pytest.mark.parametrize("case", CASES)
 def test_derived_golden_matches(case, derived):
     fixtures.check_derived(_golden(case, "derived.json"), derived[case], case)
+
+
+def test_changes():
+    changes = fixtures.changes
+    assert changes({"a": [1.0, "x"]}, {"a": [1.0 + 1e-13, "x"]}) == []
+    off = 1.0 + 1e-9
+    assert changes({"a": [1.0, "x"]}, {"a": [off, "x"]}) == [["$.a[0]", 1.0, off]]
+    assert changes({"a": [1.0, "x"]}, {"a": [1.0, "y"]}) == [["$.a[1]", "x", "y"]]
+    assert changes({"a": {"b": 1}}, {"a": {"b": 1.0}}) == [["$.a.b", 1, 1.0]]
+    assert changes([{"a": None}], [{"a": 0}]) == [["$[0].a", None, 0]]
+    # Whole, where the shape differs.
+    assert changes({"a": [1, 2]}, {"a": [1, 2, 3]}) == [["$.a", [1, 2], [1, 2, 3]]]
+    assert changes({"a": 1, "b": 2}, {"a": 1, "c": 2}) == [
+        ["$", {"a": 1, "b": 2}, {"a": 1, "c": 2}]
+    ]
+    assert changes({"a": [1]}, {"a": {"0": 1}}) == [["$.a", [1], {"0": 1}]]
+    # Each change, in order.
+    assert changes([1, 2, 3], [0, 2, 4]) == [["$[0]", 1, 0], ["$[2]", 3, 4]]
+
+
+def test_fresh_changes(projects):
+    # The frozen project stands in for a fresh build that stores its values.
+    golden = _golden("f3", "stored.json")
+    project = projects["f3"].model_copy(deep=True)
+    assert fixtures.fresh_changes(golden, project) == []
+    # A fresh build's log entries are compared without their hashes and versions.
+    _log_entry(19, content_hash="0" * 64, version="9")(project)
+    assert fixtures.fresh_changes(golden, project) == []
+    _log_entry(19, time="2026-10-31T09:00:19.001Z")(project)
+    assert fixtures.fresh_changes(golden, project) == [
+        ["$.log[19].time", "2026-10-31T09:00:19.000Z", "2026-10-31T09:00:19.001Z"]
+    ]
+    project = projects["f3"].model_copy(deep=True)
+    band = project.batch.proteins[1].bands[2]
+    net = band.net
+    band.net = net * (1 + 1e-13)  # within the derived tolerance
+    assert fixtures.fresh_changes(golden, project) == []
+    band.net = net * (1 + 1e-9)
+    assert fixtures.fresh_changes(golden, project) == [
+        ["$.batch.proteins[1].bands[2].net", net, band.net]
+    ]
+    # Each is part of the derived output, so the derived check catches it.
+    derived = _golden("f3", "derived.json")
+    actual = {**derived, "fresh_changes": fixtures.fresh_changes(golden, project)}
+    assert fixtures.derived_differences(derived, actual) == ["$.fresh_changes: 0 items != 1"]
+    # What stored.json records about the fixture itself is not compared.
+    assert fixtures.fresh_changes({**golden, "case": "f9", "content_hash": "0"}, project) == [
+        ["$.batch.proteins[1].bands[2].net", net, band.net]
+    ]
 
 
 def test_derived_failure_prints_the_refresh_command(derived):
@@ -133,14 +521,12 @@ def _first_float(values: list) -> int:
 def test_comparator_catches_stored_ulp():
     golden = _golden("f1", "stored.json")
     actual = copy.deepcopy(golden)
-    band = actual["proteins"][0]["bands"][0]
+    band = actual["batch"]["proteins"][0]["bands"][0]
+    old = golden["batch"]["proteins"][0]["bands"][0]["net"]
     band["net"] = math.nextafter(band["net"], math.inf)
-    assert band["net"] != golden["proteins"][0]["bands"][0]["net"]
+    assert band["net"] != old
     found = fixtures.differences(golden, actual)
-    assert found == [
-        f"$.proteins[0].bands[0].net: {golden['proteins'][0]['bands'][0]['net']!r}"
-        f" != {band['net']!r}"
-    ]
+    assert found == [f"$.batch.proteins[0].bands[0].net: {old!r} != {band['net']!r}"]
     # Within the derived tolerance it would pass: exactness is what catches it.
     assert fixtures.differences(golden, actual, rel_tol=1e-12) == []
 
@@ -155,11 +541,9 @@ def test_stored_check_catches_a_net_one_ulp_off_in_the_file(tmp_path):
     assert text.count(f'"net": {old!r}') == 1
     changed = text.replace(f'"net": {old!r}', f'"net": {new!r}')
     path.write_text(changed, encoding="utf-8", newline="\n")
-    golden = _golden("f1", "stored.json")
-    expected = {k: v for k, v in golden.items() if k not in ("built_at", "version")}
-    project = ops.open_project(folder, autosave=None).project
-    found = fixtures.differences(expected, fixtures.stored_values(project))
-    assert [f.split(":")[0] for f in found] == ["$.content_hash", "$.proteins[0].bands[0].net"]
+    assert _stored_differences("f1", folder) == [
+        f"$.batch.proteins[0].bands[0].net: {old!r} != {new!r}"
+    ]
 
 
 def test_comparator_catches_derived_1e9(derived):
@@ -381,7 +765,7 @@ def test_goldens_are_canonical(case):
 # --- The commands ---
 
 
-def test_refresh_derived_leaves_frozen_files(tmp_path, monkeypatch, capsys):
+def test_refresh_derived_leaves_frozen_files(tmp_path, monkeypatch, capsys, derived):
     root = tmp_path / "schema2"
     for case in CASES:
         fixtures.copy_project(DATA / case, root / case)
@@ -412,9 +796,35 @@ def test_refresh_derived_leaves_frozen_files(tmp_path, monkeypatch, capsys):
     assert changed <= {f"{case}/derived.json" for case in CASES}
     assert "f1/derived.json" in changed
     for case in CASES:
+        # What the module's derived output gives: the same build, one machine.
         written = (root / case / "derived.json").read_bytes()
-        assert written == fixtures.canonical_json(json.loads(written))
-        fixtures.check_derived(_golden(case, "derived.json"), json.loads(written), case)
+        assert written == fixtures.canonical_json(derived[case])
+
+
+def test_derived_output_closes_the_project_it_opens(tmp_path, monkeypatch):
+    opened, closed = [], []
+    real_open, real_close = ops.open_project, ops.ProjectSession.close
+
+    def open_project(*args, **kwargs):
+        opened.append(real_open(*args, **kwargs))
+        return opened[-1]
+
+    def close(self, *args, **kwargs):
+        closed.append(self)
+        return real_close(self, *args, **kwargs)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("stopped")
+
+    monkeypatch.setattr(ops, "open_project", open_project)
+    monkeypatch.setattr(ops.ProjectSession, "close", close)
+    # Stopped while the copy is open, and after it is read (at the fresh build).
+    for module, name in ((fixtures.results, "compute_results"), (fixtures, "build")):
+        with monkeypatch.context() as patched:
+            patched.setattr(module, name, fail)
+            with pytest.raises(RuntimeError, match="stopped"):
+                fixtures.derived_output(DATA / "f3", tmp_path / name)
+    assert len(opened) == 2 and closed == opened
 
 
 def test_frozen_refusal():
@@ -422,6 +832,7 @@ def test_frozen_refusal():
     module = toplevel / "src" / "proteia" / "__init__.py"
     ok = {"head": FROZEN, "changes": "", "module": module, "toplevel": toplevel}
     assert fixtures.frozen_refusal(**ok) is None
+    assert fixtures.frozen_refusal(**ok, mismatched=[]) is None
     other = fixtures.frozen_refusal(**{**ok, "head": "1" * 40})
     assert other is not None and FROZEN in other and "1" * 40 in other
     changed = fixtures.frozen_refusal(**{**ok, "changes": " M src/proteia/core/model.py\n"})
@@ -429,6 +840,161 @@ def test_frozen_refusal():
     elsewhere = Path("elsewhere") / "proteia" / "__init__.py"
     imported = fixtures.frozen_refusal(**{**ok, "module": elsewhere})
     assert imported is not None and "elsewhere" in imported
+    lines = ["numpy: locked 2.2.6, installed 2.3.4", "scipy: locked 1.16.0, installed nowhere"]
+    mismatched = fixtures.frozen_refusal(**ok, mismatched=lines)
+    assert mismatched == (
+        "the installed dependencies are not those uv.lock locks (run uv sync --locked):\n"
+        "  numpy: locked 2.2.6, installed 2.3.4\n"
+        "  scipy: locked 1.16.0, installed nowhere"
+    )
+    # The commit is named first.
+    assert fixtures.frozen_refusal(**{**ok, "head": "1" * 40}, mismatched=lines) == other
+
+
+LOCK = """\
+version = 1
+
+[[package]]
+name = "app"
+version = "1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "click" },
+    { name = "numpy" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[[package]]
+name = "click"
+version = "8.2.1"
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+
+[[package]]
+name = "numpy"
+version = "2.2.6"
+resolution-markers = ["python_full_version < '3.14'"]
+
+[[package]]
+name = "numpy"
+version = "2.3.4"
+resolution-markers = ["python_full_version >= '3.14'"]
+
+[[package]]
+name = "pytest"
+version = "8.4.0"
+
+[[package]]
+name = "typing-extensions"
+version = "4.15.0"
+
+[[package]]
+name = "uvicorn"
+version = "0.54.0"
+dependencies = [
+    { name = "click" },
+]
+
+[package.optional-dependencies]
+standard = [
+    { name = "typing-extensions" },
+]
+"""
+# Installed as the lock asks, colorama (a marker's) left out, names as
+# distributions spell them.
+INSTALLED = {
+    "Click": "8.2.1",
+    "NumPy": "2.2.6",
+    "uvicorn": "0.54.0",
+    "typing_extensions": "4.15.0",
+    "pytest": "8.4.0",
+    "other": "1",
+}
+
+
+def test_lock_mismatches():
+    def found(lock=LOCK, **versions):
+        installed = {k: v for k, v in {**INSTALLED, **versions}.items() if v is not None}
+        return fixtures.lock_mismatches(lock, installed, project="app")
+
+    assert found() == []
+    assert found(NumPy="2.3.4") == []  # either version the lock holds
+    assert found(NumPy="2.4.0") == ["numpy: locked 2.2.6 or 2.3.4, installed 2.4.0"]
+    assert found(Click=None) == ["click: locked 8.2.1, installed nowhere"]
+    # Through a dependency, and through an extra it asks for.
+    assert found(typing_extensions="4.14.0") == [
+        "typing-extensions: locked 4.15.0, installed 4.14.0"
+    ]
+    # Asked for by a marker only: may be missing, but not at another version.
+    assert found(colorama="0.4.5") == ["colorama: locked 0.4.6, installed 0.4.5"]
+    assert found(colorama="0.4.6") == []
+    unmarked = LOCK.replace(
+        '    { name = "typing-extensions" },\n]',
+        '    { name = "typing-extensions" },\n    { name = "colorama" },\n]',
+    )
+    assert unmarked != LOCK
+    assert found(unmarked) == ["colorama: locked 0.4.6, installed nowhere"]
+    # A cycle (click and uvicorn asking for each other) is followed once.
+    cyclic = LOCK.replace(
+        'dependencies = [\n    { name = "colorama", marker',
+        'dependencies = [\n    { name = "uvicorn" },\n    { name = "colorama", marker',
+    )
+    assert cyclic != LOCK
+    assert found(cyclic) == []
+    assert found(cyclic, uvicorn="0.53.0") == ["uvicorn: locked 0.54.0, installed 0.53.0"]
+    # A dependency group is not the runtime's.
+    assert found(pytest="9.0.0") == []
+    assert found(Click="8.2.0", NumPy="1.0") == [
+        "click: locked 8.2.1, installed 8.2.0",
+        "numpy: locked 2.2.6 or 2.3.4, installed 1.0",
+    ]
+    assert fixtures.lock_mismatches(LOCK, INSTALLED, project="other") == ["other: not in uv.lock"]
+    # A dependency the lock does not hold.
+    broken = LOCK.replace('{ name = "click" },\n    { name = "numpy" }', '{ name = "gone" }')
+    assert broken != LOCK
+    assert found(broken) == ["gone: locked nowhere, installed nowhere"]
+
+
+def test_this_checkout_runs_on_its_locked_dependencies():
+    # The real lock, with its markers, read without a false refusal.
+    checkout = Path(fixtures.proteia.__file__).resolve().parents[2]
+    lock = (checkout / "uv.lock").read_text(encoding="utf-8")
+    assert fixtures.lock_mismatches(lock, fixtures.installed_versions()) == []
+    assert {"numpy", "scipy", "pillow", "tifffile", "pydantic"} <= set(
+        fixtures.installed_versions()
+    )
+
+
+def test_refusal_here_checks_the_installed_dependencies(tmp_path, monkeypatch):
+    checkout = Path(fixtures.proteia.__file__).resolve().parents[2]
+    answers = {
+        ("rev-parse", "--show-toplevel"): f"{checkout}\n",
+        ("rev-parse", "HEAD"): f"{FROZEN}\n",
+        ("status", "--porcelain"): "",
+    }
+    monkeypatch.setattr(fixtures, "_git", lambda *args: answers[args[:2]])
+    assert fixtures._refusal_here() is None  # as at 05b4af5, on the locked dependencies
+    installed = {**fixtures.installed_versions(), "numpy": "0.0.1"}
+    monkeypatch.setattr(fixtures, "installed_versions", lambda: installed)
+    refusal = fixtures._refusal_here()
+    assert refusal is not None
+    assert refusal.startswith("the installed dependencies are not those uv.lock locks")
+    assert refusal.endswith(", installed 0.0.1") and "\n  numpy: locked " in refusal
+    answers[("rev-parse", "--show-toplevel")] = f"{tmp_path}\n"  # no uv.lock there
+    refusal = fixtures._refusal_here()
+    assert refusal is not None
+    assert refusal.startswith(f"cannot tell whether this checkout is at {FROZEN}: ")
+    assert "uv.lock" in refusal
 
 
 def _head() -> str | None:
@@ -477,7 +1043,24 @@ def test_write_frozen_writes_a_case_only_once(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["f2"]
 
 
-def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys):
+def test_main_leaves_the_console_alone(tmp_path, monkeypatch):
+    # Only the scripts, run as such, let the console print any text; main()
+    # called in a process of its own (this one) leaves its streams alone.
+    class Console(io.StringIO):
+        def reconfigure(self, **kwargs):
+            raise AssertionError(f"reconfigured with {kwargs}")
+
+    monkeypatch.setattr(sys, "stdout", Console())
+    monkeypatch.setattr(sys, "stderr", Console())
+    monkeypatch.setattr(fixtures, "_refusal_here", lambda: "not here, µ")
+    assert fixtures.main(["--write-frozen", "--out", str(tmp_path / "out")]) == 2
+    assert sys.stderr.getvalue() == "refused: not here, µ\n"
+    monkeypatch.syspath_prepend(str(DATA))  # as when it runs as a script
+    assert _load("derive").main([str(tmp_path)]) == 2
+    assert "derive.py: cannot read the case of " in sys.stderr.getvalue()
+
+
+def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys, derived):
     # As at 05b4af5 (a stand-in commit), from the frozen image files: what it
     # writes holds the frozen values, as far as this platform's floats allow.
     monkeypatch.setattr(fixtures, "_refusal_here", lambda: None)
@@ -488,24 +1071,40 @@ def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys):
         lambda *args: "f" * 40 + "\n" if args == ("rev-parse", "HEAD") else real_git(*args),
     )
     monkeypatch.setattr(fixtures, "sources", lambda case: fixtures.frozen_sources(DATA / case))
+    # The derived output of the same build of the same image files, computed
+    # by the module already (one build less per case).
+    asked = []
+
+    def derived_output(folder, work, case=None):
+        asked.append((Path(folder), case, (Path(folder) / "stored.json").is_file()))
+        return copy.deepcopy(derived[case])
+
+    monkeypatch.setattr(fixtures, "derived_output", derived_output)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     out = tmp_path / "out"
     out.mkdir()
     assert fixtures.main(["--write-frozen", "--out", str(out)]) == 0
     assert capsys.readouterr().out.splitlines() == [f"wrote {case}" for case in CASES]
+    assert asked == [(out / case, case, True) for case in CASES]
     for case in CASES:
         stored = json.loads((out / case / "stored.json").read_text(encoding="utf-8"))
+        project = (out / case / "project.json").read_bytes()
+        assert stored["case"] == case
+        assert stored["project_sha256"] == hashlib.sha256(project).hexdigest()
+        assert stored["content_hash"] == json.loads(project)["log"][-1]["content_hash"]
         frozen = _golden(case, "stored.json")
         assert stored.pop("built_at") == "f" * 40 and frozen.pop("built_at") == FROZEN
+        # Each hash changes whole with the last bit of any float.
         for values in (stored, frozen):
-            del values["content_hash"]  # changes whole with the last bit of any float
+            del values["project_sha256"], values["content_hash"]
+            for entry in values["log"]:
+                del entry["content_hash"]
         assert fixtures.differences(frozen, stored, rel_tol=1e-12) == []
-        written = json.loads((out / case / "derived.json").read_text(encoding="utf-8"))
-        fixtures.check_derived(_golden(case, "derived.json"), written, case)
-        assert (out / case / "project.json").is_file()
+        assert (out / case / "derived.json").read_bytes() == fixtures.canonical_json(derived[case])
         assert sorted(p.name for p in (out / case / "images").iterdir()) == sorted(
             p.name for p in (DATA / case / "images").iterdir()
         )
+    assert list(tmp_path.iterdir()) == [out]  # its temporary folder is gone
 
 
 def test_fixtures_stay_under_400_kb():
@@ -546,37 +1145,100 @@ def test_generator_writes_the_formats_named():
                 assert np.array_equal(fixtures.decoded(data), drawn[name]), name
 
 
-def test_build_imports_the_files_given(tmp_path):
+def test_build_imports_the_files_given(tmp_path, monkeypatch):
     files = fixtures.frozen_sources(DATA / "f3")
     marker = fixtures.decoded(files[fixtures.N])
     files[fixtures.N] = fixtures._encoded(marker, "PNG", compress_level=1)  # same pixels
     assert files[fixtures.N] != fixtures.frozen_sources(DATA / "f3")[fixtures.N]
+    built, closed = [], []
+    real_new, real_close = ops.new_project, ops.ProjectSession.close
+
+    def new_project(*args, **kwargs):
+        built.append(real_new(*args, **kwargs))
+        return built[-1]
+
+    def close(self, *args, **kwargs):
+        closed.append(self)
+        return real_close(self, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "new_project", new_project)
+    monkeypatch.setattr(ops.ProjectSession, "close", close)
     project = fixtures.build(tmp_path / "f3", "f3", files=files)
+    assert len(built) == 1 and closed == built  # and it closes the project it builds
     stored = {image.original_name: image.sha256 for image in project.batch.iter_images()}
     assert stored == {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
 
 
-def test_derive_writes_a_case(tmp_path, monkeypatch, capsysbinary, derived):
+def test_main_needs_a_command(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        fixtures.main([])
+    assert stopped.value.code == 2
+    assert "one of the arguments --write-frozen --refresh-derived is required" in (
+        capsys.readouterr().err
+    )
+
+
+def _copy_fixture(case: str, folder: Path) -> Path:
+    """A copy of ``case``'s fixture (its project and ``stored.json``) in
+    ``folder``, named anything."""
+    fixtures.copy_project(DATA / case, folder)
+    (folder / "stored.json").write_bytes((DATA / case / "stored.json").read_bytes())
+    return folder
+
+
+def test_derive_writes_a_case(tmp_path, monkeypatch, capsysbinary):
     monkeypatch.syspath_prepend(str(DATA))  # as when it runs as a script
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     derive = _load("derive")
+    asked = []
+
+    def derived_output(folder, work, case=None):
+        asked.append((Path(folder), case, Path(work).parent == tmp_path))
+        return {"case": case, "µ": [0.1]}
+
+    monkeypatch.setattr(derive.make_fixtures, "derived_output", derived_output)
     out = tmp_path / "f3.json"
-    assert derive.main(["f3", "--out", str(out)]) == 0
-    assert out.read_bytes() == fixtures.canonical_json(derived["f3"])
-    assert [p.name for p in tmp_path.iterdir()] == ["f3.json"]  # its copies are gone
+    assert derive.main(["f3", "--out", str(out)]) == 0  # a case, by its name
+    assert out.read_bytes() == '{\n "case": "f3",\n "µ": [0.1]\n}\n'.encode()
     assert capsysbinary.readouterr().out == b""
-    assert derive.main([str(DATA / "f3")]) == 0  # a case folder, to stdout
-    assert capsysbinary.readouterr().out == out.read_bytes()
+    # A fixture folder named otherwise: the case its stored.json names, to stdout.
+    folder = _copy_fixture("f2", tmp_path / "copy of f3")
+    assert derive.main([str(folder)]) == 0
+    assert capsysbinary.readouterr().out == '{\n "case": "f2",\n "µ": [0.1]\n}\n'.encode()
+    assert asked == [(DATA / "f3", "f3", True), (folder.resolve(), "f2", True)]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["copy of f3", "f3.json"]
+
+
+def test_derive_refuses_a_folder_that_names_no_case(tmp_path, monkeypatch, capsys):
+    monkeypatch.syspath_prepend(str(DATA))
+    derive = _load("derive")
+    monkeypatch.setattr(derive.make_fixtures, "derived_output", None)  # never reached
+    fixtures.copy_project(DATA / "f3", tmp_path / "f3")  # a project, no stored.json
+    folder = (tmp_path / "f3").resolve()
+    assert derive.main([str(folder)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"derive.py: cannot read the case of {folder}: ")
+    for text, named in (("[]", None), ('{"case": "f9"}', "'f9'"), ('{"case": ["f1"]}', "['f1']")):
+        (folder / "stored.json").write_text(text, encoding="utf-8")
+        assert derive.main([str(folder)]) == 2
+        assert capsys.readouterr().err == (
+            f"derive.py: {folder / 'stored.json'} names no case of f1, f2, f3: {named}\n"
+        )
 
 
 def test_derive_script_prints_canonical_json(tmp_path, derived):
-    env = {**os.environ, "TMP": str(tmp_path), "TEMP": str(tmp_path), "TMPDIR": str(tmp_path)}
+    # As a script, on a fixture folder named otherwise.
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    env = {**os.environ, "TMP": str(temp), "TEMP": str(temp), "TMPDIR": str(temp)}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    folder = _copy_fixture("f2", tmp_path / "fixture")
     script = DATA / "derive.py"
     printed = subprocess.run(
-        [sys.executable, str(script), str(DATA / "f2")], check=True, env=env, capture_output=True
+        [sys.executable, str(script), str(folder)], check=True, env=env, capture_output=True
     ).stdout
     assert printed == fixtures.canonical_json(derived["f2"])
+    assert list(temp.iterdir()) == []  # its copies are gone
 
 
 # --- What each project holds (the issue's list) ---
