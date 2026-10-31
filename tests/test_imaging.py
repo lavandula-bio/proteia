@@ -17,7 +17,7 @@ import tifffile
 from PIL import Image, ImageCms, ImageDraw
 from skimage import io
 
-from conftest import synthetic_blot
+from conftest import lzw_encode, synthetic_blot, write_lzw_tiff
 from proteia import samples
 from proteia.core import imaging
 from proteia.core.imaging import (
@@ -652,8 +652,10 @@ def test_compressed_tiff_is_read_exactly(tmp_path, pixels, depth, compression):
     assert loaded.bit_depth == depth
 
 
-def _declared(photometric, samples, shape=(6, 8), dtype=np.uint8) -> _Declared:
-    return _Declared("LZW", shape, np.dtype(dtype), photometric, samples)
+def _declared(
+    photometric, samples, shape=(6, 8), dtype=np.uint8, extrasamples=(), planar=False
+) -> _Declared:
+    return _Declared("LZW", shape, np.dtype(dtype), photometric, samples, extrasamples, planar)
 
 
 @pytest.mark.parametrize(
@@ -662,13 +664,21 @@ def _declared(photometric, samples, shape=(6, 8), dtype=np.uint8) -> _Declared:
         # Pillow would change these values: it inverts white-is-zero gray and
         # un-premultiplies associated alpha.
         _declared(tifffile.PHOTOMETRIC.MINISWHITE, 1),
-        _declared(tifffile.PHOTOMETRIC.RGB, 4, (6, 8, 4)),
+        _declared(tifffile.PHOTOMETRIC.RGB, 4, (6, 8, 4), extrasamples=(1,)),
         _declared(tifffile.PHOTOMETRIC.PALETTE, 1),
         # A result that differs from the declaration: never read with another scale.
         _declared(tifffile.PHOTOMETRIC.MINISBLACK, 1, dtype=np.uint16),
         _declared(tifffile.PHOTOMETRIC.RGB, 3, (6, 8, 3)),
+        _declared(tifffile.PHOTOMETRIC.RGB, 4, (6, 8, 4), extrasamples=(2,)),
     ],
-    ids=["min-is-white", "rgba", "palette", "other-bit-depth", "other-shape"],
+    ids=[
+        "min-is-white",
+        "associated-alpha",
+        "palette",
+        "other-bit-depth",
+        "other-shape",
+        "rgba-other-shape",
+    ],
 )
 def test_pillow_is_used_only_where_it_reads_the_same_values(tmp_path, declared):
     path = tmp_path / "lzw.tif"
@@ -683,6 +693,295 @@ def test_a_compressed_tiff_over_pillows_size_limit_says_so(tmp_path, monkeypatch
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)  # 48 pixels is over twice the limit
     with pytest.raises(ValueError, match="more pixels than the compressed-TIFF reader"):
         load_image(path)
+
+
+# --- Compressed TIFFs with an extra sample (#232) ---
+
+_OPAQUE = np.full((6, 8), 255, dtype=np.uint8)
+_CLEAR = np.zeros((6, 8), dtype=np.uint8)
+# Every level from 1 to 254 in some order: neither opaque nor transparent.
+_TRANSLUCENT = (np.arange(48).reshape(6, 8) * 37 % 254 + 1).astype(np.uint8)
+
+
+def _tiles_40() -> np.ndarray:
+    """40 x 40 RGB plus alpha, in 3 x 3 tiles of 16 x 16 (the last ones padded)."""
+    level = np.arange(40 * 40).reshape(40, 40)
+    return np.dstack([level % 256, level * 3 % 256, level * 7 % 256, level * 11 % 255 + 1]).astype(
+        np.uint8
+    )
+
+
+def _gray_alpha(alpha: np.ndarray) -> np.ndarray:
+    return np.dstack([_gray(np.uint8, 255), alpha])
+
+
+def _gray_rgba(alpha: np.ndarray) -> np.ndarray:
+    gray = _gray(np.uint8, 255)
+    return np.dstack([gray, gray, gray, alpha])
+
+
+_RGB, _GRAY = {"photometric": "rgb"}, {"photometric": "minisblack"}
+_UNASSOCIATED, _ASSOCIATED, _UNSPECIFIED = (
+    {"extrasamples": [2]},
+    {"extrasamples": [1]},
+    {"extrasamples": [0]},
+)
+
+
+def _plain_and_lzw(folder: Path, pixels: np.ndarray, **layout) -> tuple[Path, Path]:
+    """The same pixels written uncompressed (read by tifffile) and with LZW
+    (decoded by Pillow, as tifffile cannot here), in the same layout."""
+    plain, lzw = folder / "copy β.tif", folder / "lzw α µ.tif"
+    tifffile.imwrite(
+        plain,
+        np.moveaxis(pixels, -1, 0) if layout.get("planar") else pixels,
+        byteorder=layout.get("byteorder", "<"),
+        planarconfig="separate" if layout.get("planar") else None,
+        rowsperstrip=layout.get("rowsperstrip"),
+        tile=layout.get("tile"),
+        **{key: value for key, value in layout.items() if key in ("photometric", "extrasamples")},
+    )
+    write_lzw_tiff(lzw, pixels, **layout)
+    with tifffile.TiffFile(lzw) as tif:  # the premise: Pillow decodes it, not tifffile
+        page = tif.pages.first
+        assert page.compression == tifffile.COMPRESSION.LZW
+        assert page.compression not in tifffile.TIFF.DECOMPRESSORS
+    return plain, lzw
+
+
+@pytest.mark.parametrize(
+    ("pixels", "layout", "warnings"),
+    [
+        (_gray_rgba(_OPAQUE), _RGB | _UNASSOCIATED, []),
+        (_gray_rgba(_TRANSLUCENT), _RGB | _UNASSOCIATED, []),
+        (_gray_rgba(_CLEAR), _RGB | _UNASSOCIATED, []),
+        (np.dstack([_rgb8(), _TRANSLUCENT]), _RGB | _UNASSOCIATED, ["color_channels_differ"]),
+        (
+            np.dstack([_rgb8(), _TRANSLUCENT]),
+            _RGB | _UNASSOCIATED | {"planar": True},
+            ["color_channels_differ"],
+        ),
+        (
+            np.dstack([_rgb8(), _TRANSLUCENT]),
+            _RGB | _UNASSOCIATED | {"byteorder": ">"},
+            ["color_channels_differ"],
+        ),
+        (
+            np.dstack([_rgb8(), _TRANSLUCENT]),
+            _RGB | _UNASSOCIATED | {"rowsperstrip": 2},
+            ["color_channels_differ"],
+        ),
+        (
+            np.dstack([_rgb8(), _TRANSLUCENT]),
+            _RGB | _UNASSOCIATED | {"predictor": True},
+            ["color_channels_differ"],
+        ),
+        (_tiles_40(), _RGB | _UNASSOCIATED | {"tile": (16, 16)}, ["color_channels_differ"]),
+        (
+            _tiles_40(),
+            _RGB | _UNASSOCIATED | {"tile": (16, 16), "planar": True},
+            ["color_channels_differ"],
+        ),
+        (
+            _gray_rgba(_TRANSLUCENT),
+            _RGB | _UNASSOCIATED | {"planar": True, "rowsperstrip": 2, "byteorder": ">"},
+            [],
+        ),
+        (_gray_alpha(_OPAQUE), _GRAY | _UNASSOCIATED, []),
+        (_gray_alpha(_TRANSLUCENT), _GRAY | _UNASSOCIATED, []),
+        (_gray_alpha(_CLEAR), _GRAY | _UNASSOCIATED, []),
+        (
+            _gray_alpha(_TRANSLUCENT),
+            _GRAY | _UNASSOCIATED | {"byteorder": ">", "rowsperstrip": 2},
+            [],
+        ),
+        (_gray_alpha(_TRANSLUCENT), _GRAY | _UNASSOCIATED | {"predictor": True}, []),
+        (_tiles_40()[..., 2:], _GRAY | _UNASSOCIATED | {"tile": (16, 16)}, []),
+    ],
+    ids=[
+        "rgba-gray-opaque",
+        "rgba-gray-translucent",
+        "rgba-gray-transparent",
+        "rgba-colour",
+        "rgba-planar",
+        "rgba-big-endian",
+        "rgba-strips",
+        "rgba-predictor",
+        "rgba-tiles",
+        "rgba-planar-tiles",
+        "rgba-planar-strips-big-endian",
+        "gray-alpha-opaque",
+        "gray-alpha-translucent",
+        "gray-alpha-transparent",
+        "gray-alpha-big-endian-strips",
+        "gray-alpha-predictor",
+        "gray-alpha-tiles",
+    ],
+)
+def test_a_compressed_tiff_with_unassociated_alpha_reads_as_its_uncompressed_copy(
+    tmp_path, pixels, layout, warnings
+):
+    # #232: Pillow reads an unassociated alpha sample as stored, so the LZW
+    # file reads as tifffile reads its uncompressed copy: its colours and its
+    # alpha, channels last, which the analysis array then ignores.
+    plain, lzw = _plain_and_lzw(tmp_path, pixels, **layout)
+    copy, read = imaging.read_file(plain), imaging.read_file(lzw)
+    np.testing.assert_array_equal(read.pixels, pixels)
+    assert (read.pixels.shape, read.pixels.dtype) == (pixels.shape, np.uint8)
+    assert (read.lossy, read.cmyk, read.palette) == (copy.lossy, copy.cmyk, copy.palette)
+    np.testing.assert_array_equal(read.pixels, copy.pixels)
+    loaded, expected = imaging.load_pixels(read), imaging.load_pixels(copy)
+    np.testing.assert_array_equal(loaded.array, expected.array)
+    np.testing.assert_array_equal(loaded.array, pixels[..., :-1].mean(axis=-1))
+    assert (loaded.bit_depth, loaded.warnings) == (8, expected.warnings)
+    assert _codes(loaded) == warnings
+
+
+def test_a_compressed_rgba_tiff_saved_by_an_image_editor_is_read(tmp_path):
+    # #232: a gray blot saved as RGBA with LZW (here by Pillow, which writes an
+    # unassociated alpha) reads as its uncompressed copy, with no colour note:
+    # the alpha does not make the channels differ.
+    for mode, pixels in (("RGBA", _gray_rgba(_OPAQUE)), ("LA", _gray_alpha(_TRANSLUCENT))):
+        lzw = tmp_path / f"saved {mode} µ.tif"
+        Image.fromarray(pixels, mode).save(lzw, compression="tiff_lzw")
+        with tifffile.TiffFile(lzw) as tif:
+            page = tif.pages.first
+            assert (page.compression, page.extrasamples) == (tifffile.COMPRESSION.LZW, (2,))
+        loaded = load_image(lzw)
+        np.testing.assert_array_equal(loaded.pixels, pixels)
+        np.testing.assert_array_equal(loaded.array, _gray(np.uint8, 255).astype(np.float64))
+        assert (loaded.bit_depth, loaded.warnings) == (8, [])
+
+
+def test_a_jpeg_compressed_rgba_tiff_is_read_as_lossy(tmp_path):
+    # Any compression Pillow decodes for tifffile takes the same rule (#232):
+    # unassociated alpha after the colours is kept; JPEG is lossy, so the
+    # colours come back near the written ones, and the import says so.
+    level = np.linspace(40, 200, 32 * 48).reshape(32, 48).astype(np.uint8)
+    pixels = np.dstack([level, level, level, np.full_like(level, 255)])
+    path = tmp_path / "jpeg rgba α.tif"
+    Image.fromarray(pixels, "RGBA").save(path, compression="tiff_jpeg")
+    read = imaging.read_file(path)
+    assert (read.pixels.shape, read.pixels.dtype, read.lossy) == ((32, 48, 4), np.uint8, True)
+    assert np.abs(read.pixels.astype(int) - pixels).max() <= 8
+    assert "lossy_format" in _codes(imaging.load_pixels(read))
+
+
+def _refusal(name: str, shape: str, dtype: str, photometric: str) -> str:
+    return (
+        f"{name}: LZW compression of this {shape} {dtype} {photometric} image cannot be"
+        " decoded by this installation; save the image as an uncompressed TIFF"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pixels", "layout", "declared"),
+    [
+        # Pillow un-premultiplies associated alpha: these colours would come
+        # back unchanged only because the alpha is opaque.
+        (_gray_rgba(_OPAQUE), _RGB | _ASSOCIATED, "6x8x4 uint8 RGB"),
+        (_gray_rgba(_TRANSLUCENT), _RGB | _ASSOCIATED, "6x8x4 uint8 RGB"),
+        (_gray_rgba(_TRANSLUCENT), _RGB | _ASSOCIATED | {"planar": True}, "6x8x4 uint8 RGB"),
+        # Pillow drops an unspecified extra sample (tifffile keeps it).
+        (_gray_rgba(_TRANSLUCENT), _RGB | _UNSPECIFIED, "6x8x4 uint8 RGB"),
+        (_gray_rgba(_TRANSLUCENT), _RGB | _UNSPECIFIED | {"planar": True}, "6x8x4 uint8 RGB"),
+        (
+            np.dstack([_gray_rgba(_TRANSLUCENT), _OPAQUE]),
+            _RGB | {"extrasamples": [2, 0]},
+            "6x8x5 uint8 RGB",
+        ),
+        (
+            np.dstack([_gray_rgba(_TRANSLUCENT), _OPAQUE]),
+            _RGB | {"extrasamples": [2, 2]},
+            "6x8x5 uint8 RGB",
+        ),
+        (_gray_alpha(_TRANSLUCENT), _GRAY | _ASSOCIATED, "6x8x2 uint8 MINISBLACK"),
+        (_gray_alpha(_TRANSLUCENT), _GRAY | _UNSPECIFIED, "6x8x2 uint8 MINISBLACK"),
+        # Pillow loses the alpha of planar gray (its gray is right).
+        (
+            _gray_alpha(_TRANSLUCENT),
+            _GRAY | _UNASSOCIATED | {"planar": True},
+            "6x8x2 uint8 MINISBLACK",
+        ),
+        (
+            _tiles_40()[..., 2:],
+            _GRAY | _UNASSOCIATED | {"planar": True, "tile": (16, 16)},
+            "40x40x2 uint8 MINISBLACK",
+        ),
+        # Pillow inverts white-is-zero gray.
+        (
+            _gray_alpha(_TRANSLUCENT),
+            {"photometric": "miniswhite"} | _UNASSOCIATED,
+            "6x8x2 uint8 MINISWHITE",
+        ),
+    ],
+    ids=[
+        "rgb-associated-opaque",
+        "rgb-associated",
+        "rgb-associated-planar",
+        "rgb-unspecified",
+        "rgb-unspecified-planar",
+        "rgb-alpha-and-unspecified",
+        "rgb-two-alphas",
+        "gray-associated",
+        "gray-unspecified",
+        "gray-alpha-planar",
+        "gray-alpha-planar-tiles",
+        "min-is-white-alpha",
+    ],
+)
+def test_a_compressed_tiff_whose_extra_sample_pillow_changes_is_refused_unread(
+    tmp_path, monkeypatch, pixels, layout, declared
+):
+    # #232: refused from its header, with the message it had before, and
+    # never decoded: Pillow would give other values, or another shape.
+    _, lzw = _plain_and_lzw(tmp_path, pixels, **layout)
+    opened = []
+    monkeypatch.setattr(Image, "open", lambda *args, **kwargs: opened.append(args))
+    with pytest.raises(ValueError) as info:
+        imaging.read_file(lzw)
+    shape, dtype, photometric = declared.split()
+    assert str(info.value) == _refusal("lzw α µ.tif", shape, dtype, photometric)
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("pixels", "layout", "declared"),
+    [
+        # Pillow narrows 16-bit colour to 8 bits, alpha and all.
+        (
+            np.dstack([_rgb8(), _TRANSLUCENT]).astype(np.uint16) * 257,
+            _RGB | _UNASSOCIATED,
+            "6x8x4 uint16 RGB",
+        ),
+        # And it cannot read 16-bit gray with alpha.
+        (
+            _gray_alpha(_TRANSLUCENT).astype(np.uint16) * 257,
+            _GRAY | _UNASSOCIATED,
+            "6x8x2 uint16 MINISBLACK",
+        ),
+    ],
+    ids=["rgb16-alpha", "gray16-alpha"],
+)
+def test_a_compressed_16_bit_tiff_with_alpha_stays_refused(tmp_path, pixels, layout, declared):
+    _, lzw = _plain_and_lzw(tmp_path, pixels, **layout)
+    with pytest.raises(ValueError) as info:
+        imaging.read_file(lzw)
+    shape, dtype, photometric = declared.split()
+    assert str(info.value) == _refusal("lzw α µ.tif", shape, dtype, photometric)
+
+
+def test_the_lzw_writer_of_the_tests_is_decoded_as_written(tmp_path):
+    # write_lzw_tiff starts its table again before codes need 10 bits: data
+    # long enough to fill the table many times decodes as written.
+    pixels = np.random.default_rng(232).integers(0, 256, size=(64, 96, 4), dtype=np.uint8)
+    path = write_lzw_tiff(
+        tmp_path / "long µ.tif", pixels, photometric="rgb", extrasamples=[2], rowsperstrip=40
+    )
+    with Image.open(path) as image:
+        np.testing.assert_array_equal(np.asarray(image), pixels)
+    codes = len(lzw_encode(pixels[:40].tobytes())) * 8 // 9  # in its first strip alone
+    assert codes > 10 * 511
 
 
 def test_display_rgb_views():
@@ -1356,8 +1655,9 @@ def _five_inks_untagged(path: Path) -> None:
             ("cmyk", True, False),
         ),
         # A copy saved as RGB or grayscale that is more than 8-bit or keeps an
-        # extra channel (alpha, a fifth ink) is read only uncompressed (#207
-        # review): the refusal says so.
+        # extra channel (alpha, a fifth ink) is read for certain only
+        # uncompressed (#207 review; compressed, only unassociated alpha is
+        # read, #232): the refusal says so.
         (
             "16-bit.tif",
             _separated(_inks(_blot_rgb().astype(np.uint16) * 257)),

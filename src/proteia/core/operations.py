@@ -1571,8 +1571,9 @@ _SEVERAL_IMAGES: Final = (
     "; it also holds more than one image (a stack or a multi-channel composite), and"
     " only a single image can be quantified"
 )
-# What to save, by whether the copy must be uncompressed to be read (a 16-bit
-# RGB or an RGBA TIFF is read only uncompressed; Inks.uncompressed_copy).
+# What to save, by whether the copy must be uncompressed to be read for certain
+# (a 16-bit RGB TIFF is read only uncompressed, and an RGBA one compressed only
+# if its alpha is unassociated, #232; Inks.uncompressed_copy).
 _COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grayscale TIFF"}
 
 

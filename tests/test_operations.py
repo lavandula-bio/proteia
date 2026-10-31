@@ -44,6 +44,7 @@ from conftest import (
     sample_doc_v1,
     synthetic_blot,
     write_image_files,
+    write_lzw_tiff,
     write_tiff,
 )
 from proteia.core import boxes, imaging, mwcal, quantify, record, results, rowdetect, storage
@@ -1792,8 +1793,8 @@ def _alpha(inks: np.ndarray) -> np.ndarray:
 
 def _wide_cmyk_files() -> dict[str, io.BytesIO]:
     """Single-image CMYK files whose RGB or grayscale copy is more than 8-bit
-    or keeps an extra channel, which reading decodes uncompressed only (#207
-    review), by the name they are imported under."""
+    or keeps an extra channel, which reading decodes for certain only
+    uncompressed (#207 review, #232), by the name they are imported under."""
     from PIL import Image
 
     inks = np.asarray(Image.fromarray(_tinted_rgb()).convert("CMYK"))
@@ -1944,8 +1945,9 @@ def test_a_cmyk_file_of_more_than_8_bits_or_with_alpha_asks_for_an_uncompressed_
     tmp_path, name
 ):
     # #207 review: its RGB copy is 16-bit (or float) or keeps an extra channel,
-    # which reading decodes uncompressed only (a 16-bit RGB or an RGBA TIFF
-    # saved with LZW is refused), so the next step says so.
+    # which reading decodes for certain only uncompressed (a 16-bit RGB TIFF
+    # saved with LZW is refused, and so is an RGBA one unless its alpha is
+    # unassociated, #232), so the next step says so.
     s = session_on(tmp_path)
     source = _wide_cmyk_files()[name]
     error = _imports_nothing(
@@ -2462,8 +2464,11 @@ def test_a_16_bit_cmyk_file_saved_as_an_uncompressed_tiff_is_imported(tmp_path, 
 @pytest.mark.parametrize(("mode", "warnings"), [("RGBA", ["color_channels_differ"]), ("LA", [])])
 def test_a_cmyk_file_with_alpha_saved_as_an_uncompressed_tiff_is_imported(tmp_path, mode, warnings):
     # #207 review: the next step for inks with an alpha channel, done. The
-    # copy keeps the alpha channel: uncompressed, it imports and measures;
-    # saved with LZW, it is refused, which is why the step says uncompressed.
+    # copy keeps the alpha channel: uncompressed, it imports and measures.
+    # Saved with LZW, it imports too if its alpha is unassociated, as Pillow
+    # saves it (#232), with the same nets; with associated alpha, which an
+    # image editor may write instead, it is refused, which is why the step
+    # still says uncompressed.
     from PIL import Image
 
     s = session_on(tmp_path)
@@ -2478,19 +2483,129 @@ def test_a_cmyk_file_with_alpha_saved_as_an_uncompressed_tiff_is_imported(tmp_pa
     )
     opaque = np.full((H, W), 255, dtype=np.uint8)
     copy = Image.fromarray(np.dstack([_tinted_rgb(), opaque])).convert(mode)
-    lzw = _encoded(copy, "TIFF", compression="tiff_lzw")
-    refused = _imports_nothing(
-        s, lambda: ops.import_image(s, lzw, "copy lzw.tif", kind=CHEMI, polarity=DARK)
+    associated = write_lzw_tiff(
+        tmp_path / "associated.tif",
+        np.asarray(copy),
+        photometric="rgb" if mode == "RGBA" else "minisblack",
+        extrasamples=[1],
     )
+    with associated.open("rb") as source:
+        refused = _imports_nothing(
+            s,
+            lambda: ops.import_image(s, source, "copy associated.tif", kind=CHEMI, polarity=DARK),
+        )
     assert refused.code is ErrorCode.UNREADABLE_IMAGE
     assert str(refused).endswith("save the image as an uncompressed TIFF")
-    image_id = ops.import_image(
-        s, _encoded(copy, "TIFF"), f"copy {mode} µ.tif", kind=CHEMI, polarity=DARK
+    nets = []
+    for named, options in (
+        (f"copy {mode} µ.tif", {}),
+        (f"copy {mode} lzw α.tif", {"compression": "tiff_lzw"}),
+    ):
+        image_id = ops.import_image(
+            s, _encoded(copy, "TIFF", **options), named, kind=CHEMI, polarity=DARK
+        )
+        image = s.project.batch.find_image(image_id)
+        assert (image.bit_depth, [w.code for w in image.import_warnings]) == (8, warnings)
+        protein = ops.add_protein(s, f"β-actin {named}", Role.TARGET, image_id)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        nets.append([band.net for band in s.project.batch.find_protein(protein).bands])
+    assert nets[0] == nets[1]
+    assert_nets_current(s)
+
+
+def _over_exposed_8_bit() -> np.ndarray:
+    """:func:`blot` in 8 bits, its narrow band's core at 0 (over-exposed)."""
+    gray = (blot() >> 8).astype(np.uint8)
+    gray[ROW - 1 : ROW + 2, NARROW_X - 1 : NARROW_X + 2] = 0
+    return gray
+
+
+def _translucent() -> np.ndarray:
+    """An alpha of every level from 1 to 254, in some order."""
+    return (np.arange(H * W).reshape(H, W) * 37 % 254 + 1).astype(np.uint8)
+
+
+@pytest.mark.parametrize(
+    ("layout", "warnings", "check"),
+    [
+        ("rgba", [], "exact"),
+        ("rgba translucent", [], "exact"),
+        ("rgba planar", [], "exact"),
+        ("rgba tinted", ["color_channels_differ"], "possible"),
+        ("gray alpha", [], "exact"),
+    ],
+)
+def test_a_compressed_tiff_with_unassociated_alpha_imports_as_its_uncompressed_copy(
+    tmp_path, layout, warnings, check
+):
+    # #232: the LZW file and its uncompressed copy import with the same
+    # pixels, size, bit depth, background and notes, and measure the same
+    # nets, backgrounds and over-exposure, whatever its alpha; its colours,
+    # shown, are the same too. The alpha makes no colour note: only the
+    # tinted copy's channels differ.
+    s = session_on(tmp_path)
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])
+    gray = _over_exposed_8_bit()
+    alpha = _translucent() if "translucent" in layout else np.full((H, W), 255, np.uint8)
+    if layout.startswith("gray"):
+        pixels, photometric = np.dstack([gray, alpha]), "minisblack"
+    else:
+        rgb = np.dstack([gray, gray, gray])
+        if "tinted" in layout:
+            rgb[:4, :4] = (200, 30, 30)  # a red mark away from the bands
+        pixels, photometric = np.dstack([rgb, alpha]), "rgb"
+    planar = "planar" in layout
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    plain = sources / f"{layout} µ.tif"
+    tifffile.imwrite(
+        plain,
+        np.moveaxis(pixels, -1, 0) if planar else pixels,
+        photometric=photometric,
+        extrasamples=[2],
+        planarconfig="separate" if planar else None,
     )
-    image = s.project.batch.find_image(image_id)
-    assert (image.bit_depth, [w.code for w in image.import_warnings]) == (8, warnings)
-    protein = ops.add_protein(s, "β-actin", Role.TARGET, image_id)
-    ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+    lzw = write_lzw_tiff(
+        sources / f"{layout} lzw α.tif",
+        pixels,
+        photometric=photometric,
+        extrasamples=[2],
+        planar=planar,
+    )
+    measured = []
+    for path in (plain, lzw):
+        with path.open("rb") as source:
+            image_id = ops.import_image(s, source, path.name, kind=CHEMI, polarity=DARK)
+        image = s.project.batch.find_image(image_id)
+        protein = ops.add_protein(s, f"β-actin {path.stem}", Role.TARGET, image_id)
+        ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
+        ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
+        bands = s.project.batch.find_protein(protein).bands
+        measured.append(
+            (
+                (image.width, image.height, image.bit_depth, image.background),
+                image.import_warnings,
+                [
+                    (b.box, b.net, b.background_level, b.background_mode, b.background_spread)
+                    for b in bands
+                ],
+                [(b.clipped, b.possibly_clipped) for b in bands],
+                s.pixels(image_id),
+                s.colour_pixels(image_id),
+            )
+        )
+    (size, notes, nets, flags, array, colours), lzw_measured = measured
+    assert lzw_measured[:4] == (size, notes, nets, flags)
+    np.testing.assert_array_equal(lzw_measured[4], array)
+    np.testing.assert_array_equal(lzw_measured[5], colours)
+    np.testing.assert_array_equal(colours, pixels)
+    assert [w.code for w in notes] == warnings
+    assert size[2] == 8
+    # The narrow band holds the pixels at the limit: by the exact check where
+    # the channels are the same gray, else by the possible one.
+    assert flags == (
+        [(True, None), (False, None)] if check == "exact" else [(None, True), (None, False)]
+    )
     assert_nets_current(s)
 
 
