@@ -1,0 +1,611 @@
+{
+ "calibration": [
+  {
+   "groups": [
+    {
+     "fit": {
+      "disagreement": null,
+      "disagreement_infinite": false,
+      "disagreement_mw": null,
+      "ignored": [],
+      "image_ids": ["img-1", "img-3"],
+      "ladders": [
+       {
+        "points": 3,
+        "predicted_mw": 68.89875533311566,
+        "quality": 0.015983520479579072,
+        "quality_infinite": false,
+        "range": [27.80148821534985, 163.66030353324183],
+        "side": "left",
+        "two_point": false,
+        "worst_mw": 70.0,
+        "x": 12.0
+       }
+      ],
+      "method": "log_linear_piecewise",
+      "offset_px": null,
+      "range": [27.80148821534985, 163.66030353324183],
+      "tilt_deg": null
+     },
+     "image_ids": ["img-1", "img-3"]
+    }
+   ],
+   "membrane_id": "mem-2"
+  },
+  {
+   "groups": [
+    {
+     "fit": null,
+     "image_ids": ["img-4"]
+    }
+   ],
+   "membrane_id": "mem-5"
+  }
+ ],
+ "fresh": {
+  "background_method": "ring_median_v1",
+  "images": [
+   {
+    "background": 49931.0,
+    "bit_depth": 16,
+    "file": "img-1.tif",
+    "id": "img-1",
+    "import_warnings": [],
+    "kind": "chemiluminescence",
+    "marker_image_id": "img-3",
+    "original_name": "S signal β.tif",
+    "polarity": "dark_on_light",
+    "sha256": "bebe6bb770999eab20c2b39578c0a7dbe96ed890682c6b93e25d3e4c89200cb5",
+    "size": [96, 48]
+   },
+   {
+    "background": 205.0,
+    "bit_depth": 8,
+    "file": "img-3.png",
+    "id": "img-3",
+    "import_warnings": [],
+    "kind": "visible_marker",
+    "marker_image_id": null,
+    "original_name": "N marker µ.png",
+    "polarity": "dark_on_light",
+    "sha256": "fbe7147c89a51b3fe079ca7b150b77a4df92ce78e64c52eaaff2c7d97073515b",
+    "size": [96, 48]
+   },
+   {
+    "background": 49920.0,
+    "bit_depth": 16,
+    "file": "img-4.tif",
+    "id": "img-4",
+    "import_warnings": [],
+    "kind": "chemiluminescence",
+    "marker_image_id": null,
+    "original_name": "R reprobe α.tif",
+    "polarity": "dark_on_light",
+    "sha256": "20173dc191c40674fb6276f969c7ca57c7795dba93672c9a29146169cce05190",
+    "size": [96, 48]
+   }
+  ],
+  "lanes": [
+   {
+    "included": true,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V1"
+   },
+   {
+    "included": true,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V2"
+   },
+   {
+    "included": true,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A1"
+   },
+   {
+    "included": true,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A2"
+   }
+  ],
+  "log": [
+   [1, "2026-10-31T09:00:00.000Z", "new_project"],
+   [2, "2026-10-31T09:00:01.000Z", "import_image"],
+   [3, "2026-10-31T09:00:02.000Z", "import_image"],
+   [4, "2026-10-31T09:00:03.000Z", "import_image"],
+   [5, "2026-10-31T09:00:04.000Z", "set_marker_image"],
+   [6, "2026-10-31T09:00:05.000Z", "set_ladder"],
+   [7, "2026-10-31T09:00:06.000Z", "add_calibration_point"],
+   [8, "2026-10-31T09:00:07.000Z", "add_calibration_point"],
+   [9, "2026-10-31T09:00:08.000Z", "add_calibration_point"],
+   [10, "2026-10-31T09:00:09.000Z", "set_lanes"],
+   [11, "2026-10-31T09:00:10.000Z", "add_protein"],
+   [12, "2026-10-31T09:00:11.000Z", "detect_row_boxes"],
+   [13, "2026-10-31T09:00:12.000Z", "add_protein"],
+   [14, "2026-10-31T09:00:13.000Z", "place_box"],
+   [15, "2026-10-31T09:00:14.000Z", "place_box"],
+   [16, "2026-10-31T09:00:15.000Z", "place_box"],
+   [17, "2026-10-31T09:00:16.000Z", "place_box"],
+   [18, "2026-10-31T09:00:17.000Z", "remove_image"],
+   [19, "2026-10-31T09:00:18.000Z", "undo"],
+   [20, "2026-10-31T09:00:19.000Z", "redo"],
+   [21, "2026-10-31T09:00:20.000Z", "undo"]
+  ],
+  "membranes": [
+   {
+    "fit_method": "log_linear_piecewise",
+    "fit_quality": 0.015983520479579072,
+    "id": "mem-2",
+    "image_ids": ["img-1", "img-3"],
+    "ladder": "pageruler_plus/tris_glycine",
+    "ladder_kda": [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0, 10.0],
+    "points": [
+     {
+      "image_id": "img-3",
+      "mw": 130.0,
+      "side": "left",
+      "source": "visible_marker",
+      "x": 12.0,
+      "y": 8.0
+     },
+     {
+      "image_id": "img-3",
+      "mw": 70.0,
+      "side": "left",
+      "source": "visible_marker",
+      "x": 12.0,
+      "y": 26.87
+     },
+     {
+      "image_id": "img-3",
+      "mw": 35.0,
+      "side": "left",
+      "source": "visible_marker",
+      "x": 12.0,
+      "y": 47.0
+     }
+    ]
+   },
+   {
+    "fit_method": "log_linear",
+    "fit_quality": null,
+    "id": "mem-5",
+    "image_ids": ["img-4"],
+    "ladder": null,
+    "ladder_kda": [],
+    "points": []
+   }
+  ],
+  "proteins": [
+   {
+    "bands": [
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49953.75,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": [25, 13],
+      "clipped": false,
+      "id": "band-7",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1333176.75,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49928.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": [40, 13],
+      "clipped": false,
+      "id": "band-8",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1167998.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49928.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": [57, 13],
+      "clipped": false,
+      "id": "band-9",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1696784.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49947.1,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": [72, 13],
+      "clipped": false,
+      "id": "band-10",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1515603.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     }
+    ],
+    "box_padding": [0, 0],
+    "box_size": [15, 11],
+    "expected_band_count": 1,
+    "expected_mw": 92.0,
+    "id": "prot-6",
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "role": "target",
+    "undetected": []
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": null,
+      "background_level": 49889.0,
+      "background_mode": "symmetric",
+      "background_spread": 46.96761841868056,
+      "band_index": 0,
+      "bands_found": null,
+      "box": [26, 23],
+      "clipped": false,
+      "id": "band-12",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1680941.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 49863.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": [42, 23],
+      "clipped": false,
+      "id": "band-13",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1607355.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 49868.5,
+      "background_mode": "symmetric",
+      "background_spread": 15.68405129796767,
+      "band_index": 0,
+      "bands_found": null,
+      "box": [58, 23],
+      "clipped": false,
+      "id": "band-14",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1767351.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 49892.5,
+      "background_mode": "symmetric",
+      "background_spread": 44.818698358143166,
+      "band_index": 0,
+      "bands_found": null,
+      "box": [74, 23],
+      "clipped": false,
+      "id": "band-15",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1642149.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     }
+    ],
+    "box_padding": [0, 0],
+    "box_size": [12, 10],
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-11",
+    "image_id": "img-4",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "role": "loading control",
+    "undetected": []
+   }
+  ],
+  "reference_condition": "vehicle"
+ },
+ "history_issues": [],
+ "lane_tables": [
+  {
+   "csv": "lane,condition,sample,include,β-catenin,β-catenin clipped,α-tubulin,α-tubulin clipped,β-catenin ÷ α-tubulin normalized,β-catenin ÷ α-tubulin fold change vs vehicle\r\n1,vehicle,V1,yes,1333176.75,no,1680941.0,no,0.793113,1.043727\r\n2,vehicle,V2,yes,1167998.5,no,1607355.0,no,0.726659,0.956273\r\n3,10 µM,A1,yes,1696784.5,no,1767351.0,no,0.960072,1.263442\r\n4,10 µM,A2,yes,1515603.5,no,1642149.0,no,0.922939,1.214576\r\n",
+   "label": null,
+   "near_midpoint": []
+  }
+ ],
+ "plotted": [
+  {
+   "charts": [
+    {
+     "bars": [
+      {
+       "error": 0.03455393234701433,
+       "geometric_mean": 1.2387680624809594,
+       "geometric_sd_factor": 1.028284601697068,
+       "label": "10 µM",
+       "lane_indices": [2, 3],
+       "mean": 1.2390089990565651,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.2634423189358002, 1.2145756791773301]
+      }
+     ],
+     "comparisons": [],
+     "coverage": [
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": false
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {},
+     "statement": ["Bars: mean ± SD; points: replicates", "No test: a test needs two conditions or more"],
+     "subtitle": null,
+     "test": null,
+     "test_name": null,
+     "test_note": "no test: a test needs two conditions or more",
+     "test_p": null,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    }
+   ],
+   "label": null,
+   "notices": [
+    {
+     "code": "reference_not_plotted",
+     "conditions": ["vehicle"],
+     "image_ids": [],
+     "lane_indices": [],
+     "level": "info",
+     "message": "the reference condition 'vehicle' is not plotted; fold-changes are still relative to it",
+     "protein_ids": []
+    }
+   ],
+   "plot_conditions": ["10 µM"]
+  }
+ ],
+ "results": {
+  "all_lanes": null,
+  "error_type": "SD",
+  "excluded_lanes": [],
+  "label": null,
+  "lanes": [
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 0,
+    "sample": "V1"
+   },
+   {
+    "condition": "vehicle",
+    "included": true,
+    "index": 1,
+    "sample": "V2"
+   },
+   {
+    "condition": "10 µM",
+    "included": true,
+    "index": 2,
+    "sample": "A1"
+   },
+   {
+    "condition": "10 µM",
+    "included": true,
+    "index": 3,
+    "sample": "A2"
+   }
+  ],
+  "method": "mean",
+  "notices": [],
+  "plot_conditions": null,
+  "proteins": [
+   {
+    "apparent_mw": [92.11861326748509, 92.11861326748509, 92.11861326748509, 92.11861326748509],
+    "band_ids": ["band-7", "band-8", "band-9", "band-10"],
+    "bands_found": [1, 1, 1, 1],
+    "calibration": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "tilt_deg": null,
+     "two_ladders": false
+    },
+    "clipped": [false, false, false, false],
+    "count_check": ["passed", "passed", "passed", "passed"],
+    "detected": [true, true, true, true],
+    "expected_mws": [92.0],
+    "image_id": "img-1",
+    "mw_check": ["passed", "passed", "passed", "passed"],
+    "mw_not_run": null,
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "nets": [1333176.75, 1167998.5, 1696784.5, 1515603.5],
+    "possibly_clipped": [null, null, null, null],
+    "protein_id": "prot-6",
+    "role": "target"
+   },
+   {
+    "apparent_mw": [null, null, null, null],
+    "band_ids": ["band-12", "band-13", "band-14", "band-15"],
+    "bands_found": [null, null, null, null],
+    "calibration": null,
+    "clipped": [false, false, false, false],
+    "count_check": ["not_run", "not_run", "not_run", "not_run"],
+    "detected": [true, true, true, true],
+    "expected_mws": [],
+    "image_id": "img-4",
+    "mw_check": ["not_run", "not_run", "not_run", "not_run"],
+    "mw_not_run": "no_expected_mw",
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "nets": [1680941.0, 1607355.0, 1767351.0, 1642149.0],
+    "possibly_clipped": [null, null, null, null],
+    "protein_id": "prot-11",
+    "role": "loading control"
+   }
+  ],
+  "reference_condition": "vehicle",
+  "series": [
+   {
+    "averaged": [],
+    "baseline": 0.7598860273320347,
+    "chart": {
+     "bars": [
+      {
+       "error": 0.06183892141047153,
+       "geometric_mean": 0.9990435295318192,
+       "geometric_sd_factor": 1.0638329526779415,
+       "label": "vehicle",
+       "lane_indices": [0, 1],
+       "mean": 1.0,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.0437267206706065, 0.9562732793293937]
+      },
+      {
+       "error": 0.03455393234701433,
+       "geometric_mean": 1.2387680624809594,
+       "geometric_sd_factor": 1.028284601697068,
+       "label": "10 µM",
+       "lane_indices": [2, 3],
+       "mean": 1.2390089990565651,
+       "n": 2,
+       "not_detected_lanes": [],
+       "points": [1.2634423189358002, 1.2145756791773301]
+      }
+     ],
+     "comparisons": [
+      {
+       "group_a": "vehicle",
+       "group_b": "10 µM",
+       "p_value": 0.046361221814640315
+      }
+     ],
+     "coverage": [
+      {
+       "label": "vehicle",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      },
+      {
+       "label": "10 µM",
+       "left_out": null,
+       "n": 2,
+       "not_detected": 0,
+       "replicates": 2,
+       "tested": true
+      }
+     ],
+     "error_type": "SD",
+     "rank_min_p": {
+      "all_pairs": 0.3333333333333333,
+      "vs_reference": 0.3333333333333333
+     },
+     "statement": ["Bars: mean ± SD; points: replicates", "Student's t-test on log values: p = 0.0464", "Tested: both conditions"],
+     "subtitle": null,
+     "test": {
+      "adjustment": "none",
+      "chosen": {
+       "comparisons": "auto",
+       "family": "auto",
+       "scale": "auto"
+      },
+      "comparisons": "all_pairs",
+      "covered": ["vehicle", "10 µM"],
+      "design": "independent",
+      "family": "pooled",
+      "id": "student_t",
+      "method": null,
+      "min_attainable_p": null,
+      "name": "Student's t-test",
+      "notes": [],
+      "omnibus": null,
+      "p_value": 0.046361221814640315,
+      "pairwise": [
+       {
+        "estimate": 1.239954041903942,
+        "group_a": "vehicle",
+        "group_b": "10 µM",
+        "p_value": 0.046361221814640315
+       }
+      ],
+      "reasons": ["ratios: log scale", "equal n: pooled variance", "2 conditions: all pairs"],
+      "reference": null,
+      "scale": "log",
+      "statistic": -4.481251624598258
+     },
+     "test_name": "student_t",
+     "test_note": null,
+     "test_p": 0.046361221814640315,
+     "title": "β-catenin fold-change vs vehicle  (/α-tubulin)",
+     "value_kind": "fold_change",
+     "x_label": "Condition",
+     "y_label": "Fold change vs control"
+    },
+    "fold_change": [1.0437267206706065, 0.9562732793293937, 1.2634423189358002, 1.2145756791773301],
+    "groups": {
+     "10 µM": [1.2634423189358002, 1.2145756791773301],
+     "vehicle": [1.0437267206706065, 0.9562732793293937]
+    },
+    "loading": "α-tubulin",
+    "loading_id": "prot-11",
+    "normalized": [0.7931133513906794, 0.7266587032733901, 0.9600721644992987, 0.9229390877441693],
+    "target": "β-catenin",
+    "target_id": "prot-6",
+    "undetected": {},
+    "value_kind": "fold_change"
+   }
+  ],
+  "statistics": {
+   "comparisons": "auto",
+   "family": "auto",
+   "scale": "auto"
+  },
+  "tier": "fold_change"
+ }
+}
