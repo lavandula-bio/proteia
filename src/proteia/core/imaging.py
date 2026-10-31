@@ -20,7 +20,9 @@ file holds, whatever its suffix; reading picks its reader by the suffix, as it
 did for the images imported before, and says which inks a TIFF of several
 images holds when it refuses it (:class:`NotSingleImageError`). Since #215 an
 import refuses a TIFF of several images named with another suffix too, which
-Pillow would read as its first image (:func:`check_misnamed_tiff`).
+Pillow would read as its first image (:func:`check_misnamed_tiff`), in the
+same words; since #220 the import's refusal names the file as the user chose
+it (:meth:`NotSingleImageError.refusal`).
 A TIFF in any other colour space that is not gray, RGB or a palette (CIELAB,
 YCbCr, ...) is refused with the colour space's name rather than read wrong.
 
@@ -236,25 +238,55 @@ def _require_single_image(series: Sequence[tifffile.TiffPageSeries], name: str) 
     ``name`` and saying the inks among its images."""
     if _single_image(series):
         return
-    axes = series[0].axes if series else ""
-    raise NotSingleImageError(
-        f"{name}: holds {len(series)} image series with axes {axes!r};"
-        " only a single 2-D gray or color image can be quantified"
-        " (stacks and multi-channel composites are not supported)",
-        _inks_of(series),
-    )
+    raise NotSingleImageError(name, _inks_of(series), no_image=not series)
+
+
+# How a refusal says that a file holds more than one image, and why that is
+# refused: the words of NotSingleImageError, and of the import's refusal of
+# printing inks among several images. True of every layout refused so: a
+# stack, a composite's channels, images of several sizes, and an image after
+# a mask or a thumbnail series of its own (_single_image).
+SEVERAL_IMAGES: Final = (
+    "more than one image (such as a stack, the channels of a composite, or an image with a"
+    " mask or a thumbnail)"
+)
+SINGLE_IMAGE_ONLY: Final = "only a single image can be quantified"
 
 
 class NotSingleImageError(ValueError):
     """A TIFF that is not the single image reading takes (:func:`_single_image`):
-    a stack, a multi-channel composite, images of several sizes, or none.
-    ``inks`` are the printing inks among its images (:func:`_inks_of`), None
-    if there are none, so that an import, which refuses inks (#207), can name
-    both problems."""
+    a stack, a multi-channel composite, images of several sizes, or none
+    (``no_image``). ``inks`` are the printing inks among its images
+    (:func:`_inks_of`), None if there are none, so that an import, which
+    refuses inks (#207), can name both problems. The message names the file
+    read (``name``); :meth:`refusal` gives it for another name, so that an
+    import names the file as the user chose it, not its stored copy (#220)."""
 
-    def __init__(self, message: str, inks: Inks | None) -> None:
-        super().__init__(message)
+    def __init__(self, name: str, inks: Inks | None, no_image: bool) -> None:
+        self.name = name
         self.inks = inks
+        self.no_image = no_image
+        super().__init__(self.refusal(name))
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # Rebuilt from what it was made of, not from its message (pickle and
+        # copy would otherwise call it with the message alone).
+        return type(self), (self.name, self.inks, self.no_image), self.__dict__
+
+    def refusal(self, name: str) -> str:
+        """The refusal of the file named ``name``: what it holds, in plain
+        words, and a next step that imports an image: save one of its images
+        as its own file; of a file of no image, export the image again."""
+        if self.no_image:
+            return (
+                f"{name!r} holds no image, so there is nothing to quantify: export the image"
+                " again from the program that made it, as a TIFF or PNG file, and import that"
+                " file"
+            )
+        return (
+            f"{name!r} holds {SEVERAL_IMAGES}, which Proteia does not import:"
+            f" {SINGLE_IMAGE_ONLY}; save one of its images as its own file and import it again"
+        )
 
 
 def _image_series(tif: tifffile.TiffFile, name: str) -> Sequence[tifffile.TiffPageSeries]:
