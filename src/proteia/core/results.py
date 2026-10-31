@@ -1120,15 +1120,15 @@ def _rows_tilted(
     xs: list[float] = []
     ys: list[float] = []
     for protein in proteins:
-        boxes = _tilt_boxes(protein, joined[protein.id], included)
-        if len(boxes) < TILT_MIN_LANES:
+        bands = _tilt_boxes(protein, joined[protein.id], included)
+        if len(bands) < TILT_MIN_LANES:
             continue
         size = batch.boxes_of(protein).box_size
-        reference = _tilt_reference(fitted, protein, boxes)
+        reference = _tilt_reference(fitted, protein, bands)
         if reference is None:
             continue
         points: list[tuple[float, float, float]] = []
-        for band in boxes:
+        for band in bands:
             cx, cy = band.box.x + size.width / 2, band.box.y + size.height / 2
             line = fitted.y_at(reference, cx)
             if line is not None:
@@ -1585,14 +1585,18 @@ def _compute(
         LaneRow(index=lane.index, condition=lane.label, sample=lane.sample, included=lane.included)
         for lane in batch.lanes
     ]
-    joined = {protein.id: _join(batch, protein, n) for protein in batch.proteins}
+    joined = {
+        protein.id: _join(batch, protein, len(batch.lanes_of_protein(protein)))
+        for protein in batch.proteins
+    }
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
-    # Each protein's image, read once, and its calibration (#58), from the stored points.
+    # Each protein's image, read once, and each image's calibration (#58), fitted
+    # once from the stored points.
     image_ids = {p.id: batch.image_id_of(p) for p in batch.proteins}
     fits = {
-        image_ids[p.id]: mwcal.calibration_for(batch.membrane_of(image_ids[p.id]), image_ids[p.id])
-        for p in batch.proteins
+        image_id: mwcal.calibration_for(batch.membrane_of(image_id), image_id)
+        for image_id in dict.fromkeys(image_ids.values())
     }
     columns = [
         ProteinColumn(
@@ -1702,11 +1706,12 @@ def _compute(
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
+    images = {image.id: image for image in batch.iter_images()}
     for protein in batch.proteins:  # bands likely over-exposed, where that cannot be checked
-        image = batch.image_of(protein)
+        image = images[image_ids[protein.id]]
         _possibly_clipped(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # bands not checked for that, in lanes this set includes
-        image = batch.image_of(protein)
+        image = images[image_ids[protein.id]]
         _clipping_not_checked(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # backgrounds to check, in lanes this set includes
         _background_notices(batch, protein, joined[protein.id], included, note)

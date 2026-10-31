@@ -831,11 +831,10 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     """
     batch = draft.batch
     image = batch.find_image(image_id)
-    placed = [
-        (batch.boxes_of(protein).box_size, band)
-        for protein in batch.proteins_on(image_id)
-        for band in batch.boxes_of(protein).bands
-    ]
+    placed: list[tuple[BoxSize, Band]] = []
+    for protein in batch.proteins_on(image_id):
+        boxes = batch.boxes_of(protein)
+        placed.extend((boxes.box_size, band) for band in boxes.bands)
     if not placed:
         return
     dark_on_light = image.polarity.dark_on_light
@@ -4007,13 +4006,11 @@ def _misnumbered_lanes(
     pitch = lane_pitch(anchors.values())
     if pitch is None:  # no protein has two kept lanes
         return None
-    grown = {
-        b.id
-        for p in proteins
-        if batch.boxes_of(p).fitted_size.width > pitch
-        for b in batch.boxes_of(p).bands
-        if b.source is ProposalSource.CLICK
-    }
+    grown: set[str] = set()
+    for p in proteins:
+        boxes = batch.boxes_of(p)
+        if boxes.fitted_size.width > pitch:
+            grown.update(b.id for b in boxes.bands if b.source is ProposalSource.CLICK)
     if grown:
         anchors = anchors_of({*without, *grown})
     ways = {p.id: lanes_run_right_to_left(anchors[p.id]) for p in proteins}
