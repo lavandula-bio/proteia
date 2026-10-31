@@ -651,6 +651,21 @@ def test_on_a_jpeg_the_chosen_channel_is_assessed_near_its_limit(tmp_path):
     assert_nets_current(s)
 
 
+def test_every_array_the_session_reads_is_read_only(tmp_path):
+    s = session_on(tmp_path, save_to_folder)
+    image = import_pixels(s, colour_blot(), "GFP µ.tif")
+    reopened = ops.open_project(s.folder, autosave=None)  # nothing cached
+    for array in (
+        reopened.pixels(image, keep=False),
+        reopened.channel_array(image, GREEN),
+        reopened.pixels(image),
+    ):
+        assert not array.flags.writeable
+        with pytest.raises(ValueError):
+            array[0, 0] = 0.0
+    assert image in reopened._pixels
+
+
 def test_an_image_with_no_band_takes_the_channel_with_its_median_and_warnings(tmp_path):
     s = session_on(tmp_path, Recorder())
     rgb = colour_blot(crosstalk=0.3)
