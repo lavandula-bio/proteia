@@ -488,10 +488,11 @@ class Restored:
 
     ``seq`` and ``action`` name the original change's log entry. The ids that
     went and came back are in the order :meth:`~proteia.core.model.Project.iter_ids`
-    gives: by kind (membranes, images, lane tables, membrane areas, proteins,
-    rows, bands), each kind as stored (images membrane by membrane, areas
-    membrane by membrane, rows and bands protein by protein, bands by lane),
-    so not sorted by id. Not-detected records, which have no ids, are listed by
+    gives: by kind, the kinds schema 2 held first (membranes, images,
+    proteins, bands), then those schema 3 added (lane tables, membrane areas,
+    rows), each kind as stored (images membrane by membrane, areas membrane by
+    membrane, bands and rows protein by protein, bands by lane), so not sorted
+    by id. Not-detected records, which have no ids, are listed by
     (protein id, lane index, band index), as stored. An object or record in
     both states whose fields changed (a moved box, a replaced record) is in no
     list.

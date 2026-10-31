@@ -49,11 +49,11 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   writes ``"undetected": []``, and a hand-edited file that holds it loads, hashes
   as if the key were absent and is saved without it. The second is
   ``Row.box_padding``, left out while it is ``{"across": 0, "along": 0}``,
-  likewise. A membrane area's ``Arena.outline`` is left out while ``null`` (the
-  whole image), as every area an import or a migration makes has none. The
-  third is ``Band.possibly_clipped``
+  likewise. The third is ``Arena.outline`` (#223), left out while ``null`` (the
+  whole image): every area an import or a migration makes has none. The fourth
+  is ``Band.possibly_clipped``
   (#112), left out while it is ``null``: only bands on a lossy, colour or CMYK
-  image of known bit depth have it. The fourth is in the molecular-weight
+  image of known bit depth have it. The fifth is in the molecular-weight
   calibration (#58): ``CalibrationPoint.x`` is left out while ``null``,
   ``CalibrationPoint.side`` while ``"left"`` and ``MwCalibration.ladder_kda``
   while empty, and in the band count (#58): ``Band.bands_found`` while
