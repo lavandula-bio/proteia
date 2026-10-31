@@ -2906,6 +2906,25 @@ _MPO_SIZES = {
 }
 
 
+def test_an_animated_webp_is_refused_as_several_frames_and_a_still_one_is_read(tmp_path):
+    # #234 review: Pillow reads a WebP (named .png, which an import takes)
+    # by its content; an animated one, which was imported as its first
+    # frame with the others dropped, is refused like an animated PNG.
+    frames = [Image.fromarray(frame).convert("RGB") for frame in _narrow_frames(2, 8)]
+    animated, still = tmp_path / "animated µ.png", tmp_path / "still α.png"
+    frames[0].save(animated, format="WEBP", save_all=True, append_images=frames[1:], lossless=True)
+    frames[0].save(still, format="WEBP", lossless=True)
+    with Image.open(animated) as image:
+        assert (image.format, image.n_frames) == ("WEBP", 2)
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        imaging.read_file(animated)
+    assert str(info.value) == (
+        "animated µ.png: it holds more than one frame (such as an animated image), and only a"
+        " single image can be quantified; save one frame as its own file and import it again"
+    )
+    np.testing.assert_array_equal(imaging.read_file(still).pixels, np.asarray(frames[0]))
+
+
 @pytest.mark.parametrize("suffix", [".jpg", ".jpeg"])
 @pytest.mark.parametrize("case", list(_MPO_SIZES))
 def test_a_jpeg_of_several_pictures_reads_as_its_first_as_before(tmp_path, case, suffix):
