@@ -213,6 +213,8 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool, str | None]:
                 keyframe.dtype,
                 keyframe.photometric,
                 keyframe.samplesperpixel,
+                tuple(keyframe.extrasamples),
+                axes == "SYX",
             )
             pixels = None
         else:
@@ -329,9 +331,11 @@ def _inks_of(series: Sequence[tifffile.TiffPageSeries]) -> Inks | None:
 
 def _uncompressed_copy(page: tifffile.TiffPage) -> bool:
     """Whether the RGB or grayscale copy of a TIFF image that a user saves is
-    one reading decodes only uncompressed (:func:`_read_tiff_with_pillow`):
+    one reading may decode only uncompressed (:func:`_read_tiff_with_pillow`):
     one of more than 8 bits (or not integer), or one that keeps a channel
-    besides its colours (alpha, an ink beyond four)."""
+    besides its colours (alpha, an ink beyond four). Compressed, such a
+    channel is read only as unassociated alpha (#232), which an image editor
+    may not write it as, so the copy that is always read is uncompressed."""
     return (
         page.dtype != np.uint8
         or bool(page.extrasamples)
@@ -490,17 +494,27 @@ class _Declared:
     dtype: np.dtype
     photometric: tifffile.PHOTOMETRIC
     samples: int
+    extrasamples: tuple[int, ...]  # what each sample after the colours holds (alpha, ...)
+    planar: bool  # each sample stored apart (PlanarConfiguration 2)
 
 
 def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
     """Decode a TIFF whose compression tifffile cannot decode on its own.
 
     Only the layouts Pillow reads with the same values as tifffile are accepted:
-    8- or 16-bit black-is-zero gray, 8-bit RGB without alpha, and 8-bit CMYK
-    without extra samples (its inks, converted afterwards as tifffile's are).
-    Pillow inverts white-is-zero gray and un-premultiplies associated alpha, and
-    it narrows 16-bit color, so those, and any result whose shape or pixel type
-    differs from the declaration, are refused rather than read with changed values.
+    8- or 16-bit black-is-zero gray, 8-bit RGB, and 8-bit CMYK without extra
+    samples (its inks, converted afterwards as tifffile's are); and, since
+    #232, 8-bit black-is-zero gray or 8-bit RGB followed by one sample of
+    unassociated alpha, which Pillow reads as stored, as tifffile does: gray
+    with its samples together, RGB with its samples together or, with LZW
+    (the compression measured so), each apart. The alpha is kept, channels
+    last, and ignored as it is in an uncompressed file. Pillow inverts
+    white-is-zero gray, un-premultiplies associated alpha, drops or cannot read
+    an unspecified extra sample, loses the alpha of planar gray, narrows 16-bit
+    color and cannot read 16-bit gray with alpha, so those, and any result
+    whose shape or pixel type differs from the declaration, are refused rather
+    than read with changed values; any other layout with an extra sample is
+    refused from its header, before it is decoded.
     """
     from PIL import Image
 
@@ -512,8 +526,21 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
         " installation",
         uncompressed,
     )
-    gray = declared.photometric is tifffile.PHOTOMETRIC.MINISBLACK and declared.samples == 1
-    color = declared.photometric is tifffile.PHOTOMETRIC.RGB and declared.samples == 3
+    # One unassociated alpha sample after 8-bit colours.
+    alpha = (
+        declared.extrasamples == (tifffile.EXTRASAMPLE.UNASSALPHA,) and declared.dtype == np.uint8
+    )
+    gray = declared.photometric is tifffile.PHOTOMETRIC.MINISBLACK and (
+        declared.samples == 1 or (declared.samples == 2 and alpha and not declared.planar)
+    )
+    color = declared.photometric is tifffile.PHOTOMETRIC.RGB and (
+        declared.samples == 3
+        or (
+            declared.samples == 4
+            and alpha
+            and (not declared.planar or declared.codec == tifffile.COMPRESSION.LZW.name)
+        )
+    )
     cmyk = declared.photometric is tifffile.PHOTOMETRIC.SEPARATED and declared.samples == 4
     if not (gray or color or cmyk):
         raise refusal
@@ -685,8 +712,8 @@ class Inks(NamedTuple):
     # several (a stack, a multi-channel composite), which reading refuses too.
     single_image: bool
     # Whether the copy a user saves of it (or of one of its images) as RGB or
-    # grayscale must be an uncompressed TIFF to be read: one of more than 8
-    # bits, or with alpha (:func:`_uncompressed_copy`).
+    # grayscale must be an uncompressed TIFF to be read for certain: one of
+    # more than 8 bits, or with alpha (:func:`_uncompressed_copy`).
     uncompressed_copy: bool
 
 
