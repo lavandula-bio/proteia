@@ -989,8 +989,9 @@ class Batch(_Model):
         return self.lane_table_of(self.membrane_of_protein(protein)).lanes
 
     def image_id_of(self, protein: Protein) -> str:
-        """The id of the image a protein is quantified on (its row's area's),
-        with no lookup of the images."""
+        """The id of the image a protein is quantified on: its row's area's,
+        found by a scan of the membrane areas (:meth:`image_of` also looks
+        the image up)."""
         return self.find_arena(self.only_row(protein).arena_id)[1].image_id
 
     def image_of(self, protein: Protein) -> ImageRef:
@@ -1399,8 +1400,9 @@ class Project(_Model):
         # One method for the whole batch; under the legacy one, the legacy values.
         legacy = self.background_method == LEGACY_BACKGROUND_METHOD
         batch = self.batch
+        images = {image.id: image for image in batch.images}
         medians = {
-            arena.id: batch.find_image(arena.image_id).background
+            arena.id: images[arena.image_id].background
             for membrane in batch.membranes
             for arena in membrane.arenas
         }

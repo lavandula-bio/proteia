@@ -1597,10 +1597,9 @@ def _compute(
         LaneRow(index=lane.index, condition=lane.label, sample=lane.sample, included=lane.included)
         for lane in table
     ]
-    joined = {
-        protein.id: _join(batch, protein, len(batch.lanes_of_protein(protein)))
-        for protein in batch.proteins
-    }
+    # Every protein's lanes are the project's one table's; per-table results come with the
+    # lane-table issue.
+    joined = {protein.id: _join(batch, protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
     # Each protein's image, read once, and each image's calibration (#58), fitted
