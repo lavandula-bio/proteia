@@ -743,9 +743,12 @@ _SEVERAL_FRAMES: Final = (
 
 
 # The formats, as Pillow names them, whose files can hold several frames
-# that scikit-image reads stacked: an animated PNG, a GIF, a WebP, an MPO. A
-# TIFF named otherwise is counted for its images before (check_misnamed_tiff).
-_FRAME_FORMATS: Final = frozenset({"PNG", "GIF", "WEBP", "MPO"})
+# that scikit-image reads stacked: an animated PNG, a GIF, a WebP. Not a
+# JPEG of several pictures (MPO), whose extra pictures are no frames of it
+# (a phone's preview or depth map, a stereo pair): it reads as its first
+# picture, as before #234. A TIFF named otherwise is counted for its images
+# before (check_misnamed_tiff).
+_FRAME_FORMATS: Final = frozenset({"PNG", "GIF", "WEBP"})
 
 
 def _frames_in(image: object) -> int:

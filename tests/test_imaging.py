@@ -2859,8 +2859,9 @@ def test_reading_refuses_a_file_apart_from_its_name(tmp_path, name, write, words
 def test_frames_are_counted_only_in_formats_that_hold_several(tmp_path, monkeypatch):
     # #234: counting them makes Pillow read every frame, which fails on some
     # damaged files that reading takes as their first image (a random sweep
-    # found a damaged TIFF named .jpg): a TIFF or JPEG is never counted, a
-    # PNG is.
+    # found a damaged TIFF named .jpg): a TIFF or JPEG is never counted, nor
+    # a JPEG of several pictures (MPO), whose extra pictures are no frames
+    # (#234 review); a PNG is.
     counted = []
     real = imaging._frames_in
 
@@ -2872,6 +2873,7 @@ def test_frames_are_counted_only_in_formats_that_hold_several(tmp_path, monkeypa
     files = {
         "gray tiff named µ.png": lambda path: tifffile.imwrite(path, _gray(np.uint8, 255)),
         "gray α.jpg": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
+        "phone photo µ.jpg": _mpo([(6, 8), (3, 4)]),
         "gray β.png": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
     }
     for name, write in files.items():
@@ -2879,6 +2881,47 @@ def test_frames_are_counted_only_in_formats_that_hold_several(tmp_path, monkeypa
         write(path)
         assert imaging.read_file(path).pixels.shape[:2] == (6, 8)
     assert counted == ["PNG"]
+
+
+def _mpo(sizes: list[tuple[int, int]]):
+    """A writer of a JPEG of several pictures (MPO, as Pillow names it) of
+    unlike RGB pixels, of ``sizes`` (height, width): a phone's photo with a
+    smaller preview or depth map, or a stereo pair of the same size."""
+
+    def write(path):
+        rng = np.random.default_rng(len(sizes))
+        pictures = [
+            Image.fromarray(rng.integers(0, 256, (height, width, 3), dtype=np.uint8))
+            for height, width in sizes
+        ]
+        pictures[0].save(path, format="MPO", save_all=True, append_images=pictures[1:])
+
+    return write
+
+
+_MPO_SIZES = {
+    "phone preview": [(120, 200), (60, 100)],
+    "same size": [(120, 200), (120, 200)],
+    "three pictures": [(120, 200), (60, 100), (30, 50)],
+}
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".jpeg"])
+@pytest.mark.parametrize("case", list(_MPO_SIZES))
+def test_a_jpeg_of_several_pictures_reads_as_its_first_as_before(tmp_path, case, suffix):
+    # #234 review: Pillow opens a JPEG of several pictures as MPO and counts
+    # them as frames, but they are no frames of the picture (a phone's photo
+    # of a blot keeps a preview or a depth map): the file reads as its first
+    # picture, as before #234, and is not refused.
+    path = tmp_path / f"phone photo µ{suffix}"
+    _mpo(_MPO_SIZES[case])(path)
+    with Image.open(path) as image:
+        assert (image.format, image.n_frames) == ("MPO", len(_MPO_SIZES[case]))
+        first = np.asarray(image.convert("RGB"))
+    read = imaging.read_file(path)
+    assert first.shape == (120, 200, 3)
+    np.testing.assert_array_equal(read.pixels, first)
+    assert (read.lossy, read.cmyk, read.palette) == (True, None, False)
 
 
 def test_a_count_pillow_cannot_make_is_one_frame():

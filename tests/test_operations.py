@@ -121,7 +121,7 @@ from test_background_truth import LANES as TRUTH_LANES
 from test_background_truth import _blot as truth_blot
 from test_background_truth import _fold_changes as truth_fold_changes
 from test_background_truth import _worst as truth_worst
-from test_imaging import _cmyk_profile, _declared_as, _packed_tiff
+from test_imaging import _MPO_SIZES, _cmyk_profile, _declared_as, _mpo, _packed_tiff
 from test_regression_baseline import (
     BOX_SIZE,
     CONDITIONS,
@@ -2411,6 +2411,26 @@ def test_one_frame_of_an_animated_file_saved_as_its_own_file_is_imported(tmp_pat
         frame = _encoded(animated.convert("L"), "PNG")
     image_id = ops.import_image(s, frame, "frame 2 α.png", kind=CHEMI, polarity=DARK)
     np.testing.assert_array_equal(s.pixels(image_id), gray[::-1].astype(np.float64))
+
+
+@pytest.mark.parametrize("case", list(_MPO_SIZES))
+def test_a_jpeg_of_several_pictures_is_imported_as_its_first_as_before(tmp_path, case):
+    # #234 review: a phone's photo of a blot, which keeps a preview or a depth
+    # map (MPO, as Pillow opens it), is imported as its first picture, as
+    # before #234: never refused as frames of an animation.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    source = tmp_path / "phone photo µ.jpg"
+    _mpo(_MPO_SIZES[case])(source)
+    with Image.open(source) as image:
+        first = np.asarray(image.convert("RGB")).astype(np.float64)
+    with source.open("rb") as f:
+        image_id = ops.import_image(s, f, "phone photo µ.jpg", kind=CHEMI, polarity=DARK)
+    image = s.project.batch.find_image(image_id)
+    assert (image.width, image.height, image.bit_depth) == (200, 120, 8)
+    assert [w.code for w in image.import_warnings] == ["lossy_format", "color_channels_differ"]
+    np.testing.assert_allclose(s.pixels(image_id), first.mean(axis=-1), rtol=0, atol=1e-9)
 
 
 @pytest.mark.parametrize("fmt", ["TIFF", "PNG", "JPEG"])
