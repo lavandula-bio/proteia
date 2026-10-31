@@ -1,0 +1,889 @@
+{
+ "background_method": "ring_median_v1",
+ "batch": {
+  "lanes": [
+   {
+    "included": true,
+    "index": 0,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V1"
+   },
+   {
+    "included": true,
+    "index": 1,
+    "label": "vehicle",
+    "metadata": {},
+    "sample": "V2"
+   },
+   {
+    "included": true,
+    "index": 2,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A1"
+   },
+   {
+    "included": true,
+    "index": 3,
+    "label": "10 µM",
+    "metadata": {},
+    "sample": "A2"
+   }
+  ],
+  "membranes": [
+   {
+    "calibration": {
+     "fit_method": "log_linear_piecewise",
+     "fit_quality": 0.015983520479579072,
+     "ladder": "pageruler_plus/tris_glycine",
+     "ladder_kda": [250.0, 130.0, 100.0, 70.0, 55.0, 35.0, 25.0, 15.0, 10.0],
+     "points": [
+      {
+       "image_id": "img-3",
+       "mw": 130.0,
+       "side": "left",
+       "source": "visible_marker",
+       "x": 12.0,
+       "y": 8.0
+      },
+      {
+       "image_id": "img-3",
+       "mw": 70.0,
+       "side": "left",
+       "source": "visible_marker",
+       "x": 12.0,
+       "y": 26.87
+      },
+      {
+       "image_id": "img-3",
+       "mw": 35.0,
+       "side": "left",
+       "source": "visible_marker",
+       "x": 12.0,
+       "y": 47.0
+      }
+     ]
+    },
+    "id": "mem-2",
+    "images": [
+     {
+      "background": 49931.0,
+      "bit_depth": 16,
+      "file": "img-1.tif",
+      "height": 48,
+      "id": "img-1",
+      "import_warnings": [],
+      "kind": "chemiluminescence",
+      "marker_image_id": "img-3",
+      "original_name": "S signal β.tif",
+      "polarity": "dark_on_light",
+      "sha256": "bebe6bb770999eab20c2b39578c0a7dbe96ed890682c6b93e25d3e4c89200cb5",
+      "width": 96
+     },
+     {
+      "background": 205.0,
+      "bit_depth": 8,
+      "file": "img-3.png",
+      "height": 48,
+      "id": "img-3",
+      "import_warnings": [],
+      "kind": "visible_marker",
+      "marker_image_id": null,
+      "original_name": "N marker µ.png",
+      "polarity": "dark_on_light",
+      "sha256": "fbe7147c89a51b3fe079ca7b150b77a4df92ce78e64c52eaaff2c7d97073515b",
+      "width": 96
+     }
+    ]
+   },
+   {
+    "calibration": {
+     "fit_method": "log_linear",
+     "fit_quality": null,
+     "ladder": null,
+     "ladder_kda": [],
+     "points": []
+    },
+    "id": "mem-5",
+    "images": [
+     {
+      "background": 49920.0,
+      "bit_depth": 16,
+      "file": "img-4.tif",
+      "height": 48,
+      "id": "img-4",
+      "import_warnings": [],
+      "kind": "chemiluminescence",
+      "marker_image_id": null,
+      "original_name": "R reprobe α.tif",
+      "polarity": "dark_on_light",
+      "sha256": "20173dc191c40674fb6276f969c7ca57c7795dba93672c9a29146169cce05190",
+      "width": 96
+     }
+    ]
+   }
+  ],
+  "proteins": [
+   {
+    "bands": [
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49953.75,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 25,
+       "y": 13
+      },
+      "clipped": false,
+      "id": "band-7",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1333176.75,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49928.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 40,
+       "y": 13
+      },
+      "clipped": false,
+      "id": "band-8",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1167998.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49928.5,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 57,
+       "y": 13
+      },
+      "clipped": false,
+      "id": "band-9",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1696784.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     },
+     {
+      "apparent_mw": 92.11861326748509,
+      "background_level": 49947.1,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": 1,
+      "box": {
+       "x": 72,
+       "y": 13
+      },
+      "clipped": false,
+      "id": "band-10",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1515603.5,
+      "possibly_clipped": null,
+      "source": "row_box"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 11,
+     "width": 15
+    },
+    "expected_band_count": 1,
+    "expected_mw": 92.0,
+    "id": "prot-6",
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "role": "target",
+    "undetected": []
+   },
+   {
+    "bands": [
+     {
+      "apparent_mw": null,
+      "background_level": 49889.0,
+      "background_mode": "symmetric",
+      "background_spread": 46.96761841868056,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 26,
+       "y": 23
+      },
+      "clipped": false,
+      "id": "band-12",
+      "lane_index": 0,
+      "manually_edited": false,
+      "net": 1680941.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 49863.0,
+      "background_mode": "symmetric",
+      "background_spread": 0.0,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 42,
+       "y": 23
+      },
+      "clipped": false,
+      "id": "band-13",
+      "lane_index": 1,
+      "manually_edited": false,
+      "net": 1607355.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 49868.5,
+      "background_mode": "symmetric",
+      "background_spread": 15.68405129796767,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 58,
+       "y": 23
+      },
+      "clipped": false,
+      "id": "band-14",
+      "lane_index": 2,
+      "manually_edited": false,
+      "net": 1767351.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     },
+     {
+      "apparent_mw": null,
+      "background_level": 49892.5,
+      "background_mode": "symmetric",
+      "background_spread": 44.818698358143166,
+      "band_index": 0,
+      "bands_found": null,
+      "box": {
+       "x": 74,
+       "y": 23
+      },
+      "clipped": false,
+      "id": "band-15",
+      "lane_index": 3,
+      "manually_edited": false,
+      "net": 1642149.0,
+      "possibly_clipped": null,
+      "source": "manual"
+     }
+    ],
+    "box_padding": {
+     "across": 0,
+     "along": 0
+    },
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_band_count": 1,
+    "expected_mw": null,
+    "id": "prot-11",
+    "image_id": "img-4",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "role": "loading control",
+    "undetected": []
+   }
+  ],
+  "reference_condition": "vehicle"
+ },
+ "built_at": "05b4af5b08e51b450436e9446651f5650bff48e4",
+ "case": "f3",
+ "content_hash": "1d29f62d522356e36901618393d6a827027fff793f41e4f7eec5dabeb48be269",
+ "log": [
+  {
+   "action": "new_project",
+   "content_hash": "f6ab14dda115562f0f767894caa17ffd8ab5558fa2ba16be7d9650b4727fdb36",
+   "params": {},
+   "seq": 1,
+   "time": "2026-10-31T09:00:00.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "import_image",
+   "content_hash": "704ef5d138feee36760248bb36cee1a7ade5497e9983c033806d73bfe19fe672",
+   "params": {
+    "image_id": "img-1",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-2",
+    "new_membrane": true,
+    "original_name": "S signal β.tif",
+    "polarity": "dark_on_light",
+    "sha256": "bebe6bb770999eab20c2b39578c0a7dbe96ed890682c6b93e25d3e4c89200cb5"
+   },
+   "seq": 2,
+   "time": "2026-10-31T09:00:01.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "import_image",
+   "content_hash": "0f849b64f32855cbf9c51cffb661a549f8da7ae8709c0e9e0a8bbcd97ffb7ba6",
+   "params": {
+    "image_id": "img-3",
+    "kind": "visible_marker",
+    "membrane_id": "mem-2",
+    "new_membrane": false,
+    "original_name": "N marker µ.png",
+    "polarity": "dark_on_light",
+    "sha256": "fbe7147c89a51b3fe079ca7b150b77a4df92ce78e64c52eaaff2c7d97073515b"
+   },
+   "seq": 3,
+   "time": "2026-10-31T09:00:02.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "import_image",
+   "content_hash": "2d5baf2f506ce51894e16ccfd601d19fb19b907fa1c6c96a4504975cf3610583",
+   "params": {
+    "image_id": "img-4",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-5",
+    "new_membrane": true,
+    "original_name": "R reprobe α.tif",
+    "polarity": "dark_on_light",
+    "sha256": "20173dc191c40674fb6276f969c7ca57c7795dba93672c9a29146169cce05190"
+   },
+   "seq": 4,
+   "time": "2026-10-31T09:00:03.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_marker_image",
+   "content_hash": "6a64f4f957063bdb572e0f75d65602015e4517b407c480efeec8a76c5ada5161",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-1", "img-3"],
+    "image_id": "img-1",
+    "marker_image_id": "img-3",
+    "membrane_id": "mem-2",
+    "previous": null
+   },
+   "seq": 5,
+   "time": "2026-10-31T09:00:04.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_ladder",
+   "content_hash": "332c748696c78e2ff8de2a22020440dd023a2a2fd144016217eafddf90634dd0",
+   "params": {
+    "kda": [250, 130, 100, 70, 55, 35, 25, 15, 10],
+    "ladder": "pageruler_plus/tris_glycine",
+    "membrane_id": "mem-2"
+   },
+   "seq": 6,
+   "time": "2026-10-31T09:00:05.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "cc3e1eff2f94a85d2dc2aa381665171a8abbf3d9d45ae591017c070c63c64220",
+   "params": {
+    "curves_changed": [],
+    "dropped_undetected": [],
+    "fit": null,
+    "group": ["img-1", "img-3"],
+    "image_id": "img-3",
+    "membrane_id": "mem-2",
+    "mw": 130.0,
+    "side": "left",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 12.0,
+    "y": 8.0,
+    "y_given": 8.0
+   },
+   "seq": 7,
+   "time": "2026-10-31T09:00:06.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "5bc8c9fa86d18272c70e15b57210c9bda242f9a2eea20d4b22114540e08c439d",
+   "params": {
+    "curves_changed": ["img-1", "img-3"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "ignored": [],
+     "image_ids": ["img-1", "img-3"],
+     "ladders": [
+      {
+       "points": 2,
+       "predicted_mw": null,
+       "quality": null,
+       "quality_infinite": false,
+       "range": [55.602976430699705, 163.66030353324183],
+       "side": "left",
+       "two_point": true,
+       "worst_mw": null,
+       "x": 12.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": null,
+     "range": [55.602976430699705, 163.66030353324183],
+     "tilt_deg": null
+    },
+    "group": ["img-1", "img-3"],
+    "image_id": "img-3",
+    "membrane_id": "mem-2",
+    "mw": 70.0,
+    "side": "left",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 12.0,
+    "y": 26.87,
+    "y_given": 26.87
+   },
+   "seq": 8,
+   "time": "2026-10-31T09:00:07.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_calibration_point",
+   "content_hash": "cf3c18c19327f712468ce87ca759c00d375391ae9a99476474689e47e5e0af59",
+   "params": {
+    "curves_changed": ["img-1", "img-3"],
+    "dropped_undetected": [],
+    "fit": {
+     "disagreement": null,
+     "disagreement_infinite": false,
+     "disagreement_mw": null,
+     "ignored": [],
+     "image_ids": ["img-1", "img-3"],
+     "ladders": [
+      {
+       "points": 3,
+       "predicted_mw": 68.89875533311566,
+       "quality": 0.015983520479579072,
+       "quality_infinite": false,
+       "range": [27.80148821534985, 163.66030353324183],
+       "side": "left",
+       "two_point": false,
+       "worst_mw": 70.0,
+       "x": 12.0
+      }
+     ],
+     "method": "log_linear_piecewise",
+     "offset_px": null,
+     "range": [27.80148821534985, 163.66030353324183],
+     "tilt_deg": null
+    },
+    "group": ["img-1", "img-3"],
+    "image_id": "img-3",
+    "membrane_id": "mem-2",
+    "mw": 35.0,
+    "side": "left",
+    "snapped": false,
+    "source": "visible_marker",
+    "x": 12.0,
+    "y": 47.0,
+    "y_given": 47.0
+   },
+   "seq": 9,
+   "time": "2026-10-31T09:00:08.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "set_lanes",
+   "content_hash": "bc6105e106cdcad96dea5c9b1bcb26edc6473cb75a48ed393a076ab7e7e5e387",
+   "params": {
+    "changed": [
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 0,
+      "sample": "V1"
+     },
+     {
+      "condition": "vehicle",
+      "included": true,
+      "index": 1,
+      "sample": "V2"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 2,
+      "sample": "A1"
+     },
+     {
+      "condition": "10 µM",
+      "included": true,
+      "index": 3,
+      "sample": "A2"
+     }
+    ],
+    "dropped_undetected": [],
+    "lane_count": 4,
+    "reference_condition": "vehicle"
+   },
+   "seq": 10,
+   "time": "2026-10-31T09:00:09.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "14963f3d14958567b4a40c283510fb910cd810da0491b4589952b6bba806a9fe",
+   "params": {
+    "box_size": {
+     "height": 4,
+     "width": 12
+    },
+    "expected_mw": 92.0,
+    "image_id": "img-1",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "β-catenin",
+    "pinned_targets": [],
+    "protein_id": "prot-6",
+    "role": "target"
+   },
+   "seq": 11,
+   "time": "2026-10-31T09:00:10.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "detect_row_boxes",
+   "content_hash": "43816d65734bed8f06584fd9f370a2487ce1d6444ee89596387909716a09ce94",
+   "params": {
+    "box_size": {
+     "height": 11,
+     "width": 15
+    },
+    "dropped_undetected": [],
+    "flags": [],
+    "kept_lanes": [],
+    "lanes": [
+     {
+      "band_id": "band-7",
+      "expected_x": 32.0,
+      "reason": "band",
+      "rect": [25, 13, 40, 24],
+      "snr": 286.86
+     },
+     {
+      "band_id": "band-8",
+      "expected_x": 47.5,
+      "reason": "band",
+      "rect": [40, 13, 55, 24],
+      "snr": 249.32
+     },
+     {
+      "band_id": "band-9",
+      "expected_x": 64.0,
+      "reason": "band",
+      "rect": [57, 13, 72, 24],
+      "snr": 363.6
+     },
+     {
+      "band_id": "band-10",
+      "expected_x": 79.5,
+      "reason": "band",
+      "rect": [72, 13, 87, 24],
+      "snr": 325.04
+     }
+    ],
+    "noise": 51.971421680458185,
+    "notes": ["stage 2 skipped: too few band-free pixels"],
+    "pitch": 15.980000000000004,
+    "protein_id": "prot-6",
+    "removed_band_ids": [],
+    "replaced_band_ids": [],
+    "right_to_left": false,
+    "row": [22, 9, 90, 29],
+    "saturated_at": 0.0,
+    "settings": {
+     "ambiguity_margin": 4.0,
+     "apart_doubt": 0.6,
+     "bg_clip_k": 3.0,
+     "bg_guard": [0.5, 0.25],
+     "bg_guard_min": 2,
+     "bg_iter": 30,
+     "bg_min_keep": 0.1,
+     "bg_min_pixels": 200,
+     "bg_warn_k": 3.0,
+     "cell_seed": 0.25,
+     "cut_level": 0.3,
+     "despeckle_min": 3,
+     "detect_k": 6.0,
+     "edge_hump": 0.5,
+     "empty_window": 0.3,
+     "end_doubt": 1.5,
+     "end_hi": 1.0,
+     "end_lo": 0.1,
+     "end_sym_tol": 0.25,
+     "end_tol": 0.1,
+     "envelope_half": 0.5,
+     "envelope_min": 2,
+     "extent_level": 0.3,
+     "fit_max_pixels": 20000,
+     "flat_edge": 0.8,
+     "gap_frac": 0.1,
+     "gap_search": 1,
+     "hollow_pixels": 5,
+     "join_rows": 0.5,
+     "lanes_doubt": 0.5,
+     "line_flat": 0.8,
+     "line_px": 4,
+     "line_span": 2.0,
+     "membrane_shift_k": 6.0,
+     "membrane_spread_k": 1.5,
+     "min_box": 2,
+     "min_fit": 16,
+     "min_width_pitch": 0.15,
+     "min_width_px": 7,
+     "near_peaks": 1.5,
+     "noise_floor_frac": 0.001,
+     "noise_k": 3.0,
+     "pitch_doubt": 0.3,
+     "pitch_prior_tol": 0.25,
+     "pitch_range": [0.55, 1.3],
+     "pitch_refine": 0.04,
+     "pitch_steps": [0.05, 0.01],
+     "q_window": 2,
+     "reduce_mass": 0.25,
+     "rel_threshold": 0.3,
+     "row_line_k": 0.75,
+     "row_line_min": 4,
+     "row_line_tol": 0.25,
+     "row_line_tol_px": 3.0,
+     "row_min_keep": 3,
+     "row_min_rows": 5,
+     "row_smile": 2.0,
+     "row_walk_tol": 0.02,
+     "run_lane_min": 0.6,
+     "second_share": 0.25,
+     "single_max_width": 1.25,
+     "size_guard": 2.0,
+     "size_rule": "max_guarded",
+     "smooth": [3, 5],
+     "spacing_tol": 0.15,
+     "split_penalty": 1.0,
+     "tail_q": 97.5,
+     "valley_frac": 0.75
+    },
+    "undetected_written": [],
+    "unlocated_lanes": []
+   },
+   "seq": 12,
+   "time": "2026-10-31T09:00:11.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "add_protein",
+   "content_hash": "fc37e614a18df7b060ffc37d75bd1ceafa266a606896ca932cf5382ee3578eeb",
+   "params": {
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "expected_mw": null,
+    "image_id": "img-4",
+    "loading_control_ids": [],
+    "mw_tolerance": 0.1,
+    "name": "α-tubulin",
+    "pinned_targets": [],
+    "protein_id": "prot-11",
+    "role": "loading control"
+   },
+   "seq": 13,
+   "time": "2026-10-31T09:00:12.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "e17e759042c87f72cc4c1d747130399bca47cae839d111308ad9626728c5b65c",
+   "params": {
+    "band_id": "band-12",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 0,
+    "lane_proposed": false,
+    "protein_id": "prot-11",
+    "rect": [26, 23, 38, 33],
+    "replaced_undetected": null,
+    "x": 32,
+    "y": 28
+   },
+   "seq": 14,
+   "time": "2026-10-31T09:00:13.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "6b994c15dbf9f39e5406aeffb3962f413a8b0d2bab4c51f43a05e7299fc9b0cd",
+   "params": {
+    "band_id": "band-13",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 1,
+    "lane_proposed": false,
+    "protein_id": "prot-11",
+    "rect": [42, 23, 54, 33],
+    "replaced_undetected": null,
+    "x": 48,
+    "y": 28
+   },
+   "seq": 15,
+   "time": "2026-10-31T09:00:14.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "e8b503d5cd5ddc2151882709b19f52be629351cc68d322bbb6b27f9519e2136d",
+   "params": {
+    "band_id": "band-14",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 2,
+    "lane_proposed": false,
+    "protein_id": "prot-11",
+    "rect": [58, 23, 70, 33],
+    "replaced_undetected": null,
+    "x": 64,
+    "y": 28
+   },
+   "seq": 16,
+   "time": "2026-10-31T09:00:15.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "place_box",
+   "content_hash": "1d29f62d522356e36901618393d6a827027fff793f41e4f7eec5dabeb48be269",
+   "params": {
+    "band_id": "band-15",
+    "box_size": {
+     "height": 10,
+     "width": 12
+    },
+    "grow": false,
+    "lane_index": 3,
+    "lane_proposed": false,
+    "protein_id": "prot-11",
+    "rect": [74, 23, 86, 33],
+    "replaced_undetected": null,
+    "x": 80,
+    "y": 28
+   },
+   "seq": 17,
+   "time": "2026-10-31T09:00:16.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "remove_image",
+   "content_hash": "50e263d7b293c23f603b77cecfe99125d3ee27036723bb4235eb490578eeb729",
+   "params": {
+    "detached_targets": [],
+    "dropped_undetected": [],
+    "image_id": "img-3",
+    "removed": ["img-3"],
+    "removed_undetected": [],
+    "unfitted_membranes": ["mem-2"],
+    "unpaired_images": ["img-1"]
+   },
+   "seq": 18,
+   "time": "2026-10-31T09:00:17.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "undo",
+   "content_hash": "1d29f62d522356e36901618393d6a827027fff793f41e4f7eec5dabeb48be269",
+   "params": {
+    "removed": [],
+    "restored": ["img-3"],
+    "returns_to_seq": 17,
+    "undetected_removed": [],
+    "undetected_restored": [],
+    "undone_action": "remove_image",
+    "undone_seq": 18
+   },
+   "seq": 19,
+   "time": "2026-10-31T09:00:18.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "redo",
+   "content_hash": "50e263d7b293c23f603b77cecfe99125d3ee27036723bb4235eb490578eeb729",
+   "params": {
+    "redone_action": "remove_image",
+    "redone_seq": 18,
+    "removed": ["img-3"],
+    "restored": [],
+    "returns_to_seq": 18,
+    "undetected_removed": [],
+    "undetected_restored": []
+   },
+   "seq": 20,
+   "time": "2026-10-31T09:00:19.000Z",
+   "version": "0.1.0.dev0"
+  },
+  {
+   "action": "undo",
+   "content_hash": "1d29f62d522356e36901618393d6a827027fff793f41e4f7eec5dabeb48be269",
+   "params": {
+    "removed": [],
+    "restored": ["img-3"],
+    "returns_to_seq": 17,
+    "undetected_removed": [],
+    "undetected_restored": [],
+    "undone_action": "remove_image",
+    "undone_seq": 18
+   },
+   "seq": 21,
+   "time": "2026-10-31T09:00:20.000Z",
+   "version": "0.1.0.dev0"
+  }
+ ],
+ "next_id": 16,
+ "project_sha256": "2400c7a55556180206654d7cf9a4849fb9903dda16cfa3f3a79780c19637738b",
+ "version": "0.1.0.dev0"
+}
