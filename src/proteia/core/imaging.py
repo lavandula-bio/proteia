@@ -243,8 +243,13 @@ def _require_single_image(series: Sequence[tifffile.TiffPageSeries], name: str) 
 
 # How a refusal says that a file holds more than one image, and why that is
 # refused: the words of NotSingleImageError, and of the import's refusal of
-# printing inks among several images.
-SEVERAL_IMAGES: Final = "more than one image (a stack or a multi-channel composite)"
+# printing inks among several images. True of every layout refused so: a
+# stack, a composite's channels, images of several sizes, and an image after
+# a mask or a thumbnail series of its own (_single_image).
+SEVERAL_IMAGES: Final = (
+    "more than one image (such as a stack, the channels of a composite, or an image with a"
+    " mask or a thumbnail)"
+)
 SINGLE_IMAGE_ONLY: Final = "only a single image can be quantified"
 
 
@@ -254,21 +259,29 @@ class NotSingleImageError(ValueError):
     (``no_image``). ``inks`` are the printing inks among its images
     (:func:`_inks_of`), None if there are none, so that an import, which
     refuses inks (#207), can name both problems. The message names the file
-    read; :meth:`refusal` gives it for another name, so that an import names
-    the file as the user chose it, not its stored copy (#220)."""
+    read (``name``); :meth:`refusal` gives it for another name, so that an
+    import names the file as the user chose it, not its stored copy (#220)."""
 
-    def __init__(self, name: str, inks: Inks | None, *, no_image: bool) -> None:
+    def __init__(self, name: str, inks: Inks | None, no_image: bool) -> None:
+        self.name = name
         self.inks = inks
         self.no_image = no_image
         super().__init__(self.refusal(name))
 
+    def __reduce__(self) -> tuple[object, ...]:
+        # Rebuilt from what it was made of, not from its message (pickle and
+        # copy would otherwise call it with the message alone).
+        return type(self), (self.name, self.inks, self.no_image), self.__dict__
+
     def refusal(self, name: str) -> str:
         """The refusal of the file named ``name``: what it holds, in plain
-        words, and how to import one of its images (save it as its own file)."""
+        words, and a next step that imports an image: save one of its images
+        as its own file; of a file of no image, export the image again."""
         if self.no_image:
             return (
-                f"{name!r} holds no image, so there is nothing to quantify: save the image as"
-                " its own file and import it again"
+                f"{name!r} holds no image, so there is nothing to quantify: export the image"
+                " again from the program that made it, as a TIFF or PNG file, and import that"
+                " file"
             )
         return (
             f"{name!r} holds {SEVERAL_IMAGES}, which Proteia does not import:"

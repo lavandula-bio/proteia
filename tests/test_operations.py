@@ -1893,8 +1893,9 @@ def _refusal(name: str, inks: str, *, several: bool, uncompressed: bool) -> str:
     }[inks]
     if several:
         reason += (
-            "; it also holds more than one image (a stack or a multi-channel composite),"
-            " and only a single image can be quantified"
+            "; it also holds more than one image (such as a stack, the channels of a"
+            " composite, or an image with a mask or a thumbnail), and only a single image can"
+            " be quantified"
         )
     what = "one of its images" if several else "it"
     copy = "an uncompressed RGB or grayscale TIFF" if uncompressed else "RGB or grayscale"
@@ -1997,16 +1998,17 @@ def test_the_refusals_of_files_of_several_images_in_full(tmp_path):
     assert answers == {
         "gray then spots.tif": (
             "'gray then spots.tif' holds printing inks other than CMYK (a separated TIFF),"
-            " which Proteia does not import; it also holds more than one image (a stack or a"
-            " multi-channel composite), and only a single image can be quantified; save one"
-            " of its images as RGB or grayscale and import it again"
+            " which Proteia does not import; it also holds more than one image (such as a"
+            " stack, the channels of a composite, or an image with a mask or a thumbnail), and"
+            " only a single image can be quantified; save one of its images as RGB or"
+            " grayscale and import it again"
         ),
         "16-bit stack.tif": (
             "'16-bit stack.tif' is a CMYK file, which Proteia does not import: its gray levels"
-            " could only be estimated from its inks; it also holds more than one image (a"
-            " stack or a multi-channel composite), and only a single image can be quantified;"
-            " save one of its images as an uncompressed RGB or grayscale TIFF and import it"
-            " again"
+            " could only be estimated from its inks; it also holds more than one image (such"
+            " as a stack, the channels of a composite, or an image with a mask or a"
+            " thumbnail), and only a single image can be quantified; save one of its images as"
+            " an uncompressed RGB or grayscale TIFF and import it again"
         ),
     }
 
@@ -2147,13 +2149,16 @@ def test_a_tiff_of_several_images_is_refused_whatever_its_suffix(tmp_path, layou
 
 
 # A TIFF that is not a single image (#220), by the name it is offered under:
-# a stack of two, a multi-channel composite, and a file of no image, each
-# named .tif and otherwise (#215).
+# a stack of two, a multi-channel composite, images of two sizes, a
+# thumbnail before the image, and a file of no image, named .tif and
+# otherwise (#215).
 _NOT_A_SINGLE_IMAGE = {
     "stack of two µ.tif": lambda: _several_images()["stack"],
     "stack of two α.png": lambda: _several_images()["stack"],
     "composite β.tif": lambda: _several_images()["composite"],
     "composite µ.jpg": lambda: _several_images()["composite"],
+    "two sizes α.tif": lambda: _several_images()["two sizes"],
+    "thumbnail first β.png": lambda: _several_images()["thumbnail first"],
     "no image α.tif": lambda: b"II*\x00" + bytes(4),  # the first page's offset is 0: no page
     "no image β.PNG": lambda: b"II*\x00" + bytes(4),
 }
@@ -2164,6 +2169,8 @@ def test_the_refusals_of_a_tiff_that_is_not_a_single_image_in_full(tmp_path):
     # image series with axes 'QYX'" of a stack, and gave no next step. It
     # names the file as chosen, says in plain words that it holds more than
     # one image, or none, and how to import one: whatever the suffix.
+    # #220 review: words true of every layout refused so, and a next step for
+    # a file of no image that can be done (there is no image in it to save).
     s = session_on(tmp_path)
     answers = {}
     for name, data in _NOT_A_SINGLE_IMAGE.items():
@@ -2174,36 +2181,57 @@ def test_the_refusals_of_a_tiff_that_is_not_a_single_image_in_full(tmp_path):
         )
         assert (error.code, error.ids, error.detail) == (ErrorCode.UNREADABLE_IMAGE, (), None)
         answers[name] = str(error)
+    several = (
+        "{!r} holds more than one image (such as a stack, the channels of a composite, or an"
+        " image with a mask or a thumbnail), which Proteia does not import: only a single"
+        " image can be quantified; save one of its images as its own file and import it again"
+    )
+    no_image = (
+        "{!r} holds no image, so there is nothing to quantify: export the image again from"
+        " the program that made it, as a TIFF or PNG file, and import that file"
+    )
     assert answers == {
-        "stack of two µ.tif": (
-            "'stack of two µ.tif' holds more than one image (a stack or a multi-channel"
-            " composite), which Proteia does not import: only a single image can be"
-            " quantified; save one of its images as its own file and import it again"
-        ),
-        "stack of two α.png": (
-            "'stack of two α.png' holds more than one image (a stack or a multi-channel"
-            " composite), which Proteia does not import: only a single image can be"
-            " quantified; save one of its images as its own file and import it again"
-        ),
-        "composite β.tif": (
-            "'composite β.tif' holds more than one image (a stack or a multi-channel"
-            " composite), which Proteia does not import: only a single image can be"
-            " quantified; save one of its images as its own file and import it again"
-        ),
-        "composite µ.jpg": (
-            "'composite µ.jpg' holds more than one image (a stack or a multi-channel"
-            " composite), which Proteia does not import: only a single image can be"
-            " quantified; save one of its images as its own file and import it again"
-        ),
-        "no image α.tif": (
-            "'no image α.tif' holds no image, so there is nothing to quantify: save the image"
-            " as its own file and import it again"
-        ),
-        "no image β.PNG": (
-            "'no image β.PNG' holds no image, so there is nothing to quantify: save the image"
-            " as its own file and import it again"
-        ),
+        name: (no_image if name.startswith("no image") else several).format(name)
+        for name in _NOT_A_SINGLE_IMAGE
     }
+    assert answers["two sizes α.tif"] == (
+        "'two sizes α.tif' holds more than one image (such as a stack, the channels of a"
+        " composite, or an image with a mask or a thumbnail), which Proteia does not import:"
+        " only a single image can be quantified; save one of its images as its own file and"
+        " import it again"
+    )
+    assert answers["no image α.tif"] == (
+        "'no image α.tif' holds no image, so there is nothing to quantify: export the image"
+        " again from the program that made it, as a TIFF or PNG file, and import that file"
+    )
+
+
+@pytest.mark.parametrize("fmt", ["TIFF", "PNG"])
+def test_the_image_of_a_tiff_of_no_image_exported_again_is_imported(tmp_path, fmt):
+    # #220 review: the refusal's next step, done literally: the image the
+    # file should have held, exported again as a TIFF or PNG file, imports
+    # and measures as that image.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(b"II*\x00" + bytes(4)), "no image µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert str(error).endswith(
+        ": export the image again from the program that made it, as a TIFF or PNG file, and"
+        " import that file"
+    )
+    gray = (blot() >> 8).astype(np.uint8)
+    exported = _encoded(Image.fromarray(gray), fmt)
+    image_id = ops.import_image(
+        s, exported, f"exported again α.{fmt.lower()}", kind=CHEMI, polarity=DARK
+    )
+    np.testing.assert_array_equal(s.pixels(image_id), gray.astype(np.float64))
+    image = s.project.batch.find_image(image_id)
+    assert (image.bit_depth, image.import_warnings) == (8, [])
 
 
 @pytest.mark.parametrize("suffix", [".tif", ".png"])
@@ -2365,9 +2393,10 @@ def test_one_image_of_a_cmyk_stack_saved_as_rgb_or_grayscale_is_imported(tmp_pat
     )
     assert error.code is ErrorCode.UNREADABLE_IMAGE
     assert str(error) == (
-        "'stack saved.tif' holds more than one image (a stack or a multi-channel composite),"
-        " which Proteia does not import: only a single image can be quantified; save one of"
-        " its images as its own file and import it again"
+        "'stack saved.tif' holds more than one image (such as a stack, the channels of a"
+        " composite, or an image with a mask or a thumbnail), which Proteia does not import:"
+        " only a single image can be quantified; save one of its images as its own file and"
+        " import it again"
     )
     image_id = ops.import_image(
         s, _encoded(pages[1], "TIFF"), "stack page 2 µ.tif", kind=CHEMI, polarity=DARK
@@ -3244,9 +3273,10 @@ def test_a_tiff_of_several_images_is_refused_as_such_whatever_the_type_of_the_fi
     )
     assert error.code is ErrorCode.UNREADABLE_IMAGE
     assert str(error) == (
-        f"{name!r} holds more than one image (a stack or a multi-channel composite), which"
-        " Proteia does not import: only a single image can be quantified; save one of its"
-        " images as its own file and import it again"
+        f"{name!r} holds more than one image (such as a stack, the channels of a composite,"
+        " or an image with a mask or a thumbnail), which Proteia does not import: only a"
+        " single image can be quantified; save one of its images as its own file and import"
+        " it again"
     )
 
 

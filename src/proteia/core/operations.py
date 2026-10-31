@@ -1423,7 +1423,8 @@ def import_image(
     would take its first image only. A single image keeps that reader, and
     images imported before keep being read so. Either refusal names the file
     as it was offered, says that it holds more than one image (or none), and
-    says to save one of its images as its own file and import it again
+    says to save one of its images as its own file and import it again (of
+    a file of no image, to export the image again as a TIFF or PNG file)
     (#220; :meth:`~proteia.core.imaging.NotSingleImageError.refusal`).
 
     A file whose pixels have no fixed range is refused (``UNSUPPORTED_PIXEL_TYPE``,

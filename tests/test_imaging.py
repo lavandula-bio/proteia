@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for reading image files and rendering previews; files are generated here."""
 
+import copy
 import dataclasses
 import functools
 import hashlib
 import itertools
 import os
+import pickle
 import re
 import struct
 from io import BytesIO
@@ -137,9 +139,10 @@ def test_multi_page_tiff_is_refused(tmp_path):
     with pytest.raises(ValueError) as info:
         read_pixels(path)
     assert str(info.value) == (
-        "'stack.tif' holds more than one image (a stack or a multi-channel composite), which"
-        " Proteia does not import: only a single image can be quantified; save one of its"
-        " images as its own file and import it again"
+        "'stack.tif' holds more than one image (such as a stack, the channels of a composite,"
+        " or an image with a mask or a thumbnail), which Proteia does not import: only a"
+        " single image can be quantified; save one of its images as its own file and import"
+        " it again"
     )
 
 
@@ -328,9 +331,10 @@ def test_multi_channel_composite_is_refused(tmp_path):
     with pytest.raises(ValueError) as info:
         read_pixels(path)
     assert str(info.value) == (
-        "'composite.tif' holds more than one image (a stack or a multi-channel composite),"
-        " which Proteia does not import: only a single image can be quantified; save one of"
-        " its images as its own file and import it again"
+        "'composite.tif' holds more than one image (such as a stack, the channels of a"
+        " composite, or an image with a mask or a thumbnail), which Proteia does not import:"
+        " only a single image can be quantified; save one of its images as its own file and"
+        " import it again"
     )
 
 
@@ -1594,9 +1598,10 @@ def test_reading_a_tiff_of_several_images_says_its_inks(tmp_path, write, inks):
     with pytest.raises(imaging.NotSingleImageError) as info:
         load_image(path)
     assert str(info.value) == (
-        "'several µ.tif' holds more than one image (a stack or a multi-channel composite),"
-        " which Proteia does not import: only a single image can be quantified; save one of"
-        " its images as its own file and import it again"
+        "'several µ.tif' holds more than one image (such as a stack, the channels of a"
+        " composite, or an image with a mask or a thumbnail), which Proteia does not import:"
+        " only a single image can be quantified; save one of its images as its own file and"
+        " import it again"
     )
     assert info.value.inks == inks
 
@@ -1664,8 +1669,8 @@ def test_the_header_of_a_tiff_with_no_image_says_so(tmp_path, monkeypatch):
     with pytest.raises(imaging.NotSingleImageError) as info:
         load_image(empty)  # no single image either
     assert str(info.value) == (
-        "'empty.tif' holds no image, so there is nothing to quantify: save the image as its own"
-        " file and import it again"
+        "'empty.tif' holds no image, so there is nothing to quantify: export the image again"
+        " from the program that made it, as a TIFF or PNG file, and import that file"
     )
     separated = tmp_path / "no series.tif"
     _separated(_inks(_rgb8()))(separated)
@@ -1711,9 +1716,10 @@ def test_a_tiff_of_several_images_named_otherwise_is_refused_as_reading_refuses_
         imaging.check_misnamed_tiff(path)
     assert str(counted.value) == str(read.value).replace("stack µ.tif", path.name)
     assert str(counted.value) == (
-        f"'stack µ{suffix}' holds more than one image (a stack or a multi-channel composite),"
-        " which Proteia does not import: only a single image can be quantified; save one of"
-        " its images as its own file and import it again"
+        f"'stack µ{suffix}' holds more than one image (such as a stack, the channels of a"
+        " composite, or an image with a mask or a thumbnail), which Proteia does not import:"
+        " only a single image can be quantified; save one of its images as its own file and"
+        " import it again"
     )
     assert counted.value.inks is read.value.inks is None
 
@@ -1845,8 +1851,8 @@ def test_a_tiff_of_no_image_named_otherwise_is_refused_as_reading_refuses_a_tif(
     with pytest.raises(imaging.NotSingleImageError) as info:
         imaging.check_misnamed_tiff(path)
     assert str(info.value) == (
-        "'empty.png' holds no image, so there is nothing to quantify: save the image as its own"
-        " file and import it again"
+        "'empty.png' holds no image, so there is nothing to quantify: export the image again"
+        " from the program that made it, as a TIFF or PNG file, and import that file"
     )
 
 
@@ -1872,13 +1878,53 @@ def test_the_refusal_of_a_tiff_that_is_not_a_single_image_can_name_the_file_othe
     chosen = "β-actin 10 µM α.tif"
     assert info.value.refusal(chosen) == str(info.value).replace("'img-1.tif'", repr(chosen))
     assert info.value.refusal(chosen) == (
-        "'β-actin 10 µM α.tif' holds no image, so there is nothing to quantify: save the image"
-        " as its own file and import it again"
+        "'β-actin 10 µM α.tif' holds no image, so there is nothing to quantify: export the"
+        " image again from the program that made it, as a TIFF or PNG file, and import that"
+        " file"
         if no_image
-        else "'β-actin 10 µM α.tif' holds more than one image (a stack or a multi-channel"
-        " composite), which Proteia does not import: only a single image can be quantified;"
-        " save one of its images as its own file and import it again"
+        else "'β-actin 10 µM α.tif' holds more than one image (such as a stack, the channels"
+        " of a composite, or an image with a mask or a thumbnail), which Proteia does not"
+        " import: only a single image can be quantified; save one of its images as its own"
+        " file and import it again"
     )
+
+
+@pytest.mark.parametrize(
+    ("write", "inks", "no_image"),
+    [
+        (_stack_of_two(), None, False),
+        (
+            _pages((_gray(np.uint8, 255), {}), (_inks(_rgb8()), _INKS)),
+            ("cmyk", False, False),
+            False,
+        ),
+        (lambda path: path.write_bytes(b"II*\x00" + bytes(4)), None, True),
+    ],
+    ids=["stack", "gray-then-cmyk", "no-image"],
+)
+def test_the_refusal_of_a_tiff_that_is_not_a_single_image_survives_pickle_and_copy(
+    tmp_path, write, inks, no_image
+):
+    # #220 review: built from the file's name, not from its message, it must
+    # still be rebuilt by pickle (another process) and copy, with its inks
+    # and whether it holds no image.
+    path = tmp_path / "several µ.tif"
+    write(path)
+    with pytest.raises(imaging.NotSingleImageError) as info:
+        load_image(path)
+    error = info.value
+    assert (error.inks, error.no_image) == (inks, no_image)
+    protocols = range(pickle.HIGHEST_PROTOCOL + 1)
+    rebuilt = [pickle.loads(pickle.dumps(error, protocol)) for protocol in protocols]
+    for again in [*rebuilt, copy.copy(error), copy.deepcopy(error)]:
+        assert type(again) is imaging.NotSingleImageError
+        assert (str(again), again.args, again.inks, again.no_image) == (
+            str(error),
+            error.args,
+            inks,
+            no_image,
+        )
+        assert again.refusal("β α.png") == error.refusal("β α.png")
 
 
 def test_reading_a_tiff_of_several_images_named_otherwise_takes_its_first_as_before(tmp_path):
