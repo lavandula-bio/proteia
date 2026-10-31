@@ -19,8 +19,9 @@ and expected band, a :class:`Band` (a box), an :class:`UndetectedBand` (a
 detector measured the lane and the band stayed below its detection limit), or
 neither (not measured). A reprobe is simply another image of the same
 membrane. Until areas can be drawn, lane tables added and a protein put on
-several membranes, a project holds one area per image, one lane table and one
-row per protein (:meth:`Batch._check_supported`). Objects refer to each other by
+several membranes, a project holds one area per image, each over the whole
+image and unturned, one lane table and one row per protein
+(:meth:`Batch._check_supported`). Objects refer to each other by
 stable, project-unique ids (``mem-N``, ``img-N``, ``lt-N``, ``arena-N``,
 ``prot-N``, ``row-N``, ``band-N``) and to lanes by index, never by list
 position or name; a not-detected record has no id of its own, only its
@@ -1025,12 +1026,13 @@ class Batch(_Model):
 
     # --- Validation ---
 
-    def _check_supported(self, twice: set[str]) -> None:
-        """What this build reads: one lane table, one membrane area per image
-        and one row per protein. A file with more was written by a build that
-        draws areas, adds lane tables or puts a protein on several membranes;
-        the message names the file's part, never an id. The areas of an image
-        listed ``twice`` are not counted: :meth:`Project._check_ids` refuses its id."""
+    def _check_supported(self, images: dict[str, ImageRef], twice: set[str]) -> None:
+        """What this build reads: one lane table, one membrane area per image,
+        over the whole image (:meth:`_check_whole_image_areas`), and one row
+        per protein. A file with more was written by a build that adds lane
+        tables, draws areas or puts a protein on several membranes; the message
+        names the file's part, never an id. The areas of an image listed
+        ``twice`` are not counted: :meth:`Project._check_ids` refuses its id."""
         if len(self.lane_tables) > 1:
             raise ValueError(f"the project holds {len(self.lane_tables)} lane tables, {_NEWER}")
         held = Counter(arena.image_id for membrane in self.membranes for arena in membrane.arenas)
@@ -1039,10 +1041,44 @@ class Batch(_Model):
                 raise ValueError(
                     f"{image.original_name!r} holds {held[image.id]} membrane areas, {_NEWER}"
                 )
+        self._check_whole_image_areas(images)
         for protein in self.proteins:
             if len(protein.rows) > 1:
                 raise ValueError(
                     f"{protein.name!r} has rows on {len(protein.rows)} membrane areas, {_NEWER}"
+                )
+
+    def _check_whole_image_areas(self, images: dict[str, ImageRef]) -> None:
+        """Until areas can be drawn, each covers its whole image, unturned, as
+        an import or a conversion makes it: nothing in this build reads an
+        outline or keeps boxes to one. The checks of drawn areas below stay for
+        the build that draws them (their tests lift this one)."""
+        for membrane in self.membranes:
+            for arena in membrane.arenas:
+                image = images.get(arena.image_id)
+                if image is None:
+                    continue  # refused below, by its id
+                if arena.outline is not None:
+                    what = "with a drawn outline"
+                elif arena.angle_deg != 0:
+                    what = f"turned by {arena.angle_deg:g} degrees"
+                elif arena.source is not ArenaSource.WHOLE_IMAGE:
+                    what = "drawn by hand"
+                else:
+                    continue
+                raise ValueError(f"{image.original_name!r} holds a membrane area {what}, {_NEWER}")
+
+    def _check_image_order(self, images: dict[str, ImageRef]) -> None:
+        """The images are listed membrane by membrane, in the order of each
+        membrane's areas (:attr:`images`); every image has an area and every
+        area an image by now."""
+        listed = dict.fromkeys(image.id for image in self.images)
+        placed = dict.fromkeys(a.image_id for membrane in self.membranes for a in membrane.arenas)
+        for here, due in zip(listed, placed, strict=True):
+            if here != due:
+                raise ValueError(
+                    f"the project lists {images[here].original_name!r} out of order: images are"
+                    " listed membrane by membrane, in the order of each membrane's areas"
                 )
 
     @model_validator(mode="after")
@@ -1050,7 +1086,7 @@ class Batch(_Model):
         images = {image.id: image for image in self.images}
         listed = Counter(image.id for image in self.images)
         twice = {image_id for image_id, count in listed.items() if count > 1}
-        self._check_supported(twice)
+        self._check_supported(images, twice)
         tables = {table.id: table for table in self.lane_tables}
         arenas: dict[str, tuple[Membrane, Arena]] = {}
         for membrane in self.membranes:
@@ -1079,6 +1115,7 @@ class Batch(_Model):
         for image in self.images:
             if image.id not in on_some:
                 raise ValueError(f"image {image.id} is on no membrane: no membrane area is on it")
+        self._check_image_order(images)
         for membrane in self.membranes:
             self._check_membrane(membrane, images)
         self._check_linked_areas(images, twice)

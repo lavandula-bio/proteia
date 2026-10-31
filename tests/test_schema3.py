@@ -38,6 +38,7 @@ from proteia.core.model import (
     SCHEMA_VERSION,
     Arena,
     ArenaSource,
+    Batch,
     ImageKind,
     Outline,
     Project,
@@ -649,6 +650,63 @@ def test_pr2_restrictions(case):
     assert not ID.search(expected)
 
 
+@pytest.fixture
+def drawn_areas(monkeypatch):
+    """Lift the refusal of drawn, turned and hand-made areas, to check the
+    rules such an area keeps to: what the build that draws them reads."""
+    monkeypatch.setattr(Batch, "_check_whole_image_areas", lambda self, images: None)
+
+
+@pytest.mark.parametrize(
+    ("edit", "what"),
+    [
+        pytest.param(
+            {"outline": {"x0": 0, "y0": 0, "x1": 200, "y1": 100}},
+            "with a drawn outline",
+            id="outline",
+        ),
+        pytest.param({"angle_deg": 2.5}, "turned by 2.5 degrees", id="turned"),
+        pytest.param({"angle_deg": -45.0}, "turned by -45 degrees", id="turned-back"),
+        pytest.param({"source": "manual"}, "drawn by hand", id="manual"),
+    ],
+)
+def test_a_drawn_turned_or_hand_made_area_is_refused(edit, what):
+    # Nothing in this build draws an area or keeps to one; a file that holds
+    # one was written by a build that does.
+    doc = _v3()
+    _arena(doc, "arena-23").update(edit)
+    expected = f"'α-tubulin µ.jpg' holds a membrane area {what}, {NEWER}"
+    assert expected in _refusal(doc)
+    assert not ID.search(expected)
+    # The linked images img-2 and img-3 alike.
+    doc = _v3()
+    _arena(doc, "arena-20").update(edit)
+    _arena(doc, "arena-21").update(edit)
+    assert f"'β-actin 10 µM.tif' holds a membrane area {what}, {NEWER}" in _refusal(doc)
+
+
+@pytest.mark.parametrize(
+    ("order", "named"),
+    [
+        pytest.param((1, 0, 2, 3), "marker α.png", id="swapped"),
+        pytest.param((3, 0, 1, 2), "α-tubulin µ.jpg", id="later-membrane-first"),
+        pytest.param((0, 1, 3, 2), "α-tubulin µ.jpg", id="last-two"),
+    ],
+)
+def test_images_out_of_membrane_order_are_refused(order, named):
+    # A membrane's images follow its areas, membrane by membrane: an import
+    # puts each new image there, and a file must hold them so.
+    doc = _v3()
+    images = doc["batch"]["images"]
+    doc["batch"]["images"] = [images[i] for i in order]
+    expected = (
+        f"the project lists {named!r} out of order: images are listed membrane by membrane,"
+        " in the order of each membrane's areas"
+    )
+    assert expected in _refusal(doc)
+    assert not ID.search(expected)
+
+
 def test_ids_stay_unique_across_the_new_kinds():
     # Two images of one id (each with its area) are a duplicate id, not two
     # areas on one image; an area or a row whose number another object holds
@@ -714,6 +772,7 @@ def test_a_row_on_a_visible_marker_is_invalid():
     )
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_box_centre_outside_area_is_invalid():
     # GAPDH's boxes on img-4 (340x150) are 24x14 at x = 18 and 58: centres 30 and 70.
     doc = _v3()
@@ -726,6 +785,7 @@ def test_box_centre_outside_area_is_invalid():
     )
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_a_not_detected_region_outside_its_area_is_invalid():
     # GAPDH's records on img-4: lane 3 at x 98-128 (centre 113), lane 4 at 138-168 (153).
     doc = _v3(undetected_doc())
@@ -738,6 +798,7 @@ def test_a_not_detected_region_outside_its_area_is_invalid():
     )
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_box_and_record_centres_are_read_down_the_image_too():
     # GAPDH's boxes (y 100-114) and records (y 93-121) on img-4 are centred at
     # y 107; an area from y 100 holds them, but not a centre read higher up.
@@ -748,6 +809,7 @@ def test_box_and_record_centres_are_read_down_the_image_too():
     assert "protein prot-9: the centre of band-17's box lies outside" in _refusal(doc)
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_a_calibration_point_outside_its_area_is_invalid():
     # mem-5's strip edges on img-6 (200x100) at y 0 and 100, with no x: read at
     # the outline's centre x. α-tubulin's boxes there are centred at y 45.
@@ -761,6 +823,7 @@ def test_a_calibration_point_outside_its_area_is_invalid():
     )
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_a_mark_across_the_width_is_read_on_the_outline_middle():
     # mem-5's strip edges (y 0 and 100, no x) on img-6 under an outline over its
     # right half, x 100-200, on its top and bottom edges: read at x 150, inside;
@@ -777,6 +840,7 @@ def test_a_mark_across_the_width_is_read_on_the_outline_middle():
     assert not arena.contains(project.batch.find_image("img-6"), 50.0, 0.0)
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_a_calibration_point_with_x_is_read_where_it_was_marked():
     # A point at x 5 inside an outline whose centre x is far from it.
     doc = _v3()
@@ -788,6 +852,7 @@ def test_a_calibration_point_with_x_is_read_where_it_was_marked():
     assert "membrane mem-5: calibration point at y=" in _refusal(doc)
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_marker_areas_must_be_equal():
     # img-2 is linked to its marker img-3: their areas (arena-20, arena-21).
     message = (
@@ -812,6 +877,8 @@ def test_a_marker_of_another_membrane_is_invalid():
     doc = _v3()
     _arena(doc, "arena-21")["image_id"] = "img-6"  # mem-1's area moves to img-6...
     _arena(doc, "arena-23")["image_id"] = "img-3"  # ...and mem-5's to the marker img-3
+    images = doc["batch"]["images"]  # listed in the areas' order: img-2, img-6, img-4, img-3
+    doc["batch"]["images"] = [images[i] for i in (0, 3, 2, 1)]
     assert (
         "image img-2: marker image 'img-3' is not a visible-light marker or merged image of"
         " membrane mem-1" in _refusal(doc)
@@ -828,6 +895,7 @@ def test_outline_bounds():
             Outline(x0=0, y0=0, x1=x1, y1=y1)
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_an_outline_centre_outside_the_image_is_invalid():
     doc = _v3()
     _arena(doc, "arena-23").update(outline={"x0": 150, "y0": 0, "x1": 251, "y1": 100})
@@ -837,6 +905,7 @@ def test_an_outline_centre_outside_the_image_is_invalid():
     )
 
 
+@pytest.mark.usefixtures("drawn_areas")
 @pytest.mark.parametrize(
     ("outline", "centre"),
     [
@@ -854,6 +923,7 @@ def test_an_outline_centre_on_each_side_of_the_image(outline, centre):
     assert f"the centre {centre} of area arena-23 lies outside the 200x100 image" in (_refusal(doc))
 
 
+@pytest.mark.usefixtures("drawn_areas")
 def test_an_outline_centre_on_the_edge_belongs():
     # Centres (0, 50), (200, 50), (100, 0) and (100, 100), reaching past the image.
     for outline in ((-100, 0, 100, 100), (100, 0, 300, 100), (0, -50, 200, 50), (0, 50, 200, 150)):
