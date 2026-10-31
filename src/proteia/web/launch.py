@@ -440,10 +440,13 @@ class Instance:
         finally:
             try:
                 try:
-                    self.workspace.flush()
+                    notice = self.workspace.flush()  # logged there
                 except UnsavedChangesError as exc:
                     print(f"Proteia stopped, but {exc}", file=sys.stderr)
                     _log.warning("Proteia stopped, but %s", exc, extra=logs.FILE_ONLY)
+                else:
+                    if notice is not None:
+                        print(f"Proteia stopped. {notice}", file=sys.stderr)
                 self.workspace.close()
             finally:
                 self.close()

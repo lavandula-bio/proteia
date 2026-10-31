@@ -1403,6 +1403,20 @@ def import_image(
     :func:`_count_misnamed_tiff`): Pillow, which reads it by its suffix,
     would take its first image only. A single image keeps that reader, and
     images imported before keep being read so.
+
+    While ``project.json`` is not the file the session last read or wrote
+    (changed outside Proteia), the import is refused
+    (``PROJECT_CHANGED_OUTSIDE``, with the message a save gets) before it
+    stores a file or deletes an orphan: what that file references is unknown.
+    The message says whether the file was edited or removed, as it is now,
+    and, with changes not saved, the copy they are kept in, as a refused save
+    says it (:meth:`~proteia.core.session.ProjectSession.refusal`). A file
+    that holds the project as it is open, in other bytes, is taken for the
+    one it last read or wrote, and the import goes on.
+
+    The image takes the id ``next_id`` gives, unless the file of an image a
+    kept copy of the project references holds it: then the first one after
+    that none holds (:meth:`~proteia.core.session.ProjectSession.image_number`).
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1420,8 +1434,23 @@ def import_image(
         )
 
     # An orphan may hold the id this import gets (an import that was never saved).
-    session._remove_orphans()
-    image_id = f"img-{session.project.next_id}"  # the id the change below will take
+    # Which files are orphans is known only while project.json is the file the
+    # session last read or wrote: one changed outside Proteia (its image may
+    # hold that id) refuses the import before anything is stored or deleted
+    # (#101). One that cannot be read lets it go on, deleting nothing; its save
+    # then fails as a file error.
+    try:
+        session.check_file()
+    except storage.ChangedOutsideError as exc:
+        refused = session.refusal(exc)  # as the file is now, with the copy of changes not saved
+        raise OperationError(ErrorCode.PROJECT_CHANGED_OUTSIDE, str(refused)) from exc
+    except OSError:
+        pass
+    kept = (session.kept_references(),)  # read once, for the cleanup and the id
+    session._remove_orphans(kept=kept)
+    # The id the change below will take: past those a kept copy's images hold.
+    number = session.image_number(kept)
+    image_id = f"img-{number}"
     try:
         stored = storage.store_image(
             session.folder, image_id, original_name, source, max_bytes=max_bytes
@@ -1466,6 +1495,7 @@ def import_image(
         )
 
         def change(draft: Project) -> str:
+            draft.next_id = max(draft.next_id, number)  # past the ids a kept copy holds
             if draft.new_id("img") != image_id:  # the lock makes this impossible
                 raise RuntimeError(f"image id {image_id} changed while the file was stored")
             if membrane_id is None:

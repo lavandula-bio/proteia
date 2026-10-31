@@ -380,6 +380,25 @@ def write_image_files(folder: Path, project: Project) -> None:
 # --- Real pixels ---
 
 
+class SavesBlocked:
+    """A folder in place of a project's ``project.json``, so that no save can
+    replace it or even read it: every save fails as a file error, as one held
+    open by another program does on Windows. :meth:`lift` puts the file back
+    as it was. A session saves only over the ``project.json`` it last read or
+    wrote (#101): one removed for good would refuse every later save, as
+    changed outside Proteia."""
+
+    def __init__(self, project_file: Path) -> None:
+        self.path = project_file
+        self.kept = project_file.read_bytes()
+        project_file.unlink()
+        project_file.mkdir()
+
+    def lift(self) -> None:
+        self.path.rmdir()
+        self.path.write_bytes(self.kept)
+
+
 def write_tiff(path: Path, pixels: np.ndarray) -> Path:
     """Write ``pixels`` as an uncompressed single-image TIFF (parents created)."""
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ JSON."""
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import http.client
 import io
@@ -37,6 +38,7 @@ from starlette.routing import Mount
 from conftest import (
     MEMBRANE_LEVEL,
     FakeClock,
+    SavesBlocked,
     make_project,
     make_project_with_clashing_names,
     make_project_with_undetected,
@@ -50,7 +52,6 @@ from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
 from proteia.core.model import (
-    BoxSize,
     Project,
     ProposalSource,
     Region,
@@ -1068,20 +1069,24 @@ def test_a_preview_does_not_keep_the_full_image_in_memory(tmp_path):
     assert image_id not in session._pixels
 
 
-def test_quit_saves_unsaved_changes_first_or_refuses(client, tmp_path, monkeypatch):
+def test_quit_saves_unsaved_changes_first_or_refuses(client, tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
     client.ok("POST", "/api/projects", {"name": "Blot"})
     project_file = client.root / "Blot" / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # the autosave cannot replace it
+    blocked = SavesBlocked(project_file)  # the autosave cannot replace it
     answer = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
     assert answer["project"]["saved"] is False and answer["project"]["save_error"]
+    assert answer["project"]["save_error_code"] is None  # a file error: no code of its own
 
-    assert client.refused("POST", "/api/quit")[:2] == (409, "unsaved_changes")
+    status, payload = client.call("POST", "/api/quit")
+    assert (status, payload["code"]) == (409, "unsaved_changes") and "detail" not in payload
     assert client.ok("GET", "/api/status")["app"] == "proteia"  # still running
 
-    project_file.rmdir()
-    assert client.call("POST", "/api/quit")[0] == 202
+    blocked.lift()
+    caplog.set_level(logging.WARNING, logger="proteia.web.api")
+    caplog.clear()
+    assert client.call("POST", "/api/quit") == (202, {"status": "stopping"})
+    assert [r.getMessage() for r in caplog.records if r.name == "proteia.web.api"] == []
     saved = json.loads(project_file.read_text(encoding="utf-8"))
     assert [lane["label"] for lane in saved["batch"]["lanes"]] == ["vehicle"]
 
@@ -2867,10 +2872,10 @@ def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
     assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
 
     # Unsaved changes: the file is older than the session, not changed outside.
-    def refuse(project: Project, folder: Path) -> Path:
+    def refuse(project: Project, folder: Path, *, expect: str | None) -> str:
         raise PermissionError(13, "held by another process", str(folder))
 
-    monkeypatch.setattr(storage, "save_project", refuse)
+    monkeypatch.setattr(storage, "save_project_over", refuse)  # what a session saves with
     api.ops.set_lanes(session, [api.ops.LaneInput("drug")])
     assert session.dirty
     project = session.project
@@ -2903,6 +2908,205 @@ def test_a_reopen_waits_for_a_short_read_and_then_reads_the_changed_file(tmp_pat
     finally:
         read.join(10)
     assert workspace.view(session)[0] == 2 and not session.project.batch.lanes
+
+
+# The project's own version is kept as this copy, named for the time of the
+# refused save (the client's FakeClock, from 08:00:00Z, one second a call).
+KEPT_COPY = "project.unsaved-20260926T080004Z.json"
+CHANGED_OUTSIDE = (
+    "'Blot µ' was changed outside Proteia after Proteia last opened or saved it, so"
+    " Proteia did not save over it and kept a copy of its own version in the project's"
+    " folder as 'project.unsaved-20260926T080004Z.json': open the project again to read"
+    " the version now on disk; to open Proteia's version instead, rename that copy to"
+    " project.json while Proteia does not have the project open"
+)
+
+
+def test_a_save_refused_after_a_change_outside_reaches_the_page_until_a_reopen(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot µ"})
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    project_file = client.root / "Blot µ" / storage.PROJECT_FILE
+    backup = project_file.read_bytes()
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "drug"}]})
+    project_file.write_bytes(backup)  # a previous version restored (#101)
+
+    # The edit is made, its save refused: the state says why, with a code, and
+    # where the project as Proteia holds it was kept.
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "dose α"}]})["project"]
+    assert [lane["condition"] for lane in shown["lanes"]] == ["dose α"]
+    assert (shown["saved"], shown["save_error"], shown["save_error_code"]) == (
+        False,
+        CHANGED_OUTSIDE,
+        "project_changed_outside",
+    )
+    assert str(client.root) not in shown["save_error"]
+    assert project_file.read_bytes() == backup
+    copy = client.root / "Blot µ" / KEPT_COPY
+    kept = json.loads(copy.read_text(encoding="utf-8"))
+    assert [lane["label"] for lane in kept["batch"]["lanes"]] == ["dose α"]
+
+    # An import is refused before anything is stored.
+    images = client.root / "Blot µ" / storage.IMAGES_DIR
+    status, refused = upload(client, blot_bytes(tmp_path))
+    assert (status, refused["code"], refused["message"]) == (
+        422,
+        "project_changed_outside",
+        CHANGED_OUTSIDE,
+    )
+    assert list(images.iterdir()) == []
+
+    kept_bytes = copy.read_bytes()
+
+    # Opening it again reads the version on disk, under a new opening.
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})["project"]
+    assert reopened["open_id"] == 2
+    assert [lane["condition"] for lane in reopened["lanes"]] == ["vehicle"]
+    assert (reopened["saved"], reopened["save_error"], reopened["save_error_code"]) == (
+        True,
+        None,
+        None,
+    )
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle µ"}]})
+    saved = json.loads(project_file.read_text(encoding="utf-8"))
+    assert [lane["label"] for lane in saved["batch"]["lanes"]] == ["vehicle µ"]
+    client.ok("POST", "/api/projects", {"name": "Other"})
+    assert sorted(p.name for p in copy.parent.glob("project.unsaved-*")) == [KEPT_COPY]
+    assert copy.read_bytes() == kept_bytes
+
+
+def test_an_image_only_the_kept_copy_references_survives_a_reopen_and_a_switch(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "Blot µ"})
+    folder = client.root / "Blot µ"
+    project_file = folder / storage.PROJECT_FILE
+    older = project_file.read_bytes()
+    status, answer = upload(client, blot_bytes(tmp_path))
+    assert status == 201, answer
+    image = f"{answer['image_id']}.tif"
+    project_file.write_bytes(older)  # a version without the image restored (#101)
+
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})["project"]
+    assert shown["save_error_code"] == "project_changed_outside"
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})["project"]
+    assert reopened["images"] == []  # the version on disk
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "drug"}]})  # saved, then cleaned
+    client.ok("POST", "/api/projects", {"name": "Other"})  # the switch closes it
+    assert [p.name for p in (folder / storage.IMAGES_DIR).iterdir()] == [image]
+    (copy,) = folder.glob("project.unsaved-*.json")
+    kept = json.loads(copy.read_text(encoding="utf-8"))
+    assert [i["file"] for m in kept["batch"]["membranes"] for i in m["images"]] == [image]
+
+
+# Its project.json removed outside Proteia, then an edit: its save refused, the
+# project kept in this copy (the client's FakeClock: the fourth call).
+REMOVED_COPY = "project.unsaved-20260926T080003Z.json"
+KEPT_NOTICE = (
+    "'Blot µ' was closed with changes that could not be saved, as its project.json was"
+    " changed outside Proteia: they are kept in 'project.unsaved-20260926T080003Z.json' in"
+    " its folder; to go on from them, rename that copy to project.json, then open 'Blot µ'"
+)
+
+
+def _removed_then_edited(client: Client) -> Path:
+    """Create 'Blot µ', remove its project.json outside Proteia, and edit it: its
+    save refused, the change kept in a copy. Returns the project's folder."""
+    client.ok("POST", "/api/projects", {"name": "Blot µ"})
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    folder = client.root / "Blot µ"
+    (folder / storage.PROJECT_FILE).unlink()
+    shown = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "dose α"}]})["project"]
+    assert (shown["saved"], shown["save_error_code"]) == (False, "project_changed_outside")
+    return folder
+
+
+def _labels(path: Path) -> list[str]:
+    return [lane["label"] for lane in json.loads(path.read_text("utf-8"))["batch"]["lanes"]]
+
+
+def test_a_switch_goes_on_once_the_unsaved_changes_are_kept_in_a_copy(client, caplog):
+    folder = _removed_then_edited(client)
+    caplog.set_level(logging.WARNING, logger="proteia.web.api")
+    answer = client.ok("POST", "/api/projects", {"name": "Other"})
+    assert (answer["project"]["name"], answer["notice"]) == ("Other", KEPT_NOTICE)
+    said = [r.getMessage() for r in caplog.records if r.name == "proteia.web.api"]
+    assert said.count(KEPT_NOTICE) == 1
+    assert str(client.root) not in answer["notice"]
+    assert _labels(folder / REMOVED_COPY) == ["dose α"]
+    assert not (folder / storage.PROJECT_FILE).exists()
+    # Nothing to say at the next switch.
+    assert "notice" not in client.ok("POST", "/api/projects", {"name": "Third"})
+
+    (folder / REMOVED_COPY).rename(folder / storage.PROJECT_FILE)  # as it says
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})["project"]
+    assert [lane["condition"] for lane in reopened["lanes"]] == ["dose α"]
+
+
+def test_quit_goes_on_once_the_unsaved_changes_are_kept_in_a_copy(client):
+    folder = _removed_then_edited(client)
+    assert client.call("POST", "/api/quit") == (202, {"status": "stopping", "notice": KEPT_NOTICE})
+    assert _labels(folder / REMOVED_COPY) == ["dose α"]
+
+
+def test_a_switch_and_quit_are_refused_while_no_copy_could_be_kept(client, monkeypatch):
+    real_temp = storage._temp_file
+
+    def temp_file(directory, name, suffix):
+        if name.startswith("project.unsaved-"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_temp(directory, name, suffix)
+
+    monkeypatch.setattr(storage, "_temp_file", temp_file)
+    folder = _removed_then_edited(client)
+    not_saved = {
+        "code": "unsaved_changes",
+        "message": (
+            "the open project could not be saved: 'Blot µ' was changed outside Proteia: its"
+            " project.json was removed after Proteia last opened or saved it, so Proteia did"
+            " not write it again, and it could not keep a copy of its own version either (No"
+            " space left on device): the changes not saved are kept only while the project"
+            " stays open; put the file back to go on saving the project"
+        ),
+        "ids": [],
+        "detail": {"cause": "project_changed_outside"},
+    }
+    assert client.call("POST", "/api/projects", {"name": "Other"}) == (409, not_saved)
+    assert client.call("POST", "/api/quit") == (409, not_saved)
+    assert not (client.root / "Other").exists() and list(folder.glob("project.unsaved-*")) == []
+
+
+def test_opening_again_a_project_whose_file_was_removed_says_what_to_do(client):
+    folder = _removed_then_edited(client)
+    status, refused = client.call("POST", "/api/projects/open", {"name": "Blot µ"})
+    assert (status, refused["code"], refused["message"]) == (
+        409,
+        "project_changed_outside",
+        "'Blot µ' was changed outside Proteia: its project.json was removed after Proteia"
+        " last opened or saved it, so there is nothing to open again; Proteia kept a copy of"
+        " its own version in the project's folder as 'project.unsaved-20260926T080003Z.json':"
+        " put the file back, or rename that copy to project.json, then open the project again",
+    )
+    (folder / REMOVED_COPY).rename(folder / storage.PROJECT_FILE)  # as it says
+    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})["project"]
+    assert (reopened["open_id"], reopened["saved"], reopened["save_error"]) == (1, True, None)
+    assert [lane["condition"] for lane in reopened["lanes"]] == ["dose α"]
+
+
+def test_a_project_json_made_while_a_project_is_created_answers_project_exists(client, monkeypatch):
+    real = storage.save_project_over
+
+    def save_over(project, path, *, expect):  # another program made it meanwhile
+        if expect is None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / storage.PROJECT_FILE).write_bytes(b'{"theirs": true}')
+        return real(project, path, expect=expect)
+
+    monkeypatch.setattr(storage, "save_project_over", save_over)
+    status, refused = client.call("POST", "/api/projects", {"name": "New µ"})
+    assert (status, refused["code"], refused["message"]) == (
+        409,
+        "project_exists",
+        "a project named 'New µ' already exists",
+    )
+    assert (client.root / "New µ" / storage.PROJECT_FILE).read_bytes() == b'{"theirs": true}'
 
 
 def test_a_project_created_where_the_open_one_was_removed_keeps_the_files_it_stores(tmp_path):
@@ -4547,8 +4751,9 @@ def test_an_edit_past_the_check_is_made_in_its_opening_before_a_reopen_reads_the
     # made to that box, in a project the page never showed, and its answer, of
     # opening 2, would be the page's first sign of that opening. The reopen
     # waits for the request instead: the move is made to the box the page shows
-    # and answered as of opening 1. Saved, it replaces the outside change, as an
-    # edit made just before the reopen does, so the reopen finds nothing to read.
+    # and answered as of opening 1. Its save is refused, as is any save over a
+    # file changed outside Proteia (#101), so the reopen then reads that file,
+    # as the refusal says it would, under opening 2.
     target_id, _, _ = live(client, tmp_path, DOSES, boxed=(0, 1, 2))
     session = client.workspace.current()
     other = tmp_path / "copy µ"
@@ -4592,17 +4797,17 @@ def test_an_edit_past_the_check_is_made_in_its_opening_before_a_reopen_reads_the
     assert answer["project"]["open_id"] == shown
     box = next(b for p in answer["project"]["proteins"] for b in p["bands"] if b["id"] == band_id)
     assert (box["lane_index"], box["rect"]) == (3, rect)
+    assert (answer["project"]["saved"], answer["project"]["save_error_code"]) == (
+        False,
+        "project_changed_outside",
+    )
     assert not read_meanwhile
     assert reopen_status == 200, reopen
-    assert (reopen["project"]["open_id"], reopen["project"]["revision"]) == (
-        shown,
-        answer["project"]["revision"],
-    )
+    assert reopen["project"]["open_id"] == shown + 1
+    read = next(b for p in reopen["project"]["proteins"] for b in p["bands"] if b["id"] == band_id)
+    assert read["lane_index"] == 4  # the other copy's box
     _, saved = storage.load_project(session.folder).batch.find_band(band_id)
-    assert (saved.lane_index, list(saved.box.rect(BoxSize(width=SIZE[0], height=SIZE[1])))) == (
-        3,
-        rect,
-    )
+    assert saved.lane_index == 4
 
 
 def test_a_read_past_the_check_answers_its_opening_before_a_reopen_reads_the_file(
@@ -4939,8 +5144,9 @@ def test_an_upload_holds_its_session_while_it_imports_and_answers(
     # other route on the open project does from its start
     # (USES_ITS_SESSION_LATER): its import is made, and answered, within the
     # opening it named. project.json changes outside Proteia while it runs; a
-    # reopen meanwhile waits for it, then finds the import saved over the
-    # change (held in the import) or reads the change (held in the answer).
+    # reopen meanwhile waits for it, then reads the change. Held before the
+    # import, the import is refused, as it finds the file changed (#101);
+    # held in the answer, it was saved before the change.
     shown, folder, earlier = _lanes_set(client, "Blot")
     session = client.workspace.current()
     owner, name = {"import": (api.ops, "import_image"), "answer": (api, "_answer")}[held]
@@ -4963,17 +5169,18 @@ def test_an_upload_holds_its_session_while_it_imports_and_answers(
         assert not thread.is_alive()
 
     (status, answer), (reopen_status, reopen) = uploaded[0], reopened[0]
-    assert status == 201, answer
-    project = answer["project"]
-    assert (project["open_id"], project["lanes"]) == (shown["open_id"], shown["lanes"])
-    assert [image["id"] for image in project["images"]] == [answer["image_id"]]
+    if held == "import":  # refused before anything is stored
+        assert (status, answer["code"]) == (422, "project_changed_outside"), answer
+        assert list((folder / storage.IMAGES_DIR).iterdir()) == []
+    else:
+        assert status == 201, answer
+        project = answer["project"]
+        assert (project["open_id"], project["lanes"]) == (shown["open_id"], shown["lanes"])
+        assert [image["id"] for image in project["images"]] == [answer["image_id"]]
     assert not read_meanwhile
     assert reopen_status == 200, reopen
     after = reopen["project"]
-    if held == "import":  # saved over the change: nothing to read
-        assert (after["open_id"], after["revision"]) == (shown["open_id"], project["revision"])
-    else:
-        assert (after["open_id"], after["lanes"], after["images"]) == (shown["open_id"] + 1, [], [])
+    assert (after["open_id"], after["lanes"], after["images"]) == (shown["open_id"] + 1, [], [])
 
 
 # --- Images handed to the app (#57, N3) ---
@@ -5739,8 +5946,7 @@ def test_an_accept_while_the_open_project_cannot_be_saved_changes_nothing(
     monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
     client.ok("POST", "/api/projects", {"name": "Blot"})
     project_file = client.root / "Blot" / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # the autosave cannot replace it
+    blocked = SavesBlocked(project_file)  # the autosave cannot replace it
     client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
     handoff_id, files = handed_off(client, tmp_path, ["a.tif"])
     path = f"/api/handoffs/{handoff_id}/accept"
@@ -5749,7 +5955,7 @@ def test_an_accept_while_the_open_project_cannot_be_saved_changes_nothing(
     assert in_root(client) == ["Blot"]
     assert listed(client, handoff_id)["files"] == files and len(staging(client)) == 1
 
-    project_file.rmdir()
+    blocked.lift()
     assert accept(client, handoff_id, files)["project"]["name"] == "a"
     saved = storage.load_project(client.root / "Blot")
     assert [lane.label for lane in saved.batch.lanes] == ["vehicle"]
@@ -5769,17 +5975,17 @@ def test_an_edit_made_while_a_switch_runs_is_saved_before_the_old_project_closes
     old = client.workspace.current()
     project_file = old.folder / storage.PROJECT_FILE
     edits: list[str] = []
+    blocks: list[SavesBlocked] = []
     fixed = threading.Event()  # the file can be written again once the edit is made
     create_project = api.projects.create_project
 
     def edited_meanwhile(*args: Any, **kwargs: Any) -> Any:
-        project_file.unlink()
-        project_file.mkdir()  # the edit's autosave fails
+        blocks.append(SavesBlocked(project_file))  # the edit's autosave fails
         edits.append(f"c{len(edits) + 1}")
         api.ops.set_lanes(old, [api.ops.LaneInput(condition) for condition in edits])
         assert old.dirty
         if fixed.is_set():
-            project_file.rmdir()
+            blocks[-1].lift()
         return create_project(*args, **kwargs)
 
     monkeypatch.setattr(api.projects, "create_project", edited_meanwhile)
@@ -5805,7 +6011,7 @@ def test_an_edit_made_while_a_switch_runs_is_saved_before_the_old_project_closes
     assert client.ok("GET", "/api/workspace")["handoffs"] == []  # its images are in First
     assert staging(client) == []
 
-    project_file.rmdir()  # saved again before the switch, then while it runs
+    blocks[-1].lift()  # saved again before the switch, then while it runs
     fixed.set()
     status, payload = switch_to("Second")
     assert status == 201, payload
@@ -5828,10 +6034,10 @@ def test_an_open_whose_old_project_cannot_be_saved_after_it_names_nothing_create
     old = client.workspace.current()
     project_file = old.folder / storage.PROJECT_FILE
     open_project = api.ops.open_project
+    blocks: list[SavesBlocked] = []
 
     def edited_meanwhile(*args: Any, **kwargs: Any) -> Any:
-        project_file.unlink()
-        project_file.mkdir()  # the edit's autosave fails
+        blocks.append(SavesBlocked(project_file))  # the edit's autosave fails
         api.ops.set_lanes(old, [api.ops.LaneInput("c1")])
         assert old.dirty
         return open_project(*args, **kwargs)
@@ -5846,7 +6052,7 @@ def test_an_open_whose_old_project_cannot_be_saved_after_it_names_nothing_create
     assert (client.root / "Other" / storage.PROJECT_FILE).read_bytes() == other
 
     monkeypatch.setattr(api.ops, "open_project", open_project)
-    project_file.rmdir()
+    blocks[-1].lift()
     assert client.ok("POST", "/api/projects/open", {"name": "Other"})["project"]["name"] == "Other"
     assert [lane.label for lane in storage.load_project(old.folder).batch.lanes] == ["c1"]
 
@@ -5861,8 +6067,7 @@ def test_a_switch_waits_for_an_edit_running_on_the_old_project(tmp_path, monkeyp
     workspace = api.Workspace(tmp_path / "root", reveal=lambda folder: None, clock=FakeClock())
     old = workspace.create("Blot")
     project_file = old.folder / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # every save of Blot fails
+    SavesBlocked(project_file)  # every save of Blot fails
     made = threading.Event()
     create_project = api.projects.create_project
 
@@ -5924,12 +6129,11 @@ def test_an_edit_made_on_the_old_project_once_replaced_is_saved_after_the_close(
 
     def edited_then_closed(**kwargs: Any) -> None:
         assert workspace.current() is not old  # replaced
-        project_file.unlink()
-        project_file.mkdir()  # the edit's autosave fails
+        blocked = SavesBlocked(project_file)  # the edit's autosave fails
         api.ops.set_lanes(old, [api.ops.LaneInput("vehicle")])
         assert old.dirty
         if saves:
-            project_file.rmdir()
+            blocked.lift()
         close(**kwargs)
 
     monkeypatch.setattr(old, "close", edited_then_closed)
