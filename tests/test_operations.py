@@ -42,6 +42,7 @@ from conftest import (
     make_project_with_clashing_names,
     make_project_with_undetected,
     sample_doc_v1,
+    stored_copy_or_path_in,
     synthetic_blot,
     write_image_files,
     write_tiff,
@@ -2062,9 +2063,9 @@ def test_inks_the_header_check_misses_are_refused_as_read_with_the_same_answer(t
         # Reading picks its reader by the suffix, as for the images imported
         # before: a JPEG named .tif is no TIFF to it.
         ("jpeg named γ.tif", "not a TIFF file"),
-        # Inks reading does not convert, as before #207 (named as stored).
-        ("five inks.tiff", "img-1.tiff: this separated TIFF has 5 inks"),
-        ("float inks.tif", "img-1.tif: this separated TIFF has float32 inks"),
+        # Inks reading does not convert, as before #207 (#234: named as chosen).
+        ("five inks.tiff", "this separated TIFF has 5 inks"),
+        ("float inks.tif", "this separated TIFF has float32 inks"),
     ],
 )
 def test_inks_the_header_check_misses_that_reading_refuses_are_not_imported(tmp_path, name, why):
@@ -2260,6 +2261,278 @@ def test_one_image_of_a_tiff_of_several_saved_as_its_own_file_is_imported(
     assert s.project.batch.find_image(image_id).bit_depth == one.dtype.itemsize * 8
 
 
+# --- A reading refusal names the file as chosen (#234) ---
+
+
+def _gray8() -> np.ndarray:
+    return (blot() >> 8).astype(np.uint8)
+
+
+def _cielab(gray: np.ndarray) -> bytes:
+    """A CIELAB TIFF of 8-bit ``gray`` levels as its lightness, with no colour."""
+    lab = np.zeros((*gray.shape, 3), dtype=np.uint8)
+    lab[..., 0] = gray
+    return _tiff_bytes(lab, photometric="cielab")
+
+
+def _animated(fmt: str, *frames: np.ndarray) -> bytes:
+    """An animated PNG or GIF (``fmt``) of ``frames``."""
+    from PIL import Image
+
+    images = [Image.fromarray(frame) for frame in frames]
+    return _encoded(images[0], fmt, save_all=True, append_images=images[1:]).read()
+
+
+_SEVERAL_FRAMES = (
+    "it holds more than one frame (such as an animated image), and only a single image can be"
+    " quantified; save one frame as its own file and import it again"
+)
+_UNIDENTIFIED = (
+    "it is not an image Proteia can read (a TIFF, PNG or JPEG file), or it is damaged; save the"
+    " image as a TIFF, PNG or JPEG file and import it again"
+)
+_GRAY_OR_RGB = "which Proteia does not convert to gray; save the image as a gray or RGB TIFF"
+# The refusals of #234 by the name the file is offered under: the file, and
+# what the refusal says after "cannot read '<name>': ".
+_REFUSALS_234 = {
+    "cielab µ.tif": (
+        lambda: _cielab(_gray8()),
+        f"its pixels are stored in the CIELAB colour space, {_GRAY_OR_RGB}",
+    ),
+    "ycbcr α.tif": (
+        lambda: _tiff_bytes(_tinted_rgb(), photometric="ycbcr"),
+        f"its pixels are stored in the YCbCr colour space, {_GRAY_OR_RGB}",
+    ),
+    "camera raw β.tif": (
+        lambda: _tiff_bytes(blot(), photometric=tifffile.PHOTOMETRIC.CFA),
+        f"its pixels are stored with photometric interpretation CFA, {_GRAY_OR_RGB}",
+    ),
+    "two frames µ.png": (lambda: _animated("PNG", _gray8(), _gray8()[::-1]), _SEVERAL_FRAMES),
+    "two rgb frames α.png": (
+        lambda: _animated("PNG", _tinted_rgb(), _tinted_rgb()[::-1]),
+        _SEVERAL_FRAMES,
+    ),
+    "gif named β.png": (lambda: _animated("GIF", _gray8(), _gray8()[::-1]), _SEVERAL_FRAMES),
+    "not an image µ.png": (lambda: b"not an image at all", _UNIDENTIFIED),
+    "not an image α.jpg": (lambda: b"not an image at all", _UNIDENTIFIED),
+    "truncated header β.png": (lambda: _encoded_png()[:30], _UNIDENTIFIED),
+    "damaged tiff named µ.png": (lambda: b"II*\x00\x08\x00\x00\x00" + b"\xff" * 40, _UNIDENTIFIED),
+}
+
+
+def _encoded_png() -> bytes:
+    from PIL import Image
+
+    return _encoded(Image.fromarray(_gray8()), "PNG").read()
+
+
+@pytest.mark.filterwarnings("ignore:Corrupt EXIF data")  # Pillow, on the damaged TIFF
+def test_the_refusals_of_234_name_only_the_chosen_file_in_full(tmp_path):
+    # #234: they named the stored copy ("img-1.tif: its pixels are stored
+    # ..."), or showed its full local path ("cannot identify image file
+    # 'C:\\...\\images\\img-1.png'"), and two gave no next step ("img-1.png:
+    # unsupported image layout (2, 40, 60)"). Each names the file as chosen,
+    # says what is wrong and what to do; which files are refused is as before.
+    s = session_on(tmp_path)
+    answers = {}
+    for name, (data, _) in _REFUSALS_234.items():
+        source = io.BytesIO(data())
+        error = _imports_nothing(
+            s, functools.partial(ops.import_image, s, source, name, kind=CHEMI, polarity=DARK)
+        )
+        assert (error.code, error.ids, error.detail) == (ErrorCode.UNREADABLE_IMAGE, (), None)
+        answers[name] = str(error)
+    assert answers == {
+        name: f"cannot read {name!r}: {words}" for name, (_, words) in _REFUSALS_234.items()
+    }
+    assert answers["two frames µ.png"] == (
+        "cannot read 'two frames µ.png': it holds more than one frame (such as an animated"
+        " image), and only a single image can be quantified; save one frame as its own file and"
+        " import it again"
+    )
+    assert answers["not an image µ.png"] == (
+        "cannot read 'not an image µ.png': it is not an image Proteia can read (a TIFF, PNG or"
+        " JPEG file), or it is damaged; save the image as a TIFF, PNG or JPEG file and import it"
+        " again"
+    )
+    assert answers["cielab µ.tif"] == (
+        "cannot read 'cielab µ.tif': its pixels are stored in the CIELAB colour space, which"
+        " Proteia does not convert to gray; save the image as a gray or RGB TIFF"
+    )
+
+
+@pytest.mark.parametrize("copy", ["gray", "RGB"])
+def test_the_image_of_a_cielab_tiff_saved_as_a_gray_or_rgb_tiff_is_imported(tmp_path, copy):
+    # #234: the refusal's next step, done: the image saved as a gray or an RGB
+    # TIFF imports, with its lightness as the gray levels.
+    from skimage.color import lab2rgb
+
+    s = session_on(tmp_path)
+    gray = _gray8()
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(_cielab(gray)), "cielab µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert str(error).endswith("; save the image as a gray or RGB TIFF")
+    lab = np.zeros((*gray.shape, 3))
+    lab[..., 0] = gray / 255 * 100  # CIELAB TIFF lightness: 0 to 255 for 0 to 100
+    rgb = np.round(lab2rgb(lab) * 255).astype(np.uint8)
+    pixels = rgb if copy == "RGB" else rgb[..., 0]
+    saved = _tiff_bytes(pixels, photometric="rgb" if copy == "RGB" else "minisblack")
+    image_id = ops.import_image(
+        s, io.BytesIO(saved), f"saved {copy} α.tif", kind=CHEMI, polarity=DARK
+    )
+    image = s.project.batch.find_image(image_id)
+    assert image.bit_depth == 8
+    expected = rgb.astype(np.float64).mean(axis=-1) if copy == "RGB" else rgb[..., 0]
+    np.testing.assert_allclose(s.pixels(image_id), expected, rtol=0, atol=1e-9)
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "GIF"])
+def test_one_frame_of_an_animated_file_saved_as_its_own_file_is_imported(tmp_path, fmt):
+    # #234: the refusal's next step, done literally: the second frame saved
+    # as its own file imports, and measures as that frame.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    gray = _gray8()
+    data = _animated(fmt, gray, gray[::-1])
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(s, io.BytesIO(data), "frames µ.png", kind=CHEMI, polarity=DARK),
+    )
+    assert str(error).endswith("; save one frame as its own file and import it again")
+    with Image.open(io.BytesIO(data)) as animated:
+        animated.seek(1)
+        frame = _encoded(animated.convert("L"), "PNG")
+    image_id = ops.import_image(s, frame, "frame 2 α.png", kind=CHEMI, polarity=DARK)
+    np.testing.assert_array_equal(s.pixels(image_id), gray[::-1].astype(np.float64))
+
+
+@pytest.mark.parametrize("fmt", ["TIFF", "PNG", "JPEG"])
+def test_the_image_of_a_file_proteia_cannot_tell_saved_as_tiff_png_or_jpeg_is_imported(
+    tmp_path, fmt
+):
+    # #234: the refusal's next step, done: the image saved as a TIFF, PNG or
+    # JPEG file imports.
+    from PIL import Image
+
+    s = session_on(tmp_path)
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(b"not an image at all"), "unknown µ.png", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert str(error).endswith("; save the image as a TIFF, PNG or JPEG file and import it again")
+    suffix = {"TIFF": "tif", "PNG": "png", "JPEG": "jpg"}[fmt]
+    saved = _encoded(Image.fromarray(_gray8()), fmt)
+    image_id = ops.import_image(s, saved, f"saved α.{suffix}", kind=CHEMI, polarity=DARK)
+    assert s.project.batch.find_image(image_id).bit_depth == 8
+
+
+def _refused_on_reading() -> dict[str, tuple[bytes, ErrorCode]]:
+    """Files an import refuses on reading them, by the name they are offered
+    under, with the code of the refusal (#234: as before): damaged, of a
+    layout or colour space reading refuses, compressed as this installation
+    cannot decode, or not a single image."""
+    from PIL import Image
+
+    gray = _gray8()
+    palette = Image.fromarray(gray).convert("P")
+    lzw = _encoded(palette, "TIFF", compression="tiff_lzw").read()  # Pillow reads indices
+    unreadable = {
+        "signature µ.tif": b"II*\x00",
+        "signature α.png": b"II*\x00",
+        "damaged page β.tif": b"II*\x00\x08\x00\x00\x00" + b"\xff" * 40,
+        "not a tiff µ.tif": _encoded_png(),
+        "truncated α.tif": _tiff_bytes(blot())[:3000],
+        "untyped β.tif": _declared_as(128, 4),
+        "five samples µ.tif": _tiff_bytes(
+            np.dstack([gray] * 5), photometric="minisblack", planarconfig="contig"
+        ),
+        "lzw palette α.tif": lzw,
+        "truncated idat β.png": _encoded_png()[:-200],
+        "stack µ.tif": _several_images()["stack"],
+        "stack α.png": _several_images()["stack"],
+        "no image β.tif": b"II*\x00" + bytes(4),
+        **{name: data() for name, (data, _) in _REFUSALS_234.items()},
+    }
+    return {
+        **{name: (data, ErrorCode.UNREADABLE_IMAGE) for name, data in unreadable.items()},
+        "float µ.tif": (_tiff_bytes(blot().astype(np.float32)), ErrorCode.UNSUPPORTED_PIXEL_TYPE),
+        "cmyk α.jpg": (_cmyk_files()["cmyk µ.jpg"].read(), ErrorCode.CMYK_IMAGE),
+    }
+
+
+@pytest.mark.filterwarnings("ignore:Corrupt EXIF data")  # Pillow, on the damaged TIFF
+@pytest.mark.parametrize("name", list(_refused_on_reading()))
+def test_no_reading_refusal_names_the_stored_copy_or_a_local_path(tmp_path, name):
+    # #234: whatever reading refuses, the refusal names the file as chosen;
+    # the stored copy (img-1.tif) and the project's folder are Proteia's own.
+    data, code = _refused_on_reading()[name]
+    s = session_on(tmp_path)
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
+    )
+    assert error.code is code
+    message = str(error)
+    assert repr(name) in message
+    assert not stored_copy_or_path_in(message, name, s.folder), message
+
+
+@pytest.mark.parametrize(
+    ("error", "reason", "words"),
+    [
+        (FileNotFoundError, "No such file or directory", "No such file or directory"),
+        (PermissionError, "Permission denied", "Permission denied"),
+        (OSError, None, "OSError"),  # no reason given: its kind
+    ],
+)
+def test_a_stored_copy_the_system_cannot_read_is_refused_without_its_path(
+    tmp_path, monkeypatch, error, reason, words
+):
+    # #234: the system's error names the stored copy's full path, which is
+    # Proteia's own: the refusal gives its reason alone.
+    def unreadable(path):
+        raise error(5, reason, str(path))  # errno 5 (EIO): no subclass of its own
+
+    monkeypatch.setattr(ops, "read_file", unreadable)
+    s = session_on(tmp_path)
+    refused = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(_tiff_bytes(blot())), "gray µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert (refused.code, str(refused)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        f"cannot read 'gray µ.tif': {words}",
+    )
+
+
+def test_the_words_of_a_library_that_name_no_path_are_kept(tmp_path):
+    # #234: a damaged file the library refuses in its own words, which name
+    # neither the stored copy nor a path, keeps them, as before.
+    s = session_on(tmp_path)
+    answers = {}
+    for name, data in (
+        ("png named µ.tif", _encoded_png()),
+        ("truncated α.png", _encoded_png()[:-200]),
+    ):
+        source = io.BytesIO(data)
+        error = _imports_nothing(
+            s, functools.partial(ops.import_image, s, source, name, kind=CHEMI, polarity=DARK)
+        )
+        answers[name] = str(error)
+    assert answers == {
+        "png named µ.tif": "cannot read 'png named µ.tif': not a TIFF file: header=b'\\x89PNG'",
+        "truncated α.png": "cannot read 'truncated α.png': image file is truncated",
+    }
+
+
 @pytest.mark.parametrize("suffix", [".png", ".jpg"])
 @pytest.mark.parametrize(
     "name",
@@ -2363,13 +2636,14 @@ def test_a_tiff_of_several_images_imported_before_215_reads_as_before(tmp_path):
 )
 @pytest.mark.filterwarnings("ignore:Corrupt EXIF data")  # Pillow, on the damaged page
 def test_a_tiff_named_otherwise_whose_images_cannot_be_counted_is_left_to_reading(tmp_path, data):
-    # #215: refused by the reader its suffix picks, as before, with its words.
+    # #215: refused by the reader its suffix picks, as before, with its words;
+    # #234: which name the file as chosen, not the stored copy's full path.
     s = session_on(tmp_path)
     error = _imports_nothing(
         s, lambda: ops.import_image(s, io.BytesIO(data), "damaged µ.png", kind=CHEMI, polarity=DARK)
     )
     assert error.code is ErrorCode.UNREADABLE_IMAGE
-    assert str(error).startswith("cannot read 'damaged µ.png': cannot identify image file")
+    assert str(error) == f"cannot read 'damaged µ.png': {_UNIDENTIFIED}"
 
 
 @pytest.mark.parametrize("mode", ["RGB", "L"])

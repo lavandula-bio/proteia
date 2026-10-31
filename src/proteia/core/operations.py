@@ -186,6 +186,7 @@ from proteia.core.imaging import (
     InkSet,
     NotSingleImageError,
     PixelType,
+    ReadingRefusal,
     assess_processed,
     check_misnamed_tiff,
     clipping_depth,
@@ -1442,6 +1443,13 @@ def import_image(
     again; of 1-bit pixels, that it holds no gray levels and the original is
     needed. Images imported before, with their ``unknown_bit_depth`` warning,
     keep being read so.
+
+    Any other file reading refuses is refused (``UNREADABLE_IMAGE``) by the
+    name it was offered under, never by its stored copy's name or a local path
+    (#234; :func:`_reading_refusal`): a colour space reading does not
+    convert, a file of more than one frame (an animated PNG or GIF: save one
+    frame as its own file), one Pillow cannot tell the format of (save the
+    image as a TIFF, PNG or JPEG file), a damaged one.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1490,7 +1498,7 @@ def import_image(
             raise OperationError(ErrorCode.UNREADABLE_IMAGE, exc.refusal(original_name)) from exc
         except (ValueError, OSError) as exc:
             raise OperationError(
-                ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
+                ErrorCode.UNREADABLE_IMAGE, _reading_refusal(original_name, exc)
             ) from exc
         # Failing closed, before any conversion: a type no header declared (the
         # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
@@ -1580,6 +1588,21 @@ _SEVERAL_IMAGES: Final = f"; it also holds {SEVERAL_IMAGES}, and {SINGLE_IMAGE_O
 # What to save, by whether the copy must be uncompressed to be read (a 16-bit
 # RGB or an RGBA TIFF is read only uncompressed; Inks.uncompressed_copy).
 _COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grayscale TIFF"}
+
+
+def _reading_refusal(original_name: str, exc: ValueError | OSError) -> str:
+    """Why reading refused the file offered as ``original_name``, naming it so
+    and never by its stored copy or a local path (#234): reading's own refusal
+    for that name (:class:`~proteia.core.imaging.ReadingRefusal`), else the
+    words of the library that read it, or the system's reason without the
+    stored copy's path."""
+    if isinstance(exc, ReadingRefusal):
+        return exc.refusal(original_name)
+    if isinstance(exc, OSError) and exc.filename is not None:
+        why = exc.strerror or type(exc).__name__
+    else:
+        why = str(exc)
+    return f"cannot read {original_name!r}: {why}"
 
 
 def _header_inks(path: Path) -> Inks | None:

@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-from PIL import Image, ImageCms, ImageDraw
+from PIL import Image, ImageCms, ImageDraw, UnidentifiedImageError
 from skimage import io
 
 from conftest import synthetic_blot
@@ -2342,3 +2342,275 @@ def test_reading_an_image_does_not_assess_whether_it_looks_processed(tmp_path, m
     assert _codes(loaded) == []
     assert loaded.palette  # for the import to assess
     assert not load_image(_write(tmp_path / "figure µ.tif", _white_clipped())).palette
+
+
+# --- A reading refusal apart from the file's name (#234) ---
+
+
+def _rebuilt(error: Exception) -> list[Exception]:
+    """``error`` rebuilt by pickle, at every protocol, and by copy."""
+    protocols = range(pickle.HIGHEST_PROTOCOL + 1)
+    return [
+        *(pickle.loads(pickle.dumps(error, protocol)) for protocol in protocols),
+        copy.copy(error),
+        copy.deepcopy(error),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("remedy", "as_read", "as_chosen"),
+    [
+        (
+            "save it again",
+            "img-1.tif: holds no frames; save it again",
+            "cannot read 'β α.png': holds no frames; save it again",
+        ),
+        ("", "img-1.tif: holds no frames", "cannot read 'β α.png': holds no frames"),
+    ],
+    ids=["remedy", "no-remedy"],
+)
+def test_a_reading_refusal_names_the_file_read_and_gives_its_refusal_for_another(
+    remedy, as_read, as_chosen
+):
+    # #234: the message names the file read (an image's stored copy); the
+    # refusal names it as the user chose it, with the same words.
+    error = imaging.ReadingRefusal("img-1.tif", "holds no frames", remedy)
+    assert isinstance(error, ValueError)
+    assert (str(error), error.refusal("β α.png")) == (as_read, as_chosen)
+    assert (error.name, error.problem, error.remedy) == ("img-1.tif", "holds no frames", remedy)
+    for again in _rebuilt(error):
+        assert type(again) is imaging.ReadingRefusal
+        assert (str(again), again.args, again.refusal("β α.png")) == (
+            as_read,
+            error.args,
+            as_chosen,
+        )
+
+
+def test_a_colour_space_refusal_is_a_reading_refusal_that_survives_pickle_and_copy(tmp_path):
+    path = tmp_path / "cielab µ.tif"
+    tifffile.imwrite(path, np.zeros((6, 8, 3), dtype=np.uint8), photometric="cielab")
+    with pytest.raises(UnsupportedColourSpaceError) as info:
+        load_image(path)
+    error = info.value
+    problem = (
+        "its pixels are stored in the CIELAB colour space, which Proteia does not convert to gray"
+    )
+    assert isinstance(error, imaging.ReadingRefusal)
+    assert (error.problem, error.remedy) == (problem, "save the image as a gray or RGB TIFF")
+    assert error.refusal("lab α.tif") == (
+        f"cannot read 'lab α.tif': {problem}; save the image as a gray or RGB TIFF"
+    )
+    for again in _rebuilt(error):
+        assert type(again) is UnsupportedColourSpaceError
+        assert (str(again), again.problem, again.refusal("β.tif")) == (
+            str(error),
+            problem,
+            error.refusal("β.tif"),
+        )
+
+
+def _frames_of(fmt: str, frames: list[np.ndarray]):
+    def write(path):
+        images = [Image.fromarray(frame) for frame in frames]
+        images[0].save(path, format=fmt, save_all=True, append_images=images[1:])
+
+    return write
+
+
+_RGB_FRAMES = [_gray(np.uint8, 255)[..., None].repeat(3, axis=-1)] * 2
+
+
+@pytest.mark.parametrize(
+    ("name", "write", "words"),
+    [
+        (
+            "two frames µ.png",
+            _frames_of("PNG", [_gray(np.uint8, 255), _gray(np.uint8, 255)[::-1]]),
+            "it holds more than one frame (such as an animated image), and only a single image"
+            " can be quantified; save one frame as its own file and import it again",
+        ),
+        (
+            "rgb frames α.png",
+            _frames_of("PNG", [_RGB_FRAMES[0], _RGB_FRAMES[1][::-1]]),
+            "it holds more than one frame (such as an animated image), and only a single image"
+            " can be quantified; save one frame as its own file and import it again",
+        ),
+        (
+            "gif β.png",
+            _frames_of("GIF", [_gray(np.uint8, 255), _gray(np.uint8, 255)[::-1]]),
+            "it holds more than one frame (such as an animated image), and only a single image"
+            " can be quantified; save one frame as its own file and import it again",
+        ),
+        (
+            "five samples µ.tif",
+            lambda path: tifffile.imwrite(
+                path,
+                np.zeros((6, 8, 5), dtype=np.uint8),
+                photometric="minisblack",
+                planarconfig="contig",
+            ),
+            "unsupported image layout (6, 8, 5)",
+        ),
+        (
+            "not an image α.png",
+            lambda path: path.write_bytes(b"not an image"),
+            "it is not an image Proteia can read (a TIFF, PNG or JPEG file), or it is damaged;"
+            " save the image as a TIFF, PNG or JPEG file and import it again",
+        ),
+        (
+            "not an image β.jpg",
+            lambda path: path.write_bytes(b"not an image"),
+            "it is not an image Proteia can read (a TIFF, PNG or JPEG file), or it is damaged;"
+            " save the image as a TIFF, PNG or JPEG file and import it again",
+        ),
+        (
+            "lzw palette µ.tif",
+            lambda path: (
+                Image.fromarray(_gray(np.uint8, 255))
+                .convert("P")
+                .save(path, compression="tiff_lzw")
+            ),
+            "LZW compression of this 6x8 uint8 PALETTE image cannot be decoded by this"
+            " installation; save the image as an uncompressed TIFF",
+        ),
+        (
+            "truncated α.tif",
+            lambda path: path.write_bytes(b"II*\x00"),
+            "not a readable image (unpack requires a buffer of 4 bytes)",
+        ),
+    ],
+    ids=["animated", "animated-rgb", "gif", "five-samples", "png", "jpeg", "lzw", "damaged"],
+)
+def test_reading_refuses_a_file_apart_from_its_name(tmp_path, name, write, words):
+    # #234: every refusal of reading itself names the file read, and gives
+    # its refusal for another name: a file of several frames and one Pillow
+    # cannot tell in plain words, with a next step; the others as before.
+    path = tmp_path / name
+    write(path)
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        imaging.read_file(path)
+    assert str(info.value) == f"{name}: {words}"
+    assert info.value.refusal("chosen µ.tif") == f"cannot read 'chosen µ.tif': {words}"
+    assert str(path.parent) not in str(info.value)
+
+
+def test_frames_are_counted_only_for_a_layout_reading_refuses(tmp_path, monkeypatch):
+    # #234: counting them makes Pillow read every frame, which fails on some
+    # damaged files that reading takes as their first image (a random sweep
+    # found one): every file reading takes is read as before, uncounted.
+    def never(path):
+        raise AssertionError("frames counted")
+
+    monkeypatch.setattr(imaging, "_frame_count", never)
+    files = {
+        "gray µ.png": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
+        "palette α.png": lambda path: _palette_png().save(path),
+        "gray µ.jpg": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
+    }
+    for name, write in files.items():
+        path = tmp_path / name
+        write(path)
+        assert imaging.read_file(path).pixels.shape[:2] == (6, 8)
+
+
+def test_a_layout_refused_in_a_file_of_one_frame_is_named_as_before(tmp_path, monkeypatch):
+    # #234: only a file of more than one frame is refused as one; scikit-image
+    # giving a layout reading refuses of a file of one frame is refused as
+    # before.
+    path = tmp_path / "one frame µ.png"
+    Image.fromarray(_gray(np.uint8, 255)).save(path)
+    monkeypatch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        imaging.read_file(path)
+    assert str(info.value) == "one frame µ.png: unsupported image layout (2, 6, 8)"
+
+
+def test_a_file_of_a_format_with_no_frames_counts_as_one_frame(tmp_path, monkeypatch):
+    # Pillow's JPEG has no frame count: a layout reading refuses is not
+    # taken for several frames.
+    path = tmp_path / "gray µ.jpg"
+    Image.fromarray(_gray(np.uint8, 255)).save(path)
+    with Image.open(path) as image:
+        assert not hasattr(image, "n_frames")
+    assert imaging._frame_count(path) == 1
+    monkeypatch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        imaging.read_file(path)
+    assert str(info.value) == "gray µ.jpg: unsupported image layout (2, 6, 8)"
+
+
+def test_frames_are_counted_without_pillows_size_warning(tmp_path, monkeypatch, recwarn):
+    # A local file the user chose, as reading opens it: Pillow's size guard
+    # is for untrusted input. 48 pixels a frame is over the limit of 40, and
+    # under twice it, where Pillow refuses instead.
+    path = tmp_path / "two frames µ.png"
+    _frames_of("PNG", [_gray(np.uint8, 255), _gray(np.uint8, 255)[::-1]])(path)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40)
+    recwarn.clear()
+    assert imaging._frame_count(path) == 2
+    assert [w.category for w in recwarn] == []
+
+
+def test_a_file_pillow_cannot_tell_is_refused_with_its_error_as_cause(tmp_path):
+    path = tmp_path / "unknown µ.png"
+    path.write_bytes(b"not an image")
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        imaging.read_file(path)
+    assert type(info.value.__cause__) is UnidentifiedImageError
+    with pytest.raises(UnidentifiedImageError):  # its header, as read before
+        imaging.reads_as_palette(path)
+
+
+def test_a_compressed_tiff_over_pillows_size_limit_is_a_reading_refusal(tmp_path, monkeypatch):
+    path = tmp_path / "large lzw µ.tif"
+    Image.fromarray(_gray(np.uint16, 65535)).save(path, compression="tiff_lzw")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)  # 48 pixels is over twice the limit
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        load_image(path)
+    assert info.value.refusal("big α.tif") == (
+        "cannot read 'big α.tif': this compressed TIFF has more pixels than the compressed-TIFF"
+        " reader accepts; save the image as an uncompressed TIFF"
+    )
+    assert str(info.value).startswith("large lzw µ.tif: this compressed TIFF has more pixels")
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        _declared(tifffile.PHOTOMETRIC.MINISWHITE, 1),
+        _declared(tifffile.PHOTOMETRIC.MINISBLACK, 1, dtype=np.uint16),
+    ],
+    ids=["layout-pillow-changes", "result-differs"],
+)
+def test_a_tiff_pillow_would_read_otherwise_is_a_reading_refusal(tmp_path, declared):
+    path = tmp_path / "lzw µ.tif"
+    Image.fromarray(_gray(np.uint8, 255)).save(path, compression="tiff_lzw")
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        _read_tiff_with_pillow(path, declared)
+    words = (
+        f"LZW compression of this 6x8 {declared.dtype} {declared.photometric.name} image cannot"
+        " be decoded by this installation; save the image as an uncompressed TIFF"
+    )
+    assert (str(info.value), info.value.refusal("x.tif")) == (
+        f"lzw µ.tif: {words}",
+        f"cannot read 'x.tif': {words}",
+    )
+
+
+def test_a_decoder_error_of_a_compressed_tiff_is_a_reading_refusal(tmp_path, monkeypatch):
+    path = tmp_path / "lzw µ.tif"
+    Image.fromarray(_gray(np.uint8, 255)).save(path, compression="tiff_lzw")
+    real = Image.open
+
+    def broken(*args, **kwargs):
+        image = real(*args, **kwargs)
+        image.close()
+        raise SyntaxError("broken")
+
+    monkeypatch.setattr(Image, "open", broken)
+    declared = _declared(tifffile.PHOTOMETRIC.MINISBLACK, 1)
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        _read_tiff_with_pillow(path, declared)
+    assert info.value.refusal("x.tif").startswith("cannot read 'x.tif': LZW compression of this")
+    assert type(info.value.__cause__) is SyntaxError

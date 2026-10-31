@@ -19,8 +19,11 @@ Image helpers for tests that read real pixels: :func:`write_tiff` and
 :func:`assert_strict_json` checks that a model's JSON is strict and loses nothing.
 """
 
+import functools
 import hashlib
+import inspect
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +33,7 @@ import pytest
 import tifffile
 from pydantic import BaseModel
 
+from proteia.core import operations
 from proteia.core.model import Project, apply_change
 from proteia.core.storage import image_path
 
@@ -65,6 +69,52 @@ def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
     state = tmp_path_factory.mktemp("user-state")
     monkeypatch.setenv("LOCALAPPDATA", str(state))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
+
+
+# The name of an image's stored copy in images/ (img-1.tif), whatever the case.
+_STORED_COPY = re.compile(r"img-\d+\.(?:tiff?|png|jpe?g)", re.IGNORECASE)
+# The start of a Windows path (C:\ or C:/), as written or escaped in a repr.
+_DRIVE = re.compile(r"\b[A-Za-z]:[\\/]")
+
+
+def stored_copy_or_path_in(message: str, original_name: str, folder: Path) -> bool:
+    """Whether ``message``, an import's refusal of a file offered as
+    ``original_name`` into the project at ``folder``, names an image's
+    stored copy (``img-1.tif``) or shows a local path: the project folder,
+    the folder it is in, or any Windows path (#234). The offered name itself
+    may hold anything."""
+    rest = message.replace(repr(original_name), "").replace(original_name, "")
+    if _STORED_COPY.search(rest) or _DRIVE.search(rest):
+        return True
+    paths = {folder, folder.resolve(), folder.parent, folder.resolve().parent}
+    forms = {form for path in paths for form in (str(path), repr(str(path))[1:-1])}
+    return any(form in rest for form in forms)
+
+
+_IMPORT_IMAGE = inspect.signature(operations.import_image)
+
+
+@pytest.fixture(autouse=True)
+def _import_refusals_name_the_file_as_chosen(monkeypatch):
+    """No import refusal that any test meets names the image's stored copy or
+    shows a local path (#234), whatever else the test checks: each refusal of
+    :func:`~proteia.core.operations.import_image` is checked as it is raised."""
+    real = operations.import_image
+
+    @functools.wraps(real)
+    def import_image(*args, **kwargs):
+        try:
+            return real(*args, **kwargs)
+        except operations.OperationError as exc:
+            call = _IMPORT_IMAGE.bind(*args, **kwargs)
+            name = call.arguments["original_name"]
+            folder = getattr(call.arguments["session"], "folder", None)
+            if isinstance(name, str) and folder is not None:
+                where = stored_copy_or_path_in(str(exc), name, folder)
+                assert not where, f"an import refusal names a stored copy or a path: {exc}"
+            raise
+
+    monkeypatch.setattr(operations, "import_image", import_image)
 
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
