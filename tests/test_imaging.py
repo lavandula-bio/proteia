@@ -3036,6 +3036,19 @@ def test_a_refusal_names_the_chosen_file_for_the_stored_copys_folder_and_name(pl
     assert other == "cannot read 'img-1.png gel µ.png': img-12.png or ximg-1.png"
 
 
+def test_a_refusal_names_the_chosen_file_for_the_stored_copy_as_given_and_resolved(tmp_path):
+    # A library may give the path it was handed or the one it resolves.
+    stored = tmp_path / "other" / ".." / "project µ" / "images" / "img-1.png"
+    stored.parent.mkdir(parents=True)
+    resolved = stored.resolve()
+    assert str(resolved) != str(stored)
+    answers = [
+        imaging.named_refusal(ValueError(f"cannot open {path}"), "gel α.png", stored)
+        for path in (stored, resolved)
+    ]
+    assert answers == ["cannot read 'gel α.png': cannot open gel α.png"] * 2
+
+
 def test_a_refusal_for_an_image_already_imported_gives_no_remedy():
     # #234 review: an image already in the project is read again; a remedy
     # that says to import it again would lose its boxes. Its refusal says
