@@ -154,9 +154,9 @@ class ErrorCode(StrEnum):
     # inks (#207); one imported before is still read, converted. ``detail``:
     # inks ("cmyk" or "other"), several_images, uncompressed_copy.
     CMYK_IMAGE = "cmyk_image"
-    # An import of a file whose pixels have no fixed range: floating point, or
-    # integers other than unsigned 8 or 16 bits (#224); one imported before is
-    # still read, with its unknown_bit_depth warning.
+    # An import of a file whose pixels have no fixed range: floating point,
+    # complex, 1-bit, or integers other than unsigned 8 or 16 bits (#224); one
+    # imported before is still read, with its unknown_bit_depth warning.
     UNSUPPORTED_PIXEL_TYPE = "unsupported_pixel_type"
     IMAGE_FILE_CHANGED = "image_file_changed"  # stored file missing, other bytes, other shape
     # The project folder's path leaves an export's files too little room within

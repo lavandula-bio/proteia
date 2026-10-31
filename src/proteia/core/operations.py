@@ -1411,15 +1411,18 @@ def import_image(
     A file whose pixels have no fixed range is refused (``UNSUPPORTED_PIXEL_TYPE``,
     #224; :func:`_refuse_pixel_type`): floating point (ImageJ's 32-bit type),
     1-bit, or integers other than unsigned 8 or 16 bits, on which over-exposure
-    cannot be checked. A TIFF is refused from its header, before its pixels
-    are read (:func:`_header_pixel_type`), so that one is refused for its type
-    whatever else reading would say (a NaN pixel, a layout or a stack); any
-    other file as read, before its pixels are converted. The message names the
-    file and its pixel type (a TIFF's integers by the width its header says)
-    and says to save it as a 16-bit TIFF (unsigned, for signed integers) and
-    import it again; of 1-bit pixels, that it holds no gray levels and the
-    original is needed. Images imported before, with their
-    ``unknown_bit_depth`` warning, keep being read so.
+    cannot be checked. A TIFF of a single image is refused from its header,
+    before its pixels are read (:func:`_header_pixel_type`), so that one is
+    refused for its type whatever else reading would say (a NaN pixel, a
+    layout); a TIFF of several images is refused as such, as before, whatever
+    the type of the first (a mask or a thumbnail); any other file as read,
+    before its pixels are converted. The message names the file and its pixel
+    type (a TIFF's integers by the width its header says), and a colour space
+    reading refuses too, and says to save it as a 16-bit TIFF (unsigned, for
+    signed integers; grayscale or RGB, for such a colour space) and import it
+    again; of 1-bit pixels, that it holds no gray levels and the original is
+    needed. Images imported before, with their ``unknown_bit_depth`` warning,
+    keep being read so.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1462,18 +1465,17 @@ def import_image(
         try:
             _count_misnamed_tiff(path)
             read = read_file(path)
-            # Failing closed, before any conversion: a type no header declared
-            # (the file is no TIFF: a 1-bit PNG) is refused as read.
-            _refuse_pixel_type(original_name, pixel_type(read.pixels))
-            loaded = load_pixels(read)
-        except OperationError:
-            raise
         except (ValueError, OSError) as exc:
             if isinstance(exc, NotSingleImageError):
                 _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
             raise OperationError(
                 ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
             ) from exc
+        # Failing closed, before any conversion: a type no header declared (the
+        # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
+        # bit depth, integers in the layout reading checked, convert without error.
+        _refuse_pixel_type(original_name, pixel_type(read.pixels))
+        loaded = load_pixels(read)
         if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
             # Failing closed: inks the header check missed are refused as read,
             # never imported converted. Reading drops an alpha channel, so the
@@ -1637,9 +1639,11 @@ def _refuse_pixel_type(original_name: str, pixels: PixelType | None) -> None:
     warning; reading still does, for the images imported so.
 
     The copy to save is a 16-bit TIFF, unsigned for signed integers (or
-    integers whose sign no header says), which an import takes. A 1-bit
-    image holds no gray levels, which no copy of it would hold either: the
-    refusal asks for the image it was made from."""
+    integers whose sign no header says), which an import takes; grayscale or
+    RGB where reading refuses the file's colour space too, which the refusal
+    names (``pixels.held``), so that the copy imports. A 1-bit image holds
+    no gray levels, which no copy of it would hold either: the refusal asks
+    for the image it was made from."""
     if pixels is None:
         return
     name, kind, bits = repr(original_name), pixels.kind, pixels.bits
@@ -1650,19 +1654,21 @@ def _refuse_pixel_type(original_name: str, pixels: PixelType | None) -> None:
             " or white, so the file holds no gray levels to measure; import the original"
             " grayscale image instead",
         )
-    copy = "a 16-bit TIFF"
+    tiff = "16-bit grayscale or RGB TIFF" if pixels.held else "16-bit TIFF"
+    copy = f"a {tiff}"
     if kind not in "iu":
         what = f"{_PIXEL_KINDS.get(kind, pixels.name)} pixels"
     elif bits is None:
-        what, copy = _READ_INTEGERS, "an unsigned 16-bit TIFF"
+        what, copy = _READ_INTEGERS, f"an unsigned {tiff}"
     elif kind == "i":
-        what, copy = f"signed {bits}-bit integer pixels", "an unsigned 16-bit TIFF"
+        what, copy = f"signed {bits}-bit integer pixels", f"an unsigned {tiff}"
     else:
         what = f"{bits}-bit integer pixels"
+    held = f" {pixels.held}" if pixels.held else ""
     raise OperationError(
         ErrorCode.UNSUPPORTED_PIXEL_TYPE,
-        f"{name} holds {what}, which Proteia does not import: save it as {copy} and import"
-        " it again",
+        f"{name} holds {what}{held}, which Proteia does not import: save it as {copy} and"
+        " import it again",
     )
 
 

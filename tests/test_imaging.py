@@ -436,6 +436,12 @@ def _three_pages(pixels: np.ndarray):
     return write
 
 
+def _image_after(first: np.ndarray, **options):
+    """A writer of a TIFF of a 16-bit image after a page ``first`` (a mask or
+    a thumbnail, by ``options``): two image series, which reading refuses."""
+    return _pages((first, options), (_gray(np.uint16, 65535), {}))
+
+
 def _patched_header(data: bytes, bits: int, sampleformat: int) -> bytes:
     """A :func:`_packed_tiff` file whose header says its samples are ``bits``
     wide, of ``sampleformat`` (1 unsigned, 2 signed integer, 3 floating
@@ -490,7 +496,64 @@ _DECLARED_TYPES = {
         ("c", 64),
     ),
     # The first image's: a stack of them is refused as one when read.
-    "float stack β.tif": (_three_pages(_gray(np.uint8, 255).astype(np.float32)), ("f", 32)),
+    # #224 review 2: a TIFF of several images is judged by none of them: its
+    # first page may be a mask or a thumbnail of another type than the image,
+    # and reading refuses the file as several images.
+    "float stack β.tif": (_three_pages(_gray(np.uint8, 255).astype(np.float32)), None),
+    "float stack in one series µ.tif": (
+        lambda path: tifffile.imwrite(
+            path, np.stack([_gray(np.uint8, 255)] * 2).astype(np.float32)
+        ),
+        None,
+    ),
+    "mask first α.tif": (
+        lambda path: _image_after(_gray(np.uint8, 255) > 99, subfiletype=4, bitspersample=1)(path),
+        None,
+    ),
+    "float thumbnail first β.tif": (
+        lambda path: _image_after(_gray(np.uint8, 255).astype(np.float32), subfiletype=1)(path),
+        None,
+    ),
+    # #224 review 2: reading refuses the colour space too, which the
+    # refusal names with the type.
+    "float CIELAB µ.tif": (
+        lambda path: tifffile.imwrite(
+            path, np.dstack([_gray(np.uint8, 255)] * 3).astype(np.float32), photometric="cielab"
+        ),
+        ("f", 32, "in the CIELAB colour space"),
+    ),
+    "int16 YCbCr α.tif": (
+        lambda path: tifffile.imwrite(
+            path, np.dstack([_gray(np.int16, 99)] * 3), photometric="ycbcr"
+        ),
+        ("i", 16, "in the YCbCr colour space"),
+    ),
+    "float CFA β.tif": (
+        lambda path: tifffile.imwrite(
+            path, _gray(np.uint8, 255).astype(np.float32), photometric=32803
+        ),
+        ("f", 32, "with photometric interpretation CFA"),
+    ),
+    # Gray, RGB and palette are read as stored, white-is-zero too, and CMYK
+    # converted (whose inks an import refuses first, #207).
+    "float CMYK β.tif": (
+        lambda path: tifffile.imwrite(
+            path, np.dstack([_gray(np.uint8, 255)] * 4).astype(np.float32), photometric="separated"
+        ),
+        ("f", 32),
+    ),
+    "float white-is-zero µ.tif": (
+        lambda path: tifffile.imwrite(
+            path, _gray(np.uint8, 255).astype(np.float32), photometric="miniswhite"
+        ),
+        ("f", 32),
+    ),
+    "float RGB α.tif": (
+        lambda path: tifffile.imwrite(
+            path, np.dstack([_gray(np.uint8, 255)] * 3).astype(np.float32), photometric="rgb"
+        ),
+        ("f", 32),
+    ),
     # Widths tifffile has no type for, named by their sample format.
     "signed 12-bit µ.tif": (lambda path: path.write_bytes(_declared_as(12, 2)), ("i", 12)),
     "128-bit α.tif": (lambda path: path.write_bytes(_declared_as(128, 1)), ("u", 128)),
@@ -521,7 +584,8 @@ def test_a_tiff_header_declares_the_type_of_pixels_with_no_known_bit_depth(tmp_p
     if expected is None:
         assert declared is None
     else:
-        assert declared == imaging.PixelType(*expected, "")
+        kind, bits, *held = expected
+        assert declared == imaging.PixelType(kind, bits, "", *held or [""])
         assert type(declared.bits) is int
 
 
@@ -547,6 +611,25 @@ def test_a_header_that_cannot_be_read_declares_no_type(tmp_path, data, error, me
         imaging.declared_pixel_type(path)
     if message is not None:
         assert str(info.value) == f"damaged µ.tif: not a readable image {message}"
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_running_out_of_memory_while_reading_a_header_is_not_a_damaged_file(
+    tmp_path, monkeypatch, error
+):
+    # #224 review 2: a header that cannot be read is left to reading (a
+    # ValueError the import ignores); a MemoryError must not be, or a signed
+    # 8-bit TIFF named .png would be read by Pillow as unsigned. As #217's
+    # check_misnamed_tiff.
+    path = tmp_path / "int8 µ.png"
+    tifffile.imwrite(path, _gray(np.int8, 127))
+
+    def run_out(*args, **kwargs):
+        raise error("no room")
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out)
+    with pytest.raises(error, match="^no room$"):
+        imaging.declared_pixel_type(path)
 
 
 @pytest.mark.parametrize(

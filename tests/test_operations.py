@@ -2883,8 +2883,9 @@ _UNKNOWN_DEPTH_FILES = {
     ),
     # #224 review: refused for its type, not as a file reading refuses: one
     # NaN or infinite pixel (common in ratio images), a layout of five
-    # samples, a stack, a type Pillow (which reads a TIFF named .png) cannot
-    # read. Each is refused from its header, before it is decoded.
+    # samples, a type Pillow (which reads a TIFF named .png) cannot read.
+    # Each is refused from its header, before it is decoded. (A stack is
+    # refused as several images: _SEVERAL_IMAGES_FIRST.)
     "nan µ.tif": (lambda: _float_with(np.nan), "floating-point", _SIXTEEN),
     "infinite α.tif": (lambda: _float_with(np.inf), "floating-point", _SIXTEEN),
     "minus infinite β.tif": (lambda: _float_with(-np.inf), "floating-point", _SIXTEEN),
@@ -2893,7 +2894,6 @@ _UNKNOWN_DEPTH_FILES = {
         "floating-point",
         _SIXTEEN,
     ),
-    "stack α.tif": (_float_stack, "floating-point", _SIXTEEN),
     "half named β.png": (
         lambda: _tiff_bytes(blot().astype(np.float16)),
         "floating-point",
@@ -3108,6 +3108,125 @@ def test_a_header_that_cannot_be_read_leaves_the_reading_to_say_why(tmp_path):
         )
         assert error.code is ErrorCode.UNREADABLE_IMAGE
         assert str(error).startswith(f"cannot read {name!r}: ")
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_running_out_of_memory_on_the_header_check_imports_nothing(tmp_path, monkeypatch, error):
+    # #224 review 2: had the header check taken it for a damaged header, the
+    # import would have read this signed 8-bit TIFF named .png by Pillow, as
+    # unsigned 8-bit, and imported it with its negative values wrong.
+    real = tifffile.TiffFile
+
+    def run_out_in_the_header_check(*args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "declared_pixel_type":
+            raise error("no room")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out_in_the_header_check)
+    s = session_on(tmp_path)
+    source = io.BytesIO(_tiff_bytes((blot() >> 9).astype(np.int8) - 64))
+    with pytest.raises(error, match="^no room$"):
+        ops.import_image(s, source, "int8 µ.png", kind=CHEMI, polarity=DARK)
+    assert (_stored_files(s), s.project.next_id) == ([], 1)
+
+
+def _image_after(first: np.ndarray, **options) -> bytes:
+    """A TIFF of :func:`blot` as a 16-bit image after a page ``first`` (a
+    mask or a thumbnail, by ``options``): two image series."""
+    data = io.BytesIO()
+    with tifffile.TiffWriter(data) as tif:
+        tif.write(first, **options)
+        tif.write(blot())
+    return data.getvalue()
+
+
+# TIFFs of several images whose first is of a type with no known bit depth,
+# by the name they are offered under, and the axes reading names (#215).
+_SEVERAL_IMAGES_FIRST = {
+    "mask first µ.tif": (
+        lambda: _image_after(blot() < 40000, subfiletype=4, bitspersample=1),
+        "holds 2 image series with axes 'YX'",
+    ),
+    "mask first α.png": (
+        lambda: _image_after(blot() < 40000, subfiletype=4, bitspersample=1),
+        "holds 2 image series with axes 'YX'",
+    ),
+    "float thumbnail first β.tif": (
+        lambda: _image_after((blot()[::4, ::4] / 65535).astype(np.float32), subfiletype=1),
+        "holds 2 image series with axes 'YX'",
+    ),
+    "float stack µ.tif": (_float_stack, "holds 3 image series with axes 'YX'"),
+    "float stack in one series α.tif": (
+        lambda: _tiff_bytes(np.stack([blot() / 65535] * 2).astype(np.float32)),
+        "holds 1 image series with axes 'QYX'",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_SEVERAL_IMAGES_FIRST))
+def test_a_tiff_of_several_images_is_refused_as_such_whatever_the_type_of_the_first(tmp_path, name):
+    # #224 review 2: the header check judges the image reading takes, and
+    # only in a file of one: a 1-bit mask or a float thumbnail before a
+    # 16-bit image says nothing of the image. The file is refused as several
+    # images (#215), whose next step (save one image) leads on.
+    s = session_on(tmp_path)
+    data, held = _SEVERAL_IMAGES_FIRST[name]
+    source = io.BytesIO(data())
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
+    )
+    stored = f"img-1{Path(name).suffix}"
+    assert error.code is ErrorCode.UNREADABLE_IMAGE
+    assert str(error) == (
+        f"cannot read {name!r}: {stored}: {held}; only a single 2-D gray or color image can be"
+        " quantified (stacks and multi-channel composites are not supported)"
+    )
+
+
+# Files of a type with no known bit depth in a colour space reading refuses
+# too, by name: what the refusal says they hold, the copy it asks for, and
+# that copy's pixels.
+_GRAY_OR_RGB = "a 16-bit grayscale or RGB TIFF"
+_IN_A_COLOUR_SPACE = {
+    "float CIELAB µ.tif": (
+        lambda: _tiff_bytes(
+            np.dstack([blot() / 65535] * 3).astype(np.float32), photometric="cielab"
+        ),
+        "floating-point pixels in the CIELAB colour space",
+        _GRAY_OR_RGB,
+    ),
+    "int16 YCbCr α.tif": (
+        lambda: _tiff_bytes(np.dstack([blot() // 2] * 3).astype(np.int16), photometric="ycbcr"),
+        "signed 16-bit integer pixels in the YCbCr colour space",
+        "an unsigned 16-bit grayscale or RGB TIFF",
+    ),
+    "float CFA named β.png": (
+        lambda: _tiff_bytes((blot() / 65535).astype(np.float32), photometric=32803),
+        "floating-point pixels with photometric interpretation CFA",
+        _GRAY_OR_RGB,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_IN_A_COLOUR_SPACE))
+def test_a_file_also_in_a_colour_space_reading_refuses_is_refused_for_both(tmp_path, name):
+    # #224 review 2: "save it as a 16-bit TIFF" alone would leave the colour
+    # space, which reading then refuses; the refusal names both, and its
+    # next step done (a 16-bit grayscale copy) imports.
+    data, what, copy = _IN_A_COLOUR_SPACE[name]
+    s = session_on(tmp_path)
+    source = io.BytesIO(data())
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, name, kind=CHEMI, polarity=DARK)
+    )
+    assert (error.code, str(error)) == (
+        ErrorCode.UNSUPPORTED_PIXEL_TYPE,
+        f"{name!r} holds {what}, which Proteia does not import: save it as {copy} and import"
+        " it again",
+    )
+    image_id = import_blot(s, blot(), Path(name).stem + ".tif")  # the gray copy
+    image = s.project.batch.find_image(image_id)
+    assert (image_id, image.bit_depth, image.import_warnings) == ("img-1", 16, [])
 
 
 @pytest.mark.parametrize(("suffix", "warnings"), [(".png", []), (".jpg", ["lossy_format"])])

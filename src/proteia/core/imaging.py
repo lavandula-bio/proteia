@@ -329,14 +329,18 @@ def _holds_cmyk(page: tifffile.TiffPage, name: str) -> bool:
 def _colour_space_refusal(
     name: str, photometric: tifffile.PHOTOMETRIC | int
 ) -> UnsupportedColourSpaceError:
+    return UnsupportedColourSpaceError(
+        name, f"its pixels are stored {_held(photometric)}, which Proteia does not convert to gray"
+    )
+
+
+def _held(photometric: tifffile.PHOTOMETRIC | int) -> str:
+    """How a refusal says a TIFF holds its pixels in a colour space reading
+    does not convert: by its name, or by its photometric interpretation."""
     space = _COLOUR_SPACES.get(photometric)
     if space is None:
-        held = f"with photometric interpretation {getattr(photometric, 'name', photometric)}"
-    else:
-        held = f"in the {space} colour space"
-    return UnsupportedColourSpaceError(
-        name, f"its pixels are stored {held}, which Proteia does not convert to gray"
-    )
+        return f"with photometric interpretation {getattr(photometric, 'name', photometric)}"
+    return f"in the {space} colour space"
 
 
 def _check_inks(page: tifffile.TiffPage, name: str) -> None:
@@ -746,6 +750,9 @@ class PixelType(NamedTuple):
     # numpy's name of the type as read, for a kind no reader gives; a
     # header's kinds are those of its sample formats.
     name: str = ""
+    # How a TIFF holds them when reading refuses its colour space too ("in the
+    # CIELAB colour space"), so that the refusal names both; empty otherwise.
+    held: str = ""
 
 
 def pixel_type(pixels: np.ndarray) -> PixelType | None:
@@ -769,35 +776,52 @@ def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
     """The type a TIFF's header declares for its pixels (a TIFF by its first
     bytes, whatever its suffix) if it has no known bit depth, with its bits
     per sample, so that an import refuses the file before decoding it (#224).
-    It is the first image's, as tifffile reads it: a stack is refused as one
-    when read. A TIFF named otherwise is read by Pillow, which reads a signed
-    8-bit one as unsigned, and is refused by its header all the same. A type
-    tifffile does not read (signed 12-bit integers) is named by its sample
-    format.
+    It is that of the image reading takes, as tifffile reads it, in a TIFF of
+    a single image (:func:`_single_image`). A TIFF named otherwise is read by
+    Pillow, which reads a signed 8-bit one as unsigned, and is refused by its
+    header all the same. A type tifffile does not read (signed 12-bit
+    integers) is named by its sample format. Where reading refuses the
+    colour space too (CIELAB, YCbCr, ...), it says how the file holds them.
 
     None for a file that is not a TIFF (its type is told as read,
-    :func:`pixel_type`), and for a TIFF whose pixels have a known bit depth.
-    A file it cannot read raises ``ValueError`` or ``OSError``.
+    :func:`pixel_type`), for a TIFF whose pixels have a known bit depth, and
+    for a TIFF of several images (a stack, a mask or a thumbnail before the
+    image), which says nothing of the image: it is refused as several images
+    (:func:`check_misnamed_tiff`, reading). A file it cannot read raises
+    ``ValueError`` or ``OSError``.
     """
     path = Path(path)
     try:
         if not _holds_tiff(path):
             return None
         with tifffile.TiffFile(path) as tif:
-            page = _first_page(tif, path.name)
+            series = tif.series
+            if not _single_image(series):
+                return None
+            page = series[0].keyframe
             dtype, bits, sampleformat = page.dtype, int(page.bitspersample), page.sampleformat
-    except (ValueError, OSError):
+            photometric = page.photometric
+    except (ValueError, OSError, MemoryError, RecursionError):
+        # Running out of memory or stack is not a damaged header: the import
+        # must not take the file by the reader its suffix picks (as #217).
         raise
     except Exception as exc:  # a damaged file: struct.error, ...
         raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
     if dtype is not None:
-        return None if _depth_of(dtype) is not None else PixelType(dtype.kind, bits)
-    kind = _SAMPLE_KINDS.get(sampleformat)
-    if kind is None:  # untyped (VOID), complex or unknown samples of such a width
-        raise ValueError(
-            f"{path.name}: not a readable image ({bits}-bit samples of format {int(sampleformat)})"
-        )
-    return PixelType(kind, bits)
+        if _depth_of(dtype) is not None:
+            return None
+        kind = dtype.kind
+    else:
+        kind = _SAMPLE_KINDS.get(sampleformat)
+        if kind is None:  # untyped (VOID), complex or unknown samples of such a width
+            raise ValueError(
+                f"{path.name}: not a readable image"
+                f" ({bits}-bit samples of format {int(sampleformat)})"
+            )
+    # Reading takes these colour spaces, converting CMYK (whose inks an import
+    # refuses first, #207); it refuses any other.
+    taken = photometric in _TIFF_AS_STORED or photometric == tifffile.PHOTOMETRIC.SEPARATED
+    return PixelType(kind, bits, held="" if taken else _held(photometric))
 
 
 # The looks_processed warning (#127): signals that an image was prepared for
