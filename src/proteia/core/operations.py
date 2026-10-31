@@ -183,12 +183,16 @@ from proteia.core.imaging import (
     Inks,
     InkSet,
     NotSingleImageError,
+    PixelType,
     assess_processed,
     check_misnamed_tiff,
     clipping_depth,
+    declared_pixel_type,
     ink_set,
-    load_image,
+    load_pixels,
+    pixel_type,
     possible_clipping_depth,
+    read_file,
     reads_as_palette,
 )
 from proteia.core.model import (
@@ -1409,6 +1413,22 @@ def import_image(
     :func:`_count_misnamed_tiff`): Pillow, which reads it by its suffix,
     would take its first image only. A single image keeps that reader, and
     images imported before keep being read so.
+
+    A file whose pixels have no fixed range is refused (``UNSUPPORTED_PIXEL_TYPE``,
+    #224; :func:`_refuse_pixel_type`): floating point (ImageJ's 32-bit type),
+    1-bit, or integers other than unsigned 8 or 16 bits, on which over-exposure
+    cannot be checked. A TIFF of a single image is refused from its header,
+    before its pixels are read (:func:`_header_pixel_type`), so that one is
+    refused for its type whatever else reading would say (a NaN pixel, a
+    layout); a TIFF of several images is refused as such, as before, whatever
+    the type of the first (a mask or a thumbnail); any other file as read,
+    before its pixels are converted. The message names the file and its pixel
+    type (a TIFF's integers by the width its header says), and a colour space
+    reading refuses too, and says to save it as a 16-bit TIFF (unsigned, for
+    signed integers; grayscale or RGB, for such a colour space) and import it
+    again; of 1-bit pixels, that it holds no gray levels and the original is
+    needed. Images imported before, with their ``unknown_bit_depth`` warning,
+    keep being read so.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1447,15 +1467,21 @@ def import_image(
     path = session.folder / storage.IMAGES_DIR / stored.file
     try:
         _refuse_inks(original_name, _header_inks(path))
+        _refuse_pixel_type(original_name, _header_pixel_type(path))
         try:
             _count_misnamed_tiff(path)
-            loaded = load_image(path)
+            read = read_file(path)
         except (ValueError, OSError) as exc:
             if isinstance(exc, NotSingleImageError):
                 _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
             raise OperationError(
                 ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
             ) from exc
+        # Failing closed, before any conversion: a type no header declared (the
+        # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
+        # bit depth, integers in the layout reading checked, convert without error.
+        _refuse_pixel_type(original_name, pixel_type(read.pixels))
+        loaded = load_pixels(read)
         if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
             # Failing closed: inks the header check missed are refused as read,
             # never imported converted. Reading drops an alpha channel, so the
@@ -1588,6 +1614,67 @@ def _refuse_inks(original_name: str, inks: Inks | None) -> None:
             "several_images": not inks.single_image,
             "uncompressed_copy": inks.uncompressed_copy,
         },
+    )
+
+
+def _header_pixel_type(path: Path) -> PixelType | None:
+    """The type the header of the stored copy at ``path`` declares for its
+    pixels if it has no known bit depth
+    (:func:`~proteia.core.imaging.declared_pixel_type`); None for a header
+    that cannot be read, as reading the file then says why."""
+    try:
+        return declared_pixel_type(path)
+    except (ValueError, OSError):
+        return None
+
+
+# How a refusal names pixels with no known bit depth (#224) by numpy's kind,
+# but integers (by their width, where a header says it, and sign) and 1-bit
+# pixels (_refuse_pixel_type); a kind no reader gives by numpy's name.
+_PIXEL_KINDS: Final = {"f": "floating-point", "c": "complex-valued"}
+# The integers a reader gives, whose width may be wider than the file's and
+# whose sign may not be its own (Pillow reads 16-bit integers into signed 32).
+_READ_INTEGERS: Final = "integer pixels that are not unsigned 8- or 16-bit"
+
+
+def _refuse_pixel_type(original_name: str, pixels: PixelType | None) -> None:
+    """Refuse (``UNSUPPORTED_PIXEL_TYPE``) the file offered as ``original_name``
+    if it holds ``pixels`` of a type with no known bit depth; nothing if None.
+    Their range is not fixed, so over-exposure cannot be checked on them.
+    Until #224 an import took such a file with an ``unknown_bit_depth``
+    warning; reading still does, for the images imported so.
+
+    The copy to save is a 16-bit TIFF, unsigned for signed integers (or
+    integers whose sign no header says), which an import takes; grayscale or
+    RGB where reading refuses the file's colour space too, which the refusal
+    names (``pixels.held``), so that the copy imports. A 1-bit image holds
+    no gray levels, which no copy of it would hold either: the refusal asks
+    for the image it was made from."""
+    if pixels is None:
+        return
+    name, kind, bits = repr(original_name), pixels.kind, pixels.bits
+    if kind == "b":
+        raise OperationError(
+            ErrorCode.UNSUPPORTED_PIXEL_TYPE,
+            f"{name} holds 1-bit pixels, which Proteia does not import: each pixel is black"
+            " or white, so the file holds no gray levels to measure; import the original"
+            " grayscale image instead",
+        )
+    tiff = "16-bit grayscale or RGB TIFF" if pixels.held else "16-bit TIFF"
+    copy = f"a {tiff}"
+    if kind not in "iu":
+        what = f"{_PIXEL_KINDS.get(kind, pixels.name)} pixels"
+    elif bits is None:
+        what, copy = _READ_INTEGERS, f"an unsigned {tiff}"
+    elif kind == "i":
+        what, copy = f"signed {bits}-bit integer pixels", f"an unsigned {tiff}"
+    else:
+        what = f"{bits}-bit integer pixels"
+    held = f" {pixels.held}" if pixels.held else ""
+    raise OperationError(
+        ErrorCode.UNSUPPORTED_PIXEL_TYPE,
+        f"{name} holds {what}{held}, which Proteia does not import: save it as {copy} and"
+        " import it again",
     )
 
 

@@ -720,6 +720,37 @@ def test_a_cmyk_file_imported_before_207_is_offered_in_its_converted_colours(
     assert np.abs(gray.astype(int) - expected).max() <= error * 2
 
 
+def test_a_floating_point_tiff_is_refused_and_one_imported_before_224_is_shown(
+    client, tmp_path, monkeypatch
+):
+    # #224: an upload of pixels with no fixed range is refused, naming the
+    # file as chosen and the copy to save, and stores nothing; one imported
+    # before, as an import took it then, is listed with its warning and shown.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    pixels = synthetic_blot((H, W), [(x, ROW, 5.0, 3.0, 30000.0) for x in LANE_X]) / 65535
+    data = io.BytesIO()
+    tifffile.imwrite(data, pixels.astype(np.float32))
+    status, answer = upload(client, data.getvalue(), name="32-bit µ.tif")
+    assert (status, answer["code"], answer["ids"]) == (422, "unsupported_pixel_type", [])
+    assert answer["message"] == (
+        "'32-bit µ.tif' holds floating-point pixels, which Proteia does not import: save it"
+        " as a 16-bit TIFF and import it again"
+    )
+    assert client.ok("GET", "/api/project")["project"]["images"] == []
+    with monkeypatch.context() as before_224:
+        before_224.setattr(ops, "_refuse_pixel_type", lambda name, pixels: None)
+        status, answer = upload(client, data.getvalue(), name="32-bit µ.tif")
+    assert status == 201, answer
+    [image] = answer["project"]["images"]
+    assert (image["bit_depth"], [w["code"] for w in image["warnings"]]) == (
+        None,
+        ["unknown_bit_depth"],
+    )
+    mode, gray = decoded(preview_of(client, answer["image_id"]))
+    assert (mode, gray.shape) == ("L", (H, W))
+    assert gray.min() == 0 and gray.max() == 255  # stretched from its minimum to its maximum
+
+
 def test_an_image_in_a_colour_space_proteia_does_not_convert_is_refused(client, tmp_path):
     client.ok("POST", "/api/projects", {"name": "Blot"})
     buffer = io.BytesIO()
