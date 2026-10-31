@@ -12,8 +12,12 @@
 # - collects the web client (proteia/web/static) as package data;
 # - limits matplotlib to the Agg, SVG and PDF backends (its hook collects
 #   mpl-data, the fonts the charts are drawn with among it);
-# - leaves out napari, Qt, tkinter and the build tools (bundle.EXCLUDES), and the
-#   Universal CRT DLLs, which Windows 10 and later provide;
+# - leaves out napari, Qt, tkinter and the build tools (bundle.EXCLUDES), the
+#   Universal CRT DLLs, which Windows 10 and later provide, and the Visual C++
+#   runtime files that neither the Python build nor a package provides, which
+#   PyInstaller would copy from the build machine's System32 (MSVCP140.dll, #54),
+#   with the extension modules that import MSVCP140.dll and that the app never
+#   loads (bundle.MSVCP140_IMPORTERS);
 # - copies the metadata of every distribution the bundle takes code or data from:
 #   the record reads versions from it, and notices.py reads the license texts;
 #   the build stops if a bundled top-level name belongs to no distribution;
@@ -25,6 +29,7 @@ import importlib.metadata
 import json
 import os
 import sys
+import sysconfig
 
 sys.path.insert(0, SPECPATH)  # noqa: F821 (PyInstaller defines it)
 
@@ -54,13 +59,16 @@ a = Analysis(  # noqa: F821
     hookspath=[],
     hooksconfig={"matplotlib": {"backends": list(bundle.MATPLOTLIB_BACKENDS)}},
     runtime_hooks=[],
-    excludes=list(bundle.EXCLUDES),
+    # The MSVCP140.dll importers go too: the bundle does not carry that DLL (#54).
+    excludes=list(bundle.EXCLUDES + bundle.MSVCP140_IMPORTERS),
     noarchive=False,
     optimize=0,
 )
 
-left_out = sorted(dest for dest, _, _ in a.binaries if bundle.is_universal_crt(dest))
-a.binaries = [entry for entry in a.binaries if not bundle.is_universal_crt(entry[0])]
+# A Visual C++ runtime file from a package's folder in the build environment's
+# site-packages is the package's own copy and stays; one found elsewhere goes.
+package_roots = {sysconfig.get_path("purelib"), sysconfig.get_path("platlib")}
+a.binaries, left_out = bundle.leave_out(a.binaries, package_roots)
 
 found, unknown = bundle.bundled_distributions(
     (name for name, _, _ in a.pure),
@@ -90,7 +98,8 @@ with open(os.path.join(workpath, "bundle-manifest.json"), "w", encoding="utf-8")
         "python": sys.version.split()[0],
         "distributions": {name: importlib.metadata.version(name) for name in dists},
         "top_level": {name: sorted(names) for name, names in sorted(found.items())},
-        "universal_crt_left_out": left_out,
+        "universal_crt_left_out": left_out["universal_crt"],
+        "vc_runtime_left_out": left_out["vc_runtime"],
     }
     json.dump(manifest, f, indent=1)
 
