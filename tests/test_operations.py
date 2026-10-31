@@ -2062,6 +2062,197 @@ def test_inks_the_header_check_misses_that_reading_refuses_are_not_imported(tmp_
     assert str(error).startswith(f"cannot read {name!r}: {why}")
 
 
+def _tiff_bytes(pixels: np.ndarray, **options) -> bytes:
+    data = io.BytesIO()
+    tifffile.imwrite(data, pixels, **options)
+    return data.getvalue()
+
+
+def _several_images() -> dict[str, bytes]:
+    """TIFFs of more than one image and no inks, which reading refuses when
+    named .tif (#215), by layout: a stack as tifffile, Pillow and ImageJ write
+    one, pages written apart, images of two sizes, a multi-channel composite,
+    a thumbnail written before its image (Pillow takes the thumbnail), 16-bit
+    RGB (Pillow narrows it), and both byte orders of a classic TIFF and of a
+    BigTIFF (Pillow reads no big-endian BigTIFF)."""
+    from PIL import Image
+
+    gray = (blot() >> 8).astype(np.uint8)
+    other = np.ascontiguousarray(gray[::-1])
+    stack = np.stack([gray, other])
+    rgb16 = np.dstack([blot(), blot() // 2, blot() // 3])
+    pages = [Image.fromarray(gray), Image.fromarray(other)]
+    return {
+        "stack": _tiff_bytes(stack),
+        "pillow stack": _encoded(pages[0], "TIFF", save_all=True, append_images=pages[1:]).read(),
+        "lzw stack": _encoded(
+            pages[0], "TIFF", save_all=True, append_images=pages[1:], compression="tiff_lzw"
+        ).read(),
+        "imagej stack": _tiff_bytes(stack, imagej=True),
+        "pages": _tiff_pages((gray, {}), (other, {})).read(),
+        "two sizes": _tiff_pages((gray, {}), (gray[:20, :30], {})).read(),
+        "composite": _tiff_bytes(
+            np.stack([blot(), blot() // 2, blot() // 3]),
+            photometric="minisblack",
+            metadata={"axes": "CYX"},
+        ),
+        "thumbnail first": _tiff_pages((gray[::4, ::4], {"subfiletype": 1}), (gray, {})).read(),
+        "16-bit rgb stack": _tiff_bytes(np.stack([rgb16, rgb16[::-1]]), photometric="rgb"),
+        "big-endian stack": _tiff_bytes(stack, byteorder=">"),
+        "bigtiff stack": _tiff_bytes(stack, bigtiff=True),
+        "big-endian bigtiff stack": _tiff_bytes(stack, bigtiff=True, byteorder=">"),
+    }
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg", ".jpeg", ".PNG"])
+@pytest.mark.parametrize("layout", list(_several_images()))
+def test_a_tiff_of_several_images_is_refused_whatever_its_suffix(tmp_path, layout, suffix):
+    # #215: named otherwise, it was read by Pillow, which took its first image
+    # (or its thumbnail) and dropped the rest without a notice. It is told by
+    # its first bytes and refused as it is when named .tif.
+    s = session_on(tmp_path)
+    data = _several_images()[layout]
+    as_tif = _imports_nothing(
+        s,
+        lambda: ops.import_image(s, io.BytesIO(data), f"{layout} µ.tif", kind=CHEMI, polarity=DARK),
+    )
+    name = f"{layout} µ{suffix}"
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
+    )
+    assert (as_tif.code, error.code) == (ErrorCode.UNREADABLE_IMAGE, ErrorCode.UNREADABLE_IMAGE)
+    assert (error.ids, error.detail) == ((), as_tif.detail)
+    assert str(error) == str(as_tif).replace(f"{layout} µ.tif", name).replace(
+        "img-1.tif", f"img-1{suffix.lower()}"
+    )
+
+
+def test_the_refusal_of_a_tiff_of_several_images_named_png_in_full(tmp_path):
+    s = session_on(tmp_path)
+    data = _several_images()["stack"]
+    error = _imports_nothing(
+        s,
+        lambda: ops.import_image(s, io.BytesIO(data), "stack µ.png", kind=CHEMI, polarity=DARK),
+    )
+    assert str(error) == (
+        "cannot read 'stack µ.png': img-1.png: holds 1 image series with axes 'QYX'; only a"
+        " single 2-D gray or color image can be quantified (stacks and multi-channel"
+        " composites are not supported)"
+    )
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "gray then cmyk.tif",
+        "rgb then cmyk γ.tif",
+        "gray then spots.tif",
+        "gray then 16-bit cmyk.tif",
+    ],
+)
+def test_inks_after_a_first_image_of_none_are_refused_whatever_the_suffix(tmp_path, name, suffix):
+    # #215: the header check looks at the first page only (#207 review); the
+    # later inks of a TIFF named otherwise are found when its images are
+    # counted, as reading finds those of one named .tif, with the same answer.
+    s = session_on(tmp_path)
+    inks, uncompressed, source = _cmyk_stacks()[name]
+    named = name.replace(".tif", suffix)
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, source, named, kind=CHEMI, polarity=DARK)
+    )
+    assert (error.code, error.ids, error.detail) == (
+        ErrorCode.CMYK_IMAGE,
+        (),
+        {"inks": inks, "several_images": True, "uncompressed_copy": uncompressed},
+    )
+    assert str(error) == _refusal(named, inks, several=True, uncompressed=uncompressed)
+
+
+def _single_tiffs() -> dict[str, bytes]:
+    """Single-image TIFFs, by layout: those that tifffile, which reads a file
+    named .tif, reads otherwise than Pillow (#214 review: white-is-zero gray,
+    a palette, 16-bit RGB, associated alpha) or refuses (CIELAB); plain gray
+    in either byte order and as a BigTIFF; and an image followed by its
+    reduced-resolution thumbnail, which is no second image."""
+    gray = (blot() >> 8).astype(np.uint8)
+    rgb = _tinted_rgb()
+    alpha = np.full(gray.shape, 200, dtype=np.uint8)
+    level = np.arange(256, dtype=np.uint16)
+    colormap = np.stack([level * 257, (255 - level) * 257, level * 128])
+    return {
+        "white is zero": _tiff_bytes(gray, photometric="miniswhite"),
+        "palette": _tiff_bytes(gray, photometric="palette", colormap=colormap),
+        "16-bit rgb": _tiff_bytes(np.dstack([blot(), blot() // 2, blot() // 3]), photometric="rgb"),
+        "associated alpha": _tiff_bytes(
+            np.dstack([rgb, alpha]), photometric="rgb", extrasamples=[1]
+        ),
+        "cielab": _tiff_bytes(rgb, photometric="cielab"),
+        "gray": _tiff_bytes(gray),
+        "16-bit big-endian": _tiff_bytes(blot(), byteorder=">"),
+        "bigtiff": _tiff_bytes(gray, bigtiff=True),
+        "thumbnail after": _tiff_pages((gray, {}), (gray[::4, ::4], {"subfiletype": 1})).read(),
+    }
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg"])
+@pytest.mark.parametrize("layout", list(_single_tiffs()))
+def test_a_single_image_tiff_named_otherwise_keeps_the_reader_its_suffix_picks(
+    tmp_path, layout, suffix
+):
+    # #215 counts its images only: read by its content, as a .tif is, five of
+    # these layouts would change their values or be refused, for files that
+    # imported before and still read so in the projects that hold them.
+    from skimage import io as skimage_io
+
+    s = session_on(tmp_path)
+    data = _single_tiffs()[layout]
+    image_id = ops.import_image(
+        s, io.BytesIO(data), f"{layout} µ{suffix}", kind=CHEMI, polarity=DARK
+    )
+    copy = tmp_path / f"copy{suffix}"
+    copy.write_bytes(data)
+    by_suffix = quantify.to_grayscale(skimage_io.imread(copy)).astype(np.float64)
+    np.testing.assert_array_equal(s.pixels(image_id), by_suffix)
+    as_tif = tmp_path / "copy.tif"
+    as_tif.write_bytes(data)
+    try:
+        by_content = imaging.load_image(as_tif).array
+    except ValueError:
+        by_content = None  # CIELAB: refused by name
+    differ = {"white is zero", "palette", "16-bit rgb", "associated alpha", "cielab"}
+    assert (by_content is None or not np.array_equal(by_content, by_suffix)) == (layout in differ)
+
+
+def test_a_tiff_of_several_images_imported_before_215_reads_as_before(tmp_path):
+    # #215 changes the import only: a project that holds such a file, imported
+    # as its first image, opens and reads it so.
+    s = session_on(tmp_path, save_to_folder)
+    data = _several_images()["pages"]
+    with mock.patch.object(ops, "check_misnamed_tiff"):  # the import before #215
+        image_id = ops.import_image(s, io.BytesIO(data), "pages µ.png", kind=CHEMI, polarity=DARK)
+    s.close()
+    reopened = ops.open_project(tmp_path / FOLDER, clock=FakeClock())
+    np.testing.assert_array_equal(reopened.pixels(image_id), (blot() >> 8).astype(np.uint8))
+    assert reopened.project.batch.find_image(image_id).import_warnings == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"II*\x00", b"II*\x00\x08\x00\x00\x00" + b"\xff" * 40],
+    ids=["signature-only", "damaged-page"],
+)
+@pytest.mark.filterwarnings("ignore:Corrupt EXIF data")  # Pillow, on the damaged page
+def test_a_tiff_named_otherwise_whose_images_cannot_be_counted_is_left_to_reading(tmp_path, data):
+    # #215: refused by the reader its suffix picks, as before, with its words.
+    s = session_on(tmp_path)
+    error = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), "damaged µ.png", kind=CHEMI, polarity=DARK)
+    )
+    assert error.code is ErrorCode.UNREADABLE_IMAGE
+    assert str(error).startswith("cannot read 'damaged µ.png': cannot identify image file")
+
+
 @pytest.mark.parametrize("mode", ["RGB", "L"])
 def test_one_image_of_a_cmyk_stack_saved_as_rgb_or_grayscale_is_imported(tmp_path, mode):
     # The stack refusal's next step, done: one of its images saved as RGB or
