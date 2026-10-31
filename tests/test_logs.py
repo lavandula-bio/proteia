@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from conftest import FakeClock, synthetic_blot, write_tiff
+from conftest import FakeClock, SavesBlocked, synthetic_blot, write_tiff
 from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.web import api, launch, logs, projects, server
@@ -552,14 +552,13 @@ def test_unsaved_changes_at_the_stop_reach_the_log_and_the_console_once(
     monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
     client.ok("POST", "/api/projects", {"name": "Blot"})
     project_file = log.root / "Blot" / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # no save can replace it
+    blocked = SavesBlocked(project_file)  # no save can replace it
     client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
     capsys.readouterr()
     client.instance.stop()
     client.thread.join(10)
     assert not client.thread.is_alive()
-    project_file.rmdir()
+    blocked.lift()
 
     (stopped,) = log.messages("WARNING")[1:]  # after the autosave's
     assert stopped.startswith("Proteia stopped, but the open project could not be saved: ")
@@ -621,10 +620,9 @@ def test_no_full_project_path_reaches_the_log(log, client, monkeypatch, capsys):
     client.ok("POST", "/api/projects", {"name": "Blot µ"})
     folder = log.root / "Blot µ"
     project_file = folder / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # the autosave cannot replace it
+    blocked = SavesBlocked(project_file)  # the autosave cannot replace it
     client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
-    project_file.rmdir()
+    blocked.lift()
     # The console shows the warning as before: its message alone, the path whole.
     (shown,) = capsys.readouterr().err.splitlines()
     assert shown.startswith("autosave after set_lanes failed; the change is kept in memory:")

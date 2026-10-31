@@ -12,6 +12,13 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   memory (``dirty`` stays True, ``save_error`` holds the exception) and the
   previous ``project.json`` on disk (the write is atomic); the next change, or an
   explicit :meth:`ProjectSession.save`, tries again.
+* A save goes only over the ``project.json`` the session last read or wrote,
+  compared by the SHA-256 of its bytes (#101): one replaced, edited or removed
+  outside Proteia since (a synced or restored copy) is refused as a failed save
+  (:class:`~proteia.core.storage.ChangedOutsideError`, whose code for clients
+  is ``PROJECT_CHANGED_OUTSIDE``: :func:`save_failure_code`), and every later
+  save is, until :meth:`ProjectSession.reload` reads the file on disk, which
+  drops the changes not saved.
 * Every committed change appends one :class:`~proteia.core.model.LogEntry` at
   that single commit point, in the same project object, so one save writes the
   change and its entry together; refusals and no-ops append nothing. Times come
@@ -38,7 +45,10 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   the log, which keeps params and hashes but not states, cannot rebuild it.
 * Files in ``images/`` that no project references (an image removed, an import
   that was never saved, a temp file left by a crash) are deleted after a
-  successful save and before an import, but only if the ``project.json`` on
+  successful save and before an import, but only while ``project.json`` is the
+  file the session last read or wrote (what one changed outside Proteia
+  references is unknown, so an import is then refused and nothing is deleted),
+  and only if the ``project.json`` on
   disk does not reference them, no state in the undo history does, no backup
   of an older ``project.json`` names them with an id below ``next_id``
   (:func:`~proteia.core.storage.backup_references`; while one cannot be read,
@@ -160,6 +170,10 @@ class ErrorCode(StrEnum):
     PATH_TOO_LONG = "path_too_long"
     FOLDER_NOT_EMPTY = "folder_not_empty"
     LEFTOVER_FILE = "leftover_file"  # an orphan holding the next image id could not be deleted
+    # project.json is not the file the session last read or wrote: changed,
+    # replaced or removed outside Proteia (#101). A save is refused so
+    # (save_failure_code), and so is an import, before it stores anything.
+    PROJECT_CHANGED_OUTSIDE = "project_changed_outside"
     NOTHING_TO_UNDO = "nothing_to_undo"
     NOTHING_TO_REDO = "nothing_to_redo"
     # Molecular-weight calibration (#58). A calibration point would be out of
@@ -208,6 +222,16 @@ class OperationError(ValueError):
 AutosaveHook = Callable[["ProjectSession"], None]
 # Returns an aware datetime; tests inject a fake one.
 Clock = Callable[[], datetime]
+
+
+def save_failure_code(error: BaseException | None) -> ErrorCode | None:
+    """The code for clients of a failed save's error (``save_error``):
+    ``PROJECT_CHANGED_OUTSIDE`` for one refused because ``project.json`` changed
+    outside Proteia; None for any other failure (a file that could not be
+    written, image files missing), which has only its message."""
+    if isinstance(error, storage.ChangedOutsideError):
+        return ErrorCode.PROJECT_CHANGED_OUTSIDE
+    return None
 
 
 def utc_now() -> datetime:
@@ -365,7 +389,9 @@ class ProjectSession:
     ``project.json``; ``save_error`` is the last failed save (None after a
     successful one); ``last_action`` names the last committed operation.
     ``clock`` gives the time of each log entry and export. :attr:`undo_step` and
-    :attr:`redo_step` name what undo and redo would do.
+    :attr:`redo_step` name what undo and redo would do. ``file_digest`` is the
+    SHA-256 of the ``project.json`` bytes the project was read from or written
+    as: a save goes only over that file.
     """
 
     def __init__(
@@ -375,6 +401,7 @@ class ProjectSession:
         *,
         autosave: AutosaveHook | None,
         saved_files: Iterable[str],
+        file_digest: str,
         clock: Clock = utc_now,
     ) -> None:
         self._project = project
@@ -393,6 +420,10 @@ class ProjectSession:
         self._headers: dict[tuple[str, str], bool | str] = {}
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
+        # The SHA-256 of the project.json bytes this session last read or wrote:
+        # the only file a save goes over, and while it is on disk the one
+        # _saved_files describes (#101).
+        self._file_digest = file_digest
         # The undo history: the states committed in this session, oldest first,
         # from the one it began with (added at its first change), and the index of
         # the committed one; empty and -1 before the first change and after close.
@@ -583,19 +614,34 @@ class ProjectSession:
     def save(self) -> Path:
         """Write ``project.json`` now and return its path; then delete the orphans
         no saved project references. ``OSError`` and ``ProjectError`` are recorded
-        in ``save_error`` and re-raised."""
+        in ``save_error`` and re-raised.
+
+        Only over the ``project.json`` this session last read or wrote
+        (:func:`~proteia.core.storage.save_project_over`): one changed, replaced
+        or removed outside Proteia since is not written over, and no orphan is
+        deleted (:class:`~proteia.core.storage.ChangedOutsideError`, a
+        ``ProjectError``: the message says to open the project again, which
+        reads it, :meth:`reload`)."""
         with self.lock:
             project = self._project
             try:
-                path = storage.save_project(project, self._folder)
+                digest = storage.save_project_over(project, self._folder, expect=self._file_digest)
             except (OSError, storage.ProjectError) as exc:
                 self.save_error = exc
                 raise
+            self._file_digest = digest
             self._saved_files = _referenced_files(project)
             self.dirty = False
             self.save_error = None
             self._remove_orphans()
-            return path
+            return self._folder / storage.PROJECT_FILE
+
+    def check_file(self) -> None:
+        """:class:`~proteia.core.storage.ChangedOutsideError` unless
+        ``project.json`` is still the file this session last read or wrote
+        (:func:`~proteia.core.storage.check_unchanged`); an ``OSError`` reading it
+        propagates. Called with the lock held."""
+        storage.check_unchanged(self._folder, self._file_digest)
 
     def _commit(
         self,
@@ -799,20 +845,35 @@ class ProjectSession:
         save or import.
 
         With unsaved changes (``dirty``) the file is not read: it is older than
-        the committed project, not changed outside Proteia. ``OSError`` (a
-        missing file too, or a backup of a file of an older schema that cannot
-        be kept: :class:`~proteia.core.storage.BackupError`) and the
+        the committed project, not changed outside Proteia. Unless the last save
+        was refused because it was (``ChangedOutsideError``, whose message says
+        that opening the project again reads it): then it is read, whatever it
+        holds, and the changes not saved are dropped (and logged so). ``OSError``
+        (a missing file too, or a backup of a file of an older schema that
+        cannot be kept: :class:`~proteia.core.storage.BackupError`) and the
         :class:`~proteia.core.storage.ProjectError` family propagate, with the
         session as it was.
         """
         with self.lock:
-            if self.dirty:
+            refused = isinstance(self.save_error, storage.ChangedOutsideError)
+            if self.dirty and not refused:
                 return False
             saved = (self._folder / storage.PROJECT_FILE).read_bytes()
-            if saved == storage.project_to_json(self._project):
+            if not self.dirty and saved == storage.project_to_json(self._project):
                 return False
-            project, migrated = storage.read_project(self._folder, clock=self.clock, backup=True)
+            project, migrated = storage.read_project(
+                self._folder, clock=self.clock, backup=True, data=saved
+            )
+            if self.dirty:
+                _log.warning(
+                    "in %r: dropped the changes that could not be saved, as its project.json"
+                    " was changed outside Proteia",
+                    self._folder.name,
+                )
             self._project = project
+            self._file_digest = hashlib.sha256(saved).hexdigest()
+            self.dirty = False
+            self.save_error = None
             self._saved_files = _referenced_files(project)
             self._pixels = {}
             self._states, self._cursor = [], -1
@@ -855,7 +916,15 @@ class ProjectSession:
         project only raises it). So the file of the id an import takes next is
         never kept for a backup, even where a backup's text names it (as an
         original name) or a backup cannot be read, which keeps every image file
-        below ``next_id``, as what it names is unknown."""
+        below ``next_id``, as what it names is unknown.
+
+        Nothing is deleted unless ``project.json`` is the file this session last
+        read or wrote (:meth:`check_file`): what one changed outside Proteia
+        references is unknown, and so it is while the file cannot be read."""
+        try:
+            self.check_file()
+        except (OSError, storage.ChangedOutsideError):
+            return
         referenced = self._saved_files | _referenced_files(self._project) | self._retained_files()
         keep = {name.lower() for name in referenced}
         orphans = [
@@ -911,9 +980,11 @@ def new_project(
         clock=clock,
     )
     project = Project(log=(created,))
-    storage.save_project(project, path)
+    digest = storage.save_project_over(project, path, expect=None)
     _log_entry(path, created)
-    return ProjectSession(project, path, autosave=autosave, saved_files=(), clock=clock)
+    return ProjectSession(
+        project, path, autosave=autosave, saved_files=(), file_digest=digest, clock=clock
+    )
 
 
 def open_project(
@@ -938,9 +1009,16 @@ def open_project(
     written. A record exported before any edit then cites the log
     ``project.json`` holds. The undo history begins from the migrated state.
     """
-    project, migrated = storage.read_project(folder, clock=clock, backup=True)
+    # The digest of the very bytes read: a save goes over them only.
+    data = (Path(folder) / storage.PROJECT_FILE).read_bytes()
+    project, migrated = storage.read_project(folder, clock=clock, backup=True, data=data)
     session = ProjectSession(
-        project, folder, autosave=autosave, saved_files=_referenced_files(project), clock=clock
+        project,
+        folder,
+        autosave=autosave,
+        saved_files=_referenced_files(project),
+        file_digest=hashlib.sha256(data).hexdigest(),
+        clock=clock,
     )
     _log_opened(session.folder, project)
     if migrated:

@@ -227,7 +227,13 @@ The hand-off routes add: ``stopping``, ``too_many_pending``, ``file_claimed``,
 listed now) 409, ``handoff_not_found`` 404, and ``nothing_imported`` 422
 (``detail.refused``: each file and why). ``unsaved_changes`` carries
 ``detail.created`` when a switch created its project but then could not save
-the one open, which stays open.
+the one open, which stays open, and ``detail.cause`` when the failed save has
+a code: ``project_changed_outside`` when the open project's ``project.json``
+was changed outside Proteia since Proteia last opened or saved it (#101), so
+it was not saved over; opening that project again reads it. An import (``POST
+/api/images``) then is refused as ``project_changed_outside`` 422, before
+anything is stored. An edit is answered as made, its failed save in the
+state's ``save_error`` and ``save_error_code`` (:mod:`proteia.web.state`).
 """
 
 from __future__ import annotations
@@ -279,7 +285,14 @@ from proteia.core.model import (
 )
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
-from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
+from proteia.core.session import (
+    Clock,
+    ErrorCode,
+    OperationError,
+    ProjectSession,
+    save_failure_code,
+    utc_now,
+)
 from proteia.core.storage import ProjectError
 from proteia.web import cloudsync, diagnostics, handoff, logs, projects, sample_project
 from proteia.web.charts import ChartStore
@@ -323,11 +336,25 @@ class ProjectChangedError(RuntimeError):
 class UnsavedChangesError(RuntimeError):
     """The open project has changes that could not be saved; it stays open.
     ``created``: the project a switch created before that save failed, which
-    exists, complete, and stays closed; None if none was."""
+    exists, complete, and stays closed; None if none was. ``cause``: the
+    failed save's code when it has one
+    (:func:`~proteia.core.session.save_failure_code`)."""
 
-    def __init__(self, message: str, *, created: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, created: str | None = None, cause: ErrorCode | None = None
+    ) -> None:
         super().__init__(message)
         self.created = created
+        self.cause = cause
+
+    def detail(self) -> dict[str, Any] | None:
+        """The answer's ``detail``: ``created`` and ``cause``, those that are set."""
+        detail: dict[str, Any] = {}
+        if self.created is not None:
+            detail["created"] = self.created
+        if self.cause is not None:
+            detail["cause"] = self.cause.value
+        return detail or None
 
 
 class NothingImportedError(RuntimeError):
@@ -398,7 +425,9 @@ def _reason(exc: OSError) -> str:
 
 def _not_saved(exc: Exception) -> UnsavedChangesError:
     """The open project could not be saved (``exc``), and nothing was made."""
-    return UnsavedChangesError(f"the open project could not be saved: {exc}")
+    return UnsavedChangesError(
+        f"the open project could not be saved: {exc}", cause=save_failure_code(exc)
+    )
 
 
 class UploadTooLargeError(ValueError):
@@ -785,6 +814,7 @@ class Workspace:
                             f"{name!r} could not be saved: {exc}. {created(session.folder.name)};"
                             f" open it from Projects once {name!r} can be saved",
                             created=session.folder.name,
+                            cause=save_failure_code(exc),
                         ) from exc
                 self._opened(session)
         old.close(remove_files=not shared)
@@ -983,7 +1013,10 @@ class Workspace:
         that waited for its edits' answers finds it no older than what it
         shows); and with its undo history and kept results. Its unsaved changes
         (a failed autosave) are neither saved first, as a switch saves them, nor
-        replaced by the older file: the next change or quitting saves them. The
+        replaced by the older file: the next change or quitting saves them;
+        unless the save was refused because the file was changed outside
+        Proteia (#101), whose message says that opening the project again reads
+        it: then it is read, and they are dropped. The
         requests using the session (:meth:`using`: an edit, or a read such as a
         preview), and then an operation running on it, are waited for, up to
         :data:`REOPEN_WAIT_S` in all, before the file is checked: after an
@@ -2596,12 +2629,7 @@ def install(app: FastAPI, workspace: Workspace) -> None:
         ProjectChangedError: lambda e: _error(
             409, "project_changed", str(e), detail={"open": e.open, "open_id": e.open_id}
         ),
-        UnsavedChangesError: lambda e: _error(
-            409,
-            "unsaved_changes",
-            str(e),
-            detail=None if e.created is None else {"created": e.created},
-        ),
+        UnsavedChangesError: lambda e: _error(409, "unsaved_changes", str(e), detail=e.detail()),
         UploadTooLargeError: lambda e: _error(413, "image_too_large", str(e)),
         NothingImportedError: lambda e: _error(
             422,

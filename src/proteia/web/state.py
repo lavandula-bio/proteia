@@ -65,6 +65,14 @@ array) and its ``fit`` (:meth:`~proteia.core.operations.CalibrationFit.as_json`,
 null without a curve). Each protein's ``predicted_row`` is where its row is
 predicted by its expected MW (:func:`_predicted_row`), and before it has a box,
 its missing lanes' y follows it.
+
+``saved`` says whether ``project.json`` holds the project; ``save_error`` is
+the last failed save's message (null after a successful one), and
+``save_error_code`` its code when it has one
+(:func:`~proteia.core.session.save_failure_code`): ``project_changed_outside``
+for a save refused because ``project.json`` was changed outside Proteia
+(#101), whose message says that opening the project again reads it; null for
+any other failure.
 """
 
 from __future__ import annotations
@@ -81,7 +89,7 @@ from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
 from proteia.core.model import Batch, ImageRef, Membrane, Project, Protein
 from proteia.core.operations import calibration_fit, unassessed_images
 from proteia.core.project import lane_anchors, lane_positions
-from proteia.core.session import HistoryStep, ProjectSession
+from proteia.core.session import HistoryStep, ProjectSession, save_failure_code
 
 
 def _missing_lanes(
@@ -194,6 +202,8 @@ def project_state(
     the one redo would make again, each as its log entry's ``seq`` and
     ``action`` (null when there is none)."""
     undo, redo = session.history_steps
+    save_error = session.save_error  # read once: the message and its code are of one failure
+    save_code = save_failure_code(save_error)
     batch = project.batch
     images: list[JsonValue] = [
         {
@@ -287,7 +297,8 @@ def project_state(
         "membranes": [_membrane(membrane) for membrane in batch.membranes],
         "proteins": proteins,
         "saved": not session.dirty,
-        "save_error": None if session.save_error is None else str(session.save_error),
+        "save_error": None if save_error is None else str(save_error),
+        "save_error_code": None if save_code is None else save_code.value,
     }
 
 

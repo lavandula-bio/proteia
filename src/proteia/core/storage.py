@@ -24,7 +24,9 @@ after a saved ``project.json`` no longer references it. An orphan image can hold
 an id that a failed or unsaved import gave back, so importing removes
 :func:`orphan_files` before storing a new image: all but those the session
 keeps (:class:`~proteia.core.session.ProjectSession`), none of which holds the
-id the import takes.
+id the import takes. A session saves only over the ``project.json`` it last
+read or wrote (:func:`save_project_over`, by its SHA-256): one changed outside
+Proteia meanwhile, by a synced or restored copy, is never saved over (#101).
 
 Canonical form. ``project.json`` is ``json.dumps`` of the re-validated model's
 JSON-mode dump with sorted keys, ``indent=1``, ``ensure_ascii=False`` and
@@ -85,6 +87,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import hashlib
 import json
 import os
@@ -169,6 +172,30 @@ class MissingImageError(ProjectError):
     def __init__(self, image_ids: list[str]) -> None:
         super().__init__(f"missing image files for {', '.join(image_ids)}")
         self.image_ids = list(image_ids)
+
+
+class ChangedOutsideError(ProjectError):
+    """``project.json`` is not the file a session last read or wrote: it was
+    replaced, edited or removed (``removed``) outside Proteia since, as by a
+    synced or restored copy (#101). :func:`save_project_over` refuses so, and
+    writes nothing. The message names the project by its folder's name, never
+    its path, and says what to do."""
+
+    def __init__(self, name: str, *, removed: bool) -> None:
+        if removed:
+            message = (
+                f"{name!r} was changed outside Proteia: its {PROJECT_FILE} was removed after"
+                " Proteia last opened or saved it, so Proteia did not write it again; put the"
+                " file back to go on saving the project"
+            )
+        else:
+            message = (
+                f"{name!r} was changed outside Proteia after Proteia last opened or saved it,"
+                " so Proteia did not save over it: open the project again to read the version"
+                " now on disk (the changes not saved here are then dropped)"
+            )
+        super().__init__(message)
+        self.removed = removed
 
 
 class BackupError(OSError):
@@ -492,10 +519,13 @@ def _missing_images(project: Project, folder: str | os.PathLike[str]) -> list[st
     ]
 
 
-def _replace(src: Path, dst: Path) -> None:
-    """``Path.replace``, retried while Windows reports a sharing violation."""
+def _replace(src: Path, dst: Path, check: Callable[[], None] | None = None) -> None:
+    """``Path.replace``, retried while Windows reports a sharing violation;
+    ``check`` runs right before each try, and what it raises propagates."""
     delay = REPLACE_DELAY
     for attempt in range(REPLACE_ATTEMPTS):
+        if check is not None:
+            check()
         try:
             src.replace(dst)
             return
@@ -561,13 +591,17 @@ def name_fits(folder: Path, name: str) -> bool:
     return len(path.encode("utf-16-le", "surrogatepass")) // 2 <= PATH_LIMIT
 
 
-def write_atomic(path: Path, data: bytes, *, private: bool = False) -> None:
+def write_atomic(
+    path: Path, data: bytes, *, private: bool = False, check: Callable[[], None] | None = None
+) -> None:
     """Replace ``path`` with ``data`` so a reader sees either the old or the new bytes.
 
     The folder must exist. A ``PermissionError`` that outlasts the retries (a
     reader holding the file on Windows) propagates and leaves the old file intact.
     ``private`` makes the file owner-only (0600 on POSIX) whatever the old one's
-    mode; on Windows the folder's permissions apply either way.
+    mode; on Windows the folder's permissions apply either way. ``check`` runs
+    once the new bytes are durable, right before each try to replace the old
+    file: what it raises propagates, and leaves the old file intact too.
     """
     mode = None if private else _file_mode(path)
     fd, tmp = _temp_file(path.parent, path.name, ".tmp")
@@ -579,7 +613,7 @@ def write_atomic(path: Path, data: bytes, *, private: bool = False) -> None:
             os.fsync(f.fileno())
         if mode is not None:
             tmp.chmod(mode)
-        _replace(tmp, path)
+        _replace(tmp, path, check)
         _fsync_dir(path.parent)
     finally:
         with contextlib.suppress(OSError):  # already gone after a successful replace
@@ -593,18 +627,63 @@ def save_project(project: Project, folder: str | os.PathLike[str]) -> Path:
     written) and refuses, before creating anything, when an image file is missing.
     Creates the folder, ``images/`` and ``exports/``; never copies or deletes images.
     A ``PermissionError`` that outlasts the retries propagates and leaves the
-    previous ``project.json`` intact.
+    previous ``project.json`` intact. Writes over whatever ``project.json``
+    holds: an open project saves with :func:`save_project_over`.
     """
+    folder = Path(folder)
+    _write_project(project, folder, None)
+    return folder / PROJECT_FILE
+
+
+def save_project_over(
+    project: Project, folder: str | os.PathLike[str], *, expect: str | None
+) -> str:
+    """:func:`save_project`, only over the ``project.json`` a session last read
+    or wrote: one whose bytes have the SHA-256 ``expect`` (lowercase hex), or,
+    with ``expect`` None, none at all (:func:`check_unchanged`). Return the
+    SHA-256 of the bytes written, which the next save expects.
+
+    Checked before anything is created or written, and again once the new
+    bytes are durable, right before the old file is replaced (each try of it):
+    :class:`ChangedOutsideError`, writing nothing, if it is not that file. A
+    replace in the instant between the last check and the rename is not seen;
+    no file system offers a rename that compares first. An ``OSError`` reading
+    the file propagates, as one writing it does.
+    """
+    folder = Path(folder)
+    return _write_project(project, folder, functools.partial(check_unchanged, folder, expect))
+
+
+def check_unchanged(folder: str | os.PathLike[str], expect: str | None) -> None:
+    """:class:`ChangedOutsideError` unless ``folder``'s ``project.json`` holds
+    bytes whose SHA-256 is ``expect`` or, with ``expect`` None, there is none.
+    The bytes are compared, not the modification time, which a sync or a
+    restore can keep. An ``OSError`` reading the file (other than its absence)
+    propagates: whether it changed is then unknown."""
+    folder = Path(folder)
+    try:
+        data = (folder / PROJECT_FILE).read_bytes()
+    except FileNotFoundError:
+        if expect is None:
+            return
+        raise ChangedOutsideError(folder.name, removed=True) from None
+    if expect is None or hashlib.sha256(data).hexdigest() != expect:
+        raise ChangedOutsideError(folder.name, removed=False)
+
+
+def _write_project(project: Project, folder: Path, check: Callable[[], None] | None) -> str:
+    """Write ``project.json`` (:func:`save_project`), running ``check`` first and
+    right before the replace; return the SHA-256 of the bytes written."""
     data = project_to_json(project)
+    if check is not None:
+        check()
     missing = _missing_images(project, folder)
     if missing:
         raise MissingImageError(missing)
-    folder = Path(folder)
     for directory in (folder, folder / IMAGES_DIR, folder / EXPORTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
-    path = folder / PROJECT_FILE
-    write_atomic(path, data)
-    return path
+    write_atomic(folder / PROJECT_FILE, data, check=check)
+    return hashlib.sha256(data).hexdigest()
 
 
 def load_project(
@@ -630,6 +709,7 @@ def read_project(
     require_images: bool = True,
     clock: Callable[[], datetime] = _utc_now,
     backup: bool = False,
+    data: bytes | None = None,
 ) -> tuple[Project, bool]:
     """:func:`load_project`, and whether the project was migrated: then
     ``project.json``, of an older schema, does not hold it (nor its ``migrate``
@@ -640,9 +720,14 @@ def read_project(
     (:func:`keep_backup`), which its ``migrate`` entry names (its ``backup``
     param): what opening a project does before it saves the migration. A
     backup that cannot be written raises :class:`BackupError`; a missing image
-    file raises before it is written. Nothing else is written."""
+    file raises before it is written. Nothing else is written.
+
+    ``data``: the bytes of ``project.json``, read already, for a caller that
+    must know which bytes the project came from (a session, to save only over
+    them); None reads them here."""
     folder = Path(folder)
-    data = (folder / PROJECT_FILE).read_bytes()
+    if data is None:
+        data = (folder / PROJECT_FILE).read_bytes()
     project, found = _parse(data)
     if require_images:
         missing = _missing_images(project, folder)

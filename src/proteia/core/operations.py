@@ -1396,6 +1396,11 @@ def import_image(
     read; inks it does not see (after a first image of none) are refused as
     reading finds them, and so is, failing closed, any file reading converts
     from CMYK. Images imported converted before keep being read so.
+
+    While ``project.json`` is not the file the session last read or wrote
+    (changed outside Proteia), the import is refused
+    (``PROJECT_CHANGED_OUTSIDE``, with the message a save gets) before it
+    stores a file or deletes an orphan: what that file references is unknown.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1413,6 +1418,17 @@ def import_image(
         )
 
     # An orphan may hold the id this import gets (an import that was never saved).
+    # Which files are orphans is known only while project.json is the file the
+    # session last read or wrote: one changed outside Proteia (its image may
+    # hold that id) refuses the import before anything is stored or deleted
+    # (#101). One that cannot be read lets it go on, deleting nothing; its save
+    # then fails as a file error.
+    try:
+        session.check_file()
+    except storage.ChangedOutsideError as exc:
+        raise OperationError(ErrorCode.PROJECT_CHANGED_OUTSIDE, str(exc)) from exc
+    except OSError:
+        pass
     session._remove_orphans()
     image_id = f"img-{session.project.next_id}"  # the id the change below will take
     try:
