@@ -18,7 +18,9 @@ Since #207 an import refuses a file of printing inks instead (:func:`ink_set`,
 for the images imported converted before. The header check looks at what the
 file holds, whatever its suffix; reading picks its reader by the suffix, as it
 did for the images imported before, and says which inks a TIFF of several
-images holds when it refuses it (:class:`NotSingleImageError`).
+images holds when it refuses it (:class:`NotSingleImageError`). Since #215 an
+import refuses a TIFF of several images named with another suffix too, which
+Pillow would read as its first image (:func:`check_misnamed_tiff`).
 A TIFF in any other colour space that is not gray, RGB or a palette (CIELAB,
 YCbCr, ...) is refused with the colour space's name rather than read wrong.
 
@@ -182,14 +184,8 @@ def _read_tiff(path: Path) -> tuple[np.ndarray, bool, str | None]:
     """
     with tifffile.TiffFile(path) as tif:
         series = tif.series
-        axes = series[0].axes if series else ""
-        if not _single_image(series):
-            raise NotSingleImageError(
-                f"{path.name}: holds {len(series)} image series with axes {axes!r};"
-                " only a single 2-D gray or color image can be quantified"
-                " (stacks and multi-channel composites are not supported)",
-                _inks_of(series),
-            )
+        _require_single_image(series, path.name)
+        axes = series[0].axes
         keyframe = series[0].keyframe
         cmyk = _holds_cmyk(keyframe, path.name)
         profile = keyframe.iccprofile if cmyk else None
@@ -225,6 +221,21 @@ def _single_image(series: Sequence[tifffile.TiffPageSeries]) -> bool:
     or images of several sizes; a reduced-resolution thumbnail page after the
     image is no series of its own."""
     return len(series) == 1 and series[0].axes in _SINGLE_IMAGE_AXES
+
+
+def _require_single_image(series: Sequence[tifffile.TiffPageSeries], name: str) -> None:
+    """Refuse (:class:`NotSingleImageError`) a TIFF's image series that are not
+    the single image reading takes (:func:`_single_image`), naming the file
+    ``name`` and saying the inks among its images."""
+    if _single_image(series):
+        return
+    axes = series[0].axes if series else ""
+    raise NotSingleImageError(
+        f"{name}: holds {len(series)} image series with axes {axes!r};"
+        " only a single 2-D gray or color image can be quantified"
+        " (stacks and multi-channel composites are not supported)",
+        _inks_of(series),
+    )
 
 
 class NotSingleImageError(ValueError):
@@ -559,6 +570,36 @@ def _holds_tiff(path: Path) -> bool:
         return file.read(4) in _TIFF_SIGNATURES
 
 
+def check_misnamed_tiff(path: str | os.PathLike[str]) -> None:
+    """Refuse a TIFF named with another suffix (``.png``, ``.jpg``) that does
+    not hold the single image reading takes, as reading refuses one named
+    ``.tif`` (:class:`NotSingleImageError`, which says its inks), #215:
+    reading picks its reader by the suffix, and Pillow, which reads such a
+    file, takes its first image and drops the rest without a notice.
+
+    The file is told to be a TIFF by its first bytes (classic or BigTIFF, of
+    either byte order), and only its images are counted: a single image keeps
+    the reader its suffix picks, and its values, which tifffile would give
+    otherwise for some layouts (white-is-zero gray, a palette, 16-bit RGB,
+    associated alpha) or refuse (CIELAB). A file named ``.tif`` or ``.tiff``
+    is not looked at: reading counts its images, so that it is parsed once.
+    A file whose images it cannot count raises another ``ValueError``, or
+    ``OSError``.
+    """
+    path = Path(path)
+    if path.suffix.lower() in TIFF_SUFFIXES:
+        return
+    try:
+        if not _holds_tiff(path):
+            return
+        with tifffile.TiffFile(path) as tif:
+            _require_single_image(tif.series, path.name)
+    except (ValueError, OSError):
+        raise
+    except Exception as exc:  # a damaged file: struct.error, ...
+        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+
+
 def ink_set(path: str | os.PathLike[str]) -> Inks | None:
     """Whether the file's pixels are printing inks, which an import refuses
     (#207), from its header alone and by what the file holds, whatever its
@@ -573,9 +614,11 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
     Of a TIFF it reads the first page, and the image series only if that page
     is separated, so that an ordinary TIFF of many pages is not parsed twice:
     inks after a first image of none are found when reading refuses the file
-    as several images (:class:`NotSingleImageError`). Reading such a file still
-    converts CMYK, for images imported before (:func:`load_image`). A file it
-    cannot read raises ``ValueError`` or ``OSError``.
+    as several images (:class:`NotSingleImageError`), or, if it is named with
+    another suffix, when the import counts them (:func:`check_misnamed_tiff`).
+    Reading such a file still converts CMYK, for images imported before
+    (:func:`load_image`). A file it cannot read raises ``ValueError`` or
+    ``OSError``.
     """
     path = Path(path)
     try:
