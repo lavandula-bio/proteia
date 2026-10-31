@@ -363,13 +363,14 @@ def test_an_import_warns_of_an_image_that_looks_like_a_processed_figure(client):
 
 
 def duplicate_notices(answer: dict) -> list[dict]:
-    """The answer's duplicate_images notices (#216), of the set listed first."""
-    return [n for n in answer["results"]["sets"][0]["notices"] if n["code"] == "duplicate_images"]
+    """The answer's notices of images of one file (#216), of each result set."""
+    codes = ("duplicate_images", "duplicate_images_measured")
+    return [n for one in answer["results"]["sets"] for n in one["notices"] if n["code"] in codes]
 
 
-def test_an_import_of_a_file_already_in_the_project_answers_a_warning_naming_both(client, tmp_path):
+def test_an_import_of_a_file_already_in_the_project_answers_a_note_naming_both(client, tmp_path):
     # #216: worked out from the images the project holds, in every answer;
-    # no image stores it.
+    # no image stores it. Neither copy is boxed yet: a note.
     client.ok("POST", "/api/projects", {"name": "Blot"})
     data = blot_bytes(tmp_path)
     status, first = upload(client, data, name="β-actin 10 µM.tif")
@@ -378,11 +379,11 @@ def test_an_import_of_a_file_already_in_the_project_answers_a_warning_naming_bot
     status, answer = upload(client, data, name="copy α.tif")
     assert status == 201, answer
     ids = [first["image_id"], answer["image_id"]]
-    warning = {
+    note = {
         "code": "duplicate_images",
-        "level": "warning",
+        "level": "info",
         "message": "'β-actin 10 µM.tif' and 'copy α.tif' are the same file (identical bytes),"
-        " on 2 membranes: a band boxed on both is counted twice. If one should be a"
+        " on 2 membranes: a band boxed on both would be counted twice. If one should be a"
         " different image, import that image's file; nothing needs to change for a copy"
         " imported on purpose",
         "protein_ids": [],
@@ -390,13 +391,13 @@ def test_an_import_of_a_file_already_in_the_project_answers_a_warning_naming_bot
         "conditions": [],
         "image_ids": ids,
     }
-    assert duplicate_notices(answer) == [warning]
+    assert duplicate_notices(answer) == [note]
     assert [image["warnings"] for image in answer["project"]["images"]] == [[], []]
     client.ok("POST", "/api/projects", {"name": "Other"})
-    assert duplicate_notices(client.ok("POST", "/api/projects/open", {"name": "Blot"})) == [warning]
-    assert duplicate_notices(client.ok("GET", "/api/project")) == [warning]
+    assert duplicate_notices(client.ok("POST", "/api/projects/open", {"name": "Blot"})) == [note]
+    assert duplicate_notices(client.ok("GET", "/api/project")) == [note]
     assert duplicate_notices(client.ok("DELETE", f"/api/images/{ids[1]}")) == []
-    assert duplicate_notices(client.ok("POST", "/api/undo")) == [warning]
+    assert duplicate_notices(client.ok("POST", "/api/undo")) == [note]
     assert duplicate_notices(client.ok("POST", "/api/redo")) == []
 
 
