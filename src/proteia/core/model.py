@@ -828,10 +828,23 @@ class Batch(_Model):
     membranes: list[Membrane] = Field(default_factory=list)
     proteins: list[Protein] = Field(default_factory=list)
 
+    # --- Access points (#222) ---
+    # Code outside this module reads a membrane's images and register groups,
+    # the lanes, and a protein's image, membrane and boxes through these, one
+    # per concept, so that a change of the stored shape changes them and not
+    # their readers. Each is a plain read of the fields above: a membrane
+    # holds its images, the batch one lane table, and a protein its image and
+    # its boxes. tests/test_accessors.py lists any read that goes around them.
+
     def iter_images(self) -> Iterator[ImageRef]:
         """Every image of every membrane, in membrane then image order."""
         for membrane in self.membranes:
-            yield from membrane.images
+            yield from self.images_of(membrane)
+
+    def images_of(self, membrane: Membrane) -> list[ImageRef]:
+        """A membrane's images, in its order (the stored list: read it, do not
+        change it)."""
+        return membrane.images
 
     def find_image(self, image_id: str) -> ImageRef:
         for image in self.iter_images():
@@ -841,9 +854,51 @@ class Batch(_Model):
 
     def membrane_of(self, image_id: str) -> Membrane:
         for membrane in self.membranes:
-            if any(image.id == image_id for image in membrane.images):
+            if any(image.id == image_id for image in self.images_of(membrane)):
                 return membrane
         raise UnknownIdError(f"unknown image {image_id!r}")
+
+    def membranes_on(self, image_id: str) -> list[Membrane]:
+        """The membranes on an image: the one membrane that holds it;
+        ``UnknownIdError`` for an unknown image."""
+        return [self.membrane_of(image_id)]
+
+    def register_groups(self, membrane: Membrane) -> list[frozenset[str]]:
+        """A membrane's register groups (:meth:`Membrane.register_groups`)."""
+        return membrane.register_groups()
+
+    def group_of(self, membrane: Membrane, image_id: str) -> frozenset[str]:
+        """The register group of ``membrane`` holding ``image_id``;
+        ``UnknownIdError`` if it is not on the membrane."""
+        return membrane.group_of(image_id)
+
+    def lanes_of(self, membrane: Membrane) -> list[Lane]:
+        """The lanes of a membrane's images: the batch's lane table."""
+        return self.lanes
+
+    def lanes_of_protein(self, protein: Protein) -> list[Lane]:
+        """The lanes a protein's bands and records index: the batch's lane table."""
+        return self.lanes
+
+    def image_of(self, protein: Protein) -> ImageRef:
+        """The image a protein is quantified on."""
+        return self.find_image(protein.image_id)
+
+    def membrane_of_protein(self, protein: Protein) -> Membrane:
+        """The membrane of the image a protein is quantified on."""
+        return self.membrane_of(protein.image_id)
+
+    def proteins_on(self, image_id: str) -> list[Protein]:
+        """The proteins quantified on an image, in batch order; [] for none."""
+        return [protein for protein in self.proteins if protein.image_id == image_id]
+
+    @staticmethod
+    def boxes_of(protein: Protein) -> Protein:
+        """What holds a protein's boxes: its ``box_size``, ``box_padding``
+        (and ``fitted_size``), ``bands`` and ``undetected`` records, to read
+        and write. That is the protein itself; it needs no batch, so a helper
+        given only a protein reaches it as ``Batch.boxes_of(protein)``."""
+        return protein
 
     def find_protein(self, protein_id: str) -> Protein:
         for protein in self.proteins:
@@ -853,7 +908,7 @@ class Batch(_Model):
 
     def find_band(self, band_id: str) -> tuple[Protein, Band]:
         for protein in self.proteins:
-            for band in protein.bands:
+            for band in self.boxes_of(protein).bands:
                 if band.id == band_id:
                     return protein, band
         raise UnknownIdError(f"unknown band {band_id!r}")

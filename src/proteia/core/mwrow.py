@@ -266,13 +266,13 @@ def lane_span(batch: Batch, protein: Protein, fitted: mwcal.Calibration) -> Lane
     already placed there, else on the image of its register group with the
     most lanes placed (the first of them in membrane order), else between its
     two ladders; None when none shows it (see the module docstring)."""
-    n = len(batch.lanes)
+    n = len(batch.lanes_of_protein(protein))
     if n < 1:
         return None
-    image = batch.find_image(protein.image_id)
+    image = batch.image_of(protein)
     replaced = {
         band.id
-        for band in protein.bands
+        for band in batch.boxes_of(protein).bands
         if band.band_index == 0 and not band.manually_edited and band.source in DETECTING_SOURCES
     }
     anchors = lane_anchors(batch, image, without=replaced)
@@ -281,9 +281,9 @@ def lane_span(batch: Batch, protein: Protein, fitted: mwcal.Calibration) -> Lane
         ids = tuple(lane_anchor_ids(batch, image, without=replaced))
         return LaneSpan(*span, "anchors", ids, image.id)
     membrane = batch.membrane_of(image.id)
-    group = membrane.group_of(image.id)
+    group = batch.group_of(membrane, image.id)
     best: tuple[int, str, list[tuple[float, int]]] | None = None
-    for other in membrane.images:
+    for other in batch.images_of(membrane):
         if other.id == image.id or other.id not in group:
             continue
         found = lane_anchors(batch, other)
@@ -305,7 +305,7 @@ def placed_on_add(batch: Batch, protein: Protein) -> bool:
     expects one band at a known MW, and its image has a curve."""
     if protein.expected_mw is None or protein.expected_band_count != 1:
         return False
-    fitted = mwcal.calibration_for(batch.membrane_of(protein.image_id), protein.image_id)
+    fitted = mwcal.calibration_for(batch.membrane_of_protein(protein), batch.image_of(protein).id)
     return isinstance(fitted, mwcal.Calibration)
 
 
@@ -330,7 +330,7 @@ def predict(batch: Batch, protein: Protein) -> Prediction | None:
     level line."""
     if not placed_on_add(batch, protein) or protein.expected_mw is None:
         return None
-    image = batch.find_image(protein.image_id)
+    image = batch.image_of(protein)
     fitted = mwcal.calibration_for(batch.membrane_of(image.id), image.id)
     if not isinstance(fitted, mwcal.Calibration):  # never: placed_on_add found the curve
         return None

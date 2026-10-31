@@ -97,14 +97,15 @@ def _missing_lanes(
     row (the median centre y of its first bands; before it has one, its
     ``predicted`` row's at its expected MW, along the protein line where the
     lane's x is known); None where that cannot be known yet."""
-    first = [band for band in protein.bands if band.band_index == 0]
+    boxes = batch.boxes_of(protein)
+    first = [band for band in boxes.bands if band.band_index == 0]
     has = {band.lane_index for band in first}
-    has.update(record.lane_index for record in protein.undetected if record.band_index == 0)
-    lanes = [lane.index for lane in batch.lanes if lane.index not in has]
+    has.update(record.lane_index for record in boxes.undetected if record.band_index == 0)
+    lanes = [lane.index for lane in batch.lanes_of_protein(protein) if lane.index not in has]
     if not lanes:
         return []
     xs = lane_positions(anchors, lanes)
-    centres = [band.box.y + protein.box_size.height / 2 for band in first]
+    centres = [band.box.y + boxes.box_size.height / 2 for band in first]
     y = statistics.median(centres) if centres else None
     if y is not None or predicted is None or predicted.expected_y[0] is None:
         return [{"lane_index": lane, "x": xs.get(lane), "y": y} for lane in lanes]
@@ -139,13 +140,14 @@ def _predicted_row(predicted: mwrow.Prediction | None) -> JsonValue:
     }
 
 
-def _membrane(membrane: Membrane) -> JsonValue:
+def _membrane(batch: Batch, membrane: Membrane) -> JsonValue:
     """A membrane's ladder and its register groups, each with its calibration
     points and its fit."""
     calibration = membrane.calibration
+    images = batch.images_of(membrane)
     groups: list[JsonValue] = []
-    for group in membrane.register_groups():
-        image_ids = [image.id for image in membrane.images if image.id in group]
+    for group in batch.register_groups(membrane):
+        image_ids = [image.id for image in images if image.id in group]
         fit = calibration_fit(membrane, image_ids[0])
         groups.append(
             {
@@ -167,7 +169,7 @@ def _membrane(membrane: Membrane) -> JsonValue:
         )
     return {
         "id": membrane.id,
-        "image_ids": [image.id for image in membrane.images],
+        "image_ids": [image.id for image in images],
         "ladder": calibration.ladder,
         "ladder_kda": list(calibration.ladder_kda),
         "groups": groups,
@@ -213,19 +215,20 @@ def project_state(
             ],
         }
         for membrane in batch.membranes
-        for image in membrane.images
+        for image in batch.images_of(membrane)
     ]
     anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
-        size, fitted, padding = protein.box_size, protein.fitted_size, protein.box_padding
+        boxes, image_id = batch.boxes_of(protein), batch.image_of(protein).id
+        size, fitted, padding = boxes.box_size, boxes.fitted_size, boxes.box_padding
         predicted = mwrow.predict(batch, protein)
         proteins.append(
             {
                 "id": protein.id,
                 "name": protein.name,
                 "role": protein.role.value,
-                "image_id": protein.image_id,
+                "image_id": image_id,
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
                 "mw_tolerance": protein.mw_tolerance,
@@ -246,7 +249,7 @@ def project_state(
                         "source": band.source.value,
                         "manually_edited": band.manually_edited,
                     }
-                    for band in protein.bands
+                    for band in boxes.bands
                 ],
                 "undetected": [
                     {
@@ -258,11 +261,9 @@ def project_state(
                         "region": list(record.region.rect()),
                         "source": record.source.value,
                     }
-                    for record in protein.undetected
+                    for record in boxes.undetected
                 ],
-                "missing_lanes": _missing_lanes(
-                    batch, protein, anchors[protein.image_id], predicted
-                ),
+                "missing_lanes": _missing_lanes(batch, protein, anchors[image_id], predicted),
                 "predicted_row": _predicted_row(predicted),
             }
         )
@@ -284,7 +285,7 @@ def project_state(
         ],
         "reference_condition": batch.reference_condition,
         "images": images,
-        "membranes": [_membrane(membrane) for membrane in batch.membranes],
+        "membranes": [_membrane(batch, membrane) for membrane in batch.membranes],
         "proteins": proteins,
         "saved": not session.dirty,
         "save_error": None if session.save_error is None else str(session.save_error),

@@ -699,16 +699,14 @@ def _log_fallbacks(session: ProjectSession, before: Project) -> None:
     old = {
         band.id: (band.background_mode, band.clipped)
         for protein in before.batch.proteins
-        for band in protein.bands
+        for band in before.batch.boxes_of(protein).bands
     }
     batch, name = session.project.batch, session.folder.name
     for image in batch.iter_images():
         cut: dict[str, list[str]] = {}
         unchecked: list[str] = []
-        for protein in batch.proteins:
-            if protein.image_id != image.id:
-                continue
-            for band in protein.bands:
+        for protein in batch.proteins_on(image.id):
+            for band in batch.boxes_of(protein).bands:
                 was = old.get(band.id)
                 mode = band.background_mode
                 if mode in _CUT_BACKGROUNDS and (was is None or was[0] != mode):
@@ -766,15 +764,16 @@ def _drop_undetected_where(
 ) -> list[dict[str, JsonValue]]:
     """Remove a draft protein's records for which ``drop`` is true; return their
     log forms in the stored order (plain values, as a change should return)."""
+    own = Batch.boxes_of(protein)
     kept: list[UndetectedBand] = []
     dropped: list[dict[str, JsonValue]] = []
-    for u in protein.undetected:
+    for u in own.undetected:
         if drop(u):
             dropped.append(_undetected_json(protein.id, u))
         else:
             kept.append(u)
     if dropped:
-        protein.undetected = kept
+        own.undetected = kept
     return dropped
 
 
@@ -824,10 +823,9 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     batch = draft.batch
     image = batch.find_image(image_id)
     placed = [
-        (protein.box_size, band)
-        for protein in batch.proteins
-        if protein.image_id == image_id
-        for band in protein.bands
+        (batch.boxes_of(protein).box_size, band)
+        for protein in batch.proteins_on(image_id)
+        for band in batch.boxes_of(protein).bands
     ]
     if not placed:
         return
@@ -866,10 +864,7 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
 def _bands_on(batch: Batch, image_id: str) -> list[str]:
     """The ids of every band on one image, of every protein."""
     return [
-        band.id
-        for protein in batch.proteins
-        if protein.image_id == image_id
-        for band in protein.bands
+        band.id for protein in batch.proteins_on(image_id) for band in batch.boxes_of(protein).bands
     ]
 
 
@@ -918,11 +913,15 @@ def _point_key(point: CalibrationPoint) -> tuple:
     return point.side.value, point.y, point.mw, point.source.value, point.image_id, point.x
 
 
-def _calibration_inputs(membrane: Membrane) -> tuple:
+def _calibration_inputs(batch: Batch, membrane: Membrane) -> tuple:
     """What a membrane's fit depends on: its points and its marker links."""
     return (
         sorted(_point_key(point) for point in membrane.calibration.points),
-        [(image.id, image.marker_image_id) for image in membrane.images if image.marker_image_id],
+        [
+            (image.id, image.marker_image_id)
+            for image in batch.images_of(membrane)
+            if image.marker_image_id
+        ],
     )
 
 
@@ -940,12 +939,12 @@ def _fitted_before_58(membrane: Membrane, batch: Batch) -> bool:
         or mwcal.fit_method(membrane) is not FitMethod.LOG_LINEAR
     ):
         return True
-    images = {image.id for image in membrane.images}
+    images = {image.id for image in batch.images_of(membrane)}
     return any(
         band.apparent_mw is not None
         for protein in batch.proteins
-        if protein.image_id in images
-        for band in protein.bands
+        if batch.image_of(protein).id in images
+        for band in batch.boxes_of(protein).bands
     )
 
 
@@ -994,10 +993,12 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
     refitted_older: set[str] = set()  # the images of membranes whose older fit was replaced
     for membrane in draft.batch.membranes:
         stored = before.get(membrane.id)
-        if stored is not None and _calibration_inputs(stored) == _calibration_inputs(membrane):
+        if stored is not None and _calibration_inputs(committed.batch, stored) == (
+            _calibration_inputs(draft.batch, membrane)
+        ):
             continue
         if stored is not None and _fitted_before_58(stored, committed.batch):
-            refitted_older.update(image.id for image in membrane.images)
+            refitted_older.update(image.id for image in draft.batch.images_of(membrane))
         calibration = membrane.calibration
         calibration.fit_method = mwcal.fit_method(membrane)
         quality = mwcal.fit_quality(membrane)
@@ -1015,19 +1016,20 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
     ]
     moved_curves = set(changed)
     boxes_before = {
-        band.id: (band.box, protein.box_size)
+        band.id: (band.box, committed.batch.boxes_of(protein).box_size)
         for protein in committed.batch.proteins
-        for band in protein.bands
+        for band in committed.batch.boxes_of(protein).bands
     }
     dropped: list[dict[str, JsonValue]] = []
     for protein in draft.batch.proteins:
-        fitted, size = new[protein.image_id], protein.box_size
-        for band in protein.bands:
-            if protein.image_id in moved_curves or boxes_before.get(band.id) != (band.box, size):
+        own, image_id = draft.batch.boxes_of(protein), draft.batch.image_of(protein).id
+        fitted, size = new[image_id], own.box_size
+        for band in own.bands:
+            if image_id in moved_curves or boxes_before.get(band.id) != (band.box, size):
                 band.apparent_mw = _apparent_mw(fitted, band.box, size)
-        if protein.image_id in moved_curves:
+        if image_id in moved_curves:
             dropped.extend(_drop_mw_guided(protein))
-            for band in protein.bands:
+            for band in own.bands:
                 band.bands_found = None
     return _MwRefresh(curves_changed=tuple(changed), dropped=tuple(dropped))
 
@@ -1050,15 +1052,15 @@ def _remeasured(
     A no-op, ``after`` the same as ``before``, moves none."""
     nets = {
         band.id: band.net
-        for other in after.proteins
-        if other.image_id == image_id and other.id != protein_id
-        for band in other.bands
+        for other in after.proteins_on(image_id)
+        if other.id != protein_id
+        for band in after.boxes_of(other).bands
     }
     remeasured = tuple(
         (band.id, band.net, nets[band.id])
-        for other in before.proteins
-        if other.image_id == image_id and other.id != protein_id
-        for band in other.bands
+        for other in before.proteins_on(image_id)
+        if other.id != protein_id
+        for band in before.boxes_of(other).bands
         if nets[band.id] != band.net
     )
     shares = [(abs(new - old) / old, band_id) for band_id, old, new in remeasured if old > 0]
@@ -1185,8 +1187,10 @@ def _count_cleared_by_tolerance(batch: Batch, protein: Protein) -> bool:
     window was sized from it, as it is wherever its image has a curve (a curve
     change clears them, so a count there was made with that curve); without
     one, the window is the row box's rows."""
-    membrane = batch.membrane_of(protein.image_id)
-    return isinstance(mwcal.calibration_for(membrane, protein.image_id), mwcal.Calibration)
+    membrane = batch.membrane_of_protein(protein)
+    return isinstance(
+        mwcal.calibration_for(membrane, batch.image_of(protein).id), mwcal.Calibration
+    )
 
 
 def _loading_controls(batch: Batch, protein_id: str | None, role: Role, ids: object) -> list[str]:
@@ -1298,10 +1302,11 @@ def _check_lane(
 
 def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> list[str]:
     """The protein's bands (other than ``skip``) whose box overlaps ``rect``."""
+    own = Batch.boxes_of(protein)
     return [
         band.id
-        for band in protein.bands
-        if band.id != skip and overlaps(rect, band.box.rect(protein.box_size))
+        for band in own.bands
+        if band.id != skip and overlaps(rect, band.box.rect(own.box_size))
     ]
 
 
@@ -1320,11 +1325,12 @@ def _covered(
     same pair of boxes was refused or not by which came first."""
     rects = list(rects)
     found = []
-    for other in batch.proteins:
-        if other.id == protein.id or other.image_id != protein.image_id:
+    for other in batch.proteins_on(batch.image_of(protein).id):
+        if other.id == protein.id:
             continue
-        for band in other.bands:
-            box = band.box.rect(other.box_size)
+        theirs = batch.boxes_of(other)
+        for band in theirs.bands:
+            box = band.box.rect(theirs.box_size)
             share = max((overlap_share(rect, box) for rect in rects), default=0.0)
             if share > COVER_SHARE:
                 found.append((other, band, share))
@@ -1628,10 +1634,16 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
 
     def change(draft: Project) -> tuple[Cascade, list[JsonValue], list[JsonValue]]:
         batch = draft.batch
-        gone = [p for p in batch.proteins if p.image_id == image_id]
+        gone = batch.proteins_on(image_id)
         gone_ids = {p.id for p in gone}
-        removed = [image_id, *(p.id for p in gone), *(b.id for p in gone for b in p.bands)]
-        records: list[JsonValue] = [_undetected_json(p.id, u) for p in gone for u in p.undetected]
+        removed = [
+            image_id,
+            *(p.id for p in gone),
+            *(b.id for p in gone for b in batch.boxes_of(p).bands),
+        ]
+        records: list[JsonValue] = [
+            _undetected_json(p.id, u) for p in gone for u in batch.boxes_of(p).undetected
+        ]
         # Targets using a removed loading control without naming it lose it too.
         implicit = {t for p in gone for t in _implicit_users(batch, p.id)} - gone_ids
         batch.proteins = [p for p in batch.proteins if p.id not in gone_ids]
@@ -1652,15 +1664,15 @@ def remove_image(session: ProjectSession, image_id: str) -> Cascade:
                 unpaired.append(image.id)
 
         membrane = batch.membrane_of(image_id)
-        membrane.images = [image for image in membrane.images if image.id != image_id]
+        membrane.images = [image for image in batch.images_of(membrane) if image.id != image_id]
         unfitted = []
         calibration = membrane.calibration
         points = [point for point in calibration.points if point.image_id != image_id]
         if len(points) != len(calibration.points):
             calibration.points = points
-            if membrane.images:
+            if batch.images_of(membrane):
                 unfitted.append(membrane.id)
-        if not membrane.images:
+        if not batch.images_of(membrane):
             batch.membranes = [m for m in batch.membranes if m.id != membrane.id]
             removed.append(membrane.id)
         dropped: list[JsonValue] = list(_refresh_mw(committed, draft).dropped)
@@ -1713,14 +1725,12 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
         drafted.import_warnings = warnings
         if array is not None:
             _quantify_image(draft, image_id, array)
-        for protein in draft.batch.proteins:
-            if protein.image_id == image_id:
-                for band in protein.bands:
-                    band.bands_found = None
+        for protein in draft.batch.proteins_on(image_id):
+            for band in draft.batch.boxes_of(protein).bands:
+                band.bands_found = None
         return [
             dropped
-            for protein in draft.batch.proteins
-            if protein.image_id == image_id
+            for protein in draft.batch.proteins_on(image_id)
             for dropped in _drop_undetected_where(protein, lambda _: True)
         ]
 
@@ -1867,12 +1877,18 @@ def _within_image(image: ImageRef, *, x: float | None, y: float | None) -> None:
             )
 
 
-def _group_names(membrane: Membrane, group: frozenset[str]) -> str:
+def _group_ids(batch: Batch, membrane: Membrane, group: frozenset[str]) -> list[str]:
+    """A register group's images, in membrane order, as log entries list them."""
+    return [image.id for image in batch.images_of(membrane) if image.id in group]
+
+
+def _group_names(batch: Batch, membrane: Membrane, group: frozenset[str]) -> str:
     """A register group's images, in membrane order, as refusals name them."""
-    return ", ".join(image.id for image in membrane.images if image.id in group)
+    return ", ".join(_group_ids(batch, membrane, group))
 
 
 def _ladder_refusal(
+    batch: Batch,
     membrane: Membrane,
     group: frozenset[str],
     points: Sequence[CalibrationPoint],
@@ -1893,7 +1909,7 @@ def _ladder_refusal(
     in conflict, the ``upper`` one's (the smaller y) and the ``lower`` one's;
     or the ``reason`` the sides are refused (``strip_edge``, ``no_x`` with the
     ``side`` and ``mw`` of the point without its x, or ``not_right``)."""
-    names = _group_names(membrane, group)
+    names = _group_names(batch, membrane, group)
     head = f"membrane {membrane.id}:"
 
     def at(point: CalibrationPoint) -> str:
@@ -1992,10 +2008,12 @@ def _calibration_target(batch: Batch, image_id: str) -> tuple[Membrane, ImageRef
     names by any of the group's images (``UnknownIdError`` if none)."""
     image = batch.find_image(image_id)
     membrane = batch.membrane_of(image_id)
-    return membrane, image, membrane.group_of(image_id)
+    return membrane, image, batch.group_of(membrane, image_id)
 
 
-def _find_point(membrane: Membrane, group: frozenset[str], side: LadderSide, mw: float) -> int:
+def _find_point(
+    batch: Batch, membrane: Membrane, group: frozenset[str], side: LadderSide, mw: float
+) -> int:
     """The index in the membrane's points of the point at ``mw`` on ``side`` of
     the group (a point's identity: its group, side and MW, compared on
     log10(MW) as the model does); ``UnknownIdError`` if there is none."""
@@ -2005,7 +2023,7 @@ def _find_point(membrane: Membrane, group: frozenset[str], side: LadderSide, mw:
             return index
     raise UnknownIdError(
         f"no calibration point at {mw:g} kDa on the {side.value} ladder of"
-        f" {_group_names(membrane, group)}"
+        f" {_group_names(batch, membrane, group)}"
     )
 
 
@@ -2127,7 +2145,9 @@ def set_marker_image(
             ids=(image_id,),
         )
     if marker is not None:
-        if marker.kind not in _MARKER_KINDS or all(i.id != marker.id for i in membrane.images):
+        if marker.kind not in _MARKER_KINDS or all(
+            i.id != marker.id for i in batch.images_of(membrane)
+        ):
             raise _invalid(
                 f"{marker.id} is not a visible-light marker or merged image of membrane"
                 f" {membrane.id}",
@@ -2141,11 +2161,12 @@ def set_marker_image(
                 " its image pixel for pixel",
                 ids=(image_id, marker.id),
             )
-    linked = membrane.model_copy(deep=True)
-    next(i for i in linked.images if i.id == image_id).marker_image_id = marker_image_id
-    for group in linked.register_groups():
+    linked_batch = batch.model_copy(deep=True)  # with the link made, to check it
+    linked_batch.find_image(image_id).marker_image_id = marker_image_id
+    linked = linked_batch.membrane_of(image_id)
+    for group in linked_batch.register_groups(linked):
         points = [p for p in linked.calibration.points if p.image_id in group]
-        refusal = _ladder_refusal(linked, group, points)
+        refusal = _ladder_refusal(linked_batch, linked, group, points)
         if refusal is not None:
             raise refusal
     previous = image.marker_image_id
@@ -2153,13 +2174,13 @@ def set_marker_image(
     def edit(draft: Project) -> None:
         draft.batch.find_image(image_id).marker_image_id = marker_image_id
 
-    group = linked.group_of(image_id)
+    group = linked_batch.group_of(linked, image_id)
     params = {
         "membrane_id": membrane.id,
         "image_id": image_id,
         "marker_image_id": marker_image_id,
         "previous": previous,
-        "group": [i.id for i in linked.images if i.id in group],
+        "group": _group_ids(linked_batch, linked, group),
     }
     change, logged = _calibration_change(session, image_id, edit, params)
     return _calibration_update(_apply(session, "set_marker_image", change, logged))
@@ -2306,7 +2327,7 @@ def add_calibration_point(
     found = _snapped(session, new, image, marked) if snap else None
     if found is not None:
         new = new.model_copy(update={"y": found})
-    refusal = _ladder_refusal(membrane, group, [*points, new], new)
+    refusal = _ladder_refusal(batch, membrane, group, [*points, new], new)
     if refusal is not None:
         raise refusal
 
@@ -2316,7 +2337,7 @@ def add_calibration_point(
     snapped = found is not None
     params = {
         "membrane_id": membrane.id,
-        "group": [i.id for i in membrane.images if i.id in group],
+        "group": _group_ids(batch, membrane, group),
         "side": side.value,
         "image_id": image_id,
         "mw": mw,
@@ -2368,7 +2389,7 @@ def edit_calibration_point(
     membrane, image, group = _calibration_target(batch, image_id)
     side = _member(LadderSide, side, "ladder side")
     mw = _kda(mw)
-    index = _find_point(membrane, group, side, mw)
+    index = _find_point(batch, membrane, group, side, mw)
     old = membrane.calibration.points[index]
     point_image = batch.find_image(old.image_id)
     given_y = None if y is KEEP else _number(y, "y")
@@ -2389,7 +2410,9 @@ def edit_calibration_point(
         found = _snapped(session, moved, point_image, marked)
         if found is not None:
             moved = moved.model_copy(update={"y": found})
-    refusal = _ladder_refusal(membrane, group, [moved if p is old else p for p in points], moved)
+    refusal = _ladder_refusal(
+        batch, membrane, group, [moved if p is old else p for p in points], moved
+    )
     if refusal is not None:
         raise refusal
 
@@ -2399,7 +2422,7 @@ def edit_calibration_point(
     snapped = found is not None
     params = {
         "membrane_id": membrane.id,
-        "group": [i.id for i in membrane.images if i.id in group],
+        "group": _group_ids(batch, membrane, group),
         "side": side.value,
         "mw": old.mw,
         "new_mw": moved.mw,
@@ -2430,7 +2453,7 @@ def remove_calibration_point(
     batch = session.project.batch
     membrane, _, group = _calibration_target(batch, image_id)
     side = _member(LadderSide, side, "ladder side")
-    index = _find_point(membrane, group, side, _kda(mw))
+    index = _find_point(batch, membrane, group, side, _kda(mw))
     removed = membrane.calibration.points[index]
 
     def edit(draft: Project) -> None:
@@ -2438,7 +2461,7 @@ def remove_calibration_point(
 
     params = {
         "membrane_id": membrane.id,
-        "group": [i.id for i in membrane.images if i.id in group],
+        "group": _group_ids(batch, membrane, group),
         "side": side.value,
         "removed": _point_json(removed),
     }
@@ -2470,7 +2493,7 @@ def clear_calibration(
 
     params = {
         "membrane_id": membrane.id,
-        "group": [i.id for i in membrane.images if i.id in group],
+        "group": _group_ids(batch, membrane, group),
         "side": None if chosen is None else chosen.value,
         "removed": list(removed),
     }
@@ -2800,7 +2823,7 @@ def set_ladder_points(
         for y, mw in sorted(pairs)
     ]
     kept = [p.model_copy(update={"side": moved}) if moved is not None else p for p in opposite]
-    refusal = _ladder_refusal(membrane, group, [*kept, *applied])
+    refusal = _ladder_refusal(batch, membrane, group, [*kept, *applied])
     if refusal is not None:
         raise refusal
     proposal = None if found_x is None else _proposal(session, membrane, image, found_x, side)
@@ -2817,7 +2840,7 @@ def set_ladder_points(
 
     params: dict[str, JsonValue] = {
         "membrane_id": membrane.id,
-        "group": [i.id for i in membrane.images if i.id in group],
+        "group": _group_ids(batch, membrane, group),
         "side": stored.value,
         "image_id": image_id,
         "x": x,
@@ -2909,7 +2932,7 @@ def set_lanes(
         if conditions[i] != typed_conditions[i] or samples[i] != typed_samples[i]
     )
 
-    cut = [band for p in batch.proteins for band in p.bands if band.lane_index >= n]
+    cut = [band for p in batch.proteins for band in batch.boxes_of(p).bands if band.lane_index >= n]
     if cut:
         held = lanes_phrase({band.lane_index for band in cut})
         raise OperationError(
@@ -3126,7 +3149,7 @@ def edit_protein(
         dropped: list[JsonValue] = []
         if mw != protein.expected_mw or tolerance != protein.mw_tolerance:
             dropped.extend(_drop_mw_guided(edited))
-        for band in edited.bands:  # counts whose window or slot the edit moved
+        for band in draft.batch.boxes_of(edited).bands:  # counts whose window or slot moved
             guided = mw != protein.expected_mw and band.source is ProposalSource.MW_GUIDED
             if recount or guided:
                 band.bands_found = None
@@ -3164,14 +3187,15 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
     and reported. The log lists the records in full (``removed_undetected``).
     The other bands on its image are re-quantified: their rings no longer leave
     out its boxes."""
-    protein = session.project.batch.find_protein(protein_id)
-    image_id = protein.image_id
-    band_ids = [band.id for band in protein.bands]
+    committed = session.project.batch
+    protein = committed.find_protein(protein_id)
+    image_id = committed.image_of(protein).id
+    band_ids = [band.id for band in committed.boxes_of(protein).bands]
     array = _pixels_left(session, image_id, band_ids) if band_ids else None
 
     def change(draft: Project) -> tuple[Cascade, list[JsonValue]]:
         batch = draft.batch
-        gone = batch.find_protein(protein_id)
+        gone = batch.boxes_of(batch.find_protein(protein_id))
         removed = (protein_id, *(band.id for band in gone.bands))
         records: list[JsonValue] = [_undetected_json(protein_id, u) for u in gone.undetected]
         implicit = set(_implicit_users(batch, protein_id))
@@ -3246,16 +3270,17 @@ def place_box(
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
+    own = batch.boxes_of(protein)
     x, y = _int(x, "x"), _int(y, "y")
     lane_index = None if lane_index is None else _int(lane_index, "lane index")
     proposed = lane_index is None
     if not isinstance(grow, bool):
         raise _invalid(f"grow must be True or False, not {grow!r}")
-    n = len(batch.lanes)
+    n = len(batch.lanes_of_protein(protein))
     if n == 0:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before placing boxes")
-    taken = {b.lane_index: b.id for b in protein.bands if b.band_index == 0}
-    image = batch.find_image(protein.image_id)
+    taken = {b.lane_index: b.id for b in own.bands if b.band_index == 0}
+    image = batch.image_of(protein)
     width, height = image.width, image.height
     if not (0 <= x < width and 0 <= y < height):
         raise OperationError(
@@ -3278,7 +3303,7 @@ def place_box(
             lane_index = _check_lane(protein, propose_lane(x, anchors), n, taken, proposed=True)
 
     array = session.pixels(image.id)
-    rects = [band.box.rect(protein.box_size) for band in protein.bands]
+    rects = [band.box.rect(own.box_size) for band in own.bands]
     if grow:
         # The settings the export record reports (record.settings), passed explicitly.
         grown = grow_box(
@@ -3293,7 +3318,7 @@ def place_box(
             raise OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})")
         try:
             size, resized, rect = boxes.grow_to_fit(
-                rects, protein.box_size, grown, width=width, height=height, pad=protein.box_padding
+                rects, own.box_size, grown, width=width, height=height, pad=own.box_padding
             )
         except boxes.BoxRuleError as exc:  # overlap, or size_would_overlap
             raise OperationError(ErrorCode(exc.code), str(exc)) from exc
@@ -3307,7 +3332,7 @@ def place_box(
         if covered:
             raise _cover_refusal(
                 covered,
-                f"at the box size {boxes.size_words(size, protein.box_padding)} this band"
+                f"at the box size {boxes.size_words(size, own.box_padding)} this band"
                 f" needs, boxes of {protein.name!r} would overlap",
             )
         source = ProposalSource.CLICK
@@ -3318,7 +3343,7 @@ def place_box(
             at = x if gx0 <= 0 or gx1 >= width else (gx0 + gx1) / 2
             lane_index = _check_lane(protein, propose_lane(at, anchors), n, taken, proposed=True)
     else:
-        size, resized = protein.box_size, rects
+        size, resized = own.box_size, rects
         rect = boxes.centered_rect(x, y, size, width, height)
         hits = _overlapped(rect, protein)
         if hits:
@@ -3334,8 +3359,9 @@ def place_box(
 
     def change(draft: Project) -> tuple[str, dict[str, JsonValue] | None]:
         edited = draft.batch.find_protein(protein_id)
-        edited.box_size = size
-        for band, old, new in zip(edited.bands, rects, resized, strict=True):
+        edited_boxes = draft.batch.boxes_of(edited)
+        edited_boxes.box_size = size
+        for band, old, new in zip(edited_boxes.bands, rects, resized, strict=True):
             if new != old:
                 _set_box(band, new)
         band = Band(
@@ -3346,8 +3372,8 @@ def place_box(
             source=source,
             **_UNQUANTIFIED,
         )
-        edited.bands.append(band)
-        _quantify_image(draft, edited.image_id, array)
+        edited_boxes.bands.append(band)
+        _quantify_image(draft, draft.batch.image_of(edited).id, array)
         _refresh_box_mws(session.project, draft)
         return band.id, _drop_undetected(edited, lane_index, 0)
 
@@ -3389,9 +3415,10 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         raise _invalid(f"rect must be (x0, y0, x1, y1), not {rect!r}")
     x0, y0, x1, y1 = (_int(v, "rect coordinate") for v in rect)
     rect = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-    image = batch.find_image(protein.image_id)
-    new = boxes.center_snap(rect, protein.box_size, image.width, image.height)
-    if new == band.box.rect(protein.box_size):
+    image = batch.image_of(protein)
+    size = batch.boxes_of(protein).box_size
+    new = boxes.center_snap(rect, size, image.width, image.height)
+    if new == band.box.rect(size):
         return
     hits = _overlapped(new, protein, skip=band_id)
     if hits:
@@ -3408,7 +3435,7 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         _set_box(moved, new)
         moved.manually_edited = True
         moved.bands_found = None
-        _quantify_image(draft, edited.image_id, array)
+        _quantify_image(draft, draft.batch.image_of(edited).id, array)
         _refresh_box_mws(session.project, draft)
 
     _apply(session, "move_box", change, lambda _: {"band_id": band_id, "rect": list(new)})
@@ -3421,12 +3448,13 @@ def remove_box(session: ProjectSession, band_id: str) -> None:
     out the box."""
     protein, band = session.project.batch.find_band(band_id)
     params = {"band_id": band_id, "protein_id": protein.id, "lane_index": band.lane_index}
-    image_id = protein.image_id
+    image_id = session.project.batch.image_of(protein).id
     array = _pixels_left(session, image_id, [band_id])
 
     def change(draft: Project) -> None:
         protein, _ = draft.batch.find_band(band_id)
-        protein.bands = [band for band in protein.bands if band.id != band_id]
+        own = draft.batch.boxes_of(protein)
+        own.bands = [band for band in own.bands if band.id != band_id]
         if array is not None:
             _quantify_image(draft, image_id, array)
 
@@ -3450,10 +3478,10 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
         return
     taken = {
         b.lane_index: b.id
-        for b in protein.bands
+        for b in batch.boxes_of(protein).bands
         if b.band_index == band.band_index and b.id != band_id
     }
-    _check_lane(protein, lane, len(batch.lanes), taken, proposed=False)
+    _check_lane(protein, lane, len(batch.lanes_of_protein(protein)), taken, proposed=False)
     params = {
         "band_id": band_id,
         "protein_id": protein.id,
@@ -3498,9 +3526,10 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
     (``box_size``) and the fitted size typed (``fitted_size``)."""
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
-    image = batch.find_image(protein.image_id)
+    own = batch.boxes_of(protein)
+    image = batch.image_of(protein)
     size = _box_size(size)
-    fitted, pad = protein.fitted_size, protein.box_padding
+    fitted, pad = own.fitted_size, own.box_padding
     if size == fitted:
         return
     for typed, current, (name, where, dimension) in zip(
@@ -3509,7 +3538,7 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
         padding = getattr(pad, name)
         if typed < current and 2 * padding > typed:
             larger = f"type a {dimension} of at least {2 * padding}"
-            if protein.bands:  # without a box, set_box_padding refuses to lower it
+            if own.bands:  # without a box, set_box_padding refuses to lower it
                 lower = (
                     f"lower that padding to {typed // 2} px or less"
                     if typed > 1
@@ -3521,7 +3550,7 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
                 f" {where} more than half of it; {larger}"
             )
     effective = _within(_padded(size, pad), image, pad)
-    rects = [band.box.rect(protein.box_size) for band in protein.bands]
+    rects = [band.box.rect(own.box_size) for band in own.bands]
     resized = boxes.resize_all(rects, effective, width=image.width, height=image.height)
     if resized is None:
         raise OperationError(
@@ -3536,16 +3565,17 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
             f"at the box size {boxes.size_words(effective, pad)}, boxes of {protein.name!r}"
             " would overlap",
         )
-    array = session.pixels(image.id) if protein.bands else None
+    array = session.pixels(image.id) if own.bands else None
 
     def change(draft: Project) -> None:
         edited = draft.batch.find_protein(protein_id)
-        edited.box_size = effective
-        for band, old, new in zip(edited.bands, rects, resized, strict=True):
+        edited_boxes = draft.batch.boxes_of(edited)
+        edited_boxes.box_size = effective
+        for band, old, new in zip(edited_boxes.bands, rects, resized, strict=True):
             if new != old:
                 _set_box(band, new)
         if array is not None:
-            _quantify_image(draft, edited.image_id, array)
+            _quantify_image(draft, draft.batch.image_of(edited).id, array)
         _refresh_box_mws(session.project, draft)
 
     _apply(
@@ -3573,7 +3603,8 @@ def _padding_overlap(
     the direction raised (left and right if raising it alone makes boxes
     overlap), and the most that fits of it, the other held as asked, when any
     does: overlap only grows with a padding, so a bisection finds it."""
-    fitted = protein.fitted_size
+    own = Batch.boxes_of(protein)
+    fitted = own.fitted_size
 
     def fits(pad: BoxPadding) -> bool:
         _, hits = boxes.resize_checked(
@@ -3599,7 +3630,7 @@ def _padding_overlap(
     held = ""
     if other in raised:
         held = f", with {getattr(new, other)} px {_WHERE[other]},"
-    lanes = lanes_phrase({protein.bands[i].lane_index for i in clashing})
+    lanes = lanes_phrase({own.bands[i].lane_index for i in clashing})
     message = (
         f"{value} px of padding {_WHERE[name]}{held} would make the boxes of"
         f" {protein.name!r} in {lanes} overlap"
@@ -3607,7 +3638,7 @@ def _padding_overlap(
     if most is not None:
         message += f"; at most {most} px fits"
     return OperationError(
-        ErrorCode.SIZE_WOULD_OVERLAP, message, ids=[protein.bands[i].id for i in clashing]
+        ErrorCode.SIZE_WOULD_OVERLAP, message, ids=[own.bands[i].id for i in clashing]
     )
 
 
@@ -3648,6 +3679,7 @@ def set_box_padding(
     """
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
+    own = batch.boxes_of(protein)
     given = {"across": across, "along": along}
     wanted = {
         name: _int(given[name], f"padding {where}")
@@ -3657,19 +3689,19 @@ def set_box_padding(
     for name, value in wanted.items():
         if value < 0:
             raise _invalid(f"padding {_WHERE[name]} must be 0 or more, not {value}")
-    old = protein.box_padding
+    old = own.box_padding
     new = BoxPadding(**{**old.model_dump(), **wanted})
-    fitted = protein.fitted_size
+    fitted = own.fitted_size
     if new == old:
         return PaddingChange(
-            box_size=protein.box_size.model_copy(),
+            box_size=own.box_size.model_copy(),
             fitted_size=fitted,
             padding=old.model_copy(),
             net_change=None,
             edge_shifted=(),
             overlapping=(),
         )
-    if not protein.bands:
+    if not own.bands:
         raise _invalid(
             f"place a box of {protein.name!r} first: its padding follows the fitted size the"
             " bands set"
@@ -3681,9 +3713,9 @@ def set_box_padding(
                 f"padding {where} can be raised to at most {half} px for {protein.name!r}"
                 f" (half its fitted {dimension}, {getattr(fitted, dimension)} px), not {value}"
             )
-    image = batch.find_image(protein.image_id)
+    image = batch.image_of(protein)
     size = _within(_padded(fitted, new), image, new)
-    rects = [band.box.rect(protein.box_size) for band in protein.bands]
+    rects = [band.box.rect(own.box_size) for band in own.bands]
     resized, clashing = boxes.resize_checked(rects, size, width=image.width, height=image.height)
     if clashing:
         raise _padding_overlap(protein, rects, old, new, clashing, image)
@@ -3698,12 +3730,13 @@ def set_box_padding(
 
     def change(draft: Project) -> None:
         edited = draft.batch.find_protein(protein_id)
-        edited.box_padding = new.model_copy()
-        edited.box_size = size
-        for band, before, after in zip(edited.bands, rects, resized, strict=True):
+        edited_boxes = draft.batch.boxes_of(edited)
+        edited_boxes.box_padding = new.model_copy()
+        edited_boxes.box_size = size
+        for band, before, after in zip(edited_boxes.bands, rects, resized, strict=True):
             if after != before:
                 _set_box(band, after)
-        _quantify_image(draft, edited.image_id, array)
+        _quantify_image(draft, draft.batch.image_of(edited).id, array)
         _refresh_box_mws(session.project, draft)
 
     params = {
@@ -3714,22 +3747,23 @@ def set_box_padding(
     _apply(session, "set_box_padding", change, lambda _: params)
 
     after = session.project.batch
-    nets = {band.id: band.net for band in after.find_protein(protein_id).bands}
-    changes = [nets[band.id] / band.net - 1 for band in protein.bands if band.net > 0]
+    nets = {band.id: band.net for band in after.boxes_of(after.find_protein(protein_id)).bands}
+    changes = [nets[band.id] / band.net - 1 for band in own.bands if band.net > 0]
     da, dl = new.across - old.across, new.along - old.along
     shifted = tuple(
         band.id
-        for band, (x0, y0, x1, y1), rect in zip(protein.bands, rects, resized, strict=True)
+        for band, (x0, y0, x1, y1), rect in zip(own.bands, rects, resized, strict=True)
         if rect != (x0 - da, y0 - dl, x1 + da, y1 + dl)
     )
-    others = [
-        band.id
-        for other in batch.proteins
-        if other.image_id == image.id and other.id != protein_id
-        for band in other.bands
-        if boxes.overlaps_any(band.box.rect(other.box_size), resized)
-        and not boxes.overlaps_any(band.box.rect(other.box_size), rects)
-    ]
+    others: list[str] = []  # other proteins' bands its boxes newly overlap
+    for other in batch.proteins_on(image.id):
+        if other.id == protein_id:
+            continue
+        theirs = batch.boxes_of(other)
+        for band in theirs.bands:
+            box = band.box.rect(theirs.box_size)
+            if boxes.overlaps_any(box, resized) and not boxes.overlaps_any(box, rects):
+                others.append(band.id)
     remeasured, largest = _remeasured(batch, after, image.id, protein_id)
     return PaddingChange(
         box_size=size,
@@ -3757,15 +3791,17 @@ def clear_boxes(session: ProjectSession, protein_id: str) -> ClearedBoxes:
     leave out the boxes. The log entry lists the band ids with their lanes, and
     the records in full (``dropped_undetected``).
     """
-    protein = session.project.batch.find_protein(protein_id)
-    removed = [band.id for band in protein.bands]
-    lanes = [band.lane_index for band in protein.bands]
-    image_id = protein.image_id
+    committed = session.project.batch
+    protein = committed.find_protein(protein_id)
+    own = committed.boxes_of(protein)
+    removed = [band.id for band in own.bands]
+    lanes = [band.lane_index for band in own.bands]
+    image_id = committed.image_of(protein).id
     array = _pixels_left(session, image_id, removed) if removed else None
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         edited = draft.batch.find_protein(protein_id)
-        edited.bands = []
+        draft.batch.boxes_of(edited).bands = []
         if array is not None:
             _quantify_image(draft, image_id, array)
         return _drop_undetected_where(edited, lambda _: True)
@@ -3856,11 +3892,13 @@ def _misnumbered_lanes(
     lie that far apart; two boxes dropped on opposite edges of a band wider
     than half the pitch can.
     """
-    proteins = [p for p in batch.proteins if p.image_id == image.id]
+    proteins = batch.proteins_on(image.id)
 
     def anchors_of(skipped: Collection[str]) -> dict[str, list[tuple[float, int]]]:
         return {
-            p.id: lane_anchors(batch, image, without=skipped, only={b.id for b in p.bands})
+            p.id: lane_anchors(
+                batch, image, without=skipped, only={b.id for b in batch.boxes_of(p).bands}
+            )
             for p in proteins
         }
 
@@ -3871,8 +3909,8 @@ def _misnumbered_lanes(
     grown = {
         b.id
         for p in proteins
-        if p.fitted_size.width > pitch
-        for b in p.bands
+        if batch.boxes_of(p).fitted_size.width > pitch
+        for b in batch.boxes_of(p).bands
         if b.source is ProposalSource.CLICK
     }
     if grown:
@@ -3902,7 +3940,7 @@ def _misnumbered_lanes(
         (lane, p, b.id)
         for lane in apart
         for p in proteins
-        for b in p.bands
+        for b in batch.boxes_of(p).bands
         if b.band_index == 0 and b.lane_index == lane and lane in held[p.id]
     ]
     named = [p for p in proteins if any(q is p for _, q, _ in boxes_in)]
@@ -4597,7 +4635,7 @@ def detect_row_boxes(session: ProjectSession, protein_id: str, row: Rect) -> Row
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     given = _row(row)
-    if not batch.lanes:
+    if not batch.lanes_of_protein(protein):
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before detecting a row")
     return _place_row(
         session,
@@ -4645,8 +4683,9 @@ def _place_row(
     record of the rows it read on that line, as a lane with no band does."""
     protein_id = protein.id
     batch = session.project.batch
-    n = len(batch.lanes)
-    image = batch.find_image(protein.image_id)
+    own = batch.boxes_of(protein)
+    n = len(batch.lanes_of_protein(protein))
+    image = batch.image_of(protein)
     width, height = image.width, image.height
     # The lanes on the image, less this protein's boxes that give way to the
     # row whatever it finds, turn the row and check it. Showing no direction,
@@ -4655,7 +4694,7 @@ def _place_row(
     # consistently.
     detectors = {
         b.id
-        for b in protein.bands
+        for b in own.bands
         if b.band_index == 0 and not b.manually_edited and b.source in DETECTING_SOURCES
     }
     anchors = lane_anchors(batch, image, without=detectors)
@@ -4701,12 +4740,12 @@ def _place_row(
     banded = {lane.lane for lane in found.lanes if lane.rect is not None}
     kept = {
         b.lane_index: b.id
-        for b in protein.bands
+        for b in own.bands
         if b.band_index == 0
         and (b.manually_edited or (b.source in _PLACED_BY_USER and b.lane_index not in banded))
     }
     yielding = {
-        b.lane_index: b.id for b in protein.bands if b.band_index == 0 and b.lane_index not in kept
+        b.lane_index: b.id for b in own.bands if b.band_index == 0 and b.lane_index not in kept
     }
     # The same lanes check the reading (none when they show no direction);
     # past them, the row's own pitch.
@@ -4745,18 +4784,18 @@ def _place_row(
     # The boxes that survive the commit: those kept, and those of another band
     # index.
     keeping = set(kept.values())
-    surviving = [b for b in protein.bands if b.band_index > 0 or b.id in keeping]
+    surviving = [b for b in own.bands if b.band_index > 0 or b.id in keeping]
     survivors = [b.id for b in surviving]
-    old = [b.box.rect(protein.box_size) for b in surviving]
+    old = [b.box.rect(own.box_size) for b in surviving]
     placed = [lane for lane in found.lanes if lane.rect is not None and lane.lane not in kept]
-    pad = protein.box_padding
+    pad = own.box_padding
     try:
         # The detector's size, the fitted size, plus the protein's padding; while
         # a box survives it only grows the size, even if every band found is in a
         # kept lane and nothing is placed.
         size, resized, new_rects = boxes.grow_to_fit_all(
             old,
-            protein.box_size,
+            own.box_size,
             [lane.rect for lane in placed],
             need=found.size,
             width=width,
@@ -4830,13 +4869,14 @@ def _place_row(
         draft: Project,
     ) -> tuple[list[str | None], list[Rect | None], list[JsonValue], list[JsonValue]]:
         edited = draft.batch.find_protein(protein_id)
-        old_size = edited.box_size
-        edited.box_size = size
-        by_id = {band.id: band for band in edited.bands}
+        edited_boxes = draft.batch.boxes_of(edited)
+        old_size = edited_boxes.box_size
+        edited_boxes.box_size = size
+        by_id = {band.id: band for band in edited_boxes.bands}
         for band_id, before, after in zip(survivors, old, resized, strict=True):
             if after != before:
                 _set_box(by_id[band_id], after)
-        edited.bands = [by_id[band_id] for band_id in survivors]
+        edited_boxes.bands = [by_id[band_id] for band_id in survivors]
         for lane, rect in rects.items():  # in lane order: new ids too
             if lane in yielding:  # the band found takes the box nobody edited
                 band = by_id[yielding[lane]]
@@ -4853,9 +4893,9 @@ def _place_row(
                     **_UNQUANTIFIED,
                 )
             band.bands_found = counts[lane]
-            edited.bands.append(band)
+            edited_boxes.bands.append(band)
         # The boxes placed, moved and removed change every ring on the image.
-        _quantify_image(draft, edited.image_id, array)
+        _quantify_image(draft, draft.batch.image_of(edited).id, array)
         # Every band-index-0 record gives way to this run's outcome in its lane (a
         # kept box's lane holds none).
         dropped: list[JsonValue] = list(
@@ -4873,12 +4913,12 @@ def _place_row(
                 region=Region(x0=x0, y0=y0, x1=x1, y1=y1),
                 source=source,
             )
-            edited.undetected.append(record)
+            edited_boxes.undetected.append(record)
             written.append(_undetected_json(protein_id, record))
         # The MWs of the boxes placed, moved or resized, last (#58).
         _refresh_box_mws(session.project, draft)
         # Each lane's first-band box after the change: placed, replaced or kept.
-        after = {b.lane_index: b for b in edited.bands if b.band_index == 0}
+        after = {b.lane_index: b for b in edited_boxes.bands if b.band_index == 0}
         band_ids = [after[lane].id if lane in after else None for lane in range(n)]
         lane_rects = [after[lane].box.rect(size) if lane in after else None for lane in range(n)]
         return band_ids, lane_rects, written, dropped
@@ -4974,11 +5014,11 @@ def _span(span: object) -> tuple[int, int]:
 
 
 def _no_calibration(
-    membrane: Membrane, image: ImageRef, fitted: mwcal.NoCalibration
+    batch: Batch, membrane: Membrane, image: ImageRef, fitted: mwcal.NoCalibration
 ) -> OperationError:
     """The refusal of a row placed by MW on an image without a curve, worded by
     why it has none."""
-    names = _group_names(membrane, fitted.group)
+    names = _group_names(batch, membrane, fitted.group)
     if fitted.reason == "one_point":
         message = f"{names}: each ladder there has one calibration point; mark at least two"
     elif image.marker_image_id is not None:
@@ -5057,7 +5097,7 @@ def detect_mw_row(
     batch = session.project.batch
     protein = batch.find_protein(protein_id)
     given = None if span is None else _span(span)
-    n = len(batch.lanes)
+    n = len(batch.lanes_of_protein(protein))
     if n == 0:
         raise OperationError(ErrorCode.NO_LANES, "declare the lanes before placing a row")
     if protein.expected_mw is None:
@@ -5075,12 +5115,12 @@ def detect_mw_row(
             ids=(protein_id,),
         )
     mws = (protein.expected_mw,)
-    image = batch.find_image(protein.image_id)
+    image = batch.image_of(protein)
     membrane = batch.membrane_of(image.id)
     fitted = mwcal.calibration_for(membrane, image.id)
     if isinstance(fitted, mwcal.NoCalibration):
-        raise _no_calibration(membrane, image, fitted)
-    names = _group_names(membrane, fitted.group)
+        raise _no_calibration(batch, membrane, image, fitted)
+    names = _group_names(batch, membrane, fitted.group)
     for mw in mws:
         if not fitted.z_lo <= math.log10(mw) <= fitted.z_hi:
             raise OperationError(
@@ -5197,14 +5237,15 @@ def remove_undetected(
     protein = batch.find_protein(protein_id)
     lane = _int(lane_index, "lane index")
     band = _int(band_index, "band index")
-    n = len(batch.lanes)
+    n = len(batch.lanes_of_protein(protein))
     if not 0 <= lane < n:
         raise OperationError(
             ErrorCode.LANE_OUT_OF_RANGE, f"lane {lane_number(lane)} is not one of the {n} lanes"
         )
     if band < 0:
         raise _invalid(f"band index must be 0 or more, not {band}")
-    if all((u.lane_index, u.band_index) != (lane, band) for u in protein.undetected):
+    records = batch.boxes_of(protein).undetected
+    if all((u.lane_index, u.band_index) != (lane, band) for u in records):
         return
 
     def change(draft: Project) -> dict[str, JsonValue] | None:
@@ -5240,9 +5281,8 @@ def unassessed_images(batch: Batch) -> list[str]:
         if possible_clipping_depth(image.bit_depth, image.import_warnings) is not None
         and any(
             band.possibly_clipped is None
-            for protein in batch.proteins
-            if protein.image_id == image.id
-            for band in protein.bands
+            for protein in batch.proteins_on(image.id)
+            for band in batch.boxes_of(protein).bands
         )
     ]
 
@@ -5402,7 +5442,10 @@ def _outdated_readings(session: ProjectSession, project: Project) -> dict[str, s
     that this version no longer makes, by image id
     (:meth:`~proteia.core.session.ProjectSession.outdated_reading`, from the
     header, once per image)."""
-    measured = {protein.image_id for protein in project.batch.proteins if protein.bands}
+    batch = project.batch
+    measured = {
+        batch.image_of(protein).id for protein in batch.proteins if batch.boxes_of(protein).bands
+    }
     return {
         image.id: why
         for image in project.batch.iter_images()
