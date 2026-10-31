@@ -590,6 +590,10 @@ def test_rows_tilted_reads_only_detector_boxes_nobody_edited():
     ):
         res = compute_results(blot(ladder(X_LEFT, 1.0), row).batch)
         assert of(res, NoticeCode.ROWS_TILTED) == [], row
+    # As many as TILT_MIN_LANES are enough (spread across the blot).
+    enough = dataclasses.replace(tilted, lanes=(0, 2, 5, 7))
+    res = compute_results(blot(ladder(X_LEFT, 1.0), enough).batch)
+    assert [n.code for n in of(res, NoticeCode.ROWS_TILTED)] == [NoticeCode.ROWS_TILTED]
     # Without an expected MW, the line at the boxes' median apparent MW.
     unexpected = dataclasses.replace(tilted, expected=None)
     res = compute_results(blot(ladder(X_LEFT, 1.0), unexpected).batch)

@@ -789,6 +789,29 @@ def test_import_and_add_protein_make_and_log_their_ids(tmp_path):
     assert [v for v in logged if v] == ["arena-4", "arena-7", "arena-9", "row-11"]
 
 
+def test_an_image_onto_a_first_membrane_without_one_goes_first(tmp_path):
+    # A hand file's first membrane holds no image: one imported onto it goes
+    # before the images of the membranes after it, in membrane order.
+    doc = sample_doc()
+    doc["batch"]["membranes"].insert(0, {"id": "mem-19", "images": []})
+    doc["next_id"] = 20
+    folder = tmp_path / "hand µ"
+    write_image_files(folder, Project.model_validate(_v3(doc)))
+    (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
+    s = ops.open_project(folder, autosave=None, clock=FakeClock())
+    try:
+        image = import_blot(s, blot(), "first.tif", membrane_id="mem-19")
+        assert [i.id for i in s.project.batch.iter_images()] == [
+            image,
+            "img-2",
+            "img-3",
+            "img-4",
+            "img-6",
+        ]
+    finally:
+        s.close()
+
+
 def test_set_lanes_makes_the_first_lane_table_and_logs_it(tmp_path):
     s = session_on(tmp_path)
     ops.set_lanes(s, [ops.LaneInput("vehicle"), ops.LaneInput("10 µM")])
