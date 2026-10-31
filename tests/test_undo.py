@@ -209,13 +209,13 @@ def test_undo_of_a_removal_lists_the_cascade_it_brings_back(tmp_path):
     gone = ("mem-5", "img-6", "prot-8", "band-13", "band-14", "band-15", "band-16")
     assert sorted(gone) == sorted(cascade.removed)
     # With the image went its membrane area, and with the protein its row.
-    back = ("mem-5", "img-6", "arena-23", "prot-8", "row-25", *gone[3:])
+    back = ("mem-5", "img-6", "prot-8", *gone[3:], "arena-23", "row-25")
 
     assert ops.undo(s) == Restored(
         seq=removal.seq,
         action="remove_image",
         removed=(),
-        # by kind: membranes, images, (lane tables,) areas, proteins, rows, bands
+        # by kind: membranes, images, proteins, bands, (lane tables,) areas, rows
         restored=back,
         undetected_removed=(),
         undetected_restored=(),

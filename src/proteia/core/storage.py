@@ -99,7 +99,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Final, NoReturn
+from typing import Any, BinaryIO, Final, NoReturn, TypeGuard
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -108,6 +108,7 @@ from proteia.core.model import (
     IMAGE_SUFFIXES,
     LEGACY_BACKGROUND_METHOD,
     SCHEMA_VERSION,
+    UNKNOWN_IMAGE_ROWS,
     ImageId,
     ImageRef,
     LogEntry,
@@ -334,13 +335,19 @@ def _parse(data: bytes) -> tuple[Project, int]:
             found=version,
             supported=SCHEMA_VERSION,
         )
+    unknown_image_rows: frozenset[str] = frozenset()
     if version < SCHEMA_VERSION:
         raw = migrate(raw)
+        unknown_image_rows = _rows_on_no_area(raw)
 
     # The model knows only the latest schema; strict JSON mode keeps every type
     # exactly (no "340" for an int, no 0 for a bool), so load then save is a fixed point.
     try:
-        project = Project.model_validate_json(json.dumps(raw, ensure_ascii=False), strict=True)
+        project = Project.model_validate_json(
+            json.dumps(raw, ensure_ascii=False),
+            strict=True,
+            context={UNKNOWN_IMAGE_ROWS: unknown_image_rows},
+        )
     except ValidationError as exc:
         raise ProjectFormatError(f"project.json is not a valid project: {exc}") from exc
     return project, version
@@ -414,6 +421,56 @@ def _v1_content(content: dict[str, Any]) -> dict[str, Any]:
 
 # The keys of a schema-2 protein that schema 3 holds in its row.
 _ROW_KEYS: Final = ("box_size", "box_padding", "bands", "undetected")
+# The number an id ends in.
+_ID_NUMBER: Final = re.compile(r"-([0-9]+)\Z")
+
+
+def _highest_number(batch: dict[str, Any]) -> int:
+    """The highest number of an id a schema-2 batch holds (membranes, images,
+    proteins and bands), 0 for none, for :func:`_v2_to_v3`. An id that is not
+    text ending in a number is skipped: validation refuses it."""
+    held: list[object] = []
+    for membrane in _dicts(batch.get("membranes")):
+        held.append(membrane.get("id"))
+        held.extend(image.get("id") for image in _dicts(membrane.get("images")))
+    for protein in _dicts(batch.get("proteins")):
+        held.append(protein.get("id"))
+        held.extend(band.get("id") for band in _dicts(protein.get("bands")))
+    numbers = [
+        int(match.group(1))
+        for obj_id in held
+        if isinstance(obj_id, str) and (match := _ID_NUMBER.search(obj_id))
+    ]
+    return max(numbers, default=0)
+
+
+def _is_image_id(value: object) -> TypeGuard[str]:
+    try:
+        _IMAGE_ID.validate_python(value, strict=True)
+    except ValidationError:
+        return False
+    return True
+
+
+def _rows_on_no_area(doc: dict[str, Any]) -> frozenset[str]:
+    """The ids of the rows of a document :func:`_v2_to_v3` converted whose
+    area reference names no area of it: each holds the image reference of a
+    protein on no image of the file, which validation reads as such
+    (:data:`~proteia.core.model.UNKNOWN_IMAGE_ROWS`)."""
+    batch = doc.get("batch")
+    if not isinstance(batch, dict):
+        return frozenset()
+    areas = {
+        arena.get("id")
+        for membrane in _dicts(batch.get("membranes"))
+        for arena in _dicts(membrane.get("arenas"))
+    }
+    return frozenset(
+        row["id"]  # each drawn by the conversion
+        for protein in _dicts(batch.get("proteins"))
+        for row in _dicts(protein.get("rows"))
+        if isinstance(row.get("arena_id"), str) and row["arena_id"] not in areas
+    )
 
 
 def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
@@ -428,11 +485,25 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
     the area of its image, holding its box size, padding, bands and
     not-detected records as they were (a key left out stays left out). The new
     ids come from ``next_id`` in that order: the table, the areas, the rows.
-    Pure JSON, on the copy :func:`migrate` passes; a part that is not the shape
-    it should be is left for validation to refuse.
+    Pure JSON, on the copy :func:`migrate` passes.
+
+    A part that is not the shape it should be is left for validation to
+    refuse with the message schema 2 gave. An image without an image id gets
+    no area. A ``next_id`` that is not a whole number above every id held is
+    kept as it is, and the new ids are drawn above every held number
+    (:meth:`~proteia.core.model.Project.iter_ids` meets them last). A
+    protein's reference to an image the file does not hold (or to no image
+    id at all) stays as its row's area reference, which :func:`_parse` then
+    has validated as the image reference it was (:func:`_rows_on_no_area`).
     """
     doc["schema_version"] = 3
-    counter = doc.get("next_id", 1)
+    next_id = doc.get("next_id", 1)
+    batch = doc.setdefault("batch", {})
+    if not isinstance(batch, dict):
+        return doc
+    highest = _highest_number(batch)
+    usable = type(next_id) is int and highest < next_id  # a bool is not an int here
+    counter = next_id if usable else highest + 1
 
     def new(prefix: str) -> str:
         nonlocal counter
@@ -440,9 +511,6 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
         counter += 1
         return made
 
-    batch = doc.setdefault("batch", {})
-    if not isinstance(batch, dict):
-        return doc
     table = {"id": new("lt"), "lanes": batch.pop("lanes", [])}
     batch["lane_tables"] = [table]
     images: list[Any] = []
@@ -456,23 +524,29 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
         membrane["arenas"] = arenas = []
         for image in held:
             images.append(image)  # whatever it holds: validation refuses what is no image
-            if not isinstance(image, dict):
-                continue
-            arena = {"id": new("arena"), "angle_deg": 0.0, "source": "whole_image"}
-            if "id" in image:
-                arena["image_id"] = image["id"]  # a missing id stays missing, for validation
-            if isinstance(image.get("id"), str):
-                arena_of[image["id"]] = arena["id"]
+            image_id = image.get("id") if isinstance(image, dict) else None
+            if not _is_image_id(image_id):
+                continue  # no image id: refused for that alone
+            arena = {
+                "id": new("arena"),
+                "image_id": image_id,
+                "angle_deg": 0.0,
+                "source": "whole_image",
+            }
+            arena_of[image_id] = arena["id"]
             arenas.append(arena)
     batch["images"] = images
     for protein in _dicts(batch.get("proteins")):
-        image_id = protein.get("image_id")
-        if not isinstance(image_id, str) or image_id not in arena_of:
-            continue  # an unknown image: validation refuses the protein
-        row = {"id": new("row"), "arena_id": arena_of[protein.pop("image_id")]}
+        row: dict[str, Any] = {"id": new("row")}
+        if "image_id" in protein:  # a missing one stays missing
+            image_id = protein.pop("image_id")
+            known = isinstance(image_id, str) and image_id in arena_of
+            # No image of the file: the reference is kept, to be refused.
+            row["arena_id"] = arena_of[image_id] if known else image_id
         row.update((key, protein.pop(key)) for key in _ROW_KEYS if key in protein)
         protein["rows"] = [row]
-    doc["next_id"] = counter
+    if usable:
+        doc["next_id"] = counter
     return doc
 
 

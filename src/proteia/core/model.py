@@ -61,10 +61,10 @@ from __future__ import annotations
 import itertools
 import math
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Final, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol, cast
 
 from pydantic import (
     AfterValidator,
@@ -73,8 +73,14 @@ from pydantic import (
     Field,
     JsonValue,
     StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
     model_validator,
 )
+from pydantic_core import PydanticKnownError
 
 # Before v0.1, an additive change (a new optional field left out while empty, or
 # a new enum value) does not bump; from v0.1 on, every saved-form change bumps and
@@ -673,6 +679,19 @@ class UndetectedBand(_Model):
         return self
 
 
+# The validation context key under which storage passes the ids of the rows
+# whose area reference holds the image reference of their schema-2 protein:
+# an image the converted file does not hold. Such a reference is read as the
+# image reference it was (Row) and refused as schema 2 refused it (Batch).
+UNKNOWN_IMAGE_ROWS: Final = "unknown_image_rows"
+_IMAGE_ID: Final = TypeAdapter(ImageId)
+
+
+def _unknown_image_rows(info: ValidationInfo) -> Collection[str]:
+    rows: Collection[str] = (info.context or {}).get(UNKNOWN_IMAGE_ROWS, ())
+    return rows
+
+
 class Row(_Model):
     """One protein quantified on one membrane area: its boxes there.
 
@@ -694,6 +713,22 @@ class Row(_Model):
     # Left out of the saved form when empty, so a project without records keeps its
     # bytes and hash. Do not "normalize" this: see "Canonical form" in storage.
     undetected: list[UndetectedBand] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+    @field_validator("arena_id", mode="wrap")
+    @classmethod
+    def _schema_2_image(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> str:
+        """An area reference, or, in a row of :data:`UNKNOWN_IMAGE_ROWS`, the
+        image reference of its schema-2 protein, checked as schema 2 checked
+        it (the batch then refuses the image it names)."""
+        if info.data.get("id") not in _unknown_image_rows(info):
+            return cast(str, handler(value))
+        try:
+            return _IMAGE_ID.validate_python(value, strict=True)
+        except ValidationError as exc:
+            [error] = exc.errors()
+            raise PydanticKnownError(error["type"], error.get("ctx")) from None
 
     @property
     def fitted_size(self) -> BoxSize:
@@ -830,6 +865,9 @@ class LogEntry(_Model):
 
 
 # --- Batch and project ---
+
+# How a refusal of what a newer build writes ends.
+_NEWER: Final = "which this Proteia build cannot read; open the project with a newer build"
 
 
 class Batch(_Model):
@@ -987,36 +1025,32 @@ class Batch(_Model):
 
     # --- Validation ---
 
-    def _check_supported(self) -> None:
+    def _check_supported(self, twice: set[str]) -> None:
         """What this build reads: one lane table, one membrane area per image
         and one row per protein. A file with more was written by a build that
         draws areas, adds lane tables or puts a protein on several membranes;
-        the message names the file's part, never an id."""
-        newer = "which this Proteia build cannot read; open the project with a newer build"
+        the message names the file's part, never an id. The areas of an image
+        listed ``twice`` are not counted: :meth:`Project._check_ids` refuses its id."""
         if len(self.lane_tables) > 1:
-            raise ValueError(f"the project holds {len(self.lane_tables)} lane tables, {newer}")
+            raise ValueError(f"the project holds {len(self.lane_tables)} lane tables, {_NEWER}")
         held = Counter(arena.image_id for membrane in self.membranes for arena in membrane.arenas)
         for image in self.images:
-            if held[image.id] > 1:
+            if image.id not in twice and held[image.id] > 1:
                 raise ValueError(
-                    f"{image.original_name!r} holds {held[image.id]} membrane areas, {newer}"
+                    f"{image.original_name!r} holds {held[image.id]} membrane areas, {_NEWER}"
                 )
         for protein in self.proteins:
             if len(protein.rows) > 1:
                 raise ValueError(
-                    f"{protein.name!r} has rows on {len(protein.rows)} membrane areas, {newer}"
+                    f"{protein.name!r} has rows on {len(protein.rows)} membrane areas, {_NEWER}"
                 )
 
     @model_validator(mode="after")
-    def _check_references(self) -> Batch:
-        self._check_supported()
-        if self.reference_condition is not None and self.reference_condition not in {
-            lane.label for table in self.lane_tables for lane in table.lanes
-        }:
-            raise ValueError(
-                f"reference condition {self.reference_condition!r} is not a lane condition"
-            )
+    def _check_references(self, info: ValidationInfo) -> Batch:
         images = {image.id: image for image in self.images}
+        listed = Counter(image.id for image in self.images)
+        twice = {image_id for image_id, count in listed.items() if count > 1}
+        self._check_supported(twice)
         tables = {table.id: table for table in self.lane_tables}
         arenas: dict[str, tuple[Membrane, Arena]] = {}
         for membrane in self.membranes:
@@ -1047,8 +1081,15 @@ class Batch(_Model):
                 raise ValueError(f"image {image.id} is on no membrane: no membrane area is on it")
         for membrane in self.membranes:
             self._check_membrane(membrane, images)
-        self._check_linked_areas(images)
-        self._check_proteins(images, tables, arenas)
+        self._check_linked_areas(images, twice)
+        # After the membranes, before the proteins, as schema 2 checked them.
+        if self.reference_condition is not None and self.reference_condition not in {
+            lane.label for table in self.lane_tables for lane in table.lanes
+        }:
+            raise ValueError(
+                f"reference condition {self.reference_condition!r} is not a lane condition"
+            )
+        self._check_proteins(images, tables, arenas, _unknown_image_rows(info))
         return self
 
     def _check_membrane(self, membrane: Membrane, images: dict[str, ImageRef]) -> None:
@@ -1103,16 +1144,19 @@ class Batch(_Model):
         for group in self.register_groups(membrane):
             self._check_ladders(membrane, group)
 
-    def _check_linked_areas(self, images: dict[str, ImageRef]) -> None:
+    def _check_linked_areas(self, images: dict[str, ImageRef], twice: set[str]) -> None:
         """Linked images hold the same membrane areas: each membrane's area on
-        the one equals its area on the other, in outline and angle."""
+        the one equals its area on the other, in outline and angle. A link
+        to or from an image listed ``twice`` is left to the id check."""
         areas: dict[str, dict[str, tuple[Outline | None, float]]] = {}
         for membrane in self.membranes:
             for arena in membrane.arenas:
                 areas.setdefault(arena.image_id, {})[membrane.id] = (arena.outline, arena.angle_deg)
         for image in images.values():
             marker = image.marker_image_id
-            if marker is not None and areas.get(image.id) != areas.get(marker):
+            if marker is None or not twice.isdisjoint((image.id, marker)):
+                continue
+            if areas.get(image.id) != areas.get(marker):
                 raise ValueError(
                     f"image {image.id} and its marker image {marker} hold different membrane"
                     " areas; linked images hold the same areas"
@@ -1177,11 +1221,13 @@ class Batch(_Model):
         images: dict[str, ImageRef],
         tables: dict[str, LaneTable],
         arenas: dict[str, tuple[Membrane, Arena]],
+        unknown_image_rows: Collection[str],
     ) -> None:
         """Each protein's name, loading controls and rows: each row on a known
         area of a signal image, its box size within the image, and each box and
         record inside the image, in a lane of its membrane's table, and centred
-        in its area."""
+        in its area. A row of ``unknown_image_rows`` (:data:`UNKNOWN_IMAGE_ROWS`)
+        is refused for the image its schema-2 protein named."""
         roles = {protein.id: protein.role for protein in self.proteins}
         names: set[str] = set()
         for protein in self.proteins:
@@ -1191,6 +1237,8 @@ class Batch(_Model):
             placed: list[tuple[Row, Arena, ImageRef, list[Lane]]] = []
             for row in protein.rows:
                 found = arenas.get(row.arena_id)
+                if found is None and row.id in unknown_image_rows:
+                    raise ValueError(f"protein {protein.id}: unknown image {row.arena_id!r}")
                 if found is None:
                     raise ValueError(
                         f"protein {protein.id}: unknown membrane area {row.arena_id!r}"
@@ -1269,19 +1317,22 @@ class Project(_Model):
     log: tuple[LogEntry, ...] = ()  # history, oldest first; excluded from the content hash
 
     def iter_ids(self) -> Iterator[str]:
-        """Every object id: membranes, images, lane tables, membrane areas (by
-        membrane), proteins, rows and bands (by protein); not-detected records
-        have none."""
+        """Every object id: the kinds schema 2 held, membranes, images,
+        proteins and bands (by protein), then the kinds schema 3 added, lane
+        tables, membrane areas (by membrane) and rows (by protein);
+        not-detected records have none. :meth:`_check_ids` meets them in this
+        order, so a schema-2 file whose ids are wrong is refused for the id it
+        was refused for before, never one its conversion drew."""
         batch = self.batch
         yield from (membrane.id for membrane in batch.membranes)
         yield from (image.id for image in batch.images)
-        yield from (table.id for table in batch.lane_tables)
-        yield from (arena.id for membrane in batch.membranes for arena in membrane.arenas)
         yield from (protein.id for protein in batch.proteins)
-        yield from (row.id for protein in batch.proteins for row in protein.rows)
         yield from (
             band.id for protein in batch.proteins for row in protein.rows for band in row.bands
         )
+        yield from (table.id for table in batch.lane_tables)
+        yield from (arena.id for membrane in batch.membranes for arena in membrane.arenas)
+        yield from (row.id for protein in batch.proteins for row in protein.rows)
 
     def new_id(self, prefix: IdPrefix) -> str:
         """A fresh id such as ``img-7``.

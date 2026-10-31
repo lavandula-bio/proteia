@@ -16,8 +16,10 @@ import copy
 import json
 import math
 import re
+from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from conftest import (
     V1_CONTENT_HASH,
@@ -225,14 +227,15 @@ def test_the_converted_sample_opens_with_its_ids():
         "img-3",
         "img-4",
         "img-6",
+        "prot-7",
+        "prot-8",
+        "prot-9",
+        # The kinds schema 3 added come last.
         "lt-19",
         "arena-20",
         "arena-21",
         "arena-22",
         "arena-23",
-        "prot-7",
-        "prot-8",
-        "prot-9",
         "row-24",
         "row-25",
         "row-26",
@@ -380,6 +383,224 @@ def test_a_malformed_schema_2_file_is_a_format_error(edit):
         project_from_json(_encode(doc))
 
 
+# A schema-2 file the schema-2 build refused is refused with the messages it
+# gave (each error's text; where it points follows the schema-3 shape). The
+# messages below are the schema-2 build's for the same files.
+
+
+def _messages(doc: dict) -> list[str]:
+    """The messages of the validation errors that refuse ``doc``, sorted."""
+    with pytest.raises(ProjectFormatError) as info:
+        project_from_json(_encode(doc))
+    cause = info.value.__cause__
+    assert isinstance(cause, ValidationError), info.value
+    return sorted(error["msg"] for error in cause.errors())
+
+
+@pytest.mark.parametrize(
+    ("next_id", "message"),
+    [
+        pytest.param("30", "Input should be a valid integer", id="text"),
+        pytest.param(None, "Input should be a valid integer", id="null"),
+        pytest.param(True, "Input should be a valid integer", id="true"),
+        pytest.param(False, "Input should be a valid integer", id="false"),
+        pytest.param(30.0, "Input should be a valid integer", id="float"),
+        pytest.param(0, "Input should be greater than or equal to 1", id="zero"),
+        pytest.param(-3, "Input should be greater than or equal to 1", id="negative"),
+        # Below ids already held: the first one met (membranes, images, proteins,
+        # bands) is named, as at schema 2, never one the conversion drew.
+        pytest.param(15, "Value error, id band-15 is not below next_id 15", id="below-a-band"),
+        pytest.param(8, "Value error, id prot-8 is not below next_id 8", id="below-a-protein"),
+        pytest.param(5, "Value error, id mem-5 is not below next_id 5", id="below-a-membrane"),
+        pytest.param(..., "Value error, id mem-1 is not below next_id 1", id="missing"),
+    ],
+)
+def test_a_schema_2_next_id_is_refused_as_before(next_id, message):
+    doc = sample_doc()
+    if next_id is ...:
+        del doc["next_id"]
+    else:
+        doc["next_id"] = next_id
+    assert _messages(doc) == [message]
+    assert _messages(_v1_shape(doc)) == [message]  # through both steps alike
+
+
+def _v1_shape(doc: dict) -> dict:
+    """A schema-2 document as schema 1 held it: without the background fields."""
+    doc = copy.deepcopy(doc)
+    doc["schema_version"] = 1
+    doc.pop("background_method", None)
+    for protein in doc["batch"]["proteins"]:
+        for band in protein["bands"]:
+            for key in ("background_level", "background_mode", "background_spread"):
+                band.pop(key, None)
+    return doc
+
+
+def _id_40(kind: str, doc: dict) -> None:
+    """Give one object of ``kind`` in a schema-2 sample document the id 40."""
+    one, five = doc["batch"]["membranes"]
+    proteins = doc["batch"]["proteins"]
+    if kind == "membrane":
+        doc["batch"]["membranes"].append({"id": "mem-40", "images": []})
+    elif kind == "image":  # img-6, with its points and α-tubulin on it
+        five["images"][0].update(id="img-40", file="img-40.jpg")
+        for point in five["calibration"]["points"]:
+            point["image_id"] = "img-40"
+        proteins[1]["image_id"] = "img-40"
+    elif kind == "protein":
+        proteins[2]["id"] = "prot-40"  # GAPDH, a loading control nobody names
+    else:
+        proteins[2]["bands"][1]["id"] = "band-40"
+
+
+@pytest.mark.parametrize(
+    ("kind", "held"), [("membrane", "mem"), ("image", "img"), ("protein", "prot"), ("band", "band")]
+)
+def test_an_id_of_each_kind_above_next_id_is_refused_as_before(kind, held):
+    doc = sample_doc()  # next_id 19
+    _id_40(kind, doc)
+    assert _messages(doc) == [f"Value error, id {held}-40 is not below next_id 19"]
+
+
+def test_a_schema_2_next_id_near_its_limit_converts():
+    # A file whose next_id leaves room for the ids the conversion draws.
+    doc = sample_doc()
+    doc["next_id"] = 10**9 - 8
+    assert project_from_json(_encode(doc)).next_id == 10**9
+
+
+@pytest.mark.parametrize(
+    ("where", "message"),
+    [
+        pytest.param("same", "Value error, duplicate id number 4: img-4 and img-4", id="same"),
+        pytest.param("other", "Value error, duplicate id number 4: img-4 and img-4", id="other"),
+        # img-3 is img-2's marker: its two listings would hold different areas.
+        pytest.param("marker", "Value error, duplicate id number 3: img-3 and img-3", id="marker"),
+    ],
+)
+def test_an_image_listed_twice_is_refused_as_a_duplicate_id(where, message):
+    doc = sample_doc()
+    one, five = doc["batch"]["membranes"]
+    if where == "same":
+        one["images"].append(copy.deepcopy(one["images"][2]))  # img-4 again, on mem-1
+    elif where == "other":
+        five["images"].append(copy.deepcopy(one["images"][2]))  # img-4 on mem-5 too
+    else:
+        five["images"].append(copy.deepcopy(one["images"][1]))  # img-3 on mem-5 too
+    assert _messages(doc) == [message]
+    assert NEWER not in _refusal(doc)
+
+
+@pytest.mark.parametrize(
+    ("image_id", "message"),
+    [
+        pytest.param(
+            "img-999", "Value error, protein prot-8: unknown image 'img-999'", id="unknown"
+        ),
+        pytest.param(
+            "mem-5", "String should match pattern '^img-[1-9][0-9]{0,8}$'", id="not-an-image-id"
+        ),
+        pytest.param(5, "Input should be a valid string", id="number"),
+        pytest.param(None, "Input should be a valid string", id="null"),
+        pytest.param(..., "Field required", id="missing"),
+    ],
+)
+def test_a_protein_on_an_unknown_image_is_refused_as_before(image_id, message):
+    doc = sample_doc()
+    protein = doc["batch"]["proteins"][1]  # α-tubulin, on img-6
+    if image_id is ...:
+        del protein["image_id"]
+    else:
+        protein["image_id"] = image_id
+    assert _messages(doc) == [message]
+
+
+def test_an_earlier_fault_is_still_named_before_an_unknown_image():
+    # The schema-2 build checked the proteins in order: an earlier protein's
+    # fault is named first, as the conversion leaves it.
+    doc = sample_doc()
+    doc["batch"]["proteins"][0]["loading_control_ids"] = ["prot-99"]
+    doc["batch"]["proteins"][1]["image_id"] = "img-999"
+    assert _messages(doc) == ["Value error, protein prot-7: unknown loading control 'prot-99'"]
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        pytest.param(
+            lambda one: one["calibration"]["points"][0].update(y=200.0),
+            "Value error, membrane mem-1: calibration point at y=200.0 is below the bottom of"
+            " img-3",
+            id="point",
+        ),
+        pytest.param(
+            lambda one: one["images"][0].update(marker_image_id="img-4"),
+            "Value error, image img-2: marker image 'img-4' is not a visible-light marker or"
+            " merged image of membrane mem-1",
+            id="marker",
+        ),
+    ],
+)
+def test_a_membrane_fault_is_named_before_the_reference(edit, message):
+    # Schema 2 checked the membranes before the reference condition.
+    doc = sample_doc()
+    doc["batch"]["reference_condition"] = "DMSO"
+    edit(doc["batch"]["membranes"][0])
+    assert _messages(doc) == [message]
+
+
+# Every schema-1 or schema-2 document the schema-2 build refused while its
+# test suite ran (loaded as a file or validated as a project), with the
+# messages it gave, recorded once from that build: each as edits ("set" or
+# "del" at a path) to one of a few base documents, the suite's sample
+# documents and that build's dumps of its sample projects.
+REFUSALS = Path(__file__).parent / "data" / "schema2_refusals.json"
+
+
+def _edited(base: dict, edits: list) -> dict:
+    doc = copy.deepcopy(base)
+    for op, path, *value in edits:
+        *parents, last = path
+        target = doc
+        for key in parents:
+            target = target[key]
+        if op == "del":
+            del target[last]
+        else:
+            target[last] = value[0]
+    return doc
+
+
+def test_every_schema_2_refusal_keeps_its_messages():
+    data = json.loads(REFUSALS.read_text(encoding="utf-8"))
+    cases = data["cases"]
+    docs = [_edited(data["bases"][case["base"]], case["edits"]) for case in cases]
+    assert len(docs) == 132
+    assert {doc["schema_version"] for doc in docs} == {1, 2}
+    assert [_messages(doc) for doc in docs] == [case["messages"] for case in cases]
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        pytest.param(lambda image: image.pop("id"), "Field required", id="missing"),
+        pytest.param(
+            lambda image: image.update(id=["img-4"]), "Input should be a valid string", id="list"
+        ),
+        pytest.param(
+            lambda image: image.update(id="image-4"),
+            "String should match pattern '^img-[1-9][0-9]{0,8}$'",
+            id="not-an-image-id",
+        ),
+    ],
+)
+def test_an_image_without_a_valid_id_is_refused_for_that_alone(edit, message):
+    doc = sample_doc()
+    edit(doc["batch"]["membranes"][0]["images"][2])  # img-4, under GAPDH
+    assert _messages(doc) == [message]
+
+
 # --- Degenerate projects ---
 
 
@@ -429,14 +650,15 @@ def test_pr2_restrictions(case):
 
 
 def test_ids_stay_unique_across_the_new_kinds():
-    # Two images of one id (each with its area) hold two areas on "one" image;
-    # an area or a row whose number another object holds is refused too.
+    # Two images of one id (each with its area) are a duplicate id, not two
+    # areas on one image; an area or a row whose number another object holds
+    # is refused too.
     doc = _v3()
     image = copy.deepcopy(doc["batch"]["images"][2])  # img-4, as a second img-2
     image.update(id="img-2", file="img-2.tif")
     doc["batch"]["images"][2] = image
     _arena(doc, "arena-22")["image_id"] = "img-2"
-    assert "membrane areas" in _refusal(doc)
+    assert "duplicate id number 2: img-2 and img-2" in _refusal(doc)
     for kind, edit in (
         (
             "area",  # img-4's area, and GAPDH's row on it, renumbered onto prot-7's number
@@ -836,11 +1058,12 @@ def test_undo_and_redo_list_the_new_ids_in_order(tmp_path):
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)  # prot-5, row-6
     ops.remove_image(s, image)
     restored = ops.undo(s)
-    assert restored.restored == ("mem-2", "img-1", "arena-4", "prot-5", "row-6")
+    # The kinds schema 2 held, then those schema 3 added (Project.iter_ids).
+    assert restored.restored == ("mem-2", "img-1", "prot-5", "arena-4", "row-6")
     assert restored.removed == ()
     assert s.project.log[-1].params["restored"] == list(restored.restored)
     again = ops.redo(s)
-    assert again.removed == ("mem-2", "img-1", "arena-4", "prot-5", "row-6")
+    assert again.removed == ("mem-2", "img-1", "prot-5", "arena-4", "row-6")
     assert protein == "prot-5"
     assert [t.id for t in s.project.batch.lane_tables] == ["lt-3"]  # the table stays
 
