@@ -464,6 +464,21 @@ def test_an_id_of_each_kind_above_next_id_is_refused_as_before(kind, held):
     assert _messages(doc) == [f"Value error, id {held}-40 is not below next_id 19"]
 
 
+@pytest.mark.parametrize(
+    ("next_id", "message"),
+    [
+        pytest.param("x", "Input should be a valid integer", id="text"),
+        pytest.param(None, "Input should be a valid integer", id="null"),
+        pytest.param(0, "Input should be greater than or equal to 1", id="zero"),
+    ],
+)
+def test_a_file_without_ids_and_a_bad_next_id_is_refused_as_before(next_id, message):
+    # The ids the conversion draws, from 1 up, are not what is refused.
+    assert _messages({"schema_version": 2, "next_id": next_id}) == [message]
+    one = {"schema_version": 2, "next_id": next_id, "batch": {"membranes": [{"id": "mem-1"}]}}
+    assert _messages(one) == [message]
+
+
 def test_a_schema_2_next_id_near_its_limit_converts():
     # A file whose next_id leaves room for the ids the conversion draws.
     doc = sample_doc()
@@ -683,6 +698,12 @@ def test_a_drawn_turned_or_hand_made_area_is_refused(edit, what):
     _arena(doc, "arena-20").update(edit)
     _arena(doc, "arena-21").update(edit)
     assert f"'β-actin 10 µM.tif' holds a membrane area {what}, {NEWER}" in _refusal(doc)
+    # On an image the file does not hold, it is refused for that image.
+    doc = _v3()
+    _arena(doc, "arena-23").update(edit, image_id="img-99")
+    assert "membrane mem-5: area arena-23 is on 'img-99', which is not an image of the project" in (
+        _refusal(doc)
+    )
 
 
 @pytest.mark.parametrize(
