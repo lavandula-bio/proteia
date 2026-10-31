@@ -70,6 +70,14 @@ so a ``boxes_overlap`` warning names, for each protein whose counted box
 overlaps another protein's, the other proteins, the lanes and the share of the
 smaller box's area (#208); it is read from the stored boxes, never stored.
 
+A file may be imported more than once, under any name and into any membrane
+(#216). A ``duplicate_images`` warning then names each group of images with
+the same ``sha256`` (the same file bytes) as the page names images, counts the
+membranes they lie on, and gives a next step that removes nothing. It is read
+from the stored hashes, never stored: removing a copy, undo and redo update it,
+and a project saved before shows it when opened. The same pixels saved another
+way are other bytes, and are not found.
+
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
 MWs in them are whole kDa (one decimal below 10 kDa).
@@ -79,6 +87,7 @@ from __future__ import annotations
 
 import math
 import statistics as stats
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from enum import StrEnum
 from functools import partial
@@ -196,6 +205,9 @@ class NoticeCode(StrEnum):
     LADDERS_DISAGREE = "ladders_disagree"
     # Per register group: a ladder side marked but not used, and why.
     LADDER_SIDE_IGNORED = "ladder_side_ignored"
+    # #216. Per group of images whose files have the same bytes (one sha256),
+    # on any membranes: read from the stored hashes, never stored.
+    DUPLICATE_IMAGES = "duplicate_images"
 
 
 class Level(StrEnum):
@@ -242,6 +254,10 @@ SERIES_NOTICE_CODES = frozenset(
 )
 # The background modes of a ring cut short (quantify.band_backgrounds).
 _FALLBACK_MODES = frozenset({"asymmetric", "image"})
+# A duplicate_images notice names each image of a group of up to this many; the
+# notice of a bigger group names its first image and gives the others' places
+# in the image list (#216).
+NAMED_COPIES: Final = 3
 # What makes imaging.clipping_depth distrust an image, besides an unknown bit
 # depth: its import warnings, as the clipping_not_checked and possibly_clipped
 # notices name them. The keys are imaging.UNTRUSTED_WARNINGS, kept in step by a
@@ -497,6 +513,60 @@ def share_words(shared: int, smaller: int) -> str:
     if 100 * shared < smaller:
         return "under 1%"
     return f"{(200 * shared + smaller) // (2 * smaller)}%"
+
+
+def _image_names(images: Sequence[model.ImageRef]) -> dict[str, str]:
+    """Each image's name as the page tells images apart, by image id: its file
+    name, quoted; where another of ``images`` (the image list) has the same
+    name, with its place in the list, counted from 1, as the import's Membrane
+    choice gives it: ``'blot.tif' (image 3)``. Names are told apart as they
+    are written, as the page compares them (another case is another name)."""
+    counts = Counter(image.original_name for image in images)
+    return {
+        image.id: repr(image.original_name)
+        + (f" (image {place})" if counts[image.original_name] > 1 else "")
+        for place, image in enumerate(images, start=1)
+    }
+
+
+def _duplicate_notices(batch: model.Batch, note: Callable[..., None]) -> None:
+    """The ``duplicate_images`` notices (#216): one per group of two or more
+    images with the same ``sha256`` (one file's bytes, under any names and on
+    any membranes), by the place of each group's first image in the image list
+    (membrane then image order). Each names its images in that order
+    (:func:`_image_names`): each one, up to :data:`NAMED_COPIES`; past it, the
+    first and the others' places in the list. It counts the membranes they lie
+    on, says what boxing them twice means and a next step that removes nothing.
+    It compares bytes, not pixels: the same pixels saved another way are not
+    found."""
+    images = list(batch.iter_images())
+    names = _image_names(images)
+    place = {image.id: number for number, image in enumerate(images, start=1)}
+    membrane = {image.id: m.id for m in batch.membranes for image in m.images}
+    groups: dict[str, list[str]] = {}
+    for image in images:
+        groups.setdefault(image.sha256, []).append(image.id)
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        if len(ids) <= NAMED_COPIES:
+            named = in_words([names[i] for i in ids])
+        else:
+            others = ", ".join(str(place[i]) for i in ids[1:])
+            named = f"{names[ids[0]]} and {len(ids) - 1} more (images {others})"
+        on = len({membrane[i] for i in ids})
+        where = "one membrane" if on == 1 else f"{on} membranes"
+        if len(ids) == 2:
+            counted = "both is counted twice"
+        else:
+            counted = "more than one of them is counted more than once"
+        note(
+            NoticeCode.DUPLICATE_IMAGES,
+            f"{named} are the same file (identical bytes), on {where}: a band boxed on"
+            f" {counted}. If one should be a different image, import that image's file;"
+            " nothing needs to change for a copy imported on purpose",
+            image_ids=tuple(ids),
+        )
 
 
 def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..., None]) -> None:
@@ -1472,6 +1542,7 @@ def _compute(
         level = Level.INFO if code in _INFO_CODES else Level.WARNING
         notices.append(Notice(code=code, level=level, message=message, **objects))
 
+    _duplicate_notices(batch, note)  # #216, of the images, whatever the lanes
     # 1. The lane rows and the raw table, and what the model lacks.
     lanes = [
         LaneRow(index=lane.index, condition=lane.label, sample=lane.sample, included=lane.included)

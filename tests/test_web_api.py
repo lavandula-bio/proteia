@@ -362,28 +362,42 @@ def test_an_import_warns_of_an_image_that_looks_like_a_processed_figure(client):
     assert answer["project"]["images"][0]["warnings"] == [warning]
 
 
-def test_an_import_of_a_file_already_in_the_project_answers_a_warning_naming_it(client, tmp_path):
-    # #216: the page lists it with the import's other warnings, and again
-    # once the project is reopened.
+def duplicate_notices(answer: dict) -> list[dict]:
+    """The answer's duplicate_images notices (#216), of the set listed first."""
+    return [n for n in answer["results"]["sets"][0]["notices"] if n["code"] == "duplicate_images"]
+
+
+def test_an_import_of_a_file_already_in_the_project_answers_a_warning_naming_both(client, tmp_path):
+    # #216: worked out from the images the project holds, in every answer;
+    # no image stores it.
     client.ok("POST", "/api/projects", {"name": "Blot"})
     data = blot_bytes(tmp_path)
-    _, first = upload(client, data, name="β-actin 10 µM.tif")
+    status, first = upload(client, data, name="β-actin 10 µM.tif")
+    assert status == 201, first
+    assert duplicate_notices(first) == []
     status, answer = upload(client, data, name="copy α.tif")
     assert status == 201, answer
-    image = next(i for i in answer["project"]["images"] if i["id"] == answer["image_id"])
-    assert image["warnings"] == [
-        {
-            "code": "duplicate_file",
-            "message": "When this file was imported, its bytes were identical to those of"
-            " 'β-actin 10 µM.tif' on another membrane: the same image may be quantified more"
-            " than once. Remove this image unless you meant to import the file again.",
-        }
-    ]
-    assert answer["project"]["images"][0]["warnings"] == []  # the image it names
+    ids = [first["image_id"], answer["image_id"]]
+    warning = {
+        "code": "duplicate_images",
+        "level": "warning",
+        "message": "'β-actin 10 µM.tif' and 'copy α.tif' are the same file (identical bytes),"
+        " on 2 membranes: a band boxed on both is counted twice. If one should be a"
+        " different image, import that image's file; nothing needs to change for a copy"
+        " imported on purpose",
+        "protein_ids": [],
+        "lane_indices": [],
+        "conditions": [],
+        "image_ids": ids,
+    }
+    assert duplicate_notices(answer) == [warning]
+    assert [image["warnings"] for image in answer["project"]["images"]] == [[], []]
     client.ok("POST", "/api/projects", {"name": "Other"})
-    reopened = client.ok("POST", "/api/projects/open", {"name": "Blot"})
-    assert reopened["project"]["images"][1] == image
-    assert first["project"]["images"][0]["id"] == reopened["project"]["images"][0]["id"]
+    assert duplicate_notices(client.ok("POST", "/api/projects/open", {"name": "Blot"})) == [warning]
+    assert duplicate_notices(client.ok("GET", "/api/project")) == [warning]
+    assert duplicate_notices(client.ok("DELETE", f"/api/images/{ids[1]}")) == []
+    assert duplicate_notices(client.ok("POST", "/api/undo")) == [warning]
+    assert duplicate_notices(client.ok("POST", "/api/redo")) == []
 
 
 def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):

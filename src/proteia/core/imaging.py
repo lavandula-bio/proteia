@@ -84,15 +84,12 @@ _COLOUR_SPACES = {
 # The TIFF tags that say which inks a separated image holds (defaults: CMYK, 4).
 _INK_SET, _NUMBER_OF_INKS, _INK_SET_CMYK = 332, 334, 1
 
-# Warning codes and messages recorded on import. Each but looks_processed and
-# duplicate_file turns the over-exposure check off (clipping_depth), and its
-# message says so. Since #207 an import refuses CMYK, so only images imported
-# before hold cmyk_converted, whose message names how the colours were
-# converted: one of CMYK_CONVERSIONS; the looks_processed message names the
-# signals that fired (processed_signals), joined by semicolons. duplicate_file
-# comes from the project, not the file: the import records it when an image of
-# the project held the same bytes then, naming each such image
-# (operations.import_image, #216).
+# Warning codes and messages recorded on import. Each but looks_processed turns
+# the over-exposure check off (clipping_depth), and its message says so. Since
+# #207 an import refuses CMYK, so only images imported before hold
+# cmyk_converted, whose message names how the colours were converted: one of
+# CMYK_CONVERSIONS; the looks_processed message names the signals that fired
+# (processed_signals), joined by semicolons.
 WARNINGS = {
     "lossy_format": (
         "JPEG-type compression can change pixel values, so over-exposure cannot be"
@@ -114,11 +111,6 @@ WARNINGS = {
         "This looks like a processed figure rather than a raw scan: {signals}. Its"
         " background may then not be the membrane, and over-exposure may be hidden;"
         " quantify the original scan if you have it."
-    ),
-    "duplicate_file": (
-        "When this file was imported, its bytes were identical to those of {images}: the"
-        " same image may be quantified more than once. Remove this image unless you meant"
-        " to import the file again."
     ),
 }
 # How a CMYK file's colours were converted, as its cmyk_converted warning says.
