@@ -18,6 +18,7 @@ import math
 import re
 from pathlib import Path
 
+import pydantic
 import pytest
 from pydantic import ValidationError
 
@@ -508,6 +509,90 @@ def test_an_image_listed_twice_is_refused_as_a_duplicate_id(where, message):
     assert NEWER not in _refusal(doc)
 
 
+def _holding_schema_3_keys(doc: dict) -> None:
+    """Put each key schema 3 added into a schema-2 sample document, as a
+    schema-3 file relabelled schema 2 holds them (not in field order)."""
+    batch = doc["batch"]
+    one, five = batch["membranes"]
+    batch["membranes"] = [{"lane_table_id": "lt-30", **one, "arenas": []}, five]
+    batch["proteins"][1] = {"rows": [], **batch["proteins"][1]}
+    doc["batch"] = {"images": [], **batch, "lane_tables": []}
+
+
+@pytest.mark.parametrize(
+    ("edit", "places"),
+    [
+        pytest.param(lambda d: d["batch"].update(images=[]), [("batch", "images")], id="images"),
+        pytest.param(
+            lambda d: d["batch"].update(images=copy.deepcopy(d["batch"]["membranes"][1]["images"])),
+            [("batch", "images")],
+            id="images-held",
+        ),
+        pytest.param(
+            lambda d: d["batch"].update(lane_tables=[{"id": "lt-30", "lanes": []}]),
+            [("batch", "lane_tables")],
+            id="lane-tables",
+        ),
+        pytest.param(
+            lambda d: d["batch"]["membranes"][1].update(arenas=[]),
+            [("batch", "membranes", 1, "arenas")],
+            id="arenas",
+        ),
+        pytest.param(
+            lambda d: d["batch"]["membranes"][0].update(lane_table_id="lt-30"),
+            [("batch", "membranes", 0, "lane_table_id")],
+            id="lane-table-id",
+        ),
+        pytest.param(
+            lambda d: d["batch"]["proteins"][2].update(rows=None),
+            [("batch", "proteins", 2, "rows")],
+            id="rows",
+        ),
+        pytest.param(
+            _holding_schema_3_keys,
+            [
+                ("batch", "images"),
+                ("batch", "lane_tables"),
+                ("batch", "membranes", 0, "lane_table_id"),
+                ("batch", "membranes", 0, "arenas"),
+                ("batch", "proteins", 1, "rows"),
+            ],
+            id="all",
+        ),
+    ],
+)
+def test_a_schema_2_file_holding_a_schema_3_key_is_refused_as_before(edit, places):
+    # The conversion writes these keys: one a schema-2 file already holds
+    # would be written over and lost. Schema 2 refused each as an extra input,
+    # named where the file holds it; so does the conversion, before it writes.
+    doc = sample_doc()
+    edit(doc)
+    with pytest.raises(ProjectFormatError) as info:
+        project_from_json(_encode(doc))
+    errors = info.value.__cause__.errors()
+    assert [(e["loc"], e["msg"], e["type"]) for e in errors] == [
+        (place, "Extra inputs are not permitted", "extra_forbidden") for place in places
+    ]
+    assert str(info.value).startswith(
+        f"project.json is not a valid project: {len(places)} validation error"
+    )
+
+
+def test_a_schema_3_key_is_refused_in_the_schema_2_build_s_words():
+    doc = sample_doc()
+    doc["batch"]["membranes"][0]["arenas"] = []
+    with pytest.raises(ProjectFormatError) as info:
+        project_from_json(_encode(doc))
+    minor = ".".join(pydantic.VERSION.split(".")[:2])  # in the link pydantic prints
+    assert str(info.value) == (  # the schema-2 build's text, whole
+        "project.json is not a valid project: 1 validation error for Project\n"
+        "batch.membranes.0.arenas\n"
+        "  Extra inputs are not permitted [type=extra_forbidden, input_value=[],"
+        " input_type=list]\n"
+        f"    For further information visit https://errors.pydantic.dev/{minor}/v/extra_forbidden"
+    )
+
+
 @pytest.mark.parametrize(
     ("image_id", "message"),
     [
@@ -567,10 +652,11 @@ def test_a_membrane_fault_is_named_before_the_reference(edit, message):
 
 
 # Every schema-1 or schema-2 document the schema-2 build refused while its
-# test suite ran (loaded as a file or validated as a project), with the
-# messages it gave, recorded once from that build: each as edits ("set" or
-# "del" at a path) to one of a few base documents, the suite's sample
-# documents and that build's dumps of its sample projects.
+# test suite ran (loaded as a file or validated as a project), and those a
+# review of the conversion added (keys schema 3 added, ids near the limit),
+# with the messages that build gave, recorded once from it: each as edits
+# ("set" or "del" at a path) to one of a few base documents, the suite's
+# sample documents and that build's dumps of its sample projects.
 REFUSALS = Path(__file__).parent / "data" / "schema2_refusals.json"
 
 
@@ -592,7 +678,7 @@ def test_every_schema_2_refusal_keeps_its_messages():
     data = json.loads(REFUSALS.read_text(encoding="utf-8"))
     cases = data["cases"]
     docs = [_edited(data["bases"][case["base"]], case["edits"]) for case in cases]
-    assert len(docs) == 132
+    assert len(docs) == 140
     assert {doc["schema_version"] for doc in docs} == {1, 2}
     assert [_messages(doc) for doc in docs] == [case["messages"] for case in cases]
 

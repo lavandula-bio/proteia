@@ -102,6 +102,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Final, NoReturn, TypeGuard
 
 from pydantic import TypeAdapter, ValidationError
+from pydantic_core import InitErrorDetails
 
 import proteia
 from proteia.core.model import (
@@ -336,13 +337,12 @@ def _parse(data: bytes) -> tuple[Project, int]:
             supported=SCHEMA_VERSION,
         )
     unknown_image_rows: frozenset[str] = frozenset()
-    if version < SCHEMA_VERSION:
-        raw = migrate(raw)
-        unknown_image_rows = _rows_on_no_area(raw)
-
     # The model knows only the latest schema; strict JSON mode keeps every type
     # exactly (no "340" for an int, no 0 for a bool), so load then save is a fixed point.
     try:
+        if version < SCHEMA_VERSION:
+            raw = migrate(raw)  # a ValidationError for what it cannot convert unread
+            unknown_image_rows = _rows_on_no_area(raw)
         project = Project.model_validate_json(
             json.dumps(raw, ensure_ascii=False),
             strict=True,
@@ -473,6 +473,25 @@ def _rows_on_no_area(doc: dict[str, Any]) -> frozenset[str]:
     )
 
 
+def _schema_3_keys(batch: dict[str, Any]) -> list[tuple[tuple[str | int, ...], Any]]:
+    """Where a schema-2 batch holds a key that schema 3 added and its
+    conversion writes (the batch's ``images`` and ``lane_tables``, a
+    membrane's ``arenas`` and ``lane_table_id``, a protein's ``rows``), each
+    with its value, in the order schema-2 validation named them: a model's
+    own keys, as the file holds them, before those of the models it holds."""
+    found: list[tuple[tuple[str | int, ...], Any]] = [
+        (("batch", key), value) for key, value in batch.items() if key in ("images", "lane_tables")
+    ]
+    for kind, keys in (("membranes", ("arenas", "lane_table_id")), ("proteins", ("rows",))):
+        items = batch.get(kind)
+        for i, item in enumerate(items if isinstance(items, list) else []):
+            if isinstance(item, dict):
+                found += [
+                    (("batch", kind, i, key), value) for key, value in item.items() if key in keys
+                ]
+    return found
+
+
 def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
     """Schema 2 to 3 (#223): the images kept once by the batch, each
     membrane's area on each of its images, the lane table with an id, and each
@@ -487,11 +506,16 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
     ids come from ``next_id`` in that order: the table, the areas, the rows.
     Pure JSON, on the copy :func:`migrate` passes.
 
-    A part that is not the shape it should be is left for validation to
-    refuse with the message schema 2 gave. An image without an image id gets
-    no area. A ``next_id`` that is not a whole number above every id held is
-    kept as it is, and the new ids are drawn above every held number
-    (:meth:`~proteia.core.model.Project.iter_ids` meets them last). A
+    A file schema 2 refused is refused with the messages schema 2 gave. One
+    that holds a key the conversion writes (:func:`_schema_3_keys`) is
+    refused before anything is written over: a ``ValidationError`` naming
+    each such key an extra input, where schema 2 named it (and alone: the
+    file's other faults are not listed with it). A part that is not the
+    shape it should be is left for validation to refuse. An image without an
+    image id gets no area. A ``next_id`` that is not a whole number above
+    every id held is kept as it is, and the new ids are drawn above every
+    held number (:meth:`~proteia.core.model.Project.iter_ids` meets them
+    last). A
     protein's reference to an image the file does not hold (or to no image
     id at all) stays as its row's area reference, which :func:`_parse` then
     has validated as the image reference it was (:func:`_rows_on_no_area`).
@@ -501,6 +525,11 @@ def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
     batch = doc.setdefault("batch", {})
     if not isinstance(batch, dict):
         return doc
+    if held := _schema_3_keys(batch):
+        lines: list[InitErrorDetails] = [
+            {"type": "extra_forbidden", "loc": loc, "input": value} for loc, value in held
+        ]
+        raise ValidationError.from_exception_data("Project", lines)
     highest = _highest_number(batch)
     usable = type(next_id) is int and highest < next_id  # a bool is not an int here
     counter = next_id if usable else highest + 1
