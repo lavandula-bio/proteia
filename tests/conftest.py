@@ -17,8 +17,10 @@ its saved form has no ``undetected`` key; :func:`make_project_with_undetected`
 adds some. :func:`sample_doc_v1` is the same project as schema 1 saved it,
 before #83, for the migration tests.
 
-Image helpers for tests that read real pixels: :func:`write_tiff` and
-:func:`synthetic_blot`. :class:`FakeClock` gives a session predictable log times.
+Image helpers for tests that read real pixels: :func:`write_tiff`,
+:func:`write_lzw_tiff` (an LZW TIFF of any layout, which tifffile cannot
+write without imagecodecs) and :func:`synthetic_blot`. :class:`FakeClock`
+gives a session predictable log times.
 :func:`assert_strict_json` checks that a model's JSON is strict and loses nothing.
 """
 
@@ -413,6 +415,100 @@ def write_tiff(path: Path, pixels: np.ndarray) -> Path:
     """Write ``pixels`` as an uncompressed single-image TIFF (parents created)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(path, pixels)
+    return path
+
+
+_LZW_CLEAR, _LZW_END, _LZW_FIRST = 256, 257, 258
+
+
+def lzw_encode(data: bytes) -> bytes:
+    """``data`` compressed as TIFF LZW, in 9-bit codes only: a Clear code
+    starts the table again before it reaches 511 entries, where a decoder
+    would widen its codes to 10 bits."""
+    codes = [_LZW_CLEAR]
+    table: dict[bytes, int] = {}
+    prefix = b""
+    for value in data:
+        joined = prefix + bytes((value,))
+        if not prefix or joined in table:
+            prefix = joined
+            continue
+        codes.append(table[prefix] if len(prefix) > 1 else prefix[0])
+        table[joined] = _LZW_FIRST + len(table)
+        prefix = joined[-1:]
+        if _LZW_FIRST + len(table) == 511:
+            codes.append(_LZW_CLEAR)
+            table.clear()
+    if prefix:
+        codes.append(table[prefix] if len(prefix) > 1 else prefix[0])
+    codes.append(_LZW_END)
+    bits = "".join(format(code, "09b") for code in codes)
+    bits += "0" * (-len(bits) % 8)
+    return int(bits, 2).to_bytes(len(bits) // 8, "big")
+
+
+def write_lzw_tiff(
+    path: Path,
+    pixels: np.ndarray,
+    *,
+    planar: bool = False,
+    byteorder: str = "<",
+    rowsperstrip: int | None = None,
+    tile: tuple[int, int] | None = None,
+    predictor: bool = False,
+    compression: int = tifffile.COMPRESSION.LZW,
+    **options,
+) -> Path:
+    """Write ``pixels`` (2-D, or channels last) as an LZW-compressed TIFF, in
+    any layout tifffile writes uncompressed with the same arguments (``options``
+    such as ``photometric`` and ``extrasamples``): planar, of either byte order,
+    in strips or tiles, with the horizontal predictor. tifffile cannot encode
+    LZW without imagecodecs, so it writes the strips (or tiles) encoded here as
+    Deflate, and the Compression tag is then set to LZW, or to another
+    ``compression`` for a test of what the header alone decides."""
+    data = np.asarray(pixels)
+    data = data.astype(data.dtype.newbyteorder(byteorder))
+    stored = np.moveaxis(data, -1, 0) if planar else data
+    planes = list(stored) if planar else [stored]
+    height, width = planes[0].shape[:2]
+    rows = rowsperstrip or height
+    chunks = []
+    for plane in planes:
+        if tile:
+            across, down = -(-width // tile[1]) * tile[1], -(-height // tile[0]) * tile[0]
+            padded = np.zeros((down, across, *plane.shape[2:]), plane.dtype)
+            padded[:height, :width] = plane
+            pieces = [
+                padded[y : y + tile[0], x : x + tile[1]]
+                for y in range(0, down, tile[0])
+                for x in range(0, across, tile[1])
+            ]
+        else:
+            pieces = [plane[top : top + rows] for top in range(0, height, rows)]
+        for piece in pieces:
+            if predictor:  # each sample less the same sample of the pixel on its left
+                original, piece = piece, piece.copy()
+                piece[:, 1:] -= original[:, :-1]  # wrapping round, as unsigned integers do
+            chunks.append(lzw_encode(np.ascontiguousarray(piece).tobytes()))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(
+        path,
+        iter(chunks),
+        shape=stored.shape,
+        dtype=stored.dtype,
+        byteorder=byteorder,
+        compression="zlib",
+        predictor=predictor or None,
+        planarconfig="separate" if planar else None,
+        rowsperstrip=None if tile else rows,
+        tile=tile,
+        **options,
+    )
+    with tifffile.TiffFile(path) as tif:
+        offset = tif.pages.first.tags["Compression"].valueoffset
+    with path.open("r+b") as file:
+        file.seek(offset)
+        file.write(int(compression).to_bytes(2, "little" if byteorder == "<" else "big"))
     return path
 
 
