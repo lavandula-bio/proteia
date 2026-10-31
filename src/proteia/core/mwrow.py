@@ -305,7 +305,7 @@ def placed_on_add(batch: Batch, protein: Protein) -> bool:
     expects one band at a known MW, and its image has a curve."""
     if protein.expected_mw is None or protein.expected_band_count != 1:
         return False
-    fitted = mwcal.calibration_for(batch.membrane_of_protein(protein), batch.image_of(protein).id)
+    fitted = mwcal.calibration_for(batch.membrane_of_protein(protein), batch.image_id_of(protein))
     return isinstance(fitted, mwcal.Calibration)
 
 

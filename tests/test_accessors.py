@@ -5,21 +5,26 @@ holds, and no reader outside the model that goes around them.
 Each concept is read through one accessor of :class:`~proteia.core.model.Batch`,
 so that a change of the stored shape changes the accessor and not its readers:
 the images in order and by id, a membrane's images and register groups, the
-membranes on an image, the lanes of a membrane or a protein, a protein's image,
+membrane of an image, the lanes of a protein, a protein's image (and its id),
 membrane and boxes, the proteins on an image, and the band lookup.
 
 The second half reads the source of the package (the model aside, which holds
-the stored shape and the accessors) and lists every read that goes around
-them: any ``image_id`` or ``images``, a ``lanes`` of a stored batch (held, by
-the package's habit, in a name ending in ``batch``), register groups asked of
-anything but such a batch, and a protein's box fields read or written on
+the stored shape and the accessors) and lists every access that goes around
+them, whatever the names of the variables: any read, write or deletion of a
+``lanes``, ``images`` or ``image_id``; those fields and the box fields given
+to the constructor of a stored record or to a ``model_copy`` update; a
+membrane's own ``register_groups()`` or ``group_of(image_id)`` (the batch's
+take the membrane first); and a protein's box fields read or written on
 anything but a ``boxes_of(...)`` call or a name that every binding in its
-function sets to one. A read of an attribute of the same name on something
-else, such as a calibration point's ``image_id`` or a request body's
-``box_size``, is allowed by name in :data:`ALLOWED`, with the reason.
+function sets to one, on which nothing else is read. An access of a field of
+the same name on something else, such as a calibration point's ``image_id``,
+a row detection's ``lanes`` or a request body's ``box_size``, and the writers
+of the stored shape are allowed by name in :data:`ALLOWED`, with the reason.
 """
 
 import ast
+import inspect
+import typing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,21 +32,34 @@ import pytest
 
 from conftest import make_project
 from proteia.core import operations as ops
-from proteia.core.model import Box, ImageKind, Project, UnknownIdError
+from proteia.core import storage
+from proteia.core.model import (
+    Batch,
+    Box,
+    Boxes,
+    CalibrationPointSource,
+    ImageKind,
+    Project,
+    UnknownIdError,
+)
 from proteia.core.operations import ErrorCode, OperationError
 from proteia.core.project import lane_anchors
 from proteia.web import state
 from test_operations import (
+    CAL_LEFT_X,
     NARROW_X,
     ROW,
     band_of,
     boxed,
     cal_blot,
     cal_marker,
+    cal_y,
     calibrated,
     import_blot,
     plant,
 )
+
+CHEMI_MARKER = CalibrationPointSource.CHEMILUMINESCENCE_MARKER
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "proteia"
 
@@ -98,18 +116,15 @@ def test_images_in_order_and_by_id():
         batch.find_image("img-99")
 
 
-def test_membranes_on_an_image():
+def test_the_membrane_of_an_image():
     batch = _shuffled().batch
     mem_5, mem_1 = batch.membranes
-    [on_6] = batch.membranes_on("img-6")
-    assert on_6 is mem_5
+    assert batch.membrane_of("img-6") is mem_5
     for image_id in ("img-4", "img-2", "img-3"):
-        [on] = batch.membranes_on(image_id)
-        assert on is mem_1
         assert batch.membrane_of(image_id) is mem_1
     for unknown in ("img-99", "mem-1", "prot-9"):
         with pytest.raises(UnknownIdError):
-            batch.membranes_on(unknown)
+            batch.membrane_of(unknown)
 
 
 def test_register_groups_and_group_of():
@@ -125,13 +140,10 @@ def test_register_groups_and_group_of():
         batch.group_of(mem_1, "img-6")  # an image of the other membrane
 
 
-def test_lanes_of_a_membrane_and_of_a_protein():
+def test_lanes_of_a_protein():
     batch = _shuffled().batch
-    samples = ["v1", "v2", "a1", "a2"]
-    for membrane in batch.membranes:
-        assert [lane.sample for lane in batch.lanes_of(membrane)] == samples
     for protein in batch.proteins:
-        assert [lane.sample for lane in batch.lanes_of_protein(protein)] == samples
+        assert [lane.sample for lane in batch.lanes_of_protein(protein)] == ["v1", "v2", "a1", "a2"]
 
 
 def test_a_proteins_image_membrane_and_boxes():
@@ -141,6 +153,8 @@ def test_a_proteins_image_membrane_and_boxes():
     assert batch.image_of(gapdh) is batch.find_image("img-4")
     assert batch.image_of(alpha) is batch.find_image("img-6")
     assert batch.image_of(beta).id == batch.image_of(p53).id == "img-2"
+    ids = [batch.image_id_of(protein) for protein in batch.proteins]
+    assert ids == ["img-4", "img-2", "img-6", "img-2"]
     assert batch.membrane_of_protein(gapdh) is mem_1
     assert batch.membrane_of_protein(alpha) is mem_5
     assert batch.membrane_of_protein(p53) is mem_1
@@ -154,6 +168,36 @@ def test_a_proteins_image_membrane_and_boxes():
     assert (boxes.box_padding.across, boxes.box_padding.along) == (2, 1)
     assert (boxes.fitted_size.width, boxes.fitted_size.height) == (10, 8)
     assert [(record.lane_index, record.snr) for record in boxes.undetected] == [(1, 2.5)]
+
+
+def test_an_image_id_is_read_without_a_lookup(monkeypatch):
+    # The hot paths that only key by a protein's image ask for its id: no scan
+    # of the images, so no find_image call.
+    batch = _shuffled().batch
+
+    def no_lookup(self, image_id):
+        raise AssertionError(f"looked up {image_id}")
+
+    monkeypatch.setattr(Batch, "find_image", no_lookup)
+    assert [batch.image_id_of(p) for p in batch.proteins] == ["img-4", "img-2", "img-6", "img-2"]
+
+
+def test_boxes_are_asked_of_the_batch_and_hold_the_box_fields_only():
+    # An instance method, so the batch can answer from wherever the boxes are
+    # stored; its answer is typed as the box fields alone.
+    assert not isinstance(inspect.getattr_static(Batch, "boxes_of"), staticmethod)
+    assert typing.get_type_hints(Batch.boxes_of)["return"] is Boxes
+    declared = {name for name in vars(Boxes) if not name.startswith("_")}
+    assert declared | set(Boxes.__annotations__) == {
+        "bands",
+        "box_size",
+        "box_padding",
+        "undetected",
+        "fitted_size",
+    }
+    batch = _shuffled().batch
+    with pytest.raises(TypeError):
+        Batch.boxes_of(batch.proteins[0])  # no batch: no answer
 
 
 def test_proteins_on_an_image():
@@ -255,6 +299,21 @@ def test_a_marker_of_another_membrane_or_kind_is_refused_in_its_own_words(tmp_pa
         assert s.project is before
 
 
+def test_a_refused_link_leaves_the_images_as_they_were(tmp_path):
+    # The link is tried on a copy before the change: a refusal must leave the
+    # committed image unlinked, not only the session on the same project.
+    c = calibrated(tmp_path)
+    s = c.session
+    ops.set_marker_image(s, c.blot, None)
+    y70 = cal_y(70, CAL_LEFT_X)
+    ops.add_calibration_point(s, c.blot, y70 + 5.0, 70, CHEMI_MARKER, x=CAL_LEFT_X, snap=False)
+    with pytest.raises(OperationError) as info:
+        ops.set_marker_image(s, c.blot, c.marker)
+    assert info.value.code is ErrorCode.DUPLICATE_MW
+    assert s.project.batch.find_image(c.blot).marker_image_id is None
+    assert storage.content_hash(s.project) == s.project.log[-1].content_hash
+
+
 def test_a_padding_reports_the_change_of_a_net_under_one(tmp_path):
     s, _, beta = boxed(tmp_path)
     band_id = ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
@@ -270,17 +329,25 @@ def test_a_padding_reports_the_change_of_a_net_under_one(tmp_path):
 
 # --- No reader around them ---
 
-# A protein's box fields: read and written only on what Batch.boxes_of returns.
+# A protein's box fields: read and written only on what Batch.boxes_of
+# returns, on which nothing else is read.
 BOX_FIELDS = frozenset({"bands", "box_size", "box_padding", "undetected", "fitted_size"})
-# Read only through the batch's accessors of the same names.
-GROUP_METHODS = frozenset({"register_groups", "group_of"})
+# The stored shape's other fields the accessors serve: any read, write or
+# deletion of one outside the model, whatever holds it, is listed.
+SHAPE_FIELDS = frozenset({"lanes", "images", "image_id"})
+# The membrane's methods the batch's accessors of the same name wrap, by the
+# number of arguments the membrane's takes (the batch's take the membrane first).
+GROUP_METHODS = {"register_groups": 0, "group_of": 1}
+# The stored records whose constructors take those fields.
+RECORDS = frozenset({"Batch", "Membrane", "Protein"})
 
 
 @dataclass(frozen=True, order=True)
 class Reader:
-    """A read around the accessors: the file (under ``src/proteia``), the
-    function (dotted, nested functions included), the receiver as written,
-    and the attribute."""
+    """An access around the accessors: the file (under ``src/proteia``), the
+    function (dotted, nested functions included), the receiver as written
+    (``Protein(...)`` for a constructor, ``x.model_copy(update=...)`` for an
+    update), and the field."""
 
     path: str
     function: str
@@ -365,6 +432,11 @@ class _Checker(ast.NodeVisitor):
         self.names: list[str] = []  # the enclosing functions and classes
         self.scopes: list[dict[str, bool]] = []  # their bindings, innermost last
         self.found: list[Reader] = []
+        self.called: set[int] = set()  # the group methods judged by their call
+
+    def _note(self, receiver: str, field: str) -> None:
+        function = ".".join(self.names) or "<module>"
+        self.found.append(Reader(self.path, function, receiver, field))
 
     def _enter(self, node: ast.AST, name: str) -> None:
         self.names.append(name)
@@ -396,24 +468,41 @@ class _Checker(ast.NodeVisitor):
                     return scope[receiver.id]
         return False
 
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if isinstance(func, ast.Attribute) and func.attr in GROUP_METHODS:
+            self.called.add(id(func))
+            if len(node.args) + len(node.keywords) == GROUP_METHODS[func.attr]:
+                self._note(ast.unparse(func.value), func.attr)  # the membrane's own
+        if name in RECORDS:
+            for keyword in node.keywords:
+                if keyword.arg in SHAPE_FIELDS | BOX_FIELDS:
+                    self._note(f"{name}(...)", keyword.arg)
+        if name == "model_copy" and isinstance(func, ast.Attribute):
+            for keyword in node.keywords:
+                if keyword.arg == "update" and isinstance(keyword.value, ast.Dict):
+                    for key in keyword.value.keys:
+                        if isinstance(key, ast.Constant) and key.value in SHAPE_FIELDS | BOX_FIELDS:
+                            self._note(
+                                f"{ast.unparse(func.value)}.model_copy(update=...)", key.value
+                            )
+        self.generic_visit(node)
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        receiver = ast.unparse(node.value)
-        # The package holds a stored batch in a name ending in "batch".
-        on_batch = receiver.rsplit(".", 1)[-1].endswith("batch")
-        load = isinstance(node.ctx, ast.Load)
+        holds_boxes = self._holds_boxes(node.value)
         if node.attr in BOX_FIELDS:
-            around = not self._holds_boxes(node.value)  # a write too
-        elif node.attr == "lanes":
-            around = load and on_batch
-        elif node.attr in ("images", "image_id"):
-            around = load
+            around = not holds_boxes  # read, write or deletion
+        elif holds_boxes:
+            around = True  # an answer of boxes_of holds the box fields only
+        elif node.attr in SHAPE_FIELDS:
+            around = True  # read, write or deletion, whatever holds it
         elif node.attr in GROUP_METHODS:
-            around = not on_batch
+            around = id(node) not in self.called  # a call is judged by its arguments
         else:
             around = False
         if around:
-            function = ".".join(self.names) or "<module>"
-            self.found.append(Reader(self.path, function, receiver, node.attr))
+            self._note(ast.unparse(node.value), node.attr)
         self.generic_visit(node)
 
 
@@ -475,7 +564,33 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "core/operations.py detect_mw_row: lanes_span.image_id",
     ),
     **_allow(
-        "an answer, a request body, a result series or the undo history: not the stored batch",
+        "a row detection's lanes (rowdetect.RowDetection and its parts) or the lane count an"
+        " MW search names (_MwSearch), not the lane table",
+        "core/operations.py _mw_refusal_words: found.lanes",
+        "core/operations.py _mw_refusal_words: mw.lanes",
+        "core/operations.py _not_recorded: found.lanes",
+        "core/operations.py _off_row_step: found.lanes",
+        "core/operations.py _place_row: found.lanes",
+        "core/operations.py _place_row.params: found.lanes",
+        "core/operations.py _row_refusal: found.lanes",
+        "core/operations.py _span_step: mw.lanes",
+        "core/rowdetect.py RowDetection.slots: self.lanes",
+        "core/rowdetect.py _assign: a.lanes",
+        "core/rowdetect.py _assign: best.lanes",
+        "core/rowdetect.py _assign.run: a.lanes",
+        "core/rowdetect.py _count_components: res.lanes",
+        "core/rowdetect.py _doubts: assign.lanes",
+        "core/rowdetect.py _empty_lanes: res.lanes",
+        "core/rowdetect.py _lanes_from: assign.lanes",
+        "core/rowdetect.py _stage2_free: res.lanes",
+        "core/rowdetect.py detect_row: res.lanes",
+        "core/rowdetect.py detect_row_along: found.lanes",
+    ),
+    **_allow(
+        "an answer, a request body, a result set, a series, reduced samples or the undo"
+        " history: not the stored batch",
+        "core/export.py result_set_table: results.lanes",
+        "core/results.py _compute: red.lanes",
         "core/session.py ProjectSession._move: target.images",
         "core/session.py ProjectSession._retained_files: state.images",
         "web/api.py _padding_change: change.box_size",
@@ -485,6 +600,7 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "web/api.py add_protein: body.image_id",
         "web/api.py clear_boxes: cleared.undetected",
         "web/api.py list_diagnostics: plan.images",
+        "web/api.py set_lanes: body.lanes",
         "web/api.py write_diagnostics: body.images",
         "web/diagnostics.py Plan.digest: self.images",
         "web/diagnostics.py Plan.files: self.images",
@@ -492,8 +608,8 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "web/results_view.py _series: series.undetected",
     ),
     **_allow(
-        "the batch's lane table as a whole (declared, exported, shown, computed over):"
-        " no membrane or protein to ask for; #222 adds no accessor for it",
+        "the batch's lane table as a whole (declared and written, exported, shown, computed"
+        " over): no membrane or protein to ask for; #222 adds no accessor for it",
         "core/operations.py export_bundle: batch.lanes",
         "core/operations.py export_lane_table: batch.lanes",
         "core/operations.py set_lanes: batch.lanes",
@@ -511,8 +627,14 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "core/operations.py calibration_fit: membrane.images",
     ),
     **_allow(
-        "the import's write of a new image into its membrane: a writer of the stored shape",
+        "a writer of the stored shape, which changes with it: the import adds an image to its"
+        " membrane, the removal takes it out, adding a protein builds it on its image with"
+        " its box size, and the results build a copy of the batch with every lane included",
+        "core/operations.py add_protein.change: Protein(...).box_size",
+        "core/operations.py add_protein.change: Protein(...).image_id",
         "core/operations.py import_image.change: membrane.images",
+        "core/operations.py remove_image.change: membrane.images",
+        "core/results.py compute_results: batch.model_copy(update=...).lanes",
     ),
 }
 
@@ -544,10 +666,26 @@ def test_allowed_readers_are_still_there():
         ("def f(protein):\n    return protein.fitted_size\n", "fitted_size"),
         ("def f(batch):\n    return len(batch.lanes)\n", "lanes"),
         ("def f(session):\n    return session.project.batch.lanes\n", "lanes"),
+        # Whatever the receiver is called: a batch is not always named "batch".
+        ("def f(committed):\n    return committed.lanes\n", "lanes"),
+        ("def f(before):\n    return [i.id for i in before.membranes[0].images]\n", "images"),
         ("def f(membrane):\n    return membrane.images\n", "images"),
         ("def f(protein):\n    return protein.image_id\n", "image_id"),
+        # Writes and deletions, constructors and updates of the stored shape.
+        ("def f(membrane, kept):\n    membrane.images = kept\n", "images"),
+        ("def f(after, lanes):\n    after.lanes = lanes\n", "lanes"),
+        ("def f(protein):\n    del protein.image_id\n", "image_id"),
+        ("def f(image):\n    return Protein(id='prot-1', image_id=image)\n", "image_id"),
+        ("def f(size):\n    return model.Protein(id='prot-1', box_size=size)\n", "box_size"),
+        ("def f(images):\n    return Membrane(id='mem-1', images=images)\n", "images"),
+        ("def f(b):\n    return b.model_copy(update={'lanes': []})\n", "lanes"),
+        # A membrane's own group methods, by their arguments; or not called.
         ("def f(membrane, image_id):\n    return membrane.group_of(image_id)\n", "group_of"),
         ("def f(membrane):\n    return membrane.register_groups()\n", "register_groups"),
+        ("def f(m):\n    return m.register_groups\n", "register_groups"),
+        # The answer of boxes_of holds the box fields only.
+        ("def f(b, p):\n    return b.boxes_of(p).name\n", "name"),
+        ("def f(b, p):\n    own = b.boxes_of(p)\n    return own.role\n", "role"),
         # Named like the accessor's answer, but not bound to it here.
         ("def f(protein):\n    boxes = protein\n    return boxes.bands\n", "bands"),
         (
@@ -573,25 +711,26 @@ def test_the_check_finds_each_kind_of_read(source, attr):
 
 def test_the_check_passes_reads_through_the_accessors():
     source = (
-        "def f(batch, draft, protein, membrane, image_id, size):\n"
+        "def f(batch, committed, protein, membrane, image_id, size):\n"
         "    boxes = batch.boxes_of(protein)\n"
         "    boxes.box_size = size\n"
-        "    own, n = draft.batch.boxes_of(protein), 1\n"
+        "    own, n = committed.boxes_of(protein), 1\n"
         "    def g():\n"
         "        return boxes.bands\n"
         "    return (\n"
         "        boxes.box_padding,\n"
         "        own.bands,\n"
         "        batch.boxes_of(protein).undetected,\n"
-        "        Batch.boxes_of(protein).fitted_size,\n"
+        "        committed.boxes_of(protein).fitted_size,\n"
         "        batch.lanes_of_protein(protein),\n"
         "        batch.images_of(membrane),\n"
         "        batch.image_of(protein).id,\n"
-        "        batch.group_of(membrane, image_id),\n"
-        "        draft.batch.register_groups(membrane),\n"
+        "        committed.image_id_of(protein),\n"
+        "        committed.group_of(membrane, image_id),\n"
+        "        batch.register_groups(membrane),\n"
+        "        Protein(id='prot-1', name='p53'),\n"
+        "        protein.model_copy(update={'name': 'p53'}),\n"
         "        g,\n"
         "    )\n"
-        "def h(batch, lanes):\n"
-        "    batch.lanes = lanes\n"  # a write of the lane table itself
     )
     assert direct_readers(source, "x.py") == []

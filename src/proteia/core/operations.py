@@ -764,11 +764,12 @@ def _undetected_json(protein_id: str, record: UndetectedBand) -> dict[str, JsonV
 
 
 def _drop_undetected_where(
-    protein: Protein, drop: Callable[[UndetectedBand], bool]
+    batch: Batch, protein: Protein, drop: Callable[[UndetectedBand], bool]
 ) -> list[dict[str, JsonValue]]:
-    """Remove a draft protein's records for which ``drop`` is true; return their
-    log forms in the stored order (plain values, as a change should return)."""
-    own = Batch.boxes_of(protein)
+    """Remove the records of a draft protein of ``batch`` for which ``drop`` is
+    true; return their log forms in the stored order (plain values, as a
+    change should return)."""
+    own = batch.boxes_of(protein)
     kept: list[UndetectedBand] = []
     dropped: list[dict[str, JsonValue]] = []
     for u in own.undetected:
@@ -781,20 +782,24 @@ def _drop_undetected_where(
     return dropped
 
 
-def _drop_mw_guided(protein: Protein) -> list[dict[str, JsonValue]]:
+def _drop_mw_guided(batch: Batch, protein: Protein) -> list[dict[str, JsonValue]]:
     """Remove a draft protein's MW-guided records: the slot each one examined was
     placed from the expected MW, the MW tolerance and its image's calibration
     curve (its register group's), so a change to any of them leaves the record
     about a slot nobody looked in."""
-    return _drop_undetected_where(protein, lambda record: record.source is ProposalSource.MW_GUIDED)
+    return _drop_undetected_where(
+        batch, protein, lambda record: record.source is ProposalSource.MW_GUIDED
+    )
 
 
 def _drop_undetected(
-    protein: Protein, lane_index: int, band_index: int
+    batch: Batch, protein: Protein, lane_index: int, band_index: int
 ) -> dict[str, JsonValue] | None:
     """Remove a draft protein's record at (lane, band index): its log form, or None."""
     dropped = _drop_undetected_where(
-        protein, lambda record: (record.lane_index, record.band_index) == (lane_index, band_index)
+        batch,
+        protein,
+        lambda record: (record.lane_index, record.band_index) == (lane_index, band_index),
     )
     return dropped[0] if dropped else None
 
@@ -947,7 +952,7 @@ def _fitted_before_58(membrane: Membrane, batch: Batch) -> bool:
     return any(
         band.apparent_mw is not None
         for protein in batch.proteins
-        if batch.image_of(protein).id in images
+        if batch.image_id_of(protein) in images
         for band in batch.boxes_of(protein).bands
     )
 
@@ -1026,13 +1031,13 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
     }
     dropped: list[dict[str, JsonValue]] = []
     for protein in draft.batch.proteins:
-        own, image_id = draft.batch.boxes_of(protein), draft.batch.image_of(protein).id
+        own, image_id = draft.batch.boxes_of(protein), draft.batch.image_id_of(protein)
         fitted, size = new[image_id], own.box_size
         for band in own.bands:
             if image_id in moved_curves or boxes_before.get(band.id) != (band.box, size):
                 band.apparent_mw = _apparent_mw(fitted, band.box, size)
         if image_id in moved_curves:
-            dropped.extend(_drop_mw_guided(protein))
+            dropped.extend(_drop_mw_guided(draft.batch, protein))
             for band in own.bands:
                 band.bands_found = None
     return _MwRefresh(curves_changed=tuple(changed), dropped=tuple(dropped))
@@ -1193,7 +1198,7 @@ def _count_cleared_by_tolerance(batch: Batch, protein: Protein) -> bool:
     one, the window is the row box's rows."""
     membrane = batch.membrane_of_protein(protein)
     return isinstance(
-        mwcal.calibration_for(membrane, batch.image_of(protein).id), mwcal.Calibration
+        mwcal.calibration_for(membrane, batch.image_id_of(protein)), mwcal.Calibration
     )
 
 
@@ -1304,9 +1309,11 @@ def _check_lane(
     return lane
 
 
-def _overlapped(rect: Rect, protein: Protein, *, skip: str | None = None) -> list[str]:
+def _overlapped(
+    batch: Batch, rect: Rect, protein: Protein, *, skip: str | None = None
+) -> list[str]:
     """The protein's bands (other than ``skip``) whose box overlaps ``rect``."""
-    own = Batch.boxes_of(protein)
+    own = batch.boxes_of(protein)
     return [
         band.id
         for band in own.bands
@@ -1329,7 +1336,7 @@ def _covered(
     same pair of boxes was refused or not by which came first."""
     rects = list(rects)
     found = []
-    for other in batch.proteins_on(batch.image_of(protein).id):
+    for other in batch.proteins_on(batch.image_id_of(protein)):
         if other.id == protein.id:
             continue
         theirs = batch.boxes_of(other)
@@ -1818,7 +1825,7 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
         return [
             dropped
             for protein in draft.batch.proteins_on(image_id)
-            for dropped in _drop_undetected_where(protein, lambda _: True)
+            for dropped in _drop_undetected_where(draft.batch, protein, lambda _: True)
         ]
 
     _apply(
@@ -2248,9 +2255,13 @@ def set_marker_image(
                 " its image pixel for pixel",
                 ids=(image_id, marker.id),
             )
-    linked_batch = batch.model_copy(deep=True)  # with the link made, to check it
+    # The batch with the link made, to check it: only the membrane is copied
+    # (its images with it), the rest shared and left as it is.
+    linked = membrane.model_copy(deep=True)
+    linked_batch = batch.model_copy(
+        update={"membranes": [linked if m is membrane else m for m in batch.membranes]}
+    )
     linked_batch.find_image(image_id).marker_image_id = marker_image_id
-    linked = linked_batch.membrane_of(image_id)
     for group in linked_batch.register_groups(linked):
         points = [p for p in linked.calibration.points if p.image_id in group]
         refusal = _ladder_refusal(linked_batch, linked, group, points)
@@ -3055,7 +3066,9 @@ def set_lanes(
         return [
             dropped
             for protein in draft.batch.proteins
-            for dropped in _drop_undetected_where(protein, lambda record: record.lane_index >= n)
+            for dropped in _drop_undetected_where(
+                draft.batch, protein, lambda record: record.lane_index >= n
+            )
         ]
 
     # Only the rows that are new or differ from the committed table, as stored.
@@ -3235,7 +3248,7 @@ def edit_protein(
         edited.loading_control_ids = controls
         dropped: list[JsonValue] = []
         if mw != protein.expected_mw or tolerance != protein.mw_tolerance:
-            dropped.extend(_drop_mw_guided(edited))
+            dropped.extend(_drop_mw_guided(draft.batch, edited))
         for band in draft.batch.boxes_of(edited).bands:  # counts whose window or slot moved
             guided = mw != protein.expected_mw and band.source is ProposalSource.MW_GUIDED
             if recount or guided:
@@ -3276,7 +3289,7 @@ def remove_protein(session: ProjectSession, protein_id: str) -> Cascade:
     out its boxes."""
     committed = session.project.batch
     protein = committed.find_protein(protein_id)
-    image_id = committed.image_of(protein).id
+    image_id = committed.image_id_of(protein)
     band_ids = [band.id for band in committed.boxes_of(protein).bands]
     array = _pixels_left(session, image_id, band_ids) if band_ids else None
 
@@ -3432,7 +3445,7 @@ def place_box(
     else:
         size, resized = own.box_size, rects
         rect = boxes.centered_rect(x, y, size, width, height)
-        hits = _overlapped(rect, protein)
+        hits = _overlapped(batch, rect, protein)
         if hits:
             raise OperationError(
                 ErrorCode.OVERLAP, "the box would overlap another box of this protein", ids=hits
@@ -3460,9 +3473,9 @@ def place_box(
             **_UNQUANTIFIED,
         )
         edited_boxes.bands.append(band)
-        _quantify_image(draft, draft.batch.image_of(edited).id, array)
+        _quantify_image(draft, draft.batch.image_id_of(edited), array)
         _refresh_box_mws(session.project, draft)
-        return band.id, _drop_undetected(edited, lane_index, 0)
+        return band.id, _drop_undetected(draft.batch, edited, lane_index, 0)
 
     def params(result: tuple[str, dict[str, JsonValue] | None]) -> _Params:
         band_id, replaced = result
@@ -3507,7 +3520,7 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
     new = boxes.center_snap(rect, size, image.width, image.height)
     if new == band.box.rect(size):
         return
-    hits = _overlapped(new, protein, skip=band_id)
+    hits = _overlapped(batch, new, protein, skip=band_id)
     if hits:
         raise OperationError(
             ErrorCode.OVERLAP, "the box would overlap another box of this protein", ids=hits
@@ -3522,7 +3535,7 @@ def move_box(session: ProjectSession, band_id: str, rect: Rect) -> None:
         _set_box(moved, new)
         moved.manually_edited = True
         moved.bands_found = None
-        _quantify_image(draft, draft.batch.image_of(edited).id, array)
+        _quantify_image(draft, draft.batch.image_id_of(edited), array)
         _refresh_box_mws(session.project, draft)
 
     _apply(session, "move_box", change, lambda _: {"band_id": band_id, "rect": list(new)})
@@ -3535,7 +3548,7 @@ def remove_box(session: ProjectSession, band_id: str) -> None:
     out the box."""
     protein, band = session.project.batch.find_band(band_id)
     params = {"band_id": band_id, "protein_id": protein.id, "lane_index": band.lane_index}
-    image_id = session.project.batch.image_of(protein).id
+    image_id = session.project.batch.image_id_of(protein)
     array = _pixels_left(session, image_id, [band_id])
 
     def change(draft: Project) -> None:
@@ -3581,7 +3594,7 @@ def set_box_lane(session: ProjectSession, band_id: str, lane_index: int) -> None
         edited.lane_index = lane
         edited.manually_edited = True
         edited.bands_found = None
-        return _drop_undetected(edited_protein, lane, edited.band_index)
+        return _drop_undetected(draft.batch, edited_protein, lane, edited.band_index)
 
     _apply(
         session,
@@ -3662,7 +3675,7 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
             if new != old:
                 _set_box(band, new)
         if array is not None:
-            _quantify_image(draft, draft.batch.image_of(edited).id, array)
+            _quantify_image(draft, draft.batch.image_id_of(edited), array)
         _refresh_box_mws(session.project, draft)
 
     _apply(
@@ -3678,6 +3691,7 @@ def set_box_size(session: ProjectSession, protein_id: str, size: BoxSize) -> Non
 
 
 def _padding_overlap(
+    batch: Batch,
     protein: Protein,
     rects: Sequence[Rect],
     old: BoxPadding,
@@ -3690,7 +3704,7 @@ def _padding_overlap(
     the direction raised (left and right if raising it alone makes boxes
     overlap), and the most that fits of it, the other held as asked, when any
     does: overlap only grows with a padding, so a bisection finds it."""
-    own = Batch.boxes_of(protein)
+    own = batch.boxes_of(protein)
     fitted = own.fitted_size
 
     def fits(pad: BoxPadding) -> bool:
@@ -3805,7 +3819,7 @@ def set_box_padding(
     rects = [band.box.rect(own.box_size) for band in own.bands]
     resized, clashing = boxes.resize_checked(rects, size, width=image.width, height=image.height)
     if clashing:
-        raise _padding_overlap(protein, rects, old, new, clashing, image)
+        raise _padding_overlap(batch, protein, rects, old, new, clashing, image)
     covered = _covered(batch, protein, [r for r, o in zip(resized, rects, strict=True) if r != o])
     if covered:
         raise _cover_refusal(
@@ -3823,7 +3837,7 @@ def set_box_padding(
         for band, before, after in zip(edited_boxes.bands, rects, resized, strict=True):
             if after != before:
                 _set_box(band, after)
-        _quantify_image(draft, draft.batch.image_of(edited).id, array)
+        _quantify_image(draft, draft.batch.image_id_of(edited), array)
         _refresh_box_mws(session.project, draft)
 
     params = {
@@ -3883,7 +3897,7 @@ def clear_boxes(session: ProjectSession, protein_id: str) -> ClearedBoxes:
     own = committed.boxes_of(protein)
     removed = [band.id for band in own.bands]
     lanes = [band.lane_index for band in own.bands]
-    image_id = committed.image_of(protein).id
+    image_id = committed.image_id_of(protein)
     array = _pixels_left(session, image_id, removed) if removed else None
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
@@ -3891,7 +3905,7 @@ def clear_boxes(session: ProjectSession, protein_id: str) -> ClearedBoxes:
         draft.batch.boxes_of(edited).bands = []
         if array is not None:
             _quantify_image(draft, image_id, array)
-        return _drop_undetected_where(edited, lambda _: True)
+        return _drop_undetected_where(draft.batch, edited, lambda _: True)
 
     dropped = _apply(
         session,
@@ -4982,11 +4996,11 @@ def _place_row(
             band.bands_found = counts[lane]
             edited_boxes.bands.append(band)
         # The boxes placed, moved and removed change every ring on the image.
-        _quantify_image(draft, draft.batch.image_of(edited).id, array)
+        _quantify_image(draft, draft.batch.image_id_of(edited), array)
         # Every band-index-0 record gives way to this run's outcome in its lane (a
         # kept box's lane holds none).
         dropped: list[JsonValue] = list(
-            _drop_undetected_where(edited, lambda record: record.band_index == 0)
+            _drop_undetected_where(draft.batch, edited, lambda record: record.band_index == 0)
         )
         written: list[JsonValue] = []
         for lane in records:
@@ -5336,7 +5350,7 @@ def remove_undetected(
         return
 
     def change(draft: Project) -> dict[str, JsonValue] | None:
-        return _drop_undetected(draft.batch.find_protein(protein_id), lane, band)
+        return _drop_undetected(draft.batch, draft.batch.find_protein(protein_id), lane, band)
 
     _apply(
         session,
@@ -5531,7 +5545,7 @@ def _outdated_readings(session: ProjectSession, project: Project) -> dict[str, s
     header, once per image)."""
     batch = project.batch
     measured = {
-        batch.image_of(protein).id for protein in batch.proteins if batch.boxes_of(protein).bands
+        batch.image_id_of(protein) for protein in batch.proteins if batch.boxes_of(protein).bands
     }
     return {
         image.id: why

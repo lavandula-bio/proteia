@@ -220,7 +220,7 @@ def project_state(
     anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
-        boxes, image_id = batch.boxes_of(protein), batch.image_of(protein).id
+        boxes, image_id = batch.boxes_of(protein), batch.image_id_of(protein)
         size, fitted, padding = boxes.box_size, boxes.fitted_size, boxes.box_padding
         predicted = mwrow.predict(batch, protein)
         proteins.append(
