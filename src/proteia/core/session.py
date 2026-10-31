@@ -271,11 +271,11 @@ def _log_opened(folder: Path, project: Project, *, again: bool = False) -> None:
         else f"opened {folder.name!r}",
         sum(1 for _ in batch.iter_images()),
         len(batch.proteins),
-        sum(len(protein.bands) for protein in batch.proteins),
+        sum(len(batch.boxes_of(protein).bands) for protein in batch.proteins),
         len(project.log),
     )
     if project.background_method == LEGACY_BACKGROUND_METHOD and any(
-        protein.bands for protein in batch.proteins
+        batch.boxes_of(protein).bands for protein in batch.proteins
     ):
         _log.info(
             "in %r: the nets are measured with the legacy background (%s), each image's"
@@ -325,10 +325,11 @@ class _Move(Enum):
 
 def _record_keys(project: Project) -> list[tuple[str, int, int]]:
     """(protein id, lane index, band index) of every not-detected record."""
+    batch = project.batch
     return [
         (protein.id, record.lane_index, record.band_index)
-        for protein in project.batch.proteins
-        for record in protein.undetected
+        for protein in batch.proteins
+        for record in batch.boxes_of(protein).undetected
     ]
 
 

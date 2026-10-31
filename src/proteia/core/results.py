@@ -415,13 +415,14 @@ def _field(bands: list[model.Band | None], attr: str) -> list:
     return [None if band is None else getattr(band, attr) for band in bands]
 
 
-def _join(protein: model.Protein, n: int) -> list[model.Band | None]:
+def _join(batch: model.Batch, protein: model.Protein, n: int) -> list[model.Band | None]:
     """A protein's band-index-0 band per lane, by stored lane index.
 
     The same join as :func:`~proteia.core.project.join_to_spine`: a lane with no box
     is ``None`` and shifts nothing. The model allows one band-index-0 band per lane.
     """
-    by_lane = {band.lane_index: band for band in protein.bands if band.band_index == 0}
+    bands = batch.boxes_of(protein).bands
+    by_lane = {band.lane_index: band for band in bands if band.band_index == 0}
     return [by_lane.get(i) for i in range(n)]
 
 
@@ -435,11 +436,12 @@ def lane_detected(batch: model.Batch) -> dict[str, list[bool | None]]:
     in :func:`_join`; :func:`compute_results` takes the detection state from
     here. The model allows a lane a box or a record, never both.
     """
-    n = len(batch.lanes)
     detected: dict[str, list[bool | None]] = {}
     for protein in batch.proteins:
-        state = {u.lane_index: False for u in protein.undetected if u.band_index == 0}
-        state.update((b.lane_index, True) for b in protein.bands if b.band_index == 0)
+        boxes = batch.boxes_of(protein)
+        state = {u.lane_index: False for u in boxes.undetected if u.band_index == 0}
+        state.update((b.lane_index, True) for b in boxes.bands if b.band_index == 0)
+        n = len(batch.lanes_of_protein(protein))
         detected[protein.id] = [state.get(i) for i in range(n)]
     return detected
 
@@ -450,15 +452,19 @@ def lane_nets(batch: model.Batch) -> dict[str, LaneNets]:
     Nets are joined to the lane table by their stored lane index (band index 0
     only): a lane with no box is ``None``. With no lanes, every protein has ``[]``.
     """
-    n = len(batch.lanes)
-    return {protein.id: _field(_join(protein, n), "net") for protein in batch.proteins}
+    return {
+        protein.id: _field(_join(batch, protein, len(batch.lanes_of_protein(protein))), "net")
+        for protein in batch.proteins
+    }
 
 
 def lane_clipped(batch: model.Batch) -> dict[str, list[bool | None]]:
     """Each protein's clipping flags per lane, keyed like :func:`lane_nets`: None
     where there is no box, or where the band was not checked."""
-    n = len(batch.lanes)
-    return {protein.id: _field(_join(protein, n), "clipped") for protein in batch.proteins}
+    return {
+        protein.id: _field(_join(batch, protein, len(batch.lanes_of_protein(protein))), "clipped")
+        for protein in batch.proteins
+    }
 
 
 def _listed(values: Collection[object]) -> str:
@@ -466,6 +472,7 @@ def _listed(values: Collection[object]) -> str:
 
 
 def _background_notices(
+    batch: model.Batch,
     protein: model.Protein,
     bands: list[model.Band | None],
     included: list[bool],
@@ -477,7 +484,7 @@ def _background_notices(
     the box, its spread moving the net by more than
     :data:`~proteia.core.quantify.BACKGROUND_UNEVEN_LIMIT` of it
     (``background_uneven``, also for any spread under a net of 0)."""
-    size = protein.box_size
+    size = batch.boxes_of(protein).box_size
     shown = [(i, band) for i, band in enumerate(bands) if band is not None and included[i]]
     cut = tuple(i for i, band in shown if band.background_mode in _FALLBACK_MODES)
     if cut:
@@ -541,7 +548,7 @@ def _duplicate_notices(batch: model.Batch) -> list[Notice]:
     3)``. So no two images a note names read alike. It compares bytes, not
     pixels: the same pixels saved another way are not found."""
     markers = {image.marker_image_id for image in batch.iter_images()}
-    held = {protein.image_id for protein in batch.proteins}
+    held = {batch.image_id_of(protein) for protein in batch.proteins}
     place: dict[str, int] = {}
     names: Counter[str] = Counter()
     groups: dict[str, list[model.ImageRef]] = {}
@@ -599,9 +606,11 @@ def _overlap_notices(batch: model.Batch, included: list[bool], note: Callable[..
     to right, so each pair whose columns meet is compared once."""
     on_image: dict[str, list[tuple[int, model.Band, model.Rect]]] = {}
     for p, protein in enumerate(batch.proteins):
-        for band in protein.bands:
-            rect = band.box.rect(protein.box_size)
-            on_image.setdefault(protein.image_id, []).append((p, band, rect))
+        protein_boxes = batch.boxes_of(protein)
+        image_id = batch.image_id_of(protein)
+        for band in protein_boxes.bands:
+            rect = band.box.rect(protein_boxes.box_size)
+            on_image.setdefault(image_id, []).append((p, band, rect))
     # By protein, then by the other protein (their places in the batch): (its
     # lane, the other's lane) -> (shared pixels, the smaller box's area).
     found: dict[int, dict[int, dict[tuple[int, int], tuple[int, int]]]] = {}
@@ -743,11 +752,13 @@ def _mw_not_run(protein: model.Protein, fitted: _Fitted) -> MwNotRun | None:
     return None
 
 
-def _beyond_range(fitted: mwcal.Calibration, protein: model.Protein, band: model.Band) -> bool:
+def _beyond_range(
+    batch: model.Batch, fitted: mwcal.Calibration, protein: model.Protein, band: model.Band
+) -> bool:
     """Whether a box's centre lies outside its image's calibrated range, as a
     box without an apparent MW does, but for one stored by a fit from before
     #58 (its MW stays as stored until a calibration change refits it)."""
-    size = protein.box_size
+    size = batch.boxes_of(protein).box_size
     try:
         mw = fitted.mw_at(band.box.x + size.width / 2, band.box.y + size.height / 2)
     except OverflowError:  # past the largest float: only a ladder labelled near it
@@ -860,10 +871,11 @@ def _mw_protein_notices(
     shown = [(i, band) for i, band in enumerate(bands) if band is not None and included[i]]
     if not shown:
         return
-    ids, image = (protein.id,), (protein.image_id,)
+    image_id = batch.image_id_of(protein)
+    ids, image = (protein.id,), (image_id,)
     expected, tolerance = protein.expected_mw, protein.mw_tolerance
     if expected is not None and isinstance(fitted, mwcal.NoCalibration):
-        points = batch.membrane_of(protein.image_id).calibration.points
+        points = batch.membrane_of_protein(protein).calibration.points
         sides = {point.side for point in points if point.image_id in fitted.group}
         if fitted.reason == "no_points":
             missing = "no molecular-weight calibration"
@@ -879,7 +891,7 @@ def _mw_protein_notices(
             advice = f"mark at least {mwcal.MIN_LADDER_POINTS}"
         note(
             NoticeCode.MW_NOT_CHECKED,
-            f"{protein.name!r} has {missing} on {protein.image_id}: its bands are taken to"
+            f"{protein.name!r} has {missing} on {image_id}: its bands are taken to"
             f" be at {expected:g} kDa and their MW is not checked; {advice}",
             protein_ids=ids,
             image_ids=image,
@@ -898,7 +910,7 @@ def _mw_protein_notices(
             at = low if low == high else f"{low}–{high}"
             low, high = (_percent_past(mw / expected - 1.0, tolerance) for mw in ends)
             spread = low if low == high else f"{low} to {high}"
-            membrane = batch.membrane_of(protein.image_id)
+            membrane = batch.membrane_of_protein(protein)
             note(
                 NoticeCode.MW_DEVIATION,
                 f"{protein.name!r} runs at {at} kDa in {lanes_phrase(lanes)} ({spread}), more"
@@ -911,7 +923,7 @@ def _mw_protein_notices(
         outside = tuple(
             i
             for i, band in shown
-            if band.apparent_mw is None and _beyond_range(fitted, protein, band)
+            if band.apparent_mw is None and _beyond_range(batch, fitted, protein, band)
         )
         if outside:
             where = ", where both ladders reach" if fitted.two_ladders else ""
@@ -919,7 +931,7 @@ def _mw_protein_notices(
             note(
                 NoticeCode.MW_OUTSIDE_CALIBRATION,
                 f"{protein.name!r} in {lanes_phrase(outside)} {lies} outside the calibrated"
-                f" range of {protein.image_id} ({_kda_at(fitted.z_hi)}–{_kda_at(fitted.z_lo)} kDa"
+                f" range of {image_id} ({_kda_at(fitted.z_hi)}–{_kda_at(fitted.z_lo)} kDa"
                 f"{where}): its MW is not checked there",
                 protein_ids=ids,
                 lane_indices=outside,
@@ -951,12 +963,14 @@ def _mw_protein_notices(
 
 
 def _ladder_images(
-    membrane: model.Membrane, group: frozenset[str], side: model.LadderSide
+    batch: model.Batch, membrane: model.Membrane, group: frozenset[str], side: model.LadderSide
 ) -> tuple[str, ...]:
     """The images of a register group holding points of one ladder side, in
     membrane order."""
     holding = {p.image_id for p in membrane.calibration.points if p.side == side}
-    return tuple(image.id for image in membrane.images if image.id in group and image.id in holding)
+    return tuple(
+        image.id for image in batch.images_of(membrane) if image.id in group and image.id in holding
+    )
 
 
 def _two_sides(fitted: mwcal.Calibration) -> bool:
@@ -967,6 +981,7 @@ def _two_sides(fitted: mwcal.Calibration) -> bool:
 
 
 def _calibration_notices(
+    batch: model.Batch,
     membrane: model.Membrane,
     group: frozenset[str],
     fitted: mwcal.Calibration,
@@ -980,7 +995,7 @@ def _calibration_notices(
     strip = model.CalibrationPointSource.STRIP_EDGE
     two_sides = _two_sides(fitted)
     for ladder in fitted.ladders:
-        images = _ladder_images(membrane, group, ladder.side)
+        images = _ladder_images(batch, membrane, group, ladder.side)
         named = ", ".join(images)
         name = (
             f"the {ladder.side.value} ladder of {named}" if two_sides else f"the ladder of {named}"
@@ -1021,7 +1036,9 @@ def _calibration_notices(
     disagreement = fitted.disagreement
     if disagreement is not None and disagreement.value > mwcal.LADDERS_WARN:
         marked = {p.image_id for p in membrane.calibration.points}
-        images = tuple(image.id for image in membrane.images if image.id in group & marked)
+        images = tuple(
+            image.id for image in batch.images_of(membrane) if image.id in group & marked
+        )
         by = (
             f"{disagreement.value:.0%}"
             if math.isfinite(disagreement.value)
@@ -1035,7 +1052,7 @@ def _calibration_notices(
             image_ids=images,
         )
     for side, reason in fitted.ignored:
-        images = _ladder_images(membrane, group, side)
+        images = _ladder_images(batch, membrane, group, side)
         where = f"the {side.value} ladder of {', '.join(images)}"
         if reason == "one_point":
             why = f"{where} has 1 point and is not used; mark at least {mwcal.MIN_LADDER_POINTS}"
@@ -1082,6 +1099,7 @@ def _tilt_reference(
 
 
 def _rows_tilted(
+    batch: model.Batch,
     image_id: str,
     fitted: mwcal.Calibration,
     proteins: Sequence[model.Protein],
@@ -1105,7 +1123,7 @@ def _rows_tilted(
         boxes = _tilt_boxes(protein, joined[protein.id], included)
         if len(boxes) < TILT_MIN_LANES:
             continue
-        size = protein.box_size
+        size = batch.boxes_of(protein).box_size
         reference = _tilt_reference(fitted, protein, boxes)
         if reference is None:
             continue
@@ -1162,18 +1180,20 @@ def _rows_tilted(
 
 def _mw_notices(
     batch: model.Batch,
+    image_ids: Mapping[str, str],
     fits: Mapping[str, _Fitted],
     joined: Mapping[str, list[model.Band | None]],
     included: list[bool],
     note: Callable[..., None],
 ) -> None:
-    """Every MW, band-count and calibration notice of a set (#58): per protein,
+    """Every MW, band-count and calibration notice of a set (#58), given each
+    protein's image (``image_ids``, by protein id): per protein,
     then per register group with boxes in the set's lanes, then per image.
     The notices of a group or an image name every protein boxed on its images
     in any lane, so that the two result sets' copies of one name the same
     proteins (the all-lanes view tells them apart by code and proteins)."""
     for protein in batch.proteins:
-        fitted = fits[protein.image_id]
+        fitted = fits[image_ids[protein.id]]
         _mw_protein_notices(batch, protein, fitted, joined[protein.id], included, note)
     boxed = [
         protein
@@ -1187,14 +1207,14 @@ def _mw_notices(
     }
     for membrane in batch.membranes:
         for group, fitted in mwcal.calibrations(membrane).items():
-            on = tuple(protein.id for protein in boxed if protein.image_id in group)
+            on = tuple(protein.id for protein in boxed if image_ids[protein.id] in group)
             if in_set.intersection(on) and isinstance(fitted, mwcal.Calibration):
-                _calibration_notices(membrane, group, fitted, on, note)
+                _calibration_notices(batch, membrane, group, fitted, on, note)
     for image in batch.iter_images():
         fitted = fits.get(image.id)
-        on_image = [protein for protein in boxed if protein.image_id == image.id]
+        on_image = [protein for protein in boxed if image_ids[protein.id] == image.id]
         if in_set.intersection(p.id for p in on_image) and isinstance(fitted, mwcal.Calibration):
-            _rows_tilted(image.id, fitted, on_image, joined, included, note)
+            _rows_tilted(batch, image.id, fitted, on_image, joined, included, note)
 
 
 def chart_test(
@@ -1565,12 +1585,13 @@ def _compute(
         LaneRow(index=lane.index, condition=lane.label, sample=lane.sample, included=lane.included)
         for lane in batch.lanes
     ]
-    joined = {protein.id: _join(protein, n) for protein in batch.proteins}
+    joined = {protein.id: _join(batch, protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
-    # Each protein image's calibration (#58), from the stored points.
+    # Each protein's image, read once, and its calibration (#58), from the stored points.
+    image_ids = {p.id: batch.image_id_of(p) for p in batch.proteins}
     fits = {
-        p.image_id: mwcal.calibration_for(batch.membrane_of(p.image_id), p.image_id)
+        image_ids[p.id]: mwcal.calibration_for(batch.membrane_of(image_ids[p.id]), image_ids[p.id])
         for p in batch.proteins
     }
     columns = [
@@ -1578,7 +1599,7 @@ def _compute(
             protein_id=p.id,
             name=p.name,
             role=p.role,
-            image_id=p.image_id,
+            image_id=image_ids[p.id],
             nets=nets[p.id],
             band_ids=_field(joined[p.id], "id"),
             clipped=_field(joined[p.id], "clipped"),
@@ -1590,21 +1611,25 @@ def _compute(
             mw_check=[
                 None
                 if band is None
-                else _mw_check(p.expected_mw, p.mw_tolerance, fits[p.image_id], band.apparent_mw)
+                else _mw_check(
+                    p.expected_mw, p.mw_tolerance, fits[image_ids[p.id]], band.apparent_mw
+                )
                 for band in joined[p.id]
             ],
-            mw_not_run=_mw_not_run(p, fits[p.image_id]),
+            mw_not_run=_mw_not_run(p, fits[image_ids[p.id]]),
             bands_found=_field(joined[p.id], "bands_found"),
             count_check=[
                 None if band is None else _count_check(band, p.expected_band_count)
                 for band in joined[p.id]
             ],
-            calibration=_image_calibration(fits[p.image_id]),
+            calibration=_image_calibration(fits[image_ids[p.id]]),
         )
         for p in batch.proteins
     ]
     # Boxes only: a record beyond the first band has no value to ignore.
-    extra = tuple(p.id for p in batch.proteins if any(b.band_index > 0 for b in p.bands))
+    extra = tuple(
+        p.id for p in batch.proteins if any(b.band_index > 0 for b in batch.boxes_of(p).bands)
+    )
     if extra:
         note(
             NoticeCode.EXTRA_BANDS_IGNORED,
@@ -1615,7 +1640,9 @@ def _compute(
     # A project quantified before #83 keeps the whole-image median until it is
     # requantified; every band then has this mode (the model keeps one method).
     legacy = tuple(
-        p.id for p in batch.proteins if any(b.background_mode == "global_median" for b in p.bands)
+        p.id
+        for p in batch.proteins
+        if any(b.background_mode == "global_median" for b in batch.boxes_of(p).bands)
     )
     if legacy:
         note(
@@ -1626,7 +1653,7 @@ def _compute(
             protein_ids=legacy,
         )
     for image_id, why in outdated.items():  # an image with no band has no nets to warn about
-        measured = tuple(p.id for p in batch.proteins if p.image_id == image_id and p.bands)
+        measured = tuple(p.id for p in batch.proteins_on(image_id) if batch.boxes_of(p).bands)
         if measured:
             note(NoticeCode.OUTDATED_READING, why, protein_ids=measured)
     targets = [p for p in batch.proteins if p.role is Role.TARGET]
@@ -1676,13 +1703,13 @@ def _compute(
                 lane_indices=over,
             )
     for protein in batch.proteins:  # bands likely over-exposed, where that cannot be checked
-        image = batch.find_image(protein.image_id)
+        image = batch.image_of(protein)
         _possibly_clipped(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # bands not checked for that, in lanes this set includes
-        image = batch.find_image(protein.image_id)
+        image = batch.image_of(protein)
         _clipping_not_checked(protein, image, joined[protein.id], included, note)
     for protein in batch.proteins:  # backgrounds to check, in lanes this set includes
-        _background_notices(protein, joined[protein.id], included, note)
+        _background_notices(batch, protein, joined[protein.id], included, note)
     _overlap_notices(batch, included, note)  # #208, of boxes counted in lanes this set includes
     for column in columns:  # not-detected records in lanes this set includes
         below = tuple(i for i, flag in enumerate(column.detected) if flag is False and included[i])
@@ -1702,7 +1729,7 @@ def _compute(
             lane_indices=below,
             conditions=tuple(dict.fromkeys(conditions[i] for i in below)),
         )
-    _mw_notices(batch, fits, joined, included, note)  # #58, in lanes this set includes
+    _mw_notices(batch, image_ids, fits, joined, included, note)  # #58, in lanes this set includes
     labels = list(dict.fromkeys(conditions))  # distinct, in lane order
     similar: dict[str, list[str]] = {}
     for label in labels:
