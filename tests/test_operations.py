@@ -2646,7 +2646,7 @@ def test_a_cmyk_file_with_alpha_saved_as_an_uncompressed_tiff_is_imported(tmp_pa
         assert (image.bit_depth, [w.code for w in image.import_warnings]) == (8, warnings)
         protein = ops.add_protein(s, f"β-actin {named}", Role.TARGET, image_id)
         ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-        nets.append([band.net for band in s.project.batch.find_protein(protein).bands])
+        nets.append([band.net for band in boxes_of(s, protein).bands])
     assert nets[0] == nets[1]
     assert_nets_current(s)
 
@@ -2718,7 +2718,7 @@ def test_a_compressed_tiff_with_unassociated_alpha_imports_as_its_uncompressed_c
         protein = ops.add_protein(s, f"β-actin {path.stem}", Role.TARGET, image_id)
         ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
         ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)
-        bands = s.project.batch.find_protein(protein).bands
+        bands = boxes_of(s, protein).bands
         measured.append(
             (
                 (image.width, image.height, image.bit_depth, image.background),
