@@ -356,6 +356,9 @@ def test_newer_schema_refused():
         pytest.param(
             lambda d: d["batch"]["membranes"][0].update(images="x"), id="images-not-a-list"
         ),
+        # Empty, or none: refused as at schema 2, not read as no images.
+        pytest.param(lambda d: d["batch"]["membranes"][0].update(images=""), id="images-empty"),
+        pytest.param(lambda d: d["batch"]["membranes"][0].update(images=None), id="images-null"),
         pytest.param(lambda d: d["batch"]["membranes"][0]["images"][0].pop("id"), id="image-no-id"),
         pytest.param(
             lambda d: d["batch"]["membranes"][0]["images"][0].update(id=["img-2"]),
