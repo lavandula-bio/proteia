@@ -11,7 +11,7 @@ import pickle
 import re
 import struct
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import numpy as np
 import pytest
@@ -2856,61 +2856,312 @@ def test_reading_refuses_a_file_apart_from_its_name(tmp_path, name, write, words
     assert str(path.parent) not in str(info.value)
 
 
-def test_frames_are_counted_only_for_a_layout_reading_refuses(tmp_path, monkeypatch):
+def test_frames_are_counted_only_in_formats_that_hold_several(tmp_path, monkeypatch):
     # #234: counting them makes Pillow read every frame, which fails on some
     # damaged files that reading takes as their first image (a random sweep
-    # found one): every file reading takes is read as before, uncounted.
-    def never(path):
-        raise AssertionError("frames counted")
+    # found a damaged TIFF named .jpg): a TIFF or JPEG is never counted, a
+    # PNG is.
+    counted = []
+    real = imaging._frames_in
 
-    monkeypatch.setattr(imaging, "_frame_count", never)
+    def counting(image):
+        counted.append(image.format)
+        return real(image)
+
+    monkeypatch.setattr(imaging, "_frames_in", counting)
     files = {
-        "gray µ.png": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
-        "palette α.png": lambda path: _palette_png().save(path),
-        "gray µ.jpg": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
+        "gray tiff named µ.png": lambda path: tifffile.imwrite(path, _gray(np.uint8, 255)),
+        "gray α.jpg": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
+        "gray β.png": lambda path: Image.fromarray(_gray(np.uint8, 255)).save(path),
     }
     for name, write in files.items():
         path = tmp_path / name
         write(path)
         assert imaging.read_file(path).pixels.shape[:2] == (6, 8)
+    assert counted == ["PNG"]
+
+
+def test_a_count_pillow_cannot_make_is_one_frame():
+    # #234 review: a count that fails says nothing of the file's pixels,
+    # which are read as before #234, as one image; running out of memory or
+    # stack is no count.
+    class Counted:
+        n_frames = 3
+
+    class NoCount:
+        pass
+
+    def broken(error):
+        class Broken:
+            @property
+            def n_frames(self):
+                raise error("broken frame")
+
+        return Broken()
+
+    answers = [imaging._frames_in(image) for image in (Counted(), NoCount())]
+    answers += [imaging._frames_in(broken(error)) for error in (SyntaxError, OSError)]
+    assert answers == [3, 1, 1, 1]
+    for error in (MemoryError, RecursionError):
+        with pytest.raises(error):
+            imaging._frames_in(broken(error))
+
+
+def _narrow_frames(count: int, width: int) -> list[np.ndarray]:
+    """``count`` unlike 8-bit gray frames, 6 pixels high and ``width`` wide."""
+    return [np.full((6, width), 40 * (index + 1), dtype=np.uint8) for index in range(count)]
+
+
+@pytest.mark.parametrize(
+    ("count", "width"), [(2, 2), (2, 3), (3, 4), (5, 3), (3, 2), (3, 8), (4, 8), (4, 60)]
+)
+def test_an_animated_png_of_narrow_frames_is_refused_as_several_frames(tmp_path, count, width):
+    # #234 review: scikit-image reads its frames as (frames, height, width),
+    # which passes for one image of 2 to 4 channels: it was read as an image
+    # 6 pixels wide whose "colours" were its frames. And 3 or 4 frames of any
+    # width it moves to the channels: one colour image of the frames' size.
+    path = tmp_path / "narrow frames µ.png"
+    _frames_of("PNG", _narrow_frames(count, width))(path)
+    with Image.open(path) as image:
+        assert image.n_frames == count
+    if count in (3, 4) and width not in (3, 4):
+        assert io.imread(path).shape == (6, width, count)  # why the layout cannot tell
+    with pytest.raises(imaging.ReadingRefusal) as info:
+        imaging.read_file(path)
+    assert str(info.value) == (
+        "narrow frames µ.png: it holds more than one frame (such as an animated image), and only"
+        " a single image can be quantified; save one frame as its own file and import it again"
+    )
+
+
+@pytest.mark.parametrize("width", [2, 3, 4])
+def test_a_png_of_one_narrow_frame_is_read_as_before(tmp_path, width):
+    path = tmp_path / "narrow µ.png"
+    frame = _narrow_frames(1, width)[0]
+    Image.fromarray(frame).save(path)
+    np.testing.assert_array_equal(imaging.read_file(path).pixels, frame)
 
 
 def test_a_layout_refused_in_a_file_of_one_frame_is_named_as_before(tmp_path, monkeypatch):
     # #234: only a file of more than one frame is refused as one; scikit-image
     # giving a layout reading refuses of a file of one frame is refused as
-    # before.
-    path = tmp_path / "one frame µ.png"
-    Image.fromarray(_gray(np.uint8, 255)).save(path)
-    monkeypatch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
-    with pytest.raises(imaging.ReadingRefusal) as info:
-        imaging.read_file(path)
-    assert str(info.value) == "one frame µ.png: unsupported image layout (2, 6, 8)"
-
-
-def test_a_file_of_a_format_with_no_frames_counts_as_one_frame(tmp_path, monkeypatch):
-    # Pillow's JPEG has no frame count: a layout reading refuses is not
-    # taken for several frames.
-    path = tmp_path / "gray µ.jpg"
-    Image.fromarray(_gray(np.uint8, 255)).save(path)
-    with Image.open(path) as image:
+    # before, and so is one of a format with no frame count (Pillow's JPEG).
+    for name in ("one frame µ.png", "one frame α.jpg"):
+        path = tmp_path / name
+        Image.fromarray(_gray(np.uint8, 255)).save(path)
+        monkeypatch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
+        with pytest.raises(imaging.ReadingRefusal) as info:
+            imaging.read_file(path)
+        assert str(info.value) == f"{name}: unsupported image layout (2, 6, 8)"
+        monkeypatch.undo()
+    with Image.open(tmp_path / "one frame α.jpg") as image:
         assert not hasattr(image, "n_frames")
-    assert imaging._frame_count(path) == 1
-    monkeypatch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
+
+
+# The stored copy of an image, as a Windows and as a POSIX path, by platform
+# name: what a library may name in its words, in any of its forms.
+_STORED = {
+    "windows": PureWindowsPath(r"D:\lab µ\project α\images\img-1.png"),
+    "posix": PurePosixPath("/home/lab µ/project α/images/img-1.png"),
+}
+
+
+def _forms_of(stored) -> dict[str, str]:
+    """The ways a library's words may give ``stored``: as written, with
+    forward or back slashes, escaped as a repr escapes it, and Windows's
+    long-path prefix."""
+    native = str(stored)
+    return {
+        "as written": native,
+        "forward slashes": native.replace("\\", "/"),
+        "back slashes": native.replace("/", "\\"),
+        "escaped": native.replace("\\", "\\\\"),
+        "long path": "\\\\?\\" + native.replace("/", "\\"),
+    }
+
+
+@pytest.mark.parametrize("form", list(_forms_of(_STORED["windows"])))
+@pytest.mark.parametrize("platform", list(_STORED))
+def test_a_refusal_names_the_chosen_file_wherever_a_library_names_the_stored_copy(platform, form):
+    # #234 review: an error of a library that puts the stored copy's path in
+    # its words (imageio: "`D:\...\images\img-1.png` can not be opened"), as
+    # a ValueError, an OSError without a filename, or inside reading's own
+    # refusal of a damaged file, showed the path; it names the chosen file.
+    stored = _STORED[platform]
+    path = _forms_of(stored)[form]
+    name = "β gel µ.png"
+    answers = [
+        imaging.named_refusal(ValueError(f"`{path}` can not be opened"), name, stored),
+        imaging.named_refusal(OSError(f"cannot open {path}: broken"), name, stored),
+        imaging.named_refusal(
+            imaging.ReadingRefusal(stored.name, f"not a readable image (cannot open {path})"),
+            name,
+            stored,
+        ),
+    ]
+    assert answers == [
+        "cannot read 'β gel µ.png': `β gel µ.png` can not be opened",
+        "cannot read 'β gel µ.png': cannot open β gel µ.png: broken",
+        "cannot read 'β gel µ.png': not a readable image (cannot open β gel µ.png)",
+    ]
+
+
+@pytest.mark.parametrize("platform", list(_STORED))
+def test_a_refusal_names_the_chosen_file_for_the_stored_copys_folder_and_name(platform):
+    stored = _STORED[platform]
+    name = "img-1.png gel µ.png"  # holds the stored copy's name: not named twice
+    answers = {
+        "folder": imaging.named_refusal(
+            PermissionError(f"cannot list {stored.parent}"), name, stored
+        ),
+        "project": imaging.named_refusal(
+            ValueError(f"no room in {stored.parent.parent}"), name, stored
+        ),
+        "file": imaging.named_refusal(ValueError(f"{stored.name}: truncated"), name, stored),
+        "filename": imaging.named_refusal(
+            FileNotFoundError(2, "No such file or directory", str(stored)), name, stored
+        ),
+        "neither": imaging.named_refusal(ValueError("image file is truncated"), name, stored),
+    }
+    assert answers == {
+        "folder": "cannot read 'img-1.png gel µ.png': cannot list img-1.png gel µ.png",
+        "project": "cannot read 'img-1.png gel µ.png': no room in img-1.png gel µ.png",
+        "file": "cannot read 'img-1.png gel µ.png': img-1.png gel µ.png: truncated",
+        "filename": "cannot read 'img-1.png gel µ.png': No such file or directory",
+        "neither": "cannot read 'img-1.png gel µ.png': image file is truncated",
+    }
+    # Another image's copy, or a name that only starts like it, is no
+    # stored copy of this one.
+    other = imaging.named_refusal(ValueError("img-12.png or ximg-1.png"), name, stored)
+    assert other == "cannot read 'img-1.png gel µ.png': img-12.png or ximg-1.png"
+
+
+def test_a_refusal_for_an_image_already_imported_gives_no_remedy():
+    # #234 review: an image already in the project is read again; a remedy
+    # that says to import it again would lose its boxes. Its refusal says
+    # what is wrong only.
+    stored = _STORED["windows"]
+    refusals = [
+        imaging.ReadingRefusal("img-1.png", "it holds frames", "save one and import it again"),
+        imaging.UnsupportedColourSpaceError("img-1.png", "its pixels are stored in CIELAB"),
+        imaging.NotSingleImageError("img-1.png", None, no_image=False),
+        imaging.NotSingleImageError("img-1.png", None, no_image=True),
+    ]
+    answers = [imaging.named_refusal(e, "gel µ.png", stored, remedy=False) for e in refusals]
+    assert answers == [
+        "cannot read 'gel µ.png': it holds frames",
+        "cannot read 'gel µ.png': its pixels are stored in CIELAB",
+        "'gel µ.png' holds more than one image (such as a stack, the channels of a composite,"
+        " or an image with a mask or a thumbnail), which Proteia does not import: only a single"
+        " image can be quantified",
+        "'gel µ.png' holds no image, so there is nothing to quantify",
+    ]
+    assert [imaging.named_refusal(e, "gel µ.png", stored) for e in refusals] == [
+        "cannot read 'gel µ.png': it holds frames; save one and import it again",
+        "cannot read 'gel µ.png': its pixels are stored in CIELAB; save the image as a gray or"
+        " RGB TIFF",
+        "'gel µ.png' holds more than one image (such as a stack, the channels of a composite,"
+        " or an image with a mask or a thumbnail), which Proteia does not import: only a single"
+        " image can be quantified; save one of its images as its own file and import it again",
+        "'gel µ.png' holds no image, so there is nothing to quantify: export the image again"
+        " from the program that made it, as a TIFF or PNG file, and import that file",
+    ]
+
+
+def test_a_tiff_that_is_not_a_single_image_is_a_reading_refusal():
+    # #234 review: one kind of error for every refusal of reading, so that an
+    # import names the file as chosen in one place; its words are #220's.
+    error = imaging.NotSingleImageError("stack µ.tif", None, no_image=False)
+    assert isinstance(error, imaging.ReadingRefusal)
+    assert str(error) == error.refusal("stack µ.tif")
+    assert error.args == (str(error),)
+
+
+def _damaged_reads(tmp_path: Path) -> dict[str, tuple[object, Path]]:
+    """Each reader's read of a damaged file, by reader: the reader and the
+    file. A TIFF of a signature only is cut off in its header; Pillow's open,
+    and a TIFF's colour map, are made to fail with an error of their own."""
+    truncated = tmp_path / "truncated µ.tif"
+    truncated.write_bytes(b"II*\x00")
+    named_png = tmp_path / "truncated α.png"
+    named_png.write_bytes(b"II*\x00")
+    gray_png = tmp_path / "gray β.png"
+    Image.fromarray(_gray(np.uint8, 255)).save(gray_png)
+    palette_tif = tmp_path / "palette µ.tif"
+    _write(palette_tif, _gray(np.uint8, 255), photometric="palette", colormap=_palette_map())
+    return {
+        "converts_cmyk": (converts_cmyk, truncated),
+        "check_misnamed_tiff": (imaging.check_misnamed_tiff, named_png),
+        "ink_set": (imaging.ink_set, truncated),
+        "reads_as_palette": (reads_as_palette, gray_png),
+        "declared_pixel_type": (imaging.declared_pixel_type, truncated),
+        "file_colours": (file_colours, truncated),
+        "file_colours of a png": (file_colours, gray_png),
+        "read_colours": (read_colours, palette_tif),
+    }
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "converts_cmyk",
+        "check_misnamed_tiff",
+        "ink_set",
+        "reads_as_palette",
+        "declared_pixel_type",
+        "file_colours",
+        "file_colours of a png",
+        "read_colours",
+    ],
+)
+def test_every_reader_refuses_a_damaged_file_as_a_reading_refusal_in_its_words(
+    tmp_path, monkeypatch, reader
+):
+    # #234 review: they raised a plain ValueError naming the file read, which
+    # the one place that names the file as chosen did not recognise. The
+    # words are as before.
+    read, path = _damaged_reads(tmp_path)[reader]
+
+    def broken(*args):
+        raise struct.error("bad bytes")
+
+    if path.name == "gray β.png":
+        monkeypatch.setattr(imaging, "_pillow_mode", broken)
+    if read is read_colours:
+        monkeypatch.setattr(imaging, "_tiff_colours", broken)
     with pytest.raises(imaging.ReadingRefusal) as info:
-        imaging.read_file(path)
-    assert str(info.value) == "gray µ.jpg: unsupported image layout (2, 6, 8)"
+        read(path)
+    assert type(info.value) is imaging.ReadingRefusal
+    words = (
+        "not a readable image (bad bytes)"
+        if path.name in ("gray β.png", "palette µ.tif")
+        else "not a readable image (unpack requires a buffer of 4 bytes)"
+    )
+    assert str(info.value) == f"{path.name}: {words}"
+    assert info.value.refusal("chosen µ.tif") == f"cannot read 'chosen µ.tif': {words}"
 
 
-def test_frames_are_counted_without_pillows_size_warning(tmp_path, monkeypatch, recwarn):
-    # A local file the user chose, as reading opens it: Pillow's size guard
-    # is for untrusted input. 48 pixels a frame is over the limit of 40, and
-    # under twice it, where Pillow refuses instead.
-    path = tmp_path / "two frames µ.png"
-    _frames_of("PNG", [_gray(np.uint8, 255), _gray(np.uint8, 255)[::-1]])(path)
-    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40)
-    recwarn.clear()
-    assert imaging._frame_count(path) == 2
-    assert [w.category for w in recwarn] == []
+def test_a_header_of_untyped_samples_or_of_no_image_is_a_reading_refusal(tmp_path):
+    untyped = tmp_path / "untyped µ.tif"
+    untyped.write_bytes(_declared_as(128, 4))
+    empty = tmp_path / "no image α.tif"
+    empty.write_bytes(b"II*\x00" + bytes(4))  # the first page's offset is 0: no page
+    cases = [
+        (
+            imaging.declared_pixel_type,
+            untyped,
+            "not a readable image (128-bit samples of format 4)",
+        ),
+        (converts_cmyk, empty, "holds no image"),
+        (file_colours, empty, "holds no image"),
+    ]
+    for read, path, words in cases:
+        with pytest.raises(imaging.ReadingRefusal) as info:
+            read(path)
+        assert (type(info.value), str(info.value)) == (
+            imaging.ReadingRefusal,
+            f"{path.name}: {words}",
+        )
 
 
 def test_a_file_pillow_cannot_tell_is_refused_with_its_error_as_cause(tmp_path):

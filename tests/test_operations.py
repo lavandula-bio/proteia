@@ -2535,6 +2535,167 @@ def test_the_words_of_a_library_that_name_no_path_are_kept(tmp_path):
     }
 
 
+# Errors of reading that name the stored copy in their words, as a library
+# may (imageio: "`<path>` can not be opened"), by case: what is raised for the
+# stored copy at a path, and what the refusal says after "cannot read
+# '<name>': ".
+_NAMING_THE_COPY = {
+    "path in a ValueError": (
+        lambda path: ValueError(f"`{path}` can not be opened"),
+        "`gel µ.tif` can not be opened",
+    ),
+    "posix path in an OSError": (
+        lambda path: OSError(f"cannot open {path.as_posix()}"),
+        "cannot open gel µ.tif",
+    ),
+    "escaped path": (
+        lambda path: ValueError(f"cannot open {str(path)!r}"),
+        "cannot open 'gel µ.tif'",
+    ),
+    "folder": (lambda path: OSError(f"no room in {path.parent}"), "no room in gel µ.tif"),
+    "file name": (lambda path: ValueError(f"{path.name} is cut short"), "gel µ.tif is cut short"),
+    "damaged": (
+        lambda path: imaging.ReadingRefusal(path.name, f"not a readable image (at {path})"),
+        "not a readable image (at gel µ.tif)",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_NAMING_THE_COPY))
+def test_an_error_naming_the_stored_copy_names_the_chosen_file_on_import(
+    tmp_path, monkeypatch, case
+):
+    # #234 review: only an OSError's filename was left out; any other words
+    # that named the stored copy or its folder showed them.
+    raised, words = _NAMING_THE_COPY[case]
+
+    def unreadable(path):
+        raise raised(path)
+
+    monkeypatch.setattr(ops, "read_file", unreadable)
+    s = session_on(tmp_path)
+    refused = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(_tiff_bytes(blot())), "gel µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert (refused.code, str(refused)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        f"cannot read 'gel µ.tif': {words}",
+    )
+
+
+def _imported_then_reopened(tmp_path: Path) -> tuple[ProjectSession, str]:
+    """A project with the blot imported as 'β-actin µ.tif', saved and opened
+    again, so that nothing of its file is read yet: the session, the id."""
+    s = session_on(tmp_path, save_to_folder)
+    image = import_blot(s, blot(), "β-actin µ.tif")
+    return ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock()), image
+
+
+# How reading an image already in the project fails, by case: where (the
+# session's read of its pixels, of its colours, or of its bytes for their
+# SHA-256), what is raised for the stored copy at a path, and what the
+# refusal says: never the stored copy, and never to import the file again,
+# which would lose the image's boxes.
+_READING_AGAIN = {
+    "unidentified": (
+        "load_image",
+        lambda path: imaging.ReadingRefusal(
+            path.name,
+            "it is not an image Proteia can read (a TIFF, PNG or JPEG file), or it is damaged",
+            "save the image as a TIFF, PNG or JPEG file and import it again",
+        ),
+        "cannot read 'β-actin µ.tif': it is not an image Proteia can read (a TIFF, PNG or JPEG"
+        " file), or it is damaged",
+    ),
+    "several frames": (
+        "load_image",
+        lambda path: imaging.ReadingRefusal(
+            path.name, "it holds more than one frame", "save one frame and import it again"
+        ),
+        "cannot read 'β-actin µ.tif': it holds more than one frame",
+    ),
+    "several images": (
+        "load_image",
+        lambda path: imaging.NotSingleImageError(path.name, None, no_image=False),
+        "'β-actin µ.tif' holds more than one image (such as a stack, the channels of a"
+        " composite, or an image with a mask or a thumbnail), which Proteia does not import:"
+        " only a single image can be quantified",
+    ),
+    "library naming the copy": (
+        "load_image",
+        lambda path: ValueError(f"`{path}` can not be opened"),
+        "cannot read 'β-actin µ.tif': `β-actin µ.tif` can not be opened",
+    ),
+    "colours": (
+        "read_colours",
+        lambda path: imaging.ReadingRefusal(path.name, "not a readable image (bad bytes)"),
+        "cannot read 'β-actin µ.tif': not a readable image (bad bytes)",
+    ),
+    "bytes": (
+        "file_digest",
+        lambda path: PermissionError(13, "Permission denied", str(path)),
+        "cannot read 'β-actin µ.tif': Permission denied",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_READING_AGAIN))
+def test_reading_an_image_already_imported_names_it_as_imported(tmp_path, monkeypatch, case):
+    # #234 review: the session gave the reading's own words, which name the
+    # stored copy ("img-1.tif: ...") and may say to import the file again.
+    where, raised, message = _READING_AGAIN[case]
+    reopened, image = _imported_then_reopened(tmp_path)
+    path = storage.image_path(reopened.folder, reopened.project.batch.find_image(image))
+
+    def unreadable(*args, **kwargs):
+        raise raised(path)
+
+    owner = hashlib if where == "file_digest" else session_module
+    monkeypatch.setattr(owner, where, unreadable)
+    read = reopened.colour_pixels if where == "read_colours" else reopened.pixels
+    before = reopened.project
+    with pytest.raises(OperationError) as info:
+        read(image)
+    assert (info.value.code, info.value.ids, str(info.value)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        (image,),
+        message,
+    )
+    assert "again" not in str(info.value)
+    assert (reopened.project is before, reopened._pixels) == (True, {})
+
+
+def test_a_colour_space_refused_where_the_header_cannot_tell_names_the_image_as_imported(
+    tmp_path, monkeypatch
+):
+    # The header (converts_cmyk) cannot be read, so the refusal of what
+    # reading says (a colour space) cannot say what the image's numbers are:
+    # it names the image as imported, with what is wrong only.
+    reopened, image = _imported_then_reopened(tmp_path)
+
+    def no_header(path):
+        raise ValueError("cut short")
+
+    def lab(path):
+        raise imaging.UnsupportedColourSpaceError(
+            Path(path).name,
+            "its pixels are stored in the CIELAB colour space, which Proteia does not convert"
+            " to gray",
+        )
+
+    monkeypatch.setattr(session_module, "converts_cmyk", no_header)
+    monkeypatch.setattr(session_module, "load_image", lab)
+    with pytest.raises(OperationError) as info:
+        reopened.pixels(image)
+    assert str(info.value) == (
+        "cannot read 'β-actin µ.tif': its pixels are stored in the CIELAB colour space, which"
+        " Proteia does not convert to gray"
+    )
+
+
 @pytest.mark.parametrize("suffix", [".png", ".jpg"])
 @pytest.mark.parametrize(
     "name",

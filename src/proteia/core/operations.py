@@ -186,13 +186,13 @@ from proteia.core.imaging import (
     InkSet,
     NotSingleImageError,
     PixelType,
-    ReadingRefusal,
     assess_processed,
     check_misnamed_tiff,
     clipping_depth,
     declared_pixel_type,
     ink_set,
     load_pixels,
+    named_refusal,
     pixel_type,
     possible_clipping_depth,
     read_file,
@@ -1446,10 +1446,11 @@ def import_image(
 
     Any other file reading refuses is refused (``UNREADABLE_IMAGE``) by the
     name it was offered under, never by its stored copy's name or a local path
-    (#234; :func:`_reading_refusal`): a colour space reading does not
-    convert, a file of more than one frame (an animated PNG or GIF: save one
-    frame as its own file), one Pillow cannot tell the format of (save the
-    image as a TIFF, PNG or JPEG file), a damaged one.
+    (#234; :func:`~proteia.core.imaging.named_refusal`, whatever the words of
+    the library that read it): a colour space reading does not convert, a
+    file of more than one frame (an animated PNG or GIF: save one frame as
+    its own file), one Pillow cannot tell the format of (save the image as a
+    TIFF, PNG or JPEG file), a damaged one.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1492,13 +1493,12 @@ def import_image(
         try:
             _count_misnamed_tiff(path)
             read = read_file(path)
-        except NotSingleImageError as exc:
-            _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
-            # Named as chosen, not as stored, whatever the suffix (#220).
-            raise OperationError(ErrorCode.UNREADABLE_IMAGE, exc.refusal(original_name)) from exc
         except (ValueError, OSError) as exc:
+            if isinstance(exc, NotSingleImageError):
+                _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
+            # Named as chosen, never as stored, whatever reading refused (#220, #234).
             raise OperationError(
-                ErrorCode.UNREADABLE_IMAGE, _reading_refusal(original_name, exc)
+                ErrorCode.UNREADABLE_IMAGE, named_refusal(exc, original_name, path)
             ) from exc
         # Failing closed, before any conversion: a type no header declared (the
         # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
@@ -1589,21 +1589,6 @@ _SEVERAL_IMAGES: Final = f"; it also holds {SEVERAL_IMAGES}, and {SINGLE_IMAGE_O
 # (a 16-bit RGB TIFF is read only uncompressed, and an RGBA one compressed only
 # if its alpha is unassociated, #232; Inks.uncompressed_copy).
 _COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grayscale TIFF"}
-
-
-def _reading_refusal(original_name: str, exc: ValueError | OSError) -> str:
-    """Why reading refused the file offered as ``original_name``, naming it so
-    and never by its stored copy or a local path (#234): reading's own refusal
-    for that name (:class:`~proteia.core.imaging.ReadingRefusal`), else the
-    words of the library that read it, or the system's reason without the
-    stored copy's path."""
-    if isinstance(exc, ReadingRefusal):
-        return exc.refusal(original_name)
-    if isinstance(exc, OSError) and exc.filename is not None:
-        why = exc.strerror or type(exc).__name__
-    else:
-        why = str(exc)
-    return f"cannot read {original_name!r}: {why}"
 
 
 def _header_inks(path: Path) -> Inks | None:
