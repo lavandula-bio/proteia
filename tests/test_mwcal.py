@@ -12,6 +12,7 @@ read pixels: synthetic ladder bands and strips, with seeded noise.
 import ast
 import math
 import statistics
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -22,12 +23,15 @@ from conftest import MEMBRANE_LEVEL, make_project, synthetic_blot
 from proteia import samples
 from proteia.core import ladders, mwcal
 from proteia.core.model import (
+    Arena,
+    Batch,
     CalibrationPoint,
     CalibrationPointSource,
     FitMethod,
     ImageKind,
     ImageRef,
     LadderSide,
+    LaneTable,
     Membrane,
     MwCalibration,
     Polarity,
@@ -96,17 +100,35 @@ def _ladder(pairs, *, x=None, side=LEFT, image_id="img-1") -> list[CalibrationPo
     return [_point(y, mw, x=x, side=side, image_id=image_id) for y, mw in pairs]
 
 
-def _membrane(*points: CalibrationPoint, width: int = 1330, height: int = 800) -> Membrane:
-    """mem-1 with one visible-light marker image, img-1, holding ``points``."""
-    return Membrane(
+def _batch(*images: ImageRef, points: Sequence[CalibrationPoint] = ()) -> Batch:
+    """One membrane, mem-1, on ``images`` (a whole-image area on each, in
+    order), with the calibration ``points``."""
+    arenas = [
+        Arena(id=f"arena-{80 + i}", image_id=image.id, source="whole_image")
+        for i, image in enumerate(images)
+    ]
+    membrane = Membrane(
         id="mem-1",
-        images=[_image("img-1", width=width, height=height)],
+        lane_table_id="lt-90",
+        arenas=arenas,
         calibration=MwCalibration(points=list(points)),
     )
+    return Batch(images=list(images), lane_tables=[LaneTable(id="lt-90")], membranes=[membrane])
+
+
+def _membrane(*points: CalibrationPoint, width: int = 1330, height: int = 800) -> Batch:
+    """mem-1 with one visible-light marker image, img-1, holding ``points``,
+    as a batch."""
+    return _batch(_image("img-1", width=width, height=height), points=points)
+
+
+def _fitted(batch: Batch, image_id: str):
+    """The register group of mem-1 (the batch's one membrane) holding ``image_id``, fitted."""
+    return mwcal.calibration_for(batch, batch.membranes[0], image_id)
 
 
 def _calibration(*points: CalibrationPoint, **image) -> Calibration:
-    fitted = mwcal.calibration_for(_membrane(*points, **image), "img-1")
+    fitted = _fitted(_membrane(*points, **image), "img-1")
     assert isinstance(fitted, Calibration)
     return fitted
 
@@ -197,7 +219,7 @@ def test_a_stored_log_linear_calibration_is_read_piecewise():
     project = make_project()
     mem_1 = project.batch.membranes[0]
     assert mem_1.calibration.fit_method is FitMethod.LOG_LINEAR  # as the fixture stores it
-    fitted = mwcal.calibration_for(mem_1, "img-2")
+    fitted = mwcal.calibration_for(project.batch, mem_1, "img-2")
     assert isinstance(fitted, Calibration)
     assert fitted.method is FitMethod.LOG_LINEAR_PIECEWISE
     ys, mws = (20.0, 61.5, 95.25), (250, 100, 55)
@@ -226,8 +248,9 @@ def test_range_extrapolates_a_tenth_of_a_decade_past_ladder_points():
 
 
 def test_no_extrapolation_past_strip_edges():
-    mem_5 = make_project().batch.membranes[1]  # strip edges: 100 kDa at y=0, 75 at y=100
-    fitted = mwcal.calibration_for(mem_5, "img-6")
+    batch = make_project().batch
+    mem_5 = batch.membranes[1]  # strip edges: 100 kDa at y=0, 75 at y=100
+    fitted = mwcal.calibration_for(batch, mem_5, "img-6")
     assert isinstance(fitted, Calibration)
     assert (fitted.z_lo, fitted.z_hi) == (math.log10(75), 2.0)
     # The strip's own MWs are inside, although 10**log10(75) may print 75.00000000000001.
@@ -279,33 +302,32 @@ def test_two_points_have_no_quality():
 
 
 def test_no_calibration_reasons():
-    assert mwcal.calibration_for(_membrane(), "img-1") == NoCalibration(
-        frozenset({"img-1"}), "no_points"
-    )
-    assert mwcal.calibration_for(_membrane(_point(100, 100)), "img-1") == NoCalibration(
+    assert _fitted(_membrane(), "img-1") == NoCalibration(frozenset({"img-1"}), "no_points")
+    assert _fitted(_membrane(_point(100, 100)), "img-1") == NoCalibration(
         frozenset({"img-1"}), "one_point"
     )
     one_each = _membrane(_point(100, 100, x=10.0), _point(110, 100, x=900.0, side=RIGHT))
-    assert mwcal.calibration_for(one_each, "img-1") == NoCalibration(
-        frozenset({"img-1"}), "one_point"
-    )
+    assert _fitted(one_each, "img-1") == NoCalibration(frozenset({"img-1"}), "one_point")
     # Other groups' points are not used: img-4 of mem-1 is not linked to the marker.
-    mem_1 = make_project().batch.membranes[0]
-    assert mwcal.calibration_for(mem_1, "img-4") == NoCalibration(frozenset({"img-4"}), "no_points")
+    batch = make_project().batch
+    mem_1 = batch.membranes[0]
+    no_points = NoCalibration(frozenset({"img-4"}), "no_points")
+    assert mwcal.calibration_for(batch, mem_1, "img-4") == no_points
     with pytest.raises(UnknownIdError):
-        mwcal.calibration_for(mem_1, "img-6")
+        mwcal.calibration_for(batch, mem_1, "img-6")
 
 
 def test_register_group_decides_the_points():
-    mem_1 = make_project().batch.membranes[0]
-    fitted = mwcal.calibration_for(mem_1, "img-2")
+    batch = make_project().batch
+    mem_1 = batch.membranes[0]
+    fitted = mwcal.calibration_for(batch, mem_1, "img-2")
     assert isinstance(fitted, Calibration)
-    assert fitted == mwcal.calibration_for(mem_1, "img-3")
+    assert fitted == mwcal.calibration_for(batch, mem_1, "img-3")
     assert fitted.group == frozenset({"img-2", "img-3"})
     [ladder] = fitted.ladders
     assert (ladder.ys, ladder.mws) == ((20.0, 61.5, 95.25), (250, 100, 55))
     assert ladder.sources == (MARKER, MARKER, CalibrationPointSource.CHEMILUMINESCENCE_MARKER)
-    assert mwcal.calibrations(mem_1) == {
+    assert mwcal.calibrations(batch, mem_1) == {
         frozenset({"img-2", "img-3"}): fitted,
         frozenset({"img-4"}): NoCalibration(frozenset({"img-4"}), "no_points"),
     }
@@ -564,29 +586,33 @@ def test_fit_quality_is_the_worst_ladder():
         # img-3 (its own group): the vendor-shaped ladder.
         *_ladder(zip(VENDOR_YS, KDA, strict=True), image_id="img-3"),
     ]
-    membrane = Membrane(
-        id="mem-1", images=[marker, signal, other], calibration=MwCalibration(points=points)
-    )
-    linked = mwcal.calibration_for(membrane, "img-2")
+    batch = _batch(marker, signal, other, points=points)
+    membrane = batch.membranes[0]
+    linked = mwcal.calibration_for(batch, membrane, "img-2")
     left, right = linked.ladders
     assert right.quality.value > left.quality.value
     assert linked.quality == right.quality
-    alone = mwcal.calibration_for(membrane, "img-3")
+    alone = mwcal.calibration_for(batch, membrane, "img-3")
     assert alone.group == frozenset({"img-3"})
     assert right.quality.value > alone.quality.value > left.quality.value
-    assert mwcal.fit_quality(membrane) == right.quality.value
+    assert mwcal.fit_quality(batch, membrane) == right.quality.value
     # No ladder with three points: nothing to measure.
-    assert mwcal.fit_quality(_membrane(_point(100, 100), _point(140, 70))) is None
-    assert mwcal.fit_quality(_membrane()) is None
+    two = _membrane(_point(100, 100), _point(140, 70))
+    assert mwcal.fit_quality(two, two.membranes[0]) is None
+    assert mwcal.fit_quality(_membrane(), _membrane().membranes[0]) is None
 
 
 def test_fit_method_default_with_a_curve():
     assert DEFAULT_FIT_METHOD is FitMethod.LOG_LINEAR_PIECEWISE
-    assert mwcal.fit_method(_membrane()) is FitMethod.LOG_LINEAR
-    assert mwcal.fit_method(_membrane(_point(100, 100))) is FitMethod.LOG_LINEAR
-    assert mwcal.fit_method(_membrane(_point(100, 100), _point(140, 70))) is DEFAULT_FIT_METHOD
-    project = make_project()
-    assert [mwcal.fit_method(m) for m in project.batch.membranes] == [DEFAULT_FIT_METHOD] * 2
+    for points, method in (
+        ((), FitMethod.LOG_LINEAR),
+        ((_point(100, 100),), FitMethod.LOG_LINEAR),
+        ((_point(100, 100), _point(140, 70)), DEFAULT_FIT_METHOD),
+    ):
+        batch = _membrane(*points)
+        assert mwcal.fit_method(batch, batch.membranes[0]) is method
+    batch = make_project().batch
+    assert [mwcal.fit_method(batch, m) for m in batch.membranes] == [DEFAULT_FIT_METHOD] * 2
 
 
 def test_settings_are_the_constants():

@@ -5,9 +5,9 @@ GUI-independent: the standard library plus the model (and pydantic, through its
 types). A project folder, which may have any name, holds::
 
     project.json                    the model (see "Canonical form" below)
-    project.schema1.json            project.json as it was before a migration from schema 1
+    project.schema2.json            project.json as it was before a migration from schema 2
                                     rewrote it (keep_backup; numbered if taken:
-                                    project.schema1 (2).json)
+                                    project.schema2 (2).json; schema1 for schema 1)
     images/img-2.tif                byte-identical copies of the imported files, named by id
     exports/                        created by save_project, for exported results:
     exports/lane-table.csv          the per-lane table
@@ -40,15 +40,18 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   never used: a library upgrade must not move the hash.
 * Sorted keys make the bytes independent of field order and of the insertion
   order of ``Lane.metadata``. The model sorts bands, not-detected records and
-  calibration points; the order of membranes, images and proteins is content
-  and changes the hash.
+  calibration points; the order of membranes, images, membrane areas, lane
+  tables, proteins and rows is content and changes the hash.
 * An optional field added before v0.1 is left out of every dump (``project.json``,
   :func:`content_document` and so the export record's ``content``) while its value
   is empty or its default, so adding it changes no project's bytes or hash. The
-  first case is ``Protein.undetected``: Proteia never writes ``"undetected": []``,
-  and a hand-edited file that holds it loads, hashes as if the key were absent and
-  is saved without it. The second is ``Protein.box_padding``, left out while it is
-  ``{"across": 0, "along": 0}``, likewise. The third is ``Band.possibly_clipped``
+  first case is ``Row.undetected`` (a protein's before schema 3): Proteia never
+  writes ``"undetected": []``, and a hand-edited file that holds it loads, hashes
+  as if the key were absent and is saved without it. The second is
+  ``Row.box_padding``, left out while it is ``{"across": 0, "along": 0}``,
+  likewise. A membrane area's ``Arena.outline`` is left out while ``null`` (the
+  whole image), as every area an import or a migration makes has none. The
+  third is ``Band.possibly_clipped``
   (#112), left out while it is ``null``: only bands on a lossy, colour or CMYK
   image of known bit depth have it. The fourth is in the molecular-weight
   calibration (#58): ``CalibrationPoint.x`` is left out while ``null``,
@@ -58,9 +61,10 @@ compactly) without the keys in :data:`HASH_EXCLUDE`. In detail:
   move every existing project's hash, so every export would report
   ``content_changed_outside_log``.
 * The hash covers ``schema_version``, the background method, every id, the lane
-  table, the image records (and so the pixels, through each ``sha256``), the
-  calibrations, and the proteins with their bands (stored nets, backgrounds and
-  flags) and their not-detected records. It excludes ``next_id`` and the log
+  tables, the image records (and so the pixels, through each ``sha256``), the
+  membrane areas, the calibrations, and the proteins with their rows' bands
+  (stored nets, backgrounds and flags) and not-detected records. It excludes
+  ``next_id`` and the log
   (the history: equal content made at other times must hash equal), and the
   file's formatting. The project never stores its own hash; each log entry
   stores the hash of the content it left.
@@ -408,16 +412,114 @@ def _v1_content(content: dict[str, Any]) -> dict[str, Any]:
     return old
 
 
+# The keys of a schema-2 protein that schema 3 holds in its row.
+_ROW_KEYS: Final = ("box_size", "box_padding", "bands", "undetected")
+
+
+def _v2_to_v3(doc: dict[str, Any]) -> dict[str, Any]:
+    """Schema 2 to 3 (#223): the images kept once by the batch, each
+    membrane's area on each of its images, the lane table with an id, and each
+    protein's boxes in a row on the area of its image.
+
+    Every membrane stays a membrane, each of its images, in order, gets an
+    area covering the whole image (no outline) at angle 0, the lane table
+    becomes the project's one table, which every membrane uses, the
+    fold-change reference stays the batch's, and each protein gets one row on
+    the area of its image, holding its box size, padding, bands and
+    not-detected records as they were (a key left out stays left out). The new
+    ids come from ``next_id`` in that order: the table, the areas, the rows.
+    Pure JSON, on the copy :func:`migrate` passes; a part that is not the shape
+    it should be is left for validation to refuse.
+    """
+    doc["schema_version"] = 3
+    counter = doc.get("next_id", 1)
+
+    def new(prefix: str) -> str:
+        nonlocal counter
+        made = f"{prefix}-{counter}"
+        counter += 1
+        return made
+
+    batch = doc.setdefault("batch", {})
+    if not isinstance(batch, dict):
+        return doc
+    table = {"id": new("lt"), "lanes": batch.pop("lanes", [])}
+    batch["lane_tables"] = [table]
+    images: list[Any] = []
+    arena_of: dict[str, str] = {}
+    for membrane in _dicts(batch.get("membranes")):
+        held = membrane.pop("images", [])
+        membrane["lane_table_id"] = table["id"]
+        membrane["arenas"] = arenas = []
+        for image in _dicts(held):
+            images.append(image)
+            arena = {"id": new("arena"), "angle_deg": 0.0, "source": "whole_image"}
+            if "id" in image:
+                arena["image_id"] = image["id"]  # a missing id stays missing, for validation
+            if isinstance(image.get("id"), str):
+                arena_of[image["id"]] = arena["id"]
+            arenas.append(arena)
+    batch["images"] = images
+    for protein in _dicts(batch.get("proteins")):
+        image_id = protein.get("image_id")
+        if not isinstance(image_id, str) or image_id not in arena_of:
+            continue  # an unknown image: validation refuses the protein
+        row = {"id": new("row"), "arena_id": arena_of[protein.pop("image_id")]}
+        row.update((key, protein.pop(key)) for key in _ROW_KEYS if key in protein)
+        protein["rows"] = [row]
+    doc["next_id"] = counter
+    return doc
+
+
+def _v2_content(content: dict[str, Any]) -> dict[str, Any]:
+    """A schema-3 content document (:func:`content_document`) as schema 2 held
+    the same content: the lanes of its one table, each membrane's images in the
+    order of its areas, and each protein's image, box size, padding, bands and
+    records from its one row; without the tables, areas and rows. Exact for a
+    migrated project, which holds one of each where :func:`_v2_to_v3` made them."""
+    old = {**content, "schema_version": 2}
+    batch = dict(content["batch"])
+    old["batch"] = batch
+    images = {image["id"]: image for image in batch.pop("images")}
+    tables = batch.pop("lane_tables")
+    batch["lanes"] = tables[0]["lanes"] if tables else []
+    image_of = {}
+    membranes = []
+    for membrane in batch["membranes"]:
+        for arena in membrane["arenas"]:
+            image_of[arena["id"]] = arena["image_id"]
+        membranes.append(
+            {
+                "id": membrane["id"],
+                "images": [images[arena["image_id"]] for arena in membrane["arenas"]],
+                "calibration": membrane["calibration"],
+            }
+        )
+    batch["membranes"] = membranes
+    proteins = []
+    for protein in batch["proteins"]:
+        [row] = protein["rows"]
+        held = {key: value for key, value in protein.items() if key != "rows"}
+        held["image_id"] = image_of[row["arena_id"]]
+        held.update((key, row[key]) for key in _ROW_KEYS if key in row)
+        proteins.append(held)
+    batch["proteins"] = proteins
+    return old
+
+
 # {n: a step from schema n to n + 1}. Before v0.1, an additive change (a new
 # optional field left out while empty, or a new enum value) does not bump; from
 # v0.1 on, every saved-form change bumps and registers a migration: it bumps
 # SCHEMA_VERSION and registers a step here (an additive change registers a step
 # that only bumps the number), and registers in _EARLIER_CONTENT how the content
 # of a project migrated from each older schema read in that schema.
-MIGRATIONS: Mapping[int, Migration] = {1: _v1_to_v2}
+MIGRATIONS: Mapping[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3}
 # {n: a latest-schema content document as schema n held it}: the migrate entry's
 # from_content_hash.
-_EARLIER_CONTENT: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {1: _v1_content}
+_EARLIER_CONTENT: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    1: lambda content: _v1_content(_v2_content(content)),
+    2: _v2_content,
+}
 
 
 def _migrated(

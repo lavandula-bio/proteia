@@ -148,7 +148,7 @@ def _membrane(batch: Batch, membrane: Membrane) -> JsonValue:
     groups: list[JsonValue] = []
     for group in batch.register_groups(membrane):
         image_ids = [image.id for image in images if image.id in group]
-        fit = calibration_fit(membrane, image_ids[0])
+        fit = calibration_fit(batch, membrane, image_ids[0])
         groups.append(
             {
                 "image_ids": list(image_ids),
@@ -281,7 +281,7 @@ def project_state(
                 "sample": lane.sample,
                 "included": lane.included,
             }
-            for lane in batch.lanes
+            for lane in batch.only_lanes()
         ],
         "reference_condition": batch.reference_condition,
         "images": images,

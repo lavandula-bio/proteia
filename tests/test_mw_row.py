@@ -55,12 +55,12 @@ from test_checks import law as model_law
 from test_operations import (
     assert_mw_current,
     assert_nets_current,
+    boxes_of,
     import_blot,
     lane_bands,
     noisy16,
     open_sample,
     plant,
-    protein_of,
     session_on,
 )
 
@@ -221,7 +221,7 @@ def add(b: Blot, row: tuple = TARGET, name: str = "β-catenin", **kwargs) -> str
 
 def on_truth(s: ProjectSession, protein_id: str, kda: float, degrees: float = 0.0) -> list[int]:
     """The lanes whose box holds the true centre of the protein's band there."""
-    size = protein_of(s, protein_id).box_size
+    size = boxes_of(s, protein_id).box_size
     held = []
     for lane, band in sorted(lane_bands(s, protein_id).items()):
         x0, y0, x1, y1 = band.box.rect(size)
@@ -255,7 +255,7 @@ def fitted_from(points: Sequence[CalibrationPoint]) -> mwcal.Calibration:
     """The calibration of ``img-2`` in a model-only project whose marker
     ``img-1`` holds ``points`` (:func:`test_checks.blot`, 1330 x 500)."""
     project = model_blot(points)
-    fitted = mwcal.calibration_for(project.batch.membranes[0], "img-2")
+    fitted = mwcal.calibration_for(project.batch, project.batch.membranes[0], "img-2")
     assert isinstance(fitted, mwcal.Calibration)
     return fitted
 
@@ -423,7 +423,7 @@ def test_span_from_anchors_after_first_row(tmp_path):
     placed = ops.detect_mw_row(s, target)
     assert placed.span_from == "anchors"
     boxes = lane_bands(s, loading)
-    size = protein_of(s, loading).box_size
+    size = boxes_of(s, loading).box_size
     centres = [boxes[lane].box.x + size.width / 2 for lane in range(8)]
     pitch = (centres[-1] - centres[0]) / 7
     assert abs(placed.span[0] - (centres[0] - pitch / 2)) <= 3
@@ -471,13 +471,13 @@ def _reprobes(b: Blot, lanes: Sequence[Sequence[int]]) -> list[tuple[str, set[st
         for lane in boxed:
             x, y = truth(TARGET[0], LANES[lane])
             ops.place_box(s, protein, round(x), round(y), lane_index=lane, grow=True)
-        out.append((image, {band.id for band in protein_of(s, protein).bands}))
+        out.append((image, {band.id for band in boxes_of(s, protein).bands}))
     return out
 
 
 def _span_of(b: Blot, protein_id: str) -> mwrow.LaneSpan | None:
     batch = b.session.project.batch
-    fitted = mwcal.calibration_for(batch.membrane_of(b.blot), b.blot)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of(b.blot), b.blot)
     return mwrow.lane_span(batch, batch.find_protein(protein_id), fitted)
 
 
@@ -757,7 +757,7 @@ def test_a_one_lane_batch_reads_its_lane_between_the_ladders(tmp_path):
     ops.set_lanes(b.session, [LaneInput(samples.CONDITIONS[0], samples.SAMPLES[0])])
     target = add(b)
     batch = b.session.project.batch
-    fitted = mwcal.calibration_for(batch.membrane_of(b.blot), b.blot)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of(b.blot), b.blot)
     span = mwrow.lane_span(batch, batch.find_protein(target), fitted)
     assert span == mwrow.LaneSpan(365, 941, "ladders")
 
@@ -770,7 +770,7 @@ def test_an_expected_mw_on_a_range_end_is_searched(tmp_path, end):
     # there (no band in them) rather than refusing the MW.
     b = calibrated(tmp_path)
     s = b.session
-    fitted = mwcal.calibration_for(s.project.batch.membrane_of(b.blot), b.blot)
+    fitted = mwcal.calibration_for(s.project.batch, s.project.batch.membrane_of(b.blot), b.blot)
     z = fitted.z_hi if end == "top" else fitted.z_lo
     mw = 10.0**z
     for _ in range(8):  # the float whose log10 is the end, within a few last bits
@@ -822,7 +822,7 @@ def test_a_prediction_off_its_slot_reads_the_span_s_centre():
     target = next(p for p in project.batch.proteins if p.name == "target")
     predicted = mwrow.predict(project.batch, target)
     assert predicted.slot is None and predicted.span.source == "anchors"
-    fitted = mwcal.calibration_for(project.batch.membranes[0], "img-2")
+    fitted = mwcal.calibration_for(project.batch, project.batch.membranes[0], "img-2")
     centre = 0.5 * (predicted.span.x0 + predicted.span.x1)
     assert predicted.expected_y == (fitted.y_at(60.0, centre),)
     assert predicted.expected_y[0] is not None
@@ -837,9 +837,10 @@ def test_a_prediction_with_no_lanes_reads_between_the_ladders():
         _ladders(400.0, 900.0, FOLD_LEFT, FOLD_RIGHT),
         ModelRow("target", 60.0, expected=60.0, lanes=()),
     )
-    batch = project.batch.model_copy(update={"lanes": []})
+    tables = [table.model_copy(update={"lanes": []}) for table in project.batch.lane_tables]
+    batch = project.batch.model_copy(update={"lane_tables": tables})
     predicted = mwrow.predict(batch, batch.proteins[0])
-    fitted = mwcal.calibration_for(batch.membranes[0], "img-2")
+    fitted = mwcal.calibration_for(batch, batch.membranes[0], "img-2")
     assert (predicted.span, predicted.slot) == (None, None)
     assert predicted.expected_y == (fitted.y_at(60.0, 650.0),)
     assert predicted.expected_y[0] != fitted.y_at(60.0, 400.0)
@@ -971,7 +972,7 @@ def test_a_deeper_band_below_is_not_boxed_with_the_target(tmp_path):
     placed = ops.detect_mw_row(s, target)
     assert on_truth(s, target, TARGET[0]) == list(range(8))
     assert on_truth(s, target, DEEPER_BELOW[0]) == []
-    size, lone_size = protein_of(s, target).box_size, protein_of(lone.session, alone).box_size
+    size, lone_size = boxes_of(s, target).box_size, boxes_of(lone.session, alone).box_size
     assert size.height <= lone_size.height + 1 and size.width <= lone_size.width + 2
     assert "multiple_components" in placed.flags
     assert all(0.9 * TARGET[0] <= mw <= TARGET[0] for mw in mws(s, target))
@@ -1084,7 +1085,7 @@ def test_a_burnt_out_band_with_a_smear_under_one_half_is_boxed_whole(tmp_path, s
     assert "hollow_band" in placed.flags
     assert "multiple_components" not in placed.flags
     assert on_truth(s, target, TARGET[0]) == list(range(8))
-    assert protein_of(s, target).box_size.width >= 90
+    assert boxes_of(s, target).box_size.width >= 90
 
 
 DUMBBELL_TARGET = (TARGET[0], TARGET[1], 8.0, 0.5, 0.05)  # half as deep in its middle
@@ -1103,7 +1104,7 @@ def test_a_sloping_dumbbell_band_is_boxed_whole(tmp_path, degrees):
     target = add(b, DUMBBELL_TARGET)
     placed = ops.detect_mw_row(s, target, span=(140, 1170))
     assert on_truth(s, target, TARGET[0], degrees) == list(range(8))
-    size = protein_of(s, target).box_size
+    size = boxes_of(s, target).box_size
     for lane, band in lane_bands(s, target).items():
         x0, _, x1, _ = band.box.rect(size)
         assert abs((x0 + x1) / 2 - truth(TARGET[0], LANES[lane], degrees)[0]) <= 3.0, lane
@@ -1119,7 +1120,7 @@ def test_log_params(tmp_path):
     entry = s.project.log[-1]
     assert entry.action == "detect_mw_row"
     params = entry.params
-    fit = ops.calibration_fit(s.project.batch.membranes[0], b.blot)
+    fit = ops.calibration_fit(s.project.batch, s.project.batch.membranes[0], b.blot)
     assert list(params)[:18] == [
         "protein_id",
         "expected_mws",
@@ -1175,8 +1176,8 @@ def test_same_placement_again_is_noop(tmp_path, padding):
     ops.detect_mw_row(s, target)
     if padding is not None:
         ops.set_box_padding(s, target, across=padding[0], along=padding[1])
-        fitted = protein_of(s, target).fitted_size
-        size = protein_of(s, target).box_size
+        fitted = boxes_of(s, target).fitted_size
+        size = boxes_of(s, target).box_size
         assert (size.width, size.height) == (fitted.width + 4, fitted.height + 6)
     before = s.project
     again = ops.detect_mw_row(s, target)
@@ -1217,7 +1218,7 @@ def test_a_drawn_row_and_an_mw_row_replace_each_other(tmp_path):
     assert {band.source for band in lane_bands(s, target).values()} == {ProposalSource.MW_GUIDED}
     # A box edited by hand stays.
     band = lane_bands(s, target)[3]
-    x0, y0, x1, y1 = band.box.rect(protein_of(s, target).box_size)
+    x0, y0, x1, y1 = band.box.rect(boxes_of(s, target).box_size)
     ops.move_box(s, band.id, (x0 + 1, y0, x1 + 1, y1))
     kept = ops.detect_mw_row(s, target)
     assert kept.kept_lanes == (3,)
@@ -1237,7 +1238,7 @@ def test_the_state_predicts_the_row(tmp_path):
         return next(p for p in project["proteins"] if p["id"] == protein_id)
 
     predicted = state_of(target)["predicted_row"]
-    fitted = mwcal.calibration_for(s.project.batch.membranes[0], b.blot)
+    fitted = mwcal.calibration_for(s.project.batch, s.project.batch.membranes[0], b.blot)
     slot = mwrow.slot(fitted, [92.0], 0.1, *mwrow.span_between_ladders(fitted, 8, WIDTH), HEIGHT)
     assert predicted == {
         "row": list(slot.row),
@@ -1331,7 +1332,7 @@ def sample_calibrated(tmp_path: Path) -> Blot:
 def sample_on_truth(s: ProjectSession, protein_id: str, row: samples.Row) -> list[int]:
     """The lanes whose box holds the sample band's nominal centre (its lane's
     nominal x and the law's y: within 2 px and 1 px of the drawn one)."""
-    size = protein_of(s, protein_id).box_size
+    size = boxes_of(s, protein_id).box_size
     held = []
     for lane, band in sorted(lane_bands(s, protein_id).items()):
         x0, y0, x1, y1 = band.box.rect(size)
@@ -2292,7 +2293,7 @@ def test_a_knocked_out_lane_is_recorded_not_detected_by_mw(tmp_path):
     assert note.startswith("lane 4: the band found lies off the row's line through the other")
     assert on_truth(s, target, TARGET[0]) == [0, 1, 2, 4, 5, 6, 7]
     assert sorted(lane_bands(s, target)) == [0, 1, 2, 4, 5, 6, 7]
-    [record] = protein_of(s, target).undetected
+    [record] = boxes_of(s, target).undetected
     assert (record.lane_index, record.source) == (3, ProposalSource.MW_GUIDED)
     assert record.reason.value == "below_detection_limit" and record.snr < record.threshold
     region = record.region
@@ -2304,5 +2305,5 @@ def test_a_knocked_out_lane_is_recorded_not_detected_by_mw(tmp_path):
     assert [w["lane_index"] for w in entry.params["undetected_written"]] == [3]
     assert_mw_current(s)
     ops.edit_protein(s, target, mw_tolerance=0.2)
-    assert protein_of(s, target).undetected == []
+    assert boxes_of(s, target).undetected == []
     assert s.project.log[-1].params["dropped_undetected"] == entry.params["undetected_written"]

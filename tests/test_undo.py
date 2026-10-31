@@ -59,6 +59,7 @@ from test_operations import (
     assert_nets_current,
     blot,
     boxed,
+    boxes_of,
     detected,
     import_blot,
     lane_bands,
@@ -88,7 +89,9 @@ def ids_diff(before: Project, after: Project) -> tuple[list[str], list[str]]:
 def record_keys(project: Project) -> list[list]:
     """Every not-detected record's key, as the undo params list it."""
     return [
-        [p.id, u.lane_index, u.band_index] for p in project.batch.proteins for u in p.undetected
+        [p.id, u.lane_index, u.band_index]
+        for p in project.batch.proteins
+        for u in project.batch.boxes_of(p).undetected
     ]
 
 
@@ -203,14 +206,17 @@ def test_undo_of_a_removal_lists_the_cascade_it_brings_back(tmp_path):
     before = s.project
     cascade = ops.remove_image(s, "img-6")  # α-tubulin's image, with its membrane
     removal = s.project.log[-1]
-    back = ("mem-5", "img-6", "prot-8", "band-13", "band-14", "band-15", "band-16")
-    assert sorted(back) == sorted(cascade.removed)
+    gone = ("mem-5", "img-6", "prot-8", "band-13", "band-14", "band-15", "band-16")
+    assert sorted(gone) == sorted(cascade.removed)
+    # With the image went its membrane area, and with the protein its row.
+    back = ("mem-5", "img-6", "arena-23", "prot-8", "row-25", *gone[3:])
 
     assert ops.undo(s) == Restored(
         seq=removal.seq,
         action="remove_image",
         removed=(),
-        restored=back,  # by kind: membranes, images, proteins, bands
+        # by kind: membranes, images, (lane tables,) areas, proteins, rows, bands
+        restored=back,
         undetected_removed=(),
         undetected_restored=(),
     )
@@ -272,12 +278,12 @@ def test_undo_of_a_padding_restores_size_boxes_and_nets(tmp_path):
     ops.set_box_padding(s, protein, across=1, along=2)
     padded = s.project
     seq = padded.log[-1].seq
-    assert protein_of(s, protein).box_padding == BoxPadding(across=1, along=2)
+    assert boxes_of(s, protein).box_padding == BoxPadding(across=1, along=2)
 
     # Boxes that moved and changed their nets, and a padding: in no list.
     assert ops.undo(s) == Restored(seq, "set_box_padding", (), (), (), ())
     assert s.project.batch == before.batch
-    assert protein_of(s, protein).box_padding == BoxPadding()
+    assert boxes_of(s, protein).box_padding == BoxPadding()
     assert_nets_current(s)
     assert ops.redo(s) == Restored(seq, "set_box_padding", (), (), (), ())
     assert s.project.batch == padded.batch
@@ -305,7 +311,7 @@ def test_a_new_change_clears_redo_and_an_undo_never_undoes_an_undo(tmp_path):
     assert s.redo_step is None  # B can no longer be redone
     assert ops.undo(s).seq == 8  # takes back C
     assert ops.undo(s).seq == 5  # then A, not the undo of B
-    assert [b.id for b in protein_of(s, protein).bands] == []
+    assert [b.id for b in boxes_of(s, protein).bands] == []
     assert s.redo_step == HistoryStep(seq=5, action="place_box")
 
     assert ops.redo(s).restored == (a,)
@@ -313,7 +319,7 @@ def test_a_new_change_clears_redo_and_an_undo_never_undoes_an_undo(tmp_path):
     with pytest.raises(OperationError) as info:
         ops.redo(s)  # B is gone from the history
     assert info.value.code is ErrorCode.NOTHING_TO_REDO
-    assert [b.lane_index for b in protein_of(s, protein).bands] == [0, 2]
+    assert [b.lane_index for b in boxes_of(s, protein).bands] == [0, 2]
 
 
 def test_undo_walks_back_only_to_the_sessions_opening(tmp_path):
@@ -494,14 +500,14 @@ def test_an_import_keeps_the_file_of_a_removal_that_can_be_undone(tmp_path):
     file = s.folder / "images" / f"{image}.tif"
     ops.remove_image(s, image)
     other = import_blot(s, blot(), "GAPDH β.tif")  # removes orphans before it stores
-    assert (image, other) == ("img-1", "img-3")
+    assert (image, other) == ("img-1", "img-5")
     assert file.exists()
-    assert ops.undo(s).removed == ("mem-4", other)  # the import
-    assert ops.undo(s).restored == ("mem-2", image)  # the removal: its file is there
+    assert ops.undo(s).removed == ("mem-6", other, "arena-7")  # the import
+    assert ops.undo(s).restored == ("mem-2", image, "arena-4")  # the removal: its file is there
     assert [i.id for i in s.project.batch.iter_images()] == [image]
     np.testing.assert_array_equal(s.pixels(image), blot().astype(np.float64))
-    assert ops.redo(s).removed == ("mem-2", image)
-    assert ops.redo(s).restored == ("mem-4", other)
+    assert ops.redo(s).removed == ("mem-2", image, "arena-4")
+    assert ops.redo(s).restored == ("mem-6", other, "arena-7")
     assert listing(s) == [f"{image}.tif", f"{other}.tif"]  # undo can still bring img-1 back
 
 
@@ -552,7 +558,7 @@ def test_an_undo_whose_autosave_fails_stays_in_memory(tmp_path, replace_lock):
     ops.undo(s)  # returns normally
     assert s.dirty and isinstance(s.save_error, PermissionError)
     assert path.read_bytes() == before
-    assert protein_of(s, protein).bands == []
+    assert boxes_of(s, protein).bands == []
     assert s.redo_step is not None  # the history moved with the commit
 
     replace_lock.locked = False
@@ -605,7 +611,7 @@ def test_clear_boxes_removes_every_box_and_record_in_one_change(tmp_path):
     lane_2 = _record(2)
     plant_records(s, protein, lane_2)
     before, length = s.project, len(s.project.log)
-    kept = protein_of(s, protein).box_size
+    kept = boxes_of(s, protein).box_size
 
     cleared = ops.clear_boxes(s, protein)
     assert cleared == ClearedBoxes(band_ids=(narrow, wide), undetected=((2, 0),))  # lane order
@@ -621,7 +627,7 @@ def test_clear_boxes_removes_every_box_and_record_in_one_change(tmp_path):
         },
     )
     assert entry.content_hash == content_hash(s.project)
-    cleared_protein = protein_of(s, protein)
+    cleared_protein = boxes_of(s, protein)
     assert (cleared_protein.bands, cleared_protein.undetected) == ([], [])
     assert cleared_protein.box_size == kept  # the width and height fields show it
     assert load_project(s.folder) == s.project
@@ -645,11 +651,11 @@ def test_clear_boxes_removes_every_box_and_record_in_one_change(tmp_path):
     alone = BoxSize(width=grown[2] - grown[0], height=grown[3] - grown[1])
     assert alone.width < kept.width  # the kept size was grown by the wide band
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=True)
-    assert protein_of(s, protein).box_size == alone
+    assert boxes_of(s, protein).box_size == alone
     # A fixed box instead uses the kept size.
     ops.undo(s)
     ops.place_box(s, protein, NARROW_X, ROW, lane_index=0, grow=False)
-    assert protein_of(s, protein).box_size == kept
+    assert boxes_of(s, protein).box_size == kept
     assert_nets_current(s)
 
 
@@ -661,9 +667,9 @@ def test_a_row_after_clear_boxes_sets_the_size_from_its_bands_alone(tmp_path):
     kept = BoxSize(width=found.size.width + 7, height=found.size.height + 5)
     ops.set_box_size(s, protein, kept)
     ops.clear_boxes(s, protein)
-    assert protein_of(s, protein).box_size == kept
+    assert boxes_of(s, protein).box_size == kept
     ops.detect_row_boxes(s, protein, case.row)
-    assert protein_of(s, protein).box_size == found.size  # not grown to the kept size
+    assert boxes_of(s, protein).box_size == found.size  # not grown to the kept size
     assert_nets_current(s)
 
 
@@ -695,9 +701,9 @@ def test_clear_boxes_of_records_only_of_nothing_or_of_an_unknown_protein(tmp_pat
     second = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=False)
     plant(s, lambda draft: setattr(draft.batch.find_band(second)[1], "band_index", 1))
     assert ops.clear_boxes(s, protein).band_ids == (first, second)  # every band index
-    assert protein_of(s, protein).bands == []
+    assert boxes_of(s, protein).bands == []
     # Another protein's boxes and records stay.
-    assert [b.id for b in protein_of(s, other).bands] == [kept]
+    assert [b.id for b in boxes_of(s, other).bands] == [kept]
     assert _keys(s, other) == [(2, 0)]
 
 
@@ -707,25 +713,25 @@ def test_clear_boxes_of_records_only_of_nothing_or_of_an_unknown_protein(tmp_pat
 def test_undo_brings_back_the_records_a_change_dropped(tmp_path):
     s, image, protein = boxed(tmp_path, save_to_folder)
     plant_records(s, protein, _record(1), _record(2, snr=-0.5))
-    records = protein_of(s, protein).undetected
+    records = boxes_of(s, protein).undetected
 
     band = ops.place_box(s, protein, WIDE_X, ROW, lane_index=1, grow=True)  # replaces lane 1's
     placed = s.project.log[-1].seq
     assert ops.undo(s) == Restored(placed, "place_box", (band,), (), (), ((protein, 1, 0),))
-    assert protein_of(s, protein).undetected == records
+    assert boxes_of(s, protein).undetected == records
 
     ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])  # cuts lane 2
     assert _keys(s, protein) == [(1, 0)]
     restored = ops.undo(s)
     assert (restored.action, restored.undetected_restored) == ("set_lanes", ((protein, 2, 0),))
-    assert protein_of(s, protein).undetected == records
-    assert len(s.project.batch.lanes) == 3
+    assert boxes_of(s, protein).undetected == records
+    assert len(s.project.batch.only_lanes()) == 3
 
     ops.set_polarity(s, image, LIGHT)  # drops every record on the image
     assert _keys(s, protein) == []
     restored = ops.undo(s)
     assert restored.undetected_restored == ((protein, 1, 0), (protein, 2, 0))
-    assert protein_of(s, protein).undetected == records
+    assert boxes_of(s, protein).undetected == records
     ops.redo(s)
     assert s.project.log[-1].params["undetected_removed"] == [[protein, 1, 0], [protein, 2, 0]]
     assert load_project(s.folder) == s.project
@@ -768,7 +774,7 @@ def test_undo_to_content_the_log_never_recorded_is_flagged(tmp_path):
     s, _, _ = boxed(tmp_path, save_to_folder)
     path = s.folder / storage.PROJECT_FILE
     doc = json.loads(path.read_bytes())
-    doc["batch"]["lanes"][0]["label"] = "DMSO"  # edited by hand, outside the log
+    doc["batch"]["lane_tables"][0]["lanes"][0]["label"] = "DMSO"  # by hand, outside the log
     path.write_bytes(document_bytes(doc))
 
     opened = ops.open_project(s.folder, clock=FakeClock())
@@ -778,7 +784,7 @@ def test_undo_to_content_the_log_never_recorded_is_flagged(tmp_path):
     ops.undo(opened)
     assert opened.project.log[-1].params["returns_to_seq"] is None
     assert history_issues(opened.project) == ["undo_mismatch"]
-    assert load_project(s.folder).batch.lanes[0].label == "DMSO"
+    assert load_project(s.folder).batch.only_lanes()[0].label == "DMSO"
 
 
 def test_a_clean_history_has_no_undo_mismatch(tmp_path):

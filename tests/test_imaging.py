@@ -182,9 +182,10 @@ def test_import_warnings_survive_save_and_load(tmp_path):
         background=float(np.median(loaded.array)),
         import_warnings=loaded.warnings,
     )
-    project = Project.model_validate(
-        {"next_id": 3, "batch": {"membranes": [{"id": "mem-2", "images": [image]}]}}
-    )
+    area = {"id": "arena-4", "image_id": "img-1", "source": "whole_image"}
+    membrane = {"id": "mem-2", "lane_table_id": "lt-3", "arenas": [area]}
+    batch = {"images": [image], "lane_tables": [{"id": "lt-3"}], "membranes": [membrane]}
+    project = Project.model_validate({"next_id": 5, "batch": batch})
     save_project(project, folder)
     reloaded = load_project(folder)
     assert reloaded == project

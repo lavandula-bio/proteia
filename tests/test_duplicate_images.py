@@ -33,7 +33,7 @@ import pytest
 import tifffile
 from pydantic import ValidationError
 
-from conftest import FakeClock, image_bytes, make_project, sample_doc_v1, write_tiff
+from conftest import FakeClock, image_bytes, make_project, sample_doc, sample_doc_v1, write_tiff
 from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.core.export import BUNDLE_README_FILE, BUNDLE_RECORD_FILE
@@ -79,8 +79,9 @@ def changed(
         for image_id, kind in (kinds or {}).items():
             draft.batch.find_image(image_id).kind = kind
         for protein in draft.batch.proteins:
-            if protein.image_id in unmeasured:
-                protein.bands, protein.undetected = [], []
+            if draft.batch.image_id_of(protein) in unmeasured:
+                boxes = draft.batch.boxes_of(protein)
+                boxes.bands, boxes.undetected = [], []
         if edit is not None:
             edit(draft)
 
@@ -93,8 +94,9 @@ def unlink(draft: Project) -> None:
 
 
 def onto_img_3(draft: Project) -> None:
-    """GAPDH moved from img-4 onto img-3 (the same size)."""
-    draft.batch.find_protein("prot-9").image_id = "img-3"
+    """GAPDH moved from img-4 onto img-3 (the same size): its row onto img-3's area."""
+    [(_, arena)] = draft.batch.arenas_on("img-3")
+    draft.batch.only_row(draft.batch.find_protein("prot-9")).arena_id = arena.id
 
 
 def notes(notices: list[Notice]) -> list[tuple[str, tuple[str, ...]]]:
@@ -332,7 +334,7 @@ def test_three_copies_are_named_and_more_are_counted(copies, names, message, ids
 
 def test_a_project_without_lanes_or_proteins_is_noted_too():
     def bare(draft: Project) -> None:
-        draft.batch.proteins, draft.batch.lanes = [], []
+        draft.batch.proteins, draft.batch.lane_tables[0].lanes = [], []
         draft.batch.reference_condition = None
 
     project = changed(make_project(), copies={"img-4": "img-2"}, edit=bare)
@@ -386,8 +388,8 @@ def test_an_import_of_the_same_bytes_is_noted_and_nothing_is_stored(tmp_path):
     assert saved == storage.project_to_json(s.project)
     assert b"same file" not in saved and CODE.encode() not in saved
     # The first image's record is as it was before the copy came.
-    alone = json.loads(saved_alone)["batch"]["membranes"][0]["images"]
-    assert json.loads(saved)["batch"]["membranes"][0]["images"][:1] == alone
+    alone = json.loads(saved_alone)["batch"]["images"]
+    assert json.loads(saved)["batch"]["images"][:1] == alone
 
 
 def test_the_same_bytes_in_another_membrane_are_named_in_the_image_lists_order(tmp_path):
@@ -540,21 +542,29 @@ def saved_project(folder: Path, doc: dict) -> None:
     file holding the bytes its SHA-256 names."""
     images = folder / storage.IMAGES_DIR
     images.mkdir(parents=True)
-    for membrane in doc["batch"]["membranes"]:
-        for image in membrane["images"]:
-            (images / image["file"]).write_bytes(STAND_INS[image["sha256"]])
+    held = doc["batch"].get("images")  # the batch's (schema 3), else each membrane's
+    if held is None:
+        held = [image for membrane in doc["batch"]["membranes"] for image in membrane["images"]]
+    for image in held:
+        (images / image["file"]).write_bytes(STAND_INS[image["sha256"]])
     (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
 
 
-@pytest.mark.parametrize("schema", [1, 2])
+@pytest.mark.parametrize("schema", [1, 2, 3])
 def test_a_project_saved_before_is_noted_when_opened_and_kept_as_it_was(tmp_path, schema):
-    # A schema-1 project (saved before #83) and one of the current schema, as
-    # main saved them: img-4's file holds img-2's bytes.
+    # A schema-1 project (saved before #83), a schema-2 one (before #223) and
+    # one of the current schema, as main saved them: img-4's file holds img-2's
+    # bytes.
     if schema == 1:
         doc = sample_doc_v1()
+    elif schema == 2:
+        doc = sample_doc()
     else:
         doc = json.loads(storage.project_to_json(make_project()))
-    mem_1 = doc["batch"]["membranes"][0]["images"]
+    if schema == 3:
+        mem_1 = doc["batch"]["images"][:3]
+    else:
+        mem_1 = doc["batch"]["membranes"][0]["images"]
     assert [image["id"] for image in mem_1] == ["img-2", "img-3", "img-4"]
     mem_1[2]["sha256"] = mem_1[0]["sha256"]
     folder = tmp_path / FOLDER
@@ -571,7 +581,7 @@ def test_a_project_saved_before_is_noted_when_opened_and_kept_as_it_was(tmp_path
     saved = (folder / storage.PROJECT_FILE).read_bytes()
     assert saved == storage.project_to_json(s.project)
     assert b"same file" not in saved and CODE.encode() not in saved
-    if schema == 2:
+    if schema == 3:
         assert saved == before
         assert storage.content_hash(s.project) == storage.content_hash(Project.model_validate(doc))
 

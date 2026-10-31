@@ -98,7 +98,7 @@ def test_history_issues(tmp_path):
 
     path = s.folder / "project.json"
     doc = json.loads(path.read_bytes())
-    doc["batch"]["proteins"][0]["bands"][0]["net"] += 1.0  # a net edited by hand
+    doc["batch"]["proteins"][0]["rows"][0]["bands"][0]["net"] += 1.0  # edited by hand
     path.write_bytes(document_bytes(doc))
     assert history_issues(load_project(s.folder)) == ["content_changed_outside_log"]
 
@@ -245,7 +245,7 @@ def test_record_lists_each_sets_notices():
     assert listed[-1]["lane_indices"] == [0, 1, 2, 3]  # α-tubulin's, in every lane
 
     def every_lane(draft: Project) -> None:
-        draft.batch.lanes[3].included = True
+        draft.batch.only_lanes()[3].included = True
 
     one = compute_results(apply_change(project, every_lane)[0].batch)
     assert one.all_lanes is None
@@ -384,9 +384,10 @@ def test_the_content_includes_not_detected_records():
     project = _with_log(make_project_with_undetected(), "new_project")
     record = build_record(project, exported_at=EXPORTED_AT, files={})
     proteins = record["content"]["batch"]["proteins"]
-    assert ["undetected" in protein for protein in proteins] == [True, False, True]
-    assert proteins[2]["undetected"] == [
-        u.model_dump(mode="json") for u in project.batch.find_protein("prot-9").undetected
+    assert ["undetected" in protein["rows"][0] for protein in proteins] == [True, False, True]
+    assert proteins[2]["rows"][0]["undetected"] == [
+        u.model_dump(mode="json")
+        for u in project.batch.boxes_of(project.batch.find_protein("prot-9")).undetected
     ]
     # The record verifies itself, and its hash covers the records.
     digest = hashlib.sha256(canonical_json(record["content"])).hexdigest()
@@ -513,8 +514,8 @@ def _baseline_like_batch():
     vehicle and 10 µM, two replicates each."""
 
     def change(draft: Project) -> None:
-        draft.batch.lanes[3].included = True
-        beta = draft.batch.find_protein("prot-7")
+        draft.batch.only_lanes()[3].included = True
+        beta = draft.batch.boxes_of(draft.batch.find_protein("prot-7"))
         extra = beta.bands[0].model_copy(update={"id": draft.new_id("band"), "lane_index": 2})
         extra.box = extra.box.model_copy(update={"x": 98})
         beta.bands.append(extra)

@@ -249,7 +249,7 @@ def _relabelled(labels: list[str]) -> Project:
     """The sample project (the lane at index 3 excluded, with values) with these
     lane labels."""
     doc = make_project().model_dump(mode="json")
-    for lane, label in zip(doc["batch"]["lanes"], labels, strict=True):
+    for lane, label in zip(doc["batch"]["lane_tables"][0]["lanes"], labels, strict=True):
         lane["label"] = label
     return Project.model_validate(doc)
 

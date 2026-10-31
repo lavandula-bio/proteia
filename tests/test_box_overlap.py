@@ -27,7 +27,9 @@ import pytest
 
 from conftest import (
     FakeClock,
+    converted,
     make_project,
+    sample_doc,
     sample_doc_v1,
     synthetic_blot,
     write_image_files,
@@ -41,7 +43,7 @@ from proteia.core.results import Level, compute_results
 from test_checks import all_lanes_view
 from test_mw_row import LOADING, calibrated
 from test_mw_row import add as add_by_mw
-from test_operations import lane_bands, protein_of
+from test_operations import boxes_of, lane_bands
 
 OVERLAP = "boxes_overlap"
 # The end of every overlap notice: one lane of the protein, or several.
@@ -87,7 +89,7 @@ def project_with(*proteins: Boxed, lanes: int = 4, excluded: Collection[int] = (
     img-6 on another), ``lanes`` lanes (vehicle and 10 µM in turn, the
     reference vehicle; ``excluded`` lanes include=no) and ``proteins``, ids in
     order: prot-100, prot-101, ...; band-200, band-201, ... Every net is 1000."""
-    doc = make_project().model_dump(mode="json")
+    doc = sample_doc()  # as a schema-2 file holds it: converted below
     doc["next_id"] = 1000
     batch = doc["batch"]
     batch["lanes"] = [
@@ -136,7 +138,7 @@ def project_with(*proteins: Boxed, lanes: int = 4, excluded: Collection[int] = (
         }
         for k, protein in enumerate(proteins)
     ]
-    return Project.model_validate(doc)
+    return converted(doc)
 
 
 def overlaps_of(notices: Sequence[results.Notice]) -> list[tuple[tuple[str, ...], tuple, str]]:
@@ -547,7 +549,7 @@ def test_the_overlap_notices_come_right_after_the_background_notices():
         gapdh((0, 62, 25), undetected=[(2, (250, 25, 270, 35))]),
         Boxed("µ-calpain", [AT], image="img-6"),
     ).model_dump(mode="json")
-    doc["batch"]["proteins"][0]["bands"][1]["background_mode"] = "asymmetric"
+    doc["batch"]["proteins"][0]["rows"][0]["bands"][1]["background_mode"] = "asymmetric"
     res = compute_results(Project.model_validate(doc).batch)
     assert [(n.code.value, n.protein_ids) for n in res.notices] == [
         ("clipping_not_checked", (A,)),
@@ -641,7 +643,7 @@ def test_the_all_lanes_view_keeps_an_overlap_its_own_notice_of_the_protein_also_
     ("at", "noted", "content_hash", "file_sha256"),
     [
         # The content hash and the SHA-256 of project.json, as Proteia wrote
-        # them before #208.
+        # them before #208 (at schema 2: the converted project maps back to them).
         pytest.param(
             (0, 80, 25),
             False,
@@ -661,10 +663,13 @@ def test_the_all_lanes_view_keeps_an_overlap_its_own_notice_of_the_protein_also_
 def test_an_overlap_is_computed_not_stored(at, noted, content_hash, file_sha256):
     project = project_with(beta(), gapdh(at))
     assert bool(overlap_notices(project)) is noted
-    assert storage.content_hash(project) == content_hash
+    earlier = storage._EARLIER_CONTENT[2](storage.content_document(project))
+    assert storage.document_hash(earlier) == content_hash
+    written = storage.document_bytes({**earlier, "next_id": 1000, "log": []})
+    assert hashlib.sha256(written).hexdigest() == file_sha256
     data = storage.project_to_json(project)
-    assert hashlib.sha256(data).hexdigest() == file_sha256
     assert storage.project_from_json(data) == project
+    assert b"overlap" not in data
 
 
 # --- The operations: a blot with two bands on one row ---
@@ -694,7 +699,7 @@ def blot_session(tmp_path: Path) -> tuple[ProjectSession, str, str, str]:
 
 def rect_of(s: ProjectSession, band_id: str) -> tuple[int, int, int, int]:
     protein, band = s.project.batch.find_band(band_id)
-    return band.box.rect(protein.box_size)
+    return band.box.rect(s.project.batch.boxes_of(protein).box_size)
 
 
 def notices_now(s: ProjectSession) -> list[tuple[tuple[str, ...], tuple, str]]:
@@ -879,7 +884,7 @@ def test_a_row_placed_by_its_mw_over_part_of_another_proteins_box_is_noted(tmp_p
     s = blot.session
     loading = add_by_mw(blot, LOADING, "α-tubulin")
     ops.detect_mw_row(s, loading)
-    size = protein_of(s, loading).box_size
+    size = boxes_of(s, loading).box_size
     first = {lane: band.box.rect(size) for lane, band in lane_bands(s, loading).items()}
     assert first[0] == (162, 247, 248, 263)
     ops.clear_boxes(s, loading)
@@ -956,7 +961,7 @@ def test_an_old_project_with_overlapping_boxes_opens_with_the_notices(tmp_path):
     doc = json.loads(path.read_text(encoding="utf-8"))
     for protein in doc["batch"]["proteins"]:
         if protein["id"] == b:
-            protein["bands"][0]["box"]["x"] = 54  # (54, 25, 74, 35): 16 of 20 columns
+            protein["rows"][0]["bands"][0]["box"]["x"] = 54  # (54, 25, 74, 35): 16 of 20
     path.write_text(json.dumps(doc), encoding="utf-8")
     data = path.read_bytes()
     s.close()

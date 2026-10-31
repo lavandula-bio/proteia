@@ -220,7 +220,10 @@ def test_marker_ladder_snaps_to_truth(tmp_path, sample_folder):
     )
     target = ops.add_protein(s, samples.TARGET, Role.TARGET, blot, expected_mw=92)
     ops.detect_row_boxes(s, target, row_box(samples.TARGET_ROW))
-    mws = [band.apparent_mw for band in s.project.batch.find_protein(target).bands]
+    mws = [
+        band.apparent_mw
+        for band in s.project.batch.boxes_of(s.project.batch.find_protein(target)).bands
+    ]
     assert len(mws) == samples.LANES
     assert all(0.9 * samples.TARGET_ROW.kda <= mw <= 1.02 * samples.TARGET_ROW.kda for mw in mws)
 
@@ -293,10 +296,11 @@ def test_the_samples_import_without_warnings(tmp_path, sample_folder):
     s = ops.new_project(tmp_path / FOLDER, autosave=None, clock=FakeClock())
     blot, marker = import_samples(s, sample_folder)
     [membrane] = s.project.batch.membranes
-    assert [image.id for image in membrane.images] == [blot, marker]
+    images = s.project.batch.images_of(membrane)
+    assert [image.id for image in images] == [blot, marker]
     found = {
         image.id: (image.kind, image.bit_depth, image.width, image.height, image.import_warnings)
-        for image in membrane.images
+        for image in images
     }
     assert found == {
         blot: (ImageKind.CHEMILUMINESCENCE, 16, 1200, 500, []),

@@ -278,7 +278,8 @@ def _drop_param(i: int, name: str):
 
 
 def _drop_last_entry(project):
-    project.log = project.log[:-1]
+    # The last entry before the one that converted the project on opening.
+    project.log = (*project.log[:-2], project.log[-1])
 
 
 # Values besides the bands and calibrations, each changed in an opened project
@@ -286,34 +287,44 @@ def _drop_last_entry(project):
 DEGRADED = {
     "undetected_reason": (
         "f1",
-        _set((("batch", "proteins", 3, "undetected", 0, "reason"), _OtherReason.OFF_ROW)),
+        _set(
+            (("batch", "proteins", 3, "rows", 0, "undetected", 0, "reason"), _OtherReason.OFF_ROW)
+        ),
         "$.batch.proteins[3].undetected[0].reason",
     ),
     "warning_code": (
         "f2",
-        _set((("batch", "membranes", 1, "images", 0, "import_warnings", 0, "code"), "lossy")),
+        _set((("batch", "images", 1, "import_warnings", 0, "code"), "lossy")),
         "$.batch.membranes[1].images[0].import_warnings[0].code",
     ),
     "warning_message": (
         "f2",
-        _set((("batch", "membranes", 0, "images", 0, "import_warnings", 0, "message"), "JPEG.")),
+        _set((("batch", "images", 0, "import_warnings", 0, "message"), "JPEG.")),
         "$.batch.membranes[0].images[0].import_warnings[0].message",
     ),
-    "lane_index": ("f1", _set((("batch", "lanes", 7, "index"), 8)), "$.batch.lanes[7].index"),
+    "lane_index": (
+        "f1",
+        _set((("batch", "lane_tables", 0, "lanes", 7, "index"), 8)),
+        "$.batch.lanes[7].index",
+    ),
     "lane_label": (
         "f1",
-        _set((("batch", "lanes", 0, "label"), "Vehicle")),
+        _set((("batch", "lane_tables", 0, "lanes", 0, "label"), "Vehicle")),
         "$.batch.lanes[0].label",
     ),
-    "lane_sample": ("f1", _set((("batch", "lanes", 1, "sample"), None)), "$.batch.lanes[1].sample"),
+    "lane_sample": (
+        "f1",
+        _set((("batch", "lane_tables", 0, "lanes", 1, "sample"), None)),
+        "$.batch.lanes[1].sample",
+    ),
     "lane_included": (
         "f1",
-        _set((("batch", "lanes", 5, "included"), True)),
+        _set((("batch", "lane_tables", 0, "lanes", 5, "included"), True)),
         "$.batch.lanes[5].included",
     ),
     "lane_metadata": (
         "f1",
-        _set((("batch", "lanes", 2, "metadata"), {"dose": "0"})),
+        _set((("batch", "lane_tables", 0, "lanes", 2, "metadata"), {"dose": "0"})),
         "$.batch.lanes[2].metadata.dose",
     ),
     "next_id": ("f3", _set((("next_id",), 17)), "$.next_id"),
@@ -466,10 +477,20 @@ def test_changes():
     assert changes([1, 2, 3], [0, 2, 4]) == [["$[0]", 1, 0], ["$[2]", 3, 4]]
 
 
-def test_fresh_changes(projects):
-    # The frozen project stands in for a fresh build that stores its values.
+@pytest.fixture(scope="module")
+def fresh(tmp_path_factory) -> dict:
+    """f1 and f3 built afresh by the current build from their frozen image
+    files, built once."""
+    work = tmp_path_factory.mktemp("schema2-fresh")
+    return {
+        case: fixtures.build(work / case, case, files=fixtures.frozen_sources(DATA / case))
+        for case in ("f1", "f3")
+    }
+
+
+def test_fresh_changes(fresh):
     golden = _golden("f3", "stored.json")
-    project = projects["f3"].model_copy(deep=True)
+    project = fresh["f3"].model_copy(deep=True)
     assert fixtures.fresh_changes(golden, project) == []
     # A fresh build's log entries are compared without their hashes and versions.
     _log_entry(19, content_hash="0" * 64, version="9")(project)
@@ -478,8 +499,8 @@ def test_fresh_changes(projects):
     assert fixtures.fresh_changes(golden, project) == [
         ["$.log[19].time", "2026-10-31T09:00:19.000Z", "2026-10-31T09:00:19.001Z"]
     ]
-    project = projects["f3"].model_copy(deep=True)
-    band = project.batch.proteins[1].bands[2]
+    project = fresh["f3"].model_copy(deep=True)
+    band = project.batch.proteins[1].rows[0].bands[2]
     net = band.net
     band.net = net * (1 + 1e-13)  # within the derived tolerance
     assert fixtures.fresh_changes(golden, project) == []
@@ -1101,7 +1122,10 @@ def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys, derived):
                 del entry["content_hash"]
         assert fixtures.differences(frozen, stored, rel_tol=1e-12) == []
         assert (out / case / "derived.json").read_bytes() == fixtures.canonical_json(derived[case])
-        assert sorted(p.name for p in (out / case / "images").iterdir()) == sorted(
+        # Named by the ids this build drew, read as the schema-2 build drew them.
+        new = fixtures.new_numbers(storage.load_project(out / case))
+        written = [p.name for p in (out / case / "images").iterdir()]
+        assert sorted(fixtures.renumbered(written, new)) == sorted(
             p.name for p in (DATA / case / "images").iterdir()
         )
     assert list(tmp_path.iterdir()) == [out]  # its temporary folder is gone

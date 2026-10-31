@@ -1,25 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The batch's access points (#222): one per concept, for what the stored shape
-holds, and no reader outside the model that goes around them.
+"""The batch's access points (#222, #223): one per concept, for what the stored
+shape holds, and no reader outside the model that goes around them.
 
 Each concept is read through one accessor of :class:`~proteia.core.model.Batch`,
 so that a change of the stored shape changes the accessor and not its readers:
 the images in order and by id, a membrane's images and register groups, the
-membrane of an image, the lanes of a protein, a protein's image (and its id),
-membrane and boxes, the proteins on an image, and the band lookup.
+membrane of an image and the membrane areas on it, the project's lanes and a
+membrane's lane table, the lanes of a protein, a protein's row, image (and its
+id), membrane and boxes, the proteins on an image, and the area and band
+lookups. The stored shape (schema 3): the batch holds the images, a membrane
+holds its area on each of its images and names its lane table, and a protein
+holds its boxes in its one row, on one area.
 
 The second half reads the source of the package (the model aside, which holds
 the stored shape and the accessors) and lists every access that goes around
 them, whatever the names of the variables: any read, write or deletion of a
-``lanes``, ``images`` or ``image_id``; those fields and the box fields given
-to the constructor of a stored record or to a ``model_copy`` update; a
-membrane's own ``register_groups()`` or ``group_of(image_id)`` (the batch's
-take the membrane first); and a protein's box fields read or written on
-anything but a ``boxes_of(...)`` call or a name that every binding in its
-function sets to one, on which nothing else is read. An access of a field of
-the same name on something else, such as a calibration point's ``image_id``,
-a row detection's ``lanes`` or a request body's ``box_size``, and the writers
-of the stored shape are allowed by name in :data:`ALLOWED`, with the reason.
+field of the stored shape (:data:`SHAPE_FIELDS`); those fields and the box
+fields given to the constructor of a stored record or to a ``model_copy``
+update; a membrane's own ``register_groups()`` or ``group_of(image_id)``,
+which the batch serves (taking the membrane first); and a protein's box
+fields read or written on anything but a ``boxes_of(...)`` call or a name that
+every binding in its function sets to one, on which nothing else is read. An
+access of a field of the same name on something else, such as a calibration
+point's ``image_id``, a row detection's ``lanes`` or a request body's
+``box_size``, and the writers of the stored shape are allowed by name in
+:data:`ALLOWED`, with the reason.
 """
 
 import ast
@@ -30,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_project
+from conftest import converted, make_project, sample_doc
 from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.core.model import (
@@ -69,8 +74,10 @@ def _shuffled() -> Project:
     order: membranes mem-5 (img-6) and mem-1, whose images are img-4, img-2
     (linked to its marker img-3) and img-3; proteins GAPDH (img-4), p53 (img-2,
     no band, padded, one not-detected record), α-tubulin (img-6) and β-catenin
-    (img-2)."""
-    doc = make_project().model_dump(mode="json")
+    (img-2). Converted from schema 2 (next_id 20): the lane table lt-20, the
+    areas arena-21 (img-6), arena-22 (img-4), arena-23 (img-2) and arena-24
+    (img-3), and the rows row-25 to row-28, in protein order."""
+    doc = sample_doc()
     batch = doc["batch"]
     mem_1, mem_5 = batch["membranes"]
     img_2, img_3, img_4 = mem_1["images"]
@@ -98,7 +105,7 @@ def _shuffled() -> Project:
     }
     batch["proteins"] = [gapdh, p53, alpha, beta]
     doc["next_id"] = 20
-    return Project.model_validate(doc)
+    return converted(doc)
 
 
 # --- The accessors ---
@@ -220,6 +227,54 @@ def test_find_band():
             batch.find_band(unknown)
 
 
+def test_the_areas_on_an_image_and_the_area_lookup():
+    batch = _shuffled().batch
+    mem_5, mem_1 = batch.membranes
+    held = [[(arena.id, arena.image_id) for arena in m.arenas] for m in batch.membranes]
+    assert held == [
+        [("arena-21", "img-6")],
+        [("arena-22", "img-4"), ("arena-23", "img-2"), ("arena-24", "img-3")],
+    ]
+    [(membrane, arena)] = batch.arenas_on("img-2")
+    assert (membrane is mem_1, arena.id) == (True, "arena-23")
+    [(membrane, arena)] = batch.arenas_on("img-6")
+    assert (membrane is mem_5, arena.id) == (True, "arena-21")
+    assert batch.arenas_on("img-99") == []
+    membrane, arena = batch.find_arena("arena-24")
+    assert (membrane is mem_1, arena.image_id) == (True, "img-3")
+    for unknown in ("arena-99", "img-2"):
+        with pytest.raises(UnknownIdError):
+            batch.find_arena(unknown)
+
+
+def test_the_lanes_of_the_project_and_of_a_membrane():
+    batch = _shuffled().batch
+    [table] = batch.lane_tables
+    assert table.id == "lt-20"
+    assert batch.only_lanes() is table.lanes
+    for membrane in batch.membranes:
+        assert batch.lane_table_of(membrane) is table
+    with pytest.raises(UnknownIdError):
+        batch.lane_table_of(batch.membranes[0].model_copy(update={"lane_table_id": "lt-99"}))
+    assert Batch().only_lanes() == []
+
+
+def test_a_proteins_row():
+    batch = _shuffled().batch
+    rows = [batch.only_row(protein) for protein in batch.proteins]
+    assert [(row.id, row.arena_id) for row in rows] == [
+        ("row-25", "arena-22"),
+        ("row-26", "arena-23"),
+        ("row-27", "arena-21"),
+        ("row-28", "arena-23"),
+    ]
+    assert all(batch.boxes_of(p) is batch.only_row(p) for p in batch.proteins)
+    beta = batch.proteins[3]
+    for held in ([], [rows[3], rows[3]]):
+        with pytest.raises(ValueError):
+            batch.only_row(beta.model_copy(update={"rows": held}))
+
+
 # --- Readers moved onto the accessors, pinned where no test pinned them ---
 
 
@@ -262,10 +317,11 @@ def test_a_click_box_as_wide_as_the_lane_pitch_shows_its_lane(width, refused):
     # β-catenin's row boxes on img-2 at centres 30, 50 and 70 (a pitch of 20 px);
     # GAPDH's box grown from a click in lane 2, centred 12 px off that lane's
     # column. Only a box wider than the pitch is left out of the check.
-    doc = make_project().model_dump(mode="json")
+    doc = sample_doc()
     beta, _, gapdh = doc["batch"]["proteins"]
     beta["box_size"] = {"width": 10, "height": 14}
-    for band, x in zip(beta["bands"], (25, 45, 65), strict=True):
+    in_lane_order = sorted(beta["bands"], key=lambda band: band["lane_index"])  # as stored
+    for band, x in zip(in_lane_order, (25, 45, 65), strict=True):
         band.update(box={"x": x, "y": 43}, source="row_box", manually_edited=False)
         band["lane_index"] = {"band-10": 0, "band-11": 1, "band-12": 2}[band["id"]]
     gapdh["image_id"] = "img-2"
@@ -273,7 +329,7 @@ def test_a_click_box_as_wide_as_the_lane_pitch_shows_its_lane(width, refused):
     gapdh["bands"] = [
         {**gapdh["bands"][0], "lane_index": 1, "box": {"x": 62 - width // 2, "y": 80}}
     ]
-    batch = Project.model_validate(doc).batch
+    batch = converted(doc).batch
     error = ops._misnumbered_lanes(batch, batch.find_image("img-2"), ())
     if not refused:
         assert error is None
@@ -314,6 +370,22 @@ def test_a_refused_link_leaves_the_images_as_they_were(tmp_path):
     assert storage.content_hash(s.project) == s.project.log[-1].content_hash
 
 
+def test_a_link_is_checked_on_a_copy_and_leaves_the_committed_project_alone(tmp_path):
+    # The check copies the image it links, not the batch's images it shares:
+    # the project committed before the link keeps its image unlinked, and
+    # the link is a change (logged), not a no-op.
+    c = calibrated(tmp_path)
+    s = c.session
+    ops.set_marker_image(s, c.blot, None)
+    before = s.project
+    entries = len(before.log)
+    ops.set_marker_image(s, c.blot, c.marker)
+    assert before.batch.find_image(c.blot).marker_image_id is None
+    assert s.project.batch.find_image(c.blot).marker_image_id == c.marker
+    assert len(s.project.log) == entries + 1
+    assert s.project.log[-1].action == "set_marker_image"
+
+
 def test_a_padding_reports_the_change_of_a_net_under_one(tmp_path):
     s, _, beta = boxed(tmp_path)
     band_id = ops.place_box(s, beta, NARROW_X, ROW, lane_index=0, grow=True)
@@ -334,12 +406,14 @@ def test_a_padding_reports_the_change_of_a_net_under_one(tmp_path):
 BOX_FIELDS = frozenset({"bands", "box_size", "box_padding", "undetected", "fitted_size"})
 # The stored shape's other fields the accessors serve: any read, write or
 # deletion of one outside the model, whatever holds it, is listed.
-SHAPE_FIELDS = frozenset({"lanes", "images", "image_id"})
-# The membrane's methods the batch's accessors of the same name wrap, by the
-# number of arguments the membrane's takes (the batch's take the membrane first).
+SHAPE_FIELDS = frozenset(
+    {"lanes", "images", "image_id", "arenas", "rows", "lane_tables", "lane_table_id", "arena_id"}
+)
+# The register-group methods the batch serves, by the number of arguments a
+# membrane's own would take (the batch's take the membrane first).
 GROUP_METHODS = {"register_groups": 0, "group_of": 1}
 # The stored records whose constructors take those fields.
-RECORDS = frozenset({"Batch", "Membrane", "Protein"})
+RECORDS = frozenset({"Batch", "LaneTable", "Membrane", "Arena", "Protein", "Row"})
 
 
 @dataclass(frozen=True, order=True)
@@ -587,6 +661,12 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "core/rowdetect.py detect_row_along: found.lanes",
     ),
     **_allow(
+        "a row detector's candidate rows of pixels (rowdetect), not a protein's rows",
+        "core/rowdetect.py _empty_lanes: cand.rows",
+        "core/rowdetect.py _slot_surfaces: cand.rows",
+        "core/rowdetect.py _stage2_free: res.cand.rows",
+    ),
+    **_allow(
         "an answer, a request body, a result set, a series, reduced samples or the undo"
         " history: not the stored batch",
         "core/export.py result_set_table: results.lanes",
@@ -608,33 +688,36 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "web/results_view.py _series: series.undetected",
     ),
     **_allow(
-        "the batch's lane table as a whole (declared and written, exported, shown, computed"
-        " over): no membrane or protein to ask for; #222 adds no accessor for it",
-        "core/operations.py export_bundle: batch.lanes",
-        "core/operations.py export_lane_table: batch.lanes",
-        "core/operations.py set_lanes: batch.lanes",
-        "core/operations.py set_lanes.change: draft.batch.lanes",
-        "core/operations.py set_reference_condition: batch.lanes",
-        "core/results.py _compute: batch.lanes",
-        "core/results.py compute_results: batch.lanes",
-        "web/state.py project_state: batch.lanes",
+        "a writer of the stored shape, which changes with it: the import adds an image to the"
+        " batch, after its membrane's images, and its membrane's area on it, and makes the"
+        " project's lane table while it has none; the removal takes the image and that area"
+        " out; adding a protein builds it with its row on its image's area; the lane table's"
+        " declaration writes the project's one table; and the results build a copy of the"
+        " batch with every lane of its tables included",
+        "core/operations.py _image_slot: arena.image_id",
+        "core/operations.py _image_slot: batch.images",
+        "core/operations.py _image_slot: m.arenas",
+        "core/operations.py _lane_table: draft.batch.lane_tables",
+        "core/operations.py add_protein.change: Protein(...).rows",
+        "core/operations.py add_protein.change: Row(...).arena_id",
+        "core/operations.py add_protein.change: Row(...).box_size",
+        "core/operations.py import_image.change: Arena(...).image_id",
+        "core/operations.py import_image.change: Membrane(...).lane_table_id",
+        "core/operations.py import_image.change: batch.images",
+        "core/operations.py import_image.change: membrane.arenas",
+        "core/operations.py remove_image.change: arena.image_id",
+        "core/operations.py remove_image.change: batch.images",
+        "core/operations.py remove_image.change: membrane.arenas",
+        "core/operations.py set_lanes.change: draft.batch.lane_tables",
+        "core/operations.py set_lanes.change: table.lanes",
+        "core/results.py compute_results: batch.lane_tables",
+        "core/results.py compute_results: batch.model_copy(update=...).lane_tables",
+        "core/results.py compute_results: table.lanes",
+        "core/results.py compute_results: table.model_copy(update=...).lanes",
     ),
     **_allow(
-        "a function of a membrane alone, which tests and the schema-2 fixture tool call"
-        " with a membrane: it takes the batch when the stored shape changes",
-        "core/mwcal.py calibration_for: membrane.group_of",
-        "core/mwcal.py calibrations: membrane.register_groups",
-        "core/operations.py calibration_fit: membrane.images",
-    ),
-    **_allow(
-        "a writer of the stored shape, which changes with it: the import adds an image to its"
-        " membrane, the removal takes it out, adding a protein builds it on its image with"
-        " its box size, and the results build a copy of the batch with every lane included",
-        "core/operations.py add_protein.change: Protein(...).box_size",
-        "core/operations.py add_protein.change: Protein(...).image_id",
-        "core/operations.py import_image.change: membrane.images",
-        "core/operations.py remove_image.change: membrane.images",
-        "core/results.py compute_results: batch.model_copy(update=...).lanes",
+        "a copy of the batch to check a marker link on, with the one image it links copied",
+        "core/operations.py set_marker_image: batch.model_copy(update=...).images",
     ),
 }
 
@@ -671,6 +754,20 @@ def test_allowed_readers_are_still_there():
         ("def f(before):\n    return [i.id for i in before.membranes[0].images]\n", "images"),
         ("def f(membrane):\n    return membrane.images\n", "images"),
         ("def f(protein):\n    return protein.image_id\n", "image_id"),
+        # The schema-3 shape (#223): areas, rows and lane tables.
+        ("def f(membrane):\n    return [a.id for a in membrane.arenas]\n", "arenas"),
+        ("def f(protein):\n    return protein.rows[0]\n", "rows"),
+        ("def f(batch):\n    return batch.lane_tables[0].id\n", "lane_tables"),
+        ("def f(membrane):\n    return membrane.lane_table_id\n", "lane_table_id"),
+        ("def f(row):\n    return row.arena_id\n", "arena_id"),
+        ("def f(table):\n    return len(table.lanes)\n", "lanes"),
+        ("def f(i):\n    return Arena(id='arena-1', image_id=i)\n", "image_id"),
+        ("def f(a, s):\n    return Row(id='row-1', arena_id=a)\n", "arena_id"),
+        ("def f(s):\n    return model.Row(id='row-1', box_size=s)\n", "box_size"),
+        ("def f(t):\n    return Membrane(id='mem-1', lane_table_id=t)\n", "lane_table_id"),
+        ("def f(r):\n    return Protein(id='prot-1', rows=r)\n", "rows"),
+        ("def f(n):\n    return LaneTable(id='lt-1', lanes=n)\n", "lanes"),
+        ("def f(b):\n    return b.model_copy(update={'arenas': []})\n", "arenas"),
         # Writes and deletions, constructors and updates of the stored shape.
         ("def f(membrane, kept):\n    membrane.images = kept\n", "images"),
         ("def f(after, lanes):\n    after.lanes = lanes\n", "lanes"),
@@ -728,6 +825,12 @@ def test_the_check_passes_reads_through_the_accessors():
         "        committed.image_id_of(protein),\n"
         "        committed.group_of(membrane, image_id),\n"
         "        batch.register_groups(membrane),\n"
+        "        batch.only_lanes(),\n"
+        "        batch.lane_table_of(membrane).id,\n"
+        "        batch.arenas_on(image_id),\n"
+        "        batch.find_arena(image_id)[1].id,\n"
+        "        batch.only_row(protein).id,\n"
+        "        Arena(id='arena-1', source='manual'),\n"
         "        Protein(id='prot-1', name='p53'),\n"
         "        protein.model_copy(update={'name': 'p53'}),\n"
         "        g,\n"
