@@ -1642,6 +1642,48 @@ def test_the_ink_set_of_a_file_it_cannot_read_is_a_value_or_os_error(tmp_path, n
         imaging.ink_set(path)
 
 
+@pytest.mark.parametrize(
+    ("data", "words"),
+    [
+        (b"II*\x00", r"^damaged µ\.tif: not a readable image \(unpack requires"),  # struct.error
+        (b"II*\x00\x08\x00\x00\x00" + b"\xff" * 40, r"^suspicious number of tags"),  # tifffile's
+    ],
+    ids=["signature-only", "damaged-page"],
+)
+def test_the_ink_set_of_a_damaged_tiff_header_is_a_value_error(tmp_path, data, words):
+    # #230: still so, as the import leaves a damaged header to reading.
+    path = tmp_path / "damaged µ.tif"
+    path.write_bytes(data)
+    with pytest.raises(ValueError, match=words):
+        imaging.ink_set(path)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+@pytest.mark.parametrize("name", ["gray µ.tif", "gray α.png"])
+def test_running_out_of_memory_while_reading_the_ink_set_is_not_a_damaged_header(
+    tmp_path, monkeypatch, name, error
+):
+    # #230: a damaged header is a ValueError, which the import takes as a
+    # header it cannot read and carries on without the ink check; running out
+    # of memory or stack must not be, as in #217's and #224's header checks.
+    # A TIFF's header is read by tifffile, any other file's by Pillow.
+    path = tmp_path / name
+    if path.suffix == ".tif":
+        tifffile.imwrite(path, _gray(np.uint16, 65535))
+    else:
+        Image.fromarray(_gray(np.uint8, 255)).save(path)
+
+    def run_out(*args, **kwargs):
+        raise error("no room")
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out)
+    monkeypatch.setattr(imaging, "_pillow_mode", run_out)
+    with pytest.raises(error, match="^no room$"):
+        imaging.ink_set(path)
+    monkeypatch.undo()
+    assert imaging.ink_set(path) is None  # a gray file: the failure alone raised
+
+
 def test_the_header_of_a_tiff_with_no_image_says_so(tmp_path, monkeypatch):
     # #207 review: the ink set says it as the other header checks do.
     empty = tmp_path / "empty.tif"

@@ -3130,6 +3130,47 @@ def test_running_out_of_memory_on_the_header_check_imports_nothing(tmp_path, mon
     assert (_stored_files(s), s.project.next_id) == ([], 1)
 
 
+def _gray_files() -> dict[str, bytes]:
+    """Gray files an import takes, by name: a TIFF, whose header the ink
+    check reads with tifffile, and a PNG, whose header it reads with Pillow."""
+    from PIL import Image
+
+    return {
+        "gray µ.tif": _tiff_bytes(blot()),
+        "gray α.png": _encoded(Image.fromarray((blot() >> 8).astype(np.uint8)), "PNG").read(),
+    }
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+@pytest.mark.parametrize("name", list(_gray_files()))
+def test_running_out_of_memory_on_the_ink_check_imports_nothing(tmp_path, monkeypatch, name, error):
+    # #230: the ink check took it for a damaged header, and the import carried
+    # on without it and imported the file. It stops instead, and stores
+    # nothing: no image, no stored copy, project.json as it was.
+    def run_out_in_the_ink_check(real):
+        def read(*args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "ink_set":
+                raise error("no room")
+            return real(*args, **kwargs)
+
+        return read
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out_in_the_ink_check(tifffile.TiffFile))
+    monkeypatch.setattr(imaging, "_pillow_mode", run_out_in_the_ink_check(imaging._pillow_mode))
+    s = session_on(tmp_path, save_to_folder)
+    saved = (s.folder / storage.PROJECT_FILE).read_bytes()
+    before, steps = s.project, s.history_steps
+    data = _gray_files()[name]
+    with pytest.raises(error, match="^no room$"):
+        ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK)
+    assert (s.project is before, s.history_steps, s.dirty) == (True, steps, False)
+    assert (_stored_files(s), s.project.next_id) == ([], 1)
+    assert (s.folder / storage.PROJECT_FILE).read_bytes() == saved
+    monkeypatch.undo()  # the file itself imports
+    assert ops.import_image(s, io.BytesIO(data), name, kind=CHEMI, polarity=DARK) == "img-1"
+    assert (s.folder / storage.PROJECT_FILE).read_bytes() != saved
+
+
 def _image_after(first: np.ndarray, **options) -> bytes:
     """A TIFF of :func:`blot` as a 16-bit image after a page ``first`` (a
     mask or a thumbnail, by ``options``): two image series."""
@@ -6211,7 +6252,7 @@ def test_dropping_records_asks_the_predicate_once_per_record(tmp_path):
         asked.append(u.lane_index)
         return u.lane_index == 1
 
-    dropped = ops._drop_undetected_where(draft.batch.find_protein(protein), drop)
+    dropped = ops._drop_undetected_where(draft.batch, draft.batch.find_protein(protein), drop)
     assert asked == [0, 1, 2]
     assert dropped == [_record_json(protein, _record(1))]
     assert [u.lane_index for u in draft.batch.find_protein(protein).undetected] == [0, 2]
