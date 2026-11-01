@@ -683,6 +683,9 @@ class ProjectSession:
         # The image names each version file in the folder holds, by its name,
         # with the size, modification time and file id they were read at.
         self._versions: dict[str, tuple[tuple[int, int, int], frozenset[str]]] = {}
+        # The files whose names kept every image file from a cleanup, logged
+        # once each in this session (_named_by_versions).
+        self._unknown_said: set[str] = set()
         self.autosave = autosave
         self.clock = clock
         self.lock = threading.RLock()
@@ -1087,8 +1090,9 @@ class ProjectSession:
             resolution = resolve(split)
             if resolution is not SET_ASIDE_OUTSIDE:  # never: the only resolution built (#101)
                 raise NotImplementedError(f"no save for {resolution}")
-            copy, moment, new = self._keep_copy(found_bytes, digest)
-            if new:  # said as it is made, whether the save then goes through or not
+            made = self._keep_copy(found_bytes, digest)
+            if made is not None:  # said as it is made, whether the save goes through or not
+                copy, moment = made
                 self._say(_set_aside_notice(name, copy, moment, version, split))
                 _log.warning(
                     "in %r: its project.json was changed outside Proteia; kept that version as"
@@ -1114,20 +1118,20 @@ class ProjectSession:
             base = self._base = dataclasses.replace(base, canonical=canonical, parsed=None)
         return base.canonical
 
-    def _keep_copy(self, data: bytes, digest: str) -> tuple[str, datetime, bool]:
-        """The conflict copy that keeps ``data`` (SHA-256 ``digest``), the
-        ``project.json`` found changed outside Proteia, when it was kept, and
-        whether it is new: the one this session kept last if it still holds
-        them, else a new one (its moment from the session clock). Called with
-        the lock held."""
+    def _keep_copy(self, data: bytes, digest: str) -> tuple[str, datetime] | None:
+        """Keep ``data`` (SHA-256 ``digest``), the ``project.json`` found
+        changed outside Proteia, in a new conflict copy: its name and when it
+        was kept (from the session clock). None when the copy this session
+        kept last still holds them: kept already, and said. Called with the
+        lock held."""
         kept = self._copy
         if kept is not None and kept[1] == digest and storage.holds(self._folder / kept[0], data):
-            return kept[0], kept[2], False
+            return None
         moment = self.clock()
         copy = storage.keep_conflict_copy(self._folder, data, moment)
         self._copy = (copy, digest, moment)
         self._kept = (copy, *self._kept)
-        return copy, moment, True
+        return copy, moment
 
     def _commit(
         self,
@@ -1482,14 +1486,26 @@ class ProjectSession:
         """The image files (lowercase names) that the other versions of the
         project in its folder name anywhere in their text (:meth:`_versions_name`),
         or None when what one of them names is unknown: for a cleanup, which
-        then deletes no image file. Called with the lock held."""
-        names, whole = self._versions_name()
-        return names if whole else None
+        then deletes no image file, and logs which file keeps them, once a
+        session for each. Called with the lock held."""
+        names, unknown = self._versions_name()
+        for name, why in unknown:
+            if name not in self._unknown_said:
+                self._unknown_said.add(name)
+                _log.warning(
+                    "in %r: image files no longer used are kept, not deleted, while what %r"
+                    " names is unknown (%s)",
+                    self._folder.name,
+                    name,
+                    why,
+                )
+        return None if unknown else names
 
-    def _versions_name(self) -> tuple[frozenset[str], bool]:
+    def _versions_name(self) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
         """The image files (lowercase names) that the other versions of the
-        project in its folder name anywhere in their text (#101), and whether
-        that is all of them: every version file
+        project in its folder name anywhere in their text (#101), and the files
+        whose names are unknown, each with why (none when that is all of
+        them): every version file
         (:func:`~proteia.core.storage.is_version`), each read once while its
         size, modification time and file id stay the same, and ``project.json``
         itself while it is not the session's base. Not all when the folder
@@ -1498,29 +1514,34 @@ class ProjectSession:
         cannot be read; the names of those read are given all the same.
         Called with the lock held."""
         names: set[str] = set()
-        whole = True
+        unknown: list[tuple[str, str]] = []
         try:
             found = storage.read_project_file(self._folder)
         except OSError:
-            found = None  # unknown, as when it is missing
-        if found is None:
-            whole = False
-        elif hashlib.sha256(found).hexdigest() != self._base.sha256:
+            found = None
+            unknown.append((storage.PROJECT_FILE, _UNREAD))
+        else:
+            if found is None:
+                unknown.append((storage.PROJECT_FILE, "it is missing"))
+        if found is not None and hashlib.sha256(found).hexdigest() != self._base.sha256:
             try:
                 names.update(storage.version_names(found))
-            except ValueError:  # not in its encoding: what it names is unknown
-                whole = False
+            except ValueError:
+                unknown.append((storage.PROJECT_FILE, _NOT_TEXT))
         try:
             paths = list(self._folder.iterdir())
         except OSError:
-            paths, whole = [], False
+            paths = []
+            unknown.append((self._folder.name, "the folder cannot be listed"))
         for path in paths:
             if storage.is_version(path.name):
                 try:
                     names.update(self._version_names(path))
-                except (OSError, ValueError):
-                    whole = False
-        return frozenset(name.lower() for name in names), whole
+                except OSError:
+                    unknown.append((path.name, _UNREAD))
+                except ValueError:
+                    unknown.append((path.name, _NOT_TEXT))
+        return frozenset(name.lower() for name in names), tuple(unknown)
 
     def _version_names(self, path: Path) -> frozenset[str]:
         """The image names the version file ``path`` holds
@@ -1559,6 +1580,11 @@ class ProjectSession:
         while number in held:
             number += 1
         return number
+
+
+# Why what a version names is unknown (ProjectSession._versions_name).
+_UNREAD: Final = "it cannot be read, or looked at"
+_NOT_TEXT: Final = "it is not text in an encoding Proteia reads"
 
 
 def _found_copies(folder: Path) -> tuple[str, ...]:

@@ -1208,44 +1208,46 @@ _SCAN_OVERLAP: Final = 64  # more than the longest name a project holds (img-, 1
 
 # A stored image's name in text: _IMAGE_NAME's rule, for a version's decoded text.
 _IMAGE_TEXT = re.compile(_IMAGE_NAME.pattern.decode("ascii"), re.IGNORECASE)
-# The byte-order marks a version's text is read by (#101), longest first: what
-# an editor or a sync tool may write a project.json as. None: UTF-8.
-_BOMS: Final = (
-    (codecs.BOM_UTF32_LE, "utf-32"),
-    (codecs.BOM_UTF32_BE, "utf-32"),
-    (codecs.BOM_UTF8, "utf-8-sig"),
-    (codecs.BOM_UTF16_LE, "utf-16"),
-    (codecs.BOM_UTF16_BE, "utf-16"),
-)
 
 
 def _encoding_of(head: bytes) -> str:
-    """The encoding a version's text is in, by the byte-order mark ``head``
-    begins with: UTF-32 or UTF-16 (little or big endian), else UTF-8."""
-    return next((encoding for bom, encoding in _BOMS if head.startswith(bom)), "utf-8")
+    """The encoding a version's text is in, by its first four bytes ``head``,
+    as JSON is read (:func:`json.detect_encoding`): the byte-order mark of
+    UTF-8, UTF-16 or UTF-32; without one, where its NUL bytes are (an editor
+    or a sync tool may write a project.json so); else UTF-8."""
+    return json.detect_encoding(head)
+
+
+def _decoded(text: str) -> str:
+    """``text`` as decoded, or ``ValueError`` when it holds a NUL: no JSON
+    does, so it was read in another encoding than its own (what it names is
+    then unknown)."""
+    if "\x00" in text:
+        raise ValueError("NUL in text: not read in its own encoding")
+    return text
 
 
 def version_names(data: bytes) -> frozenset[str]:
     """The stored image files that ``data``, the bytes of a version of the
-    project (another ``project.json``), names anywhere in its text, read in the
-    encoding its byte-order mark says (UTF-8 without one). ``UnicodeDecodeError``
-    (a ``ValueError``) for bytes that are not that encoding: what they name is
-    then unknown."""
-    text = data.decode(_encoding_of(data[:4]))
+    project (another ``project.json``), names anywhere in its text, read in its
+    encoding (:func:`_encoding_of`). ``ValueError`` (``UnicodeDecodeError``
+    among them) for bytes that are not that encoding, or text that holds a
+    NUL: what they name is then unknown."""
+    text = _decoded(data.decode(_encoding_of(data[:4])))
     return frozenset(_IMAGE_TEXT.findall(text))
 
 
 def named_images(path: Path) -> frozenset[str]:
     """:func:`version_names` of the file ``path``, read a part at a time, so
     that memory stays bounded whatever its size. An ``OSError`` and a
-    ``UnicodeDecodeError`` propagate."""
+    ``ValueError`` propagate."""
     names: set[str] = set()
     tail = ""
     with path.open("rb") as f:
         chunk = f.read(4)
         decoder = codecs.getincrementaldecoder(_encoding_of(chunk))("strict")
         while True:
-            text = tail + decoder.decode(chunk, final=not chunk)
+            text = tail + _decoded(decoder.decode(chunk, final=not chunk))
             # A name that ends where this part does may go on in the next
             # (img-3.tif, then f): it is read again there, in the overlap.
             names.update(
