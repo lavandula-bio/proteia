@@ -18,9 +18,11 @@ its :class:`Row` on one membrane area, which holds its boxes there: per lane
 and expected band, a :class:`Band` (a box), an :class:`UndetectedBand` (a
 detector measured the lane and the band stayed below its detection limit), or
 neither (not measured). A reprobe is simply another image of the same
-membrane. Until areas can be drawn, lane tables added and a protein put on
-several membranes, a project holds one area per image, each over the whole
-image and unturned, one lane table and one row per protein
+membrane. An image may hold several membranes' areas (strips cut from one
+blot, or blots side by side), each then with its outline; a box, a
+not-detected record and a calibration point belong to the one area that holds
+its centre. Until lane tables can be added and a protein put on several
+membranes, a project holds one lane table and one row per protein
 (:meth:`Batch._check_supported`). Objects refer to each other by
 stable, project-unique ids (``mem-N``, ``img-N``, ``lt-N``, ``arena-N``,
 ``prot-N``, ``row-N``, ``band-N``) and to lanes by index, never by list
@@ -38,8 +40,11 @@ background was measured, project-wide, so a batch never mixes methods:
 band's own level from the membrane around its box, or ``global_median``, the
 one image-wide median of a project quantified before #83 (a schema-1 project,
 migrated: every band's level is its image's ``background``, its mode
-``global_median`` and its spread 0, and nets floor each pixel at 0). The
-model checks that each band's mode agrees with the method; the operations keep
+``global_median`` and its spread 0, and nets floor each pixel at 0; on a
+membrane area drawn since, #243, the level is the median of the area's
+pixels, as on the image cut out there). The model checks that each band's
+mode agrees with the method, and a legacy level: its image's median over a
+whole image, one level for every band of a drawn area; the operations keep
 every value equal to what the pixels give (:mod:`proteia.core.operations`).
 
 Models are mutable. Edits go through :func:`apply_change`, which works on a copy
@@ -63,6 +68,7 @@ import itertools
 import math
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Protocol, cast
@@ -164,7 +170,12 @@ def format_timestamp(moment: datetime) -> str:
 
 
 class UnknownIdError(LookupError):
-    """No object with this id in the batch."""
+    """No object with this id in the batch. ``detail``, when given, is
+    JSON-plain data naming what was asked for (an id the message leaves out)."""
+
+    def __init__(self, message: str = "", *, detail: dict[str, JsonValue] | None = None) -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 # --- Enums: their values are the file format ---
@@ -538,7 +549,9 @@ class ImageRef(_Model):
     bit_depth: int | None = Field(default=None, ge=8, le=16)  # None = not recorded yet (#45)
     polarity: Polarity  # required: the import chooses it; there is no silent default
     # quantify.estimate_background, the global median of the analysis array: the
-    # grow seed threshold, the image-mode fallback and the legacy background.
+    # grow seed threshold, and the image-mode fallback and the legacy
+    # background of an area over the whole image (a membrane area drawn on it
+    # takes the median of its own pixels for those two instead, #243).
     background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
     # #206: the channel it is measured on; None = the mean of its red, green and
@@ -712,7 +725,7 @@ class ArenaSource(StrEnum):
 MAX_ARENA_ANGLE: Final = 45.0
 # How far outside its outline a point may lie and still count as inside, in
 # pixels: what turning the outline's edges may round away.
-_ON_EDGE: Final = 1e-9
+ON_EDGE: Final = 1e-9
 
 
 class Arena(_Model):
@@ -733,20 +746,93 @@ class Arena(_Model):
     angle_deg: Annotated[Finite, Field(ge=-MAX_ARENA_ANGLE, le=MAX_ARENA_ANGLE)] = 0.0
     source: ArenaSource
 
+    def frame(self) -> AreaFrame | None:
+        """The drawn outline's turned frame (:class:`AreaFrame`), the one
+        geometry every reading of the area uses; None for the whole image."""
+        outline = self.outline
+        if outline is None:
+            return None
+        cx, cy = outline.centre
+        turn = math.radians(self.angle_deg)
+        return AreaFrame(
+            cx=cx,
+            cy=cy,
+            cos=math.cos(turn),
+            sin=math.sin(turn),
+            half_width=(outline.x1 - outline.x0) / 2,
+            half_height=(outline.y1 - outline.y0) / 2,
+        )
+
     def contains(self, image: ImageRef, x: float, y: float) -> bool:
         """Whether the point (x, y), in pixels of ``image`` (the area's image),
         lies in the area. Closed: a point on its edge does."""
-        outline = self.outline
-        if outline is None:
+        frame = self.frame()
+        if frame is None:
             return 0 <= x <= image.width and 0 <= y <= image.height
-        cx, cy = outline.centre
-        turn = math.radians(self.angle_deg)
-        dx, dy = x - cx, y - cy
-        # The point turned back by the angle, about the outline's centre.
-        u = dx * math.cos(turn) + dy * math.sin(turn)
-        v = dy * math.cos(turn) - dx * math.sin(turn)
-        half_width, half_height = (outline.x1 - outline.x0) / 2, (outline.y1 - outline.y0) / 2
-        return abs(u) <= half_width + _ON_EDGE and abs(v) <= half_height + _ON_EDGE
+        return frame.holds(x, y)
+
+    def inside(self, image: ImageRef, x: float, y: float) -> bool:
+        """Whether the point (x, y) lies in the area past its edge
+        (:meth:`contains` less the edge)."""
+        frame = self.frame()
+        if frame is None:  # never: a whole-image area is its image's only one, sharing no point
+            return 0 < x < image.width and 0 < y < image.height
+        return frame.inside(x, y)
+
+    def corners(self, image: ImageRef) -> list[tuple[float, float]]:
+        """The area's corners in pixels of ``image``: top left, top right,
+        bottom right, bottom left, before the turn (the image's own for the
+        whole image)."""
+        frame = self.frame()
+        if frame is None:
+            w, h = float(image.width), float(image.height)
+            return [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+        a, b = frame.half_width, frame.half_height
+        return [frame.point(u, v) for u, v in ((-a, -b), (a, -b), (a, b), (-a, b))]
+
+    def bounds(self, image: ImageRef) -> tuple[int, int, int, int]:
+        """The whole pixels the area's corners span, ``(x0, y0, x1, y1)``:
+        floor of the least, ceiling of the greatest; it may reach past the image."""
+        corners = self.corners(image)
+        xs, ys = [x for x, _ in corners], [y for _, y in corners]
+        return math.floor(min(xs)), math.floor(min(ys)), math.ceil(max(xs)), math.ceil(max(ys))
+
+
+@dataclass(frozen=True)
+class AreaFrame:
+    """A drawn membrane area's outline as turned: its centre, the cosine and
+    sine of its angle (a positive angle runs its right side lower; image y runs
+    down) and its half sizes before the turn."""
+
+    cx: float
+    cy: float
+    cos: float
+    sin: float
+    half_width: float
+    half_height: float
+
+    def point(self, u: float, v: float) -> tuple[float, float]:
+        """The image point at ``(u, v)`` from the centre in the outline's own
+        axes: ``(u, v)`` turned by the angle."""
+        return self.cx + u * self.cos - v * self.sin, self.cy + u * self.sin + v * self.cos
+
+    def along(self, x: float, y: float) -> tuple[float, float]:
+        """The image point ``(x, y)`` in the outline's own axes: turned back
+        by the angle about the centre."""
+        dx, dy = x - self.cx, y - self.cy
+        return dx * self.cos + dy * self.sin, dy * self.cos - dx * self.sin
+
+    def holds(self, x: float, y: float) -> bool:
+        """Whether ``(x, y)`` lies in the turned outline, its edge included
+        (to a billionth of a pixel)."""
+        u, v = self.along(x, y)
+        return abs(u) <= self.half_width + ON_EDGE and abs(v) <= self.half_height + ON_EDGE
+
+    def inside(self, x: float, y: float) -> bool:
+        """Whether ``(x, y)`` lies in the turned outline past its edge (by
+        more than a billionth of a pixel)."""
+        u, v = self.along(x, y)
+        return abs(u) < self.half_width - ON_EDGE and abs(v) < self.half_height - ON_EDGE
 
 
 class LaneTable(_Model):
@@ -1089,6 +1175,32 @@ class LogEntry(_Model):
 _NEWER: Final = "which this Proteia build cannot read; open the project with a newer build"
 
 
+def takes_point(
+    own: Arena, other: Arena, other_first: bool, image: ImageRef, x: float, y: float
+) -> bool:
+    """Whether ``other``, another membrane area of ``own``'s image, takes the
+    point ``(x, y)`` that ``own`` holds: ``other`` holds it too, and the point
+    lies past the edge of one of them, or on the edge of both (the line two
+    areas share, as when one is cut from the other) with ``other``'s membrane
+    the earlier (``other_first``). A box, a not-detected record and a
+    calibration point belong to one area, so a point on a shared edge belongs
+    to the earlier membrane's."""
+    if not other.contains(image, x, y):
+        return False
+    return other_first or own.inside(image, x, y) or other.inside(image, x, y)
+
+
+def _sharing(
+    own: Arena, others: Iterable[tuple[Arena, bool]], image: ImageRef, x: float, y: float
+) -> Arena | None:
+    """The first of ``others`` (other areas of the image, each with whether
+    its membrane comes before ``own``'s) that takes the point ``(x, y)`` from
+    ``own`` (:func:`takes_point`), or None."""
+    return next(
+        (other for other, first in others if takes_point(own, other, first, image, x, y)), None
+    )
+
+
 class Batch(_Model):
     """One run as stored: its images, lane tables, membranes and proteins.
 
@@ -1138,11 +1250,30 @@ class Batch(_Model):
             if arena.image_id == image_id
         ]
 
+    def membranes_on(self, image_id: str) -> list[Membrane]:
+        """The membranes with an area on an image, in membrane order; [] for
+        an unknown image."""
+        return [membrane for membrane, _ in self.arenas_on(image_id)]
+
     def membrane_of(self, image_id: str) -> Membrane:
-        """The membrane on an image: each image holds one membrane's area."""
-        for membrane, _ in self.arenas_on(image_id):
-            return membrane
-        raise UnknownIdError(f"unknown image {image_id!r}")
+        """The membrane on an image that holds one membrane's area, as the
+        golden fixtures' generator (``tests/data/schema2``, frozen) reads it;
+        ``UnknownIdError`` for an unknown image, ``ValueError`` for one holding
+        several. The package reads :meth:`membranes_on` or an area's id."""
+        found = self.membranes_on(image_id)
+        if not found:
+            raise UnknownIdError(f"unknown image {image_id!r}")
+        if len(found) > 1:
+            raise ValueError(f"image {image_id} holds {len(found)} membranes' areas")
+        return found[0]
+
+    def membrane_number(self, membrane: Membrane) -> int:
+        """A membrane's number as the user reads it: its place in the batch,
+        from 1 (a removal renumbers the later ones)."""
+        for number, held in enumerate(self.membranes, start=1):
+            if held is membrane or held.id == membrane.id:
+                return number
+        raise UnknownIdError(f"unknown membrane {membrane.id!r}")
 
     def register_groups(self, membrane: Membrane) -> list[frozenset[str]]:
         """A membrane's images whose pixel rows line up: the connected
@@ -1221,10 +1352,42 @@ class Batch(_Model):
         """The membrane of the area a protein is quantified on."""
         return self.find_arena(self.only_row(protein).arena_id)[0]
 
+    def arena_of(self, protein: Protein) -> Arena:
+        """The membrane area a protein is quantified on (its row's; a lookup:
+        where only its id is needed, :meth:`arena_id_of`)."""
+        return self.find_arena(self.arena_id_of(protein))[1]
+
+    def arena_id_of(self, protein: Protein) -> str:
+        """The id of the membrane area a protein is quantified on: its row's."""
+        return self.only_row(protein).arena_id
+
+    def arenas_of(self, membrane: Membrane) -> list[Arena]:
+        """A membrane's areas, one per image it is on, in its order."""
+        return membrane.arenas
+
+    def area_on(self, membrane: Membrane, image_id: str) -> Arena:
+        """A membrane's area on one of its images (``UnknownIdError`` if it
+        has none there)."""
+        for arena in membrane.arenas:
+            if arena.image_id == image_id:
+                return arena
+        raise UnknownIdError(f"membrane {membrane.id} has no area on {image_id!r}")
+
     def proteins_on(self, image_id: str) -> list[Protein]:
         """The proteins quantified on an image, in batch order; [] for none."""
         on_image = {arena.id for _, arena in self.arenas_on(image_id)}
         return [p for p in self.proteins if self.only_row(p).arena_id in on_image]
+
+    def rows_on(self, image_id: str) -> list[tuple[Protein, Row]]:
+        """The rows on an image, of every membrane area there, each with its
+        protein: protein order, then row order; [] for none."""
+        on_image = {arena.id for _, arena in self.arenas_on(image_id)}
+        return [(p, row) for p in self.proteins for row in p.rows if row.arena_id in on_image]
+
+    def rows_on_arena(self, arena_id: str) -> list[tuple[Protein, Row]]:
+        """The rows on one membrane area, each with its protein: protein
+        order, then row order; [] for none."""
+        return [(p, row) for p in self.proteins for row in p.rows if row.arena_id == arena_id]
 
     def boxes_of(self, protein: Protein) -> Boxes:
         """A protein's boxes, to read and write (:class:`Boxes`): its row."""
@@ -1245,47 +1408,60 @@ class Batch(_Model):
 
     # --- Validation ---
 
-    def _check_supported(self, images: dict[str, ImageRef], twice: set[str]) -> None:
-        """What this build reads: one lane table, one membrane area per image,
-        over the whole image (:meth:`_check_whole_image_areas`), and one row
-        per protein. A file with more was written by a build that adds lane
-        tables, draws areas or puts a protein on several membranes; the message
-        names the file's part, never an id. The areas of an image listed
-        ``twice`` are not counted: :meth:`Project._check_ids` refuses its id."""
+    def _check_supported(self) -> None:
+        """What this build reads: one lane table and one row per protein. A
+        file with more was written by a build that adds lane tables or puts a
+        protein on several membranes; the message names the file's part, never
+        an id."""
         if len(self.lane_tables) > 1:
             raise ValueError(f"the project holds {len(self.lane_tables)} lane tables, {_NEWER}")
-        held = Counter(arena.image_id for membrane in self.membranes for arena in membrane.arenas)
-        for image in self.images:
-            if image.id not in twice and held[image.id] > 1:
-                raise ValueError(
-                    f"{image.original_name!r} holds {held[image.id]} membrane areas, {_NEWER}"
-                )
-        self._check_whole_image_areas(images)
         for protein in self.proteins:
             if len(protein.rows) > 1:
                 raise ValueError(
                     f"{protein.name!r} has rows on {len(protein.rows)} membrane areas, {_NEWER}"
                 )
 
-    def _check_whole_image_areas(self, images: dict[str, ImageRef]) -> None:
-        """Until areas can be drawn, each covers its whole image, unturned, as
-        an import or a conversion makes it: nothing in this build reads an
-        outline or keeps boxes to one. The checks of drawn areas below stay for
-        the build that draws them (their tests lift this one)."""
+    def _check_shared_images(
+        self, images: dict[str, ImageRef], twice: set[str]
+    ) -> dict[str, list[tuple[Arena, bool]]]:
+        """An image holding several membranes' areas holds none over the
+        whole image: each has its outline (a whole-image area would hold every
+        point of the others). Gives, per area, the other areas of its image
+        whose bounds meet its own, the only ones that can share a point with it
+        (:meth:`Arena.bounds`: whole pixels past its corners, so past the
+        edge's tolerance too), each with whether its membrane comes first
+        (:func:`takes_point`).
+        The areas of an image listed ``twice`` are left to the id check."""
+        on: dict[str, list[Arena]] = {}
         for membrane in self.membranes:
             for arena in membrane.arenas:
-                image = images.get(arena.image_id)
-                if image is None:
-                    continue  # refused below, by its id
-                if arena.outline is not None:
-                    what = "with a drawn outline"
-                elif arena.angle_deg != 0:
-                    what = f"turned by {arena.angle_deg:g} degrees"
-                elif arena.source is not ArenaSource.WHOLE_IMAGE:
-                    what = "drawn by hand"
-                else:
-                    continue
-                raise ValueError(f"{image.original_name!r} holds a membrane area {what}, {_NEWER}")
+                on.setdefault(arena.image_id, []).append(arena)
+        others: dict[str, list[tuple[Arena, bool]]] = {}
+        for image_id, arenas in on.items():
+            image = images.get(image_id)
+            if image is None or image_id in twice or len(arenas) < 2:
+                continue
+            for arena in arenas:
+                if arena.outline is None:
+                    raise ValueError(
+                        f"image {image_id} holds {len(arenas)} membrane areas and area"
+                        f" {arena.id} has no outline: an image with several areas holds none"
+                        " over the whole image"
+                    )
+            bounds = {arena.id: arena.bounds(image) for arena in arenas}
+            rank = {arena.id: number for number, arena in enumerate(arenas)}  # membrane order
+            for arena in arenas:
+                x0, y0, x1, y1 = bounds[arena.id]
+                others[arena.id] = [
+                    (other, rank[other.id] < rank[arena.id])
+                    for other in arenas
+                    if other is not arena
+                    and bounds[other.id][0] <= x1
+                    and x0 <= bounds[other.id][2]
+                    and bounds[other.id][1] <= y1
+                    and y0 <= bounds[other.id][3]
+                ]
+        return others
 
     def _check_image_order(self, images: dict[str, ImageRef]) -> None:
         """The images are listed membrane by membrane, in the order of each
@@ -1305,7 +1481,7 @@ class Batch(_Model):
         images = {image.id: image for image in self.images}
         listed = Counter(image.id for image in self.images)
         twice = {image_id for image_id, count in listed.items() if count > 1}
-        self._check_supported(images, twice)
+        self._check_supported()
         tables = {table.id: table for table in self.lane_tables}
         arenas: dict[str, tuple[Membrane, Arena]] = {}
         for membrane in self.membranes:
@@ -1335,8 +1511,9 @@ class Batch(_Model):
             if image.id not in on_some:
                 raise ValueError(f"image {image.id} is on no membrane: no membrane area is on it")
         self._check_image_order(images)
+        others = self._check_shared_images(images, twice)
         for membrane in self.membranes:
-            self._check_membrane(membrane, images)
+            self._check_membrane(membrane, images, others)
         self._check_linked_areas(images, twice)
         # After the membranes, before the proteins, as schema 2 checked them.
         if self.reference_condition is not None and self.reference_condition not in {
@@ -1345,11 +1522,18 @@ class Batch(_Model):
             raise ValueError(
                 f"reference condition {self.reference_condition!r} is not a lane condition"
             )
-        self._check_proteins(images, tables, arenas, _unknown_image_rows(info))
+        self._check_proteins(images, tables, arenas, others, _unknown_image_rows(info))
         return self
 
-    def _check_membrane(self, membrane: Membrane, images: dict[str, ImageRef]) -> None:
-        """A membrane's marker links, calibration points and ladders."""
+    def _check_membrane(
+        self,
+        membrane: Membrane,
+        images: dict[str, ImageRef],
+        others: dict[str, list[tuple[Arena, bool]]],
+    ) -> None:
+        """A membrane's marker links, calibration points and ladders. A point
+        lies in its membrane's area on its image and in no other area there
+        (``others``: :meth:`_check_shared_images`)."""
         own = {arena.image_id: arena for arena in membrane.arenas}
         for image_id in own:
             image = images[image_id]
@@ -1396,6 +1580,12 @@ class Batch(_Model):
                 raise ValueError(
                     f"membrane {membrane.id}: calibration point at y={point.y} on {image.id}"
                     f" lies outside its membrane area {arena.id}"
+                )
+            shared = _sharing(arena, others.get(arena.id, ()), image, x, point.y)
+            if shared is not None:
+                raise ValueError(
+                    f"membrane {membrane.id}: calibration point at y={point.y} on {image.id}"
+                    f" lies in membrane areas {arena.id} and {shared.id}"
                 )
         for group in self.register_groups(membrane):
             self._check_ladders(membrane, group)
@@ -1477,13 +1667,16 @@ class Batch(_Model):
         images: dict[str, ImageRef],
         tables: dict[str, LaneTable],
         arenas: dict[str, tuple[Membrane, Arena]],
+        others: dict[str, list[tuple[Arena, bool]]],
         unknown_image_rows: Collection[str],
     ) -> None:
         """Each protein's name, loading controls and rows: each row on a known
         area of a signal image, its box size within the image, and each box and
         record inside the image, in a lane of its membrane's table, and centred
-        in its area. A row of ``unknown_image_rows`` (:data:`UNKNOWN_IMAGE_ROWS`)
-        is refused for the image its schema-2 protein named."""
+        in its area and in no other area of the image (``others``:
+        :meth:`_check_shared_images`). A row of ``unknown_image_rows``
+        (:data:`UNKNOWN_IMAGE_ROWS`) is refused for the image its schema-2
+        protein named."""
         roles = {protein.id: protein.role for protein in self.proteins}
         names: set[str] = set()
         for protein in self.proteins:
@@ -1519,10 +1712,17 @@ class Batch(_Model):
                 if roles[lc_id] is not Role.LOADING_CONTROL:
                     raise ValueError(f"protein {protein.id}: {lc_id} is not a loading control")
             for row, arena, image, lanes in placed:
-                self._check_row(protein, row, arena, image, len(lanes))
+                self._check_row(protein, row, arena, others.get(arena.id, ()), image, len(lanes))
 
     @staticmethod
-    def _check_row(protein: Protein, row: Row, arena: Arena, image: ImageRef, lanes: int) -> None:
+    def _check_row(
+        protein: Protein,
+        row: Row,
+        arena: Arena,
+        others: Sequence[tuple[Arena, bool]],
+        image: ImageRef,
+        lanes: int,
+    ) -> None:
         for band in row.bands:
             if band.lane_index >= lanes:
                 raise ValueError(
@@ -1539,6 +1739,12 @@ class Batch(_Model):
                 raise ValueError(
                     f"protein {protein.id}: the centre of {band.id}'s box lies outside its"
                     f" membrane area {arena.id}"
+                )
+            shared = _sharing(arena, others, image, (x0 + x1) / 2, (y0 + y1) / 2)
+            if shared is not None:
+                raise ValueError(
+                    f"protein {protein.id}: the centre of {band.id}'s box lies in membrane"
+                    f" areas {arena.id} and {shared.id}"
                 )
         for record in row.undetected:
             if record.lane_index >= lanes:
@@ -1559,6 +1765,13 @@ class Batch(_Model):
                     f"protein {protein.id}: the not-detected region in lane"
                     f" {lane_number(record.lane_index)} lies outside its membrane area"
                     f" {arena.id}"
+                )
+            shared = _sharing(arena, others, image, cx, cy)
+            if shared is not None:
+                raise ValueError(
+                    f"protein {protein.id}: the not-detected region in lane"
+                    f" {lane_number(record.lane_index)} lies in membrane areas {arena.id} and"
+                    f" {shared.id}"
                 )
 
 
@@ -1619,27 +1832,59 @@ class Project(_Model):
         legacy = self.background_method == LEGACY_BACKGROUND_METHOD
         batch = self.batch
         images = {image.id: image for image in batch.images}
+        # A drawn area's level is the median of its pixels (#243), which the
+        # model, holding none, cannot check: one level for every band on the
+        # area, its first band's.
+        drawn = {
+            arena.id
+            for membrane in batch.membranes
+            for arena in membrane.arenas
+            if arena.outline is not None
+        }
         medians = {
             arena.id: images[arena.image_id].background
             for membrane in batch.membranes
             for arena in membrane.arenas
+            if arena.id not in drawn
         }
+        firsts: dict[str, Band] = {}
         for protein in batch.proteins:
             for row in protein.rows:
                 for band in row.bands:
-                    self._check_legacy_band(band, legacy, medians[row.arena_id])
+                    area = row.arena_id
+                    first = firsts.setdefault(area, band) if area in drawn else None
+                    self._check_legacy_band(band, legacy, medians.get(area), first)
         return self
 
-    def _check_legacy_band(self, band: Band, legacy: bool, median: float) -> None:
+    def _check_legacy_band(
+        self, band: Band, legacy: bool, median: float | None, first: Band | None
+    ) -> None:
+        """The legacy values of one band: over a whole image, its image's
+        ``median``; on a drawn area, the level of the ``first`` band there."""
         if (band.background_mode == LEGACY_BACKGROUND_METHOD) != legacy:
             raise ValueError(
                 f"band {band.id}: background mode {band.background_mode!r} does not"
                 f" belong to the project's background method {self.background_method!r}"
             )
-        if legacy and (band.background_level != median or band.background_spread != 0):
+        if not legacy:
+            return
+        if first is None:
+            if band.background_level != median or band.background_spread != 0:
+                raise ValueError(
+                    f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background is its"
+                    " image's median, with no spread"
+                )
+        elif band.background_spread != 0:
             raise ValueError(
-                f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background is its"
-                " image's median, with no spread"
+                f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background on a drawn membrane"
+                " area has no spread"
+            )
+        elif band.background_level != first.background_level:
+            raise ValueError(
+                f"bands {first.id} and {band.id} lie on one drawn membrane area at the levels"
+                f" {first.background_level!r} and {band.background_level!r}: a"
+                f" {LEGACY_BACKGROUND_METHOD} background there is that area's median, the same"
+                " for every band on it"
             )
 
     @model_validator(mode="after")

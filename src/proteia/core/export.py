@@ -58,7 +58,7 @@ from proteia.core.analyze import (
     TestScale,
     registered_test,
 )
-from proteia.core.model import lane_number
+from proteia.core.model import Batch, lane_number
 from proteia.core.names import name_key
 from proteia.core.plotspec import PlotSpec, ValueKind
 from proteia.core.results import Level, Notice, Results, SeriesResult
@@ -509,6 +509,7 @@ def bundle_files(
     exported_at: str,
     name_fits: Callable[[str], bool] = _fits_anywhere,
     statement_in_charts: bool = False,
+    membranes: Sequence[tuple[str, Sequence[str]]] = (),
 ) -> dict[str, bytes]:
     """Every file of a bundle but its record, by name, in the order to write them.
 
@@ -521,7 +522,10 @@ def bundle_files(
     lanes).csv``, ``chart β-catenin ÷ α-tubulin (All lanes).svg``. A series with
     no chart (no value, or no usable reference) has no chart file. The README
     gives each chart's legend (its statement) as its caption; with
-    ``statement_in_charts`` each image draws it under the chart too.
+    ``statement_in_charts`` each image draws it under the chart too. It maps
+    each membrane label to where that membrane lies (``membranes``: each
+    label with a line per image, :func:`membrane_lines`), since a label is the
+    membrane's place in the project and a removal renumbers the later ones.
 
     ``name_fits`` tells whether the folder takes a file name
     (:func:`~proteia.core.storage.name_fits` for the folder's path). The
@@ -588,8 +592,30 @@ def bundle_files(
             (stem, chart.statement) for (_, _, chart), stem in zip(charted, stems, strict=True)
         ],
         statement_in_charts=statement_in_charts,
+        membranes=membranes,
     )
     return files
+
+
+def membrane_lines(batch: Batch) -> list[tuple[str, list[str]]]:
+    """Each membrane's label ("Membrane 1") and, per image it is on, where it
+    lies there, as an export's README maps them (#243): the whole image, or
+    its outline's corners before the turn and the angle."""
+    mapped = []
+    for number, membrane in enumerate(batch.membranes, start=1):
+        lines = []
+        for arena in batch.arenas_of(membrane):
+            image = batch.find_image(arena.image_id)
+            outline = arena.outline
+            if outline is None:
+                where = "the whole image"
+            else:
+                where = f"the rectangle ({outline.x0}, {outline.y0})-({outline.x1}, {outline.y1})"
+            if arena.angle_deg:
+                where += f", turned {arena.angle_deg:g}°"
+            lines.append(f"{image.original_name}: {where}")
+        mapped.append((f"Membrane {number}", lines))
+    return mapped
 
 
 def _paragraph(text: str, indent: str = "") -> list[str]:
@@ -742,6 +768,7 @@ def _readme(
     renamed: Sequence[str] = (),
     legends: Sequence[tuple[str, Sequence[str]]] = (),
     statement_in_charts: bool = False,
+    membranes: Sequence[tuple[str, Sequence[str]]] = (),
 ) -> bytes:
     """The README of a bundle: what it holds and how to read it, in plain text
     (UTF-8, LF). ``about`` describes each file, in order; ``no_chart`` says why
@@ -856,6 +883,23 @@ def _readme(
             break_long_words=False,
             break_on_hyphens=False,
         )
+    if membranes:
+        lines += ["", "Membranes", "---------", ""]
+        lines += _paragraph(
+            "Each membrane's label, its place in the project when this was exported, and"
+            " where it lies on each of its images, in image pixels from the top left."
+        )
+        for label, places in membranes:
+            lines.append(label)
+            for place in places:
+                lines += textwrap.wrap(
+                    place,
+                    _WIDTH,
+                    initial_indent="    ",
+                    subsequent_indent="      ",
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
     if legends:
         lines += ["", "Legends", "-------", ""]
         for stem, statement in legends:

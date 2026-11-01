@@ -165,7 +165,8 @@ class NoticeCode(StrEnum):
     POSSIBLY_CLIPPED = "possibly_clipped"
     BELOW_DETECTION = "below_detection"  # not-detected records in included lanes: no value
     # Bands whose ring is cut short (by the image edge or other boxes): their
-    # level is a robust plane or the image median (quantify.band_backgrounds).
+    # level is a robust plane or the image median, a drawn membrane area's own
+    # on one (quantify.band_backgrounds).
     BACKGROUND_FALLBACK = "background_fallback"
     # Bands whose background differs around the box by more than the QC limit.
     BACKGROUND_UNEVEN = "background_uneven"
@@ -484,16 +485,24 @@ def _background_notices(
     a ring cut short (``background_fallback``), and a background uneven around
     the box, its spread moving the net by more than
     :data:`~proteia.core.quantify.BACKGROUND_UNEVEN_LIMIT` of it
-    (``background_uneven``, also for any spread under a net of 0)."""
+    (``background_uneven``, also for any spread under a net of 0). On a drawn
+    membrane area (#243), whose outline cuts a ring as the image edge does,
+    the first names the outline too."""
     size = batch.boxes_of(protein).box_size
     shown = [(i, band) for i, band in enumerate(bands) if band is not None and included[i]]
     cut = tuple(i for i, band in shown if band.background_mode in _FALLBACK_MODES)
     if cut:
+        drawn = batch.find_arena(batch.arena_id_of(protein))[1].outline is not None
+        edges, cropping = (
+            ("the image edge, its membrane area's outline", "cropping or drawing the outline")
+            if drawn
+            else ("the image edge", "cropping")
+        )
         note(
             NoticeCode.BACKGROUND_FALLBACK,
             f"{protein.name!r} has too little membrane around its box in {lanes_phrase(cut)}:"
-            " the image edge or other boxes cut it, so the background there is estimated"
-            f" less surely; when cropping, leave about {size.height} px above and below the"
+            f" {edges} or other boxes cut it, so the background there is estimated"
+            f" less surely; when {cropping}, leave about {size.height} px above and below the"
             f" bands and {round(0.4 * size.width)} px beside them (one box height, 0.4"
             " box width)",
             protein_ids=(protein.id,),
@@ -1102,15 +1111,18 @@ def _tilt_reference(
 def _rows_tilted(
     batch: model.Batch,
     image_id: str,
+    where: str,
     fitted: mwcal.Calibration,
     proteins: Sequence[model.Protein],
     joined: Mapping[str, list[model.Band | None]],
     included: list[bool],
     note: Callable[..., None],
 ) -> None:
-    """``rows_tilted`` for one image (#58): how far the rows of its proteins
-    slope against the protein line (its one ladder's level line, or the line
-    between its two ladders). Per protein with at least :data:`TILT_MIN_LANES`
+    """``rows_tilted`` for one membrane area (#58): how far the rows of its
+    proteins slope against the protein line (its one ladder's level line, or
+    the line between its two ladders), worded as ``where`` names the rows
+    (the image's, or a membrane's on an image of several, #243). Per
+    protein with at least :data:`TILT_MIN_LANES`
     boxes (:func:`_tilt_boxes`), each box centre's offset from the line at
     :func:`_tilt_reference` and the least-squares slope of those offsets
     across the lanes; the median slope over the lanes' span gives the drift,
@@ -1171,7 +1183,7 @@ def _rows_tilted(
     by = f"by up to {drift:.0%}" if math.isfinite(drift) else "past any MW"
     note(
         NoticeCode.ROWS_TILTED,
-        f"{image_id}'s rows slope by about {angle:.1f}° against {against}"
+        f"{where} slope by about {angle:.1f}° against {against}"
         f" ({shift:.0f} px across the lanes), so apparent MWs drift {by} from one side to"
         f" the other; {advice}, or widen the tolerance",
         protein_ids=tuple(protein.id for protein in proteins),
@@ -1188,14 +1200,15 @@ def _mw_notices(
     note: Callable[..., None],
 ) -> None:
     """Every MW, band-count and calibration notice of a set (#58), given each
-    protein's image (``image_ids``, by protein id): per protein,
-    then per register group with boxes in the set's lanes, then per image.
-    The notices of a group or an image name every protein boxed on its images
-    in any lane, so that the two result sets' copies of one name the same
-    proteins (the all-lanes view tells them apart by code and proteins)."""
+    protein's image (``image_ids``) and its calibration (``fits``), by protein
+    id: per protein, then per register group with boxes in the set's lanes,
+    then per membrane area. The notices of a group or an area name every
+    protein boxed on its images in any lane, so that the two result sets'
+    copies of one name the same proteins (the all-lanes view tells them apart
+    by code and proteins). A membrane's group or area holds its own proteins
+    only: two membranes on one image have their own curves (#243)."""
     for protein in batch.proteins:
-        fitted = fits[image_ids[protein.id]]
-        _mw_protein_notices(batch, protein, fitted, joined[protein.id], included, note)
+        _mw_protein_notices(batch, protein, fits[protein.id], joined[protein.id], included, note)
     boxed = [
         protein
         for protein in batch.proteins
@@ -1206,16 +1219,29 @@ def _mw_notices(
         for protein in boxed
         if any(band is not None and included[i] for i, band in enumerate(joined[protein.id]))
     }
+    areas = {protein.id: batch.arena_id_of(protein) for protein in boxed}
     for membrane in batch.membranes:
+        own = {arena.id for arena in batch.arenas_of(membrane)}
         for group, fitted in mwcal.calibrations(batch, membrane).items():
-            on = tuple(protein.id for protein in boxed if image_ids[protein.id] in group)
+            on = tuple(
+                protein.id
+                for protein in boxed
+                if areas[protein.id] in own and image_ids[protein.id] in group
+            )
             if in_set.intersection(on) and isinstance(fitted, mwcal.Calibration):
                 _calibration_notices(batch, membrane, group, fitted, on, note)
-    for image in batch.iter_images():
-        fitted = fits.get(image.id)
-        on_image = [protein for protein in boxed if image_ids[protein.id] == image.id]
-        if in_set.intersection(p.id for p in on_image) and isinstance(fitted, mwcal.Calibration):
-            _rows_tilted(batch, image.id, fitted, on_image, joined, included, note)
+    for membrane in batch.membranes:
+        for arena in batch.arenas_of(membrane):
+            on_area = [protein for protein in boxed if areas[protein.id] == arena.id]
+            if not in_set.intersection(p.id for p in on_area):
+                continue
+            fitted = fits[on_area[0].id]
+            if isinstance(fitted, mwcal.Calibration):
+                where = f"{arena.image_id}'s rows"
+                if len(batch.arenas_on(arena.image_id)) > 1:
+                    number = batch.membrane_number(membrane)
+                    where = f"membrane {number}'s rows on {arena.image_id}"
+                _rows_tilted(batch, arena.image_id, where, fitted, on_area, joined, included, note)
 
 
 def chart_test(
@@ -1558,6 +1584,38 @@ def compute_results(
     )
 
 
+def _legacy_proteins(batch: model.Batch) -> list[model.Protein]:
+    """The proteins whose nets are measured as before #83 (``global_median``,
+    which every band of such a project holds until it is requantified: the
+    model keeps one method)."""
+    return [
+        p
+        for p in batch.proteins
+        if any(b.background_mode == "global_median" for b in batch.boxes_of(p).bands)
+    ]
+
+
+def _legacy_median(batch: model.Batch, proteins: Sequence[model.Protein]) -> str:
+    """The median background the nets of ``proteins`` (:func:`_legacy_proteins`)
+    lie above, in words: the whole image's, as before #243, or, once one of
+    them is on a drawn membrane area, a drawn area's own too."""
+    if any(batch.find_arena(batch.arena_id_of(p))[1].outline is not None for p in proteins):
+        return "the median background of the whole image, or of a drawn membrane area,"
+    return "the whole-image median background,"
+
+
+def legacy_offer(batch: model.Batch) -> str | None:
+    """The page's words for its offer to requantify a project measured as
+    before #83 (``legacy_background`` says the same): which median its nets
+    use; None while no net is measured that way."""
+    proteins = _legacy_proteins(batch)
+    if not proteins:
+        return None
+    return (
+        f"The nets use {_legacy_median(batch, proteins)} as measured before the local background."
+    )
+
+
 def _compute(
     batch: model.Batch,
     *,
@@ -1605,13 +1663,16 @@ def _compute(
     joined = {protein.id: _join(batch, protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
-    # Each protein's image, read once, and each image's calibration (#58), fitted
-    # once from the stored points.
+    # Each protein's image, read once, and each membrane area's calibration
+    # (#58), fitted once from the stored points: two membranes on one image
+    # each have their own (#243).
     image_ids = {p.id: batch.image_id_of(p) for p in batch.proteins}
-    fits = {
-        image_id: mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
-        for image_id in dict.fromkeys(image_ids.values())
-    }
+    arena_ids = {p.id: batch.arena_id_of(p) for p in batch.proteins}
+    area_fits: dict[str, _Fitted] = {}
+    for arena_id in dict.fromkeys(arena_ids.values()):
+        membrane, arena = batch.find_arena(arena_id)
+        area_fits[arena_id] = mwcal.calibration_for(batch, membrane, arena.image_id)
+    fits = {protein_id: area_fits[arena_id] for protein_id, arena_id in arena_ids.items()}
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -1629,18 +1690,16 @@ def _compute(
             mw_check=[
                 None
                 if band is None
-                else _mw_check(
-                    p.expected_mw, p.mw_tolerance, fits[image_ids[p.id]], band.apparent_mw
-                )
+                else _mw_check(p.expected_mw, p.mw_tolerance, fits[p.id], band.apparent_mw)
                 for band in joined[p.id]
             ],
-            mw_not_run=_mw_not_run(p, fits[image_ids[p.id]]),
+            mw_not_run=_mw_not_run(p, fits[p.id]),
             bands_found=_field(joined[p.id], "bands_found"),
             count_check=[
                 None if band is None else _count_check(band, p.expected_band_count)
                 for band in joined[p.id]
             ],
-            calibration=_image_calibration(fits[image_ids[p.id]]),
+            calibration=_image_calibration(fits[p.id]),
         )
         for p in batch.proteins
     ]
@@ -1655,20 +1714,13 @@ def _compute(
             " each lane uses its first band",
             protein_ids=extra,
         )
-    # A project quantified before #83 keeps the whole-image median until it is
-    # requantified; every band then has this mode (the model keeps one method).
-    legacy = tuple(
-        p.id
-        for p in batch.proteins
-        if any(b.background_mode == "global_median" for b in batch.boxes_of(p).bands)
-    )
+    legacy = _legacy_proteins(batch)
     if legacy:
         note(
             NoticeCode.LEGACY_BACKGROUND,
-            "nets use the whole-image median background, as measured before the local"
-            " background; requantify to measure each band's background from the membrane"
-            " around its box",
-            protein_ids=legacy,
+            f"nets use {_legacy_median(batch, legacy)} as measured before the local background;"
+            " requantify to measure each band's background from the membrane around its box",
+            protein_ids=tuple(p.id for p in legacy),
         )
     for image_id, why in outdated.items():  # an image with no band has no nets to warn about
         measured = tuple(p.id for p in batch.proteins_on(image_id) if batch.boxes_of(p).bands)

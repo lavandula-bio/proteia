@@ -29,8 +29,12 @@ which ``PUT /api/proteins/{id}/box-padding`` takes.
 (``ring_median_v1``, or ``global_median`` for a project quantified before #83,
 until it is requantified), and each band's ``background_mode`` how its own was:
 ``symmetric``, ``asymmetric`` or ``image`` (a ring cut short), or
-``global_median``. Each band's ``clipped`` says whether it is over-exposed
-(null: not checked), and ``possibly_clipped`` whether it looks so on an image
+``global_median``; ``legacy_background`` is the page's words for its offer to
+requantify the nets measured as before #83, which name a drawn membrane area's
+median once one of them lies on one (#243), or null while none is
+(:func:`~proteia.core.results.legacy_offer`). Each band's ``clipped`` says
+whether it is over-exposed (null: not checked), and ``possibly_clipped``
+whether it looks so on an image
 that check cannot trust (null: not assessed; #112). ``unassessed_images`` lists
 the images whose bands were measured before Proteia looked for pixels near the
 detector limit, which ``POST /api/requantify`` assesses
@@ -79,9 +83,16 @@ from pydantic import JsonValue
 
 from proteia.core import mwrow
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
-from proteia.core.model import Batch, ImageRef, Membrane, Project, Protein
-from proteia.core.operations import calibration_fit, unassessed_images
+from proteia.core.model import Arena, Batch, ImageRef, Membrane, Project, Protein
+from proteia.core.operations import (
+    AreaScope,
+    area_removals,
+    calibration_fit,
+    marker_adoptions,
+    unassessed_images,
+)
 from proteia.core.project import lane_anchors, lane_positions
+from proteia.core.results import legacy_offer
 from proteia.core.session import HistoryStep, ProjectSession
 
 
@@ -170,10 +181,48 @@ def _membrane(batch: Batch, membrane: Membrane) -> JsonValue:
         )
     return {
         "id": membrane.id,
+        "label": f"Membrane {batch.membrane_number(membrane)}",
         "image_ids": [image.id for image in images],
+        "arena_ids": [arena.id for arena in batch.arenas_of(membrane)],
         "ladder": calibration.ladder,
         "ladder_kda": list(calibration.ladder_kda),
         "groups": groups,
+    }
+
+
+def _arena(batch: Batch, membrane: Membrane, arena: Arena, scope: AreaScope) -> JsonValue:
+    """A membrane area as the page draws it (#243): its outline before its
+    turn (null: the whole image), its angle and source, and its ``corners``
+    (top left, top right, bottom right, bottom left, turned) and ``bounds``
+    (the whole pixels they span) from the model's geometry, so the page
+    draws what the server checks; and what removing it would take
+    (``scope``: :func:`_removal`)."""
+    image = batch.find_image(arena.image_id)
+    outline = arena.outline
+    return {
+        "id": arena.id,
+        "membrane_id": membrane.id,
+        "image_id": arena.image_id,
+        "outline": None if outline is None else [outline.x0, outline.y0, outline.x1, outline.y1],
+        "angle_deg": arena.angle_deg,
+        "source": arena.source.value,
+        "corners": [[x, y] for x, y in arena.corners(image)],
+        "bounds": list(arena.bounds(image)),
+        "removal": _removal(scope),
+    }
+
+
+def _removal(scope: AreaScope) -> JsonValue:
+    """What removing an area would take, as the removal takes it
+    (:func:`~proteia.core.operations.area_removal`): for its confirmation."""
+    return {
+        "arena_ids": list(scope.arena_ids),
+        "image_ids": list(scope.image_ids),
+        "protein_ids": list(scope.protein_ids),
+        "boxes": scope.boxes,
+        "records": scope.records,
+        "marks": scope.marks,
+        "membrane_goes": scope.membrane_goes,
     }
 
 
@@ -198,10 +247,22 @@ def project_state(
     ``action`` (null when there is none)."""
     undo, redo = session.history_steps
     batch = project.batch
+    on: dict[str, list[tuple[Membrane, Arena]]] = {image.id: [] for image in batch.iter_images()}
+    for membrane in batch.membranes:
+        for arena in batch.arenas_of(membrane):
+            on[arena.image_id].append((membrane, arena))
+    # For a chemiluminescence image, each image of its membranes it may take
+    # as its marker, with which image a link would make take the other's
+    # areas (``marker``, ``image``, or null when they hold the same areas);
+    # {} for any other image. Built once, as every area's removal scope is.
+    links = marker_adoptions(batch)
+    scopes = area_removals(batch)
     images: list[JsonValue] = [
         {
             "id": image.id,
-            "membrane_id": membrane.id,
+            "membrane_id": on[image.id][0][0].id,  # its first area's
+            "arena_ids": [arena.id for _, arena in on[image.id]],
+            "link_areas": links.get(image.id, {}),
             "original_name": image.original_name,
             "kind": image.kind.value,
             "polarity": image.polarity.value,
@@ -218,13 +279,17 @@ def project_state(
                 for warning in image.shown_warnings
             ],
         }
-        for membrane in batch.membranes
-        for image in batch.images_of(membrane)
+        for image in batch.iter_images()
     ]
-    anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
+    anchors = {
+        arena.id: lane_anchors(batch, arena.id)
+        for membrane in batch.membranes
+        for arena in batch.arenas_of(membrane)
+    }
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
         boxes, image_id = batch.boxes_of(protein), batch.image_id_of(protein)
+        arena_id = batch.arena_id_of(protein)
         size, fitted, padding = boxes.box_size, boxes.fitted_size, boxes.box_padding
         predicted = mwrow.predict(batch, protein)
         proteins.append(
@@ -233,6 +298,7 @@ def project_state(
                 "name": protein.name,
                 "role": protein.role.value,
                 "image_id": image_id,
+                "arena_id": arena_id,
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
                 "mw_tolerance": protein.mw_tolerance,
@@ -267,7 +333,7 @@ def project_state(
                     }
                     for record in boxes.undetected
                 ],
-                "missing_lanes": _missing_lanes(batch, protein, anchors[image_id], predicted),
+                "missing_lanes": _missing_lanes(batch, protein, anchors[arena_id], predicted),
                 "predicted_row": _predicted_row(predicted),
             }
         )
@@ -277,6 +343,7 @@ def project_state(
         "revision": revision(project),
         "history": {"undo": _step(undo), "redo": _step(redo)},
         "background_method": project.background_method,
+        "legacy_background": legacy_offer(batch),
         "unassessed_images": unassessed_images(batch),
         "lanes": [
             {
@@ -289,6 +356,11 @@ def project_state(
         ],
         "reference_condition": batch.reference_condition,
         "images": images,
+        "arenas": [
+            _arena(batch, membrane, arena, scopes[arena.id])
+            for membrane in batch.membranes
+            for arena in batch.arenas_of(membrane)
+        ],
         "membranes": [_membrane(batch, membrane) for membrane in batch.membranes],
         "proteins": proteins,
         "saved": not session.dirty,

@@ -14,7 +14,9 @@ Two background methods give the level ``net_signal`` subtracts;
 * ``global_median`` (:func:`estimate_background`): one level per image, the
   median of the whole analysis array, with each pixel's contribution floored at
   0 (``clamp="pixel"``). Import stores it as ``ImageRef.background``; box growing
-  seeds from it, and the ring method falls back to it.
+  seeds from it, and the ring method falls back to it. A membrane area drawn
+  on an image (#243) is the image cut out along its outline: its level is the
+  median of its pixels alone, as the cut-out image would store.
 * ``ring_median`` version 1 (:func:`band_backgrounds`, #83): one level per band,
   from the membrane around its own box, with the box total floored once at 0
   (:data:`RING_CLAMP`), so noise around the level cancels instead of adding up
@@ -54,7 +56,7 @@ otherwise):
    axis holding :data:`RING_PLANE_SIDE` of the ring on each side of the centre,
    clamped to the range of the kept pixels (never an extrapolation). Fewer than
    ``max(10, S/4)`` ring pixels (``image``, :data:`RING_IMAGE_MIN`): the image
-   median.
+   median (a drawn membrane area's own, #243).
 5. QC. A symmetric band's ``spread`` is how far apart its candidate levels lie
    beyond three standard errors. The candidates are the ring level, the lifted
    level and the midpoints of opposite sides: the mean of the left and right
@@ -79,8 +81,9 @@ Multi-channel images are reduced to a single grayscale channel by
 
 from __future__ import annotations
 
+import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -132,15 +135,20 @@ def _box_pixels(image: np.ndarray, box: Box, size: BoxSize) -> np.ndarray:
     return gray[y0:y1, x0:x1]
 
 
-def estimate_background(image: np.ndarray) -> float:
-    """A robust background (membrane) level: the median of the grayscale image.
+def estimate_background(image: np.ndarray, inside: np.ndarray | None = None) -> float:
+    """A robust background (membrane) level: the median of the grayscale image,
+    or, with ``inside`` (a boolean mask of its first two dimensions), of its
+    pixels where the mask holds.
 
     On a typical blot the membrane dominates the frame, so its median is a good
     zeroth-order baseline to subtract: the ``global_median`` method, and the
     level :func:`band_backgrounds` falls back to where a box has too little
-    membrane around it.
+    membrane around it. A membrane area drawn on the image (#243) takes the
+    median of its pixels alone (``inside``), the level of the image cut out
+    along its outline: the same pixels give the same level either way.
     """
-    return float(np.median(to_grayscale(image)))
+    gray = to_grayscale(image)
+    return float(np.median(gray if inside is None else gray[inside]))
 
 
 def net_signal(
@@ -214,7 +222,8 @@ class BandBackground:
     ``level`` is in pixel units: what :func:`net_signal` subtracts. ``mode`` is
     how it was measured (:data:`BackgroundMode`): ``symmetric`` (the paired
     ring), ``asymmetric`` (too few pairs: a robust plane over the unpaired ring),
-    ``image`` (too little membrane: the image median) or ``global_median``.
+    ``image`` (too little membrane: the image median, or a drawn membrane
+    area's, #243) or ``global_median``.
     ``spread`` is QC in level units: how far apart the ring level, the lifted
     level and the midpoints of opposite sides of the box (left and right, top
     and bottom) lie beyond noise; 0 unless ``mode`` is ``symmetric``.
@@ -232,7 +241,8 @@ def band_backgrounds(
     *,
     dark_on_light: bool,
     integral: bool,
-    fallback: float,
+    fallback: float | Callable[[], float],
+    unreadable: np.ndarray | None = None,
 ) -> list[BandBackground]:
     """The ring_median background of every box on one image, in input order.
 
@@ -243,7 +253,13 @@ def band_backgrounds(
     of the other boxes. ``integral`` says the array holds whole detector counts
     (the image has a bit depth), which floors the robust sigma at half a count.
     ``fallback`` is the image-mode level: the image median
-    (:func:`estimate_background`, stored as ``ImageRef.background``).
+    (:func:`estimate_background`, stored as ``ImageRef.background``), or a
+    function giving it, asked once at most and only when a box falls back (a
+    drawn membrane area's median, #243, which reads its pixels).
+
+    ``unreadable``, an image-shaped mask, holds the pixels no ring may read
+    (outside the membrane area whose boxes ``rects`` are, #243); by default
+    none.
 
     Raises ValueError if the lists differ in length, a rect is not its size, or
     a box extends beyond the image bounds.
@@ -251,9 +267,12 @@ def band_backgrounds(
     gray = to_grayscale(array)
     boxes = _checked_rects(gray.shape, rects, sizes)
     excluded = _exclusion_mask(gray.shape, boxes)
+    if unreadable is not None:
+        excluded |= unreadable
     sign = -1.0 if dark_on_light else 1.0
     floor = _SIGMA_FLOOR_INTEGRAL if integral else _SIGMA_FLOOR_FLOAT
-    return [_band_background(gray, rect, excluded, sign, floor, float(fallback)) for rect in boxes]
+    level = functools.cache(lambda: float(fallback() if callable(fallback) else fallback))
+    return [_band_background(gray, rect, excluded, sign, floor, level) for rect in boxes]
 
 
 def quantify_nets(
@@ -461,13 +480,19 @@ def _ring(
 
 
 def _band_background(
-    gray: np.ndarray, rect: Rect, excluded: np.ndarray, sign: float, floor: float, fallback: float
+    gray: np.ndarray,
+    rect: Rect,
+    excluded: np.ndarray,
+    sign: float,
+    floor: float,
+    fallback: Callable[[], float],
 ) -> BandBackground:
     """One box's :class:`BandBackground`; ``sign`` turns pixels into signal-up
-    values (``-1`` for a dark-on-light image) and back."""
+    values (``-1`` for a dark-on-light image) and back; ``fallback()`` is the
+    image-mode level, asked for only when the ring holds too little."""
     ring = _ring(excluded, rect)
     if ring is None:
-        return BandBackground(level=fallback, mode="image", spread=0.0)
+        return BandBackground(level=fallback(), mode="image", spread=0.0)
     mode, ys, xs = ring
     x0, y0, x1, y1 = rect
     w = x1 - x0
