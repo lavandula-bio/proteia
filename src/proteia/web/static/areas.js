@@ -2,8 +2,10 @@
 // "Membranes on this image" (#243): where each membrane lies on the image
 // shown. One item per membrane area (its membrane, Edit outline, Remove), and
 // "Add membrane area". An image of one membrane has one area over the whole
-// image, drawn as a thin frame; "Edit outline" on it starts a split. Drawing
-// and editing an outline happen in an editor: a drag on the image draws the
+// image, drawn as a thin frame; "Edit outline" on it starts a split (an
+// outline cut across it gives the far side, with the rows there, to a new
+// membrane, as the server does it). Drawing and editing an outline happen in
+// an editor: a drag on the image draws the
 // rectangle, a drag inside it moves it and the handle above it turns it; the
 // fields type its corners and angle; arrow keys move it (Shift: 10 px) and
 // [ and ] turn it (Shift: 1°). Enter or Done sends it, Esc cancels; leaving
@@ -476,7 +478,12 @@ export class AreaPanel {
     );
     const arenaId = made ? made.id : draft.arenaId;
     this.handlers.choose(draft.imageId, arenaId);
-    this.handlers.status(answer.mw_lost.map((lost) => lost.message).join(" "));
+    // A cut says what went to the new membrane, in the server's words.
+    const words = [
+      answer.handed_off ? sentence(answer.handed_off) : "",
+      ...answer.mw_lost.map((lost) => lost.message),
+    ];
+    this.handlers.status(words.filter(Boolean).join(" "));
     if (here()) {
       this.focusItem(arenaId);
     }

@@ -2044,12 +2044,21 @@ def _area_id(arena_id: str) -> str:
 
 
 def _area_change(change: ops.AreaChange) -> dict[str, Any]:
-    """What drawing or redrawing an area did (:class:`~proteia.core.operations.AreaChange`)."""
+    """What drawing or redrawing an area did (:class:`~proteia.core.operations.AreaChange`):
+    after a cut, also what went to the new membrane (``handed_off``, in words;
+    null and empty otherwise)."""
     return {
         "arena_ids": list(change.arena_ids),
         "membrane_id": change.membrane_id,
         "new_membrane": change.new_membrane,
         "mw_lost": list(change.mw_lost),
+        "rest_membrane_id": change.rest_membrane_id,
+        "rest_arena_ids": list(change.rest_arena_ids),
+        "moved_proteins": list(change.moved_proteins),
+        "moved_points": change.moved_points,
+        "curves_changed": list(change.curves_changed),
+        "dropped_undetected": [list(key) for key in change.dropped_undetected],
+        "handed_off": change.handed_off,
     }
 
 
