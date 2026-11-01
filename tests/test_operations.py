@@ -26,6 +26,7 @@ import shutil
 import struct
 import sys
 import threading
+import weakref
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -1938,6 +1939,30 @@ def _refusal(name: str, inks: str, *, several: bool, uncompressed: bool) -> str:
     what = "one of its images" if several else "it"
     copy = "an uncompressed RGB or grayscale TIFF" if uncompressed else "RGB or grayscale"
     return f"{reason}; save {what} as {copy} and import it again"
+
+
+def _still_guarded() -> bool:
+    """Whether the guards of conftest's autouse fixtures are in place, as a
+    test that takes back patches of its own checks it took back only those
+    (``monkeypatch.undo()`` takes these back too): the import's refusal
+    check, the browser that fails the test, the test's own state folder."""
+    import webbrowser
+
+    state = [os.environ.get(name, "") for name in ("LOCALAPPDATA", "XDG_STATE_HOME")]
+    return (
+        hasattr(ops.import_image, "__wrapped__")
+        and getattr(webbrowser, "_tryorder", None) == ["proteia-test-guard"]
+        and all(Path(folder).name.startswith("user-state") for folder in state)
+    )
+
+
+def test_a_test_tells_the_guards_are_in_place(monkeypatch):
+    # #233 (#248 review): monkeypatch.undo() takes back the guards of the
+    # autouse fixtures too, so a test that took back its own patches that
+    # way ran the rest unguarded; the check tells them taken back.
+    assert _still_guarded()
+    monkeypatch.undo()  # nothing runs after this but the check
+    assert not _still_guarded()
 
 
 def _imports_nothing(s: ProjectSession, refused) -> OperationError:
@@ -4162,6 +4187,12 @@ _RAN_OUT = {
         " and import that"
     ),
 }
+# What an import that runs out of memory measuring the pixels of a file it
+# has read says after "cannot read '<name>': " (#233): the same next steps.
+_RAN_OUT_MEASURING = (
+    "Proteia ran out of memory measuring it; close other programs and try again, or, if the"
+    " file is very large, save a smaller copy (such as one cropped to the blot) and import that"
+)
 
 
 def _running_out(monkeypatch, case: str, error: BaseException) -> None:
@@ -4190,14 +4221,16 @@ def test_running_out_on_a_header_check_is_refused_as_reading_and_imports_nothing
     # it holds.
     name, data, _, then = _HEADER_CHECKS[case]
     error = kind("no room")
-    _running_out(monkeypatch, case, error)
     s = session_on(tmp_path, save_to_folder)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
     before = s.dirty
-    with caplog.at_level(logging.INFO, logger="proteia"):
-        refused = _imports_nothing(
-            s, lambda: ops.import_image(s, io.BytesIO(data()), name, kind=CHEMI, polarity=DARK)
-        )
+    with monkeypatch.context() as failing:  # only this patch is taken back below
+        _running_out(failing, case, error)
+        with caplog.at_level(logging.INFO, logger="proteia"):
+            refused = _imports_nothing(
+                s,
+                lambda: ops.import_image(s, io.BytesIO(data()), name, kind=CHEMI, polarity=DARK),
+            )
     assert (refused.code, refused.ids, refused.detail, str(refused)) == (
         ErrorCode.UNREADABLE_IMAGE,
         (),
@@ -4214,7 +4247,7 @@ def test_running_out_on_a_header_check_is_refused_as_reading_and_imports_nothing
     assert [record.getMessage() for record in caplog.records] == [
         f"reading {stored} (offered as {name!r}) failed: {kind.__name__}: no room"
     ]
-    monkeypatch.undo()  # close other programs and try again
+    # Close other programs and try again, with the guards in place.
     source = io.BytesIO(data())
     if then is None:
         assert ops.import_image(s, source, name, kind=CHEMI, polarity=DARK) == "img-1"
@@ -4224,6 +4257,7 @@ def test_running_out_on_a_header_check_is_refused_as_reading_and_imports_nothing
         )
         assert again.code is then
         assert "ran out" not in str(again)
+    assert _still_guarded()
 
 
 def test_running_out_of_memory_on_a_header_check_of_a_large_file_imports_a_smaller_copy(
@@ -4301,10 +4335,11 @@ def _raising(error: BaseException):
                 "_refuse_pixel_type",
                 "load_pixels",
                 "estimate_background",
+                "assess_processed",
                 "_prepare",
             )
         ],
-        *[(where, MemoryError) for where in ("_refuse_pixel_type", "assess_processed", "_prepare")],
+        *[(where, MemoryError) for where in ("_refuse_pixel_type", "_prepare")],
     ],
 )
 def test_running_out_in_the_imports_own_code_still_surfaces(tmp_path, monkeypatch, where, kind):
@@ -4313,7 +4348,8 @@ def test_running_out_in_the_imports_own_code_still_surfaces(tmp_path, monkeypatc
     # check's refusal, the conversion and measuring of the pixels, the
     # change) is a bug, and surfaces as it does: raised as it is, and
     # nothing is stored. So does running out of memory anywhere but in
-    # reading, converting the pixels and their background (#247 review).
+    # reading the file and measuring its pixels (#233): a check's refusal,
+    # the change.
     monkeypatch.setattr(ops, where, _raising(kind("no room")))
     s = session_on(tmp_path, save_to_folder)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
@@ -4336,25 +4372,28 @@ def _numpy_memory_error() -> MemoryError:
     ],
     ids=["memory", "numpy's memory"],
 )
-@pytest.mark.parametrize("where", ["load_pixels", "estimate_background"])
-def test_running_out_of_memory_converting_an_imports_pixels_is_refused(
+@pytest.mark.parametrize("where", ["load_pixels", "estimate_background", "assess_processed"])
+def test_running_out_of_memory_measuring_an_imports_pixels_is_refused(
     tmp_path, monkeypatch, caplog, where, made, kind
 ):
-    # #247 review: the steps most likely to run out on a large blot, the
-    # conversion of the pixels to the analysis array (8 bytes a pixel) and
-    # their background (a median), answered 500. Running out of memory
-    # there is refused as reading's is, nothing stored, and its next step
-    # works as it says: a copy cropped to the blot imports.
+    # #233: the steps a large blot most likely runs out of memory in, once
+    # the file is read, answered 500: the conversion of the pixels to the
+    # analysis array (8 bytes a pixel), their background (a median), the
+    # processed check (a mask of the image, a copy of a palette's). Running
+    # out of memory there is refused, nothing stored, saying it ran out
+    # measuring the file, which was read; the next step works as it says: a
+    # copy cropped to the blot imports.
     error = made()
     pixels = blot()
     cropped = np.ascontiguousarray(pixels[:, :120])
     real = getattr(ops, where)
 
-    def run_out_on_the_whole_blot(value, *args, **kwargs):
+    def run_out_on_the_whole_blot(*args, **kwargs):
+        value = args[1] if where == "assess_processed" else args[0]  # (warnings, array, ...)
         array = value.pixels if where == "load_pixels" else value
         if array.shape[1] > cropped.shape[1]:
             raise error
-        return real(value, *args, **kwargs)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(ops, where, run_out_on_the_whole_blot)
     s = session_on(tmp_path, save_to_folder)
@@ -4370,7 +4409,7 @@ def test_running_out_of_memory_converting_an_imports_pixels_is_refused(
         ErrorCode.UNREADABLE_IMAGE,
         (),
         None,
-        f"cannot read 'gel µ.tif': {_RAN_OUT[MemoryError]}",
+        f"cannot read 'gel µ.tif': {_RAN_OUT_MEASURING}",
     )
     assert refused.__cause__ is error
     assert (s.dirty, s.project.next_id, (s.folder / storage.PROJECT_FILE).read_bytes()) == (
@@ -4386,6 +4425,32 @@ def test_running_out_of_memory_converting_an_imports_pixels_is_refused(
         s, io.BytesIO(_tiff_bytes(cropped)), "gel cropped µ.tif", kind=CHEMI, polarity=DARK
     )
     np.testing.assert_array_equal(s.pixels(image_id), cropped.astype(np.float64))
+
+
+@pytest.mark.parametrize("where", ["estimate_background", "_header_inks"])
+def test_running_out_of_memory_lets_the_arrays_of_the_step_go_at_once(tmp_path, monkeypatch, where):
+    # #233: the refusal keeps the error as its cause, whose traceback holds
+    # the frames of the step that ran out, and so the large arrays they had
+    # made, as long as the refusal is kept: closing other programs and
+    # trying again would not free them. Those frames are cleared first, of
+    # measuring the pixels as of reading the file; the cause stays.
+    made = []
+
+    def run_out(*args, **kwargs):
+        large = np.ones(1_000_000)  # what the step had made when it ran out
+        made.append(weakref.ref(large))
+        raise MemoryError("no room")
+
+    monkeypatch.setattr(ops, where, run_out)
+    s = session_on(tmp_path)
+    refused = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(_tiff_bytes(blot())), "gel µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert (type(refused.__cause__), str(refused.__cause__)) == (MemoryError, "no room")
+    assert [ref() for ref in made] == [None]
 
 
 def test_running_out_in_the_autosave_hook_of_an_import_still_surfaces(tmp_path):

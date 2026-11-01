@@ -157,6 +157,7 @@ import itertools
 import logging
 import math
 import shutil
+import traceback
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from enum import Enum
@@ -184,8 +185,10 @@ from proteia.core.imaging import (
     SINGLE_IMAGE_ONLY,
     Inks,
     InkSet,
+    LoadedImage,
     NotSingleImageError,
     PixelType,
+    RefusalCause,
     assess_processed,
     check_frames,
     check_misnamed_tiff,
@@ -194,6 +197,7 @@ from proteia.core.imaging import (
     load_pixels,
     named_refusal,
     pixel_type,
+    ran_out_measuring,
     read_file,
     reads_as_palette,
 )
@@ -1471,10 +1475,10 @@ def import_image(
     (save the image again as a TIFF, PNG or JPEG file), whose library's words
     are logged instead; running out of memory (close other programs and try
     again, or save a smaller copy of a very large file) or of stack, which is
-    no damage, in a header check above too (#233, :func:`_reading`), and
-    running out of memory converting the pixels or taking their background
-    (:func:`_in_memory`), which then store nothing; an error of the system,
-    by its reason.
+    no damage, in a header check above too (#233), and running out of
+    memory measuring the pixels once read (their conversion, background and
+    processed check), said so (:func:`_run_out_refused`), which then store
+    nothing; an error of the system, by its reason.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1512,8 +1516,12 @@ def import_image(
 
     path = session.folder / storage.IMAGES_DIR / stored.file
     try:
-        _refuse_inks(original_name, _reading(_header_inks, path, original_name))
-        _refuse_pixel_type(original_name, _reading(_header_pixel_type, path, original_name))
+        _refuse_inks(
+            original_name, _run_out_refused(lambda: _header_inks(path), path, original_name)
+        )
+        _refuse_pixel_type(
+            original_name, _run_out_refused(lambda: _header_pixel_type(path), path, original_name)
+        )
         try:
             _count_misnamed_tiff(path)
             check_frames(path)  # the import's, not reading's: images imported before read so
@@ -1526,20 +1534,29 @@ def import_image(
         # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
         # bit depth, integers in the layout reading checked, convert without error.
         _refuse_pixel_type(original_name, pixel_type(read.pixels))
-        loaded = _in_memory(lambda: load_pixels(read), path, original_name)
-        if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
-            # Failing closed: inks the header check missed are refused as read,
-            # never imported converted. Reading drops an alpha channel, so the
-            # copy asked for is uncompressed by its bit depth alone.
-            _refuse_inks(original_name, Inks("cmyk", True, loaded.bit_depth != 8))
-        background = _in_memory(lambda: estimate_background(loaded.array), path, original_name)
-        warnings = assess_processed(
-            loaded.warnings,
-            loaded.array,
-            loaded.bit_depth,
-            dark_on_light=polarity.dark_on_light,
-            background=background,
-            palette=loaded.palette,
+
+        def measure() -> tuple[LoadedImage, float, list[ImageWarning]]:
+            """The pixels read, measured: the analysis array, its background
+            and the image's warnings."""
+            loaded = load_pixels(read)
+            if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
+                # Failing closed: inks the header check missed are refused as read,
+                # never imported converted. Reading drops an alpha channel, so the
+                # copy asked for is uncompressed by its bit depth alone.
+                _refuse_inks(original_name, Inks("cmyk", True, loaded.bit_depth != 8))
+            background = estimate_background(loaded.array)
+            warnings = assess_processed(
+                loaded.warnings,
+                loaded.array,
+                loaded.bit_depth,
+                dark_on_light=polarity.dark_on_light,
+                background=background,
+                palette=loaded.palette,
+            )
+            return loaded, background, warnings
+
+        loaded, background, warnings = _run_out_refused(
+            measure, path, original_name, measuring=True
         )
 
         def change(draft: Project) -> tuple[str, str, str | None]:
@@ -1624,41 +1641,42 @@ _COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grays
 
 
 def _refused_reading(
-    exc: ValueError | OSError | MemoryError | RecursionError, original_name: str, path: Path
+    exc: RefusalCause, original_name: str, path: Path, *, measuring: bool = False
 ) -> OperationError:
     """An import's refusal (``UNREADABLE_IMAGE``) of the file offered as
     ``original_name``, which reading its stored copy at ``path`` refused or
-    ran out of memory or of stack on (``exc``): named as chosen, never as
-    stored, in Proteia's words only (#220, #234, #233;
+    ran out of memory or of stack on (``exc``), or, ``measuring``, whose
+    pixels, read, ran out of memory being measured: named as chosen, never
+    as stored, in Proteia's words only (#220, #234, #233;
     :func:`~proteia.core.imaging.named_refusal`)."""
+    if measuring:
+        refusal = ran_out_measuring(path.name)
+        refusal.__cause__ = exc  # what the refusal logs
+        exc = refusal
     return OperationError(ErrorCode.UNREADABLE_IMAGE, named_refusal(exc, original_name, path))
 
 
-def _reading[T](read: Callable[[Path], T], path: Path, original_name: str) -> T:
-    """``read`` of the stored copy at ``path`` of the file offered as
-    ``original_name``, a header check of an import: running out of memory
-    or of stack in it, which the check raises as it is, is refused as
-    reading refuses it (:func:`_refused_reading`, with the error as its
-    cause), not raised (#233). Only the reading is: an error of the code
-    around it surfaces as it is."""
+def _run_out_refused[T](
+    step: Callable[[], T], path: Path, original_name: str, *, measuring: bool = False
+) -> T:
+    """``step()``, a step of an import of the file offered as
+    ``original_name`` (stored at ``path``) that may run out (#233): one of
+    reading the file (a header check, which raises running out as it is),
+    or, ``measuring``, the measuring of its pixels once read (their
+    conversion to the analysis array, their background, the processed
+    check), before anything is stored. Running out in it is refused as
+    :func:`_refused_reading` words it, not raised: of memory or of stack
+    reading the file; of memory only measuring it, as running out of stack
+    there is Proteia's own bug, raised as it is, as an error of the code
+    around the step is. The error's frames, which may hold the large arrays
+    the step made, are cleared first, so that its memory is free at once;
+    the error stays the refusal's cause."""
+    caught = MemoryError if measuring else EXHAUSTED
     try:
-        return read(path)
-    except EXHAUSTED as exc:
-        raise _refused_reading(exc, original_name, path) from exc
-
-
-def _in_memory[T](make: Callable[[], T], path: Path, original_name: str) -> T:
-    """``make()``, an import's conversion of the pixels of the file offered
-    as ``original_name`` (stored at ``path``) to its analysis array, or its
-    background, the steps a large blot most likely runs out of memory in: a
-    ``MemoryError`` is refused as reading's is (:func:`_refused_reading`,
-    whose next step a smaller copy of the file takes), not raised (#247
-    review). Running out of stack there is Proteia's own bug: raised as it
-    is, as any other error."""
-    try:
-        return make()
-    except MemoryError as exc:
-        raise _refused_reading(exc, original_name, path) from exc
+        return step()
+    except caught as exc:
+        traceback.clear_frames(exc.__traceback__)
+        raise _refused_reading(exc, original_name, path, measuring=measuring) from exc
 
 
 def _header_inks(path: Path) -> Inks | None:

@@ -366,6 +366,10 @@ _OUT_OF_STACK: Final = ("Proteia ran out of stack reading it", _SAVE_AGAIN)
 # that an import, which refuses it so (#233), never carries on without the
 # check (#217, #230).
 EXHAUSTED: Final = (MemoryError, RecursionError)
+# What a refusal of reading a file is made of (named_refusal): reading's
+# own refusal or a library's error (ValueError), an error of the system's
+# or a library's (OSError), or running out (EXHAUSTED).
+type RefusalCause = ValueError | OSError | MemoryError | RecursionError
 
 
 class _OutOfMemory(ReadingRefusal):
@@ -382,7 +386,17 @@ class _OutOfMemory(ReadingRefusal):
         return ", "
 
 
-_OUT_OF_MEMORY: Final = "Proteia ran out of memory reading it; close other programs and try again"
+# Of running out of memory, by what Proteia was doing with the file: reading
+# it, or measuring its pixels once read (an import's, #233).
+_RAN_OUT_OF_MEMORY: Final = "Proteia ran out of memory {} it; close other programs and try again"
+
+
+def ran_out_measuring(name: str) -> ReadingRefusal:
+    """The refusal of the file named ``name`` whose pixels, read, ran out of
+    memory being measured (an import's conversion of them to the analysis
+    array, their background, the processed check, #233): as running out
+    reading it, with its next steps, saying what Proteia was doing."""
+    return _OutOfMemory(name, _RAN_OUT_OF_MEMORY.format("measuring"))
 
 
 def _kind(error: BaseException) -> str:
@@ -402,7 +416,7 @@ def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
     from PIL import Image
 
     if isinstance(error, MemoryError):
-        return _OutOfMemory(name, _OUT_OF_MEMORY)
+        return _OutOfMemory(name, _RAN_OUT_OF_MEMORY.format("reading"))
     if isinstance(error, RecursionError):
         return ReadingRefusal(name, *_OUT_OF_STACK)
     if isinstance(error, Image.DecompressionBombError):
@@ -411,7 +425,7 @@ def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
 
 
 def named_refusal(
-    exc: ValueError | OSError | MemoryError | RecursionError,
+    exc: RefusalCause,
     name: str,
     stored: PurePath,
     *,
