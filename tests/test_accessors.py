@@ -761,6 +761,15 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "core/operations.py remove_arena.change: edited.arenas",
     ),
     **_allow(
+        "a writer of the stored shape, which changes with it (#243): cutting an area in two"
+        " makes a membrane with an area on each linked image and moves the rows past the cut"
+        " onto them",
+        "core/operations.py _cut_off: Arena(...).image_id",
+        "core/operations.py _cut_off: Membrane(...).lane_table_id",
+        "core/operations.py _cut_off: b.only_row(protein).arena_id",
+        "core/operations.py _cut_off: new.arenas",
+    ),
+    **_allow(
         "an answer (AreaChange), not the stored batch",
         "core/operations.py add_arena.params: result.lane_table_id",
     ),

@@ -78,8 +78,10 @@ record and a calibration point belong to the one area holding its centre, so
 the operations that place or move them refuse one outside its area
 (``OUT_OF_ARENA``) or in two (``IN_TWO_ARENAS``). A row is detected on a copy
 of the pixels in which its area alone shows (:func:`_detector_pixels`), lanes are
-proposed and rows checked from the boxes of the same area
-(:func:`~proteia.core.project.lane_anchors`), and each membrane has its own
+proposed and rows checked from the boxes of the same area, or of the image
+while the area holds none (:func:`~proteia.core.project.lane_anchors`), and
+redrawing an area to cut it in two hands the rows past the cut to a new
+membrane (:func:`edit_arena`). Each membrane has its own
 calibration on an image it shares. Which boxes a band's ring leaves out, and
 which pixels it reads, is one function's (:func:`_ring_context`): every box on
 the image, and every pixel, whatever areas are drawn, so an area's outline or
@@ -1316,10 +1318,13 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
        ``fit_quality`` (:func:`~proteia.core.mwcal.fit_quality`);
     2. recompute the ``apparent_mw`` of every band that is new, whose box
        moved or was resized, or whose image's curve changed (appeared, went,
-       or its ladders changed);
-    3. drop the MW-guided not-detected records of every protein on an image
-       whose curve changed, and clear the band counts (``bands_found``) of
-       every band there: their slot and count window came from the old curve.
+       or its ladders changed), the curve of its membrane's area there; a row
+       moved to another membrane's area (the far side of a cut area,
+       :func:`edit_arena`) changed curve when that area's differs from the
+       one it left;
+    3. drop the MW-guided not-detected records of every protein whose curve
+       changed, and clear the band counts (``bands_found``) of its bands:
+       their slot and count window came from the old curve.
 
     A refit of a fit no #58 build computed (:func:`_fitted_before_58`)
     changes the curve of every image of its membrane: their stored MWs came
@@ -1361,6 +1366,15 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
         for arena in draft.batch.arenas_of(membrane)
         if arena.id in moved_curves
     }
+    # Each protein read with another curve than its row was: its area's
+    # changed, or the row moved to an area of another curve.
+    was = {p.id: committed.batch.arena_id_of(p) for p in committed.batch.proteins}
+    rehomed: set[str] = set()
+    for protein in draft.batch.proteins:
+        now = draft.batch.arena_id_of(protein)
+        if protein.id in was and _curve(new[now]) != _curve(old.get(was[protein.id])):
+            rehomed.add(protein.id)
+            on_moved.add(draft.batch.image_id_of(protein))
     changed = [image.id for image in draft.batch.iter_images() if image.id in on_moved]
     boxes_before = {
         band.id: (band.box, committed.batch.boxes_of(protein).box_size)
@@ -1371,10 +1385,11 @@ def _refresh_mw(committed: Project, draft: Project) -> _MwRefresh:
     for protein in draft.batch.proteins:
         own, arena_id = draft.batch.boxes_of(protein), draft.batch.arena_of(protein).id
         fitted, size = new[arena_id], own.box_size
+        curve_moved = arena_id in moved_curves or protein.id in rehomed
         for band in own.bands:
-            if arena_id in moved_curves or boxes_before.get(band.id) != (band.box, size):
+            if curve_moved or boxes_before.get(band.id) != (band.box, size):
                 band.apparent_mw = _apparent_mw(fitted, band.box, size)
-        if arena_id in moved_curves:
+        if curve_moved:
             dropped.extend(_drop_mw_guided(draft.batch, protein))
             for band in own.bands:
                 band.bands_found = None
@@ -2271,13 +2286,26 @@ class AreaChange:
     edited, one per linked image, in image order; the membrane they are of;
     and the membranes it left with fewer than two ladder marks whose bands
     lost their apparent MW (``mw_lost``: ``{membrane_id, membrane, bands,
-    message}``, ``membrane`` its number)."""
+    message}``, ``membrane`` its number).
+
+    An edit that cut its area in two also gives the new membrane the far side
+    went to (``rest_membrane_id``) and its areas (``rest_arena_ids``), the
+    proteins whose rows went with it (batch order), how many calibration
+    points did, what :func:`_refresh_mw` changed, and all that in words
+    (``handed_off``, None for an edit that cut nothing)."""
 
     arena_ids: tuple[str, ...]
     membrane_id: str
     new_membrane: bool = False
     lane_table_id: str | None = None  # the lane table a new membrane uses
     mw_lost: tuple[dict[str, JsonValue], ...] = ()
+    rest_membrane_id: str | None = None
+    rest_arena_ids: tuple[str, ...] = ()
+    moved_proteins: tuple[str, ...] = ()
+    moved_points: int = 0
+    curves_changed: tuple[str, ...] = ()
+    dropped_undetected: tuple[tuple[str, int, int], ...] = ()
+    handed_off: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2459,13 +2487,17 @@ def _held(batch: Batch, membrane: Membrane, arena: Arena, image: ImageRef) -> li
     return found
 
 
-def _areas_refusal(batch: Batch, image_ids: Iterable[str]) -> OperationError | None:
+def _areas_refusal(
+    batch: Batch, image_ids: Iterable[str], *, cut: bool = False
+) -> OperationError | None:
     """On a draft ``batch`` whose membrane areas on ``image_ids`` an
     operation changed: the boxes, not-detected records and calibration
     points there that would lie outside their membrane's area
     (``ARENA_IN_USE``, naming those of the first membrane holding any, with
     their ids) or inside a second area too (``IN_TWO_ARENAS``); None when
-    every one belongs."""
+    every one belongs. With ``cut`` (an unturned outline drawn for an
+    unturned area, which can cut it in two: :func:`_cut_rest`), a refusal
+    naming boxes or records offers that cut as a next step."""
     shared: OperationError | None = None
     for image_id in image_ids:
         image = batch.find_image(image_id)
@@ -2484,11 +2516,18 @@ def _areas_refusal(batch: Batch, image_ids: Iterable[str]) -> OperationError | N
                 else:
                     records.append((cast(Protein, held.protein), cast(UndetectedBand, held.record)))
             if bands or records or points:
+                steps = "draw the outline around them, or move or remove them first"
+                if cut and (bands or records):
+                    steps = (
+                        "draw the outline around them; or cut the area in two: draw the outline"
+                        " to three of its edges, its fourth edge across the area with each"
+                        " protein's boxes all on one side of it, and the far side becomes a new"
+                        " membrane's area with what lies there; or move or remove them first"
+                    )
                 return OperationError(
                     ErrorCode.ARENA_IN_USE,
                     f"the new outline would leave {_things(image, bands, records, points)}"
-                    f" outside {_membrane_words(batch, membrane)}'s area; draw the outline around"
-                    " them, or move or remove them first",
+                    f" outside {_membrane_words(batch, membrane)}'s area; {steps}",
                     ids=(arena.id, *(band.id for _, band in bands)),
                     detail={
                         "membrane_id": membrane.id,
@@ -2690,6 +2729,73 @@ def add_arena(
     return _area_apply(session, "add_arena", change, params, lambda _: linked)
 
 
+def _cut_rest(area: Arena, image: ImageRef, drawn: Outline | None, angle: float) -> Outline | None:
+    """The far side of ``area`` when redrawing it as ``drawn`` turned by
+    ``angle`` cuts it in two along one line: neither turned (the whole image
+    counts as unturned), ``drawn`` reaching or passing three of the area's
+    sides, as they lie within the image, and its fourth side lying across the
+    area. None for any other redraw."""
+    if drawn is None or angle != 0 or (area.outline is not None and area.angle_deg != 0):
+        return None
+    old = area.outline
+    x0, y0, x1, y1 = (
+        (0, 0, image.width, image.height)
+        if old is None
+        else (max(old.x0, 0), max(old.y0, 0), min(old.x1, image.width), min(old.y1, image.height))
+    )
+    left, top, right, bottom = drawn.x0, drawn.y0, drawn.x1, drawn.y1
+    # Per side (left, top, right, bottom): across the area, or reaching its side.
+    across = [x0 < left < x1, y0 < top < y1, x0 < right < x1, y0 < bottom < y1]
+    reaching = [left <= x0, top <= y0, right >= x1, bottom >= y1]
+    if sum(across) != 1 or sum(reaching) != 3:
+        return None
+    far = [(x0, y0, left, y1), (x0, y0, x1, top), (right, y0, x1, y1), (x0, bottom, x1, y1)]
+    rx0, ry0, rx1, ry1 = far[across.index(True)]
+    return Outline(x0=rx0, y0=ry0, x1=rx1, y1=ry1)
+
+
+def _cut_plan(
+    batch: Batch, membrane: Membrane, image_ids: Sequence[str], drawn: Outline
+) -> tuple[tuple[str, ...], tuple[CalibrationPoint, ...]]:
+    """What redrawing ``membrane``'s area on ``image_ids`` as ``drawn``
+    (unturned) leaves outside it, to go to the far side of a cut
+    (:func:`_cut_rest`): the proteins whose rows there hold boxes or
+    not-detected records, all outside (batch order), and the membrane's
+    calibration points there outside it, each read where :func:`_held` reads it."""
+    outside: set[str] = set()
+    points: list[CalibrationPoint] = []
+    for image_id in image_ids:
+        image = batch.find_image(image_id)
+        probe = batch.area_on(membrane, image_id).model_copy(
+            update={"outline": drawn, "angle_deg": 0.0}
+        )
+        inside: dict[str, bool] = {}
+        for held in _held(batch, membrane, probe, image):
+            within = probe.contains(image, held.x, held.y)
+            if held.point is not None:
+                if not within:
+                    points.append(held.point)
+            else:
+                protein = cast(Protein, held.protein).id
+                inside[protein] = inside.get(protein, False) or within
+        outside.update(protein for protein, within in inside.items() if not within)
+    return tuple(p.id for p in batch.proteins if p.id in outside), tuple(points)
+
+
+def _handed_off(
+    batch: Batch, edited: Membrane, rest: Membrane, proteins: Sequence[str], points: int
+) -> str:
+    """A cut's hand-off in words: "the rest of membrane 1's area is now
+    membrane 2's, with 'GAPDH' and 1 ladder mark"."""
+    what = [f"{batch.find_protein(protein).name!r}" for protein in proteins]
+    if points:
+        what.append(f"{points} ladder mark" if points == 1 else f"{points} ladder marks")
+    return (
+        f"the rest of {_membrane_words(batch, edited)}'s area is now"
+        f" {_membrane_words(batch, rest)}'s, with {in_words(what)}"
+    )
+
+
 @_locked
 def edit_arena(
     session: ProjectSession,
@@ -2703,8 +2809,18 @@ def edit_arena(
     its ``angle_deg``; ``KEEP`` leaves one as it is. The edited area's
     ``source`` becomes ``manual``. On linked images the membrane's area on
     each is redrawn alike, in one change. No box moves and nothing is
-    measured again: the rings read the image as before, so no net and no
-    apparent MW changes. The same outline and angle are a no-op.
+    measured again: the rings read the image as before, so no net changes.
+    The same outline and angle are a no-op.
+
+    A cut. An image holding two membranes' rows on one area (a project from
+    before areas: two strips on one image) is split by redrawing the area so
+    that it cuts it in two along one line (:func:`_cut_rest`): the rows whose
+    boxes and not-detected records all lie past that line go, in the same
+    change, to a new membrane on the same lane table, whose area on each
+    linked image is the far side, unturned, with the membrane's calibration
+    points there; both membranes are refitted (:func:`_refresh_mw`), and the
+    rows moved keep their proteins, so a target keeps its loading control.
+    A redraw that leaves no row wholly past the line cuts nothing.
 
     Refused, changing nothing: an unknown area (``UnknownIdError``, worded for
     a page that showed one removed in another window); an outline that is not
@@ -2712,12 +2828,15 @@ def edit_arena(
     or the whole image for an area that shares its image (``INVALID_INPUT``);
     its centre outside the image (``OUT_OF_IMAGE``); boxes, not-detected
     records or calibration points the new outline would leave outside the area
-    (``ARENA_IN_USE``, naming them) or put inside a second area too
+    after any cut (``ARENA_IN_USE``, naming them, and for an unturned outline
+    of an unturned area offering the cut) or put inside a second area too
     (``IN_TWO_ARENAS``).
 
     The log entry holds ``arena_id``, ``outline`` (null: the whole image) and
     ``angle_deg`` as they took effect, and every area it redrew
-    (``arena_ids``)."""
+    (``arena_ids``); after a cut also ``rest_membrane_id``, ``rest_arena_ids``,
+    ``moved_proteins``, ``moved_points`` (whole) and what :func:`_refresh_mw`
+    changed (``curves_changed``, ``dropped_undetected``)."""
     batch = session.project.batch
     membrane, arena, image = _area_target(batch, arena_id)
     drawn = arena.outline
@@ -2736,6 +2855,13 @@ def edit_arena(
         return AreaChange(
             arena_ids=tuple(batch.area_on(membrane, i).id for i in linked), membrane_id=membrane.id
         )
+    can_cut = drawn is not None and angle == 0 and (arena.outline is None or arena.angle_deg == 0)
+    rest = _cut_rest(arena, image, drawn, angle)
+    moving: tuple[str, ...] = ()
+    marks: tuple[CalibrationPoint, ...] = ()
+    if rest is not None and drawn is not None:
+        moving, marks = _cut_plan(batch, membrane, linked, drawn)
+    committed = session.project
 
     def change(draft: Project) -> AreaChange:
         b = draft.batch
@@ -2747,20 +2873,86 @@ def edit_arena(
             area.angle_deg = angle
             area.source = ArenaSource.MANUAL
             ids.append(area.id)
-        refusal = _areas_refusal(b, linked)
+        handed = None
+        if moving and rest is not None:
+            handed = _cut_off(draft, edited, linked, rest, moving, marks)
+        refusal = _areas_refusal(b, linked, cut=can_cut)
         if refusal is not None:
             raise refusal
-        return AreaChange(arena_ids=tuple(ids), membrane_id=membrane.id, mw_lost=_mw_lost(batch, b))
+        if handed is None:
+            return AreaChange(
+                arena_ids=tuple(ids), membrane_id=membrane.id, mw_lost=_mw_lost(batch, b)
+            )
+        refresh = _refresh_mw(committed, draft)
+        return AreaChange(
+            arena_ids=tuple(ids),
+            membrane_id=membrane.id,
+            mw_lost=_mw_lost(batch, b),
+            rest_membrane_id=handed.id,
+            rest_arena_ids=tuple(a.id for a in b.arenas_of(handed)),
+            moved_proteins=moving,
+            moved_points=len(marks),
+            curves_changed=refresh.curves_changed,
+            dropped_undetected=tuple(
+                (r["protein_id"], r["lane_index"], r["band_index"]) for r in refresh.dropped
+            ),
+            handed_off=_handed_off(b, edited, handed, moving, len(marks)),
+        )
 
     def params(result: AreaChange) -> _Params:
-        return {
+        entry: dict[str, JsonValue] = {
             "arena_id": arena.id,
             "outline": None if drawn is None else [drawn.x0, drawn.y0, drawn.x1, drawn.y1],
             "angle_deg": angle,
             "arena_ids": list(result.arena_ids),
         }
+        if result.rest_membrane_id is not None:
+            entry |= {
+                "rest_membrane_id": result.rest_membrane_id,
+                "rest_arena_ids": list(result.rest_arena_ids),
+                "moved_proteins": list(result.moved_proteins),
+                "moved_points": [_point_json(point) for point in marks],
+                "curves_changed": list(result.curves_changed),
+                "dropped_undetected": [list(r) for r in result.dropped_undetected],
+            }
+        return entry
 
     return _area_apply(session, "edit_arena", change, params, lambda _: linked)
+
+
+def _cut_off(
+    draft: Project,
+    membrane: Membrane,
+    image_ids: Sequence[str],
+    rest: Outline,
+    proteins: Sequence[str],
+    points: Sequence[CalibrationPoint],
+) -> Membrane:
+    """In a draft, the far side of a cut (``rest``, :func:`_cut_rest`) given
+    to a new membrane on ``membrane``'s lane table: its area on each of
+    ``image_ids``, with the rows of ``proteins`` there and ``membrane``'s
+    calibration points ``points`` (:func:`_cut_plan`'s, read before the change)."""
+    b = draft.batch
+    new = Membrane(id=draft.new_id("mem"), lane_table_id=b.lane_table_of(membrane).id)
+    b.membranes.append(new)
+    areas: dict[str, str] = {}  # image id -> the new membrane's area there
+    for image_id in image_ids:
+        area = Arena(
+            id=draft.new_id("arena"),
+            image_id=image_id,
+            outline=rest.model_copy(),
+            source=ArenaSource.MANUAL,
+        )
+        new.arenas.append(area)
+        areas[image_id] = area.id
+    for protein_id in proteins:
+        protein = b.find_protein(protein_id)
+        b.only_row(protein).arena_id = areas[b.image_id_of(protein)]
+    keys = {_point_key(point) for point in points}
+    held = membrane.calibration.points
+    new.calibration.points = [point for point in held if _point_key(point) in keys]
+    membrane.calibration.points = [point for point in held if _point_key(point) not in keys]
+    return new  # the last membrane, on images listed already: their order stands
 
 
 @_locked
