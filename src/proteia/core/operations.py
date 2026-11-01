@@ -207,11 +207,13 @@ from proteia.core.imaging import (
     NotSingleImageError,
     PixelType,
     assess_processed,
+    check_frames,
     check_misnamed_tiff,
     clipping_depth,
     declared_pixel_type,
     ink_set,
     load_pixels,
+    named_refusal,
     pixel_type,
     possible_clipping_depth,
     read_file,
@@ -1806,6 +1808,18 @@ def import_image(
     again; of 1-bit pixels, that it holds no gray levels and the original is
     needed. Images imported before, with their ``unknown_bit_depth`` warning,
     keep being read so.
+
+    Any other file reading refuses is refused (``UNREADABLE_IMAGE``) by the
+    name it was offered under, in Proteia's words only (#234;
+    :func:`~proteia.core.imaging.named_refusal`): a colour space reading does
+    not convert; a file of more than one frame (an animated PNG, GIF or
+    WebP: save one frame as its own file), refused here only
+    (:func:`~proteia.core.imaging.check_frames`), so that one imported before
+    reads as it did; one damaged, or that Pillow cannot tell the format of
+    (save the image again as a TIFF, PNG or JPEG file), whose library's words
+    are logged instead; running out of memory (close other programs and try
+    again, or save a smaller copy of a very large file) or of stack, which is
+    no damage; an error of the system, by its reason.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1847,14 +1861,14 @@ def import_image(
         _refuse_pixel_type(original_name, _header_pixel_type(path))
         try:
             _count_misnamed_tiff(path)
+            check_frames(path)  # the import's, not reading's: images imported before read so
             read = read_file(path)
-        except NotSingleImageError as exc:
-            _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
-            # Named as chosen, not as stored, whatever the suffix (#220).
-            raise OperationError(ErrorCode.UNREADABLE_IMAGE, exc.refusal(original_name)) from exc
         except (ValueError, OSError) as exc:
+            if isinstance(exc, NotSingleImageError):
+                _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
+            # Named as chosen, never as stored, whatever reading refused (#220, #234).
             raise OperationError(
-                ErrorCode.UNREADABLE_IMAGE, f"cannot read {original_name!r}: {exc}"
+                ErrorCode.UNREADABLE_IMAGE, named_refusal(exc, original_name, path)
             ) from exc
         # Failing closed, before any conversion: a type no header declared (the
         # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
