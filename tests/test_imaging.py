@@ -3061,6 +3061,65 @@ def test_animation_is_told_by_pillow_and_a_failing_check_is_none():
             imaging._animated(broken(error))
 
 
+@pytest.mark.parametrize(
+    "made",
+    [
+        lambda: OSError(errno.EIO, "Input/output error"),
+        lambda: PermissionError(errno.EACCES, "Permission denied"),
+        lambda: OSError(None, "The drive was disconnected", "img-1.png"),
+    ],
+    ids=["input/output", "access", "naming the file"],
+)
+def test_an_error_of_the_systems_in_the_frame_check_is_no_answer(tmp_path, monkeypatch, made):
+    # #248 review: the frame check took any error for a still image, so a
+    # drive's that a read trying again may not meet skipped the refusal of
+    # an animation (scikit-image reads frames 3 pixels wide as channels).
+    # An error of the system's, opening the file or telling its frames, is
+    # raised as it is; a library's of a damaged file is still no answer.
+    path = tmp_path / "two frames µ.png"
+    narrow = [Image.fromarray(np.full((40, 3), level, dtype=np.uint8)) for level in (60, 120)]
+    narrow[0].save(path, save_all=True, append_images=narrow[1:])
+
+    class Broken:
+        format = "PNG"
+
+        def __init__(self, error: BaseException) -> None:
+            self.error = error
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        @property
+        def is_animated(self):
+            raise self.error
+
+    def raising(error: BaseException):
+        def open_(*args, **kwargs):
+            raise error
+
+        return open_
+
+    error = made()
+    assert imaging._animated(Broken(OSError("broken frame"))) is False
+    with pytest.raises(OSError) as raised:
+        imaging._animated(Broken(error))
+    assert raised.value is error
+    for opened in (raising(error), lambda *args, **kwargs: Broken(error)):
+        with monkeypatch.context() as patch:
+            patch.setattr(Image, "open", opened)
+            with pytest.raises(OSError) as raised:
+                imaging.check_frames(path)
+        assert raised.value is error
+    with monkeypatch.context() as patch:  # a damaged file's: left to reading
+        patch.setattr(Image, "open", raising(OSError("cannot identify image file")))
+        assert imaging.check_frames(path) is None
+    with pytest.raises(imaging.ReadingRefusal):  # with the drive back: refused for its frames
+        imaging.check_frames(path)
+
+
 @pytest.mark.parametrize("suffix", [".jpg", ".jpeg"])
 @pytest.mark.parametrize("case", list(_MPO_SIZES))
 def test_a_jpeg_of_several_pictures_reads_as_its_first_as_before(tmp_path, case, suffix):
@@ -3133,6 +3192,23 @@ def test_a_refusal_holds_proteias_words_and_logs_the_librarys(caplog, case):
     ]
 
 
+def test_a_refusal_caused_by_a_refusal_of_proteias_has_no_cause_to_log(caplog):
+    # #248: what is logged is an error of a library's or of the system's; a
+    # refusal of reading whose cause is Proteia's own refusal (no words of a
+    # library) logs none, and has no cause to log once per stored file.
+    try:
+        try:
+            raise imaging.NotSingleImageError("img-1.png", None, no_image=False)
+        except imaging.ReadingRefusal as inner:
+            raise imaging.ReadingRefusal("img-1.png", "it holds frames") from inner
+    except imaging.ReadingRefusal as outer:
+        refusal = outer
+    with caplog.at_level(logging.INFO, logger="proteia"):
+        answer = imaging.named_refusal(refusal, "gel µ.png", _STORED)
+    assert (answer, caplog.records) == ("cannot read 'gel µ.png': it holds frames", [])
+    assert imaging.refusal_cause(refusal) is None
+
+
 def test_a_refusal_of_reading_logs_its_cause_and_names_no_one_else(caplog):
     # Reading's own refusals are Proteia's words: those that a library's
     # error caused log that error; the others log nothing.
@@ -3159,11 +3235,26 @@ def test_a_refusal_of_reading_logs_its_cause_and_names_no_one_else(caplog):
     ]
 
 
-def test_a_refusal_gives_the_systems_reason_without_its_path():
+# What a refusal of an error of the system's says to do (#246): the file
+# read is the stored copy in the project's folder, whose drive or the file
+# itself may be at fault (EINVAL is both a decoder's seek where a damaged
+# file points and a drive that drops, on Windows), so the step holds for
+# both: if it still fails, an import says to save the image again, which an
+# image already in the project could not take without losing its boxes; of
+# that, the refusal says the file may be damaged.
+_CHECK_THE_DRIVE = "check that the project's folder and its drive can be read, then try again"
+_SAVE_IT_AGAIN = (
+    "; if it still fails, save the image again as a TIFF, PNG or JPEG file and import that"
+)
+_MAY_BE_DAMAGED = "; if it still fails, the file may be damaged"
+
+
+def test_a_refusal_gives_the_systems_reason_without_its_path_and_what_to_do():
     # #234 review 3: an error of the system's (it has an errno, with a path
-    # or without: a read that fails on a network drive) is no damage of the
-    # file: its reason is given, on an import as on an image already in the
-    # project. An error without an errno is a library's (damage).
+    # or without: a read that fails on a network drive) is given by its
+    # reason, on an import as on an image already in the project. #246: with
+    # a next step true whether the drive or the file is at fault. An error
+    # without an errno is a library's (damage).
     stored = _STORED
     errors = (
         FileNotFoundError(2, "No such file or directory", str(stored)),
@@ -3172,6 +3263,7 @@ def test_a_refusal_gives_the_systems_reason_without_its_path():
         OSError(None, "The drive was disconnected", str(stored)),
         OSError(errno.EIO, "Input/output error"),
         PermissionError(errno.EACCES, "Permission denied"),
+        OSError(errno.EINVAL, "Invalid argument"),
         OSError(errno.EIO, None),
     )
     reasons = [
@@ -3181,13 +3273,17 @@ def test_a_refusal_gives_the_systems_reason_without_its_path():
         "The drive was disconnected",
         "Input/output error",
         "Permission denied",
+        "Invalid argument",
         "OSError",
     ]
-    for remedy in (True, False):
+    for remedy, steps in (
+        (True, f"{_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}"),
+        (False, f"{_CHECK_THE_DRIVE}{_MAY_BE_DAMAGED}"),
+    ):
         answers = [
             imaging.named_refusal(error, "gel µ.png", stored, remedy=remedy) for error in errors
         ]
-        assert answers == [f"cannot read 'gel µ.png': {reason}" for reason in reasons]
+        assert answers == [f"cannot read 'gel µ.png': {reason}; {steps}" for reason in reasons]
     assert imaging.named_refusal(OSError("image file is truncated"), "gel µ.png", stored) == (
         f"cannot read 'gel µ.png': {_DAMAGED_WORDS.format('OSError')}"
     )
@@ -3283,6 +3379,91 @@ def test_running_out_of_memory_or_stack_while_reading_is_no_damage(
     assert pickle.loads(pickle.dumps(info.value)).refusal("gel µ.tif") == (
         info.value.refusal("gel µ.tif")
     )
+
+
+# An error of the system's that a library raises as it decodes a file, by
+# case (#246): an errno, or a file name (an open's). Reading raises it as it
+# is, for its refusal to give its reason and what to do (named_refusal):
+# from the error alone, the file's drive or the file may be at fault.
+_SYSTEM_ERRORS = {
+    "invalid argument": lambda: OSError(errno.EINVAL, "Invalid argument"),
+    "input/output": lambda: OSError(errno.EIO, "Input/output error"),
+    "access": lambda: PermissionError(errno.EACCES, "Permission denied"),
+    "naming the file": lambda: OSError(None, "The drive was disconnected", "gel µ.tif"),
+}
+
+
+def _decoding_reads(tmp_path: Path) -> dict[str, tuple[object, Path, object, str]]:
+    """Each reader's decoding of a file, by case: the reader, the file, and
+    the owner and name of what decodes it: tifffile's pixels of a TIFF,
+    Pillow's of a PNG through scikit-image, tifffile's colour map of a
+    palette TIFF read in its colours, and Pillow's of an LZW TIFF, which
+    tifffile cannot decode without imagecodecs."""
+    from PIL import ImageFile, TiffImagePlugin
+
+    gray_tif = tmp_path / "gray µ.tif"
+    _write(gray_tif, _gray(np.uint16, 65535))
+    gray_png = tmp_path / "gray β.png"
+    Image.fromarray(_gray(np.uint8, 255)).save(gray_png)
+    palette_tif = tmp_path / "palette α.tif"
+    _write(palette_tif, _gray(np.uint8, 255), photometric="palette", colormap=_palette_map())
+    lzw_tif = tmp_path / "lzw α.tif"
+    write_lzw_tiff(lzw_tif, _gray(np.uint16, 65535))
+    return {
+        "tiff pixels": (imaging.read_file, gray_tif, tifffile.TiffPageSeries, "asarray"),
+        "png pixels": (imaging.read_file, gray_png, ImageFile.ImageFile, "load"),
+        "tiff colours": (read_colours, palette_tif, tifffile.TiffPage, "colormap"),
+        "lzw tiff pixels": (imaging.read_file, lzw_tif, TiffImagePlugin.TiffImageFile, "load"),
+    }
+
+
+def _decoder_raising(monkeypatch, owner: object, name: str, error: BaseException) -> None:
+    """Make what decodes a file (``owner.name``, a method or a property) raise ``error``."""
+
+    def decode(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(owner, name, property(decode) if name == "colormap" else decode)
+
+
+@pytest.mark.parametrize("case", list(_SYSTEM_ERRORS))
+@pytest.mark.parametrize("reader", ["tiff pixels", "png pixels", "tiff colours", "lzw tiff pixels"])
+def test_an_error_of_the_systems_while_a_library_decodes_is_raised_as_it_is(
+    tmp_path, monkeypatch, reader, case
+):
+    # #246: whether a decoder's seek where a damaged file points or the
+    # drive failed, the error cannot tell: it is raised as it is, for the
+    # refusal to give its reason and a next step true of both. #248 review:
+    # the decoding of a compressed TIFF took it for its compression, which
+    # this installation cannot decode ("save the image as an uncompressed
+    # TIFF"), whatever it was.
+    read, path, owner, name = _decoding_reads(tmp_path)[reader]
+    error = _SYSTEM_ERRORS[case]()
+    _decoder_raising(monkeypatch, owner, name, error)
+    with pytest.raises(OSError) as raised:
+        read(path)
+    assert raised.value is error
+
+
+def test_a_compressed_tiff_whose_codec_fails_is_still_refused_for_its_compression(
+    tmp_path, monkeypatch
+):
+    # #248 review: only an error of the system's passes; a codec's failure,
+    # an error of no errno, is still refused as the compression this
+    # installation cannot decode, with the error as its cause.
+    from PIL import TiffImagePlugin
+
+    read, path, owner, name = _decoding_reads(tmp_path)["lzw tiff pixels"]
+    height, width = _gray(np.uint16, 65535).shape
+    error = OSError("decoder error -2")
+    _decoder_raising(monkeypatch, TiffImagePlugin.TiffImageFile, "load", error)
+    with pytest.raises(imaging.ReadingRefusal) as refused:
+        read(path)
+    assert str(refused.value) == (
+        f"{path.name}: LZW compression of this {height}x{width} uint16 MINISBLACK image cannot be"
+        " decoded by this installation; save the image as an uncompressed TIFF"
+    )
+    assert refused.value.__cause__ is error
 
 
 def test_a_refusal_for_an_image_already_imported_gives_no_remedy():

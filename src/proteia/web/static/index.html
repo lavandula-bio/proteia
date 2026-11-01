@@ -83,6 +83,18 @@
             <option value="light_on_dark">light on a dark background</option>
           </select>
         </label>
+        <!-- A colour image whose channels differ (#206), where the state offers
+          it (its channel's offered): the channel its nets are measured on; the
+          line under it says who chose it (app.js). -->
+        <label id="channel-field" class="field" hidden>Measured on
+          <select id="channel" aria-describedby="channel-why">
+            <option value="red">Red channel</option>
+            <option value="green">Green channel</option>
+            <option value="blue">Blue channel</option>
+            <option value="mean">Mean of red, green and blue</option>
+          </select>
+        </label>
+        <p id="channel-why" class="hint note" hidden></p>
         <!-- A chemiluminescence image only (calibration.js): the marker or merged
           image of its membrane taken with it, the same size pixel for pixel; one
           of another size is listed disabled, its tooltip says why. -->

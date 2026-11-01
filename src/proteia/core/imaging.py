@@ -424,6 +424,46 @@ def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
     return ReadingRefusal(name, _DAMAGED.format(_kind(error)), _SAVE_AGAIN)
 
 
+def of_the_system(error: BaseException) -> bool:
+    """Whether ``error`` is one of the system's, an ``OSError`` with an errno
+    or a file name, not a library's of a damaged file (which has neither)."""
+    return isinstance(error, OSError) and (error.errno is not None or error.filename is not None)
+
+
+def _raise_if_of_the_system(error: BaseException) -> None:
+    """Raise ``error`` if it is one of the system's (:func:`of_the_system`):
+    a reader that takes a library's error for an answer of its own (no
+    frames, a compression it cannot decode) must not take a drive's for
+    one, which a read that tries again may not meet (#246)."""
+    if of_the_system(error):
+        raise error
+
+
+# What to do of a file whose reading met an error of the system's (#246).
+# The file read is the stored copy in the project's folder. From the error
+# alone, its drive or the file may be at fault: a damaged file whose
+# offsets make a decoder seek or read where the system refuses gives
+# EINVAL, and on Windows so may a drive that drops (the C runtime's errno
+# for a Windows error it has none for). So the step holds for both: the
+# drive first; if it still fails, on an import, the image saved again, and
+# of an image already in the project, which importing again would lose the
+# boxes of, that the file may be damaged.
+_CHECK_THE_DRIVE: Final = (
+    "check that the project's folder and its drive can be read, then try again"
+)
+_STILL_FAILING: Final = {True: _SAVE_AGAIN, False: "the file may be damaged"}
+
+
+def refusal_cause(exc: BaseException) -> BaseException | None:
+    """The error of a library's or of the system's that a refusal of reading
+    (:func:`named_refusal`) logs of ``exc``; None for a refusal of Proteia's
+    own, which logs none."""
+    library = exc.__cause__ if isinstance(exc, ReadingRefusal) else exc
+    if library is None or isinstance(library, ReadingRefusal):
+        return None
+    return library
+
+
 def named_refusal(
     exc: RefusalCause,
     name: str,
@@ -436,20 +476,24 @@ def named_refusal(
     whose stored copy is at ``stored``, in Proteia's words only (#234):
     reading's own refusal for that name (:class:`ReadingRefusal`, with its
     remedy unless not ``remedy``); an error of the system's (one with an
-    errno or a file name) by its reason, which names no path; any other
-    error of a library's as a file damaged or not an image Proteia can read,
-    with the error's kind. A library's words may name the stored copy, so no
-    refusal holds them: unless not ``log``, they are logged, with the stored
-    copy's path, for diagnosis."""
-    library = exc.__cause__ if isinstance(exc, ReadingRefusal) else exc
-    if log and library is not None and not isinstance(library, ReadingRefusal):
-        _log.info(
-            "reading %s (offered as %r) failed: %s: %s", stored, name, _kind(library), library
-        )
+    errno or a file name) by its reason, which names no path, and what to
+    do, true whether the drive or the file is at fault (#246): check that
+    the project's folder and its drive can be read and try again; if it
+    still fails, save the image again, or, not ``remedy`` (an image already
+    in the project), that the file may be damaged; any other error of a
+    library's as a file damaged or not an image Proteia can read, with the
+    error's kind. A library's words may name the stored copy, so no refusal
+    holds them: unless not ``log``, they are logged, with the stored copy's
+    path, for diagnosis (:func:`refusal_cause`)."""
+    cause = refusal_cause(exc)
+    if log and cause is not None:
+        _log.info("reading %s (offered as %r) failed: %s: %s", stored, name, _kind(cause), cause)
     if isinstance(exc, ReadingRefusal):
         return exc.refusal(name, remedy=remedy)
-    if isinstance(exc, OSError) and (exc.errno is not None or exc.filename is not None):
-        return f"cannot read {name!r}: {exc.strerror or type(exc).__name__}"
+    if of_the_system(exc):
+        reason = exc.strerror or type(exc).__name__
+        steps = f"{_CHECK_THE_DRIVE}; if it still fails, {_STILL_FAILING[remedy]}"
+        return f"cannot read {name!r}: {reason}; {steps}"
     return _unreadable(name, exc).refusal(name, remedy=remedy)
 
 
@@ -644,7 +688,9 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
     color and cannot read 16-bit gray with alpha, so those, and any result
     whose shape or pixel type differs from the declaration, are refused rather
     than read with changed values; any other layout with an extra sample is
-    refused from its header, before it is decoded.
+    refused from its header, before it is decoded. A failure of Pillow's
+    decoding is refused as this compression; an error of the system's
+    raised as it decodes is not the codec's, and is raised as it is (#246).
     """
     from PIL import Image
 
@@ -689,6 +735,7 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
     except EXHAUSTED as exc:  # no compression it cannot decode
         raise _unreadable(path.name, exc) from exc
     except Exception as exc:  # Pillow's decoder errors are not all OSError
+        _raise_if_of_the_system(exc)  # the drive's or the file's, not the codec's
         raise refusal from exc
     if not pixels.dtype.isnative:  # e.g. a big-endian ("MM") 16-bit file
         pixels = pixels.astype(pixels.dtype.newbyteorder("="))
@@ -813,7 +860,9 @@ def check_frames(path: str | os.PathLike[str]) -> None:
     An import calls it before reading; reading does not, so that an image
     imported so before reads as it did. A TIFF named .tif or .tiff is not
     looked at (reading counts its images); a file Pillow cannot open or tell
-    this of is left to reading, which says why.
+    this of is left to reading, which says why. An error of the system's
+    (a drive's, which reading may not meet again) is raised as it is, not
+    taken for a still image (#246).
     """
     path = Path(path)
     if path.suffix.lower() in TIFF_SUFFIXES:
@@ -828,7 +877,8 @@ def check_frames(path: str | os.PathLike[str]) -> None:
                 animated = image.format in _FRAME_FORMATS and _animated(image)
     except EXHAUSTED:
         raise
-    except Exception:  # Pillow's errors of a damaged file are not all OSError
+    except Exception as exc:  # Pillow's errors of a damaged file are not all OSError
+        _raise_if_of_the_system(exc)  # a drive's must not skip the check (#246)
         return
     if animated:
         raise ReadingRefusal(path.name, *_SEVERAL_FRAMES)
@@ -838,12 +888,13 @@ def _animated(image: object) -> bool:
     """Whether Pillow says an opened image is an animation (``is_animated``,
     which stops at a second frame); False if it cannot tell: a check that
     fails says nothing of the pixels, read as before #234. Running out of
-    memory or of stack is no answer."""
+    memory or of stack is no answer, nor is an error of the system's (#246)."""
     try:
         return bool(getattr(image, "is_animated", False))
     except EXHAUSTED:
         raise
-    except Exception:  # Pillow's errors of a damaged file are not all OSError
+    except Exception as exc:  # Pillow's errors of a damaged file are not all OSError
+        _raise_if_of_the_system(exc)
         return False
 
 

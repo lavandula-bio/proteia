@@ -70,6 +70,7 @@ import os
 import re
 import threading
 import zlib
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -89,7 +90,9 @@ from proteia.core.imaging import (
     file_colours,
     load_image,
     named_refusal,
+    of_the_system,
     read_colours,
+    refusal_cause,
 )
 from proteia.core.model import (
     IMAGE_SUFFIXES,
@@ -107,6 +110,16 @@ _log = logging.getLogger(__name__)
 # The undoable steps a session keeps. A count, not a byte budget: a state is its
 # compressed content, about 24 KiB for a batch of 960 bands.
 UNDO_LIMIT: Final = 100
+
+# The causes of refusing to read a stored file whose logging a session
+# remembers (#246), so that each is logged once however often the file is
+# read; past this, the one met least recently is forgotten, and logged again
+# if met again.
+_LOGGED_CAUSES: Final = 256
+# A cause of refusing to read a stored file, as a session keeps it: the
+# image's id and SHA-256, the refusal's own type, its error's type and errno
+# (or None), and whether that error is the system's.
+type _LoggedCause = tuple[str, str, type[BaseException], type[BaseException], int | None, bool]
 
 # Proteia's image names (img-N.<suffix>) and the temp files storage writes while
 # storing or saving (.img-N.<suffix>.<random>.part/.tmp): the only orphans cleanup
@@ -421,9 +434,10 @@ class ProjectSession:
         # (image id, SHA-256) -> what its stored file's header says of reading it
         # (outdated_reading): whether it converts CMYK, or what is refused in it.
         self._headers: dict[tuple[str, str], bool | str] = {}
-        # (image id, SHA-256) of the stored files whose reading this session
-        # refused: what the library said is logged once per file (_read_checked).
-        self._refusals_logged: set[tuple[str, str]] = set()
+        # The causes of the refusals of reading a stored file this session
+        # logged (_LoggedCause), met least recently first: what the library
+        # said is logged once per cause (_logs_refusal).
+        self._refusals_logged: OrderedDict[_LoggedCause, None] = OrderedDict()
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -629,6 +643,30 @@ class ProjectSession:
         self._file_colours[key] = colours
         return colours
 
+    def _logs_refusal(self, image: ImageRef, exc: ValueError | OSError) -> bool:
+        """Whether this refusal of reading the image's stored file (id and
+        SHA-256) is to be logged: if it has a cause to log
+        (:func:`~proteia.core.imaging.refusal_cause`) that the session has
+        not met for the file among the last :data:`_LOGGED_CAUSES`. A cause
+        is the refusal's own type, its error's type and errno, and whether
+        that error is the system's, not its words, which may vary (an offset
+        or a size in them). A cause met is the most recent; past the bound,
+        the least recent is forgotten. Called with the lock held."""
+        cause = refusal_cause(exc)
+        if cause is None:
+            return False
+        errno = getattr(cause, "errno", None)
+        key = (image.id, image.sha256, type(exc), type(cause), errno, of_the_system(cause))
+        logged = self._refusals_logged
+        new = key not in logged
+        if new:
+            logged[key] = None
+            if len(logged) > _LOGGED_CAUSES:
+                logged.popitem(last=False)  # the least recent
+        else:
+            logged.move_to_end(key)  # met again: the most recent
+        return new
+
     def _read_checked(self, image: ImageRef, read: Callable[[Path], np.ndarray]) -> np.ndarray:
         """``read`` of the image's stored file, once the file's bytes match the
         recorded SHA-256; its first two dimensions must be the recorded height
@@ -638,9 +676,9 @@ class ProjectSession:
         never by its stored copy (:func:`~proteia.core.imaging.named_refusal`,
         #234), and says what is wrong without a remedy: the image is in the
         project already, and importing its file again would lose its boxes.
-        What the library said is logged at the first refusal of the stored
-        file (image id and SHA-256) in the session only, as every view and
-        measure reads it again. Called with the lock held."""
+        What the library said is logged once per cause of the stored file in
+        the session (:meth:`_logs_refusal`), as every view and measure reads
+        it again (#246). Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -652,9 +690,7 @@ class ProjectSession:
 
         def refused(exc: ValueError | OSError, why: str | None = None) -> OperationError:
             if why is None:
-                key = (image_id, image.sha256)
-                log = key not in self._refusals_logged
-                self._refusals_logged.add(key)
+                log = self._logs_refusal(image, exc)
                 why = named_refusal(exc, image.original_name, path, remedy=False, log=log)
             return OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image_id,))
 
