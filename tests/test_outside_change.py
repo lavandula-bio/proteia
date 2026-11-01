@@ -1169,7 +1169,7 @@ def test_a_missing_project_json_keeps_every_image_file_at_close(tmp_path):
     [
         ("project mine.json", True),
         ("project-LAB-PC.json", True),
-        ("Project (Roger's conflicted copy 2026-11-01).JSON", True),
+        ("Project (Lab PC's conflicted copy 2026-11-01).JSON", True),
         ("notes.json", True),
         ("old/project.json", False),  # not directly in the folder
         ("project.json.old", False),  # no .json file
@@ -1287,6 +1287,15 @@ def test_the_storage_names_of_versions_and_copies():
     ]:
         assert (storage.is_version(name), storage.is_conflict_copy(name)) == (version, copy), name
     assert storage.conflict_copies(Path("no such folder µ")) == ()
+    # Newest first: by the time in the name, then the number (none is the first).
+    assert storage._copy_order("Project.Conflict 2026-10-03 1200.JSON") == (
+        "project.conflict 2026-10-03 1200",
+        1,
+    )
+    assert storage._copy_order("project.conflict 2026-10-03 1200 (12).json") == (
+        "project.conflict 2026-10-03 1200",
+        12,
+    )
 
 
 # --- The page and the web routes ---
