@@ -529,6 +529,11 @@ def test_a_cut_reaches_the_linked_marker_and_its_ladder(tmp_path):
     )
     # Membrane 2 is left one mark: GAPDH's bands lose their apparent MW, and are told.
     assert [(lost["membrane"], lost["bands"]) for lost in change.mw_lost] == [(2, 3)]
+    assert change.mw_lost[0]["image_ids"] == [exposure, marker]
+    assert change.mw_lost[0]["message"] == (  # one register group: no image named
+        "Membrane 2 has fewer than 2 ladder marks: 3 bands lost their apparent MW; mark its"
+        " ladder to read them again"
+    )
     assert mws(gapdh) == [None, None, None] and None not in mws(p53)
     assert_mw_current(s)
     assert_nets_current(s)
@@ -2235,8 +2240,71 @@ def test_a_ladder_read_works_its_median_out_once_per_operation(tmp_path, monkeyp
     # Within one operation, once; the next operation works it out again.
     with s.transaction():
         ops._detector_pixels(s, ref, arena, (0, 0, W, H), calibration=True)
-        ops._detector_pixels(s, ref, arena, (0, 10, W, H), calibration=True)
+        again = ops._detector_pixels(s, ref, arena, (0, 10, W, H), calibration=True)
     assert len(worked) == 1
+    assert np.allclose(again[H // 2 :, :], worked[0], atol=1)  # the median kept, not lost
     with s.transaction():
         ops._detector_pixels(s, ref, arena, (0, 0, W, H), calibration=True)
     assert len(worked) == 2
+    # A commit within an operation drops it with the arrays read before it.
+    with s.transaction():
+        ops._detector_pixels(s, ref, arena, (0, 0, W, H), calibration=True)
+        ops.set_channel(s, image, Channel.RED)  # which works out red's median
+        ref, done = s.project.batch.find_image(image), len(worked)
+        ops._detector_pixels(s, ref, arena, (0, 0, W, H), calibration=True)
+        assert len(worked) == done + 1 and worked[-1] == worked[0]
+
+
+def test_a_point_inside_one_area_on_another_s_edge_is_in_two(tmp_path):
+    # Membrane 2's area reaching ten rows into membrane 1's: a click on
+    # membrane 1's lower edge lies inside membrane 2's past its edge, so in both.
+    s, image = one_image(tmp_path)
+    ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
+    ops.add_arena(s, image, (0, 40, 200, 100))
+    bottom = ops.add_protein(s, "p53 µ", Role.TARGET, arena_id="arena-6")
+    error = refused(
+        lambda: ops.place_box(s, bottom, 100, 50, lane_index=1, grow=False),
+        ErrorCode.IN_TWO_ARENAS,
+    )
+    assert str(error) == (
+        f"(100, 50) lies inside both membrane 1's and membrane 2's areas on {STRIPS!r}; redraw"
+        " one of them so they do not overlap there"
+    )
+
+
+def test_a_register_group_with_two_marks_keeps_its_ladder():
+    # mem-1's pair (img-2, img-3) left two marks: a band's MW lost there
+    # (outside the range) is not a group left without a ladder.
+    before = make_project().batch
+    after = before.model_copy(deep=True)
+    mem_1 = after.membranes[0]
+    mem_1.calibration.points = [p for p in mem_1.calibration.points if p.image_id == "img-3"]
+    after.find_band("band-12")[1].apparent_mw = None
+    assert before.find_band("band-12")[1].apparent_mw is not None
+    assert ops._mw_lost(before, after) == ()
+
+
+def test_drawing_an_area_refits_a_calibration_from_before_58(tmp_path):
+    # The sample's mem-1 holds a fit no #58 build made. Its area drawn on a
+    # linked pair changes its marker links, so it is refitted in the same
+    # change, and band-12's MW, from the older fit, is read again.
+    from test_operations import band_of, expected_mw, open_sample
+
+    s = open_sample(tmp_path, hook=None)
+    stored = band_of(s, "band-12").apparent_mw
+    assert stored == 90.5 != expected_mw(s, "band-12")
+    exposure = import_blot(s, two_strips(), "E.tif")
+    membrane = s.project.batch.membranes_on(exposure)[0].id
+    marker = import_blot(
+        s, two_strips(), "M marker.tif", kind=ImageKind.VISIBLE_MARKER, membrane_id=membrane
+    )
+    ops.set_marker_image(s, exposure, marker)
+    ops.edit_arena(s, area_on(s, exposure), outline=(0, 0, 200, 50))
+    before = s.project
+    ops.add_arena(s, exposure, (0, 50, 200, 100), membrane_id="mem-1")
+    assert band_of(s, "band-12").apparent_mw == expected_mw(s, "band-12") != stored
+    assert before.batch.find_band("band-12")[1].apparent_mw == stored  # left as it was
+    calibration = s.project.batch.membranes[0].calibration  # mem-1's
+    assert calibration.fit_method.value == "log_linear_piecewise"
+    ops.undo(s)  # the project before it, as it was
+    assert band_of(s, "band-12").apparent_mw == stored
