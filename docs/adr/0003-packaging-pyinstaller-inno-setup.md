@@ -3,6 +3,8 @@
 - **Status**: Accepted
 - **Date**: 2026-09-27
 - **Deciders**: Roger Huang
+- **Amended**: 2026-11-01, the Visual C++ runtime the bundle carries, and the
+  install on a clean machine (see [Amendments](#amendments))
 
 ## Context
 
@@ -500,3 +502,67 @@ napari is expected to leave them out; that has not been verified.
 
 - Not tried: both tools that ADR 0001 named produced a working installer, so no
   further tool was evaluated.
+
+## Amendments
+
+**2026-11-01: the Visual C++ runtime, and the install on a clean machine (#54)**
+
+The Trade-offs and the License check say that the bundle carries `MSVCP140.dll`
+copied from the build machine, and the License check that the SciPy wheel carries
+its own copy of `msvcp140`. Neither holds, and the build now fails if the first
+comes back:
+
+- Microsoft lets only Visual Studio licensees redistribute the Visual C++ (VC++)
+  runtime files that the Visual C++ Redistributable installs into `System32`. The
+  bundle therefore carries only the copies that come with the Python build
+  (`VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`) or with a package's wheel (NumPy's
+  `numpy.libs/msvcp140-<hash>.dll`; the SciPy 1.17.1 wheel carries none).
+  `THIRD_PARTY_NOTICES.txt` lists each copy and where it came from, under
+  Microsoft's terms for redistributing them.
+- Five extension modules of scikit-image 0.26.0 import `MSVCP140.dll` by name:
+  `skimage.feature._cascade`, `_haar`, `_hessian_det_appx`, and `brief_cy`, and
+  `skimage.util._remap`. scikit-image imports them only when a function that needs
+  them is first used: among others its corner and blob functions, `ORB`, `CENSURE`,
+  `BRIEF`, `Cascade`, the Haar-like features, the ridge filters (`frangi`,
+  `hessian`, `meijering`, `sato`), and `skimage.util.map_array` with the
+  segmentation functions that call it. Proteia uses none of them. The modules are
+  left out of the bundle, so a later use would fail the same way on every machine
+  (`ModuleNotFoundError`), not only on a Windows without the Visual C++
+  Redistributable.
+- The build fails if the bundle holds a Universal CRT DLL or a VC++ runtime file
+  that neither the Python build nor a package provides, or if a bundled binary
+  imports by name a VC++ runtime file that the bundle does not carry. The import
+  tables are read from the files, so the check does not depend on what the
+  self-test happens to run.
+
+The Checks for every installer build list, for #54, an install, launch, and
+uninstall on a clean Windows machine without Python. That check cannot be part of
+every build: the CI runner has Python and the Visual C++ Redistributable, so only
+a clean machine shows that the installer brings what it needs. It is run before
+each release instead (#252). The first run, on 2026-11-01:
+
+- The machine was Windows Sandbox: a fresh Windows 11 24H2 (build 26100) with no
+  Python on `PATH`, without the Visual C++ Redistributable (none of
+  `msvcp140.dll`, `vcruntime140.dll`, or `vcruntime140_1.dll` in `System32`), and
+  with networking turned off. Its account is an administrator, so the run does not
+  show an install by a standard user.
+- The installer was the one the `installer` workflow built from `main` at commit
+  03e530d: `Proteia-0.1.0.dev0-setup.exe`, 53,400,539 bytes, SHA-256
+  `fa7a2a5da143f0a3afa8ea778b09f6b4b293e28f4448b631ea528abc98e28e8b`.
+- A script run at logon installed it for the current user without prompts (exit
+  code 0; Setup ran for about 4 s): the program, `LICENSE.txt`,
+  `THIRD_PARTY_NOTICES.txt`, the uninstaller, the Start Menu shortcut, and the
+  uninstall entry. Setup's log shows no file written outside the installation
+  folder except the shortcut.
+- The installed self-test passed every step, and its 19 numbers equal those of the
+  build's frozen self-test.
+- Started from its Start Menu shortcut (after the self-test, so not the first
+  start of the new files), Proteia answered `/api/status` with its token 1.8 s
+  after the start, and with 401 without it, and served its page and script; the
+  browser opened the page. Every one of the 201 modules the process had loaded
+  once the server answered came from the installation or the Windows folder; the
+  VC++ runtime came from the installation's own copies. A second launch opened the
+  running instance instead of starting a second server, and `POST /api/quit` ended
+  Proteia with exit code 0.
+- The uninstaller removed the program, the shortcut, and the uninstall entry, and
+  kept the session log.
