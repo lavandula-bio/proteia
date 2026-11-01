@@ -285,7 +285,7 @@ def test_lane_anchors_leave_out_boxes_touching_an_edge():
     for x in (0, 1, 315, 316):
         batch = make_project().batch
         batch.find_band("band-12")[1].box = Box(x=x, y=43)
-        found[x] = lane_anchors(batch, batch.find_image("img-2"))
+        found[x] = lane_anchors(batch, batch.arenas_on("img-2")[0][1].id)
     kept = [(30.0, 0), (70.0, 1)]
     assert found == {0: kept, 1: [*kept, (13.0, 3)], 315: [*kept, (327.0, 3)], 316: kept}
 
@@ -293,7 +293,7 @@ def test_lane_anchors_leave_out_boxes_touching_an_edge():
 def test_missing_lanes_sit_on_the_row_of_the_first_bands():
     batch = make_project().batch
     beta = batch.find_protein("prot-7")  # boxes 14 px high at y=43 in lanes 1, 2 and 4
-    anchors = lane_anchors(batch, batch.find_image("img-2"))
+    anchors = lane_anchors(batch, batch.arenas_on("img-2")[0][1].id)
     assert state._missing_lanes(batch, beta, anchors, None) == [
         {"lane_index": 2, "x": 110.0, "y": 50.0}
     ]
@@ -330,7 +330,7 @@ def test_a_click_box_as_wide_as_the_lane_pitch_shows_its_lane(width, refused):
         {**gapdh["bands"][0], "lane_index": 1, "box": {"x": 62 - width // 2, "y": 80}}
     ]
     batch = converted(doc).batch
-    error = ops._misnumbered_lanes(batch, batch.find_image("img-2"), ())
+    error = ops._misnumbered_lanes(batch, batch.arenas_on("img-2")[0][1], ())
     if not refused:
         assert error is None
         return
@@ -627,7 +627,6 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "core/operations.py remove_image.change: point.image_id",
         "core/operations.py set_ladder_points: p.image_id",
         "core/operations.py set_ladder_points.edit: p.image_id",
-        "core/operations.py set_marker_image: p.image_id",
         "core/results.py _calibration_notices: p.image_id",
         "core/results.py _ladder_images: p.image_id",
         "core/results.py _mw_protein_notices: point.image_id",
@@ -677,6 +676,8 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "web/api.py _padding_change: change.fitted_size",
         "web/api.py _row_placement: placement.box_size",
         "web/api.py add_protein: body.box_size",
+        "web/api.py add_arena: body.image_id",
+        "web/api.py add_protein: body.arena_id",
         "web/api.py add_protein: body.image_id",
         "web/api.py clear_boxes: cleared.undetected",
         "web/api.py list_diagnostics: plan.images",
@@ -716,8 +717,51 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "core/results.py compute_results: table.model_copy(update=...).lanes",
     ),
     **_allow(
-        "a copy of the batch to check a marker link on, with the one image it links copied",
-        "core/operations.py set_marker_image: batch.model_copy(update=...).images",
+        "a calibration point's image, not a protein's (#243: an area operation moves or"
+        " keeps the points on its images, and an outline holds or leaves them)",
+        "core/operations.py _held: point.image_id",
+        "core/operations.py assign_arena: p.image_id",
+        "core/operations.py assign_arena.change: p.image_id",
+        "core/operations.py remove_arena.change: p.image_id",
+        "core/operations.py set_marker_image.edit: p.image_id",
+    ),
+    **_allow(
+        "a membrane area's own image (Arena.image_id), not a protein's: where an area lies,"
+        " which the readers of areas take from the area the accessors give them",
+        "core/mwrow.py lane_span: other.image_id",
+        "core/operations.py _area_target: arena.image_id",
+        "core/operations.py _fits: arena.image_id",
+        "core/operations.py _here: arena.image_id",
+        "core/operations.py _refresh_mw: arena.image_id",
+        "core/operations.py assign_arena: held.image_id",
+        "core/export.py membrane_lines: arena.image_id",
+        "core/project.py _anchored: arena.image_id",
+        "core/results.py _compute: arena.image_id",
+        "core/results.py _mw_notices: arena.image_id",
+        "web/state.py _arena: arena.image_id",
+    ),
+    **_allow(
+        "a writer of the stored shape, which changes with it (#243): drawing, redrawing, giving"
+        " and removing a membrane area, a marker link that makes the linked images' areas"
+        " equal, and the order of the batch's images, membrane by membrane, after them",
+        "core/operations.py _adopt: Arena(...).image_id",
+        "core/operations.py _adopt: a.image_id",
+        "core/operations.py _adopt: membrane.arenas",
+        "core/operations.py _order_images: arena.image_id",
+        "core/operations.py _order_images: batch.images",
+        "core/operations.py _order_images: m.arenas",
+        "core/operations.py add_arena.change: Arena(...).image_id",
+        "core/operations.py add_arena.change: Membrane(...).lane_table_id",
+        "core/operations.py add_arena.change: target.arenas",
+        "core/operations.py assign_arena.change: Membrane(...).lane_table_id",
+        "core/operations.py assign_arena.change: a.image_id",
+        "core/operations.py assign_arena.change: new.arenas",
+        "core/operations.py assign_arena.change: old.arenas",
+        "core/operations.py remove_arena.change: edited.arenas",
+    ),
+    **_allow(
+        "an answer (AreaChange), not the stored batch",
+        "core/operations.py add_arena.params: result.lane_table_id",
     ),
 }
 

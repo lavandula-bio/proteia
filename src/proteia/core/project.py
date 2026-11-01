@@ -31,7 +31,7 @@ import math
 import statistics
 from collections.abc import Collection, Iterable, Sequence
 
-from proteia.core.model import Batch, ImageRef, Lane
+from proteia.core.model import Batch, Lane
 
 # A protein's net per lane, aligned to the spine; ``None`` marks a gap. Mirrors
 # ``analyze.LaneNets`` without importing the stats layer (project stays upstream).
@@ -73,9 +73,10 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     """Propose the lane of a box whose centre is at ``x``, or None when unsure.
 
     ``anchors`` are ``(centre x, stored lane index)`` of boxes already placed on
-    the same image, of any protein: the lanes are the same columns of the
-    membrane. Each lane's anchor is the median of its boxes' centres, and only
-    anchors whose centres move steadily with the lane index are kept (the longest
+    the same membrane area, of any protein: the lanes are the same columns of
+    the membrane (:func:`lane_anchors`). Each lane's anchor is the median of
+    its boxes' centres, and only anchors whose centres move steadily with the
+    lane index are kept (the longest
     such run, left to right or, on a mirrored image, right to left), so a box
     dragged far from its lane is ignored. (A lane anchored by just two boxes, one
     of them dragged far, is anchored on their mean.) A proposal needs the lane
@@ -199,40 +200,44 @@ def _pitch(pairs: Sequence[tuple[tuple[int, float], tuple[int, float]]]) -> floa
 
 def lane_anchors(
     batch: Batch,
-    image: ImageRef,
+    arena_id: str,
     *,
     without: Collection[str] = (),
     only: Collection[str] | None = None,
 ) -> list[tuple[float, int]]:
-    """``(centre x, stored lane)`` of the first bands on an image, of any protein:
-    the anchors :func:`propose_lane` and :func:`lane_positions` take.
+    """``(centre x, stored lane)`` of the first bands on one membrane area, of
+    any protein: the anchors :func:`propose_lane` and :func:`lane_positions`
+    take. The lanes are the same columns of one membrane, not of the image: two
+    strips on one image may number their lanes opposite ways (#243).
 
-    A box touching the left or right edge is left out: it may have been shifted
-    inside the image, so its centre need not be its lane's. So are the bands
-    whose ids are in ``without`` (boxes a change is about to replace) and, when
-    ``only`` is given, those whose ids are not in it.
+    A box touching the left or right edge of the image is left out: it may have
+    been shifted inside the image, so its centre need not be its lane's. So are
+    the bands whose ids are in ``without`` (boxes a change is about to replace)
+    and, when ``only`` is given, those whose ids are not in it.
     """
-    return [(centre, lane) for _, centre, lane in _anchored(batch, image, without, only)]
+    return [(centre, lane) for _, centre, lane in _anchored(batch, arena_id, without, only)]
 
 
 def lane_anchor_ids(
     batch: Batch,
-    image: ImageRef,
+    arena_id: str,
     *,
     without: Collection[str] = (),
     only: Collection[str] | None = None,
 ) -> list[str]:
     """The ids of the bands :func:`lane_anchors` takes with the same arguments,
     in its order."""
-    return [band_id for band_id, _, _ in _anchored(batch, image, without, only)]
+    return [band_id for band_id, _, _ in _anchored(batch, arena_id, without, only)]
 
 
 def _anchored(
-    batch: Batch, image: ImageRef, without: Collection[str], only: Collection[str] | None
+    batch: Batch, arena_id: str, without: Collection[str], only: Collection[str] | None
 ) -> list[tuple[str, float, int]]:
     """``(band id, centre x, stored lane)`` of each anchor (:func:`lane_anchors`)."""
+    _, arena = batch.find_arena(arena_id)
+    image = batch.find_image(arena.image_id)
     anchors = []
-    for protein in batch.proteins_on(image.id):
+    for protein, _ in batch.rows_on_arena(arena_id):
         boxes = batch.boxes_of(protein)
         for band in boxes.bands:
             x0, _, x1, _ = band.box.rect(boxes.box_size)

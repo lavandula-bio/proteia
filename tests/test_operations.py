@@ -8362,7 +8362,7 @@ def test_lane_anchors_of_some_bands_only(tmp_path):
     other_protein_in_lanes(s, image, case, (2, 3))
     own = {band_id for band_id in ops.detect_row_boxes(s, protein, case.row).band_ids if band_id}
     batch = s.project.batch
-    ref = batch.find_image(image)
+    ref = batch.arenas_on(image)[0][1].id
 
     mine, others = lane_anchors(batch, ref, only=own), lane_anchors(batch, ref, without=own)
     assert sorted(lane for _, lane in mine) == list(range(6))
@@ -10452,11 +10452,15 @@ MW_WRITERS = frozenset(
         "remove_calibration_point",
         "clear_calibration",
         "set_ladder_points",
+        "assign_arena",
+        "remove_arena",
     }
 )
 MW_NEUTRAL = frozenset(
     {
+        "add_arena",
         "add_protein",
+        "edit_arena",
         "calibration_fit",
         "clear_boxes",
         "compute",
@@ -10557,6 +10561,14 @@ def test_mw_current_after_each_operation(tmp_path):
         "set_ladder_points",
         lambda: ops.set_ladder_points(s, c.marker, RIGHT, right, x=CAL_RIGHT_X),
     )
+    # A membrane area (#243): the linked pair's given to a new membrane, with
+    # its rows and points (the same curve); a second membrane's corner area on
+    # both, removed.
+    area = s.project.batch.arenas_on(c.blot)[0][1].id
+    step("assign_arena", lambda: ops.assign_arena(s, area, None))
+    ops.edit_arena(s, area, outline=(0, 0, CAL_W, CAL_H))
+    corner = ops.add_arena(s, c.blot, (0, 0, 20, 20)).arena_ids[0]
+    step("remove_arena", lambda: ops.remove_arena(s, corner))
     step("remove_image", lambda: ops.remove_image(s, c.marker))
     assert ran == MW_WRITERS
     calibration = s.project.batch.membranes[0].calibration

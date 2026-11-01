@@ -1101,15 +1101,18 @@ def _tilt_reference(
 def _rows_tilted(
     batch: model.Batch,
     image_id: str,
+    where: str,
     fitted: mwcal.Calibration,
     proteins: Sequence[model.Protein],
     joined: Mapping[str, list[model.Band | None]],
     included: list[bool],
     note: Callable[..., None],
 ) -> None:
-    """``rows_tilted`` for one image (#58): how far the rows of its proteins
-    slope against the protein line (its one ladder's level line, or the line
-    between its two ladders). Per protein with at least :data:`TILT_MIN_LANES`
+    """``rows_tilted`` for one membrane area (#58): how far the rows of its
+    proteins slope against the protein line (its one ladder's level line, or
+    the line between its two ladders), worded as ``where`` names the rows
+    (the image's, or a membrane's on an image of several, #243). Per
+    protein with at least :data:`TILT_MIN_LANES`
     boxes (:func:`_tilt_boxes`), each box centre's offset from the line at
     :func:`_tilt_reference` and the least-squares slope of those offsets
     across the lanes; the median slope over the lanes' span gives the drift,
@@ -1170,7 +1173,7 @@ def _rows_tilted(
     by = f"by up to {drift:.0%}" if math.isfinite(drift) else "past any MW"
     note(
         NoticeCode.ROWS_TILTED,
-        f"{image_id}'s rows slope by about {angle:.1f}° against {against}"
+        f"{where} slope by about {angle:.1f}° against {against}"
         f" ({shift:.0f} px across the lanes), so apparent MWs drift {by} from one side to"
         f" the other; {advice}, or widen the tolerance",
         protein_ids=tuple(protein.id for protein in proteins),
@@ -1187,14 +1190,15 @@ def _mw_notices(
     note: Callable[..., None],
 ) -> None:
     """Every MW, band-count and calibration notice of a set (#58), given each
-    protein's image (``image_ids``, by protein id): per protein,
-    then per register group with boxes in the set's lanes, then per image.
-    The notices of a group or an image name every protein boxed on its images
-    in any lane, so that the two result sets' copies of one name the same
-    proteins (the all-lanes view tells them apart by code and proteins)."""
+    protein's image (``image_ids``) and its calibration (``fits``), by protein
+    id: per protein, then per register group with boxes in the set's lanes,
+    then per membrane area. The notices of a group or an area name every
+    protein boxed on its images in any lane, so that the two result sets'
+    copies of one name the same proteins (the all-lanes view tells them apart
+    by code and proteins). A membrane's group or area holds its own proteins
+    only: two membranes on one image have their own curves (#243)."""
     for protein in batch.proteins:
-        fitted = fits[image_ids[protein.id]]
-        _mw_protein_notices(batch, protein, fitted, joined[protein.id], included, note)
+        _mw_protein_notices(batch, protein, fits[protein.id], joined[protein.id], included, note)
     boxed = [
         protein
         for protein in batch.proteins
@@ -1205,16 +1209,29 @@ def _mw_notices(
         for protein in boxed
         if any(band is not None and included[i] for i, band in enumerate(joined[protein.id]))
     }
+    areas = {protein.id: batch.arena_id_of(protein) for protein in boxed}
     for membrane in batch.membranes:
+        own = {arena.id for arena in batch.arenas_of(membrane)}
         for group, fitted in mwcal.calibrations(batch, membrane).items():
-            on = tuple(protein.id for protein in boxed if image_ids[protein.id] in group)
+            on = tuple(
+                protein.id
+                for protein in boxed
+                if areas[protein.id] in own and image_ids[protein.id] in group
+            )
             if in_set.intersection(on) and isinstance(fitted, mwcal.Calibration):
                 _calibration_notices(batch, membrane, group, fitted, on, note)
-    for image in batch.iter_images():
-        fitted = fits.get(image.id)
-        on_image = [protein for protein in boxed if image_ids[protein.id] == image.id]
-        if in_set.intersection(p.id for p in on_image) and isinstance(fitted, mwcal.Calibration):
-            _rows_tilted(batch, image.id, fitted, on_image, joined, included, note)
+    for membrane in batch.membranes:
+        for arena in batch.arenas_of(membrane):
+            on_area = [protein for protein in boxed if areas[protein.id] == arena.id]
+            if not in_set.intersection(p.id for p in on_area):
+                continue
+            fitted = fits[on_area[0].id]
+            if isinstance(fitted, mwcal.Calibration):
+                where = f"{arena.image_id}'s rows"
+                if len(batch.arenas_on(arena.image_id)) > 1:
+                    number = batch.membrane_number(membrane)
+                    where = f"membrane {number}'s rows on {arena.image_id}"
+                _rows_tilted(batch, arena.image_id, where, fitted, on_area, joined, included, note)
 
 
 def chart_test(
@@ -1602,13 +1619,16 @@ def _compute(
     joined = {protein.id: _join(batch, protein, n) for protein in batch.proteins}
     nets = {pid: _field(bands, "net") for pid, bands in joined.items()}
     detected = lane_detected(batch)
-    # Each protein's image, read once, and each image's calibration (#58), fitted
-    # once from the stored points.
+    # Each protein's image, read once, and each membrane area's calibration
+    # (#58), fitted once from the stored points: two membranes on one image
+    # each have their own (#243).
     image_ids = {p.id: batch.image_id_of(p) for p in batch.proteins}
-    fits = {
-        image_id: mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
-        for image_id in dict.fromkeys(image_ids.values())
-    }
+    arena_ids = {p.id: batch.arena_id_of(p) for p in batch.proteins}
+    area_fits: dict[str, _Fitted] = {}
+    for arena_id in dict.fromkeys(arena_ids.values()):
+        membrane, arena = batch.find_arena(arena_id)
+        area_fits[arena_id] = mwcal.calibration_for(batch, membrane, arena.image_id)
+    fits = {protein_id: area_fits[arena_id] for protein_id, arena_id in arena_ids.items()}
     columns = [
         ProteinColumn(
             protein_id=p.id,
@@ -1626,18 +1646,16 @@ def _compute(
             mw_check=[
                 None
                 if band is None
-                else _mw_check(
-                    p.expected_mw, p.mw_tolerance, fits[image_ids[p.id]], band.apparent_mw
-                )
+                else _mw_check(p.expected_mw, p.mw_tolerance, fits[p.id], band.apparent_mw)
                 for band in joined[p.id]
             ],
-            mw_not_run=_mw_not_run(p, fits[image_ids[p.id]]),
+            mw_not_run=_mw_not_run(p, fits[p.id]),
             bands_found=_field(joined[p.id], "bands_found"),
             count_check=[
                 None if band is None else _count_check(band, p.expected_band_count)
                 for band in joined[p.id]
             ],
-            calibration=_image_calibration(fits[image_ids[p.id]]),
+            calibration=_image_calibration(fits[p.id]),
         )
         for p in batch.proteins
     ]
