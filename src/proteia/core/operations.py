@@ -915,14 +915,17 @@ def _ring_context(batch: Batch, arena: Arena) -> RingContext:
     )
 
 
-def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
+def _quantify_image(
+    draft: Project, image_id: str, array: np.ndarray, areas: Collection[str] | None = None
+) -> None:
     """The one writer of a band's net, background fields and clipping flags:
     quantify every band on one image, of every protein, together (protein order,
     then band order; the results do not depend on it). Which boxes each band's
     ring leaves out, and which pixels it reads, is :func:`_ring_context`'s: the
     bands of one membrane area are measured in one pass, which leaves out every
-    box there, reading inside a drawn outline alone. ``array`` is the image's
-    analysis array.
+    box there, reading inside a drawn outline alone, so the bands of the areas
+    ``areas`` alone may be measured (None: every area of the image). ``array``
+    is the image's analysis array.
 
     Under the project's legacy method (``global_median``) each level is the
     image's median and each net floors every pixel at 0, as before #83;
@@ -942,6 +945,8 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     dark_on_light = image.polarity.dark_on_light
     legacy = draft.background_method == LEGACY_BACKGROUND_METHOD
     for _, arena in batch.arenas_on(image_id):
+        if areas is not None and arena.id not in areas:
+            continue
         context = _ring_context(batch, arena)
         here = [
             (batch.boxes_of(protein).box_size, band)
@@ -958,7 +963,7 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
             continue
         unreadable = None
         if context.area[1] is not None:  # a drawn outline: nothing past it is read
-            unreadable = ~_inside_mask(arena, image, (0, 0, image.width, image.height))
+            unreadable = _outside(arena, image)
         found.extend(
             band_backgrounds(
                 array,
@@ -1030,6 +1035,17 @@ def _inside_mask(area: Arena, image: ImageRef, window: Rect) -> np.ndarray:
     v = dy * frame.cos - dx * frame.sin
     # As the model reads it: a centre on the turned edge is inside.
     return (np.abs(u) <= frame.half_width + ON_EDGE) & (np.abs(v) <= frame.half_height + ON_EDGE)
+
+
+def _outside(area: Arena, image: ImageRef) -> np.ndarray:
+    """The pixels of ``image`` whose centres lie outside a drawn ``area``, as
+    an image-shaped mask: every one past its bounds, and within them those
+    :func:`_inside_mask` leaves out, so working it out costs the area's size."""
+    outside = np.ones((image.height, image.width), dtype=bool)
+    x0, y0, x1, y1 = area.bounds(image)
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(image.width, x1), min(image.height, y1)
+    outside[y0:y1, x0:x1] = ~_inside_mask(area, image, (x0, y0, x1, y1))
+    return outside
 
 
 def _detector_pixels(
@@ -2744,23 +2760,29 @@ def _area_apply[T](
     """:func:`_apply` for an operation on membrane areas, which moves no box:
     the images (``image_ids`` of the draft) on which it changes what a ring
     reads (:func:`_ring_context`) are re-quantified in the same change, their
-    pixels read after a first pass shows which: those where a row with boxes
-    that stays, or comes, is read otherwise. A row that goes takes its nets
-    with it; on the others no net can change, so no pixel is read."""
+    pixels read after a first pass shows which: the areas there where a row
+    with boxes that stays, or comes, is read otherwise, which alone are
+    measured. A row that goes takes its nets with it; on the other areas no
+    net can change, so no pixel is read for them."""
     committed = session.project
     trial, _ = _prepare(session, change)
 
-    def read_otherwise(image_id: str) -> bool:
+    def read_otherwise(image_id: str) -> set[str]:
+        # The areas of the rows that stay, or come, read otherwise.
         before = _rings(committed.batch, image_id)
-        return any(before.get(row) != ring for row, ring in _rings(trial.batch, image_id).items())
+        return {
+            ring.area[0]
+            for row, ring in _rings(trial.batch, image_id).items()
+            if before.get(row) != ring
+        }
 
-    stale = [image_id for image_id in dict.fromkeys(image_ids(trial)) if read_otherwise(image_id)]
-    arrays = {image_id: session.pixels(image_id) for image_id in stale}
+    stale = {image_id: read_otherwise(image_id) for image_id in dict.fromkeys(image_ids(trial))}
+    arrays = {image_id: session.pixels(image_id) for image_id, areas in stale.items() if areas}
 
     def requantified(draft: Project) -> T:
         result = change(draft)
         for image_id, array in arrays.items():
-            _quantify_image(draft, image_id, array)
+            _quantify_image(draft, image_id, array, areas=stale[image_id])
         return result
 
     return _apply(session, action, requantified, params)

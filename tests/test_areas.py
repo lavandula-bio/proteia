@@ -869,9 +869,21 @@ def test_an_angle_edit_crops_the_rings_that_reach_the_outline(tmp_path):
         return real(image_id, **kwargs)
 
     s.pixels = counted
-    change = ops.edit_arena(s, areas[2], angle_deg=1.0)
-    s.pixels = real
+    measured: list[int] = []
+    real_backgrounds = ops.band_backgrounds
+
+    def counted_backgrounds(array, rects, *args, **kwargs):
+        measured.append(len(rects))
+        return real_backgrounds(array, rects, *args, **kwargs)
+
+    ops.band_backgrounds = counted_backgrounds
+    try:
+        change = ops.edit_arena(s, areas[2], angle_deg=1.0)
+    finally:
+        ops.band_backgrounds = real_backgrounds
+        s.pixels = real
     assert reads == [image]
+    assert measured == [6]  # strip 3's boxes alone: the other strips' rings read as before
     after = nets(s)
     moved = {band for band in after if after[band] != before[band]}
     batch = s.project.batch
