@@ -19,6 +19,7 @@ import pytest
 
 from conftest import make_project, synthetic_blot
 from proteia.core import operations as ops
+from proteia.core import storage
 from proteia.core.model import (
     Arena,
     CalibrationPointSource,
@@ -429,7 +430,7 @@ def test_bands_a_row_finds_outside_its_area_are_refused(tmp_path, monkeypatch):
     # Were the row to read the whole image, lane 3's band, in membrane 2's
     # area, would be found: refused, naming its lane.
     s, image, protein = side_by_side(tmp_path)
-    monkeypatch.setattr(ops, "_masked", lambda array, image, area, window: array)
+    monkeypatch.setattr(ops, "_shown", lambda array, image, area, window: array)
     error = refused(
         lambda: ops.detect_row_boxes(s, protein, (10, 12, 190, 38)), ErrorCode.OUT_OF_ARENA
     )
@@ -945,7 +946,7 @@ def test_rotated_strips_row_drag_refuses_neighbour_bands(tmp_path, monkeypatch):
     assert_nets_current(s)
     ops.undo(s)
     # Degraded: clipped to the bounds only, the row takes strip 2's bands.
-    monkeypatch.setattr(ops, "_masked", lambda array, image, area, window: array)
+    monkeypatch.setattr(ops, "_shown", lambda array, image, area, window: array)
     with pytest.raises(OperationError) as info:
         ops.detect_row_boxes(s, a, bounds)
     assert info.value.code in (ErrorCode.ROW_OFF_LINE, ErrorCode.OUT_OF_ARENA)
@@ -986,23 +987,24 @@ def test_mask_matches_contains():
             assert bool(mask[r, c]) == area.contains(ref, c + 0.5, r + 0.5), (angle, c, r)
     whole = Arena(id="arena-1", image_id="img-2", source="whole_image")
     array = np.arange(60, dtype=np.uint16).reshape(6, 10)
-    assert ops._masked(array, ref, whole, (0, 0, 10, 6)) is array
+    assert ops._shown(array, ref, whole, (0, 0, 10, 6)) is array
     drawn = Arena(
         id="arena-1",
         image_id="img-2",
         outline=Outline(x0=2, y0=1, x1=6, y1=4),
         source="manual",
     )
-    masked = ops._masked(array, ref, drawn, (0, 0, 10, 6))
+    masked = ops._shown(array, ref, drawn, (0, 0, 10, 6))
     assert masked is not array and np.array_equal(array, np.arange(60).reshape(6, 10))
     inside = ops._inside_mask(drawn, ref, (0, 0, 10, 6))
     assert np.array_equal(masked[inside], array[inside])
     assert (masked[~inside] == round(ref.background)).all() or np.allclose(
         masked[~inside], ref.background, atol=1
     )
-    # Only the window is masked.
-    part = ops._masked(array, ref, drawn, (0, 0, 3, 6))
-    assert np.array_equal(part[:, 3:], array[:, 3:])
+    # Only the window is read: the rest is never filled.
+    part = ops._shown(array, ref, drawn, (0, 0, 3, 6))
+    assert np.array_equal(part[:, :3], masked[:, :3])
+    assert not part[:, 3:].any()
 
 
 def mirrored(tmp_path: Path):
@@ -1141,12 +1143,19 @@ def test_nine_strips_nets_equal_the_unsplit_image(tmp_path):
     assert {b.id: b.net for p in joined.batch.proteins for b in p.rows[0].bands} == split_nets
 
 
+def boxed_rows_on(batch, arena_id) -> frozenset[str]:
+    """The rows with boxes on a membrane area: those a ring leaves out."""
+    return frozenset(
+        row.id for protein, row in batch.rows_on_arena(arena_id) if batch.boxes_of(protein).bands
+    )
+
+
 def rings_leave_out_own_area_only(batch, image_id, row_id):
     """A ring rule the maintainer may choose instead (#243): a row's rings
     leave out the boxes of the rows on its own area only, and read across
     the outlines."""
     arena_id = next(row.arena_id for _, row in batch.rows_on(image_id) if row.id == row_id)
-    return RingContext(left_out=frozenset(row.id for _, row in batch.rows_on_arena(arena_id)))
+    return RingContext(left_out=boxed_rows_on(batch, arena_id))
 
 
 def rings_read_own_area_only(batch, image_id, row_id):
@@ -1155,7 +1164,7 @@ def rings_read_own_area_only(batch, image_id, row_id):
     arena_id = next(row.arena_id for _, row in batch.rows_on(image_id) if row.id == row_id)
     _, arena = batch.find_arena(arena_id)
     return RingContext(
-        left_out=frozenset(row.id for _, row in batch.rows_on_arena(arena_id)),
+        left_out=boxed_rows_on(batch, arena_id),
         read_within=ops.area_key(arena),
     )
 
@@ -1479,3 +1488,214 @@ def test_removing_an_area_measures_the_others_again(tmp_path):
     after = nets(s)
     moved = {band for band in after if after[band] != before[band]}
     assert {band for band, _, _ in removal.remeasured} == moved
+
+
+# --- What a ring reads, a removal takes and a detector reads ---
+
+
+def test_removing_an_area_without_boxes_reads_no_pixels(tmp_path):
+    # The rows without boxes change no ring: removing their area reads no
+    # pixel, so a stored file changed since is no reason to refuse it.
+    s, image, top, bottom = split(tmp_path)
+    box_all(s, top, 24)
+    ops.save(s)
+    reopened = ops.open_project(s.folder)
+    stored = reopened.folder / storage.IMAGES_DIR / reopened.project.batch.find_image(image).file
+    stored.write_bytes(b"not the image any more")
+    removal = ops.remove_arena(reopened, "arena-6")
+    assert removal.cascade.removed[:2] == ("arena-6", bottom)
+    assert removal.remeasured == ()
+    reopened.close()
+
+
+def linked_pair_project(tmp_path: Path):
+    """:func:`marker_project` linked, then a second exposure E2 linked to
+    the same marker (it takes the group's three areas); a protein on
+    membrane 2's area on each exposure, boxed on E."""
+    s, exposure, marker = marker_project(tmp_path)
+    ops.set_marker_image(s, exposure, marker)
+    second = import_blot(s, two_strips(), "exposure 2.tif", membrane_id="mem-2")
+    ops.set_marker_image(s, second, marker)
+    on_e = ops.add_protein(s, "p53", Role.TARGET, arena_id=area_on(s, exposure, 2))
+    ops.place_box(s, on_e, 100, 50, lane_index=1, grow=False)
+    on_e2 = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, arena_id=area_on(s, second, 2))
+    return s, (exposure, marker, second), (on_e, on_e2)
+
+
+def test_removal_scope_follows_every_link(tmp_path):
+    s, images, proteins = linked_pair_project(tmp_path)
+    exposure, marker, second = images
+    batch = s.project.batch
+    scope = ops.area_removal(batch, area_on(s, second, 2))
+    assert scope.image_ids == images  # in the batch's order
+    assert scope.arena_ids == tuple(area_on(s, i, 2) for i in images)
+    assert scope.protein_ids == proteins
+    assert (scope.boxes, scope.records, scope.marks, scope.membrane_goes) == (1, 0, 0, True)
+    # The removal takes exactly that.
+    removal = ops.remove_arena(s, area_on(s, second, 2))
+    assert removal.cascade.removed[:5] == (*scope.arena_ids, *proteins)
+
+
+def test_marker_link_direction(tmp_path):
+    s, exposure, marker = marker_project(tmp_path)
+    batch = s.project.batch
+    assert ops.marker_adoption(batch, exposure, marker) == "marker"  # M takes E's areas
+    ops.set_marker_image(s, exposure, marker)
+    batch = s.project.batch
+    assert ops.marker_adoption(batch, exposure, marker) is None  # the same areas
+    second = import_blot(s, two_strips(), "exposure 2.tif", membrane_id="mem-2")
+    batch = s.project.batch
+    assert ops.marker_adoption(batch, second, marker) == "image"  # E2 takes the group's
+    update = ops.set_marker_image(s, second, marker)
+    assert set(update.adopted_arena_ids) == {a.id for _, a in s.project.batch.arenas_on(second)}
+
+
+def touching_strips(tmp_path: Path):
+    """Two strips at 4°, one just below the other (0.07 px apart along
+    their normal), each with a band near their shared edge, 10 px apart:
+    the bands' signal joins across the edge."""
+    t = math.radians(4.0)
+    c1, c2 = (250.0, 60.0), (248.0, 90.0)
+    b1 = (c1[0] - 10 * math.sin(t), c1[1] + 10 * math.cos(t))
+    b2 = (c2[0] + 10 * math.sin(t), c2[1] - 10 * math.cos(t))
+    y, x = np.mgrid[0:130, 0:500].astype(float)
+    image = np.full((130, 500), LEVEL)
+    for bx, by in (b1, b2):
+        image -= 20000.0 * np.exp(-(((x - bx) / 15.0) ** 2) - ((y - by) / 4.0) ** 2)
+    s = session_on(tmp_path)
+    blot_id = import_blot(s, np.round(image).astype(np.uint16), "touching.tif")
+    ops.set_lanes(s, [LaneInput("a"), LaneInput("b")])
+    ops.edit_arena(s, "arena-4", outline=(50, 45, 450, 75), angle_deg=4.0)
+    ops.add_arena(s, blot_id, (48, 75, 448, 105), angle_deg=4.0)
+    protein = ops.add_protein(s, "A", Role.TARGET, arena_id="arena-4")
+    return s, blot_id, protein
+
+
+def test_a_seed_click_grows_within_its_area(tmp_path, monkeypatch):
+    s, image, protein = touching_strips(tmp_path)
+    band = ops.place_box(s, protein, 250, 70, lane_index=0, grow=True)
+    batch = s.project.batch
+    size = batch.boxes_of(batch.find_protein(protein)).box_size
+    box = batch.find_band(band)[1].box
+    assert box.y + size.height <= 77  # stopped at strip 1's edge (y 75 there)
+    ops.undo(s)
+    # Degraded: grown over the stored pixels, the box takes strip 2's band too.
+    monkeypatch.setattr(
+        ops, "_detector_pixels", lambda s_, image, area, window: s_.pixels(image.id)
+    )
+    try:
+        band = ops.place_box(s, protein, 250, 70, lane_index=0, grow=True)
+    except OperationError:
+        return  # refused: its centre left strip 1's area
+    batch = s.project.batch
+    size = batch.boxes_of(batch.find_protein(protein)).box_size
+    assert batch.find_band(band)[1].box.y + size.height > 80
+
+
+DETECTORS = (
+    ("grow_box", None),
+    ("detect_row", "rowdetect"),
+    ("detect_row_along", "rowdetect"),
+    ("find_ladder", "mwcal"),
+    ("refine_point", "mwcal"),
+    ("is_snap_position", "mwcal"),
+)
+
+
+def test_every_detector_reads_through_the_area_accessor(tmp_path, monkeypatch):
+    # Every detector the operations call is given pixels from the one
+    # accessor that shows a membrane area alone, on turned strips where every
+    # window crosses an outline: no call site reads the stored pixels.
+    import sys
+
+    s, image, (a, _, c) = rotated_strips(tmp_path)
+    produced: list[np.ndarray] = []
+    real = ops._detector_pixels
+
+    def recording(*args, **kwargs):
+        produced.append(real(*args, **kwargs))
+        return produced[-1]
+
+    monkeypatch.setattr(ops, "_detector_pixels", recording)
+    seen: list[tuple[str, np.ndarray]] = []
+    for name, module in DETECTORS:
+        owner = ops if module is None else getattr(ops, module)
+        detector = getattr(owner, name)
+
+        def spy(array, *args, _real=detector, _name=name, **kwargs):
+            if sys._getframe(1).f_globals["__name__"] == ops.__name__:
+                seen.append((_name, array))
+            return _real(array, *args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    batch = s.project.batch
+    bounds = batch.find_arena("arena-4")[1].bounds(batch.find_image(image))
+    ops.detect_row_boxes(s, a, bounds)
+    ops.place_box(s, c, 500, 253, lane_index=4, grow=True)  # strip 3's band in lane 5
+    ops.set_ladder(s, "mem-2", "pageruler_plus/tris_glycine")
+    ops.propose_ladder(s, "arena-4", 100.0)
+    ops.snap_ladder(s, "arena-4", 100.0, [40.0, 60.0])
+    ops.add_calibration_point(s, "arena-4", 40.0, 100.0, CHEMI_MARKER, x=100.0, snap=True)
+    ops.set_ladder_points(
+        s, "arena-4", "left", [(30.0, 100.0), (50.0, 70.0)], x=100.0, found_at=100.0
+    )
+    names = {name for name, _ in seen}
+    assert names >= {"grow_box", "detect_row", "find_ladder", "refine_point", "is_snap_position"}
+    for name, array in seen:
+        assert any(np.shares_memory(array, shown) for shown in produced), name
+
+
+def full_copy(session, image, area, window):
+    """What the area accessor gave before it copied only the window: the
+    whole image copied, the window masked."""
+    array = session.pixels(image.id)
+    if area.outline is None:
+        return array
+    x0, y0 = max(0, window[0]), max(0, window[1])
+    x1, y1 = min(image.width, window[2]), min(image.height, window[3])
+    masked = array.copy()
+    if x1 > x0 and y1 > y0:
+        masked[y0:y1, x0:x1][~ops._inside_mask(area, image, (x0, y0, x1, y1))] = image.background
+    return masked
+
+
+def detections(folder: Path) -> list:
+    """On :func:`rotated_strips` built in ``folder``: a row dragged over the
+    bounds of strips 1 and 3 and a ruler snapped on each, what each gave."""
+    s, image, (a, _, c) = rotated_strips(folder)
+    out = []
+    for protein, arena in ((a, "arena-4"), (c, "arena-8")):
+        batch = s.project.batch
+        bounds = batch.find_arena(arena)[1].bounds(batch.find_image(image))
+        out.append(ops.detect_row_boxes(s, protein, bounds))
+        out.append(s.project.batch.model_dump())
+        out.append(ops.snap_ladder(s, arena, 300.0, [bounds[1] + 10.0, bounds[3] - 10.0]))
+        ops.undo(s)
+    return out
+
+
+def test_detector_pixels_equal_a_full_copy(tmp_path, monkeypatch):
+    windowed = detections(tmp_path / "windowed")
+    monkeypatch.setattr(ops, "_detector_pixels", full_copy)
+    assert detections(tmp_path / "copied") == windowed
+    # A band its strip's outline cuts, grown from a click (the full copy
+    # still in force), then by the accessor that copies only the window.
+    t, _, protein = touching_strips(tmp_path / "touching")
+    band = ops.place_box(t, protein, 250, 70, lane_index=0, grow=True)
+    grown = t.project.batch.find_band(band)[1].box
+    ops.undo(t)
+    monkeypatch.undo()
+    band = ops.place_box(t, protein, 250, 70, lane_index=0, grow=True)
+    assert t.project.batch.find_band(band)[1].box == grown
+
+
+def test_a_window_inside_its_area_is_read_as_stored(tmp_path):
+    s, image, _ = rotated_strips(tmp_path)
+    batch = s.project.batch
+    arena = batch.find_arena("arena-4")[1]
+    stored = s.pixels(image)
+    shown = ops._detector_pixels(s, batch.find_image(image), arena, (500, 65, 600, 75))
+    assert shown is stored  # every pixel of the window lies inside: nothing to mask
+    shown = ops._detector_pixels(s, batch.find_image(image), arena, (40, 15, 1060, 125))
+    assert shown is not stored
+    assert not shown[200:, :].any()  # past the window: never read, never filled

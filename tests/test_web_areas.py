@@ -37,8 +37,18 @@ def test_a_whole_image_area_in_the_state(client, tmp_path):
             "source": "whole_image",
             "corners": [[0.0, 0.0], [200.0, 0.0], [200.0, 100.0], [0.0, 100.0]],
             "bounds": [0, 0, 200, 100],
+            "removal": {
+                "arena_ids": ["arena-4"],
+                "image_ids": ["img-1"],
+                "protein_ids": [],
+                "boxes": 0,
+                "records": 0,
+                "marks": 0,
+                "membrane_goes": True,
+            },
         }
     ]
+    assert image["link_areas"] == {}  # no marker to take
     [membrane] = project["membranes"]
     assert (membrane["label"], membrane["arena_ids"]) == ("Membrane 1", ["arena-4"])
 
@@ -159,8 +169,17 @@ def test_marker_link_answers_the_areas_it_adopts(client, tmp_path):
     )
     assert status == 201, answer
     marker = answer["image_id"]
+    shown = client.ok("GET", "/api/project")["project"]["images"]
+    assert next(i for i in shown if i["id"] == "img-1")["link_areas"] == {marker: "marker"}
+    assert next(i for i in shown if i["id"] == marker)["link_areas"] == {}
     answer = client.ok("PUT", "/api/images/img-1/marker", {"marker_image_id": marker})
+    shown = answer["project"]["images"]
+    assert next(i for i in shown if i["id"] == "img-1")["link_areas"] == {marker: None}
     on_marker = [a for a in answer["project"]["arenas"] if a["image_id"] == marker]
+    # Removing membrane 2's area on the marker takes it on the exposure too.
+    removal = on_marker[1]["removal"]
+    assert removal["image_ids"] == ["img-1", marker]
+    assert removal["arena_ids"] == ["arena-6", on_marker[1]["id"]]
     assert answer["adopted_arena_ids"] == [a["id"] for a in on_marker]
     assert [a["outline"] for a in on_marker] == [[0, 0, 200, 50], [0, 50, 200, 100]]
 
