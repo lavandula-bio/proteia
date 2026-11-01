@@ -2767,14 +2767,11 @@ const LEGACY_BACKGROUND = "global_median";
 // legacy background, which moves every net, or boxes on a lossy, colour or
 // CMYK image measured before Proteia looked for pixels near the detector limit
 // there (#112). The note is its own tooltip too, whole where it is cut short.
-// The legacy title holds with drawn membrane areas or without (the Checks say
-// which median the project's nets use).
+// The legacy background's tooltip is the server's (the state's
+// legacy_background), which says which median the nets use (#243).
 const REQUANTIFY_OFFERS = {
   background: {
     label: "Requantify with local background",
-    title:
-      "The nets use the median background of the whole image, or of a drawn membrane area," +
-      " as measured before the local background.",
     note: "Nets move to the local ring background; Undo takes it back.",
   },
   overExposure: {
@@ -2815,7 +2812,7 @@ function renderRequantify(project) {
     const offer = REQUANTIFY_OFFERS[reason];
     const button = $("requantify");
     button.textContent = offer.label;
-    button.title = offer.title;
+    button.title = reason === "background" ? project.legacy_background : offer.title;
     const note = $("requantify-note");
     note.textContent = offer.note;
     note.title = offer.note;

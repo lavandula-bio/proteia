@@ -1791,6 +1791,142 @@ def test_a_legacy_project_on_drawn_areas_is_logged_as_measured_there(tmp_path, c
     ) in caplog.messages
 
 
+def legacy_on_one_drawn_area(tmp_path: Path):
+    """:func:`two_levels` in a project quantified before #83, its one area
+    drawn over the top strip (0, 0, 30, 20) and a target boxed there, whose
+    level is that strip's median (1090). The session, the image and the band."""
+    from conftest import as_legacy
+
+    s = session_on(tmp_path)
+    image = import_blot(s, two_levels(), "two levels µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    s._commit(as_legacy(s.project), action="plant", params={})
+    ops.edit_arena(s, area_on(s, image), outline=(0, 0, 30, 20))
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image, box_size=LEVEL_BOX)
+    band = ops.place_box(s, protein, 15, 10, lane_index=0, grow=False)
+    assert level_of(s, band)[:3] == ("global_median", 1090.0, 0.0)
+    return s, image, band
+
+
+def test_a_legacy_area_drawn_back_over_the_whole_image_takes_its_median(tmp_path):
+    # The whole image again: its bands are above the image's stored median
+    # (10595), the area's no longer; undone, the area's again.
+    s, image, band = legacy_on_one_drawn_area(tmp_path)
+    ops.edit_arena(s, area_on(s, image), outline=None)
+    assert level_of(s, band)[:3] == ("global_median", 10595.0, 0.0)
+    assert s.project.batch.find_image(image).background == 10595.0
+    assert_nets_current(s)
+    ops.undo(s)
+    assert level_of(s, band)[:3] == ("global_median", 1090.0, 0.0)
+    assert_nets_current(s)
+    ops.redo(s)
+    assert level_of(s, band)[1] == 10595.0
+
+
+def test_a_legacy_exposure_taking_its_marker_group_s_whole_area_takes_its_median(tmp_path):
+    # E2's drawn area holds legacy bands; linked to a marker whose group
+    # holds whole-image areas, E2 takes the group's area, and its bands the
+    # stored median of E2.
+    s, exposure, band = legacy_on_one_drawn_area(tmp_path)
+    membrane = s.project.batch.membranes_on(exposure)[0].id
+    first = import_blot(s, two_levels(), "E1.tif", membrane_id=membrane)
+    marker = import_blot(
+        s, two_levels(), "M marker.tif", kind=ImageKind.VISIBLE_MARKER, membrane_id=membrane
+    )
+    ops.set_marker_image(s, first, marker)
+    assert [a.outline for _, a in s.project.batch.arenas_on(marker)] == [None]
+    assert ops.marker_adoption(s.project.batch, exposure, marker) == "image"
+    ops.set_marker_image(s, exposure, marker)
+    assert [a.outline for _, a in s.project.batch.arenas_on(exposure)] == [None]
+    assert level_of(s, band)[:3] == ("global_median", 10595.0, 0.0)
+    assert_nets_current(s)
+
+
+def test_a_legacy_area_s_median_reads_its_bounds_alone(tmp_path, monkeypatch):
+    # Under the legacy method a drawn area's median needs no image-wide mask
+    # of what lies outside it: only the mask of its own bounds.
+    s, image, bands = two_levels_split(tmp_path, legacy=True)
+
+    def image_wide(*args):
+        raise AssertionError("an image-wide mask worked out")
+
+    monkeypatch.setattr(ops, "_outside", image_wide)
+    pixels = s.pixels(image)
+    measured, _ = apply_change(s.project, lambda d: ops._quantify_image(d, image, pixels))
+    assert [measured.batch.find_band(b)[1].background_level for b in bands] == [1090.0, 30090.0]
+
+
+OLD_OFFER = (
+    "The nets use the whole-image median background, as measured before the local background."
+)
+DRAWN_OFFER = (
+    "The nets use the median background of the whole image, or of a drawn membrane area, as"
+    " measured before the local background."
+)
+
+
+def test_the_state_words_the_legacy_offer_for_its_areas(tmp_path):
+    # The page's requantify offer takes its tooltip from the state: as
+    # before #243 while no legacy band lies on a drawn area, else naming it;
+    # none for a project measured locally.
+    from proteia.web.state import project_state
+
+    def offer(s) -> str | None:
+        return project_state("p", s, s.project, open_id=1)["legacy_background"]
+
+    s, image, band = legacy_on_one_drawn_area(tmp_path)
+    assert offer(s) == DRAWN_OFFER
+    ops.edit_arena(s, area_on(s, image), outline=None)
+    assert offer(s) == OLD_OFFER
+    s2, _, _ = two_levels_split(tmp_path / "local")
+    assert offer(s2) is None
+
+
+def test_every_area_operation_keeps_a_legacy_project_s_levels(tmp_path):
+    # Under the legacy method each band's level is its area's median, a
+    # drawn area's or its image's stored one, through every area operation
+    # that draws, cuts, gives, removes or undraws an area, and back by undo.
+    from conftest import as_legacy
+
+    # :func:`two_rows` with membranes apart: the top strip lighter, the
+    # bottom one darker, so each half and the whole image have their own.
+    s = session_on(tmp_path)
+    pixels = two_strips()
+    pixels[:50] += 5000
+    pixels[50:] -= 15000
+    image = import_blot(s, pixels, STRIPS)
+    s._commit(as_legacy(s.project), action="plant", params={})  # before any box is measured
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    p53 = ops.add_protein(s, "p53 µ", Role.TARGET, image, loading_control_ids=[gapdh])
+    box_all(s, p53, 24)
+    box_all(s, gapdh, 76)
+    assert_nets_current(s)
+    stored = s.project.batch.find_image(image).background
+
+    def levels() -> set[float]:
+        batch = s.project.batch
+        return {b.background_level for p in batch.proteins for b in batch.boxes_of(p).bands}
+
+    assert levels() == {stored}
+    steps = [lambda: ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))]  # the cut
+    steps.append(lambda: ops.assign_arena(s, area_on(s, image, 2), None))  # to a new membrane
+    steps.append(lambda: ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 40)))  # redrawn
+    steps.append(lambda: ops.remove_arena(s, area_on(s, image, 2)))  # GAPDH's goes
+    steps.append(lambda: ops.edit_arena(s, "arena-4", outline=None))  # the whole image again
+    seen = []
+    for step in steps:
+        step()
+        assert_nets_current(s)
+        seen.append(levels())
+    assert seen[0] == {55000.0, 35000.0}  # each strip its own median (the image's: 35000)
+    assert seen[-1] == {stored}
+    for _ in steps:
+        ops.undo(s)
+        assert_nets_current(s)
+    assert levels() == {stored}
+
+
 def notices_of(s, code: str) -> dict[tuple[str, ...], str]:
     """The messages of the committed project's notices of ``code``, by their proteins."""
     return {n.protein_ids: n.message for n in ops.compute(s).notices if n.code == code}
@@ -1848,6 +1984,34 @@ def recorded_settings(s) -> dict:
     return record.build_record(s.project, exported_at="2026-11-01T12:00:00.000Z", files={})[
         "settings"
     ]
+
+
+LEGACY_LEVEL = (
+    "each band's level: its image's median; on a drawn membrane area, the median of the pixels"
+    " inside its outline"
+)
+
+
+def test_the_record_of_a_legacy_project_on_drawn_areas_says_their_level(tmp_path):
+    # A project quantified before #83 with a drawn area: its record says, after
+    # the method, which median each level is; with every area over its whole
+    # image again, the settings are as before, to the byte.
+    from proteia.core import record
+
+    s, image, _ = two_levels_split(tmp_path, legacy=True)
+    plain = {**record.settings(), "background_method": "global_median"}
+    got = recorded_settings(s)
+    keys = list(plain)
+    after = keys.index("background_method") + 1
+    assert list(got) == [*keys[:after], "global_median_level", *keys[after:]]
+    assert got["global_median_level"] == LEGACY_LEVEL
+    assert got["background"]["fallbacks"]["image"].endswith("the pixels inside its outline")
+    assert {k: v for k, v in got.items() if k not in ("background", "global_median_level")} == {
+        k: v for k, v in plain.items() if k != "background"
+    }
+    ops.remove_arena(s, area_on(s, image, 2))
+    ops.edit_arena(s, area_on(s, image), outline=None)
+    assert json.dumps(recorded_settings(s)) == json.dumps(plain)
 
 
 def test_the_record_says_how_drawn_areas_are_measured(tmp_path):

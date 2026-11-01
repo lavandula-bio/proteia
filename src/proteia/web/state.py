@@ -29,8 +29,12 @@ which ``PUT /api/proteins/{id}/box-padding`` takes.
 (``ring_median_v1``, or ``global_median`` for a project quantified before #83,
 until it is requantified), and each band's ``background_mode`` how its own was:
 ``symmetric``, ``asymmetric`` or ``image`` (a ring cut short), or
-``global_median``. Each band's ``clipped`` says whether it is over-exposed
-(null: not checked), and ``possibly_clipped`` whether it looks so on an image
+``global_median``; ``legacy_background`` is the page's words for its offer to
+requantify the nets measured as before #83, which name a drawn membrane area's
+median once one of them lies on one (#243), or null while none is
+(:func:`~proteia.core.results.legacy_offer`). Each band's ``clipped`` says
+whether it is over-exposed (null: not checked), and ``possibly_clipped``
+whether it looks so on an image
 that check cannot trust (null: not assessed; #112). ``unassessed_images`` lists
 the images whose bands were measured before Proteia looked for pixels near the
 detector limit, which ``POST /api/requantify`` assesses
@@ -88,6 +92,7 @@ from proteia.core.operations import (
     unassessed_images,
 )
 from proteia.core.project import lane_anchors, lane_positions
+from proteia.core.results import legacy_offer
 from proteia.core.session import HistoryStep, ProjectSession
 
 
@@ -338,6 +343,7 @@ def project_state(
         "revision": revision(project),
         "history": {"undo": _step(undo), "redo": _step(redo)},
         "background_method": project.background_method,
+        "legacy_background": legacy_offer(batch),
         "unassessed_images": unassessed_images(batch),
         "lanes": [
             {

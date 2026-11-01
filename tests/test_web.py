@@ -1931,24 +1931,26 @@ def test_the_page_offers_to_requantify_boxes_not_assessed_for_over_exposure():
     assert 'requantify: "requantify",' in words
 
 
-def test_the_legacy_offer_names_the_median_with_or_without_drawn_areas():
-    # The offer's tooltip, in the page and in its first HTML, is one sentence
-    # true of a legacy project on images of one membrane and on drawn areas,
-    # whose nets are above each area's median (#243); the Checks give the
-    # server's words for the project.
-    title = (
-        "The nets use the median background of the whole image, or of a drawn membrane area,"
-        " as measured before the local background."
-    )
-    offers = _code("app.js").split("const REQUANTIFY_OFFERS = {", 1)[1].split("\n};", 1)[0]
+def test_the_legacy_offer_takes_its_tooltip_from_the_state():
+    # Which median a legacy project's nets use is the server's to say (#243:
+    # a drawn area's own): the offer's tooltip is the state's
+    # legacy_background, and the page holds no words of its own for it. The
+    # first HTML keeps the words of a project without drawn areas, as before.
+    app = _code("app.js")
+    offers = app.split("const REQUANTIFY_OFFERS = {", 1)[1].split("\n};", 1)[0]
     background = offers.split("background: {", 1)[1].split("},", 1)[0]
-    assert background.count("title:") == 1
-    joined = " ".join(background.split()).replace('," + " ', ", ")  # one string, in two pieces
-    assert f'title: "{title}"' in joined
+    assert "title" not in background and "median" not in offers
+    _, render = _function(app, "function renderRequantify(")
+    assert (
+        'button.title = reason === "background" ? project.legacy_background : offer.title;'
+        in render
+    )
     html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
     button = html.split('<button id="requantify"', 1)[1].split(">", 1)[0]
-    assert f'title="{title}"' in " ".join(button.split())
-    assert "whole-image median" not in offers and "whole-image median" not in html
+    assert (
+        'title="The nets use the whole-image median background, as measured before the local'
+        ' background."'
+    ) in " ".join(button.split())
 
 
 def test_every_request_of_the_page_goes_through_request():

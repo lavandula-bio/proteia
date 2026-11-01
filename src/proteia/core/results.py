@@ -1584,6 +1584,38 @@ def compute_results(
     )
 
 
+def _legacy_proteins(batch: model.Batch) -> list[model.Protein]:
+    """The proteins whose nets are measured as before #83 (``global_median``,
+    which every band of such a project holds until it is requantified: the
+    model keeps one method)."""
+    return [
+        p
+        for p in batch.proteins
+        if any(b.background_mode == "global_median" for b in batch.boxes_of(p).bands)
+    ]
+
+
+def _legacy_median(batch: model.Batch, proteins: Sequence[model.Protein]) -> str:
+    """The median background the nets of ``proteins`` (:func:`_legacy_proteins`)
+    lie above, in words: the whole image's, as before #243, or, once one of
+    them is on a drawn membrane area, a drawn area's own too."""
+    if any(batch.find_arena(batch.arena_id_of(p))[1].outline is not None for p in proteins):
+        return "the median background of the whole image, or of a drawn membrane area,"
+    return "the whole-image median background,"
+
+
+def legacy_offer(batch: model.Batch) -> str | None:
+    """The page's words for its offer to requantify a project measured as
+    before #83 (``legacy_background`` says the same): which median its nets
+    use; None while no net is measured that way."""
+    proteins = _legacy_proteins(batch)
+    if not proteins:
+        return None
+    return (
+        f"The nets use {_legacy_median(batch, proteins)} as measured before the local background."
+    )
+
+
 def _compute(
     batch: model.Batch,
     *,
@@ -1682,25 +1714,12 @@ def _compute(
             " each lane uses its first band",
             protein_ids=extra,
         )
-    # A project quantified before #83 keeps the whole-image median until it is
-    # requantified, or a drawn membrane area's median on one (#243); every band
-    # then has this mode (the model keeps one method).
-    legacy = [
-        p
-        for p in batch.proteins
-        if any(b.background_mode == "global_median" for b in batch.boxes_of(p).bands)
-    ]
+    legacy = _legacy_proteins(batch)
     if legacy:
-        drawn = any(batch.find_arena(batch.arena_id_of(p))[1].outline is not None for p in legacy)
-        median = (
-            "the median background of the whole image, or of a drawn membrane area,"
-            if drawn
-            else "the whole-image median background,"
-        )
         note(
             NoticeCode.LEGACY_BACKGROUND,
-            f"nets use {median} as measured before the local background; requantify to"
-            " measure each band's background from the membrane around its box",
+            f"nets use {_legacy_median(batch, legacy)} as measured before the local background;"
+            " requantify to measure each band's background from the membrane around its box",
             protein_ids=tuple(p.id for p in legacy),
         )
     for image_id, why in outdated.items():  # an image with no band has no nets to warn about

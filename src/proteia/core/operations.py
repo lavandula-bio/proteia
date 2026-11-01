@@ -982,17 +982,18 @@ def _quantify_image(
         placed.extend(here)
         if not here:
             continue
-        unreadable = None
-        median: float | Callable[[], float] = image.background
-        if arena.outline is not None:  # a drawn outline: nothing past it is read
-            unreadable = _outside(arena, image)
-            median = functools.partial(_area_median, arena, image, array, unreadable)
-        if legacy:
-            level = median() if callable(median) else median
+        drawn = arena.outline is not None
+        if legacy:  # one level for the area, read from its bounds alone
+            level = _area_median(arena, image, array) if drawn else image.background
             found.extend(
                 [BandBackground(level=level, mode="global_median", spread=0.0)] * len(here)
             )
             continue
+        unreadable = None
+        median: float | Callable[[], float] = image.background
+        if drawn:  # a drawn outline: nothing past it is read
+            unreadable = _outside(arena, image)
+            median = functools.partial(_area_median, arena, image, array, unreadable)
         found.extend(
             band_backgrounds(
                 array,
@@ -1084,16 +1085,20 @@ def _outside(area: Arena, image: ImageRef) -> np.ndarray:
     return outside
 
 
-def _area_median(area: Arena, image: ImageRef, array: np.ndarray, outside: np.ndarray) -> float:
+def _area_median(
+    area: Arena, image: ImageRef, array: np.ndarray, outside: np.ndarray | None = None
+) -> float:
     """The median of ``array`` (``image``'s analysis array) over a drawn
-    ``area``'s pixels, those ``outside`` (:func:`_outside`) leaves out: the
-    level the image cut out along its outline would store
+    ``area``'s pixels, those whose centres it holds (:func:`_inside_mask` of
+    its bounds, or what ``outside``, its :func:`_outside` worked out already,
+    leaves): the level the image cut out along its outline would store
     (:func:`~proteia.core.quantify.estimate_background`, as
     ``ImageRef.background``), so the same pixels give the same level either
     way (#243). It reads the area's bounds alone, so it costs the area's
     size."""
-    x0, y0, x1, y1 = _bounds_on(area, image)
-    return estimate_background(array[y0:y1, x0:x1], ~outside[y0:y1, x0:x1])
+    x0, y0, x1, y1 = window = _bounds_on(area, image)
+    inside = _inside_mask(area, image, window) if outside is None else ~outside[y0:y1, x0:x1]
+    return estimate_background(array[y0:y1, x0:x1], inside)
 
 
 def _detector_pixels(
@@ -2863,9 +2868,22 @@ def _area_apply[T](
     pixels read after a first pass shows which: the areas there where a row
     with boxes that stays, or comes, is read otherwise, which alone are
     measured. A row that goes takes its nets with it; on the other areas no
-    net can change, so no pixel is read for them."""
+    net can change, so no pixel is read for them.
+
+    Under the legacy method a band's level is its area's median (#243), which
+    a draft whose drawn area now covers its whole image would hold until it is
+    measured: the change itself first sets the bands of every whole-image area
+    to their image's stored median, which needs no pixel, so the first pass
+    validates; the measuring writes the same."""
     committed = session.project
-    trial, _ = _prepare(session, change)
+
+    def settled(draft: Project) -> T:
+        result = change(draft)
+        if draft.background_method == LEGACY_BACKGROUND_METHOD:
+            _legacy_whole_levels(draft.batch)
+        return result
+
+    trial, _ = _prepare(session, settled)
 
     def read_otherwise(image_id: str) -> set[str]:
         # The areas of the rows that stay, or come, read otherwise.
@@ -2880,12 +2898,26 @@ def _area_apply[T](
     arrays = {image_id: session.pixels(image_id) for image_id, areas in stale.items() if areas}
 
     def requantified(draft: Project) -> T:
-        result = change(draft)
+        result = settled(draft)
         for image_id, array in arrays.items():
             _quantify_image(draft, image_id, array, areas=stale[image_id])
         return result
 
     return _apply(session, action, requantified, params)
+
+
+def _legacy_whole_levels(batch: Batch) -> None:
+    """Set the level of every band on a whole-image membrane area of a draft
+    ``batch`` of the legacy method to its image's stored median, as
+    :func:`_quantify_image` measures it there (spread 0, mode
+    ``global_median``)."""
+    for image in batch.iter_images():
+        for _, arena in batch.arenas_on(image.id):
+            if arena.outline is not None:
+                continue
+            for protein, _ in batch.rows_on_arena(arena.id):
+                for band in batch.boxes_of(protein).bands:
+                    band.background_level = image.background
 
 
 def _renumbered(numbers: Sequence[int]) -> str | None:

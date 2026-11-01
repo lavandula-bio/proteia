@@ -43,9 +43,9 @@ migrated: every band's level is its image's ``background``, its mode
 ``global_median`` and its spread 0, and nets floor each pixel at 0; on a
 membrane area drawn since, #243, the level is the median of the area's
 pixels, as on the image cut out there). The model checks that each band's
-mode agrees with the method, and a legacy level over a whole image; the
-operations keep every value equal to what the pixels give
-(:mod:`proteia.core.operations`).
+mode agrees with the method, and a legacy level: its image's median over a
+whole image, one level for every band of a drawn area; the operations keep
+every value equal to what the pixels give (:mod:`proteia.core.operations`).
 
 Models are mutable. Edits go through :func:`apply_change`, which works on a copy
 and re-validates the whole tree, so a failed edit leaves the project untouched.
@@ -549,8 +549,9 @@ class ImageRef(_Model):
     bit_depth: int | None = Field(default=None, ge=8, le=16)  # None = not recorded yet (#45)
     polarity: Polarity  # required: the import chooses it; there is no silent default
     # quantify.estimate_background, the global median of the analysis array: the
-    # grow seed threshold, the image-mode fallback and the legacy background
-    # (on a membrane area drawn on it, the median of the area's pixels, #243).
+    # grow seed threshold, and the image-mode fallback and the legacy
+    # background of an area over the whole image (a membrane area drawn on it
+    # takes the median of its own pixels for those two instead, #243).
     background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
     # #206: the channel it is measured on; None = the mean of its red, green and
@@ -1832,35 +1833,44 @@ class Project(_Model):
         batch = self.batch
         images = {image.id: image for image in batch.images}
         # A drawn area's level is the median of its pixels (#243), which the
-        # model, holding none, leaves to the operations (None).
-        medians = {
-            arena.id: None if arena.outline is not None else images[arena.image_id].background
+        # model, holding none, cannot check: one level for every band on the
+        # area, its first band's (None until one is met).
+        drawn = {
+            arena.id
+            for membrane in batch.membranes
+            for arena in membrane.arenas
+            if arena.outline is not None
+        }
+        medians: dict[str, float | None] = {
+            arena.id: None if arena.id in drawn else images[arena.image_id].background
             for membrane in batch.membranes
             for arena in membrane.arenas
         }
         for protein in batch.proteins:
             for row in protein.rows:
                 for band in row.bands:
-                    self._check_legacy_band(band, legacy, medians[row.arena_id])
+                    area = row.arena_id
+                    if legacy and medians[area] is None:
+                        medians[area] = band.background_level
+                    self._check_legacy_band(band, legacy, medians[area], area in drawn)
         return self
 
-    def _check_legacy_band(self, band: Band, legacy: bool, median: float | None) -> None:
+    def _check_legacy_band(
+        self, band: Band, legacy: bool, median: float | None, drawn: bool
+    ) -> None:
         if (band.background_mode == LEGACY_BACKGROUND_METHOD) != legacy:
             raise ValueError(
                 f"band {band.id}: background mode {band.background_mode!r} does not"
                 f" belong to the project's background method {self.background_method!r}"
             )
-        if not legacy:
-            return
-        if median is None:  # on a drawn area
-            if band.background_spread != 0:
-                raise ValueError(
-                    f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background has no spread"
-                )
-        elif band.background_level != median or band.background_spread != 0:
+        if legacy and (band.background_level != median or band.background_spread != 0):
+            what = (
+                "on a drawn membrane area is that area's median, the same for every band on it"
+                if drawn
+                else "is its image's median"
+            )
             raise ValueError(
-                f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background is its"
-                " image's median, with no spread"
+                f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background {what}, with no spread"
             )
 
     @model_validator(mode="after")
