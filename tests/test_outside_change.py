@@ -31,7 +31,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from conftest import FakeClock, sample_doc_v1
+from conftest import FakeClock, known, sample_doc_v1
 from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.core.model import ImageKind, LogEntry, Polarity, Project, Role
@@ -909,6 +909,7 @@ def test_a_change_after_the_replace_keeps_its_images_from_the_cleanup(tmp_path, 
     s = opened(tmp_path)
     left = s.folder / storage.IMAGES_DIR / "img-50.tif"
     left.write_bytes(tiff(50))  # what the other version imported
+    known(s, left)  # so only the version's name keeps it
     real = storage._fsync_dir
     done: list[bool] = []
 
@@ -1118,11 +1119,13 @@ def test_a_held_orphan_at_next_id_no_longer_refuses_an_import(tmp_path, monkeypa
 
 
 def _planted(s: ProjectSession) -> tuple[Path, Path]:
-    """Two image files no project references: one below next_id, one above."""
+    """Two image files no project references, which the session knows: one
+    below next_id, one above."""
     folder = s.folder / storage.IMAGES_DIR
     below, above = folder / "img-3.tif", folder / f"img-{s.project.next_id + 4}.tif"
     for path in (below, above):
         path.write_bytes(b"an image no project.json references")
+    known(s, below, above)
     return below, above
 
 
@@ -1296,6 +1299,122 @@ def test_the_storage_names_of_versions_and_copies():
         "project.conflict 2026-10-03 1200",
         12,
     )
+
+
+# --- Image files the session never knew ---
+
+
+def test_an_image_synced_before_its_project_json_is_never_deleted(tmp_path):
+    # The other computer imported an image; the sync brought its file first.
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs_image = imported(other, 2, "theirs α.tif")
+    theirs_file = s.folder / storage.IMAGES_DIR / f"{theirs_image}.tif"
+    for label in ("a", "b", "c"):
+        edit(s, label)  # each saved, then cleaned up
+    ours = imported(s, 3)  # cleans up before it stores, and skips the id
+    s.close()
+    assert theirs_file.read_bytes() == tiff(2) and ours != theirs_image
+    put(s.folder, other.project)  # its project.json arrives
+    later = ops.open_project(s.folder, clock=FakeClock())
+    edit(later, "d")
+    later.close()
+    assert theirs_file.read_bytes() == tiff(2)
+
+
+def test_an_image_synced_below_next_id_is_never_deleted(tmp_path):
+    # The other computer is behind: its next image takes an id this one passed.
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    imported(s, 3)
+    imported(s, 4)
+    theirs_image = imported(other, 2)
+    assert int(theirs_image.removeprefix("img-")) < s.project.next_id
+    edit(s)
+    s.close()
+    assert (s.folder / storage.IMAGES_DIR / f"{theirs_image}.tif").read_bytes() == tiff(2)
+
+
+def test_a_file_an_earlier_session_never_saved_stays_and_its_id_is_skipped(tmp_path):
+    # The cost: an import whose save failed before Proteia stopped leaves a
+    # file no later session knows, which is never deleted.
+    s = opened(tmp_path)
+    next_id = s.project.next_id
+    crashed = ops.open_project(s.folder, autosave=None, clock=FakeClock())
+    left = imported(crashed, 2)
+    assert left == f"img-{next_id}"
+    later = ops.open_project(s.folder, clock=FakeClock())
+    edit(later)
+    assert imported(later, 3) == f"img-{next_id + 1}"
+    later.close()
+    assert (s.folder / storage.IMAGES_DIR / f"{left}.tif").read_bytes() == tiff(2)
+
+
+def test_files_the_session_or_its_log_knew_are_still_cleaned_up(tmp_path):
+    s = opened(tmp_path)
+    removed = imported(s, 2)
+    ops.remove_image(s, removed)
+    file = s.folder / storage.IMAGES_DIR / f"{removed}.tif"
+    assert file.is_file()  # while the removal can be undone
+    s.close()
+    assert not file.exists()
+    # Removed again, then left by a crash: the next session's log records its import.
+    again = imported(s, 3)
+    ops.remove_image(s, again)
+    later = ops.open_project(s.folder, clock=FakeClock())
+    assert later._known.isdisjoint({f"{again}.tif"})  # not in the file it read
+    edit(later)
+    assert not (s.folder / storage.IMAGES_DIR / f"{again}.tif").exists()
+
+
+def test_another_image_at_an_id_this_history_imported_is_never_deleted(tmp_path, monkeypatch):
+    # Two versions that each took the same id: this one imported, removed and
+    # dropped its image; the other computer's, of other bytes, arrives there.
+    s = opened(tmp_path)
+    ours = imported(s, 2)
+    ops.remove_image(s, ours)
+    s.close()  # its file goes
+    theirs = s.folder / storage.IMAGES_DIR / f"{ours}.tif"
+    assert not theirs.exists()
+    theirs.write_bytes(tiff(9))  # synced from the other computer
+    later = ops.open_project(s.folder, clock=FakeClock())
+    edit(later)
+    later.close()
+    assert theirs.read_bytes() == tiff(9)  # the log's import stored other bytes
+    # Its own bytes again (put back from a backup): its own import's file, which
+    # goes; not while it cannot be read (held by another program).
+    theirs.write_bytes(tiff(2))
+    real = Path.open
+
+    def held(path: Path, *args, **kwargs):
+        if path == theirs:
+            raise PermissionError(13, "held by another process", str(path))
+        return real(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", held)
+        edit(later, "b")
+    assert theirs.read_bytes() == tiff(2)
+    edit(later, "c")
+    assert not theirs.exists()
+
+
+def test_files_named_in_the_project_json_read_are_known(tmp_path):
+    # At an open, and when the file is read again.
+    s = opened(tmp_path)
+    folder = s.folder
+    for when in ("open", "reload"):
+        planted = folder / storage.IMAGES_DIR / f"img-{40 if when == 'open' else 41}.tif"
+        planted.write_bytes(b"named only in the file's text")
+        doc = json.loads(file_bytes(s))
+        doc["batch"]["images"][0]["original_name"] = f"was {planted.name}"
+        (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
+        if when == "open":
+            s = ops.open_project(folder, clock=FakeClock())
+        else:
+            assert s.reload()
+        edit(s, when)  # saved, then cleaned up: the file is an orphan it knows
+        assert not planted.exists(), when
 
 
 # --- The page and the web routes ---

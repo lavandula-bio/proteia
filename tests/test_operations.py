@@ -44,6 +44,7 @@ from conftest import (
     V1_CONTENT_HASH,
     FakeClock,
     guards_in_place,
+    known,
     make_project,
     make_project_with_clashing_names,
     make_project_with_undetected,
@@ -957,9 +958,14 @@ def test_the_cleanup_keeps_every_image_file_a_backup_names(tmp_path, monkeypatch
     ops.set_reference_condition(reopened, "vehicle")
     assert reprobe.exists()
 
-    # Once the backup is deleted, the file is an orphan like any other.
+    # Once the backup is deleted, a session that never knew the file (opened
+    # after the migration: no project.json it read names it, nor its log's
+    # imports) leaves it, as it leaves every image file it does not know (#101).
     (folder / BACKUP).unlink()
     ops.set_reference_condition(reopened, None)
+    assert reprobe.exists()
+    known(reopened, reprobe)  # one that knows it deletes it: an orphan like any other
+    ops.set_reference_condition(reopened, "vehicle")
     assert not reprobe.exists()
 
 
@@ -967,8 +973,10 @@ def test_the_cleanup_keeps_an_image_file_named_in_any_backup(tmp_path):
     folder = v1_folder(tmp_path)
     s = ops.open_project(folder, clock=FakeClock())  # migrated and saved: next_id 27
     images = folder / "images"
-    for name in ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-27.tif", "img-33.tif"):
+    planted = ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-27.tif", "img-33.tif")
+    for name in planted:
         (images / name).write_bytes(b"an image no project.json references")
+    known(s, *(images / name for name in planted))  # else none is deleted (#101)
     # A backup is read as bytes, whatever its schema, even one that no longer
     # loads; its name is compared ignoring case, as Windows does. Only an id
     # below next_id is kept: a backup's images hold no other (a migration only
@@ -1021,6 +1029,7 @@ def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, mon
     folder = v1_folder(tmp_path)
     ops.open_project(folder, clock=FakeClock()).close()  # migrated and saved: next_id 27
     _crash_after_an_import(folder)  # img-27.tif left behind
+    leftover = folder / "images" / "img-27.tif"
     below = folder / "images" / "img-5.tif"
     below.write_bytes(b"an image no project.json references")
     read_bytes = Path.read_bytes
@@ -1031,10 +1040,11 @@ def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, mon
         return read_bytes(path)
 
     s = ops.open_project(folder, clock=FakeClock())
+    known(s, below)  # img-27 it never knew: left, and its id skipped (#101)
     with monkeypatch.context() as patch:
         patch.setattr(Path, "read_bytes", locked)
-        assert import_blot(s, blot(), "β.tif") == "img-27"  # saved, then cleaned up
-        assert below.exists()
+        assert import_blot(s, blot(), "β.tif") == "img-28"  # saved, then cleaned up
+        assert below.exists() and leftover.exists()
     # Once the backup can be read, it does not name img-5: the file goes.
     ops.set_reference_condition(s, None)
     assert not below.exists()
@@ -1415,13 +1425,26 @@ def test_refused_import_leaves_no_file(tmp_path, name, data, max_bytes, code):
 def test_import_removes_orphans_that_hold_its_id(tmp_path):
     s = session_on(tmp_path, save_to_folder)
     images = s.folder / "images"
-    (images / "img-1.tif").write_bytes(b"left by an import that was never saved")
+    (images / "img-1.tif").write_bytes(b"left by an import this session never saved")
+    known(s, images / "img-1.tif")
     (images / ".img-1.tif.x.part").write_bytes(b"left by a crash")
     (images / "notes.txt").write_text("the user's own file", encoding="utf-8")
     image_id = import_blot(s, blot(), "β.tif")
     assert image_id == "img-1"
     assert listing(s) == ["img-1.tif", "notes.txt"]
     assert (images / "img-1.tif").read_bytes() == (tmp_path / "sources" / "β.tif").read_bytes()
+
+
+def test_import_skips_the_id_of_a_file_the_session_never_knew(tmp_path):
+    # One an earlier session stored and never saved, or one synced from another
+    # computer before its project.json: never deleted, its id skipped (#101).
+    s = session_on(tmp_path, save_to_folder)
+    images = s.folder / "images"
+    (images / "img-1.tif").write_bytes(b"left by an import never saved")
+    (images / ".img-1.tif.x.part").write_bytes(b"left by a crash")
+    assert import_blot(s, blot(), "β.tif") == "img-2"
+    assert listing(s) == ["img-1.tif", "img-2.tif"]
+    assert (images / "img-1.tif").read_bytes() == b"left by an import never saved"
 
 
 def test_saved_references_survive_a_failed_autosave(tmp_path, replace_lock):
@@ -6179,6 +6202,7 @@ def test_orphan_cleanup_keeps_files_that_only_start_like_proteia_names(tmp_path)
     for name in ("img-1.tif.bak", "img-2.orig.png", "img-01.tif", "notes.txt"):
         (images / name).write_bytes(b"the user's own file")
     (images / "IMG-9.TIF").write_bytes(b"a Proteia file in other case, no longer referenced")
+    known(s, images / "img-9.tif")  # known in any case, as Windows compares names
     ops.save(s)
     assert listing(s) == ["img-01.tif", "img-1.tif", "img-1.tif.bak", "img-2.orig.png", "notes.txt"]
 

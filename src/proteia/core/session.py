@@ -69,7 +69,13 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   bring it back, and goes at the first save or import
   after no state references it: once the undo limit drops the last such state,
   a new change clears the redo that held it, or the session is closed or
-  reloads; or else at the next session's first save.
+  reloads; or else at the next session's first save. Only image files the
+  session knows are deleted: those the ``project.json`` it read names, and
+  those whose import the project's log records, with the bytes that import
+  stored (every image a session holds is one or the other). One it never
+  knew stays (an image another computer imported, synced before
+  the ``project.json`` that names it; or one an earlier session stored but
+  never saved, which only takes disk space), and an import skips its id.
 
 Refusals raise :class:`OperationError`, whose :class:`ErrorCode` is stable for
 clients (e.g. to map onto HTTP statuses).
@@ -627,6 +633,7 @@ class ProjectSession:
         autosave: AutosaveHook | None,
         saved_files: Iterable[str],
         base: _Base,
+        known: Iterable[str] = (),
         clock: Clock = utc_now,
     ) -> None:
         self._project = project
@@ -670,6 +677,12 @@ class ProjectSession:
         self._refusals_logged: OrderedDict[_LoggedCause, None] = OrderedDict()
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
+        # The image files this session knows (lowercase names): those the
+        # project.json it read (at open, or again) names. With the images whose
+        # import the log records (the session's own imports among them), the
+        # only image files its cleanup deletes (#101): a file synced before the
+        # project.json that names it is never deleted.
+        self._known = {name.lower() for name in (*saved_files, *known)}
         # The undo history: the states committed in this session, oldest first,
         # from the one it began with (added at its first change), and the index of
         # the committed one; empty and -1 before the first change and after close.
@@ -1327,6 +1340,9 @@ class ProjectSession:
         self._base = _read(saved, project, migrated=migrated)
         self._copy, self._said, self._kept = None, None, ()
         self._saved_files = _referenced_files(project)
+        self._known.update(
+            name.lower() for name in (*self._saved_files, *storage.image_names(saved))
+        )
         self._pixels = {}
         self._states, self._cursor = [], -1
         self._steps = (None, None)
@@ -1362,8 +1378,11 @@ class ProjectSession:
         """Delete unreferenced Proteia files in ``images/`` that neither the saved
         ``project.json``, nor a state in the undo history, nor a backup of an
         older ``project.json``, nor another version of the project references
-        (best effort: a file held open on Windows stays). Names compare
-        ignoring case, as Windows does.
+        (best effort: a file held open on Windows stays), and, of the image
+        files, only those the session knows (``_known``, or an image whose
+        import the project's log records: never one synced from another
+        computer before its project.json, #101). Names compare ignoring case,
+        as Windows does.
 
         Another version (#101, :meth:`_named_by_versions`) keeps every image
         file its text names, whatever its id: a conflict copy, any other
@@ -1385,6 +1404,16 @@ class ProjectSession:
             for path in storage.orphan_files(self._project, self._folder)
             if path.name.lower() not in keep and _ORPHAN_NAME.match(path.name)
         ]
+        # An image file only if the session knows it (a temp file always).
+        strangers = [
+            path
+            for path in orphans
+            if _IMAGE_FILE.match(path.name) and path.name.lower() not in self._known
+        ]
+        if strangers:  # the log is read only then
+            imported = _imported(self._project)
+            left = {path for path in strangers if not _of_an_import(path, imported)}
+            orphans = [path for path in orphans if path not in left]
         if not orphans:  # the versions are read only then: most saves leave no orphan
             return
         versions = self._named_by_versions()
@@ -1463,6 +1492,43 @@ class ProjectSession:
         while number in held:
             number += 1
         return number
+
+
+def _image_id(name: str) -> str:
+    """The image id of a stored image file's name (``_IMAGE_FILE``):
+    ``img-3.tif`` is ``img-3``, ``IMG-3.TIF`` too."""
+    match = _IMAGE_FILE.match(name)
+    if match is None:  # never: called only for names _IMAGE_FILE matched
+        raise ValueError(f"{name!r} is no stored image file's name")
+    return f"img-{int(match[1])}"
+
+
+def _imported(project: Project) -> dict[str, set[str]]:
+    """The images whose import ``project``'s log records, whatever happened to
+    them since: each id with the SHA-256 of the file each import stored (its
+    ``sha256`` param), for :func:`_of_an_import` (#101)."""
+    found: dict[str, set[str]] = {}
+    for entry in project.log:
+        if entry.action == "import_image":
+            image_id, digest = entry.params.get("image_id"), entry.params.get("sha256")
+            found.setdefault(str(image_id), set()).add(str(digest))
+    return found
+
+
+def _of_an_import(path: Path, imported: Mapping[str, set[str]]) -> bool:
+    """Whether the image file ``path`` is one the project's own history
+    imported (:func:`_imported`): an import recorded its id, and its bytes are
+    the ones that import stored. Not so for another computer's image of the
+    same id (two versions that each took it), nor while the file cannot be
+    read."""
+    digests = imported.get(_image_id(path.name))
+    if not digests:
+        return False
+    try:
+        with path.open("rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest() in digests
+    except OSError:
+        return False
 
 
 def _found_copies(folder: Path) -> tuple[str, ...]:
@@ -1557,6 +1623,7 @@ def open_project(
         autosave=autosave,
         saved_files=_referenced_files(project),
         base=_read(data, project, migrated=migrated),
+        known=storage.image_names(data),
         clock=clock,
     )
     _log_opened(session.folder, project)
