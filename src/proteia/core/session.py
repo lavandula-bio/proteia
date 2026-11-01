@@ -110,8 +110,12 @@ UNDO_LIMIT: Final = 100
 
 # The causes of refusing to read a stored file whose logging a session
 # remembers (#246), so that each is logged once however often the file is
-# read; past this, the oldest is forgotten, and logged again if met again.
+# read; past this, the one met least recently is forgotten, and logged again
+# if met again.
 _LOGGED_CAUSES: Final = 256
+# A cause of refusing to read a stored file, as a session keeps it: the
+# image's id and SHA-256, and the type and errno (or None) of the error.
+type _LoggedCause = tuple[str, str, type[BaseException], int | None]
 
 # Proteia's image names (img-N.<suffix>) and the temp files storage writes while
 # storing or saving (.img-N.<suffix>.<random>.part/.tmp): the only orphans cleanup
@@ -411,10 +415,10 @@ class ProjectSession:
         # (image id, SHA-256) -> what its stored file's header says of reading it
         # (outdated_reading): whether it converts CMYK, or what is refused in it.
         self._headers: dict[tuple[str, str], bool | str] = {}
-        # (image id, SHA-256, cause) of the refusals of reading a stored file
-        # this session logged, oldest first: what the library said is logged
-        # once per cause of each file (_read_checked), of the last _LOGGED_CAUSES.
-        self._refusals_logged: dict[tuple[str, str, tuple[str, str]], None] = {}
+        # (image id, SHA-256, the cause's type and errno) of the refusals of
+        # reading a stored file this session logged, met least recently first:
+        # what the library said is logged once per cause (_logs_refusal).
+        self._refusals_logged: dict[_LoggedCause, None] = {}
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -602,6 +606,27 @@ class ProjectSession:
         self._file_colours[key] = colours
         return colours
 
+    def _logs_refusal(self, image: ImageRef, exc: ValueError | OSError) -> bool:
+        """Whether this refusal of reading the image's stored file (id and
+        SHA-256) is to be logged: if it has a cause to log
+        (:func:`~proteia.core.imaging.refusal_cause`) that the session has
+        not met for the file among the last :data:`_LOGGED_CAUSES`. A cause
+        is the error's type and errno, not its words, which may vary (an
+        offset or a size in them). A cause met is the most recent; past the
+        bound, the least recent is forgotten. Called with the lock held."""
+        cause = refusal_cause(exc)
+        if cause is None:
+            return False
+        key = (image.id, image.sha256, type(cause), getattr(cause, "errno", None))
+        logged = self._refusals_logged
+        new = key not in logged
+        if not new:
+            del logged[key]  # met again: the most recent, below
+        elif len(logged) >= _LOGGED_CAUSES:
+            del logged[next(iter(logged))]  # the least recent
+        logged[key] = None
+        return new
+
     def _read_checked(self, image: ImageRef, read: Callable[[Path], np.ndarray]) -> np.ndarray:
         """``read`` of the image's stored file, once the file's bytes match the
         recorded SHA-256; its first two dimensions must be the recorded height
@@ -611,10 +636,9 @@ class ProjectSession:
         never by its stored copy (:func:`~proteia.core.imaging.named_refusal`,
         #234), and says what is wrong without a remedy: the image is in the
         project already, and importing its file again would lose its boxes.
-        What the library said is logged once per cause (its error's kind and
-        words, :func:`~proteia.core.imaging.refusal_cause`) of the stored
-        file (image id and SHA-256) in the session, as every view and measure
-        reads it again (#246). Called with the lock held."""
+        What the library said is logged once per cause of the stored file in
+        the session (:meth:`_logs_refusal`), as every view and measure reads
+        it again (#246). Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -626,14 +650,7 @@ class ProjectSession:
 
         def refused(exc: ValueError | OSError, why: str | None = None) -> OperationError:
             if why is None:
-                cause = refusal_cause(exc)
-                logged = self._refusals_logged
-                key = (image_id, image.sha256, cause)
-                log = cause is not None and key not in logged
-                if log:
-                    if len(logged) >= _LOGGED_CAUSES:
-                        del logged[next(iter(logged))]  # the oldest
-                    logged[key] = None
+                log = self._logs_refusal(image, exc)
                 why = named_refusal(exc, image.original_name, path, remedy=False, log=log)
             return OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image_id,))
 

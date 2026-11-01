@@ -12,7 +12,7 @@ import os
 import pickle
 import re
 import struct
-from io import BytesIO, RawIOBase
+from io import BytesIO
 from pathlib import Path, PureWindowsPath
 
 import numpy as np
@@ -3133,6 +3133,23 @@ def test_a_refusal_holds_proteias_words_and_logs_the_librarys(caplog, case):
     ]
 
 
+def test_a_refusal_caused_by_a_refusal_of_proteias_has_no_cause_to_log(caplog):
+    # #248: what is logged is an error of a library's or of the system's; a
+    # refusal of reading whose cause is Proteia's own refusal (no words of a
+    # library) logs none, and has no cause to log once per stored file.
+    try:
+        try:
+            raise imaging.NotSingleImageError("img-1.png", None, no_image=False)
+        except imaging.ReadingRefusal as inner:
+            raise imaging.ReadingRefusal("img-1.png", "it holds frames") from inner
+    except imaging.ReadingRefusal as outer:
+        refusal = outer
+    with caplog.at_level(logging.INFO, logger="proteia"):
+        answer = imaging.named_refusal(refusal, "gel µ.png", _STORED)
+    assert (answer, caplog.records) == ("cannot read 'gel µ.png': it holds frames", [])
+    assert imaging.refusal_cause(refusal) is None
+
+
 def test_a_refusal_of_reading_logs_its_cause_and_names_no_one_else(caplog):
     # Reading's own refusals are Proteia's words: those that a library's
     # error caused log that error; the others log nothing.
@@ -3159,11 +3176,23 @@ def test_a_refusal_of_reading_logs_its_cause_and_names_no_one_else(caplog):
     ]
 
 
-def test_a_refusal_gives_the_systems_reason_without_its_path():
+# What a refusal of an error of the system's says to do (#246): its drive
+# or the file may be at fault (EINVAL is both a decoder's seek where a
+# damaged file points and a drive that drops, on Windows), so the step
+# holds for both; an import adds the image saved again, which an image
+# already in the project could not take without losing its boxes.
+_CHECK_THE_DRIVE = "check that the file and its drive can be read, then try again"
+_SAVE_IT_AGAIN = (
+    "; if it still fails, save the image again as a TIFF, PNG or JPEG file and import that"
+)
+
+
+def test_a_refusal_gives_the_systems_reason_without_its_path_and_what_to_do():
     # #234 review 3: an error of the system's (it has an errno, with a path
-    # or without: a read that fails on a network drive) is no damage of the
-    # file: its reason is given, on an import as on an image already in the
-    # project. An error without an errno is a library's (damage).
+    # or without: a read that fails on a network drive) is given by its
+    # reason, on an import as on an image already in the project. #246: with
+    # a next step true whether the drive or the file is at fault. An error
+    # without an errno is a library's (damage).
     stored = _STORED
     errors = (
         FileNotFoundError(2, "No such file or directory", str(stored)),
@@ -3172,6 +3201,7 @@ def test_a_refusal_gives_the_systems_reason_without_its_path():
         OSError(None, "The drive was disconnected", str(stored)),
         OSError(errno.EIO, "Input/output error"),
         PermissionError(errno.EACCES, "Permission denied"),
+        OSError(errno.EINVAL, "Invalid argument"),
         OSError(errno.EIO, None),
     )
     reasons = [
@@ -3181,13 +3211,14 @@ def test_a_refusal_gives_the_systems_reason_without_its_path():
         "The drive was disconnected",
         "Input/output error",
         "Permission denied",
+        "Invalid argument",
         "OSError",
     ]
-    for remedy in (True, False):
+    for remedy, steps in ((True, f"{_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}"), (False, _CHECK_THE_DRIVE)):
         answers = [
             imaging.named_refusal(error, "gel µ.png", stored, remedy=remedy) for error in errors
         ]
-        assert answers == [f"cannot read 'gel µ.png': {reason}" for reason in reasons]
+        assert answers == [f"cannot read 'gel µ.png': {reason}; {steps}" for reason in reasons]
     assert imaging.named_refusal(OSError("image file is truncated"), "gel µ.png", stored) == (
         f"cannot read 'gel µ.png': {_DAMAGED_WORDS.format('OSError')}"
     )
@@ -3285,76 +3316,25 @@ def test_running_out_of_memory_or_stack_while_reading_is_no_damage(
     )
 
 
-class _FailingDisk(RawIOBase):
-    """A file the disk cannot give Proteia: a read fails, as a network
-    drive that dropped may fail on Windows (its C runtime's EINVAL), at
-    once, or after ``first`` (the first read's bytes)."""
-
-    def __init__(self, first: bytes = b"") -> None:
-        super().__init__()
-        self.first = first
-
-    def readable(self) -> bool:
-        return True
-
-    def readinto(self, buffer) -> int:
-        if not self.first:
-            raise OSError(errno.EINVAL, "Invalid argument")
-        size, self.first = len(self.first), b""
-        buffer[:size] = b"\x00" * size
-        return size
-
-
-def _disk_failing_for(monkeypatch, path: Path, first: bytes = b"") -> None:
-    """Make Proteia's own opening of ``path`` for reading give a file the
-    disk cannot read (:class:`_FailingDisk`, after ``first``); any other
-    open is as it is."""
-    real = Path.open
-
-    def open_(self, mode="r", *args, **kwargs):
-        if mode == "rb" and self == path:
-            return _FailingDisk(first)
-        return real(self, mode, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", open_)
-
-
-# An error of the system's that a library raises as it decodes a file it has
-# opened, by case (#246): the error; whether Proteia's own read of the
-# file's bytes fails too; and whether it is the file's (refused as damaged)
-# or the disk's (raised as it is, given by its reason). EINVAL is what a
-# seek or a read at an offset a damaged file gives, but on Windows a drive
-# that drops may give it too: the disk tells them apart, not the errno alone.
-_DECODING_ERRORS = {
-    "invalid argument": (lambda: OSError(errno.EINVAL, "Invalid argument"), None, True),
-    "invalid argument, the disk failing": (
-        lambda: OSError(errno.EINVAL, "Invalid argument"),
-        b"",
-        False,
-    ),
-    # The disk gives its first bytes, then fails: every byte is read.
-    "invalid argument, the disk failing later": (
-        lambda: OSError(errno.EINVAL, "Invalid argument"),
-        b"II*\x00",
-        False,
-    ),
-    "input/output": (lambda: OSError(errno.EIO, "Input/output error"), None, False),
-    "access": (lambda: PermissionError(errno.EACCES, "Permission denied"), None, False),
-    "invalid argument naming the file": (
-        lambda: OSError(errno.EINVAL, "Invalid argument", "gel µ.tif"),
-        None,
-        False,
-    ),
-    "no errno": (lambda: OSError("image file is truncated"), None, False),
+# An error of the system's that a library raises as it decodes a file, by
+# case (#246): an errno, or a file name (an open's). Reading raises it as it
+# is, for its refusal to give its reason and what to do (named_refusal):
+# from the error alone, the file's drive or the file may be at fault.
+_SYSTEM_ERRORS = {
+    "invalid argument": lambda: OSError(errno.EINVAL, "Invalid argument"),
+    "input/output": lambda: OSError(errno.EIO, "Input/output error"),
+    "access": lambda: PermissionError(errno.EACCES, "Permission denied"),
+    "naming the file": lambda: OSError(None, "The drive was disconnected", "gel µ.tif"),
 }
 
 
 def _decoding_reads(tmp_path: Path) -> dict[str, tuple[object, Path, object, str]]:
     """Each reader's decoding of a file, by case: the reader, the file, and
-    the owner and name of what decodes it (tifffile's pixels of a TIFF,
+    the owner and name of what decodes it: tifffile's pixels of a TIFF,
     Pillow's of a PNG through scikit-image, tifffile's colour map of a
-    palette TIFF read in its colours)."""
-    from PIL import ImageFile
+    palette TIFF read in its colours, and Pillow's of an LZW TIFF, which
+    tifffile cannot decode without imagecodecs."""
+    from PIL import ImageFile, TiffImagePlugin
 
     gray_tif = tmp_path / "gray µ.tif"
     _write(gray_tif, _gray(np.uint16, 65535))
@@ -3362,57 +3342,63 @@ def _decoding_reads(tmp_path: Path) -> dict[str, tuple[object, Path, object, str
     Image.fromarray(_gray(np.uint8, 255)).save(gray_png)
     palette_tif = tmp_path / "palette α.tif"
     _write(palette_tif, _gray(np.uint8, 255), photometric="palette", colormap=_palette_map())
+    lzw_tif = tmp_path / "lzw α.tif"
+    write_lzw_tiff(lzw_tif, _gray(np.uint16, 65535))
     return {
         "tiff pixels": (imaging.read_file, gray_tif, tifffile.TiffPageSeries, "asarray"),
         "png pixels": (imaging.read_file, gray_png, ImageFile.ImageFile, "load"),
         "tiff colours": (read_colours, palette_tif, tifffile.TiffPage, "colormap"),
+        "lzw tiff pixels": (imaging.read_file, lzw_tif, TiffImagePlugin.TiffImageFile, "load"),
     }
 
 
-@pytest.mark.parametrize("case", list(_DECODING_ERRORS))
-@pytest.mark.parametrize("reader", ["tiff pixels", "png pixels", "tiff colours"])
-def test_an_invalid_argument_while_a_library_decodes_is_the_files_unless_the_disk_fails(
-    tmp_path, monkeypatch, reader, case
-):
-    # #246: an errno error was taken for the system's wherever it was
-    # raised, so a damaged file whose offsets make a decoder seek or read
-    # where the system refuses (EINVAL) was refused as "Invalid argument",
-    # with no next step. It is the file's when the library raises it as it
-    # decodes, naming no file (an open names it), and Proteia reads every
-    # byte of the file itself: refused as damaged, with the error as cause.
-    read, path, owner, name = _decoding_reads(tmp_path)[reader]
-    made, disk_gives, the_files = _DECODING_ERRORS[case]
-    error = made()
+def _decoder_raising(monkeypatch, owner: object, name: str, error: BaseException) -> None:
+    """Make what decodes a file (``owner.name``, a method or a property) raise ``error``."""
 
     def decode(*args, **kwargs):
         raise error
 
     monkeypatch.setattr(owner, name, property(decode) if name == "colormap" else decode)
-    if disk_gives is not None:  # the disk fails for Proteia, after these bytes
-        _disk_failing_for(monkeypatch, path, disk_gives)
-    if the_files:
-        with pytest.raises(imaging.ReadingRefusal) as refused:
-            read(path)
-        assert type(refused.value) is imaging.ReadingRefusal
-        assert str(refused.value) == f"{path.name}: {_DAMAGED_WORDS.format('OSError')}"
-        assert refused.value.__cause__ is error
-    else:
-        with pytest.raises(OSError) as raised:
-            read(path)
-        assert raised.value is error
 
 
-def test_an_error_of_proteias_own_read_of_a_header_is_the_disks(tmp_path, monkeypatch):
-    # #246: Proteia's own read of a file's first bytes (whether it is a TIFF)
-    # is the disk's, whatever its errno, EINVAL too: raised as it is.
-    path = tmp_path / "gray β.png"
-    Image.fromarray(_gray(np.uint8, 255)).save(path)
-    _disk_failing_for(monkeypatch, path)
-    for check in (imaging.check_misnamed_tiff, imaging.ink_set, imaging.declared_pixel_type):
-        with pytest.raises(OSError) as raised:
-            check(path)
-        assert type(raised.value) is OSError
-        assert raised.value.errno == errno.EINVAL
+@pytest.mark.parametrize("case", list(_SYSTEM_ERRORS))
+@pytest.mark.parametrize("reader", ["tiff pixels", "png pixels", "tiff colours", "lzw tiff pixels"])
+def test_an_error_of_the_systems_while_a_library_decodes_is_raised_as_it_is(
+    tmp_path, monkeypatch, reader, case
+):
+    # #246: whether a decoder's seek where a damaged file points or the
+    # drive failed, the error cannot tell: it is raised as it is, for the
+    # refusal to give its reason and a next step true of both. #248 review:
+    # the decoding of a compressed TIFF took it for its compression, which
+    # this installation cannot decode ("save the image as an uncompressed
+    # TIFF"), whatever it was.
+    read, path, owner, name = _decoding_reads(tmp_path)[reader]
+    error = _SYSTEM_ERRORS[case]()
+    _decoder_raising(monkeypatch, owner, name, error)
+    with pytest.raises(OSError) as raised:
+        read(path)
+    assert raised.value is error
+
+
+def test_a_compressed_tiff_whose_codec_fails_is_still_refused_for_its_compression(
+    tmp_path, monkeypatch
+):
+    # #248 review: only an error of the system's passes; a codec's failure,
+    # an error of no errno, is still refused as the compression this
+    # installation cannot decode, with the error as its cause.
+    from PIL import TiffImagePlugin
+
+    read, path, owner, name = _decoding_reads(tmp_path)["lzw tiff pixels"]
+    height, width = _gray(np.uint16, 65535).shape
+    error = OSError("decoder error -2")
+    _decoder_raising(monkeypatch, TiffImagePlugin.TiffImageFile, "load", error)
+    with pytest.raises(imaging.ReadingRefusal) as refused:
+        read(path)
+    assert str(refused.value) == (
+        f"{path.name}: LZW compression of this {height}x{width} uint16 MINISBLACK image cannot be"
+        " decoded by this installation; save the image as an uncompressed TIFF"
+    )
+    assert refused.value.__cause__ is error
 
 
 def test_a_refusal_for_an_image_already_imported_gives_no_remedy():
