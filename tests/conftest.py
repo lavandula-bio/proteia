@@ -530,6 +530,13 @@ def project() -> Project:
     return make_project()
 
 
+def known(session: ProjectSession, *paths: Path) -> None:
+    """Make ``session`` know the image files ``paths``, as if it had stored them
+    and no state referenced them any more: a cleanup deletes no other image
+    file (#101), so a test of what keeps a file plants files the session knows."""
+    session._known.update(path.name.lower() for path in paths)
+
+
 def write_image_files(folder: Path, project: Project) -> None:
     """Write each image's stand-in pixels to ``images/<file>`` under ``folder``."""
     for image in project.batch.iter_images():
