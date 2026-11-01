@@ -208,18 +208,19 @@ def vc_runtime_sources(
     spec found it elsewhere (System32, which the Visual C++ Redistributable
     installs into), did not classify it, or no package lists its folder (#54)."""
     by_path = {vc.path.lower(): vc for vc in classified}
-    owners = {name: p for p in packages for name in p.top_level}
+    owners = {name.lower(): p for p in packages for name in p.top_level}
     sources, problems = [], []
     for name in files:
         vc = by_path.get(name.lower())
+        folder = (vc.folder or "").lower() if vc is not None else ""
         if vc is None:
             why = "the spec did not classify it"
         elif vc.kind is bundle.VcKind.PYTHON:
             text = "from the Python runtime's Windows build (section 1)"
             sources.append(VcSource(name, vc.kind, text))
             continue
-        elif vc.kind is bundle.VcKind.WHEEL and vc.folder in owners:
-            owner = owners[vc.folder]
+        elif vc.kind is bundle.VcKind.WHEEL and folder in owners:
+            owner = owners[folder]
             text = f"from the {owner.name} {owner.version} wheel (section 3)"
             sources.append(VcSource(name, vc.kind, text))
             continue

@@ -19,6 +19,7 @@ import posixpath
 import re
 import struct
 import sys
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -275,15 +276,20 @@ def leave_out(
 
 
 def dll_search_folders(binary: str) -> list[str]:
-    """The folders of the bundle (paths in it) where Windows looks for the DLLs
-    the binary at ``binary`` (its path in the bundle folder) imports by name:
-    :data:`CONTENTS`, which the bootloader adds (``SetDllDirectoryW``); the
-    binary's own folder, which Python adds when it loads an extension module
+    """The folders of the bundle (paths in it, ``.`` for the bundle folder) where
+    Windows looks for the DLLs the binary at ``binary`` (its path in the bundle
+    folder) imports by name. For a DLL or an extension module: :data:`CONTENTS`,
+    which the bootloader adds (``SetDllDirectoryW``); the binary's own folder,
+    which Python adds when it loads an extension module
     (``LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR``); and, for a binary of a package, the
     package's ``<name>.libs`` folder, which delvewheel's patch to the package's
-    ``__init__.py`` adds with ``os.add_dll_directory`` (NumPy's and SciPy's). A
-    DLL elsewhere in the bundle is found only if something else loaded it first."""
+    ``__init__.py`` adds with ``os.add_dll_directory`` (NumPy's and SciPy's). For
+    an ``.exe``, its own folder only: Windows resolves its imports when its
+    process starts, before anything adds a folder. A DLL elsewhere in the bundle
+    is found only if something else loaded it first."""
     own = posixpath.dirname(binary) or "."
+    if binary.lower().endswith(".exe"):
+        return [own]
     folders = [CONTENTS, own]
     parts = PurePosixPath(binary).parts
     if len(parts) > 2 and parts[0] == CONTENTS:
@@ -302,9 +308,40 @@ def vc_runtime_problems(
     package's own copy; and each such DLL a binary imports by name must be one of
     those in a folder Windows looks in for that binary (:func:`dll_search_folders`).
     Otherwise Windows looks for it in System32, where only the Visual C++
-    Redistributable puts Microsoft's names (#54)."""
-    by_path = {vc.path.lower(): vc for vc in classified}
+    Redistributable puts Microsoft's names (#54). A file the spec left out that the
+    bundle cannot do without is a problem of its own, reported first, and its
+    importers are not listed one by one: one of the Python build's two files, or
+    a package's renamed copy, which no Windows provides."""
+    in_bundle = {path.lower() for path in imports}
+    importers = Counter(name for dlls in imports.values() for name in {d.lower() for d in dlls})
     problems = []
+    causes = set()
+    for vc in sorted(classified, key=lambda vc: vc.path.lower()):
+        name = PurePosixPath(vc.path).name.lower()
+        if vc.kind in CARRIED_KINDS or vc.path.lower() in in_bundle:
+            continue
+        if name in PYTHON_VC_RUNTIME:
+            problems.append(
+                f"{vc.path}: the Python build's own Visual C++ runtime file, which the spec"
+                f" left out: PyInstaller found it in {vc.source}, not directly in the Python"
+                " installation's folder (sys.base_prefix); bundled binaries that import it:"
+                f" {importers[name]}. Build with a Python whose own folder holds"
+                " vcruntime140.dll and vcruntime140_1.dll, such as an installed or"
+                " uv-managed CPython (#54)"
+            )
+        elif not is_vc_runtime(name):
+            problems.append(
+                f"{vc.path}: a package's renamed copy of the Visual C++ runtime, which the spec"
+                f" left out: PyInstaller found it in {vc.source}, outside every package folder"
+                " of the build environment, and no Windows provides it under that name;"
+                f" bundled binaries that import it: {importers[name]}. Install the package"
+                " that ships it in the build environment (uv.lock), or leave out what needs"
+                " it (bundle.py) (#54)"
+            )
+        else:
+            continue
+        causes.add(name)
+    by_path = {vc.path.lower(): vc for vc in classified}
     carried = []
     for path in sorted(imports):
         if not is_vc_runtime_copy(path):
@@ -314,12 +351,15 @@ def vc_runtime_problems(
             problems.append(
                 f"{path}: a Visual C++ runtime file the spec's classification (the bundle"
                 " manifest) does not list, so nothing says where it came from; the bundle"
-                " carries only the Python build's copies and packages' own (#54)"
+                " carries only the Python build's copies and packages' own. Collect it as a"
+                " binary, which the spec classifies, or leave it out (proteia.spec) (#54)"
             )
         elif vc.kind not in CARRIED_KINDS:
             problems.append(
                 f"{path}: a Visual C++ runtime file from {vc.source}, which is neither the"
-                " Python build's folder nor a package's; the bundle leaves such files out (#54)"
+                " Python build's folder nor a package's; the bundle leaves such files out, so"
+                " find what added it after the spec left it out (a data entry of the same"
+                " name, say) (#54)"
             )
         else:
             carried.append(PurePosixPath(path.lower()))
@@ -327,18 +367,24 @@ def vc_runtime_problems(
         folders = dll_search_folders(binary)
         searched = {folder.lower() for folder in folders}
         provided = {path.name for path in carried if str(path.parent) in searched}
+        shown = ", ".join("the bundle folder" if folder == "." else folder for folder in folders)
         for dll in sorted(set(imports[binary]), key=str.lower):
-            if not is_vc_runtime_copy(dll) or dll.lower() in provided:
+            if not is_vc_runtime_copy(dll) or dll.lower() in provided or dll.lower() in causes:
                 continue
             why = (
                 "it loads only where the Visual C++ Redistributable is installed"
                 if is_vc_runtime(dll)
                 else "no Windows provides it"
             )
+            step = (
+                "an .exe finds it only in its own folder, before anything adds another, so"
+                " bundle a copy next to it or leave the program out (proteia.spec)"
+                if binary.lower().endswith(".exe")
+                else "leave the module out (bundle.py) or bundle a copy its package provides"
+            )
             problems.append(
                 f"{binary} imports {dll}, a Visual C++ runtime file the bundle does not carry"
-                f" where Windows looks for it ({', '.join(folders)}): {why}; leave the module"
-                " out (bundle.py) or bundle a copy its package provides (#54)"
+                f" where Windows looks for it ({shown}): {why}; {step} (#54)"
             )
     return problems
 
@@ -349,14 +395,18 @@ class NotPE(Exception):
 
 
 _PE_SIGNATURE: Final = b"PE" + bytes(2)
+# The optional header's kinds, by its magic: the name, and the size of its fields
+# before the data directories (the last of them, NumberOfRvaAndSizes, counts those).
+_OPTIONAL_HEADERS: Final = {0x10B: ("PE32", 96), 0x20B: ("PE32+", 112)}
 
 
 def pe_header_problem(path: Path) -> str | None:
     """Why the file at ``path`` is not a PE file whose import tables can be read,
     as far as its headers tell (the standard library only): None when it starts
-    with a DOS header pointing at a PE signature, and its section table and every
-    section it lists lie within the file. pefile reads a file cut short without
-    an error, and finds no imports in it."""
+    with a DOS header pointing at a PE signature, its optional header is a PE32 or
+    PE32+ one that holds its fields and data directories, and its section table
+    and every section it lists lie within the file. pefile reads a file cut short
+    without an error, and finds no imports in it."""
     size = path.stat().st_size
     if size == 0:
         return "the file is empty"
@@ -373,15 +423,29 @@ def pe_header_problem(path: Path) -> str | None:
             return "its PE header runs past the end of the file"
         (count,) = struct.unpack_from("<H", coff, 6)
         (optional,) = struct.unpack_from("<H", coff, 20)
-        f.seek(offset + 24 + optional)
+        header = f.read(optional)
         table = f.read(40 * count)
+    if len(header) < optional:
+        return "its optional header runs past the end of the file"
+    kind, fields = _OPTIONAL_HEADERS.get(int.from_bytes(header[:2], "little"), (None, 0))
+    if kind is None:
+        return "its optional header is neither PE32 nor PE32+"
+    if optional < fields:
+        return f"its optional header ({optional} bytes) is shorter than its {kind} fields"
+    (directories,) = struct.unpack_from("<I", header, fields - 4)
+    if optional < fields + 8 * directories:
+        return (
+            f"its optional header ({optional} bytes) cannot hold its {directories} data directories"
+        )
     if len(table) < 40 * count:
         return "its section table runs past the end of the file"
     for start in range(0, 40 * count, 40):
         raw_size, raw_offset = struct.unpack_from("<II", table, start + 16)
         if raw_size and raw_offset + raw_size > size:
-            section = table[start : start + 8].rstrip(bytes(1)).decode("ascii", "replace")
-            return f"its section {section!r} runs past the end of the file, which is cut short"
+            name = table[start : start + 8].rstrip(bytes(1)).decode("ascii", "replace")
+            known = name and name.isascii() and name.isprintable()
+            section = repr(name) if known else f"number {start // 40 + 1}"
+            return f"its section {section} runs past the end of the file, which is cut short"
     return None
 
 

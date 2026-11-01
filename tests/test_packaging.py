@@ -419,6 +419,9 @@ def test_importing_every_module_of_proteia_loads_none_the_bundle_leaves_out(tmp_
     # A module imported at the top of another (skimage.feature.corner imports
     # _hessian_det_appx) slips past test_nothing_the_app_imports_is_left_out:
     # here everything is imported, and what got loaded is looked at (#239).
+    # Its limit: only the modules' top levels run, so an import inside a function
+    # (imaging's `from skimage import io`, say) is not followed; the frozen
+    # self-test is the check for those paths.
     found = _import_everything(tmp_path)
     modules = {
         ".".join(path.relative_to(PACKAGE.parent).with_suffix("").parts).removesuffix(".__init__")
@@ -438,11 +441,19 @@ def test_the_import_check_finds_an_excluded_module_another_imports_at_its_top(tm
 _REDISTRIBUTABLE = "it loads only where the Visual C++ Redistributable is installed"
 
 
-def _not_found(binary: str, dll: str, folders: str, why: str = _REDISTRIBUTABLE) -> str:
+_LEAVE_OUT = "leave the module out (bundle.py) or bundle a copy its package provides"
+_NEXT_TO_IT = (
+    "an .exe finds it only in its own folder, before anything adds another, so bundle a copy"
+    " next to it or leave the program out (proteia.spec)"
+)
+
+
+def _not_found(
+    binary: str, dll: str, folders: str, why: str = _REDISTRIBUTABLE, step: str = _LEAVE_OUT
+) -> str:
     return (
         f"{binary} imports {dll}, a Visual C++ runtime file the bundle does not carry where"
-        f" Windows looks for it ({folders}): {why}; leave the module out (bundle.py) or bundle"
-        " a copy its package provides (#54)"
+        f" Windows looks for it ({folders}): {why}; {step} (#54)"
     )
 
 
@@ -452,22 +463,33 @@ def test_a_vc_runtime_file_counts_only_where_windows_looks_for_it():
         _vc("_internal/alpha.libs/vcomp140.dll", "wheel", folder="alpha.libs"),
         _vc("_internal/alpha/sub/concrt140.dll", "wheel", folder="alpha"),
         _vc("_internal/numpy.libs/msvcp140-abc.dll", "wheel", folder="numpy.libs"),
+        _vc("_internal/alpha/bin/vcomp140.dll", "wheel", folder="alpha"),
     ]
     imports = {
         **{vc.path: [] for vc in classified},
         # found in _internal, in the binary's own folder, in its package's .libs folder
-        "Proteia.exe": ["VCRUNTIME140.dll"],
         "_internal/python313.dll": ["vcruntime140.DLL", "KERNEL32.dll"],
         "_internal/alpha/x.pyd": ["vcomp140.dll", "VCRUNTIME140.dll"],
         "_internal/alpha/sub/y.pyd": ["concrt140.dll", "VCOMP140.dll"],
         "_internal/numpy/_core/z.pyd": ["msvcp140-abc.dll", "python313.dll"],
         "_internal/numpy.libs/openblas.dll": ["msvcp140-abc.dll"],
+        # an .exe's own folder only: its imports are found when its process starts,
+        # before the bootloader adds _internal, and no package adds a folder for it
+        "_internal/alpha/bin/helper.exe": ["vcomp140.dll"],
         # not: in another package's folder, in a folder below its own, in neither
         "_internal/beta/w.pyd": ["vcomp140.dll", "msvcp140-abc.dll", "vcomp140.dll"],
         "_internal/alpha/v.pyd": ["concrt140.dll"],
         "_internal/python3.dll": ["vcomp140.dll"],
+        # an .exe, from _internal or its package's .libs folder (#239 review)
+        "Proteia.exe": ["VCRUNTIME140.dll", "KERNEL32.dll"],
+        "_internal/alpha/tool.exe": ["VCRUNTIME140.dll", "vcomp140.dll"],
     }
     assert bundle.vc_runtime_problems(imports, classified) == [
+        _not_found("Proteia.exe", "VCRUNTIME140.dll", "the bundle folder", step=_NEXT_TO_IT),
+        _not_found("_internal/alpha/tool.exe", "vcomp140.dll", "_internal/alpha", step=_NEXT_TO_IT),
+        _not_found(
+            "_internal/alpha/tool.exe", "VCRUNTIME140.dll", "_internal/alpha", step=_NEXT_TO_IT
+        ),
         _not_found(
             "_internal/alpha/v.pyd",
             "concrt140.dll",
@@ -484,12 +506,21 @@ def test_a_vc_runtime_file_counts_only_where_windows_looks_for_it():
         ),
         _not_found("_internal/python3.dll", "vcomp140.dll", "_internal"),
     ]
-    assert bundle.dll_search_folders("Proteia.exe") == ["_internal", "."]
+    assert bundle.dll_search_folders("Proteia.exe") == ["."]
+    assert bundle.dll_search_folders("_internal/pkg/bin/helper.EXE") == ["_internal/pkg/bin"]
     assert bundle.dll_search_folders("_internal/PIL/_imaging.pyd") == [
         "_internal",
         "_internal/PIL",
         "_internal/PIL.libs",
     ]
+
+
+_UNCLASSIFIED = (
+    ": a Visual C++ runtime file the spec's classification (the bundle manifest) does not"
+    " list, so nothing says where it came from; the bundle carries only the Python build's"
+    " copies and packages' own. Collect it as a binary, which the spec classifies, or leave"
+    " it out (proteia.spec) (#54)"
+)
 
 
 def test_the_bundle_check_rechecks_the_specs_classification():
@@ -506,16 +537,12 @@ def test_the_bundle_check_rechecks_the_specs_classification():
         "_internal/pkg/sub/x.pyd": ["vcomp140.dll", "VCRUNTIME140.dll"],
         "_internal/numpy/y.pyd": ["MSVCP140.dll", "msvcp140-abc.dll"],
     }
-    unclassified = (
-        ": a Visual C++ runtime file the spec's classification (the bundle manifest) does"
-        " not list, so nothing says where it came from; the bundle carries only the Python"
-        " build's copies and packages' own (#54)"
-    )
     assert bundle.vc_runtime_problems(imports, classified) == [
         "_internal/MSVCP140.dll: a Visual C++ runtime file from"
         " C:\\Windows\\System32\\msvcp140.dll, which is neither the Python build's folder nor"
-        " a package's; the bundle leaves such files out (#54)",
-        "_internal/pkg/sub/vcomp140.dll" + unclassified,
+        " a package's; the bundle leaves such files out, so find what added it after the spec"
+        " left it out (a data entry of the same name, say) (#54)",
+        "_internal/pkg/sub/vcomp140.dll" + _UNCLASSIFIED,
         _not_found(
             "_internal/numpy/y.pyd",
             "MSVCP140.dll",
@@ -530,8 +557,85 @@ def test_the_bundle_check_rechecks_the_specs_classification():
     # A manifest from before the classification classifies nothing.
     assert bundle.read_vc_runtime({"proteia": "0.1.0.dev0"}) == []
     assert bundle.vc_runtime_problems({"_internal/VCRUNTIME140.dll": []}, []) == [
-        "_internal/VCRUNTIME140.dll" + unclassified
+        "_internal/VCRUNTIME140.dll" + _UNCLASSIFIED
     ]
+
+
+def _python_left_out(path: str, source: str, importers: int) -> str:
+    return (
+        f"{path}: the Python build's own Visual C++ runtime file, which the spec left out:"
+        f" PyInstaller found it in {source}, not directly in the Python installation's folder"
+        f" (sys.base_prefix); bundled binaries that import it: {importers}. Build with a"
+        " Python whose own folder holds vcruntime140.dll and vcruntime140_1.dll, such as an"
+        " installed or uv-managed CPython (#54)"
+    )
+
+
+def test_the_python_builds_file_left_out_is_reported_as_the_cause():
+    # Before the #239 review the build printed only one line per importer (110 in
+    # a real build), each with advice that cannot work, and never this cause.
+    imports = {
+        "_internal/python313.dll": ["VCRUNTIME140.dll", "KERNEL32.dll"],
+        "_internal/_ssl.pyd": ["vcruntime140.dll", "VCRUNTIME140_1.dll"],
+        "_internal/skimage/util/_remap.pyd": ["MSVCP140.dll", "VCRUNTIME140_1.dll"],
+        "_internal/VCRUNTIME140_1.dll": [],
+    }
+    system = r"C:\Windows\System32"
+    classified = [
+        _vc("_internal/VCRUNTIME140.dll", "elsewhere", source=rf"{system}\VCRUNTIME140.dll"),
+        _vc("_internal/VCRUNTIME140_1.dll", "python"),
+        # System32's MSVCP140.dll left out is what #54 wants: its importers are the cause.
+        _vc("_internal/MSVCP140.dll", "elsewhere", source=rf"{system}\msvcp140.dll"),
+    ]
+    assert bundle.vc_runtime_problems(imports, classified) == [
+        _python_left_out("_internal/VCRUNTIME140.dll", rf"{system}\VCRUNTIME140.dll", 2),
+        _not_found(
+            "_internal/skimage/util/_remap.pyd",
+            "MSVCP140.dll",
+            "_internal, _internal/skimage/util, _internal/skimage.libs",
+        ),
+    ]
+    # Both of them, from a Python run from its source tree; nothing imports the second.
+    tree = r"C:\cpython\PCbuild\amd64"
+    classified = [
+        _vc("_internal/VCRUNTIME140.dll", "elsewhere", source=rf"{tree}\vcruntime140.dll"),
+        _vc("_internal/vcruntime140_1.dll", "elsewhere", source=rf"{tree}\vcruntime140_1.dll"),
+    ]
+    imports = {"_internal/python313.dll": ["VCRUNTIME140.dll"]}
+    assert bundle.vc_runtime_problems(imports, classified) == [
+        _python_left_out("_internal/VCRUNTIME140.dll", rf"{tree}\vcruntime140.dll", 1),
+        _python_left_out("_internal/vcruntime140_1.dll", rf"{tree}\vcruntime140_1.dll", 0),
+    ]
+    # In the bundle after all (a data entry, say): what the bundle holds is the problem.
+    imports["_internal/VCRUNTIME140.dll"] = []
+    problems = bundle.vc_runtime_problems(imports, classified)
+    assert problems[0] == _python_left_out(
+        "_internal/vcruntime140_1.dll", rf"{tree}\vcruntime140_1.dll", 0
+    )
+    assert problems[1].startswith(
+        rf"_internal/VCRUNTIME140.dll: a Visual C++ runtime file from {tree}\vcruntime140.dll,"
+    )
+    assert len(problems) == 3 and problems[2].startswith("_internal/python313.dll imports")
+
+
+def test_a_renamed_copy_from_outside_every_package_is_a_problem():
+    # Main failed the build on it (its notices: "source not identified"); left out
+    # and imported by nothing, it would go missing quietly (#239 review).
+    entries = [("msvcp140-def.dll", r"C:\other\bin\msvcp140-def.dll", "BINARY")]
+    kept, left_out, classified = bundle.leave_out(entries, [_SITE], _PY, _as_is)
+    assert kept == [] and left_out["vc_runtime"] == ["msvcp140-def.dll"]
+    renamed = (
+        "_internal/msvcp140-def.dll: a package's renamed copy of the Visual C++ runtime, which"
+        " the spec left out: PyInstaller found it in C:\\other\\bin\\msvcp140-def.dll, outside"
+        " every package folder of the build environment, and no Windows provides it under that"
+        " name; bundled binaries that import it: {}. Install the package that ships it in the"
+        " build environment (uv.lock), or leave out what needs it (bundle.py) (#54)"
+    )
+    assert bundle.vc_runtime_problems({"_internal/python313.dll": []}, classified) == [
+        renamed.format(0)
+    ]
+    imports = {"_internal/pkg/x.pyd": ["MSVCP140-DEF.dll"], "_internal/pkg/y.pyd": []}
+    assert bundle.vc_runtime_problems(imports, classified) == [renamed.format(1)]
 
 
 def test_the_classification_goes_through_the_manifest_unchanged():
@@ -557,6 +661,19 @@ def test_the_classification_goes_through_the_manifest_unchanged():
         read[0].kind = bundle.VcKind.WHEEL
 
 
+def _check_libs_folders(roots) -> list[str]:
+    """The ``<name>.libs`` folders in the site-packages folders ``roots``, each
+    asserted to be added by the package ``<name>`` (its ``__init__.py`` calls
+    ``os.add_dll_directory`` with it), as delvewheel's patch does."""
+    folders = sorted(path for root in roots for path in root.glob("*.libs") if path.is_dir())
+    for folder in folders:
+        init = folder.with_name(folder.name.removesuffix(".libs")) / "__init__.py"
+        assert init.is_file(), f"{folder.name}: no package {init.parent.name} to add it"
+        text = init.read_text(encoding="utf-8")
+        assert "os.add_dll_directory(" in text and f"'{folder.name}'" in text, folder.name
+    return [folder.name for folder in folders]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="delvewheel patches the Windows wheels")
 def test_each_libs_folder_is_added_by_the_package_it_is_named_after():
     # dll_search_folders counts a package's <name>.libs folder as searched for the
@@ -565,29 +682,51 @@ def test_each_libs_folder_is_added_by_the_package_it_is_named_after():
     import sysconfig
 
     roots = {Path(sysconfig.get_path(name)) for name in ("purelib", "platlib")}
-    folders = sorted(path for root in roots for path in root.glob("*.libs") if path.is_dir())
-    assert {"numpy.libs", "scipy.libs"} <= {folder.name for folder in folders}
-    for folder in folders:
-        init = folder.with_name(folder.name.removesuffix(".libs")) / "__init__.py"
-        text = init.read_text(encoding="utf-8")
-        assert "os.add_dll_directory(" in text and f"'{folder.name}'" in text, folder.name
+    assert {"numpy.libs", "scipy.libs"} <= set(_check_libs_folders(roots))
 
 
-def _pe(sections=((0x400, 0x200),), size: int | None = None, at: int = 0x80) -> bytes:
+def test_a_libs_folder_named_otherwise_fails_the_check_by_its_name(tmp_path):
+    # pyzmq's wheel names it after the distribution (pyzmq.libs, for zmq): the
+    # check says which folder, rather than failing to read a file.
+    site = tmp_path / "site-packages"
+    patch = "os.add_dll_directory(os.path.join(here, os.pardir, 'numpy.libs'))\n"
+    _file(site / "numpy" / "__init__.py", patch)
+    (site / "numpy.libs").mkdir()
+    assert _check_libs_folders([site]) == ["numpy.libs"]
+    (site / "pyzmq.libs").mkdir()
+    _file(site / "zmq" / "__init__.py", "os.add_dll_directory(libs)\n")
+    with pytest.raises(AssertionError, match=r"^pyzmq\.libs: no package pyzmq to add it"):
+        _check_libs_folders([site])
+
+
+def _pe(
+    sections=((0x400, 0x200),),
+    size: int | None = None,
+    at: int = 0x80,
+    *,
+    magic: int = 0x20B,
+    optional: int = 0xF0,
+    directories: int = 16,
+    names=(b".text", b".data", b".rsrc"),
+) -> bytes:
     """The headers of a PE file: a DOS header pointing at the PE signature at
-    ``at``, a COFF header and a section table with ``sections`` ((offset, size) of
-    each section's data; named .text, .data, .rsrc), and zeros up to ``size``
-    bytes (by default, to the end of the last section)."""
+    ``at``, a COFF header, an optional header of ``optional`` bytes (PE32+ by
+    ``magic``, with ``directories`` data directories) and a section table with
+    ``sections`` ((offset, size) of each section's data, named by ``names``), and
+    zeros up to ``size`` bytes (by default, to the end of the last section)."""
     dos = bytearray(at)
     dos[:2] = b"MZ"
     dos[0x3C:0x40] = struct.pack("<I", at)
-    optional = 0xF0
     coff = struct.pack("<HHIIIHH", 0x8664, len(sections), 0, 0, 0, optional, 0x2022)
+    header = bytearray(optional + 4)
+    header[:2] = struct.pack("<H", magic)
+    count_at = {0x10B: 92, 0x20B: 108}.get(magic, 108)
+    header[count_at : count_at + 4] = struct.pack("<I", directories)
     table = b"".join(
         struct.pack("<8sIIIIIIHHI", name, raw + 0x11, 0x1000, raw, offset, 0, 0, 0, 0, 0x60000020)
-        for name, (offset, raw) in zip((b".text", b".data", b".rsrc"), sections, strict=False)
+        for name, (offset, raw) in zip(names, sections, strict=False)
     )
-    data = bytes(dos) + b"PE" + bytes(2) + coff + bytes(optional) + table
+    data = bytes(dos) + b"PE" + bytes(2) + coff + bytes(header[:optional]) + table
     end = max([len(data), *(offset + raw for offset, raw in sections)])
     total = end if size is None else size
     return (data + bytes(max(0, total - len(data))))[:total]
@@ -655,13 +794,17 @@ def test_a_file_named_like_a_binary_that_is_not_a_pe_file_is_a_bundle_problem(tm
     )
     _file(folder / bundle.EXE_NAME)
     problems = build.bundle_problems(folder, {}, _NOT_PE, [])
+    next_step = (
+        "; find the package that ships it, then leave the file out (proteia.spec) or reinstall"
+        " that package if the file is damaged"
+    )
     assert problems[0] == (
         "_internal/pkg/cut.dll: not a valid PE file (its section '.text' runs past the end of"
-        " the file, which is cut short), so the DLLs it imports cannot be checked"
+        " the file, which is cut short), so the DLLs it imports cannot be checked" + next_step
     )
     assert problems[2] == (
         "_internal/pkg/empty.pyd: not a valid PE file (the file is empty), so the DLLs it"
-        " imports cannot be checked"
+        " imports cannot be checked" + next_step
     )
     assert len([p for p in problems if "not a valid PE file" in p]) == 10
     # A file that is not one is no runtime the bundle carries either.
@@ -674,6 +817,50 @@ def test_a_file_named_like_a_binary_that_is_not_a_pe_file_is_a_bundle_problem(tm
         )
         in problems
     )
+
+
+def test_a_pe_header_that_contradicts_itself_names_no_section_it_does_not_have(tmp_path):
+    # With a wrong optional header size the section table is read from the wrong
+    # place, and main named a garbage "section" ('\x06'; #239 review).
+    path = tmp_path / "x.dll"
+    for data, why in (
+        (_pe(optional=0), "its optional header is neither PE32 nor PE32+"),
+        (_pe(magic=0x107), "its optional header is neither PE32 nor PE32+"),
+        (_pe(optional=96), "its optional header (96 bytes) is shorter than its PE32+ fields"),
+        (
+            _pe(magic=0x10B, optional=95, directories=0),
+            "its optional header (95 bytes) is shorter than its PE32 fields",
+        ),
+        (
+            _pe(optional=112),
+            "its optional header (112 bytes) cannot hold its 16 data directories",
+        ),
+        (
+            _pe(optional=0xF0, directories=17),
+            "its optional header (240 bytes) cannot hold its 17 data directories",
+        ),
+        (_pe()[: 0x80 + 24 + 100], "its optional header runs past the end of the file"),
+        (
+            _pe(((0x400, 0x200),), size=0x500, names=(bytes([6]),)),
+            "its section number 1 runs past the end of the file, which is cut short",
+        ),
+        (
+            _pe(((0x400, 0x100), (0x500, 0x200)), size=0x600, names=(b".text", b"")),
+            "its section number 2 runs past the end of the file, which is cut short",
+        ),
+    ):
+        path.write_bytes(data)
+        assert bundle.pe_header_problem(path) == why
+    # The real layouts: PE32 (224 bytes) and PE32+ (240), with 16 data directories,
+    # and a header with fewer of them.
+    for data in (
+        _pe(magic=0x10B, optional=224),
+        _pe(),
+        _pe(optional=112, directories=0),
+        _pe(magic=0x10B, optional=96 + 8, directories=1),
+    ):
+        path.write_bytes(data)
+        assert bundle.pe_header_problem(path) is None
 
 
 def _fake_pefile(monkeypatch, *, refuse: str = "", refuse_tables: str = "", declared=(), **tables):
@@ -1051,20 +1238,17 @@ def test_the_finished_bundle_is_checked(tmp_path):
     imports["vcomp140.dll"] = []
     imports["_internal/skimage/util/_remap.pyd"] = ["MSVCP140.dll"]
     not_pe = {"_internal/pkg/ucrtbase.dll": "it does not start with a DOS header"}
-    unclassified = (
-        ": a Visual C++ runtime file the spec's classification (the bundle manifest) does"
-        " not list, so nothing says where it came from; the bundle carries only the Python"
-        " build's copies and packages' own (#54)"
-    )
     assert build.bundle_problems(dist, imports, not_pe, classified) == [
         "_internal/PySide6 must not be in the bundle",
         "_internal/PySide6/QtCore.pyd must not be in the bundle",
         "_internal/pkg/ucrtbase.dll: not a valid PE file (it does not start with a DOS"
-        " header), so the DLLs it imports cannot be checked",
+        " header), so the DLLs it imports cannot be checked; find the package that ships it,"
+        " then leave the file out (proteia.spec) or reinstall that package if the file is"
+        " damaged",
         "_internal/api-ms-win-crt-heap-l1-1-0.dll: a Universal CRT DLL",
         "_internal/pkg/ucrtbase.dll: a Universal CRT DLL",
-        "_internal/MSVCP140.dll" + unclassified,
-        "vcomp140.dll" + unclassified,
+        "_internal/MSVCP140.dll" + _UNCLASSIFIED,
+        "vcomp140.dll" + _UNCLASSIFIED,
         _not_found(
             "_internal/skimage/util/_remap.pyd",
             "MSVCP140.dll",
@@ -1382,11 +1566,14 @@ def test_each_vc_runtime_file_is_given_where_the_spec_found_it(stand_in_bundle):
         " package's RECORD in the bundle lists" + _NOT_CARRIED,
     ]
     # A wheel's copy whose folder a package's RECORD lists is that package's.
-    gamma = [_vc("_internal/gamma.libs/vcomp140.dll", "wheel", folder="beta.libs")]
-    vc, problems = notices.vc_runtime_sources(
-        ["_internal/gamma.libs/vcomp140.dll"], gamma, packages
-    )
-    assert (vc[0].text, problems) == ("from the beta 2.0 wheel (section 3)", [])
+    gamma_dll = ["_internal/gamma.libs/vcomp140.dll"]
+    for folder in ("beta.libs", "Beta.LIBS"):  # the folder in any case its RECORD spells it
+        gamma = [_vc(gamma_dll[0], "wheel", folder=folder)]
+        vc, problems = notices.vc_runtime_sources(gamma_dll, gamma, packages)
+        assert (vc[0].text, problems) == ("from the beta 2.0 wheel (section 3)", []), folder
+    # A wheel's entry without its folder (a damaged manifest) is refused, not a crash.
+    vc, problems = notices.vc_runtime_sources(gamma_dll, [_vc(gamma_dll[0], "wheel")], packages)
+    assert vc == [] and "from the package folder None, which no package's RECORD" in problems[0]
     text = notices.render(
         proteia_version="0.1.0.dev0",
         packages=packages,

@@ -225,7 +225,9 @@ def bundle_problems(
     paths = [path.relative_to(dist).as_posix() for path in dist.rglob("*")]
     problems = [f"{path} must not be in the bundle" for path in bundle.forbidden_paths(paths)]
     problems += [
-        f"{path}: not a valid PE file ({why}), so the DLLs it imports cannot be checked"
+        f"{path}: not a valid PE file ({why}), so the DLLs it imports cannot be checked; find"
+        " the package that ships it, then leave the file out (proteia.spec) or reinstall that"
+        " package if the file is damaged"
         for path, why in sorted(not_pe.items())
     ]
     binaries = sorted({*imports, *not_pe})
