@@ -431,6 +431,54 @@ def test_a_ring_under_a_quarter_box_area_falls_back_to_the_image_level(width, mo
     assert (found.level == 9.0) == (mode == "image")
 
 
+def test_a_fallback_given_as_a_function_is_asked_for_once_and_only_when_needed():
+    # Two boxes filling a 20x60 strip leave both rings empty: the level a
+    # function gives is asked for once, for both. A box with its whole ring
+    # asks for none (a drawn area's median costs its pixels, #243).
+    asked: list[int] = []
+
+    def level() -> int:
+        asked.append(1)
+        return 7  # an integer level is a float, as a stored median is
+
+    rects = [(0, 0, 30, 20), (30, 0, 60, 20)]
+    found = band_backgrounds(
+        np.full((20, 60), 100.0),
+        rects,
+        [(30, 20)] * 2,
+        dark_on_light=True,
+        integral=False,
+        fallback=level,
+    )
+    assert [(b.mode, b.level, type(b.level)) for b in found] == [("image", 7.0, float)] * 2
+    assert asked == [1]
+    asked.clear()
+    (found,) = band_backgrounds(
+        np.full((100, 100), 100.0),
+        [(40, 45, 60, 55)],
+        [(20, 10)],
+        dark_on_light=True,
+        integral=False,
+        fallback=level,
+    )
+    assert found.mode == "symmetric" and asked == []
+
+
+def test_a_median_over_part_of_the_image():
+    # The pixels where ``inside`` holds, after the reduction to gray: the mean
+    # of red, green and blue (0, 3, 6) gives 3 + 10 x; the masked half's middle
+    # values, at x 4 and 5, are 43 and 53.
+    x = np.arange(10, dtype=np.float64)
+    rgb = np.stack([np.full(10, 0.0), np.full(10, 3.0), np.full(10, 6.0)], axis=-1)
+    rgb = (rgb + 10 * x[:, None])[None, :, :].repeat(2, axis=0)  # 2 x 10 x 3
+    inside = np.zeros((2, 10), dtype=bool)
+    inside[0, 2:8] = True
+    assert estimate_background(rgb, inside) == 48.0
+    assert estimate_background(rgb) == 48.0  # the whole image's, here the same
+    inside[0, 2:5] = False  # x 5, 6 and 7: 53, 63, 73
+    assert estimate_background(rgb, inside) == 63.0
+
+
 # _blot() under ring_median v1 as the #83 reference prototype (m_final) measures
 # it, dark on light: (level, mode, spread). The third lane's boxes are lifted;
 # the first lane's (beside the smear) and the third lane's spread.

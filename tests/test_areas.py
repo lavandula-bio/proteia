@@ -37,6 +37,8 @@ from proteia.core.project import lane_anchors
 from proteia.core.results import compute_results
 from proteia.core.storage import content_hash
 from test_operations import (
+    DARK,
+    FOLDER,
     assert_mw_current,
     assert_nets_current,
     import_blot,
@@ -1442,8 +1444,8 @@ def test_nine_strips_calibrations_are_independent(tmp_path):
 def cut_out_nets(s, arena_id: str) -> dict[str, float]:
     """The nets of the bands on an unturned drawn area as the image cut along
     its outline gives them: its pixels cropped there, its boxes shifted with
-    them, the image's median the level a ring with too little membrane falls
-    back to."""
+    them, the crop's own median the level a ring with too little membrane
+    falls back to, as it would be the cut-out image's."""
     from proteia.core.model import Box
     from proteia.core.quantify import RING_CLAMP, band_backgrounds, net_signal
 
@@ -1467,7 +1469,7 @@ def cut_out_nets(s, arena_id: str) -> dict[str, float]:
         [(size.width, size.height) for size, _ in placed],
         dark_on_light=dark,
         integral=image.bit_depth is not None,
-        fallback=image.background,
+        fallback=float(np.median(pixels)),
     )
     return {
         band.id: net_signal(pixels, box, size, level.level, dark_on_light=dark, clamp=RING_CLAMP)
@@ -1515,6 +1517,277 @@ def test_the_ring_rule_is_the_area_s(tmp_path):
             area=ops.area_key(arena),
             left_out=frozenset({batch.boxes_of(batch.find_protein(protein)).id}),
         )
+
+
+# --- The level a ring with too little membrane falls back to ---
+
+# The boxes of the two-level image: 20x10, each filling its strip but for a
+# column either side, so its ring holds 40 pixels, fewer than a quarter of
+# its 200 (the image mode).
+LEVEL_BOX = ops.BoxSize(width=20, height=10)
+
+
+def two_levels() -> np.ndarray:
+    """30x40, two strips of very different membrane levels: rows 0-19 at
+    1000 + 10 y, rows 20-39 at 30000 + 10 (y - 20), each with a band of two
+    rows of ten pixels (rows 9-10 at 100, rows 29-30 at 20000, columns
+    10-19).
+
+    Worked out by hand, each strip's 600 pixels sorted: its 20 band pixels,
+    rows 0-8 (270), then row 9's 20 left at 1090 (30090 below) at positions
+    290-309, so both middle values (299 and 300) and the median are 1090
+    (30090). The whole image's 1200: 20 at 100, the top's 580 membrane
+    pixels (up to 1190), 20 at 20000, then the bottom's 580: its middle
+    values are 1190 and 20000, its median 10595."""
+    y = np.arange(40)[:, None]
+    pixels = np.where(y < 20, 1000 + 10 * y, 30000 + 10 * (y - 20)) * np.ones((1, 30), dtype=int)
+    pixels[9:11, 10:20] = 100
+    pixels[29:31, 10:20] = 20000
+    return pixels.astype(np.uint16)
+
+
+def two_levels_split(tmp_path: Path, pixels: np.ndarray | None = None, *, legacy: bool = False):
+    """:func:`two_levels` (or ``pixels`` of its size) imported dark on light,
+    one lane, split into a membrane per strip (y 0-20 and 20-40), each with a
+    target boxed on its band (centres (15, 10) and (15, 30)); with
+    ``legacy``, in a project quantified before #83. The session, the image
+    and the two bands."""
+    from conftest import as_legacy
+
+    s = session_on(tmp_path)
+    if pixels is None:
+        image = import_blot(s, two_levels(), "two levels µ.tif")
+    else:
+        from test_channels import import_pixels
+
+        image = import_pixels(s, pixels, "two levels µ.tif", DARK)
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    ops.edit_arena(s, area_on(s, image), outline=(0, 0, 30, 20))
+    ops.add_arena(s, image, (0, 20, 30, 40))
+    top = ops.add_protein(
+        s, "β-catenin", Role.TARGET, arena_id=area_on(s, image), box_size=LEVEL_BOX
+    )
+    bottom = ops.add_protein(
+        s, "p53 µ", Role.TARGET, arena_id=area_on(s, image, 2), box_size=LEVEL_BOX
+    )
+    if legacy:
+        s._commit(as_legacy(s.project), action="plant", params={})
+    bands = [
+        ops.place_box(s, protein, 15, y, lane_index=0, grow=False)
+        for protein, y in ((top, 10), (bottom, 30))
+    ]
+    return s, image, bands
+
+
+def level_of(s, band_id: str) -> tuple[str, float, float, float]:
+    """A band's background mode, level and spread, and its net."""
+    band = s.project.batch.find_band(band_id)[1]
+    return band.background_mode, band.background_level, band.background_spread, band.net
+
+
+def test_a_ring_with_too_little_membrane_falls_back_to_its_area_s_median(tmp_path):
+    # Drawing an outline is cutting the image there: a ring with too little
+    # membrane falls back to the median of its area's pixels alone, as the
+    # cut-out image's would be, not to the whole image's (10595), which
+    # lies between two membranes far apart.
+    s, image, (top, bottom) = two_levels_split(tmp_path)
+    assert s.project.batch.find_image(image).background == 10595.0
+    assert s.project.batch.find_band(top)[1].box.rect(LEVEL_BOX) == (5, 5, 25, 15)
+    # Each net by hand: the top box's rows 5-14 lie 40, 30, ..., -50 from
+    # 1090, 20 pixels each (-1000 in all), and its band's 20 pixels 990 from
+    # it, not 0 and -10 (19900 more); the bottom's alike, its band 10090 off.
+    assert level_of(s, top) == ("image", 1090.0, 0.0, 18900.0)
+    assert level_of(s, bottom) == ("image", 30090.0, 0.0, 200900.0)
+    assert_nets_current(s)
+
+
+def test_a_legacy_level_on_a_drawn_area_is_its_area_s_median(tmp_path):
+    # A project quantified before #83 measures every band above one median:
+    # on a drawn area, its area's, as on the image cut out there.
+    s, image, (top, bottom) = two_levels_split(tmp_path, legacy=True)
+    # Each pixel floored at 0 (by hand): rows 5-8 lie 40, 30, 20 and 10 below
+    # 1090 (2000 in all), and the band's 20 pixels 990 (19800).
+    assert level_of(s, top) == ("global_median", 1090.0, 0.0, 21800.0)
+    assert level_of(s, bottom) == ("global_median", 30090.0, 0.0, 203800.0)
+    assert_nets_current(s)
+    # The model takes a drawn area's own level under the legacy method; an
+    # area over the whole image keeps its image's median (test_model).
+    revalidated = Project.model_validate(s.project.model_dump())
+    assert revalidated.batch.find_band(top)[1].background_level == 1090.0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_a_whole_image_area_falls_back_to_its_stored_median(tmp_path, monkeypatch, legacy):
+    # An image of one membrane keeps its numbers: a ring with too little
+    # membrane falls back to the median stored with the image, which no
+    # pixel is read again for, even where it is not the pixels' (here 1090).
+    from conftest import as_legacy
+
+    s = session_on(tmp_path)
+    image = import_blot(s, two_levels()[:20], "one level µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image, box_size=LEVEL_BOX)
+    assert s.project.batch.find_image(image).background == 1090.0
+
+    def stored(draft: Project) -> None:
+        draft.batch.find_image(image).background = 1234.5
+
+    plant(s, stored)
+    if legacy:
+        s._commit(as_legacy(s.project), action="plant", params={})
+
+    def no_median(*args, **kwargs):
+        raise AssertionError("a median worked out for a whole-image area")
+
+    monkeypatch.setattr(ops, "estimate_background", no_median)
+    band = ops.place_box(s, protein, 15, 10, lane_index=0, grow=False)
+    mode, level, spread, _ = level_of(s, band)
+    assert (mode, level, spread) == ("global_median" if legacy else "image", 1234.5, 0.0)
+
+
+def test_a_drawn_outline_falls_back_as_the_image_cut_out_there(tmp_path):
+    # Each strip cut out of the image and imported on its own gives its
+    # bands the same level and net as the outline drawn over the same
+    # pixels: its image's median is the area's.
+    s, image, drawn = two_levels_split(tmp_path)
+    for (y0, y1), band_id in zip(((0, 20), (20, 40)), drawn, strict=True):
+        cut = import_blot(s, two_levels()[y0:y1], f"cut {y0} µ.tif")
+        protein = ops.add_protein(s, f"cut {y0}", Role.TARGET, cut, box_size=LEVEL_BOX)
+        band = ops.place_box(s, protein, 15, 10, lane_index=0, grow=False)
+        assert level_of(s, band) == level_of(s, band_id)
+        assert s.project.batch.find_image(cut).background == level_of(s, band_id)[1]
+    assert [level_of(s, b)[1] for b in drawn] == [1090.0, 30090.0]
+
+
+def test_a_drawn_area_falls_back_on_the_channel_it_is_measured_on(tmp_path):
+    # A colour image measured on green (#206): the fallback is the median of
+    # the area's green pixels; measured on the mean of the colours again,
+    # the mean's: (5000 + 1090 + 0) / 3 and (5000 + 30090 + 0) / 3, as a
+    # mean keeps the pixels' order.
+    from proteia.core.model import Channel
+
+    gray = two_levels()
+    rgb = np.dstack([np.full_like(gray, 5000), gray, np.zeros_like(gray)])
+    s, image, (top, bottom) = two_levels_split(tmp_path, rgb)
+    assert [level_of(s, b)[1] for b in (top, bottom)] == [6090 / 3, 35090 / 3]
+    ops.set_channel(s, image, Channel.GREEN)
+    assert s.project.batch.find_image(image).background == 10595.0
+    assert [level_of(s, b)[:2] for b in (top, bottom)] == [("image", 1090.0), ("image", 30090.0)]
+    assert_nets_current(s)
+    ops.set_channel(s, image, Channel.MEAN)
+    assert [level_of(s, b)[1] for b in (top, bottom)] == [6090 / 3, 35090 / 3]
+
+
+def test_a_turned_area_past_the_edge_falls_back_to_the_pixels_inside_it(tmp_path):
+    # The median is of the pixels whose centres the turned outline holds,
+    # within the image: here the top strip's outline, 36x18 from x -3,
+    # turned by 10 degrees, reaching past the image's left and right edges
+    # and into row 20, its box leaving its ring too little. A rise of 7 a
+    # column tells its pixels from the outline's unturned (median 1192).
+    pixels = two_levels() + 7 * np.arange(30, dtype=np.uint16)
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    ops.edit_arena(s, area_on(s, image), outline=(-3, 1, 33, 19), angle_deg=10.0)
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image, box_size=LEVEL_BOX)
+    band = ops.place_box(s, protein, 15, 10, lane_index=0, grow=False)
+    ref, arena = s.project.batch.find_image(image), s.project.batch.find_arena(area_on(s, image))[1]
+    inside = ops._inside_mask(arena, ref, (0, 0, 30, 40))
+    assert inside[19:].any() and not inside[1:19].all()  # past the unturned rows, and short
+    assert float(np.median(pixels[inside])) == 1193.0
+    assert level_of(s, band)[:2] == ("image", 1193.0)
+    assert_nets_current(s)
+
+
+def test_every_outline_the_model_takes_holds_a_pixel_of_its_image():
+    # An area's median never reads an empty set: an outline at least 1 px
+    # each way, its corners whole pixels and its centre on the image, holds
+    # the centre of a pixel there whatever its turn up to 45 degrees (the
+    # nearest lies within half a pixel of its centre on each axis, which
+    # turned stays within its half sizes). Here, the smallest such outlines
+    # with their centres on the image's corners, edges and middle.
+    from types import SimpleNamespace
+
+    image = SimpleNamespace(width=5, height=4)
+    for w, h in ((1, 1), (1, 2), (2, 1), (2, 2), (3, 2)):
+        for cx in (0, 0.5, 2.5, 4.5, 5):
+            for cy in (0, 0.5, 2, 3.5, 4):
+                x0, y0 = math.floor(cx - w / 2), math.floor(cy - h / 2)
+                if (x0 + w / 2, y0 + h / 2) != (cx, cy):
+                    continue  # no whole-pixel outline of this size is centred there
+                for angle in (-45.0, -30.0, -1.0, 0.0, 1.0, 30.0, 45.0):
+                    arena = Arena(
+                        id="arena-1",
+                        image_id="img-1",
+                        outline=Outline(x0=x0, y0=y0, x1=x0 + w, y1=y0 + h),
+                        angle_deg=angle,
+                        source=ArenaSource.MANUAL,
+                    )
+                    inside = ops._inside_mask(arena, image, (0, 0, 5, 4))
+                    assert inside.any(), (w, h, cx, cy, angle)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_an_area_s_median_is_worked_out_once_and_only_when_needed(tmp_path, monkeypatch, legacy):
+    # Once per drawn area a quantification measures, however many of its
+    # bands take it; under the ring method, only for an area where one does.
+    s, image, _ = two_levels_split(tmp_path, legacy=legacy)
+    first, second = area_on(s, image), area_on(s, image, 2)
+    worked: list[str] = []
+    real = ops._area_median
+
+    def counted(area, *args):
+        worked.append(area.id)
+        return real(area, *args)
+
+    monkeypatch.setattr(ops, "_area_median", counted)
+    pixels = s.pixels(image)
+    for areas, expected in ((None, [first, second]), ([second], [second])):
+        worked.clear()
+        apply_change(s.project, lambda d, a=areas: ops._quantify_image(d, image, pixels, a))
+        assert worked == expected, areas
+    # Strips 50 rows high leave each ring whole: no band falls back.
+    s, image, top, bottom = split(tmp_path / "whole rings")
+    box_all(s, top, 24)
+    box_all(s, bottom, 76)
+    if legacy:
+        from conftest import as_legacy
+
+        s._commit(as_legacy(s.project), action="plant", params={})
+    modes = {b.background_mode for p in s.project.batch.proteins for b in p.rows[0].bands}
+    assert "image" not in modes
+    worked.clear()
+    apply_change(s.project, lambda d: ops._quantify_image(d, image, s.pixels(image)))
+    assert len(worked) == (2 if legacy else 0)
+
+
+def test_a_drawn_area_s_fallback_is_logged_as_its_median(tmp_path, caplog):
+    s = session_on(tmp_path)
+    image = import_blot(s, two_levels(), "two levels µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle")])
+    ops.edit_arena(s, area_on(s, image), outline=(0, 0, 30, 20))
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image, box_size=LEVEL_BOX)
+    with caplog.at_level("INFO", logger="proteia.core.operations"):
+        band = ops.place_box(s, protein, 15, 10, lane_index=0, grow=False)
+    assert level_of(s, band)[:2] == ("image", 1090.0)
+    assert (
+        f"in {FOLDER!r}: the background of {band} on {image} was measured another way, image"
+        " (too little membrane around its box: its membrane area's median)"
+    ) in caplog.messages
+
+
+def test_a_legacy_project_on_drawn_areas_is_logged_as_measured_there(tmp_path, caplog):
+    # Opened, a project quantified before #83 says what its nets are measured
+    # above: with a drawn area, its median too (test_logs: images alone).
+    s, image, _ = two_levels_split(tmp_path, legacy=True)
+    ops.save(s)
+    s.close()
+    with caplog.at_level("INFO", logger="proteia.core.session"):
+        ops.open_project(tmp_path / FOLDER, autosave=None).close()
+    assert (
+        f"in {FOLDER!r}: the nets are measured with the legacy background (global_median),"
+        " each image's or drawn membrane area's median, until the project is requantified"
+    ) in caplog.messages
 
 
 def edit_strip_1(s, areas, proteins, what):

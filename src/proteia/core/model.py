@@ -40,9 +40,12 @@ background was measured, project-wide, so a batch never mixes methods:
 band's own level from the membrane around its box, or ``global_median``, the
 one image-wide median of a project quantified before #83 (a schema-1 project,
 migrated: every band's level is its image's ``background``, its mode
-``global_median`` and its spread 0, and nets floor each pixel at 0). The
-model checks that each band's mode agrees with the method; the operations keep
-every value equal to what the pixels give (:mod:`proteia.core.operations`).
+``global_median`` and its spread 0, and nets floor each pixel at 0; on a
+membrane area drawn since, #243, the level is the median of the area's
+pixels, as on the image cut out there). The model checks that each band's
+mode agrees with the method, and a legacy level over a whole image; the
+operations keep every value equal to what the pixels give
+(:mod:`proteia.core.operations`).
 
 Models are mutable. Edits go through :func:`apply_change`, which works on a copy
 and re-validates the whole tree, so a failed edit leaves the project untouched.
@@ -546,7 +549,8 @@ class ImageRef(_Model):
     bit_depth: int | None = Field(default=None, ge=8, le=16)  # None = not recorded yet (#45)
     polarity: Polarity  # required: the import chooses it; there is no silent default
     # quantify.estimate_background, the global median of the analysis array: the
-    # grow seed threshold, the image-mode fallback and the legacy background.
+    # grow seed threshold, the image-mode fallback and the legacy background
+    # (on a membrane area drawn on it, the median of the area's pixels, #243).
     background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
     # #206: the channel it is measured on; None = the mean of its red, green and
@@ -1827,8 +1831,10 @@ class Project(_Model):
         legacy = self.background_method == LEGACY_BACKGROUND_METHOD
         batch = self.batch
         images = {image.id: image for image in batch.images}
+        # A drawn area's level is the median of its pixels (#243), which the
+        # model, holding none, leaves to the operations (None).
         medians = {
-            arena.id: images[arena.image_id].background
+            arena.id: None if arena.outline is not None else images[arena.image_id].background
             for membrane in batch.membranes
             for arena in membrane.arenas
         }
@@ -1838,13 +1844,20 @@ class Project(_Model):
                     self._check_legacy_band(band, legacy, medians[row.arena_id])
         return self
 
-    def _check_legacy_band(self, band: Band, legacy: bool, median: float) -> None:
+    def _check_legacy_band(self, band: Band, legacy: bool, median: float | None) -> None:
         if (band.background_mode == LEGACY_BACKGROUND_METHOD) != legacy:
             raise ValueError(
                 f"band {band.id}: background mode {band.background_mode!r} does not"
                 f" belong to the project's background method {self.background_method!r}"
             )
-        if legacy and (band.background_level != median or band.background_spread != 0):
+        if not legacy:
+            return
+        if median is None:  # on a drawn area
+            if band.background_spread != 0:
+                raise ValueError(
+                    f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background has no spread"
+                )
+        elif band.background_level != median or band.background_spread != 0:
             raise ValueError(
                 f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background is its"
                 " image's median, with no spread"

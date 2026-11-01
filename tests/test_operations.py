@@ -230,7 +230,9 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
     session's pixels, membrane area by membrane area, with every box on the
     area (every protein's, each with its size) measured together under the
     project's background method, its rings reading no pixel outside a drawn
-    area's outline (#243). ``only`` limits the check to those images.
+    area's outline (#243), whose pixels' median is the level its bands fall
+    back to, and the legacy method's level, as its image's median is for
+    an area over the whole image. ``only`` limits the check to those images.
     """
     project = session.project
     batch = project.batch
@@ -250,15 +252,17 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
         if not placed:
             continue
         outside = None
+        pixels = session.pixels(image.id)
+        median = image.background
         if arena.outline is not None:
             outside = ~ops._inside_mask(arena, image, (0, 0, image.width, image.height))
-        pixels = session.pixels(image.id)
+            median = float(np.median(np.asarray(pixels)[~outside]))
         dark = image.polarity.dark_on_light
         rects = [band.box.rect(protein.box_size) for protein, band in placed]
         sizes = [(protein.box_size.width, protein.box_size.height) for protein, _ in placed]
         integral = image.bit_depth is not None
         if legacy:
-            found = [BandBackground(image.background, "global_median", 0.0)] * len(placed)
+            found = [BandBackground(median, "global_median", 0.0)] * len(placed)
             clamp = "pixel"
         else:
             found = band_backgrounds(
@@ -267,7 +271,7 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 sizes,
                 dark_on_light=dark,
                 integral=integral,
-                fallback=image.background,
+                fallback=median,
                 unreadable=outside,
             )
             clamp = RING_CLAMP

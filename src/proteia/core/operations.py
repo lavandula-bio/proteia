@@ -49,7 +49,9 @@ equal :func:`~proteia.core.quantify.band_backgrounds`,
 :func:`~proteia.core.quantify.is_clipped` and
 :func:`~proteia.core.quantify.is_possibly_clipped` of the stored pixels, all the boxes
 on that image (every protein's, each with its protein's box size), the
-polarity, the bit depth and the project's background method. A band's ring
+polarity, the bit depth, the project's background method and the median a
+level falls back to (the image's stored ``background``, or a drawn membrane
+area's own: see below). A band's ring
 excludes every other box on its image, so any edit that adds, moves, resizes or
 removes a box re-quantifies the whole image: :func:`place_box`,
 :func:`move_box`, :func:`remove_box`, :func:`set_box_size`,
@@ -61,8 +63,9 @@ Removing an image removes its bands and changes no other image. Undo and redo
 restore a committed state whole, which met the invariant, and recompute
 nothing. A project quantified before #83 keeps the legacy method
 (``global_median``) until :func:`requantify`: each band's level is its image's
-median, its mode ``global_median``, its spread 0, and its net floors each
-pixel at 0, so edits of a legacy project keep the legacy invariant. A project
+median (on a drawn membrane area, its area's), its mode ``global_median``, its
+spread 0, and its net floors each pixel at 0, so edits of a legacy project
+keep the legacy invariant. A project
 saved before #112 holds no ``possibly_clipped`` on the bands of an image that
 check assesses (a lossy, colour or CMYK image of known bit depth): the one
 exception to the invariant, until an edit re-quantifies the image or
@@ -85,8 +88,11 @@ membrane (:func:`edit_arena`). Each membrane has its own
 calibration on an image it shares. Which boxes a band's ring leaves out, and
 which pixels it reads, is one function's (:func:`_ring_context`): drawing an
 outline is cutting the image there, so a ring leaves out the boxes of its own
-area and reads the pixels inside its outline alone, and an area over the
-whole image reads all of it, as before areas; an area operation re-quantifies
+area and reads the pixels inside its outline alone, and a ring with too little
+membrane, like every band of a legacy project, takes the median of those
+pixels (:func:`_area_median`) where the cut-out image's would be its own; an
+area over the whole image reads all of it and takes the image's stored
+median, as before areas; an area operation re-quantifies
 an image only where that function says a ring changed, and an outline or
 angle edit answers whose nets moved.
 
@@ -161,7 +167,8 @@ follows :mod:`proteia.core.names`; box placement follows :mod:`proteia.core.boxe
 Besides the log entry that the session logs for every commit, the operations
 log (Python's :mod:`logging`, at INFO: the session log of #137) the fallbacks a
 committed change took, as it first took them: a band whose background was
-measured another way (``asymmetric`` or ``image``: its ring cut short), a band
+measured another way (``asymmetric`` or ``image``: its ring cut short; the
+image's median, or a drawn membrane area's own), a band
 whose over-exposure could not be checked (its image's warnings or unknown bit
 depth say why, and whether it is assessed near the limit instead), an image
 imported with warnings, a row box whose detector warned or left lanes it
@@ -400,6 +407,12 @@ _FOLDER_ATTEMPTS: Final = 1000
 _CUT_BACKGROUNDS: Final = {
     "asymmetric": "too few paired pixels around its box: a robust plane over its ring",
     "image": "too little membrane around its box: the image's median",
+}
+# The same on an image whose membrane areas are drawn: each is the image cut
+# out along its outline, whose median is its own (#243).
+_CUT_ON_AREAS: Final = {
+    **_CUT_BACKGROUNDS,
+    "image": "too little membrane around its box: its membrane area's median",
 }
 
 _log = logging.getLogger(__name__)
@@ -769,6 +782,9 @@ def _log_fallbacks(session: ProjectSession, before: Project) -> None:
     }
     batch, name = session.project.batch, session.folder.name
     for image in batch.iter_images():
+        # An image with several areas has every one drawn; with one, it may be.
+        drawn = any(arena.outline is not None for _, arena in batch.arenas_on(image.id))
+        words = _CUT_ON_AREAS if drawn else _CUT_BACKGROUNDS
         cut: dict[str, list[str]] = {}
         unchecked: list[str] = []
         for protein in batch.proteins_on(image.id):
@@ -786,7 +802,7 @@ def _log_fallbacks(session: ProjectSession, before: Project) -> None:
                 ", ".join(band_ids),
                 image.id,
                 mode,
-                _CUT_BACKGROUNDS[mode],
+                words[mode],
             )
         if unchecked:
             _log.info(
@@ -936,7 +952,11 @@ def _quantify_image(
     image's median and each net floors every pixel at 0, as before #83;
     otherwise :func:`~proteia.core.quantify.band_backgrounds` measures each
     level (falling back to the image's median) and the net floors the box total
-    (:data:`~proteia.core.quantify.RING_CLAMP`). An image without a limit the
+    (:data:`~proteia.core.quantify.RING_CLAMP`). On a drawn outline that median
+    is its area's (:func:`_area_median`), as on the image cut out there: worked
+    out once per area, and under the ring method only if one of its bands falls
+    back; an area over the whole image takes the stored ``background``, so an
+    image of one membrane keeps its numbers. An image without a limit the
     clipping check can trust leaves its bands unchecked (``clipped`` None); if
     its range is known (a lossy, colour or CMYK-converted image), each band is
     assessed instead (``possibly_clipped``, #112), which is None everywhere else.
@@ -960,15 +980,19 @@ def _quantify_image(
             for band in batch.boxes_of(protein).bands
         ]
         placed.extend(here)
-        if legacy:
-            level = BandBackground(level=image.background, mode="global_median", spread=0.0)
-            found.extend([level] * len(here))
-            continue
         if not here:
             continue
         unreadable = None
+        median: float | Callable[[], float] = image.background
         if arena.outline is not None:  # a drawn outline: nothing past it is read
             unreadable = _outside(arena, image)
+            median = functools.partial(_area_median, arena, image, array, unreadable)
+        if legacy:
+            level = median() if callable(median) else median
+            found.extend(
+                [BandBackground(level=level, mode="global_median", spread=0.0)] * len(here)
+            )
+            continue
         found.extend(
             band_backgrounds(
                 array,
@@ -976,7 +1000,7 @@ def _quantify_image(
                 [(size.width, size.height) for size, _ in here],
                 dark_on_light=dark_on_light,
                 integral=image.bit_depth is not None,
-                fallback=image.background,
+                fallback=median,
                 unreadable=unreadable,
             )
         )
@@ -1042,15 +1066,34 @@ def _inside_mask(area: Arena, image: ImageRef, window: Rect) -> np.ndarray:
     return (np.abs(u) <= frame.half_width + ON_EDGE) & (np.abs(v) <= frame.half_height + ON_EDGE)
 
 
+def _bounds_on(area: Arena, image: ImageRef) -> Rect:
+    """The area's bounds (:meth:`~proteia.core.model.Arena.bounds`) clipped
+    to ``image``, end-exclusive: every pixel of the image whose centre the
+    area may hold lies within them."""
+    x0, y0, x1, y1 = area.bounds(image)
+    return max(0, x0), max(0, y0), min(image.width, x1), min(image.height, y1)
+
+
 def _outside(area: Arena, image: ImageRef) -> np.ndarray:
     """The pixels of ``image`` whose centres lie outside a drawn ``area``, as
     an image-shaped mask: every one past its bounds, and within them those
     :func:`_inside_mask` leaves out, so working it out costs the area's size."""
     outside = np.ones((image.height, image.width), dtype=bool)
-    x0, y0, x1, y1 = area.bounds(image)
-    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(image.width, x1), min(image.height, y1)
-    outside[y0:y1, x0:x1] = ~_inside_mask(area, image, (x0, y0, x1, y1))
+    x0, y0, x1, y1 = window = _bounds_on(area, image)
+    outside[y0:y1, x0:x1] = ~_inside_mask(area, image, window)
     return outside
+
+
+def _area_median(area: Arena, image: ImageRef, array: np.ndarray, outside: np.ndarray) -> float:
+    """The median of ``array`` (``image``'s analysis array) over a drawn
+    ``area``'s pixels, those ``outside`` (:func:`_outside`) leaves out: the
+    level the image cut out along its outline would store
+    (:func:`~proteia.core.quantify.estimate_background`, as
+    ``ImageRef.background``), so the same pixels give the same level either
+    way (#243). It reads the area's bounds alone, so it costs the area's
+    size."""
+    x0, y0, x1, y1 = _bounds_on(area, image)
+    return estimate_background(array[y0:y1, x0:x1], ~outside[y0:y1, x0:x1])
 
 
 def _detector_pixels(

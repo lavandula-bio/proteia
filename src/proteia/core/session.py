@@ -308,11 +308,16 @@ def _log_opened(folder: Path, project: Project, *, again: bool = False) -> None:
     if project.background_method == LEGACY_BACKGROUND_METHOD and any(
         batch.boxes_of(protein).bands for protein in batch.proteins
     ):
+        # A drawn membrane area is its image cut out, with its own median (#243).
+        drawn = any(
+            arena.outline is not None for m in batch.membranes for arena in batch.arenas_of(m)
+        )
         _log.info(
-            "in %r: the nets are measured with the legacy background (%s), each image's"
+            "in %r: the nets are measured with the legacy background (%s), each image's%s"
             " median, until the project is requantified",
             folder.name,
             LEGACY_BACKGROUND_METHOD,
+            " or drawn membrane area's" if drawn else "",
         )
 
 

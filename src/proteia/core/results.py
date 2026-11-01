@@ -165,7 +165,8 @@ class NoticeCode(StrEnum):
     POSSIBLY_CLIPPED = "possibly_clipped"
     BELOW_DETECTION = "below_detection"  # not-detected records in included lanes: no value
     # Bands whose ring is cut short (by the image edge or other boxes): their
-    # level is a robust plane or the image median (quantify.band_backgrounds).
+    # level is a robust plane or the image median, a drawn membrane area's own
+    # on one (quantify.band_backgrounds).
     BACKGROUND_FALLBACK = "background_fallback"
     # Bands whose background differs around the box by more than the QC limit.
     BACKGROUND_UNEVEN = "background_uneven"

@@ -223,6 +223,29 @@ def test_every_band_background_belongs_to_the_projects_method(project):
         revalidate(_edit(project, "band-10", background_mode="ring"))
 
 
+def test_a_legacy_level_on_a_drawn_area_is_left_to_the_operations(project):
+    # On a drawn membrane area a legacy level is the median of the area's
+    # pixels (#243), which the model holds none of: any level is taken, but
+    # never a spread; over the whole image it stays the image's median.
+    from proteia.core.model import Outline
+
+    legacy = as_legacy(project)
+    images = {image.id: image for image in legacy.batch.images}
+    drawn = legacy.model_copy(deep=True)
+    for membrane in drawn.batch.membranes:
+        for arena in membrane.arenas:
+            image = images[arena.image_id]
+            arena.outline = Outline(x0=0, y0=0, x1=image.width, y1=image.height)
+    other = 199.5
+    assert legacy.batch.find_band("band-10")[1].background_level != other
+    taken = revalidate(_edit(drawn.model_copy(deep=True), "band-10", background_level=other))
+    assert taken.batch.find_band("band-10")[1].background_level == other
+    with pytest.raises(ValidationError, match="a global_median background has no spread"):
+        revalidate(_edit(drawn.model_copy(deep=True), "band-10", background_spread=0.5))
+    with pytest.raises(ValidationError, match="its image's median, with no spread"):
+        revalidate(_edit(legacy.model_copy(deep=True), "band-10", background_level=other))
+
+
 def test_field_defaults():
     protein = Protein(
         id="prot-1",
