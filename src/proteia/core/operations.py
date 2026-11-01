@@ -2874,13 +2874,20 @@ def add_arena(
     return _area_apply(session, "add_arena", change, params, lambda _: linked)
 
 
+def _can_cut(area: Arena, drawn: Outline | None, angle: float) -> bool:
+    """Whether redrawing ``area`` as ``drawn`` turned by ``angle`` can cut
+    it in two (:func:`_cut_rest`): an outline, and neither of them turned
+    (the whole image counts as unturned)."""
+    return drawn is not None and angle == 0 and (area.outline is None or area.angle_deg == 0)
+
+
 def _cut_rest(area: Arena, image: ImageRef, drawn: Outline | None, angle: float) -> Outline | None:
     """The far side of ``area`` when redrawing it as ``drawn`` turned by
-    ``angle`` cuts it in two along one line: neither turned (the whole image
-    counts as unturned), ``drawn`` reaching or passing three of the area's
-    sides, as they lie within the image, and its fourth side lying across the
-    area. None for any other redraw."""
-    if drawn is None or angle != 0 or (area.outline is not None and area.angle_deg != 0):
+    ``angle`` cuts it in two along one line (:func:`_can_cut`): ``drawn``
+    reaching or passing three of the area's sides, as they lie within the
+    image, and its fourth side lying across the area. None for any other
+    redraw."""
+    if drawn is None or not _can_cut(area, drawn, angle):
         return None
     old = area.outline
     x0, y0, x1, y1 = (
@@ -2900,10 +2907,10 @@ def _cut_rest(area: Arena, image: ImageRef, drawn: Outline | None, angle: float)
 
 
 def _cut_plan(
-    batch: Batch, membrane: Membrane, image_ids: Sequence[str], drawn: Outline
+    batch: Batch, membrane: Membrane, image_ids: Sequence[str], drawn: Outline, angle: float
 ) -> tuple[tuple[str, ...], tuple[CalibrationPoint, ...]]:
     """What redrawing ``membrane``'s area on ``image_ids`` as ``drawn``
-    (unturned) leaves outside it, to go to the far side of a cut
+    turned by ``angle`` leaves outside it, to go to the far side of a cut
     (:func:`_cut_rest`): the proteins whose rows there hold boxes or
     not-detected records, all outside (batch order), and the membrane's
     calibration points there outside it, each read where :func:`_held` reads it."""
@@ -2912,7 +2919,7 @@ def _cut_plan(
     for image_id in image_ids:
         image = batch.find_image(image_id)
         probe = batch.area_on(membrane, image_id).model_copy(
-            update={"outline": drawn, "angle_deg": 0.0}
+            update={"outline": drawn, "angle_deg": angle}
         )
         inside: dict[str, bool] = {}
         for held in _held(batch, membrane, probe, image):
@@ -3000,12 +3007,11 @@ def edit_arena(
         return AreaChange(
             arena_ids=tuple(batch.area_on(membrane, i).id for i in linked), membrane_id=membrane.id
         )
-    can_cut = drawn is not None and angle == 0 and (arena.outline is None or arena.angle_deg == 0)
     rest = _cut_rest(arena, image, drawn, angle)
     moving: tuple[str, ...] = ()
     marks: tuple[CalibrationPoint, ...] = ()
-    if rest is not None and drawn is not None:
-        moving, marks = _cut_plan(batch, membrane, linked, drawn)
+    if rest is not None:  # so drawn is an outline
+        moving, marks = _cut_plan(batch, membrane, linked, cast(Outline, drawn), angle)
     committed = session.project
 
     def change(draft: Project) -> AreaChange:
@@ -3021,13 +3027,11 @@ def edit_arena(
         handed = None
         if moving and rest is not None:
             handed = _cut_off(draft, edited, linked, rest, moving, marks)
-        refusal = _areas_refusal(b, linked, cut=can_cut)
+        refusal = _areas_refusal(b, linked, cut=_can_cut(arena, drawn, angle))
         if refusal is not None:
             raise refusal
-        if handed is None:
-            return AreaChange(
-                arena_ids=tuple(ids), membrane_id=membrane.id, mw_lost=_mw_lost(batch, b)
-            )
+        if handed is None:  # no row and no point moved: no apparent MW changed
+            return AreaChange(arena_ids=tuple(ids), membrane_id=membrane.id)
         refresh = _refresh_mw(committed, draft)
         return AreaChange(
             arena_ids=tuple(ids),
