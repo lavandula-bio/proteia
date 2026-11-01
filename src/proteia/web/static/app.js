@@ -779,14 +779,25 @@ function followOpening({ refused = null, note = null } = {}) {
 // Why the page now shows `project` in place of `before`, what became of
 // `before` (`closed`: the openings switches closed, as the server answered
 // them), and what the requests `refused` did not do (keys of NOT_DONE).
+// Opened again under the same name (another tab, or a project made where
+// its folder was removed), only changes not saved are said.
 function followedText(before, project, refused, closed) {
   const now = isolate(project.name);
+  const entry = closedEntry(before, closed);
+  const lost = entry && !entry.saved ? closedText(before, closed) : null;
   const why =
     project.name === before.name
       ? `${now} was opened again, in another tab or after a change outside Proteia;` +
         " it is shown as it is now."
       : `Proteia now shows ${now}, opened in another tab; ${closedText(before, closed)}`;
-  return [why, ...[...refused].map((kind) => NOT_DONE[kind])].join(" ");
+  const said = project.name === before.name && lost ? [why, lost] : [why];
+  return [...said, ...[...refused].map((kind) => NOT_DONE[kind])].join(" ");
+}
+
+// The record of the opening `before` showed, as the switch that closed it
+// answered it (#101), or undefined when there is none (closed long ago).
+function closedEntry(before, closed) {
+  return (closed || []).find((item) => item.open_id === before.open_id);
 }
 
 // What became of the project `before` showed, as the switch that closed its
@@ -794,7 +805,7 @@ function followedText(before, project, refused, closed) {
 // Unrecorded (closed long ago), only that it was closed.
 function closedText(before, closed) {
   const name = isolate(before.name);
-  const entry = (closed || []).find((item) => item.open_id === before.open_id);
+  const entry = closedEntry(before, closed);
   if (!entry) {
     return `${name} was closed.`;
   }
@@ -1434,7 +1445,8 @@ function sameNotice(seen, project, change) {
 // the top of the panel, unless that notice of this opening was dismissed.
 // Drawn from every state shown, so no way of showing a project misses it.
 // The live region, always there, gets the words of each new notice once the
-// notice is shown, so a screen reader reads it once. A notice that appears,
+// notice is shown, so a screen reader reads it once, and is emptied while no
+// notice is shown, so none is left to read in it. A notice that appears,
 // or whose words change, pushes down what the panel holds below it: the
 // control in the panel that has the focus (the one just edited) is kept in
 // the window, the panel scrolled the least that shows it.
@@ -1453,6 +1465,8 @@ function renderOutsideChange(project) {
   if (shown && !sameNotice(saidOutside, project, change)) {
     saidOutside = { open_id: project.open_id, event: change.event };
     $("outside-change-said").textContent = change.message;
+  } else if (!shown) {
+    $("outside-change-said").textContent = "";
   }
 }
 
@@ -1464,6 +1478,7 @@ $("outside-change-dismiss").addEventListener("click", () => {
     dismissedOutside = { open_id: project.open_id, event: project.outside_change.event };
   }
   $("outside-change").hidden = true;
+  $("outside-change-said").textContent = "";
   $("switch-project").focus();
 });
 

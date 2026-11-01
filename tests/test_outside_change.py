@@ -1313,6 +1313,29 @@ def test_a_folder_named_like_a_version_is_none(tmp_path, monkeypatch):
     assert not below.exists() and not above.exists() and stranger.is_file()
 
 
+def test_a_file_that_keeps_every_image_is_logged_once_a_session(tmp_path, caplog):
+    # A notes.json in a legacy code page: what it names is unknown, so no image
+    # file is deleted while it is there; the log names it, once a session.
+    caplog.set_level(logging.WARNING, logger="proteia.core.session")
+    s = opened(tmp_path)
+    (s.folder / "notes.json").write_bytes('{"備註": "西方墨點"}'.encode("big5"))
+    removed = imported(s, 30)
+    ops.remove_image(s, removed)
+    s.close(remove_files=False)  # the history released: an orphan the session knows
+    file = s.folder / storage.IMAGES_DIR / f"{removed}.tif"
+    said = (
+        f"in {FOLDER!r}: image files no longer used are kept, not deleted, while what"
+        " 'notes.json' names is unknown (it is not text in an encoding Proteia reads)"
+    )
+    for label in ("a", "b"):
+        edit(s, label)  # saved, then cleaned up
+        assert file.is_file() and caplog.messages.count(said) == 1, label
+    later = ops.open_project(s.folder, clock=FakeClock())
+    edit(later)
+    assert file.is_file() and caplog.messages.count(said) == 2  # once in that session too
+    assert later.outside_change is None  # the page is not told
+
+
 @pytest.mark.parametrize(
     ("name", "kept"),
     [
@@ -1504,7 +1527,18 @@ def _utf(data: bytes, encoding: str) -> bytes:
 
 
 @pytest.mark.parametrize(
-    "encoding", ["utf-16", "utf-16-le-bom", "utf-16-be-bom", "utf-32", "utf-8-sig"]
+    "encoding",
+    [
+        "utf-16",
+        "utf-16-le-bom",
+        "utf-16-be-bom",
+        "utf-32",
+        "utf-8-sig",
+        "utf-16-le",  # no byte-order mark: read by where its NUL bytes are
+        "utf-16-be",
+        "utf-32-le",
+        "utf-32-be",
+    ],
 )
 def test_an_outside_version_in_another_encoding_keeps_its_images(tmp_path, encoding):
     s = opened(tmp_path)
@@ -1552,10 +1586,53 @@ def test_version_names_reads_the_text_its_byte_order_mark_says():
         codecs.BOM_UTF16_BE + text.encode("utf-16-be"),
         text.encode("utf-32"),
         codecs.BOM_UTF32_BE + text.encode("utf-32-be"),
+        text.encode("utf-16-le"),
+        text.encode("utf-16-be"),
+        text.encode("utf-32-le"),
+        text.encode("utf-32-be"),
     ):
         assert storage.version_names(encoded) == found, encoded[:4]
     with pytest.raises(UnicodeDecodeError):
         storage.version_names(b"\xc3\x28")
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_an_image_a_version_without_a_byte_order_mark_names_is_kept(tmp_path, encoding):
+    # An editor or a sync tool may write the file so: its NUL bytes are valid
+    # UTF-8, which would find no name in it.
+    s = ops.new_project(tmp_path / "Plain", clock=FakeClock())  # ASCII, as many are
+    ours = imported(s, 1, "blot.tif")
+    ours_file = s.folder / storage.IMAGES_DIR / f"{ours}.tif"
+    other = elsewhere(s)  # its version still has the image
+    edit(other, "drug")
+    data = storage.project_to_json(other.project)
+    ops.remove_image(s, ours)  # its file kept while the removal can be undone
+    (s.folder / storage.PROJECT_FILE).write_bytes(_utf(data, encoding))
+    edit(s, "a")  # sets that version aside in a copy
+    assert len(copies(s.folder)) == 1
+    s.close()  # the history goes: only the copy keeps the file
+    assert ours_file.read_bytes() == tiff(1)
+
+
+def test_text_that_still_holds_a_nul_is_unknown(tmp_path):
+    # No JSON holds one: the text was read in another encoding than its own,
+    # here UTF-16 without a byte-order mark that begins with no ASCII letter.
+    for data in (
+        b'{"a": "img-3.tif"}' + bytes(3),
+        "專案 img-3.tif".encode("utf-16-le"),
+    ):
+        with pytest.raises(ValueError):
+            storage.version_names(data)
+        path = tmp_path / "version.json"
+        path.write_bytes(data)
+        with pytest.raises(ValueError):
+            storage.named_images(path)
+    s = opened(tmp_path)
+    left = s.folder / storage.IMAGES_DIR / "img-50.tif"
+    left.write_bytes(tiff(50))  # an image no project.json references
+    (s.folder / "notes.json").write_bytes("專案 img-3.tif".encode("utf-16-le"))
+    s.close()
+    assert left.is_file()  # what the versions name is unknown: nothing deleted
 
 
 def test_named_images_reads_a_utf16_file_across_its_parts(tmp_path, monkeypatch):
@@ -1979,12 +2056,17 @@ def test_the_page_shows_the_outside_change_from_every_state_until_dismissed():
     told = shown.index('$("outside-change-said").textContent = change.message;')
     assert shown.index("notice.hidden = !shown;") < told
     assert shown.index("saidOutside = { open_id: project.open_id, event: change.event };") < told
+    # And it is emptied while no notice is shown, and at Dismiss: none is left
+    # for a screen reader to read, of this project or another.
+    cleared = '$("outside-change-said").textContent = "";'
+    assert f"}} else if (!shown) {{\n    {cleared}" in shown
     dismiss = script[script.index('$("outside-change-dismiss").addEventListener("click"') :]
     dismiss = dismiss[: dismiss.index("\n});")]
     assert (
         "dismissedOutside = { open_id: project.open_id, event: project.outside_change.event };"
         in dismiss
     )
+    assert cleared in dismiss
     assert dismiss.index('$("outside-change").hidden = true;') < dismiss.index(
         '$("switch-project").focus();'
     )
@@ -2002,14 +2084,22 @@ def test_a_page_that_follows_a_switch_says_what_became_of_its_project():
     text = script[script.index("function closedText(before, closed) {") :]
     text = text[: text.index("\n}\n")]
     for part in (
-        "(closed || []).find((item) => item.open_id === before.open_id)",
+        "const entry = closedEntry(before, closed);",
         "return `${name} was closed.`;",
         "entry.saved ? `${name} is saved.` : `${name} was closed with changes not saved:"
         " ${entry.why}.`",
     ):
         assert part in text, part
+    entry = script[script.index("function closedEntry(before, closed) {") :]
+    entry = entry[: entry.index("\n}\n")]
+    assert "(closed || []).find((item) => item.open_id === before.open_id)" in entry
     followed = script[script.index("function followedText(") :]
-    assert "${closedText(before, closed)}" in followed[: followed.index("\n}\n")]
+    body = followed[: followed.index("\n}\n")]
+    assert "${closedText(before, closed)}" in body
+    # Opened again under the same name (a project made where the folder of the
+    # one shown was removed), its changes not saved are said too.
+    assert "const lost = entry && !entry.saved ? closedText(before, closed) : null;" in body
+    assert "project.name === before.name && lost ? [why, lost] : [why]" in body
     assert "is saved.`;" not in followed[: followed.index("function closedText(")]
 
 
