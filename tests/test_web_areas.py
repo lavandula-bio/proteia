@@ -134,6 +134,8 @@ def test_a_cut_answers_what_went_to_the_new_membrane(client, tmp_path):
     )
     assert (answer["moved_proteins"], answer["moved_points"]) == ([ids[1]], 0)
     assert answer["handed_off"] == "the rest of membrane 1's area is now membrane 2's, with 'GAPDH'"
+    # The nets the cut moves, as a removal answers them.
+    assert {"remeasured", "largest_change"} <= answer.keys()
     assert [p["arena_id"] for p in project["proteins"]] == ["arena-4", *second["arena_ids"]]
     # An edit that leaves no row outside hands nothing over.
     answer = client.ok("PUT", "/api/arenas/arena-4", {"outline": [0, 0, 200, 49]})

@@ -384,7 +384,10 @@ def test_an_area_cut_in_two_gives_the_far_side_a_new_membrane(tmp_path):
     assert batch.arena_id_of(batch.find_protein(p53)) == "arena-4"
     assert batch.arena_id_of(batch.find_protein(gapdh)) == rest.id
     assert batch.find_protein(p53).loading_control_ids == [gapdh]  # still its loading control
-    assert nets(s) == measured  # the rings read the image as before
+    # Each side's rings now read its own side alone: the nets they move are answered.
+    moved = {band for band, net in nets(s).items() if net != measured[band]}
+    assert {band for band, _, _ in change.remeasured} == moved
+    assert_nets_current(s)
     params = cut.log[-1].params
     assert (params["rest_membrane_id"], params["rest_arena_ids"]) == (second.id, [rest.id])
     assert (params["moved_proteins"], params["moved_points"]) == ([gapdh], [])
@@ -851,14 +854,13 @@ def test_angle_on_whole_image_area_keeps_corners(tmp_path):
         Project.model_validate(doc)
 
 
-def test_angle_changes_no_number(tmp_path):
-    s, image, top, bottom = split(tmp_path)
-    box_all(s, top, 24)
-    box_all(s, bottom, 76)
-    ops.add_calibration_point(s, "arena-6", 52.0, 100.0, STRIP_EDGE, x=100.0, snap=False)
-    ops.add_calibration_point(s, "arena-6", 98.0, 30.0, STRIP_EDGE, x=100.0, snap=False)
-    before = s.project
-    results = compute_results(before.batch).model_dump()
+def test_an_angle_edit_crops_the_rings_that_reach_the_outline(tmp_path):
+    # Turning strip 3's area moves its outline, so the rings of its bands,
+    # which reach the outline, read other pixels: the edit measures the image
+    # again and answers whose nets changed, and by how much; the other strips
+    # keep theirs.
+    s, image, areas, proteins = nine_strips(tmp_path)
+    before = nets(s)
     reads = []
     real = s.pixels
 
@@ -867,19 +869,20 @@ def test_angle_changes_no_number(tmp_path):
         return real(image_id, **kwargs)
 
     s.pixels = counted
-    ops.edit_arena(s, "arena-6", angle_deg=3.7)
-    after = s.project.batch
-    assert reads == []  # no ring reads anything new
-    assert after.find_arena("arena-6")[1].angle_deg == 3.7
-    for protein in before.batch.proteins:
-        assert after.find_protein(protein.id).rows[0].bands == protein.rows[0].bands
-    assert after.membranes[1].calibration == before.batch.membranes[1].calibration
-    assert compute_results(after).model_dump() == results
-    # The content changed in the area alone.
-    edited = after.model_copy(deep=True)
-    edited.find_arena("arena-6")[1].angle_deg = 0.0
-    edited.find_arena("arena-6")[1].source = before.batch.find_arena("arena-6")[1].source
-    assert edited == before.batch
+    change = ops.edit_arena(s, areas[2], angle_deg=1.0)
+    s.pixels = real
+    assert reads == [image]
+    after = nets(s)
+    moved = {band for band in after if after[band] != before[band]}
+    batch = s.project.batch
+    strip_3 = {b.id for b in batch.boxes_of(batch.find_protein(proteins[2])).bands}
+    assert moved and moved <= strip_3
+    assert {band for band, _, _ in change.remeasured} == moved
+    assert change.largest_change is not None and change.largest_change[0] in moved
+    assert_nets_current(s)
+    # Turned back, the same nets as before.
+    ops.edit_arena(s, areas[2], angle_deg=0.0)
+    assert nets(s) == before
 
 
 def test_angle_is_stored(tmp_path):
@@ -978,9 +981,10 @@ def test_remove_area_cascade(tmp_path):
     assert removal.renumbered is None  # membrane 2 was the last
     batch = s.project.batch
     assert [m.id for m in batch.membranes] == ["mem-2"]
-    # The rings of the bands that stay no longer leave out the boxes gone.
-    moved = {band_id for band_id, _, _ in removal.remeasured}
-    assert moved == {b for b in top_bands if nets(s)[b] != before[b]}
+    # The rings of the bands that stay never left out the boxes gone, nor
+    # read their area: none is measured again.
+    assert removal.remeasured == ()
+    assert all(nets(s)[b] == before[b] for b in top_bands)
     assert_nets_current(s)
     restored = ops.undo(s)
     assert "arena-6" in restored.restored
@@ -1419,11 +1423,52 @@ def test_nine_strips_calibrations_are_independent(tmp_path):
     assert not [n for n in results.notices if n.code == "rows_tilted"]
 
 
-def test_nine_strips_nets_equal_the_unsplit_image(tmp_path):
+def cut_out_nets(s, arena_id: str) -> dict[str, float]:
+    """The nets of the bands on an unturned drawn area as the image cut along
+    its outline gives them: its pixels cropped there, its boxes shifted with
+    them, the image's median the level a ring with too little membrane falls
+    back to."""
+    from proteia.core.model import Box
+    from proteia.core.quantify import RING_CLAMP, band_backgrounds, net_signal
+
+    batch = s.project.batch
+    _, arena = batch.find_arena(arena_id)
+    image = batch.find_image(arena.image_id)
+    o = arena.outline
+    x0, y0 = max(0, o.x0), max(0, o.y0)
+    x1, y1 = min(image.width, o.x1), min(image.height, o.y1)
+    pixels = s.pixels(image.id)[y0:y1, x0:x1]
+    placed = [
+        (batch.boxes_of(protein).box_size, band)
+        for protein, _ in batch.rows_on_arena(arena_id)
+        for band in batch.boxes_of(protein).bands
+    ]
+    shifted = [Box(x=band.box.x - x0, y=band.box.y - y0) for _, band in placed]
+    dark = image.polarity.dark_on_light
+    found = band_backgrounds(
+        pixels,
+        [box.rect(size) for box, (size, _) in zip(shifted, placed, strict=True)],
+        [(size.width, size.height) for size, _ in placed],
+        dark_on_light=dark,
+        integral=image.bit_depth is not None,
+        fallback=image.background,
+    )
+    return {
+        band.id: net_signal(pixels, box, size, level.level, dark_on_light=dark, clamp=RING_CLAMP)
+        for box, (size, band), level in zip(shifted, placed, found, strict=True)
+    }
+
+
+def test_each_strip_measures_as_if_cut_out_of_the_image(tmp_path):
+    # Drawing an outline is cutting the image there: each strip's nets are
+    # those of the image cut along its outline, though the rings of its
+    # bands reach the next strip's boxes, as the same boxes on an image of
+    # one membrane show.
     s, image, areas, proteins = nine_strips(tmp_path)
-    split_nets = nets(s)
-    # The same boxes on the image of one membrane: the same nets (the rings
-    # read across the outlines and leave out every box on the image).
+    stored = nets(s)
+    for arena_id in areas:
+        cut = cut_out_nets(s, arena_id)
+        assert cut == {band: stored[band] for band in cut}, arena_id
     whole = s.project.model_copy(deep=True)
 
     def one_membrane(draft: Project) -> None:
@@ -1436,44 +1481,24 @@ def test_nine_strips_nets_equal_the_unsplit_image(tmp_path):
         ops._quantify_image(draft, image, s.pixels(image))
 
     joined, _ = apply_change(whole, one_membrane)
-    assert {b.id: b.net for p in joined.batch.proteins for b in p.rows[0].bands} == split_nets
+    unsplit = {b.id: b.net for p in joined.batch.proteins for b in p.rows[0].bands}
+    assert all(unsplit[band] != stored[band] for band in stored)
 
 
-def boxed_rows_on(batch, arena_id) -> frozenset[str]:
-    """The rows with boxes on a membrane area: those a ring leaves out."""
-    return frozenset(
-        row.id for protein, row in batch.rows_on_arena(arena_id) if batch.boxes_of(protein).bands
-    )
-
-
-def rings_leave_out_own_area_only(batch, image_id, row_id):
-    """A ring rule the maintainer may choose instead (#243): a row's rings
-    leave out the boxes of the rows on its own area only, and read across
-    the outlines."""
-    arena_id = next(row.arena_id for _, row in batch.rows_on(image_id) if row.id == row_id)
-    return RingContext(left_out=boxed_rows_on(batch, arena_id))
-
-
-def rings_read_own_area_only(batch, image_id, row_id):
-    """Another: as :func:`rings_leave_out_own_area_only`, and its rings read
-    no pixel outside its own area."""
-    arena_id = next(row.arena_id for _, row in batch.rows_on(image_id) if row.id == row_id)
-    _, arena = batch.find_arena(arena_id)
-    return RingContext(
-        left_out=boxed_rows_on(batch, arena_id),
-        read_within=ops.area_key(arena),
-    )
-
-
-@pytest.mark.parametrize("rule", [rings_leave_out_own_area_only, rings_read_own_area_only])
-def test_ring_rule_is_one_function(tmp_path, monkeypatch, rule):
-    s, image, areas, proteins = nine_strips(tmp_path)
-    before = nets(s)
-    monkeypatch.setattr(ops, "_ring_context", rule)
-    # A box of strip 1 moved: under another rule the nets of strip 2 are its own.
-    project, _ = apply_change(s.project, lambda d: ops._quantify_image(d, image, s.pixels(image)))
-    swapped = {b.id: b.net for p in project.batch.proteins for b in p.rows[0].bands}
-    assert swapped != before
+def test_the_ring_rule_is_the_area_s(tmp_path):
+    # The one function that decides: a row's rings leave out the boxes of the
+    # rows on its own area that have any, and read inside that area alone.
+    s, image, top, bottom = split(tmp_path)
+    box_all(s, top, 24)
+    box_all(s, bottom, 76)
+    ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, arena_id="arena-6")  # no box
+    batch = s.project.batch
+    for arena_id, protein in (("arena-4", top), ("arena-6", bottom)):
+        arena = batch.find_arena(arena_id)[1]
+        assert ops._ring_context(batch, arena) == RingContext(
+            area=ops.area_key(arena),
+            left_out=frozenset({batch.boxes_of(batch.find_protein(protein)).id}),
+        )
 
 
 def edit_strip_1(s, areas, proteins, what):
@@ -1504,12 +1529,6 @@ def others_unchanged(s, before, proteins):
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the background ring rule across membranes on one image is still the current one:"
-    " a ring leaves out every box on the image, so moving one membrane's box moves the nets"
-    " of another membrane's bands whose rings reach it, until that rule is decided (#243)",
-)
 def test_a_box_edit_of_one_membrane_leaves_the_others_nets(tmp_path):
     s, image, areas, proteins = nine_strips(tmp_path)
     before = s.project.batch.model_copy(deep=True)
@@ -1519,8 +1538,8 @@ def test_a_box_edit_of_one_membrane_leaves_the_others_nets(tmp_path):
 
 @pytest.mark.parametrize("what", ["lanes", "calibration"])
 def test_lanes_and_marks_of_one_membrane_leave_the_others_alone(tmp_path, what):
-    # Under the current rule too: the nets do not read the lane table or the
-    # marks, and each membrane's curve is its own.
+    # The nets do not read the lane table or the marks, and each membrane's
+    # curve is its own.
     s, image, areas, proteins = nine_strips(tmp_path)
     before = s.project.batch.model_copy(deep=True)
     edit_strip_1(s, areas, proteins, what)
@@ -1775,37 +1794,25 @@ def test_a_whole_image_area_masks_nothing():
     assert ops._inside_mask(whole, ref, (0, 0, 7, 3)).tolist() == [[True] * 7] * 3
 
 
-def test_another_ring_rule_is_applied_by_the_area_operations(tmp_path, monkeypatch):
-    # The ring rule swapped (one that reads only the row's own area): an
-    # outline edit then changes what the rings read, and the image is
-    # measured again by the rule in force.
-    s, image, areas, _ = nine_strips(tmp_path)
-    under_a = nets(s)
-    monkeypatch.setattr(ops, "_ring_context", rings_read_own_area_only)
-    y = strip_y(1)
-    ops.edit_arena(s, areas[1], outline=(0, y - 5, 200, y + 5))
-    fresh, _ = apply_change(s.project, lambda d: ops._quantify_image(d, image, s.pixels(image)))
-    assert fresh.batch == s.project.batch
-    assert nets(s) != under_a
-    monkeypatch.setattr(ops, "_ring_context", rings_leave_out_own_area_only)
-    other, _ = apply_change(s.project, lambda d: ops._quantify_image(d, image, s.pixels(image)))
-    assert {b.id: b.net for p in other.batch.proteins for b in p.rows[0].bands} != nets(s)
-
-
-def test_removing_an_area_measures_the_others_again(tmp_path):
-    # The rings of strips 1 and 3 left out strip 2's boxes; with them gone
-    # they read there, and their nets are measured again.
+def test_removing_an_area_leaves_the_others_nets(tmp_path):
+    # The rings of the other strips never left out strip 2's boxes nor read
+    # its pixels: nothing is measured again, and no pixel is read.
     s, image, areas, proteins = nine_strips(tmp_path)
     before = nets(s)
+    reads = []
+    real = s.pixels
+
+    def counted(image_id, **kwargs):
+        reads.append(image_id)
+        return real(image_id, **kwargs)
+
+    s.pixels = counted
     removal = ops.remove_arena(s, areas[1])
-    assert removal.remeasured
-    assert_nets_current(s)
+    assert (removal.remeasured, removal.largest_change, reads) == ((), None, [])
     after = nets(s)
-    moved = {band for band in after if after[band] != before[band]}
-    assert {band for band, _, _ in removal.remeasured} == moved
-
-
-# --- What a ring reads, a removal takes and a detector reads ---
+    assert after == {band: net for band, net in before.items() if band in after}
+    s.pixels = real
+    assert_nets_current(s)
 
 
 def test_removing_an_area_without_boxes_reads_no_pixels(tmp_path):

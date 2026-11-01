@@ -214,24 +214,31 @@ def import_before_224(
 def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None = None) -> None:
     """The operations' invariant: every stored net, background (level, mode,
     spread) and clipping flag (exact or possible) equals, exactly, its value recomputed from the
-    session's pixels, image by image, with every box on the image (every
-    protein's, each with its size) measured together under the project's
-    background method. ``only`` limits the check to those images.
+    session's pixels, membrane area by membrane area, with every box on the
+    area (every protein's, each with its size) measured together under the
+    project's background method, its rings reading no pixel outside a drawn
+    area's outline (#243). ``only`` limits the check to those images.
     """
     project = session.project
     batch = project.batch
     legacy = project.background_method == "global_median"
-    for image in batch.iter_images():
-        if only is not None and image.id not in only:
-            continue
+    areas = [
+        (image, arena)
+        for image in batch.iter_images()
+        for _, arena in batch.arenas_on(image.id)
+        if only is None or image.id in only
+    ]
+    for image, arena in areas:
         placed = [  # each band with its protein's boxes (their size)
             (batch.boxes_of(p), b)
-            for p in batch.proteins
-            if batch.image_id_of(p) == image.id
+            for p, _ in batch.rows_on_arena(arena.id)
             for b in batch.boxes_of(p).bands
         ]
         if not placed:
             continue
+        outside = None
+        if arena.outline is not None:
+            outside = ~ops._inside_mask(arena, image, (0, 0, image.width, image.height))
         pixels = session.pixels(image.id)
         dark = image.polarity.dark_on_light
         rects = [band.box.rect(protein.box_size) for protein, band in placed]
@@ -248,6 +255,7 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 dark_on_light=dark,
                 integral=integral,
                 fallback=image.background,
+                unreadable=outside,
             )
             clamp = RING_CLAMP
         # On the channel the session's pixels are of (#206).
@@ -265,6 +273,8 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 pixels, band.box, size, bit_depth=near_depth, dark_on_light=dark
             )
             assert band.possibly_clipped is possibly, band.id
+        if outside is not None:
+            continue  # the product's entry point reads an image of one membrane
         # The product's one entry point gives the same nets.
         method = "global_median" if legacy else "ring_median"
         nets = quantify_nets(
