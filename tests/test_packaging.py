@@ -719,7 +719,7 @@ def _pe(
     dos[0x3C:0x40] = struct.pack("<I", at)
     coff = struct.pack("<HHIIIHH", 0x8664, len(sections), 0, 0, 0, optional, 0x2022)
     header = bytearray(optional + 4)
-    header[:2] = struct.pack("<H", magic)
+    header[:4] = struct.pack("<HBB", magic, 14, 38)  # and the linker's version, as MSVC's
     count_at = {0x10B: 92, 0x20B: 108}.get(magic, 108)
     header[count_at : count_at + 4] = struct.pack("<I", directories)
     table = b"".join(
@@ -857,6 +857,7 @@ def test_a_pe_header_that_contradicts_itself_names_no_section_it_does_not_have(t
         _pe(magic=0x10B, optional=224),
         _pe(),
         _pe(optional=112, directories=0),
+        _pe(magic=0x10B, optional=96, directories=0),
         _pe(magic=0x10B, optional=96 + 8, directories=1),
     ):
         path.write_bytes(data)

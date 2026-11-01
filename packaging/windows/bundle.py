@@ -427,9 +427,10 @@ def pe_header_problem(path: Path) -> str | None:
         table = f.read(40 * count)
     if len(header) < optional:
         return "its optional header runs past the end of the file"
-    kind, fields = _OPTIONAL_HEADERS.get(int.from_bytes(header[:2], "little"), (None, 0))
-    if kind is None:
+    known = _OPTIONAL_HEADERS.get(int.from_bytes(header[:2], "little"))
+    if known is None:
         return "its optional header is neither PE32 nor PE32+"
+    kind, fields = known
     if optional < fields:
         return f"its optional header ({optional} bytes) is shorter than its {kind} fields"
     (directories,) = struct.unpack_from("<I", header, fields - 4)
