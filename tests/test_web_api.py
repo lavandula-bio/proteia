@@ -45,7 +45,7 @@ from conftest import (
     write_tiff,
 )
 from proteia import samples
-from proteia.core import ladders, storage
+from proteia.core import imaging, ladders, storage
 from proteia.core import operations as ops
 from proteia.core import session as session_module
 from proteia.core.analyze import ReduceMethod
@@ -283,6 +283,42 @@ def test_a_refused_upload_leaves_no_file(client, tmp_path, monkeypatch):
     assert (status, answer["code"]) == (413, "image_too_large")
     assert sorted(p.name for p in folder.rglob("*")) == before
     assert not (client.root / "escape.tif").exists()
+
+
+def _ink_check_runs_out(monkeypatch) -> None:
+    """Make the ink check of a TIFF (tifffile's read of its header) run out of memory."""
+    real = imaging.tifffile.TiffFile
+
+    def run_out(*args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "ink_set":
+            raise MemoryError("no room")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out)
+
+
+_OUT_OF_MEMORY = (
+    "Proteia ran out of memory reading it; close other programs and try again, or, if the file"
+    " is very large, save a smaller copy (such as one cropped to the blot) and import that"
+)
+
+
+def test_an_upload_whose_header_check_runs_out_of_memory_is_refused_not_failed(
+    client, tmp_path, monkeypatch
+):
+    # #233: it answered 500; it is refused as reading refuses it, and the
+    # project has no image.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    data = blot_bytes(tmp_path)
+    _ink_check_runs_out(monkeypatch)
+    status, answer = upload(client, data, name="blot µ.tif")
+    assert (status, answer["code"], answer["message"]) == (
+        422,
+        "unreadable_image",
+        f"cannot read 'blot µ.tif': {_OUT_OF_MEMORY}",
+    )
+    assert client.ok("GET", "/api/project")["project"]["images"] == []
+    assert sorted(p.name for p in (client.root / "Blot" / "images").iterdir()) == []
 
 
 def test_an_import_joins_the_membrane_it_names(client, tmp_path):
@@ -5830,6 +5866,37 @@ def test_a_cmyk_file_handed_off_with_others_is_left_out_and_the_others_imported(
     assert sorted(p.name for p in (client.workspace.current().folder / "images").iterdir()) == [
         f"{image['id']}.tif" for image in answer["project"]["images"]
     ]
+    assert staging(client) == []
+
+
+def test_a_file_handed_off_whose_header_check_runs_out_is_left_out_and_the_others_imported(
+    client, tmp_path, monkeypatch
+):
+    # #233: the whole accept answered 500 and imported nothing; the file is
+    # left out with why, as any file that cannot be imported, and the other
+    # (a PNG, whose header the ink check reads with Pillow) is imported.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    data = blot_bytes(tmp_path)
+    gray = (tifffile.imread(io.BytesIO(data)) >> 8).astype(np.uint8)
+    ids = [
+        staged(client, data, "blot µ.tif")["file_id"],
+        staged(client, png_bytes(gray), "gel α.png")["file_id"],
+    ]
+    offered = client.ok("POST", "/api/handoffs", {"files": ids})
+    files = listed(client, offered["handoff_id"])["files"]
+    _ink_check_runs_out(monkeypatch)
+    answer = accept(client, offered["handoff_id"], files)
+    handed = answer["handoff"]
+    assert [f["name"] for f in handed["imported"]] == ["gel α.png"]
+    assert handed["refused"] == [
+        {
+            "file_id": ids[0],
+            "name": "blot µ.tif",
+            "code": "unreadable_image",
+            "message": f"cannot read 'blot µ.tif': {_OUT_OF_MEMORY}",
+        }
+    ]
+    assert [image["original_name"] for image in answer["project"]["images"]] == ["gel α.png"]
     assert staging(client) == []
 
 
