@@ -181,7 +181,6 @@ from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
     SEVERAL_IMAGES,
     SINGLE_IMAGE_ONLY,
-    UNTRUSTED_WARNINGS,
     Inks,
     InkSet,
     NotSingleImageError,
@@ -189,13 +188,11 @@ from proteia.core.imaging import (
     assess_processed,
     check_frames,
     check_misnamed_tiff,
-    clipping_depth,
     declared_pixel_type,
     ink_set,
     load_pixels,
     named_refusal,
     pixel_type,
-    possible_clipping_depth,
     read_file,
     reads_as_palette,
 )
@@ -213,6 +210,10 @@ from proteia.core.model import (
     BoxSize,
     CalibrationPoint,
     CalibrationPointSource,
+    Channel,
+    ChannelBlocker,
+    ChannelChoice,
+    ChannelSource,
     FitMethod,
     ImageKind,
     ImageRef,
@@ -330,6 +331,7 @@ __all__ = [
     "set_box_lane",
     "set_box_padding",
     "set_box_size",
+    "set_channel",
     "set_ladder",
     "set_ladder_points",
     "set_lanes",
@@ -697,10 +699,11 @@ def _apply[T](
 
 
 def _unchecked_why(image: ImageRef) -> str:
-    """Why over-exposure cannot be checked on ``image``, and what runs instead."""
-    codes = [w.code for w in image.import_warnings if w.code in UNTRUSTED_WARNINGS]
+    """Why over-exposure cannot be checked on ``image``, on the channel it is
+    measured on, and what runs instead."""
+    codes = image.limit_distrusted
     why = ", ".join(codes) if codes else "unknown bit depth"
-    if possible_clipping_depth(image.bit_depth, image.import_warnings) is not None:
+    if image.near_check_depth is not None:
         return f"{why}; assessed near the detector limit instead"
     return f"{why}; not assessed either"
 
@@ -840,6 +843,8 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     clipping check can trust leaves its bands unchecked (``clipped`` None); if
     its range is known (a lossy, colour or CMYK-converted image), each band is
     assessed instead (``possibly_clipped``, #112), which is None everywhere else.
+    Both are of the channel the image is measured on, which ``array`` is of: one
+    colour channel of a lossless file is checked at its limit (#206).
     """
     batch = draft.batch
     image = batch.find_image(image_id)
@@ -864,8 +869,7 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
             fallback=image.background,
         )
         clamp = RING_CLAMP
-    depth = clipping_depth(image.bit_depth, image.import_warnings)
-    near_depth = possible_clipping_depth(image.bit_depth, image.import_warnings)
+    depth, near_depth = image.exact_check_depth, image.near_check_depth
     for (size, band), background in zip(placed, found, strict=True):
         band.net = net_signal(
             array, band.box, size, background.level, dark_on_light=dark_on_light, clamp=clamp
@@ -1761,7 +1765,7 @@ def _log_import(session: ProjectSession, image_id: str) -> None:
             warning.code,
             warning.message,
         )
-    if clipping_depth(image.bit_depth, image.import_warnings) is None:
+    if image.exact_check_depth is None:
         _log.info(
             "in %r: over-exposure cannot be checked on %s (%s)",
             name,
@@ -1879,22 +1883,13 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     if image.polarity is polarity:
         return
     array = session.pixels(image_id) if _bands_on(batch, image_id) else None
-    warnings = _processed_again(session, image, polarity, array)
+    warnings = _processed_again(session, image, array, polarity=polarity)
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         drafted = draft.batch.find_image(image_id)
         drafted.polarity = polarity
         drafted.import_warnings = warnings
-        if array is not None:
-            _quantify_image(draft, image_id, array)
-        for protein in draft.batch.proteins_on(image_id):
-            for band in draft.batch.boxes_of(protein).bands:
-                band.bands_found = None
-        return [
-            dropped
-            for protein in draft.batch.proteins_on(image_id)
-            for dropped in _drop_undetected_where(draft.batch, protein, lambda _: True)
-        ]
+        return _measure_again(draft, image_id, array)
 
     _apply(
         session,
@@ -1908,13 +1903,45 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     )
 
 
+def _measure_again(
+    draft: Project, image_id: str, array: np.ndarray | None
+) -> list[dict[str, JsonValue]]:
+    """What a change of how an image is read (its polarity or its channel)
+    does to what was measured on it, in a draft whose image already reads
+    so: every band on it re-quantified on ``array`` (None: it holds no band),
+    its band counts cleared (#58) and every not-detected record of its
+    proteins dropped, which a detector measured the other way and only a
+    detector can measure again. The dropped records' log forms, in protein
+    order, then stored order."""
+    if array is not None:
+        _quantify_image(draft, image_id, array)
+    batch = draft.batch
+    for protein in batch.proteins_on(image_id):
+        for band in batch.boxes_of(protein).bands:
+            band.bands_found = None
+    return [
+        dropped
+        for protein in batch.proteins_on(image_id)
+        for dropped in _drop_undetected_where(batch, protein, lambda _: True)
+    ]
+
+
 def _processed_again(
-    session: ProjectSession, image: ImageRef, polarity: Polarity, array: np.ndarray | None
+    session: ProjectSession,
+    image: ImageRef,
+    array: np.ndarray | None,
+    *,
+    polarity: Polarity,
+    channel: Channel | None = None,
+    background: float | None = None,
 ) -> list[ImageWarning]:
     """The image's import warnings with ``looks_processed`` assessed for
-    ``polarity`` (:func:`~proteia.core.imaging.assess_processed`), from its
-    analysis array (``array``, or read now without keeping it, since an image
-    with no band has no other use for it) and its file's header. An image whose
+    ``polarity`` on ``channel`` with the median ``background`` (by default the
+    channel the image is measured on and its stored median)
+    (:func:`~proteia.core.imaging.assess_processed`), from its analysis array
+    on that channel (``array``; None, for the channel it is measured on only,
+    reads it now without keeping it, since an image with no band has no other
+    use for it) and its file's header. An image whose
     file cannot be read loses a ``looks_processed`` assessed for the old
     polarity, which would name the wrong limit, and keeps its other warnings:
     with no band to re-quantify, its polarity changes as before #127, and every
@@ -1930,8 +1957,92 @@ def _processed_again(
         array,
         image.bit_depth,
         dark_on_light=polarity.dark_on_light,
-        background=image.background,
+        background=image.background if background is None else background,
         palette=palette,
+        channel=image.measured_channel if channel is None else channel,
+    )
+
+
+# Why a channel cannot be chosen for an image (set_channel), by
+# ImageRef.channel_blocker; the image is named as it was imported.
+_CHANNEL_REFUSALS: Final[dict[ChannelBlocker, str]] = {
+    "gray": (
+        "{name} has one gray channel (its red, green and blue are equal, or it is gray):"
+        " there is no channel to choose, and it is measured as it is"
+    ),
+    "marker": (
+        "{name} is a marker image: it is read as the mean of its colours so that every"
+        " ladder band shows; choose a channel on the images that hold proteins"
+    ),
+    "cmyk": (
+        "{name} was converted from CMYK when it was imported, so its red, green and blue"
+        " are estimates; save the original as an uncompressed RGB TIFF and import it again"
+        " to measure one channel"
+    ),
+}
+
+
+@_locked
+def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> None:
+    """Measure a colour image on one of its channels, red, green or blue, or
+    on the mean of the three (#206), chosen by the user: every band on it is
+    re-quantified on that channel's analysis array, which the session then
+    caches if a band is on it (else it is read and not kept, as on a polarity
+    change), and its over-exposure checks run there (one colour channel of a
+    lossless file is checked at the file's limit). Its median (``background``)
+    is the new array's, and its ``looks_processed`` warning is assessed again
+    on it; its other import warnings stay as imported (the page shows its
+    ``color_channels_differ`` for the channel it is measured on:
+    :attr:`~proteia.core.model.ImageRef.shown_warnings`). Its band counts (#58)
+    and the not-detected records of its proteins go, as on a polarity change
+    (:func:`set_polarity`). Ladder work on it reads the mean whatever channel
+    is chosen (:meth:`~proteia.core.session.ProjectSession.calibration_pixels`).
+
+    Refused (``INVALID_INPUT``, nothing changed) for an image with one gray
+    channel, a visible-light marker image (its ladder is of several colours)
+    or an image converted from CMYK (its colours are estimates), each naming
+    the image as it was imported, or for something that is not a channel; a
+    missing or changed stored file is refused as reading it is
+    (``IMAGE_FILE_CHANGED``, ``UNREADABLE_IMAGE``). The channel the image is
+    measured on already is a no-op, so the mean is one for an image no channel
+    was chosen for. The log entry names the image, the channel taken
+    (``channel``) and left (``from``), and the records dropped
+    (``dropped_undetected``) in full.
+    """
+    channel = _member(Channel, channel, "channel")
+    image = session.project.batch.find_image(image_id)
+    blocker = image.channel_blocker
+    if blocker is not None:
+        message = _CHANNEL_REFUSALS[blocker].format(name=repr(image.original_name))
+        raise _invalid(message, ids=(image_id,))
+    left = image.measured_channel
+    if channel is left:
+        return
+    array = session.channel_array(image_id, channel)
+    background = estimate_background(array)
+    warnings = _processed_again(
+        session, image, array, polarity=image.polarity, channel=channel, background=background
+    )
+    kept = {image_id: array} if _bands_on(session.project.batch, image_id) else None
+
+    def change(draft: Project) -> list[dict[str, JsonValue]]:
+        drafted = draft.batch.find_image(image_id)
+        drafted.channel = ChannelChoice(channel=channel, source=ChannelSource.CHOSEN)
+        drafted.background = background
+        drafted.import_warnings = warnings
+        return _measure_again(draft, image_id, array)
+
+    _apply(
+        session,
+        "set_channel",
+        change,
+        lambda dropped: {
+            "image_id": image_id,
+            "channel": channel.value,
+            "from": left.value,
+            "dropped_undetected": dropped,
+        },
+        add_pixels=kept,
     )
 
 
@@ -2204,7 +2315,7 @@ def _snapped(
     if point.x is None:  # unreachable: snapping asks for the point's x first
         raise RuntimeError("a calibration point without x cannot be snapped")
     return mwcal.refine_point(
-        session.pixels(image.id),
+        session.calibration_pixels(image.id),
         point.x,
         point.y,
         source=point.source,
@@ -2726,7 +2837,7 @@ def _proposal(
                 (ladder.curve for ladder in fitted.ladders if ladder.side is LadderSide.LEFT), None
             )
     return mwcal.find_ladder(
-        session.pixels(image.id),
+        session.calibration_pixels(image.id),
         x,
         kda=calibration.ladder_kda,
         reference_kda=reference,
@@ -2801,7 +2912,7 @@ def snap_ladder(
         _within_image(image, x=None, y=y)
     if not given:
         return ()
-    array = session.pixels(image.id)
+    array = session.calibration_pixels(image.id)
     source = _band_source(image)
     snapped = []
     for index, y in enumerate(given):
@@ -2855,7 +2966,7 @@ def _placed(
     if not applied:
         return []
     batch = session.project.batch
-    array = session.pixels(image.id)
+    array = session.calibration_pixels(image.id)
     source = _band_source(image)
     peaks = [] if proposal is None else [t.y for t in proposal.ticks if t.found]
     peaks += [] if proposal is None else list(proposal.extra)
@@ -2870,7 +2981,7 @@ def _placed(
         # only its own image, so it is not refused for that one: a point it
         # cannot check is not taken as snapped.
         try:
-            pixels = session.pixels(old.image_id)
+            pixels = session.calibration_pixels(old.image_id)
         except OperationError:
             return False
         return mwcal.is_snap_position(
@@ -4894,12 +5005,12 @@ def _place_row(
         raise misnumbered
     array = session.pixels(image.id)
     right_to_left = runs is True or last is True
-    # Pixels saturated as the over-exposure checks count them: a hollow band
-    # is reported as over-exposed, not as two bands (#121). None for an image
-    # of unknown bit depth: no band is then hollow.
+    # Pixels saturated as the over-exposure checks count them, on the channel
+    # measured: a hollow band is reported as over-exposed, not as two bands
+    # (#121). None for an image of unknown bit depth: no band is then hollow.
     saturated_at = saturation_level(
-        clipping_depth(image.bit_depth, image.import_warnings),
-        possible_clipping_depth(image.bit_depth, image.import_warnings),
+        image.exact_check_depth,
+        image.near_check_depth,
         dark_on_light=image.polarity.dark_on_light,
     )
     try:
@@ -5459,13 +5570,13 @@ def unassessed_images(batch: Batch) -> list[str]:
     for pixels near the detector limit (#112), in membrane then image order:
     an image that check assesses
     (:func:`~proteia.core.imaging.possible_clipping_depth` known: a lossy,
-    colour or CMYK-converted image of 8- or 16-bit pixels) holding a band with
-    no ``possibly_clipped`` flag, as a project saved before it holds.
-    :func:`requantify` assesses them."""
+    colour or CMYK-converted image of 8- or 16-bit pixels, on the channel it is
+    measured on) holding a band with no ``possibly_clipped`` flag, as a project
+    saved before it holds. :func:`requantify` assesses them."""
     return [
         image.id
         for image in batch.iter_images()
-        if possible_clipping_depth(image.bit_depth, image.import_warnings) is not None
+        if image.near_check_depth is not None
         and any(
             band.possibly_clipped is None
             for protein in batch.proteins_on(image.id)

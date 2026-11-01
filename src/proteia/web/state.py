@@ -209,9 +209,12 @@ def project_state(
             "height": image.height,
             "bit_depth": image.bit_depth,
             "colour": has_colour(session, image),
+            "channel": _channel(image),
+            # As shown: a colour image's color_channels_differ says the channel
+            # it is measured on (#206).
             "warnings": [
                 {"code": warning.code, "message": warning.message}
-                for warning in image.import_warnings
+                for warning in image.shown_warnings
             ],
         }
         for membrane in batch.membranes
@@ -289,6 +292,24 @@ def project_state(
         "proteins": proteins,
         "saved": not session.dirty,
         "save_error": None if session.save_error is None else str(session.save_error),
+    }
+
+
+def _channel(image: ImageRef) -> JsonValue:
+    """What a colour image (one whose red, green and blue differ) is measured
+    on (#206): the channel (``measured``: ``red``, ``green``, ``blue`` or
+    ``mean``), who chose it (``source``: ``chosen``, or null with no choice:
+    the mean, as before #206) and whether one can be chosen for it
+    (``offered``: not for a visible-light marker image or an image converted
+    from CMYK, which :func:`~proteia.core.operations.set_channel` refuses);
+    null for a gray image, which has one channel."""
+    blocker = image.channel_blocker
+    if blocker == "gray":
+        return None
+    return {
+        "measured": image.measured_channel.value,
+        "source": None if image.channel is None else image.channel.source.value,
+        "offered": blocker is None,
     }
 
 

@@ -268,8 +268,9 @@ _FALLBACK_MODES = frozenset({"asymmetric", "image"})
 NAMED_COPIES: Final = 3
 # What makes imaging.clipping_depth distrust an image, besides an unknown bit
 # depth: its import warnings, as the clipping_not_checked and possibly_clipped
-# notices name them. The keys are imaging.UNTRUSTED_WARNINGS, kept in step by a
-# test rather than an import, so that loading results does not load the image
+# notices name them. The keys are model.UNTRUSTED_WARNINGS, kept in step by a
+# test; which of them distrust the channel an image is measured on, the model
+# says (limit_distrusted_by), so that loading results does not load the image
 # readers.
 _UNCHECKED_WARNINGS = {
     "lossy_format": "lossy (JPEG-type) compression",
@@ -1278,22 +1279,24 @@ def _unassessed(image: model.ImageRef, band: model.Band | None) -> bool:
     is known but whose limit the exact check distrusts: the image
     :func:`~proteia.core.imaging.possible_clipping_depth` assesses, as
     :func:`~proteia.core.operations.unassessed_images` names it (a project
-    saved before #112). Its warnings are read as :data:`_UNCHECKED_WARNINGS`
-    names them."""
+    saved before #112). Its warnings are read for the channel it is measured
+    on (:attr:`~proteia.core.model.ImageRef.limit_distrusted`)."""
     return (
         band is not None
         and band.clipped is None
         and band.possibly_clipped is None
         and image.bit_depth is not None
-        and any(warning.code in _UNCHECKED_WARNINGS for warning in image.import_warnings)
+        and bool(image.limit_distrusted)
     )
 
 
 def _unchecked_reasons(image: model.ImageRef) -> str:
     """Why the clipping check cannot run on an image, as
     :func:`~proteia.core.imaging.clipping_depth` decides it: its import warnings
-    and an unknown bit depth, joined by "and"; empty with none."""
-    codes = {warning.code for warning in image.import_warnings}
+    that distrust the channel it is measured on
+    (:attr:`~proteia.core.model.ImageRef.limit_distrusted`) and an unknown bit depth,
+    joined by "and"; empty with none."""
+    codes = set(image.limit_distrusted)
     reasons = [text for code, text in _UNCHECKED_WARNINGS.items() if code in codes]
     if image.bit_depth is None:
         reasons.append("an unknown bit depth")

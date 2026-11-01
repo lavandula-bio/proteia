@@ -2715,6 +2715,7 @@ const ACTION_WORDS = {
   import_image: "import image",
   remove_image: "remove image",
   set_polarity: "change band polarity",
+  set_channel: "change the measured channel",
   set_lanes: "set lanes",
   set_reference_condition: "set reference condition",
   add_protein: "add protein",
