@@ -2015,3 +2015,25 @@ def test_a_ladder_on_a_chosen_channel_reads_the_mean_off_its_area(tmp_path):
     assert abs(mean_level - ref.background) > 5000
     assert np.allclose(measured[off], ref.background, atol=1)
     assert np.allclose(ladder[off], mean_level, atol=1)
+
+
+def test_a_window_on_its_area_s_edges_is_read_as_stored(tmp_path, monkeypatch):
+    s, image = one_image(tmp_path)
+    ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
+    ops.add_arena(s, image, (0, 50, 200, 100))
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena("arena-4")[1]
+    stored = s.pixels(image)
+    # The window the outline is: every pixel's centre lies inside, the edge
+    # pixels' too, so nothing is masked; one row more, and the window is.
+    assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 50)) is stored
+    assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 51)) is not stored
+    # A ladder read of an image measured on the mean takes the stored
+    # median off the area: no median is worked out again.
+
+    def no_median(array):
+        raise AssertionError("a median worked out again")
+
+    monkeypatch.setattr(ops, "estimate_background", no_median)
+    shown = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60), calibration=True)
+    assert np.allclose(shown[50:60, :], ref.background, atol=1)
