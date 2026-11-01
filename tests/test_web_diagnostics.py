@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from conftest import FakeClock
+from conftest import FakeClock, guards_in_place
 from proteia.core import operations as ops
 from proteia.core import record, storage
 from proteia.web import api, diagnostics, handoff, launch, logs, server
@@ -535,19 +535,20 @@ def test_with_changes_not_saved_its_images_are_also_those_project_json_names(
     def full(project, folder):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(storage, "save_project", full)
-    client.ok("DELETE", f"/api/images/{ids[1]}")
-    status, answer = upload(client, blot_bytes(tmp_path), name="third.tif")
-    assert status == 201, answer
-    listed = listing(served)
-    assert listed["saved"] is False
-    stored = sorted(path.name for path in (folder / storage.IMAGES_DIR).iterdir())
-    assert len(stored) == 3  # the removed image's file too, kept until a save
-    assert sorted(file["name"] for file in listed["images"]) == [
-        f"project/images/{name}" for name in stored
-    ]
-    write(served, listed, images=True)
-    monkeypatch.undo()
+    with monkeypatch.context() as patch:  # only this patch is taken back below
+        patch.setattr(storage, "save_project", full)
+        client.ok("DELETE", f"/api/images/{ids[1]}")
+        status, answer = upload(client, blot_bytes(tmp_path), name="third.tif")
+        assert status == 201, answer
+        listed = listing(served)
+        assert listed["saved"] is False
+        stored = sorted(path.name for path in (folder / storage.IMAGES_DIR).iterdir())
+        assert len(stored) == 3  # the removed image's file too, kept until a save
+        assert sorted(file["name"] for file in listed["images"]) == [
+            f"project/images/{name}" for name in stored
+        ]
+        write(served, listed, images=True)
+    assert guards_in_place()
     (path,) = served.written()
     files, manifest = opened(path)
     assert files["project/project.json"] == saved
