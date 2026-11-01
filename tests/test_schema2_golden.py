@@ -1094,12 +1094,13 @@ def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys, derived):
     )
     monkeypatch.setattr(fixtures, "sources", lambda case: fixtures.frozen_sources(DATA / case))
     # The derived output of the same build of the same image files, computed
-    # by the module already (one build less per case).
+    # by the module already (one build less per case); the build written is
+    # compared with another of its own, which stores what it stores.
     asked = []
 
     def derived_output(folder, work, case=None):
         asked.append((Path(folder), case, (Path(folder) / "stored.json").is_file()))
-        return copy.deepcopy(derived[case])
+        return {**copy.deepcopy(derived[case]), "fresh_changes": []}
 
     monkeypatch.setattr(fixtures, "derived_output", derived_output)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
@@ -1121,8 +1122,12 @@ def test_write_frozen_writes_every_case(tmp_path, monkeypatch, capsys, derived):
             del values["project_sha256"], values["content_hash"]
             for entry in values["log"]:
                 del entry["content_hash"]
-        assert fixtures.differences(frozen, stored, rel_tol=1e-12) == []
-        assert (out / case / "derived.json").read_bytes() == fixtures.canonical_json(derived[case])
+        # Every value but those a fresh build of this one stores otherwise
+        # (fresh_changes: since #206, F2's colour image's pick).
+        fresh = [path for path, _, _ in derived[case]["fresh_changes"]]
+        assert [path for path, _, _ in fixtures.changes(frozen, stored)] == fresh
+        first = {**derived[case], "fresh_changes": []}
+        assert (out / case / "derived.json").read_bytes() == fixtures.canonical_json(first)
         # Named by the ids this build drew, read as the schema-2 build drew them.
         new = fixtures.new_numbers(storage.load_project(out / case))
         written = [p.name for p in (out / case / "images").iterdir()]

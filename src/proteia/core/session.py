@@ -92,6 +92,7 @@ from proteia.core.imaging import (
     named_refusal,
     of_the_system,
     read_colours,
+    read_file,
     refusal_cause,
 )
 from proteia.core.model import (
@@ -570,6 +571,33 @@ class ProjectSession:
         commit caches it."""
         with self.lock:
             return self._read_array(self._project.batch.find_image(image_id), channel)
+
+    def cached_pixels(self, image_id: str) -> np.ndarray | None:
+        """The image's analysis array if the session holds it (of the channel
+        the committed project measures it on, :meth:`pixels`), else None; it
+        reads nothing."""
+        with self.lock:
+            return self._pixels.get(image_id)
+
+    def file_pixels(self, image_id: str) -> np.ndarray:
+        """The image's stored file's pixels as read (2-D gray, or channels
+        last: :func:`~proteia.core.imaging.read_file`), read-only, read and
+        checked as :meth:`pixels` reads the analysis array, with the same
+        errors, and never cached: for the channel rule (#206), which a channel
+        or polarity change runs on them, and the analysis array of a channel
+        made from the same read."""
+        with self.lock:
+            image = self._project.batch.find_image(image_id)
+
+            def read(path: Path) -> np.ndarray:
+                why = self.outdated_reading(image)
+                if why is not None:
+                    raise OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image.id,))
+                return read_file(path).pixels
+
+            pixels = self._read_checked(image, read)
+            pixels.flags.writeable = False
+            return pixels
 
     def _read_array(self, image: ImageRef, channel: Channel) -> np.ndarray:
         """The image's analysis array of ``channel``, read and checked

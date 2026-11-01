@@ -63,8 +63,10 @@ def _state(variable: str, folder):
     [
         pytest.param(_unwrapped(operations, "import_image"), False, id="import-check-gone"),
         pytest.param(_unwrapped(ProjectSession, "_read_checked"), False, id="read-check-gone"),
+        pytest.param(_unwrapped(operations, "set_polarity"), False, id="polarity-check-gone"),
         pytest.param(_held(operations, "import_image"), True, id="import-held"),
         pytest.param(_held(ProjectSession, "_read_checked"), True, id="read-held"),
+        pytest.param(_held(operations, "set_polarity"), True, id="polarity-held"),
         pytest.param(_browsers(None), False, id="browsers-not-looked-up"),
         pytest.param(_browsers(["firefox", "proteia-test-guard"]), False, id="real-browser-first"),
         pytest.param(_state("LOCALAPPDATA", lambda own, base: base.parent), False, id="local-out"),

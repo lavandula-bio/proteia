@@ -191,12 +191,23 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Concatenate, Final, Literal, cast
+from typing import Any, BinaryIO, Concatenate, Final, Literal, TypedDict, cast
 
 import numpy as np
 from pydantic import JsonValue, ValidationError
 
-from proteia.core import boxes, export, ladders, mwcal, mwrow, record, results, rowdetect, storage
+from proteia.core import (
+    boxes,
+    channelrule,
+    export,
+    ladders,
+    mwcal,
+    mwrow,
+    record,
+    results,
+    rowdetect,
+    storage,
+)
 from proteia.core.analyze import ReduceMethod, StatisticsSetting, statistics_setting
 from proteia.core.boxes import COVER_SHARE, overlap_share
 from proteia.core.export import (
@@ -212,6 +223,7 @@ from proteia.core.imaging import (
     EXHAUSTED,
     SEVERAL_IMAGES,
     SINGLE_IMAGE_ONLY,
+    FilePixels,
     Inks,
     InkSet,
     LoadedImage,
@@ -219,6 +231,9 @@ from proteia.core.imaging import (
     PixelType,
     RefusalCause,
     assess_processed,
+    bit_depth_of,
+    channel_masses,
+    channels_differ,
     check_frames,
     check_misnamed_tiff,
     declared_pixel_type,
@@ -229,6 +244,7 @@ from proteia.core.imaging import (
     ran_out_measuring,
     read_file,
     reads_as_palette,
+    to_analysis_array,
 )
 from proteia.core.model import (
     DETECTING_SOURCES,
@@ -738,6 +754,14 @@ def _prepare[T](session: ProjectSession, change: Callable[[Project], T]) -> tupl
 
 
 _Params = Mapping[str, JsonValue]  # a log entry's params
+
+
+class _Evidence(TypedDict):
+    """What the channel rule measured for a choice (#206; :class:`ChannelChoice`)."""
+
+    rule: int
+    masses: tuple[float, float, float]
+    apart: tuple[float, float, float]
 
 
 def _apply[T](
@@ -1881,6 +1905,15 @@ def import_image(
     ``arena_id``). ``kind`` and ``polarity`` are required (the model has no
     silent default).
 
+    A colour image whose red, green and blue differ, but a visible-light
+    marker, is measured on the channel the channel rule picks for it at
+    ``polarity`` (#206, :mod:`~proteia.core.channelrule`): the one that holds
+    the most signal above its background, or their mean where all three hold
+    its bands or none does. The choice is stored with the evidence it was made
+    on and logged as stored (``channel``); a gray image logs none, as before.
+    Its background, its ``looks_processed`` warning and the over-exposure
+    checks of the bands placed on it are of that channel.
+
     A file of printing inks, CMYK or other, is refused (``CMYK_IMAGE``, #207;
     :func:`_refuse_inks`): the message names it and says to save it as RGB or
     grayscale (an uncompressed TIFF, for a copy of more than 8 bits or with
@@ -1986,10 +2019,14 @@ def import_image(
         # bit depth, integers in the layout reading checked, convert without error.
         _refuse_pixel_type(original_name, pixel_type(read.pixels))
 
-        def measure() -> tuple[LoadedImage, float, list[ImageWarning]]:
-            """The pixels read, measured: the analysis array, its background
-            and the image's warnings."""
-            loaded = load_pixels(read)
+        def measure() -> tuple[LoadedImage, float, list[ImageWarning], ChannelChoice | None]:
+            """The pixels read, measured: the channel the rule picks for a
+            colour image (#206), first, so that its passes over the pixels
+            never coincide with the analysis array; the analysis array, of
+            that channel; its background and the image's warnings."""
+            choice = _picked(read, kind, polarity)
+            channel = None if choice is None else choice.channel
+            loaded = load_pixels(read, channel=channel)
             if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
                 # Failing closed: inks the header check missed are refused as read,
                 # never imported converted. Reading drops an alpha channel, so the
@@ -2003,10 +2040,11 @@ def import_image(
                 dark_on_light=polarity.dark_on_light,
                 background=background,
                 palette=loaded.palette,
+                channel=channel,
             )
-            return loaded, background, warnings
+            return loaded, background, warnings, choice
 
-        loaded, background, warnings = _run_out_refused(
+        loaded, background, warnings, choice = _run_out_refused(
             measure, path, original_name, measuring=True
         )
 
@@ -2034,6 +2072,7 @@ def import_image(
                 polarity=polarity,
                 background=background,
                 import_warnings=warnings,
+                channel=choice,
             )
             batch.images.insert(_image_slot(batch, membrane), image)
             arena = Arena(
@@ -2055,6 +2094,8 @@ def import_image(
         }
         if table_made is not None:
             params["lane_table_id"] = table_made  # the project's lane table, made with it
+        if choice is not None:
+            params["channel"] = choice.model_dump(mode="json")  # a colour image's, as stored
         session._commit(
             new, action="import_image", params=params, add_pixels={image_id: loaded.array}
         )
@@ -2260,12 +2301,46 @@ def _image_slot(batch: Batch, membrane: Membrane) -> int:
     return held[-1] + 1 if held else 0
 
 
+def _evidence(pixels: np.ndarray, polarity: Polarity) -> tuple[Channel, _Evidence] | None:
+    """What the channel rule (#206) picks for a file's ``pixels`` as read at
+    ``polarity``, and the evidence a choice stores
+    (:func:`~proteia.core.imaging.channel_masses`); None for pixels whose red,
+    green and blue do not differ (gray, with or without alpha), which have no
+    channel to pick, or that have no known bit depth (float, imported before
+    #224), which have no range to measure the masses in."""
+    depth = bit_depth_of(pixels)
+    if depth is None or not channels_differ(pixels):
+        return None
+    masses, apart = channel_masses(pixels, depth, dark_on_light=polarity.dark_on_light)
+    return channelrule.pick(masses), {
+        "rule": channelrule.VERSION,
+        "masses": masses,
+        "apart": apart,
+    }
+
+
+def _picked(read: FilePixels, kind: ImageKind, polarity: Polarity) -> ChannelChoice | None:
+    """The channel the rule picks for an image being imported (#206), with its
+    evidence; None where it picks none: a gray image, or one whose red, green
+    and blue are equal (:func:`_evidence`), a visible-light marker, whose
+    prestained ladder is of several colours and so is read on the mean, and a
+    file converted from CMYK (refused as read since #207)."""
+    if kind is ImageKind.VISIBLE_MARKER or read.cmyk is not None:
+        return None
+    found = _evidence(read.pixels, polarity)
+    if found is None:
+        return None
+    channel, evidence = found
+    return ChannelChoice(channel=channel, source=ChannelSource.PICKED, **evidence)
+
+
 def _log_import(session: ProjectSession, image_id: str) -> None:
-    """Log the warnings an image was imported with, and whether over-exposure
-    can be checked on it."""
+    """Log the warnings an image was imported with, as the page shows them (a
+    colour image's ``color_channels_differ`` says the channel it is measured
+    on), and whether over-exposure can be checked on it."""
     image = session.project.batch.find_image(image_id)
     name = session.folder.name
-    for warning in image.import_warnings:
+    for warning in image.shown_warnings:
         _log.info(
             "in %r: %s was imported with a warning, %s: %s",
             name,
@@ -2387,31 +2462,102 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     row's fitted background, so it cannot be recomputed here. A later detection
     run writes them again. The band counts there (#58) go too, for the same
     reason.
+
+    A colour image with a channel choice (#206) has its channels measured
+    again at the new polarity, from its file (:func:`_evidence`): a channel
+    the rule picked is picked again, and if that is another channel the image
+    is measured on it, with its median, as a channel change measures it
+    (:func:`set_channel`); a channel the user chose stays, with the evidence
+    measured again. The file is read once: for the evidence, and, unless the
+    session holds the array of the channel kept, for the array its bands are
+    measured on, which the session then keeps. The
+    choice's evidence cannot be dropped instead, for a chosen channel either:
+    nothing would measure it again, and a second target's warning would be
+    lost with no word.
+
+    The file is read for an image with a choice or with bands: while it is
+    missing, changed or of another size the change is refused
+    (``IMAGE_FILE_CHANGED``, :data:`_POLARITY_FILE`: the image as imported, the
+    file to put back in the images folder and the step after) and nothing
+    changes; a damaged one, or one read in a way this version no longer
+    reads, as reading it is refused (``UNREADABLE_IMAGE``). The log entry names
+    such an image's choice as stored after the change (``channel``); an image
+    with no choice logs none, as before.
     """
     polarity = _member(Polarity, polarity, "polarity")
     batch = session.project.batch
     image = batch.find_image(image_id)
     if image.polarity is polarity:
         return
-    array = session.pixels(image_id) if _bands_on(batch, image_id) else None
-    warnings = _processed_again(session, image, array, polarity=polarity)
+    bands = _bands_on(batch, image_id)
+    choice, background, kept = image.channel, None, None
+    channel = image.measured_channel
+    array = None
+    if choice is not None:
+        pixels = _read_for_polarity(image, lambda: session.file_pixels(image_id))
+        found = _evidence(pixels, polarity)
+        if found is not None:
+            picked, evidence = found
+            if choice.source is ChannelSource.PICKED:
+                channel = picked
+            choice = ChannelChoice(channel=channel, source=choice.source, **evidence)
+            if channel is image.measured_channel:  # the array the session holds, if it does
+                array = session.cached_pixels(image_id)
+            if array is None:  # made from this read, not read again; kept if bands use it
+                array = to_analysis_array(pixels, channel=channel)[0]
+                kept = {image_id: array} if bands else None
+            if channel is not image.measured_channel:
+                background = estimate_background(array)
+    if array is None and bands:
+        array = _read_for_polarity(image, lambda: session.pixels(image_id))
+    warnings = _processed_again(
+        session, image, array, polarity=polarity, channel=channel, background=background
+    )
+    measured = array if bands else None
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         drafted = draft.batch.find_image(image_id)
         drafted.polarity = polarity
         drafted.import_warnings = warnings
-        return _measure_again(draft, image_id, array)
+        if choice is not image.channel:  # measured again: a new record
+            drafted.channel = choice
+        if background is not None:
+            drafted.background = background
+        return _measure_again(draft, image_id, measured)
 
-    _apply(
-        session,
-        "set_polarity",
-        change,
-        lambda dropped: {
+    def params(dropped: list[dict[str, JsonValue]]) -> _Params:
+        logged: dict[str, JsonValue] = {
             "image_id": image_id,
             "polarity": polarity.value,
             "dropped_undetected": dropped,
-        },
-    )
+        }
+        if choice is not None:
+            logged["channel"] = choice.model_dump(mode="json")
+        return logged
+
+    _apply(session, "set_polarity", change, params, add_pixels=kept)
+
+
+# A polarity change refused while the image's stored file is missing, changed
+# or of another size (IMAGE_FILE_CHANGED): the image named as imported, and
+# the stored file named, the one name under which putting the file back works.
+_POLARITY_FILE: Final = (
+    "{name} cannot change polarity: its file in the project's images folder, {file}, is missing"
+    " or was changed outside Proteia, and a polarity change reads it; put the original file"
+    " back there as {file}, then change the polarity again"
+)
+
+
+def _read_for_polarity[T](image: ImageRef, read: Callable[[], T]) -> T:
+    """``read()`` of the image's stored file for a polarity change, its
+    ``IMAGE_FILE_CHANGED`` refusal said in :data:`_POLARITY_FILE`'s words."""
+    try:
+        return read()
+    except OperationError as exc:
+        if exc.code is not ErrorCode.IMAGE_FILE_CHANGED:
+            raise
+        message = _POLARITY_FILE.format(name=repr(image.original_name), file=image.file)
+        raise OperationError(ErrorCode.IMAGE_FILE_CHANGED, message, ids=(image.id,)) from exc
 
 
 def _measure_again(
@@ -2452,11 +2598,13 @@ def _processed_again(
     (:func:`~proteia.core.imaging.assess_processed`), from its analysis array
     on that channel (``array``; None, for the channel it is measured on only,
     reads it now without keeping it, since an image with no band has no other
-    use for it) and its file's header. An image whose
-    file cannot be read loses a ``looks_processed`` assessed for the old
+    use for it) and its file's header. An image whose file cannot be read here
+    (one with no band and no channel choice, whose array :func:`set_polarity`
+    does not need; for any other it has the array, or refuses the change while
+    the file cannot be read) loses a ``looks_processed`` assessed for the old
     polarity, which would name the wrong limit, and keeps its other warnings:
-    with no band to re-quantify, its polarity changes as before #127, and every
-    analysis of it is refused until the file is back."""
+    its polarity changes as before #127, and every analysis of it is refused
+    until the file is back."""
     try:
         if array is None:
             array = session.pixels(image.id, keep=False)
@@ -2508,6 +2656,11 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
     and the not-detected records of its proteins go, as on a polarity change
     (:func:`set_polarity`). Ladder work on it reads the mean whatever channel
     is chosen (:meth:`~proteia.core.session.ProjectSession.calibration_pixels`).
+    The choice keeps the evidence the channel rule measured for the image (its
+    pick on import, or on a polarity change); for an image it measured none for
+    (imported before Proteia picked a channel, or chosen before then), the rule
+    measures it on the same read of the file (:func:`_evidence`), so that the
+    results can tell where another channel holds signal apart from it.
 
     Refused (``INVALID_INPUT``, nothing changed) for an image with one gray
     channel, a visible-light marker image (its ladder is of several colours)
@@ -2529,7 +2682,20 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
     left = image.measured_channel
     if channel is left:
         return
-    array = session.channel_array(image_id, channel)
+    held = image.channel
+    evidence: _Evidence | None = None
+    if held is not None and held.rule is not None:
+        assert held.masses is not None and held.apart is not None  # the model keeps them together
+        evidence = {"rule": held.rule, "masses": held.masses, "apart": held.apart}
+        array = session.channel_array(image_id, channel)
+    else:  # no evidence yet: the rule measures it on the same read of the file
+        pixels = session.file_pixels(image_id)
+        found = _evidence(pixels, image.polarity)
+        if found is None:  # no known bit depth: nothing to measure the masses in
+            array = session.channel_array(image_id, channel)
+        else:
+            evidence = found[1]
+            array = to_analysis_array(pixels, channel=channel)[0]
     background = estimate_background(array)
     warnings = _processed_again(
         session, image, array, polarity=image.polarity, channel=channel, background=background
@@ -2538,7 +2704,9 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         drafted = draft.batch.find_image(image_id)
-        drafted.channel = ChannelChoice(channel=channel, source=ChannelSource.CHOSEN)
+        drafted.channel = ChannelChoice(
+            channel=channel, source=ChannelSource.CHOSEN, **(evidence or {})
+        )
         drafted.background = background
         drafted.import_warnings = warnings
         return _measure_again(draft, image_id, array)

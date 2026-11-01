@@ -104,14 +104,19 @@ _STORED_COPY = re.compile(r"img-\d+\.(?:tiff?|png|jpe?g)", re.IGNORECASE)
 _DRIVE = re.compile(r"\b[A-Za-z]:[\\/]")
 
 
-def stored_copy_or_path_in(message: str, original_name: str, folder: Path) -> bool:
+def stored_copy_or_path_in(
+    message: str, original_name: str, folder: Path, own_copy: str | None = None
+) -> bool:
     """Whether ``message``, a refusal of reading a file offered as
     ``original_name`` into the project at ``folder`` (on its import, or as
     an image already in the project), names an image's stored copy
     (``img-1.tif``) or shows a local path: the project folder, the folder it
     is in, or any Windows path (#234). The offered name itself may hold
-    anything."""
+    anything, and so may the image's own stored copy ``own_copy`` where a
+    refusal is let name it (see the guard below)."""
     rest = message.replace(repr(original_name), "").replace(original_name, "")
+    if own_copy is not None:
+        rest = rest.replace(own_copy, "")
     if _STORED_COPY.search(rest) or _DRIVE.search(rest):
         return True
     paths = {folder, folder.resolve(), folder.parent, folder.resolve().parent}
@@ -120,10 +125,15 @@ def stored_copy_or_path_in(message: str, original_name: str, folder: Path) -> bo
 
 
 _IMPORT_IMAGE = inspect.signature(operations.import_image)
-# The import and the session's reads as Proteia defines them, with no refusal
-# check: what monkeypatch.undo() puts back (guards_in_place). Not told by a
-# __wrapped__: the import has one of its own (its lock).
-_UNCHECKED = {"import": operations.import_image, "read": ProjectSession._read_checked}
+# The import, the session's reads and the polarity change as Proteia defines
+# them, with no refusal check: what monkeypatch.undo() puts back
+# (guards_in_place). Not told by a __wrapped__: the import and the polarity
+# change have one of their own (their lock).
+_UNCHECKED = {
+    "import": operations.import_image,
+    "read": ProjectSession._read_checked,
+    "polarity": operations.set_polarity,
+}
 
 
 # Words of the libraries that read a file (tifffile, Pillow, scikit-image),
@@ -162,12 +172,18 @@ def library_words_in(error: operations.OperationError) -> bool:
     return False
 
 
-def _check_refusal(what: str, error: operations.OperationError, name: object, folder) -> None:
+def _check_refusal(
+    what: str,
+    error: operations.OperationError,
+    name: object,
+    folder,
+    own_copy: str | None = None,
+) -> None:
     """Fail ``what``, the refusal ``error`` of reading a file offered as
-    ``name`` into the project at ``folder``, if it names a stored copy,
-    shows a path or holds a library's words."""
+    ``name`` into the project at ``folder``, if it names a stored copy (but
+    ``own_copy``, where it may), shows a path or holds a library's words."""
     if isinstance(name, str) and folder is not None:
-        where = stored_copy_or_path_in(str(error), name, folder)
+        where = stored_copy_or_path_in(str(error), name, folder, own_copy)
         assert not where, f"{what} names a stored copy or a path: {error}"
     assert not library_words_in(error), f"{what} holds a library's words: {error}"
 
@@ -180,7 +196,9 @@ def _import_refusals_name_the_file_as_chosen(monkeypatch):
     :func:`~proteia.core.operations.import_image`, and since #246 each of
     reading an image already in the project
     (:meth:`~proteia.core.session.ProjectSession._read_checked`: its pixels,
-    on any channel, and its colours), is checked as it is raised."""
+    on any channel, and its colours), is checked as it is raised; since #206
+    each refusal of :func:`~proteia.core.operations.set_polarity` too, which
+    says a missing or changed file in its own words, after the read."""
     real = operations.import_image
 
     @functools.wraps(real)
@@ -205,8 +223,31 @@ def _import_refusals_name_the_file_as_chosen(monkeypatch):
             _check_refusal(what, exc, image.original_name, self.folder)
             raise
 
+    real_polarity = operations.set_polarity
+
+    @functools.wraps(real_polarity)
+    def set_polarity(session, image_id, *args, **kwargs):
+        try:
+            return real_polarity(session, image_id, *args, **kwargs)
+        except operations.OperationError as exc:
+            image = {i.id: i for i in session.project.batch.iter_images()}.get(image_id)
+            if image is None:
+                raise
+            # The one refusal let name a stored copy (#206): a polarity change
+            # of an image whose stored file is missing or was changed outside
+            # Proteia (IMAGE_FILE_CHANGED) says to put the original file back
+            # in the images folder under that image's stored copy's name, the
+            # one name under which putting it back works. Any other stored
+            # copy, path or library's words, in it or any other refusal, fail.
+            changed = exc.code is operations.ErrorCode.IMAGE_FILE_CHANGED
+            what = "a refusal of a polarity change"
+            own = image.file if changed else None
+            _check_refusal(what, exc, image.original_name, session.folder, own)
+            raise
+
     monkeypatch.setattr(operations, "import_image", import_image)
     monkeypatch.setattr(ProjectSession, "_read_checked", read_checked)
+    monkeypatch.setattr(operations, "set_polarity", set_polarity)
 
 
 def _a_tests_own(folder: str | None) -> bool:
@@ -224,9 +265,9 @@ def guards_in_place() -> bool:
     """Whether the guards of the autouse fixtures above are all in place, as
     a test that takes its own patches back checks it took back only its own
     (``monkeypatch.undo()`` takes these back too), and as every test must end
-    (:func:`_guards_stay_in_place`): the import and the session's reads are
-    not back to Proteia's own, unchecked (the refusal checks wrap them, or a
-    test's own patch over those does), the browser that fails the test is
+    (:func:`_guards_stay_in_place`): the import, the session's reads and the
+    polarity change are not back to Proteia's own, unchecked (the refusal
+    checks wrap them, or a test's own patch over those does), the browser that fails the test is
     the only one, and the state folder is a test's own (the guard's, or one
     a test set itself in pytest's temporary folders)."""
     import webbrowser
@@ -234,6 +275,7 @@ def guards_in_place() -> bool:
     return (
         operations.import_image is not _UNCHECKED["import"]
         and ProjectSession._read_checked is not _UNCHECKED["read"]
+        and operations.set_polarity is not _UNCHECKED["polarity"]
         and getattr(webbrowser, "_tryorder", None) == [_NO_BROWSER]
         and all(_a_tests_own(os.environ.get(name)) for name in _STATE_VARIABLES)
     )

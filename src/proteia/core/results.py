@@ -78,6 +78,16 @@ read from the stored images, never stored, once per computation: removing a
 copy, undo and redo update it, and a project saved before shows it when
 opened. The same pixels saved another way are other bytes, and are not found.
 
+A colour image that holds a protein with a band, and that a channel may be
+chosen for, gets a ``colour_channel`` note (#206): the channel it is measured
+on, who chose it and why, in the channel rule's words
+(:mod:`~proteia.core.channelrule`), and how ImageJ measures the same. While it
+is measured on one channel and another holds signal apart from its bands that
+no image of its file measures, a ``channel_signal_elsewhere`` warning names
+that channel and how to measure it. Both are read from the stored choices once
+per computation, after the ``duplicate_images`` notes, and given to the
+returned set only, as those are.
+
 Notice messages count lanes from 1, as the user does; every index field
 (:attr:`Notice.lane_indices`, :attr:`Results.excluded_lanes`) stays 0-based.
 MWs in them are whole kDa (one decimal below 10 kDa).
@@ -95,7 +105,7 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, JsonValue, model_validator
 
-from proteia.core import analyze, ladders, model, mwcal
+from proteia.core import analyze, channelrule, ladders, model, mwcal
 from proteia.core.analyze import (
     ALPHA,
     BaselineError,
@@ -210,6 +220,12 @@ class NoticeCode(StrEnum):
     # on any membranes, but for markers holding no protein: a note, read from
     # the stored images and never stored.
     DUPLICATE_IMAGES = "duplicate_images"
+    # #206. Per colour image holding a protein with a band: the channel it is
+    # measured on, who chose it and why (a note); and, where another channel
+    # holds signal apart from its bands that no image of its file measures, a
+    # warning that names it. Read from the stored choices, never stored.
+    COLOUR_CHANNEL = "colour_channel"
+    CHANNEL_SIGNAL_ELSEWHERE = "channel_signal_elsewhere"
 
 
 class Level(StrEnum):
@@ -228,6 +244,7 @@ _INFO_CODES = frozenset(
         NoticeCode.CALIBRATION_TWO_POINTS,
         NoticeCode.LADDER_SIDE_IGNORED,
         NoticeCode.DUPLICATE_IMAGES,
+        NoticeCode.COLOUR_CHANNEL,
     }
 )
 
@@ -540,6 +557,74 @@ def share_words(shared: int, smaller: int) -> str:
     return f"{(200 * shared + smaller) // (2 * smaller)}%"
 
 
+def _image_names(batch: model.Batch) -> dict[str, str]:
+    """Each image's name as the image notes name it, by image id: its file
+    name, quoted as the notices quote names (as Python writes a string), and
+    where another image of the project (of any kind: the list shows them all)
+    has the same name, as written, its place in the image list
+    (:meth:`~proteia.core.model.Batch.iter_images`), from 1: ``'blot.tif'
+    (image 3)``. So no two images read alike."""
+    images = list(batch.iter_images())
+    names = Counter(image.original_name for image in images)
+    return {
+        image.id: repr(image.original_name)
+        + (f" (image {place})" if names[image.original_name] > 1 else "")
+        for place, image in enumerate(images, start=1)
+    }
+
+
+def _channel_notices(batch: model.Batch) -> list[Notice]:
+    """The notes of #206 on the channel each colour image is measured on, one
+    image at a time in list order, for each image a channel may be chosen for
+    (:attr:`~proteia.core.model.ImageRef.channel_blocker` None) that holds a
+    protein with a band: its ``colour_channel`` note, in the channel rule's
+    words (:func:`~proteia.core.channelrule.note`); then, while it is
+    measured on one channel, its ``channel_signal_elsewhere`` warning if any
+    of its signal channels (:func:`~proteia.core.channelrule.signal_channels`)
+    is measured on by no image of its file (the same ``sha256``: the copy
+    imported to measure that channel). Each names its image
+    (:func:`_image_names`) and the proteins with a band on it."""
+    names = _image_names(batch)
+    measured: dict[str, set[model.Channel]] = {}
+    for image in batch.iter_images():
+        measured.setdefault(image.sha256, set()).add(image.measured_channel)
+    notices = []
+    for image in batch.iter_images():
+        if image.channel_blocker is not None:
+            continue
+        holding = tuple(p.id for p in batch.proteins_on(image.id) if batch.boxes_of(p).bands)
+        if not holding:
+            continue
+        name = names[image.id]
+        notices.append(
+            Notice(
+                code=NoticeCode.COLOUR_CHANNEL,
+                level=_level(NoticeCode.COLOUR_CHANNEL),
+                message=channelrule.note(image.channel, name),
+                protein_ids=holding,
+                image_ids=(image.id,),
+            )
+        )
+        if image.measured_channel is model.Channel.MEAN:
+            continue  # every channel's bands are in the mean
+        unmeasured = [
+            channel
+            for channel in channelrule.signal_channels(image.channel)
+            if channel not in measured[image.sha256]
+        ]
+        if unmeasured:
+            notices.append(
+                Notice(
+                    code=NoticeCode.CHANNEL_SIGNAL_ELSEWHERE,
+                    level=_level(NoticeCode.CHANNEL_SIGNAL_ELSEWHERE),
+                    message=channelrule.elsewhere(name, unmeasured),
+                    protein_ids=holding,
+                    image_ids=(image.id,),
+                )
+            )
+    return notices
+
+
 def _duplicate_notices(batch: model.Batch) -> list[Notice]:
     """The ``duplicate_images`` notes (#216): one per group of two or more
     images with the same ``sha256`` (one file's bytes, under any names and on
@@ -551,38 +636,29 @@ def _duplicate_notices(batch: model.Batch) -> list[Notice]:
     protein. A note states the fact and a next step that removes nothing.
 
     It names the images in list order: each one, up to :data:`NAMED_COPIES`;
-    past it, the first and how many more. An image is its file name, quoted as
-    the notices quote names (as Python writes a string), and where another
-    image of the project (of any kind: the list shows them all) has the same
-    name, as written, its place in the list, from 1: ``'blot.tif' (image
-    3)``. So no two images a note names read alike. It compares bytes, not
-    pixels: the same pixels saved another way are not found."""
+    past it, the first and how many more. An image is named as the image notes
+    name it (:func:`_image_names`): no two images a note names read alike. It
+    compares bytes, not pixels: the same pixels saved another way are not
+    found."""
     markers = {image.marker_image_id for image in batch.iter_images()}
     held = {batch.image_id_of(protein) for protein in batch.proteins}
-    place: dict[str, int] = {}
-    names: Counter[str] = Counter()
+    names = _image_names(batch)
     groups: dict[str, list[model.ImageRef]] = {}
-    for number, image in enumerate(batch.iter_images(), start=1):
-        place[image.id] = number
-        names[image.original_name] += 1
+    for image in batch.iter_images():
         if image.kind is model.ImageKind.VISIBLE_MARKER:
             continue  # no protein may be on it
         if image.id in markers and image.id not in held:
             continue  # another image's marker, holding no protein
         groups.setdefault(image.sha256, []).append(image)
 
-    def named(image: model.ImageRef) -> str:
-        shared = names[image.original_name] > 1
-        return repr(image.original_name) + (f" (image {place[image.id]})" if shared else "")
-
     notices = []
     for images in groups.values():
         if len(images) < 2:
             continue
         if len(images) <= NAMED_COPIES:
-            who = in_words([named(image) for image in images])
+            who = in_words([names[image.id] for image in images])
         else:
-            who = f"{named(images[0])} and {len(images) - 1} more copies"
+            who = f"{names[images[0].id]} and {len(images) - 1} more copies"
         notices.append(
             Notice(
                 code=NoticeCode.DUPLICATE_IMAGES,
@@ -1273,7 +1349,11 @@ def _clipping_not_checked(
     bit depth. The operations check every other image, so a flag missing there
     gets no reason. Where such a band was not assessed for pixels near the limit
     either, although its image's range is known (:func:`_unassessed`: measured
-    before #112), it says to requantify."""
+    before #112), it says to requantify. Where the exact check would run on one
+    of its image's channels, on a lossless colour image measured on the mean
+    (:attr:`~proteia.core.model.ImageRef.exact_on_a_channel`), it says which
+    one to choose, in the channel rule's words
+    (:data:`~proteia.core.channelrule.TO_CHECK`, #206)."""
     unchecked = tuple(
         i
         for i, band in enumerate(bands)
@@ -1291,10 +1371,13 @@ def _clipping_not_checked(
             "; its boxes were measured before Proteia looked for pixels near the detector"
             " limit: requantify to look for them"
         )
+    channel = ""
+    if image.measured_channel is model.Channel.MEAN and image.exact_on_a_channel:
+        channel = f"; {channelrule.TO_CHECK}"
     note(
         NoticeCode.CLIPPING_NOT_CHECKED,
         f"{protein.name!r} was not checked for over-exposure in {lanes_phrase(unchecked)}"
-        f"{because}; {_clipping_effect(protein)}{requantify}",
+        f"{because}; {_clipping_effect(protein)}{requantify}{channel}",
         protein_ids=(protein.id,),
         lane_indices=unchecked,
     )
@@ -1335,6 +1418,14 @@ _MERGED: Final = (
     "a saturated band next to it may have merged into the same box, which then holds both"
     " bands and its net may be too high"
 )
+
+
+def _of_channel(image: model.ImageRef) -> str:
+    """Which limit a clipped band's pixels are at, in the ``clipped`` notice:
+    `` of its image's green channel`` on an image measured on one channel
+    (#206); nothing on the mean or a gray image's own values."""
+    channel = image.measured_channel
+    return "" if channel is model.Channel.MEAN else f" of its image's {channel} channel"
 
 
 def _clipping_effect(protein: model.Protein) -> str:
@@ -1551,7 +1642,8 @@ def compute_results(
         for lane in batch.only_lanes()
         if not lane.included and any(nets[lane.index] is not None for nets in per_protein)
     ]
-    copies = _duplicate_notices(batch)  # #216: of the images, so of the returned set only
+    # Of the images (#216, #206), so of the returned set only.
+    copies = [*_duplicate_notices(batch), *_channel_notices(batch)]
     if not removed:
         results = one_set(batch, set_label=None)
         return results.model_copy(update={"notices": [*copies, *results.notices]})
@@ -1760,6 +1852,7 @@ def _compute(
 
     # 3-4. The lane axes, and what the model accepts on purpose but the user should see.
     conditions, samples, included = spine_axes(table)
+    images = {image.id: image for image in batch.iter_images()}
     for column in columns:  # over-exposed bands in lanes this set includes
         over = tuple(i for i, flag in enumerate(column.clipped) if flag and included[i])
         if over:
@@ -1767,12 +1860,13 @@ def _compute(
             note(
                 NoticeCode.CLIPPED,
                 f"{column.name!r} is over-exposed in {lanes_phrase(over)}: pixels at the detector"
-                f" limit make its net an under-estimate, and {_MERGED}; shorten the exposure"
-                f" and image the membrane again; {kept} included",
+                f" limit{_of_channel(images[image_ids[column.protein_id]])} make its net an"
+                " under-estimate,"
+                f" and {_MERGED}; shorten the exposure and image the membrane again; {kept}"
+                " included",
                 protein_ids=(column.protein_id,),
                 lane_indices=over,
             )
-    images = {image.id: image for image in batch.iter_images()}
     for protein in batch.proteins:  # bands likely over-exposed, where that cannot be checked
         image = images[image_ids[protein.id]]
         _possibly_clipped(protein, image, joined[protein.id], included, note)
