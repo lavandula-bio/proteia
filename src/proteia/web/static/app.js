@@ -569,6 +569,7 @@ function setOpening(name) {
 function showOpened(answer) {
   proteinPanel.invalidateEdits();
   view.setImage(null, 0, 0);
+  drawing(null); // the previews dropped below are closed at once
   view.setOverlay([], [], null);
   state.shownImageId = null;
   for (const id of [...state.bitmaps.keys()]) {
@@ -1656,14 +1657,25 @@ const PREVIEW_QUERY = { grey: "", original: "?colour=original" };
 // its ImageBitmap once made, else null. A grey one's `shows` (#206), else
 // null: {channel, at}, the channel its pixels are of, as the server names it
 // once it has answered (until then, the one its image was measured on in the
-// state shown when it was asked for), and that state's revision.
+// state shown when it was asked for), and that state: {open_id, revision}.
 const fetched = new WeakMap();
+
+// Whether `at` ({open_id, revision}) is the state shown: a revision number
+// repeats across openings.
+function shownNow(at) {
+  const shown = state.answered;
+  return at.open_id === shown.open_id && at.revision === shown.revision;
+}
 
 // The bitmap the view draws (null: blank). A bitmap dropped from the previews
 // kept while the view draws it is closed once the view draws another or is
 // blanked (`retired` meanwhile): a closed bitmap cannot be drawn.
 let drawnBitmap = null;
 const retired = new Set();
+// The image shown and the channel of the grey view last drawn of it ({imageId,
+// channel}, null once the view is blanked): a grey view of another channel
+// drawn of it (a channel change, its undo or redo, another tab's) is said.
+let greyDrawn = null;
 
 // The view draws `bitmap` now (null: nothing).
 function drawing(bitmap) {
@@ -1718,11 +1730,11 @@ function bitmapOf(image, colours) {
   }
   const previews = state.bitmaps.get(image.id);
   if (!previews[colours]) {
+    const at = { open_id: state.answered.open_id, revision: state.answered.revision };
     const held = {
       controller: new AbortController(),
       bitmap: null,
-      shows:
-        colours === "grey" ? { channel: measuredOf(image), at: state.answered.revision } : null,
+      shows: colours === "grey" ? { channel: measuredOf(image), at } : null,
     };
     const path = `/api/images/${image.id}/preview${PREVIEW_QUERY[colours]}`;
     const pending = request("GET", path, { signal: held.controller.signal })
@@ -1810,6 +1822,7 @@ function renderView(project) {
     view.setImage(null, 0, 0);
     view.setOverlay([], [], null);
     drawing(null);
+    greyDrawn = null;
   }
   if (!image) {
     return;
@@ -1883,15 +1896,16 @@ function renderView(project) {
         // that state, it may be older than it (the channel changed and back
         // since): asked for again, once (that one is of this state). Asked for
         // in it, the server measures another channel now (changed in another
-        // tab): the project is read again, and the state shown follows.
+        // tab): the project is read again, and the state shown follows
+        // (catchUp).
         const previews = state.bitmaps.get(image.id);
         if (previews && previews.grey === pending) {
           forgetGrey(previews);
         }
-        if (shows.at !== state.answered.revision) {
+        if (!shownNow(shows.at)) {
           renderView(state.project);
         } else {
-          reread().catch(() => {});
+          catchUp(image);
         }
         return;
       }
@@ -1905,7 +1919,16 @@ function renderView(project) {
       drawing(bitmap);
       const switched = switchedColours === image.id;
       switchedColours = null;
-      if (switched) {
+      // Its grey view of another channel than the one drawn before (#206).
+      const changed =
+        shows !== null &&
+        greyDrawn !== null &&
+        greyDrawn.imageId === image.id &&
+        greyDrawn.channel !== shows.channel;
+      if (shows) {
+        greyDrawn = { imageId: image.id, channel: shows.channel };
+      }
+      if (switched || changed) {
         sayColours(image, colours);
       }
     })
@@ -1932,6 +1955,40 @@ function renderView(project) {
         showStatus(`${name} not shown in its original colours: ${sentence(error.message)}`);
       }
     });
+}
+
+// The server measures `image` on another channel than the state shown says
+// (changed in another tab), so its grey view was not drawn: the project is
+// read again, and the state shown follows, drawn. Not shown then (Proteia did
+// not answer, or another project is being opened here): said, with a way to
+// read it again, so the view is never left blank without a word; a refusal
+// the page says elsewhere (another project open now) is not. Gives whether
+// the project read was shown.
+async function catchUp(image) {
+  const opened = shownOpening();
+  let why;
+  try {
+    const answer = await call("GET", "/api/project");
+    if (opening === null && sameOpening(answer)) {
+      applyAnswer(answer);
+      return true;
+    }
+    why = "another project is being opened.";
+  } catch (error) {
+    if (saidElsewhere(error)) {
+      return false;
+    }
+    why = sentence(error.message);
+  }
+  if (shownOpening() === opened) {
+    const name = isolate(image.original_name);
+    showStatus(`${name} not drawn: ${why}`, {
+      label: "Show again",
+      name: `Show ${name} again`,
+      run: () => catchUp(image).then((shown) => shown && showStatus("")),
+    });
+  }
+  return false;
 }
 
 // --- Edits ---
@@ -2521,30 +2578,38 @@ function sendChannel(imageId, channel) {
 // image by its file name (the server's words name a missing or changed file,
 // and an image no longer in the project, by its id); the select shows the
 // channel measured again once the change's entry goes (sendChannel). An image
-// gone (removed in another tab, or by an undo there) is read again: if that
-// hides the select the keyboard was on, it goes to the image shown in the list.
+// gone (removed in another tab, or by an undo there) is read again, and the
+// line says which image is shown now; the keyboard, if it was on the select,
+// goes to that image in the list: the select may now be another image's.
 async function reportChannel(error, imageId) {
   const image = state.project.images.find((i) => i.id === imageId);
   const name = image ? isolate(image.original_name) : "the image";
   const had = document.activeElement === $("channel");
-  if (!saidElsewhere(error)) {
-    let why = sentence(error.message);
-    if (error.code === "unknown_id") {
-      why = sentence(`${name} is no longer in the project.`);
-    } else if (error.code === "image_file_changed") {
-      why =
-        `The file of ${name} is missing from the project's images folder or was changed` +
-        " outside Proteia. Put the original file back, then choose the channel again.";
-    }
-    showStatus(`Channel not changed: ${why}`);
-  }
   if (error.code === "unknown_id") {
     await reread().catch(() => {});
+    const shown = state.project.images.find((i) => i.id === state.imageId) || null;
+    const now = !shown
+      ? " No image is left in the project."
+      : shown.id !== imageId
+        ? ` ${isolate(shown.original_name)} is shown.`
+        : "";
+    showStatus(`Channel not changed: ${sentence(`${name} is no longer in the project.`)}${now}`);
+    if (had) {
+      const chosen = $("images").querySelector('button[aria-pressed="true"]');
+      (chosen || $("import-kind")).focus();
+    }
+    return;
   }
-  if (had && $("channel-field").hidden) {
-    const chosen = $("images").querySelector('button[aria-pressed="true"]');
-    (chosen || $("import-kind")).focus();
+  if (saidElsewhere(error)) {
+    return;
   }
+  let why = sentence(error.message);
+  if (error.code === "image_file_changed") {
+    why =
+      `The file of ${name} is missing from the project's images folder or was changed` +
+      " outside Proteia. Put the original file back, then choose the channel again.";
+  }
+  showStatus(`Channel not changed: ${why}`);
 }
 
 $("channel").addEventListener("change", (event) => {

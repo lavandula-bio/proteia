@@ -1628,6 +1628,16 @@ def test_a_chosen_channel_keeps_its_basis_through_every_rebuild(tmp_path, path):
 # --- The state the page reads ---
 
 
+def test_the_page_has_words_for_whoever_chose_a_channel():
+    # The line under "Measured on" is looked up by who chose the channel: no
+    # one, or each ChannelSource. A member without words would fail the
+    # project state of every image it chose for.
+    from proteia.web import state as web_state
+
+    assert set(web_state._CHANNEL_WORDS) == {None, *(source.value for source in ChannelSource)}
+    assert all(web_state._CHANNEL_WORDS.values())
+
+
 def test_the_state_says_what_each_image_is_measured_on(tmp_path):
     s = session_on(tmp_path)
     gray = import_pixels(s, colour_blot()[..., 1], "gray µ.tif")

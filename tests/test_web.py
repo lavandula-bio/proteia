@@ -1718,8 +1718,11 @@ def test_the_grey_preview_is_kept_under_the_channel_it_shows():
     _, view = _function(script, "function renderView(")
     mismatch = view.index("if (shows && shows.channel !== measuredOf(image)) {")
     drawn = view.index("drawing(bitmap);")
-    assert mismatch < view.index("reread()", mismatch) < view.index("return;", mismatch) < drawn
-    assert "if (shows.at !== state.answered.revision) {" in view
+    caught_up = view.index("catchUp(image);", mismatch)
+    assert mismatch < caught_up < view.index("return;", mismatch) < drawn
+    _, catch_up = _function(script, "async function catchUp(")
+    assert "applyAnswer(answer);" in catch_up and 'label: "Show again"' in catch_up
+    assert "if (saidElsewhere(error)) {" in catch_up
     blank = view.index("view.setImage(null, 0, 0);")
     assert blank < view.index("drawing(null);") < mismatch
     _, forget = _function(script, "function forgetPreview(")
@@ -1732,6 +1735,17 @@ def test_the_grey_preview_is_kept_under_the_channel_it_shows():
     assert 'image.channel ? image.channel.measured : "mean"' in measured
     _, said = _function(script, "function sayColours(")
     assert "measuredOf(image)" in said
+    # "Asked for before the state shown" is of both the opening and the
+    # revision (a revision number repeats across openings).
+    _, now = _function(script, "function shownNow(")
+    assert "at.open_id === shown.open_id && at.revision === shown.revision" in now
+    assert "if (!shownNow(shows.at)) {" in view
+    _, held = _function(script, "function bitmapOf(")
+    assert "open_id: state.answered.open_id, revision: state.answered.revision" in held
+    # Another project shown: the view blanked counts as drawing nothing, so
+    # the old project's bitmap it drew is closed.
+    _, opened = _function(script, "function showOpened(")
+    assert "  view.setImage(null, 0, 0);\n  drawing(null);" in opened
 
 
 def _object_keys(script: str, name: str) -> set[str]:
