@@ -306,10 +306,11 @@ def _preview_key(image: ImageRef, original: bool) -> _PreviewKey:
     return (image.id, image.sha256, None if original else image.measured_channel, original)
 
 
-def _same_gray(kept: _PreviewKey, key: _PreviewKey) -> bool:
-    """Whether ``kept`` is a gray preview of the image ``key`` names, of another
-    channel than ``key``'s."""
-    return kept[3] is False and kept[:2] == key[:2] and kept[2] != key[2]
+def _gray_of(kept: _PreviewKey, key: _PreviewKey) -> bool:
+    """Whether ``kept`` is a gray preview of the image ``key`` names, of any
+    channel: the one kept under ``key`` replaces it (it is stored only where
+    ``key`` was not kept, so the others are of other channels)."""
+    return kept[3] is False and kept[:2] == key[:2]
 
 
 # How long a reopen waits for an operation running on the open session before
@@ -1125,7 +1126,7 @@ class Workspace:
             if not original:
                 # The image's gray previews of other channels: it is measured on
                 # this one now, so they do not push other images' out.
-                for other in [k for k in self._previews if _same_gray(k, key)]:
+                for other in [k for k in self._previews if _gray_of(k, key)]:
                     del self._previews[other]
             self._previews[key] = data
             while len(self._previews) > _PREVIEWS_KEPT:
