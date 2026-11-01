@@ -2980,6 +2980,34 @@ def test_frames_are_looked_for_only_in_formats_that_hold_them(tmp_path, monkeypa
     assert looked == ["PNG"]
 
 
+def test_frames_are_looked_for_without_opening_a_tiff_or_warning_of_size(
+    tmp_path, monkeypatch, recwarn
+):
+    # A TIFF named .tif is not opened by Pillow at all (reading counts its
+    # images); and a local file the user chose is opened without Pillow's
+    # size warning, which is for untrusted input. 48 pixels a frame is over
+    # the limit of 40, and under twice it, where Pillow refuses instead.
+    opened = []
+    real = Image.open
+
+    def opening(path, *args, **kwargs):
+        opened.append(Path(path).name)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", opening)
+    tif = tmp_path / "gray µ.tif"
+    tifffile.imwrite(tif, _gray(np.uint8, 255))
+    assert imaging.check_frames(tif) is None
+    assert opened == []
+    animated = tmp_path / "two frames α.png"
+    _frames_of("PNG", _narrow_frames(2, 8))(animated)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40)
+    recwarn.clear()
+    with pytest.raises(imaging.ReadingRefusal):
+        imaging.check_frames(animated)
+    assert (opened, [w.category for w in recwarn]) == (["two frames α.png"], [])
+
+
 def test_a_file_pillow_cannot_open_is_left_to_reading(tmp_path):
     path = tmp_path / "not an image µ.png"
     path.write_bytes(b"not an image")
