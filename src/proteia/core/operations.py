@@ -179,6 +179,7 @@ from proteia.core.export import (
 )
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
+    EXHAUSTED,
     SEVERAL_IMAGES,
     SINGLE_IMAGE_ONLY,
     Inks,
@@ -1470,7 +1471,8 @@ def import_image(
     (save the image again as a TIFF, PNG or JPEG file), whose library's words
     are logged instead; running out of memory (close other programs and try
     again, or save a smaller copy of a very large file) or of stack, which is
-    no damage; an error of the system, by its reason.
+    no damage, in a header check above too (#233, :func:`_reading`), which
+    then stores nothing; an error of the system, by its reason.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1508,19 +1510,16 @@ def import_image(
 
     path = session.folder / storage.IMAGES_DIR / stored.file
     try:
-        _refuse_inks(original_name, _header_inks(path))
-        _refuse_pixel_type(original_name, _header_pixel_type(path))
+        _refuse_inks(original_name, _reading(_header_inks, path, original_name))
+        _refuse_pixel_type(original_name, _reading(_header_pixel_type, path, original_name))
         try:
             _count_misnamed_tiff(path)
             check_frames(path)  # the import's, not reading's: images imported before read so
             read = read_file(path)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, *EXHAUSTED) as exc:
             if isinstance(exc, NotSingleImageError):
                 _refuse_inks(original_name, exc.inks)  # e.g. inks after a gray first image
-            # Named as chosen, never as stored, whatever reading refused (#220, #234).
-            raise OperationError(
-                ErrorCode.UNREADABLE_IMAGE, named_refusal(exc, original_name, path)
-            ) from exc
+            raise _refused_reading(exc, original_name, path) from exc
         # Failing closed, before any conversion: a type no header declared (the
         # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
         # bit depth, integers in the layout reading checked, convert without error.
@@ -1620,6 +1619,30 @@ _SEVERAL_IMAGES: Final = f"; it also holds {SEVERAL_IMAGES}, and {SINGLE_IMAGE_O
 # (a 16-bit RGB TIFF is read only uncompressed, and an RGBA one compressed only
 # if its alpha is unassociated, #232; Inks.uncompressed_copy).
 _COPIES: Final = {False: "RGB or grayscale", True: "an uncompressed RGB or grayscale TIFF"}
+
+
+def _refused_reading(
+    exc: ValueError | OSError | MemoryError | RecursionError, original_name: str, path: Path
+) -> OperationError:
+    """An import's refusal (``UNREADABLE_IMAGE``) of the file offered as
+    ``original_name``, which reading its stored copy at ``path`` refused or
+    ran out of memory or of stack on (``exc``): named as chosen, never as
+    stored, in Proteia's words only (#220, #234, #233;
+    :func:`~proteia.core.imaging.named_refusal`)."""
+    return OperationError(ErrorCode.UNREADABLE_IMAGE, named_refusal(exc, original_name, path))
+
+
+def _reading[T](read: Callable[[Path], T], path: Path, original_name: str) -> T:
+    """``read`` of the stored copy at ``path`` of the file offered as
+    ``original_name``, a header check of an import: running out of memory
+    or of stack in it, which the check raises as it is, is refused as
+    reading refuses it (:func:`_refused_reading`, with the error as its
+    cause), not raised (#233). Only the reading is: an error of the code
+    around it surfaces as it is."""
+    try:
+        return read(path)
+    except EXHAUSTED as exc:
+        raise _refused_reading(exc, original_name, path) from exc
 
 
 def _header_inks(path: Path) -> Inks | None:

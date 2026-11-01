@@ -360,6 +360,12 @@ _TOO_MANY_PIXELS: Final = (
     "save the image as an uncompressed TIFF and import that",
 )
 _OUT_OF_STACK: Final = ("Proteia ran out of stack reading it", _SAVE_AGAIN)
+# Running out of memory or of stack while reading a file: no damage of it,
+# which reading refuses in words of its own (_unreadable, which named_refusal
+# gives for such an error too). A header check raises either as it is, so
+# that an import, which refuses it so (#233), never carries on without the
+# check (#217, #230).
+EXHAUSTED: Final = (MemoryError, RecursionError)
 
 
 class _OutOfMemory(ReadingRefusal):
@@ -405,7 +411,7 @@ def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
 
 
 def named_refusal(
-    exc: ValueError | OSError,
+    exc: ValueError | OSError | MemoryError | RecursionError,
     name: str,
     stored: PurePath,
     *,
@@ -666,7 +672,7 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
             "this compressed TIFF has more pixels than the compressed-TIFF reader accepts",
             uncompressed,
         ) from exc
-    except (MemoryError, RecursionError) as exc:  # no compression it cannot decode
+    except EXHAUSTED as exc:  # no compression it cannot decode
         raise _unreadable(path.name, exc) from exc
     except Exception as exc:  # Pillow's decoder errors are not all OSError
         raise refusal from exc
@@ -806,7 +812,7 @@ def check_frames(path: str | os.PathLike[str]) -> None:
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
             with Image.open(path) as image:
                 animated = image.format in _FRAME_FORMATS and _animated(image)
-    except (MemoryError, RecursionError):
+    except EXHAUSTED:
         raise
     except Exception:  # Pillow's errors of a damaged file are not all OSError
         return
@@ -821,7 +827,7 @@ def _animated(image: object) -> bool:
     memory or of stack is no answer."""
     try:
         return bool(getattr(image, "is_animated", False))
-    except (MemoryError, RecursionError):
+    except EXHAUSTED:
         raise
     except Exception:  # Pillow's errors of a damaged file are not all OSError
         return False
@@ -897,7 +903,7 @@ def check_misnamed_tiff(path: str | os.PathLike[str]) -> None:
             return
         with tifffile.TiffFile(path) as tif:
             _require_single_image(tif.series, path.name)
-    except (ValueError, OSError, MemoryError, RecursionError):
+    except (ValueError, OSError, *EXHAUSTED):
         # Running out of memory or stack is not a damaged file: it must not
         # fall back to the suffix's reader, which takes the first image only.
         raise
@@ -935,7 +941,7 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
             if _first_page(tif, path.name).photometric != tifffile.PHOTOMETRIC.SEPARATED:
                 return None
             return _inks_of(_image_series(tif, path.name))
-    except (ValueError, OSError, MemoryError, RecursionError):
+    except (ValueError, OSError, *EXHAUSTED):
         # Running out of memory or stack is not a damaged header: the import
         # must not carry on without the ink check (as #217 and #224).
         raise
@@ -1091,7 +1097,7 @@ def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
             page = series[0].keyframe
             dtype, bits, sampleformat = page.dtype, int(page.bitspersample), page.sampleformat
             photometric = page.photometric
-    except (ValueError, OSError, MemoryError, RecursionError):
+    except (ValueError, OSError, *EXHAUSTED):
         # Running out of memory or stack is not a damaged header: the import
         # must not take the file by the reader its suffix picks (as #217).
         raise
