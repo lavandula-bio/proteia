@@ -410,11 +410,14 @@ export class CalibrationPanel {
 
   // --- Drawing ---
 
-  render(project, image) {
+  // `arena` is the membrane area chosen on the image (#243): its membrane is
+  // the one calibrated (null: the image's first membrane).
+  render(project, image, arena = null) {
     this.project = project;
     this.image = image;
+    const membraneId = arena ? arena.membrane_id : image ? image.membrane_id : null;
     this.membrane = image
-      ? project.membranes.find((membrane) => membrane.id === image.membrane_id) || null
+      ? project.membranes.find((membrane) => membrane.id === membraneId) || null
       : null;
     this.group = this.membrane
       ? this.membrane.groups.find((group) => group.image_ids.includes(image.id)) || null
@@ -451,6 +454,15 @@ export class CalibrationPanel {
     this.renderGroup();
     this.renderLadder();
     this.refresh();
+  }
+
+  // Where a calibration request about this membrane on an image goes: the
+  // image's route, or, on an image holding several membranes' areas, the
+  // route of this membrane's area there (#243).
+  route(imageId) {
+    const areas = this.project.arenas.filter((area) => area.image_id === imageId);
+    const own = areas.find((area) => area.membrane_id === (this.membrane && this.membrane.id));
+    return areas.length > 1 && own ? `/api/arenas/${own.id}` : `/api/images/${imageId}`;
   }
 
   // The membrane's ladder as it is now, and the register group of the shown
@@ -703,14 +715,26 @@ export class CalibrationPanel {
     field.hidden = !image || image.kind !== "chemiluminescence";
     if (field.hidden) {
       $("marker-none").hidden = true;
+      $("marker-follow").hidden = true;
       return;
     }
     const select = $("marker-image");
+    const on = (id) =>
+      this.project.arenas.filter((area) => area.image_id === id).map((area) => area.membrane_id);
+    const mine = on(image.id);
     const markers = this.project.images.filter(
       (other) =>
-        other.membrane_id === image.membrane_id &&
+        on(other.id).some((membrane) => mine.includes(membrane)) &&
         (other.kind === "visible_marker" || other.kind === "merged"),
     );
+    // A link makes the two images hold the same membrane areas (#243): said
+    // before it is made, where the image's areas are drawn.
+    const drawn = this.project.arenas.some(
+      (area) => area.image_id === image.id && area.outline !== null,
+    );
+    const follow = $("marker-follow");
+    follow.hidden = !drawn || !markers.length;
+    follow.textContent = `Its membrane areas will follow ${isolate(image.original_name)}.`;
     const shown = JSON.stringify([
       this.project.open_id,
       image.id,
@@ -1445,7 +1469,7 @@ export class CalibrationPanel {
     let answer = null;
     let refusal = null;
     try {
-      answer = await this.handlers.read("POST", `/api/images/${image.id}/ladder-proposal`, {
+      answer = await this.handlers.read("POST", `${this.route(image.id)}/ladder-proposal`, {
         x,
         side,
       });
@@ -1755,7 +1779,7 @@ export class CalibrationPanel {
   // tick, each within the gaps to the others; null if refused (said).
   async snapped(draft) {
     try {
-      const answer = await this.handlers.read("POST", `/api/images/${draft.imageId}/ladder-snap`, {
+      const answer = await this.handlers.read("POST", `${this.route(draft.imageId)}/ladder-snap`, {
         x: draft.x,
         ys: draft.ticks.map((tick) => tick.y),
       });
@@ -1967,7 +1991,7 @@ export class CalibrationPanel {
         this.draft = { ...draft, error };
         return;
       }
-      const path = `/api/images/${draft.imageId}/calibration/${draft.side}/ladder`;
+      const path = `${this.route(draft.imageId)}/calibration/${draft.side}/ladder`;
       // With what the ruler was opened with: the server refuses it if either
       // changed since (calibration_changed), which this page may not know of.
       const body = {
@@ -2229,7 +2253,7 @@ export class CalibrationPanel {
     try {
       answer = await this.handlers.edit(
         "POST",
-        `/api/images/${image.id}/calibration/${side}/points`,
+        `${this.route(image.id)}/calibration/${side}/points`,
         body,
         {
           refused: (error) => {
@@ -2309,7 +2333,7 @@ export class CalibrationPanel {
 
   pointPath(point) {
     const mw = encodeURIComponent(String(point.mw));
-    return `/api/images/${point.image_id}/calibration/${point.side}/points/${mw}`;
+    return `${this.route(point.image_id)}/calibration/${point.side}/points/${mw}`;
   }
 
   // A mark dragged to `y`: moved there, or onto the band nearest it with
@@ -2398,7 +2422,7 @@ export class CalibrationPanel {
     }
     let answer = null;
     try {
-      answer = await this.handlers.edit("DELETE", `/api/images/${image.id}/calibration`);
+      answer = await this.handlers.edit("DELETE", `${this.route(image.id)}/calibration`);
     } catch {
       return;
     }
