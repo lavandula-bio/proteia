@@ -73,12 +73,12 @@ def propose_lane(x: float, anchors: Sequence[tuple[float, int]]) -> int | None:
     """Propose the lane of a box whose centre is at ``x``, or None when unsure.
 
     ``anchors`` are ``(centre x, stored lane index)`` of boxes already placed on
-    the same membrane area, of any protein: the lanes are the same columns of
-    the membrane (:func:`lane_anchors`). Each lane's anchor is the median of
-    its boxes' centres, and only anchors whose centres move steadily with the
-    lane index are kept (the longest
-    such run, left to right or, on a mirrored image, right to left), so a box
-    dragged far from its lane is ignored. (A lane anchored by just two boxes, one
+    the same membrane area (on an area with none yet, on its image), of any
+    protein: the lanes are the same columns of the membrane (:func:`lane_anchors`).
+    Each lane's anchor is the median of its boxes' centres, and only anchors
+    whose centres move steadily with the lane index are kept (the longest such
+    run, left to right or, on a mirrored image, right to left), so a box dragged
+    far from its lane is ignored. (A lane anchored by just two boxes, one
     of them dragged far, is anchored on their mean.) A proposal needs the lane
     pitch, so it needs two kept lanes; with fewer the answer is None and the lane
     must be chosen. An image's margins and its first lane's offset are never
@@ -208,7 +208,10 @@ def lane_anchors(
     """``(centre x, stored lane)`` of the first bands on one membrane area, of
     any protein: the anchors :func:`propose_lane` and :func:`lane_positions`
     take. The lanes are the same columns of one membrane, not of the image: two
-    strips on one image may number their lanes opposite ways (#243).
+    strips on one image may number their lanes opposite ways (#243). An area
+    with no box of its own yet takes those of every box on its image, as an
+    image of one membrane does, until its first box: a strip not boxed yet is
+    proposed the lanes of the strips beside it.
 
     A box touching the left or right edge of the image is left out: it may have
     been shifted inside the image, so its centre need not be its lane's. So are
@@ -236,8 +239,11 @@ def _anchored(
     """``(band id, centre x, stored lane)`` of each anchor (:func:`lane_anchors`)."""
     _, arena = batch.find_arena(arena_id)
     image = batch.find_image(arena.image_id)
+    rows = batch.rows_on_arena(arena_id)
+    if not any(batch.boxes_of(protein).bands for protein, _ in rows):
+        rows = batch.rows_on(image.id)  # no box of its own yet: every box on the image
     anchors = []
-    for protein, _ in batch.rows_on_arena(arena_id):
+    for protein, _ in rows:
         boxes = batch.boxes_of(protein)
         for band in boxes.bands:
             x0, _, x1, _ = band.box.rect(boxes.box_size)
