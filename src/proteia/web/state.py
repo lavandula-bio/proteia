@@ -76,8 +76,10 @@ is the last failed save's message (null after a successful one).
 files outside Proteia (#101), null for none: ``message`` (a ``project.json``
 changed outside Proteia that a save kept in a conflict copy, which it names
 with the time, before saving its own; one removed and written again; or the
-conflict copies the folder held when the project was opened or read again)
-and ``copies``, those copies' file names, newest first
+conflict copies the folder held when the project was opened or read again),
+``event``, which notice it is (a page keys a dismissal by it, so a second
+notice in the same words still shows; 0 for the copies found), and
+``copies``, those copies' file names, newest first
 (:attr:`~proteia.core.session.ProjectSession.outside_change`).
 """
 

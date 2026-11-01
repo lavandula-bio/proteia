@@ -248,7 +248,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
@@ -427,14 +427,35 @@ def _not_saved(exc: Exception) -> UnsavedChangesError:
     return UnsavedChangesError(f"the open project could not be saved: {exc}")
 
 
-def _dropped(session: ProjectSession) -> None:
+# Why a project closed by a switch kept changes it could not save: its folder
+# was removed or moved outside Proteia (ProjectRemovedError), in the page's words.
+REMOVED_WHY: Final = (
+    "its folder, or its project.json and an image file, were removed or moved outside Proteia"
+)
+# How many closed openings the workspace remembers for a page that follows (closed).
+CLOSED_KEPT: Final = 16
+
+
+def _dropped(session: ProjectSession, *, extra: Mapping[str, Any] | None = None) -> None:
     """Log that ``session``, closed, had changes not saved because its folder
     was removed or moved outside Proteia, which no save makes again (#101)."""
     if session.dirty and isinstance(session.save_error, ProjectRemovedError):
         _log.warning(
-            "closed %r with changes not saved: its folder was removed or moved outside Proteia",
-            session.folder.name,
+            "closed %r with changes not saved: %s", session.folder.name, REMOVED_WHY, extra=extra
         )
+
+
+def _closed(session: ProjectSession, open_id: int) -> dict[str, Any]:
+    """What a page that follows a switch is told of the opening ``open_id`` of
+    ``session`` that the switch closed (#101): its project's name, whether its
+    changes were all saved, and, if not, why, in words with no path
+    (:data:`REMOVED_WHY`, or that its last save failed, which the log says)."""
+    saved = not session.dirty
+    why = None
+    if not saved:
+        removed = isinstance(session.save_error, ProjectRemovedError)
+        why = REMOVED_WHY if removed else "Proteia could not save them"
+    return {"open_id": open_id, "name": session.folder.name, "saved": saved, "why": why}
 
 
 class UploadTooLargeError(ValueError):
@@ -593,6 +614,8 @@ class Workspace:
         # _preview_key -> preview PNG, least recently shown first.
         self._previews: OrderedDict[_PreviewKey, bytes] = OrderedDict()
         self._charts = ChartStore()
+        # The openings switches closed, by open id, oldest first (closed).
+        self._closed: OrderedDict[int, dict[str, Any]] = OrderedDict()
 
     def current(self, opening: int | None = None) -> ProjectSession:
         """The open project's session; with ``opening``, only if that is its open
@@ -765,13 +788,17 @@ class Workspace:
         except (OSError, ProjectError) as exc:
             raise _not_saved(exc) from exc
 
-    def flush(self) -> None:
+    def flush(self) -> str | None:
         """Save the open project if it has unsaved changes (an autosave failed);
         :class:`UnsavedChangesError` if that fails again, unless its folder was
-        removed or moved outside Proteia (:meth:`_save`)."""
+        removed or moved outside Proteia (:meth:`_save`): then what closing it
+        drops, in words, for the launcher to say as it stops; else None."""
         session = self._peek()
         if session is not None and session.dirty:
             self._save(session)
+            if isinstance(session.save_error, ProjectRemovedError):
+                return f"{session.folder.name!r} was closed with changes not saved: {REMOVED_WHY}"
+        return None
 
     def _switch(
         self,
@@ -848,7 +875,20 @@ class Workspace:
                     "%r was closed with changes that could not be saved: %s", old.folder.name, exc
                 )
         _dropped(old)
+        with self._lock:  # for a page that follows: whether it was saved (closed)
+            closed = _closed(old, self._open_ids[old])
+            self._closed[closed["open_id"]] = closed
+            while len(self._closed) > CLOSED_KEPT:
+                self._closed.popitem(last=False)
         return session
+
+    def closed(self) -> list[dict[str, Any]]:
+        """The openings switches closed, the last :data:`CLOSED_KEPT`, oldest
+        first: each one's open id, project name, whether its changes were all
+        saved and why not (#101), for a page that follows another tab's
+        switch to say what became of the project it showed."""
+        with self._lock:
+            return list(self._closed.values())
 
     def _opened(self, session: ProjectSession) -> None:
         """Make ``session`` the open one, under the next open id."""
@@ -874,7 +914,7 @@ class Workspace:
             session = self._peek()
             if session is not None:
                 session.close()
-                _dropped(session)
+                _dropped(session, extra=logs.FILE_ONLY)  # the launcher says it (flush)
         self.inbox.close()
 
     def create(self, name: object) -> ProjectSession:
@@ -1949,7 +1989,10 @@ def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 @router.get("/project")
 def get_project(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace, session)
+    """The open project's state and results, and ``closed``: the openings
+    switches closed (:meth:`Workspace.closed`), for a page that follows
+    another tab's switch to say whether the project it showed was saved."""
+    return _answer(workspace, session, closed=workspace.closed())
 
 
 def _export_folder(project: Path, folder: str) -> Path:

@@ -12,6 +12,7 @@ for word; local times are built from the injected clock.
 
 from __future__ import annotations
 
+import codecs
 import dataclasses
 import errno
 import hashlib
@@ -114,10 +115,12 @@ def file_bytes(session: ProjectSession) -> bytes:
 
 
 def go_on(name: str, which: str = "that version", copy: str = "the copy") -> str:
+    # Works with only one project, and where file name extensions are hidden.
     return (
-        f"To go on from {which} instead: open another project, rename project.json in the"
-        f" project's folder (to 'project mine.json', say) and rename {copy} to project.json,"
-        f" then open {name!r} again."
+        f"To go on from {which} instead: quit Proteia, then in the project's folder rename"
+        f" project.json to project mine.json and {copy} to project.json (where file name"
+        " extensions are hidden they show without .json: type project mine and project),"
+        f" then start Proteia and open {name!r}."
     )
 
 
@@ -125,7 +128,7 @@ def set_aside(name: str, copy: str = COPY) -> str:
     return (
         f"{name!r} was changed outside Proteia after Proteia last opened or saved it. Proteia"
         f" kept that version as {copy!r} in the project's folder, set aside on {DAY} at {HOUR},"
-        " and saved its own as usual."
+        " and saves its own in its place."
     )
 
 
@@ -210,12 +213,15 @@ def test_one_copy_per_outside_version(tmp_path, monkeypatch):
     assert s.dirty and isinstance(s.save_error, PermissionError)
     second = f"project.conflict {MINUTE} (2).json"
     assert sorted(copies(s.folder)) == sorted([COPY, second])
+    said = s.outside_change
+    assert said["event"] == 2 and said["copies"] == [second, COPY]
     monkeypatch.setattr(storage.os, "replace", real)
     edit(s, "d")
     assert sorted(copies(s.folder)) == sorted([COPY, second]) and not s.dirty
     assert (s.folder / second).read_bytes() == b'{"changed": "again"}'
-    assert s.outside_change["copies"] == [second, COPY]
-    assert f"Proteia kept that version as {second!r}" in s.outside_change["message"]
+    # Not said again: a page that dismissed the notice of that copy keeps it so.
+    assert s.outside_change == said
+    assert f"Proteia kept that version as {second!r}" in said["message"]
 
 
 def _reordered(value: Any) -> Any:
@@ -402,7 +408,11 @@ def test_an_outside_version_that_is_not_a_project_is_kept_as_it_was(tmp_path, ki
     (s.folder / storage.PROJECT_FILE).write_bytes(theirs)
     edit(s)
     assert (s.folder / COPY).read_bytes() == theirs
-    assert s.outside_change == {"message": f"{set_aside(FOLDER)} {words}", "copies": [COPY]}
+    assert s.outside_change == {
+        "event": 1,
+        "message": f"{set_aside(FOLDER)} {words}",
+        "copies": [COPY],
+    }
 
 
 def test_an_older_schema_outside_is_kept_and_counted(tmp_path):
@@ -503,13 +513,12 @@ def test_divergence_classifies_the_logs_once(ours, base, theirs, expected):
     time = None if last is None else f"2026-09-26T08:00:{last}.000Z"
     assert found == Divergence(lineage, common, their_count, our_count, time)
     # One rule today, whatever the logs: the file as found into the copy, then a save.
-    assert resolve(found) == SET_ASIDE_OUTSIDE == Resolution(copy="outside", then="save")
-    assert resolve(None) == SET_ASIDE_OUTSIDE
-    for value, field in (
-        (found, "common"),
-        (SET_ASIDE_OUTSIDE, "then"),
-        (storage.Version(None, None), "newer"),
-    ):
+    assert resolve(found) is SET_ASIDE_OUTSIDE is Resolution.SET_ASIDE_OUTSIDE
+    assert resolve(None) is SET_ASIDE_OUTSIDE
+    # Only the two that make sense can be written: the outside version into the
+    # copy and a save, or the session's into the copy and a switch to the file.
+    assert [r.value for r in Resolution] == ["set_aside_outside", "set_aside_session"]
+    for value, field in ((found, "common"), (storage.Version(None, None), "newer")):
         with pytest.raises(dataclasses.FrozenInstanceError):  # values, never changed
             setattr(value, field, None)
 
@@ -548,6 +557,7 @@ def test_a_removed_project_json_is_written_again_and_said(tmp_path, caplog):
     edit(s)
     assert file_bytes(s) == storage.project_to_json(s.project) and s.save_error is None
     assert s.outside_change == {
+        "event": 1,
         "message": (
             f"The project.json of {FOLDER!r} was removed outside Proteia after Proteia last"
             " opened or saved it, so Proteia wrote it again."
@@ -561,9 +571,10 @@ def test_a_removed_project_json_is_written_again_and_said(tmp_path, caplog):
 
 
 REMOVED = (
-    f"{FOLDER!r} is no longer in the projects folder (it was removed or moved outside"
-    " Proteia), so Proteia did not save it again; to keep this change, put the folder"
-    " back: opening another project or quitting drops it"
+    f"{FOLDER!r} is no longer in the projects folder as it was (its folder, or its"
+    " project.json and an image file, were removed or moved outside Proteia), so"
+    " Proteia did not save it again; to keep this change, put the folder back as it"
+    " was: opening another project or quitting drops it"
 )
 
 
@@ -595,6 +606,10 @@ def test_a_project_json_gone_with_an_image_is_a_removed_folder(tmp_path):
     assert sorted(p.name for p in s.folder.iterdir()) == [storage.EXPORTS_DIR]
 
 
+# Why a switch or a quit dropped a project's changes, as the log and the page say it.
+GONE = "its folder, or its project.json and an image file, were removed or moved outside Proteia"
+
+
 def test_switching_and_quitting_go_on_after_the_folder_was_removed(tmp_path, caplog):
     root = tmp_path / "root"
     workspace = api.Workspace(root, reveal=lambda folder: None, clock=FakeClock())
@@ -606,16 +621,31 @@ def test_switching_and_quitting_go_on_after_the_folder_was_removed(tmp_path, cap
     caplog.set_level(logging.WARNING, logger="proteia.web.api")
     second = workspace.create("B β")  # not refused: A can never be saved again
     assert workspace.current() is second and not (root / "A µ").exists()
-    dropped = "closed 'A µ' with changes not saved: its folder was removed or moved outside Proteia"
-    assert caplog.messages.count(dropped) == 1
+    assert caplog.messages.count(f"closed 'A µ' with changes not saved: {GONE}") == 1
+    # For a page that follows: A's opening closed with its changes not saved.
+    assert workspace.closed() == [{"open_id": 1, "name": "A µ", "saved": False, "why": GONE}]
 
     imported(second, 2)
     shutil.rmtree(second.folder)
     edit(second)
-    workspace.flush()  # a quit goes on too
+    said = f"'B β' was closed with changes not saved: {GONE}"
+    assert workspace.flush() == said  # a quit goes on too, and the launcher says it
     workspace.close()
-    closed = "closed 'B β' with changes not saved: its folder was removed or moved outside Proteia"
-    assert caplog.messages.count(closed) == 1 and not (root / "B β").exists()
+    assert caplog.messages.count(f"closed 'B β' with changes not saved: {GONE}") == 1
+    assert not (root / "B β").exists()
+
+
+def test_a_switch_records_whether_the_project_it_closed_was_saved(tmp_path):
+    root = tmp_path / "root"
+    workspace = api.Workspace(root, reveal=lambda folder: None, clock=FakeClock())
+    workspace.create("A µ")
+    workspace.create("B β")  # A saved
+    assert workspace.closed() == [{"open_id": 1, "name": "A µ", "saved": True, "why": None}]
+    for n in range(api.CLOSED_KEPT + 3):
+        workspace.create(f"C {n}")
+    kept = workspace.closed()
+    assert len(kept) == 16 and kept[0]["open_id"] == 5 and kept[-1]["name"] == "C 17"
+    assert workspace.flush() is None  # nothing unsaved: nothing dropped
 
 
 def test_a_switch_from_a_project_whose_file_and_image_went_goes_on(tmp_path, caplog):
@@ -632,9 +662,7 @@ def test_a_switch_from_a_project_whose_file_and_image_went_goes_on(tmp_path, cap
     workspace.create("B β")
     assert not (first.folder / storage.PROJECT_FILE).exists()  # never written again
     said = [record.getMessage() for record in caplog.records if record.name == "proteia.web.api"]
-    assert said == [
-        "closed 'A µ' with changes not saved: its folder was removed or moved outside Proteia"
-    ]
+    assert said == [f"closed 'A µ' with changes not saved: {GONE}"]
 
 
 def test_the_folder_put_back_takes_the_change_at_the_next_save(tmp_path):
@@ -657,8 +685,9 @@ def test_an_import_into_a_removed_folder_stores_nothing(tmp_path):
         imported(s, 2)
     assert refused.value.code is ErrorCode.PROJECT_REMOVED
     assert str(refused.value) == (
-        f"{FOLDER!r} is no longer in the projects folder (it was removed or moved outside"
-        " Proteia), so nothing was imported; put the folder back, or open another project"
+        f"{FOLDER!r} is no longer in the projects folder as it was (its folder, or its"
+        " project.json and an image file, were removed or moved outside Proteia), so"
+        " nothing was imported; put the folder back as it was, or open another project"
     )
     assert not s.folder.exists()
 
@@ -666,15 +695,29 @@ def test_an_import_into_a_removed_folder_stores_nothing(tmp_path):
 # --- Files that cannot be read, changes during the save ---
 
 
-def test_a_folder_in_place_of_project_json_fails_the_save_and_writes_nothing(tmp_path):
+def unread(name: str, why: str) -> str:
+    return (
+        f"Proteia could not read the project.json of {name!r} to check whether it was changed"
+        f" outside Proteia ({why}), so it did not save over it; this change is kept here:"
+        " close the program that holds the file (or put project.json back as a file), then"
+        " make any change"
+    )
+
+
+def test_a_folder_in_place_of_project_json_fails_the_save_and_writes_nothing(tmp_path, caplog):
     s = opened(tmp_path)
     project_file = s.folder / storage.PROJECT_FILE
     kept = project_file.read_bytes()
     project_file.unlink()
     project_file.mkdir()
+    caplog.set_level(logging.WARNING, logger="proteia.core.session")
     edit(s, "a")
-    # The read's own error, which names the file whole, as a failed write did.
-    assert isinstance(s.save_error, OSError) and s.save_error.filename == str(project_file)
+    # Proteia's own words, no path; the read's own error, with its path, is logged.
+    assert isinstance(s.save_error, storage.ProjectFileUnreadError)
+    assert str(s.save_error) == unread(FOLDER, s.save_error.__cause__.strerror)
+    cause = s.save_error.__cause__
+    assert isinstance(cause, OSError) and cause.filename == str(project_file)
+    assert f"in {FOLDER!r}: {cause}" in caplog.messages
     assert copies(s.folder) == [] and project_file.is_dir()
     project_file.rmdir()
     project_file.write_bytes(kept)
@@ -717,11 +760,30 @@ def test_a_held_project_json_is_read_again_while_windows_reports_a_sharing_viola
 def test_a_project_json_held_through_every_retry_fails_the_save(tmp_path, monkeypatch):
     s = opened(tmp_path)
     before = file_bytes(s)
-    seen = _reads(monkeypatch, storage.REPLACE_ATTEMPTS)
-    edit(s)
-    assert isinstance(s.save_error, PermissionError) and len(seen) == storage.REPLACE_ATTEMPTS
-    monkeypatch.undo()
+    with monkeypatch.context() as patch:  # only this test's patches go after it
+        seen = _reads(patch, storage.REPLACE_ATTEMPTS)
+        edit(s)
+    assert len(seen) == storage.REPLACE_ATTEMPTS
+    assert str(s.save_error) == unread(FOLDER, "held by another process")
+    assert str(tmp_path) not in str(s.save_error)
     assert file_bytes(s) == before and copies(s.folder) == []
+    # The check right before the replace reads it too, with the same words.
+    with monkeypatch.context() as patch:
+        real = Path.read_bytes
+        calls: list[int] = []
+
+        def held_at_the_check(path: Path) -> bytes:
+            if path.name == storage.PROJECT_FILE:
+                calls.append(1)
+                if len(calls) > 1:  # the read before writing goes through
+                    raise PermissionError(13, "held by another process", str(path))
+            return real(path)
+
+        patch.setattr(storage, "REPLACE_DELAY", 0)
+        patch.setattr(Path, "read_bytes", held_at_the_check)
+        edit(s, "b")
+    assert str(s.save_error) == unread(FOLDER, "held by another process")
+    assert file_bytes(s) == before
 
 
 def _changing_while_written(monkeypatch, newer: bytes) -> None:
@@ -941,10 +1003,18 @@ def test_reopening_after_a_conflict_reads_nothing_new(tmp_path):
 
 
 def _found(name: str, listed: str, held: str) -> str:
+    if held == "1 version":
+        kept = "Proteia never deletes it; once you delete it, this notice goes."
+        step = go_on(name, "it", "the copy")
+    else:
+        kept = (
+            "Proteia never deletes them; once you delete those you do not need, this notice"
+            " goes with the last."
+        )
+        step = go_on(name, "one", "that copy")
     return (
         f"The folder of {name!r} holds {held} of the project that Proteia set aside when it was"
-        f" changed outside Proteia: {listed}. Proteia never deletes them."
-        f" {go_on(name, 'one', 'that copy')}"
+        f" changed outside Proteia: {listed}. {kept} {step}"
     )
 
 
@@ -955,6 +1025,7 @@ def test_opening_lists_the_copies_in_the_folder(tmp_path, caplog):
     (folder / "project.conflict 2026-10-02 0915.json").write_bytes(b"{}")
     single = ops.open_project(folder, clock=FakeClock())
     assert single.outside_change == {
+        "event": 0,
         "message": _found(FOLDER, "'project.conflict 2026-10-02 0915.json'", "1 version"),
         "copies": ["project.conflict 2026-10-02 0915.json"],
     }
@@ -976,6 +1047,7 @@ def test_opening_lists_the_copies_in_the_folder(tmp_path, caplog):
     ]
     listed = ", ".join(repr(name) for name in newest[:3]) + " and 1 more"
     assert many.outside_change == {
+        "event": 0,
         "message": _found(FOLDER, listed, "4 versions"),
         "copies": newest,
     }
@@ -1006,6 +1078,7 @@ def test_a_reload_lists_the_copies_and_ends_what_the_opening_said(tmp_path):
     put(s.folder, other.project)
     assert s.reload()
     assert s.outside_change == {
+        "event": 0,
         "message": _found(FOLDER, repr(COPY), "1 version"),
         "copies": [COPY],
     }
@@ -1164,6 +1237,39 @@ def test_a_missing_project_json_keeps_every_image_file_at_close(tmp_path):
     assert below.is_file() and above.is_file()
 
 
+@pytest.mark.parametrize("doubt", ["held", "not in its encoding", "not listable"])
+def test_doubt_of_project_json_or_its_folder_keeps_every_image_file(tmp_path, monkeypatch, doubt):
+    s = opened(tmp_path)
+    below, above = _planted(s)
+    temp = s.folder / storage.IMAGES_DIR / ".img-9.tif.x.part"
+    temp.write_bytes(b"left by a crash")
+    if doubt == "not in its encoding":  # changed outside, not yet kept in a copy
+        (s.folder / storage.PROJECT_FILE).write_bytes(b"\xff\xfe\x00\xd8")
+    folder, real = s.folder, Path.iterdir
+
+    def refused(path: Path, *args: Any) -> Any:
+        raise PermissionError(13, "held by another process", str(path))
+
+    def iterdir(path: Path) -> Any:
+        return refused(path) if path == folder else real(path)
+
+    with monkeypatch.context() as patch:
+        if doubt == "held":
+            patch.setattr(storage, "read_project_file", refused)
+        elif doubt == "not listable":
+            patch.setattr(Path, "iterdir", iterdir)
+        s.close()
+    assert below.is_file() and above.is_file() and not temp.exists()
+
+
+def test_a_folder_named_like_a_version_is_none(tmp_path):
+    s = opened(tmp_path)
+    below, above = _planted(s)
+    (s.folder / "old.json").mkdir()
+    edit(s)  # saved, then cleaned up
+    assert not below.exists() and not above.exists()
+
+
 @pytest.mark.parametrize(
     ("name", "kept"),
     [
@@ -1298,6 +1404,185 @@ def test_the_storage_names_of_versions_and_copies():
     )
 
 
+# --- Notices, and versions in other encodings ---
+
+
+def test_a_copy_is_said_as_it_is_made_even_when_the_save_then_fails(tmp_path, monkeypatch):
+    s = opened(tmp_path)
+    (s.folder / storage.PROJECT_FILE).write_bytes(b'{"first": "outside"}')
+    with monkeypatch.context() as patch:
+        _changing_while_written(patch, b'{"second": "outside"}')
+        edit(s, "a")
+    assert isinstance(s.save_error, storage.ChangedAgainError)
+    first = s.outside_change
+    assert first["event"] == 1 and first["copies"] == [COPY]
+    assert first["message"].startswith(set_aside(FOLDER))  # the page hears of it now
+    edit(s, "b")
+    second = f"project.conflict {MINUTE} (2).json"
+    assert s.outside_change["event"] == 2 and s.outside_change["copies"] == [second, COPY]
+    assert f"Proteia kept that version as {second!r}" in s.outside_change["message"]
+    edit(s, "c")  # over its own file: nothing new to say
+    assert s.outside_change["event"] == 2
+
+
+def test_two_removals_in_one_opening_are_two_notices(tmp_path):
+    s = opened(tmp_path)
+    (s.folder / storage.PROJECT_FILE).unlink()
+    edit(s, "a")
+    first = s.outside_change
+    (s.folder / storage.PROJECT_FILE).unlink()
+    edit(s, "b")
+    # The same words, another notice: a page that dismissed the first shows it.
+    assert s.outside_change["message"] == first["message"]
+    assert (first["event"], s.outside_change["event"]) == (1, 2)
+
+
+def test_an_import_uses_the_names_of_the_versions_it_could_read(tmp_path, monkeypatch):
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs = imported(other, 5)
+    put(s.folder, other.project)
+    (s.folder / storage.IMAGES_DIR / f"{theirs}.tif").unlink()  # not synced yet
+    edit(s, "a")  # sets their version aside
+    (s.folder / "project-LAB-PC.json").write_bytes(b"{}")  # a sync client's file, held
+    real = storage.named_images
+
+    def held(path: Path) -> frozenset[str]:
+        if path.name == "project-LAB-PC.json":
+            raise PermissionError(13, "held by another process", str(path))
+        return real(path)
+
+    monkeypatch.setattr(storage, "named_images", held)
+    assert imported(s, 6) != theirs  # the copy it could read names that id
+
+
+def _utf(data: bytes, encoding: str) -> bytes:
+    return data.decode("utf-8").encode(encoding)
+
+
+@pytest.mark.parametrize(
+    "encoding", ["utf-16", "utf-16-le-bom", "utf-16-be-bom", "utf-32", "utf-8-sig"]
+)
+def test_an_outside_version_in_another_encoding_keeps_its_images(tmp_path, encoding):
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs = imported(other, 5)
+    data = storage.project_to_json(other.project)
+    if encoding == "utf-16-le-bom":
+        encoded = codecs.BOM_UTF16_LE + _utf(data, "utf-16-le")
+    elif encoding == "utf-16-be-bom":
+        encoded = codecs.BOM_UTF16_BE + _utf(data, "utf-16-be")
+    else:
+        encoded = _utf(data, encoding)
+    (s.folder / storage.PROJECT_FILE).write_bytes(encoded)
+    theirs_file = s.folder / storage.IMAGES_DIR / f"{theirs}.tif"
+    edit(s, "a")  # cleaned up after the save, from the copy's names
+    assert (s.folder / COPY).read_bytes() == encoded
+    assert theirs_file.read_bytes() == tiff(5)
+    imported(s, 6)  # and before an import
+    s.close()
+    assert theirs_file.read_bytes() == tiff(5)
+
+
+def test_a_version_not_in_its_encoding_keeps_every_image_file(tmp_path):
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs = imported(other, 5)  # an orphan here, which no version names below
+    theirs_file = s.folder / storage.IMAGES_DIR / f"{theirs}.tif"
+    version = s.folder / "project-LAB-PC.json"
+    version.write_bytes(b"\xff\xfe" + b"\x00\xd8")  # UTF-16 with a lone surrogate
+    edit(s, "a")
+    assert theirs_file.is_file()  # what it names is unknown: nothing deleted
+    version.write_bytes(b"\xc3\x28 not UTF-8")
+    edit(s, "b")
+    assert theirs_file.is_file()
+    version.unlink()
+    edit(s, "c")
+    assert not theirs_file.exists()
+
+
+def test_version_names_reads_the_text_its_byte_order_mark_says():
+    text = '{"a": "img-3.tif", "b": "IMG-12.TIFF"}'
+    found = frozenset({"img-3.tif", "IMG-12.TIFF"})
+    for encoded in (
+        text.encode("utf-8"),
+        codecs.BOM_UTF8 + text.encode("utf-8"),
+        text.encode("utf-16"),
+        codecs.BOM_UTF16_BE + text.encode("utf-16-be"),
+        text.encode("utf-32"),
+        codecs.BOM_UTF32_BE + text.encode("utf-32-be"),
+    ):
+        assert storage.version_names(encoded) == found, encoded[:4]
+    with pytest.raises(UnicodeDecodeError):
+        storage.version_names(b"\xc3\x28")
+
+
+def test_named_images_reads_a_utf16_file_across_its_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "_SCAN_CHUNK", 7)  # odd: cuts code units in two
+    path = tmp_path / "version.json"
+    path.write_bytes(("x" * 11 + '"img-27.tiff" and IMG-3.PNG, ' + "y" * 30).encode("utf-16"))
+    assert storage.named_images(path) == frozenset({"img-27.tiff", "IMG-3.PNG"})
+    path.write_bytes(b"\xff\xfe\x00\xd8")
+    with pytest.raises(UnicodeDecodeError):
+        storage.named_images(path)
+
+
+def test_a_version_that_cannot_be_looked_at_keeps_every_image_file(tmp_path, monkeypatch):
+    # A version whose whole path is past Windows' limit cannot be stat'ed: doubt.
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs = imported(other, 5)
+    theirs_file = s.folder / storage.IMAGES_DIR / f"{theirs}.tif"
+    version = s.folder / "project-LAB-PC.json"
+    version.write_bytes(b"{}")
+    real = Path.stat
+
+    def stat(path: Path, *args, **kwargs):
+        if path.name == version.name:
+            raise FileNotFoundError(2, "The filename or extension is too long", str(path))
+        return real(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "stat", stat)
+        edit(s, "a")
+    assert theirs_file.is_file()
+    edit(s, "b")  # looked at now: it names nothing
+    assert not theirs_file.exists()
+
+
+def test_an_import_whose_file_was_taken_meanwhile_names_no_id(tmp_path, monkeypatch):
+    s = opened(tmp_path)
+
+    def taken(*args, **kwargs):
+        raise FileExistsError(17, "File exists")
+
+    monkeypatch.setattr(storage, "store_image", taken)
+    with pytest.raises(OperationError) as refused:
+        imported(s, 2)
+    assert refused.value.code is ErrorCode.LEFTOVER_FILE
+    assert str(refused.value) == (
+        "another program put a file in the project's images folder where Proteia was"
+        " storing this image; import it again"
+    )
+    assert "img-" not in str(refused.value)
+
+
+def test_the_steps_back_to_a_version_work_with_one_project_and_hidden_extensions(tmp_path):
+    s = opened(tmp_path)
+    _hand_edited(s.folder)  # a project, so the notice says how to go on from it
+    edit(s)
+    (s.folder / "project.conflict 2026-10-01 0800.json").write_bytes(b"{}")
+    one = ops.open_project(s.folder, clock=FakeClock()).outside_change["message"]
+    (s.folder / COPY).unlink()  # one copy left
+    two_less = ops.open_project(s.folder, clock=FakeClock()).outside_change["message"]
+    for said in (s.outside_change["message"], one, two_less):
+        assert "open another project" not in said and "quit Proteia" in said
+        assert "type project mine and project" in said
+    assert "Proteia never deletes them; once you delete those you do not need" in one
+    assert "Proteia never deletes it; once you delete it, this notice goes." in two_less
+    assert "never deletes them" not in two_less
+
+
 # --- The page and the web routes ---
 
 
@@ -1335,6 +1620,7 @@ def test_the_state_carries_the_outside_change_for_the_opening(client, tmp_path):
     _hand_edited(folder)
     answer = client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle α"}]})
     expected = {
+        "event": 1,
         "message": (
             f"{set_aside('Blot µ')} That version's log has no change this one does not, so it"
             " is older or was edited by hand; this one has 1 change it does not."
@@ -1384,6 +1670,7 @@ def test_a_switch_that_saves_over_a_change_outside_keeps_a_copy_and_says_so_at_t
     assert (first.folder / COPY).read_bytes() == theirs
     reopened = workspace.open("A µ")
     assert reopened.outside_change == {
+        "event": 0,
         "message": _found("A µ", repr(COPY), "1 version"),
         "copies": [COPY],
     }
@@ -1423,6 +1710,7 @@ def test_a_reopen_from_another_tab_shows_the_copies(client):
     (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
     answer = client.ok("POST", "/api/projects/open", {"name": "Blot µ"})
     assert answer["project"]["outside_change"] == {
+        "event": 0,
         "message": _found("Blot µ", "'project.conflict 2026-10-01 0800.json'", "1 version"),
         "copies": ["project.conflict 2026-10-01 0800.json"],
     }
@@ -1436,26 +1724,45 @@ def test_the_page_shows_the_outside_change_from_every_state_until_dismissed():
     html = _code("index.html")
     panel = html[html.index('<aside class="panel">') :]
     assert panel.index('id="outside-change"') < panel.index("<h2>Images</h2>")
-    assert re.search(r'<div id="outside-change" class="outside-change" role="status" hidden>', html)
+    assert '<div id="outside-change" class="outside-change" hidden>' in html
     assert '<button id="outside-change-dismiss" type="button">Dismiss</button>' in html
+    # The live region a screen reader hears it from: always there, never hidden,
+    # outside the workspace (which a page without a project hides).
+    live = re.search(r'<p id="outside-change-said"[^>]*>', html)
+    assert live and 'role="status"' in live[0] and "hidden" not in live[0]
+    assert html.index('id="outside-change-said"') < html.index('<main id="workspace"')
     script = _code("app.js")
     render = script[script.index("function render() {") :]
     render = render[: render.index("\n}\n")]
     assert "renderOutsideChange(project);" in render
+    same = script[script.index("function sameNotice(") :]
+    same = same[: same.index("\n}\n")]
+    assert "seen.open_id === project.open_id && seen.event === change.event" in same
     shown = script[script.index("function renderOutsideChange(project) {") :]
     shown = shown[: shown.index("\n}\n")]
     for part in (
         "const change = project.outside_change;",
-        "dismissedOutside.open_id === project.open_id",
-        "dismissedOutside.message === change.message",
-        '$("outside-change").hidden = change === null || dismissed;',
-        '$("outside-change-text").textContent = change === null ? "" : change.message;',
+        "change !== null && !sameNotice(dismissedOutside, project, change)",
+        'const text = shown ? change.message : "";',
+        '$("outside-change-text").textContent = text;',
+        "notice.hidden = !shown;",
+        "shown && !sameNotice(saidOutside, project, change)",
     ):
         assert part in shown, part
+    # A notice that appears or changes its words keeps the focused control of
+    # the panel in the window (the page check measures it).
+    moved = shown.index('shown && (notice.hidden || $("outside-change-text").textContent !== text)')
+    kept = shown.index('focused.scrollIntoView({ block: "nearest" });')
+    assert moved < shown.index("notice.hidden = !shown;") < kept
+    assert "notice.parentElement.contains(focused)" in shown
+    # Its words reach the live region once per notice, after the notice is shown.
+    told = shown.index('$("outside-change-said").textContent = change.message;')
+    assert shown.index("notice.hidden = !shown;") < told
+    assert shown.index("saidOutside = { open_id: project.open_id, event: change.event };") < told
     dismiss = script[script.index('$("outside-change-dismiss").addEventListener("click"') :]
     dismiss = dismiss[: dismiss.index("\n});")]
     assert (
-        "dismissedOutside = { open_id: project.open_id, message: project.outside_change.message };"
+        "dismissedOutside = { open_id: project.open_id, event: project.outside_change.event };"
         in dismiss
     )
     assert dismiss.index('$("outside-change").hidden = true;') < dismiss.index(
@@ -1463,6 +1770,45 @@ def test_the_page_shows_the_outside_change_from_every_state_until_dismissed():
     )
     send = script[script.index("async function send(") :]
     assert "outside-change" not in send[: send.index("\n}\n")]  # an edit's answer keeps it
+
+
+def test_a_page_that_follows_a_switch_says_what_became_of_its_project():
+    # #101: a switch may drop the project's changes (its folder removed): the
+    # page says so, from the server's record of the opening it showed.
+    script = _code("app.js")
+    follow = script[script.index("function followOpening(") :]
+    follow = follow[: follow.index("\n}\n")]
+    assert "followedText(before, answer.project, follow.refused, answer.closed)" in follow
+    text = script[script.index("function closedText(before, closed) {") :]
+    text = text[: text.index("\n}\n")]
+    for part in (
+        "(closed || []).find((item) => item.open_id === before.open_id)",
+        "return `${name} was closed.`;",
+        "entry.saved ? `${name} is saved.` : `${name} was closed with changes not saved:"
+        " ${entry.why}.`",
+    ):
+        assert part in text, part
+    followed = script[script.index("function followedText(") :]
+    assert "${closedText(before, closed)}" in followed[: followed.index("\n}\n")]
+    assert "is saved.`;" not in followed[: followed.index("function closedText(")]
+
+
+def test_the_project_answer_carries_the_openings_switches_closed(client, tmp_path):
+    client.ok("POST", "/api/projects", {"name": "A µ"})
+    status, _ = upload(client, blot_bytes(tmp_path))
+    assert status == 201
+    shutil.rmtree(client.root / "A µ")
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})  # not saved
+    client.ok("POST", "/api/projects", {"name": "B β"})  # another tab's switch drops it
+    answer = client.ok("GET", "/api/project")
+    assert answer["closed"] == [{"open_id": 1, "name": "A µ", "saved": False, "why": GONE}]
+    client.ok("POST", "/api/projects", {"name": "C γ"})
+    assert client.ok("GET", "/api/project")["closed"][-1] == {
+        "open_id": 2,
+        "name": "B β",
+        "saved": True,
+        "why": None,
+    }
 
 
 def test_no_path_reaches_a_notice_or_the_log(tmp_path, caplog):
@@ -1499,12 +1845,12 @@ def test_the_session_log_says_what_was_kept(tmp_path, caplog):
     edit(s, "d")
     assert caplog.messages[-3:] == [
         f"in {FOLDER!r}: its project.json was changed outside Proteia; kept that version as"
-        f" {COPY!r} and saved Proteia's (extends_base: that version has 2 changes this one"
+        f" {COPY!r} and saves Proteia's (extends_base: that version has 2 changes this one"
         " does not, this one 1)",
         f"in {FOLDER!r}: its project.json was changed outside Proteia; kept that version as"
-        f" 'project.conflict {MINUTE} (2).json' and saved Proteia's (it does not read as a"
+        f" 'project.conflict {MINUTE} (2).json' and saves Proteia's (it does not read as a"
         " project)",
         f"in {FOLDER!r}: its project.json was changed outside Proteia; kept that version as"
-        f" 'project.conflict {MINUTE} (3).json' and saved Proteia's (it was saved by a newer"
+        f" 'project.conflict {MINUTE} (3).json' and saves Proteia's (it was saved by a newer"
         " Proteia, schema 99)",
     ]

@@ -1967,8 +1967,8 @@ def import_image(
     except FileExistsError as exc:
         raise OperationError(
             ErrorCode.LEFTOVER_FILE,
-            f"another file took the place of {image_id} in images/ while Proteia stored the"
-            " image; import it again",
+            "another program put a file in the project's images folder where Proteia was"
+            " storing this image; import it again",
             ids=(image_id,),
         ) from exc
     except ValueError as exc:
@@ -2088,9 +2088,9 @@ def refuse_removed(session: ProjectSession) -> None:
     if storage.project_removed(session.project, folder):
         raise OperationError(
             ErrorCode.PROJECT_REMOVED,
-            f"{folder.name!r} is no longer in the projects folder (it was removed or moved"
-            " outside Proteia), so nothing was imported; put the folder back, or open another"
-            " project",
+            f"{folder.name!r} is no longer in the projects folder as it was (its folder, or its"
+            " project.json and an image file, were removed or moved outside Proteia), so"
+            " nothing was imported; put the folder back as it was, or open another project",
         )
 
 

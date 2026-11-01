@@ -100,6 +100,7 @@ reproduced outside Python.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import copy
 import errno
@@ -219,9 +220,10 @@ class ProjectRemovedError(ProjectError):
 
     def __init__(self, name: str) -> None:
         super().__init__(
-            f"{name!r} is no longer in the projects folder (it was removed or moved outside"
-            " Proteia), so Proteia did not save it again; to keep this change, put the folder"
-            " back: opening another project or quitting drops it"
+            f"{name!r} is no longer in the projects folder as it was (its folder, or its"
+            " project.json and an image file, were removed or moved outside Proteia), so"
+            " Proteia did not save it again; to keep this change, put the folder back as it"
+            " was: opening another project or quitting drops it"
         )
 
 
@@ -249,6 +251,22 @@ class CopyNotKeptError(OSError):
             f" Proteia could not keep that version in a copy ({_why(exc)}), so it did not save"
             " over it; this change is kept here and saved, with the copy, at your next change"
             " once the folder can take it"
+        )
+
+
+class ProjectFileUnreadError(OSError):
+    """``project.json`` could not be read to check whether it changed outside
+    Proteia (another program holds it past the retries, a folder in its place,
+    access denied), so a save wrote nothing over it. The message names the
+    project by its folder's name and says what to do; the ``OSError``, with
+    its path, is ``__cause__``, for the log only."""
+
+    def __init__(self, name: str, exc: OSError) -> None:
+        super().__init__(
+            f"Proteia could not read the project.json of {name!r} to check whether it was"
+            f" changed outside Proteia ({_why(exc)}), so it did not save over it; this change"
+            " is kept here: close the program that holds the file (or put project.json back"
+            " as a file), then make any change"
         )
 
 
@@ -941,22 +959,29 @@ def read_project_file(folder: str | os.PathLike[str]) -> bytes | None:
     """The bytes of ``folder``'s ``project.json`` as they are now, or None if
     there is none (the folder too may be gone, or be a file now); read as
     :func:`_read_retrying` reads, so a reader holding it for a moment fails
-    nothing. Any other ``OSError`` propagates: what it holds is then unknown."""
+    nothing. Any other ``OSError`` raises :class:`ProjectFileUnreadError`
+    (its ``__cause__``, which names the path): what it holds is then unknown."""
+    path = Path(folder) / PROJECT_FILE
     try:
-        return _read_retrying(Path(folder) / PROJECT_FILE)
+        return _read_retrying(path)
     except (FileNotFoundError, NotADirectoryError):
         return None
+    except OSError as exc:
+        raise ProjectFileUnreadError(path.parent.name, exc) from exc
 
 
 def _unchanged(path: Path, expect: str | None) -> None:
     """:class:`ChangedAgainError` unless the file ``path`` holds bytes whose
-    SHA-256 is ``expect``, or, with ``expect`` None, there is none."""
+    SHA-256 is ``expect``, or, with ``expect`` None, there is none; a file
+    that cannot be read raises :class:`ProjectFileUnreadError`."""
     try:
         data = _read_retrying(path)
     except FileNotFoundError:
         if expect is None:
             return
         raise ChangedAgainError(path.parent.name) from None
+    except OSError as exc:
+        raise ProjectFileUnreadError(path.parent.name, exc) from exc
     if expect is None or hashlib.sha256(data).hexdigest() != expect:
         raise ChangedAgainError(path.parent.name)
 
@@ -1181,17 +1206,57 @@ _SCAN_CHUNK: Final = 1 << 20
 _SCAN_OVERLAP: Final = 64  # more than the longest name a project holds (img-, 10 digits, .tiff)
 
 
+# A stored image's name in text: _IMAGE_NAME's rule, for a version's decoded text.
+_IMAGE_TEXT = re.compile(_IMAGE_NAME.pattern.decode("ascii"), re.IGNORECASE)
+# The byte-order marks a version's text is read by (#101), longest first: what
+# an editor or a sync tool may write a project.json as. None: UTF-8.
+_BOMS: Final = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
+def _encoding_of(head: bytes) -> str:
+    """The encoding a version's text is in, by the byte-order mark ``head``
+    begins with: UTF-32 or UTF-16 (little or big endian), else UTF-8."""
+    return next((encoding for bom, encoding in _BOMS if head.startswith(bom)), "utf-8")
+
+
+def version_names(data: bytes) -> frozenset[str]:
+    """The stored image files that ``data``, the bytes of a version of the
+    project (another ``project.json``), names anywhere in its text, read in the
+    encoding its byte-order mark says (UTF-8 without one). ``UnicodeDecodeError``
+    (a ``ValueError``) for bytes that are not that encoding: what they name is
+    then unknown."""
+    text = data.decode(_encoding_of(data[:4]))
+    return frozenset(_IMAGE_TEXT.findall(text))
+
+
 def named_images(path: Path) -> frozenset[str]:
-    """:func:`image_names` of the file ``path``, read a part at a time, so that
-    memory stays bounded whatever its size. An ``OSError`` propagates."""
+    """:func:`version_names` of the file ``path``, read a part at a time, so
+    that memory stays bounded whatever its size. An ``OSError`` and a
+    ``UnicodeDecodeError`` propagate."""
     names: set[str] = set()
-    tail = b""
+    tail = ""
     with path.open("rb") as f:
-        while chunk := f.read(_SCAN_CHUNK):
-            data = tail + chunk
-            names.update(image_names(data))
-            tail = data[-_SCAN_OVERLAP:]
-    return frozenset(names)
+        chunk = f.read(4)
+        decoder = codecs.getincrementaldecoder(_encoding_of(chunk))("strict")
+        while True:
+            text = tail + decoder.decode(chunk, final=not chunk)
+            # A name that ends where this part does may go on in the next
+            # (img-3.tif, then f): it is read again there, in the overlap.
+            names.update(
+                found.group()
+                for found in _IMAGE_TEXT.finditer(text)
+                if not chunk or found.end() < len(text)
+            )
+            if not chunk:
+                return frozenset(names)
+            tail = text[-_SCAN_OVERLAP:]
+            chunk = f.read(_SCAN_CHUNK)
 
 
 def is_version(name: str) -> bool:
