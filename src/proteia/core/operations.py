@@ -77,7 +77,7 @@ areas (:func:`set_marker_image` makes them equal). A box, a not-detected
 record and a calibration point belong to the one area holding its centre, so
 the operations that place or move them refuse one outside its area
 (``OUT_OF_ARENA``) or in two (``IN_TWO_ARENAS``). A row is detected on a copy
-of the pixels in which its area alone shows (:func:`_masked`), lanes are
+of the pixels in which its area alone shows (:func:`_detector_pixels`), lanes are
 proposed and rows checked from the boxes of the same area
 (:func:`~proteia.core.project.lane_anchors`), and each membrane has its own
 calibration on an image it shares. Which boxes a band's ring leaves out, and
@@ -223,6 +223,7 @@ from proteia.core.model import (
     MAX_ARENA_ANGLE,
     ON_EDGE,
     OUTLINE_LIMIT,
+    AreaFrame,
     Arena,
     ArenaSource,
     Band,
@@ -305,6 +306,7 @@ __all__ = [
     "AreaAssignment",
     "AreaChange",
     "AreaRemoval",
+    "AreaScope",
     "CalibrationFit",
     "CalibrationUpdate",
     "Cascade",
@@ -325,6 +327,7 @@ __all__ = [
     "add_arena",
     "add_calibration_point",
     "add_protein",
+    "area_removal",
     "assign_arena",
     "calibration_fit",
     "clear_boxes",
@@ -339,6 +342,7 @@ __all__ = [
     "export_bundle",
     "export_lane_table",
     "import_image",
+    "marker_adoption",
     "move_box",
     "new_project",
     "open_project",
@@ -887,8 +891,14 @@ def _ring_context(batch: Batch, image_id: str, row_id: str) -> RingContext:
     membrane's nets are those its boxes give on the image whatever areas are
     drawn on it; an edit of one membrane's boxes moves the nets of another's
     bands whose rings reach it, as it moves another protein's on one image.
-    ``row_id`` is the row whose rings are measured."""
-    return RingContext(left_out=frozenset(row.id for _, row in batch.rows_on(image_id)))
+    ``row_id`` is the row whose rings are measured. Only rows with boxes are
+    left out: a row without any changes no ring, so its coming or going reads
+    no pixel (:func:`_area_apply`)."""
+    return RingContext(
+        left_out=frozenset(
+            row.id for protein, row in batch.rows_on(image_id) if batch.boxes_of(protein).bands
+        )
+    )
 
 
 def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
@@ -1019,22 +1029,54 @@ def _inside_mask(area: Arena, image: ImageRef, window: Rect) -> np.ndarray:
     return (np.abs(u) <= frame.half_width + ON_EDGE) & (np.abs(v) <= frame.half_height + ON_EDGE)
 
 
-def _masked(array: np.ndarray, image: ImageRef, area: Arena, window: Rect) -> np.ndarray:
-    """What row detection and the ladder search read on a drawn membrane
-    area: ``array`` with every pixel of ``window`` (clipped to the image)
-    whose centre lies outside ``area`` set to the image's stored background,
-    the value a detector already takes for off-membrane pixels; ``array``
-    itself for an area over the whole image (nothing is masked). A copy:
-    quantification never reads it."""
-    if area.outline is None:
+def _detector_pixels(
+    session: ProjectSession, image: ImageRef, area: Arena, window: Rect
+) -> np.ndarray:
+    """The pixels a detector reads in ``window`` of ``image`` for the
+    membrane ``area``: the one way every detector reads them (a row, a seed
+    click, a ladder search, a snap; :func:`_shown`), so that each reads the
+    area alone. Quantification reads the stored pixels instead."""
+    return _shown(session.pixels(image.id), image, area, window)
+
+
+def _shown(array: np.ndarray, image: ImageRef, area: Arena, window: Rect) -> np.ndarray:
+    """``array`` (``image``'s pixels) as a detector reading ``window``
+    (clipped to the image) sees ``area``: every pixel of the window whose
+    centre lies outside the area at the image's stored background, the value
+    a detector already takes for off-membrane pixels. ``array`` itself where
+    nothing is to be masked: an area over the whole image, an empty window,
+    or a window every pixel of which lies inside the area. Otherwise an array
+    of the image's shape that holds the window alone, zeros past it (no
+    detector reads past the window it is given, and a page of memory never
+    written costs nothing), so no call copies the whole image."""
+    frame = area.frame()
+    if frame is None:
         return array
     x0, y0 = max(0, window[0]), max(0, window[1])
     x1, y1 = min(image.width, window[2]), min(image.height, window[3])
-    masked = array.copy()
-    # A window off the image is empty: nothing to mask.
-    outside = ~_inside_mask(area, image, (x0, y0, max(x0, x1), max(y0, y1)))
-    masked[y0:y1, x0:x1][outside] = image.background
-    return masked
+    if x1 <= x0 or y1 <= y0 or _holds_window(frame, (x0, y0, x1, y1)):
+        return array
+    part = array[y0:y1, x0:x1].copy()
+    part[~_inside_mask(area, image, (x0, y0, x1, y1))] = image.background
+    shown = np.zeros_like(array)
+    shown[y0:y1, x0:x1] = part
+    return shown
+
+
+def _holds_window(frame: AreaFrame, window: Rect) -> bool:
+    """Whether every pixel of ``window`` has its centre in a drawn area's
+    turned outline (``frame``): its four corner pixels' centres do (the
+    outline is convex)."""
+    x0, y0, x1, y1 = window
+    return all(
+        frame.holds(x, y)
+        for x, y in (
+            (x0 + 0.5, y0 + 0.5),
+            (x1 - 0.5, y0 + 0.5),
+            (x1 - 0.5, y1 - 0.5),
+            (x0 + 0.5, y1 - 0.5),
+        )
+    )
 
 
 def _membrane_words(batch: Batch, membrane: Membrane) -> str:
@@ -1347,30 +1389,34 @@ def _refresh_box_mws(committed: Project, draft: Project) -> None:
 
 
 def _remeasured(
-    before: Batch, after: Batch, image_id: str, protein_id: str
+    before: Batch, after: Batch, image_ids: Iterable[str], protein_id: str | None = None
 ) -> tuple[tuple[tuple[str, float, float], ...], tuple[str, float] | None]:
-    """The other proteins' bands on an image whose net a change of one protein's
-    boxes moved (their rings leave out its boxes), as ``(band id, net before,
-    net after)``, protein by protein and band by band as stored; and the band
-    among them whose net changed by the largest share of its net before,
-    ``(band id, |after - before| / before)``, None when none had a net before.
-    A no-op, ``after`` the same as ``before``, moves none."""
-    nets = {
-        band.id: band.net
-        for other in after.proteins_on(image_id)
-        if other.id != protein_id
-        for band in after.boxes_of(other).bands
-    }
-    remeasured = tuple(
-        (band.id, band.net, nets[band.id])
-        for other in before.proteins_on(image_id)
-        if other.id != protein_id
-        for band in before.boxes_of(other).bands
-        if nets[band.id] != band.net
-    )
+    """The bands on the images ``image_ids`` whose net a change moved, of
+    every protein but ``protein_id`` (the one whose boxes changed: the others'
+    rings leave out its boxes) and in both ``before`` and ``after``, as
+    ``(band id, net before, net after)``, image by image, protein by protein
+    and band by band as stored; and the band among them whose net changed by
+    the largest share of its net before, ``(band id, |after - before| /
+    before)``, None when none had a net before. A no-op, ``after`` the same as
+    ``before``, moves none."""
+    remeasured: list[tuple[str, float, float]] = []
+    for image_id in image_ids:
+        nets = {
+            band.id: band.net
+            for other in after.proteins_on(image_id)
+            if other.id != protein_id
+            for band in after.boxes_of(other).bands
+        }
+        remeasured.extend(
+            (band.id, band.net, nets[band.id])
+            for other in before.proteins_on(image_id)
+            if other.id != protein_id
+            for band in before.boxes_of(other).bands
+            if band.id in nets and nets[band.id] != band.net
+        )
     shares = [(abs(new - old) / old, band_id) for band_id, old, new in remeasured if old > 0]
     largest = max(shares, key=lambda share: share[0], default=None)
-    return remeasured, None if largest is None else (largest[1], largest[0])
+    return tuple(remeasured), None if largest is None else (largest[1], largest[0])
 
 
 # --- Input checks ---
@@ -2819,6 +2865,43 @@ def assign_arena(session: ProjectSession, arena_id: str, membrane_id: str | None
     return _area_apply(session, "assign_arena", change, params, lambda _: linked)
 
 
+@dataclass(frozen=True)
+class AreaScope:
+    """What removing a membrane area takes (:func:`area_removal`): the
+    membrane's area on every image linked to the area's (in image order), those
+    images (in batch order), the proteins whose rows are on those areas (in
+    batch order, which go with them), how many boxes and not-detected
+    records they hold, how many of the membrane's calibration points lie on
+    those images, and whether the membrane, left with no area, goes too."""
+
+    arena_ids: tuple[str, ...]
+    image_ids: tuple[str, ...]
+    protein_ids: tuple[str, ...]
+    boxes: int
+    records: int
+    marks: int
+    membrane_goes: bool
+
+
+def area_removal(batch: Batch, arena_id: str) -> AreaScope:
+    """What :func:`remove_arena` would take with the area ``arena_id``, as it
+    takes it (the page's confirmation names it): it follows the marker links
+    from image to image, so it reaches every linked image."""
+    membrane, _, image = _area_target(batch, arena_id)
+    linked = _linked(batch, image.id)
+    going = tuple(batch.area_on(membrane, linked_id).id for linked_id in linked)
+    gone = [p for p in batch.proteins if batch.arena_id_of(p) in going]
+    return AreaScope(
+        arena_ids=going,
+        image_ids=tuple(linked),
+        protein_ids=tuple(p.id for p in gone),
+        boxes=sum(len(batch.boxes_of(p).bands) for p in gone),
+        records=sum(len(batch.boxes_of(p).undetected) for p in gone),
+        marks=sum(1 for point in membrane.calibration.points if point.image_id in linked),
+        membrane_goes=len(batch.arenas_of(membrane)) == len(going),
+    )
+
+
 @_locked
 def remove_arena(session: ProjectSession, arena_id: str) -> AreaRemoval:
     """Remove a membrane area, with the rows on it (their bands and
@@ -2842,7 +2925,8 @@ def remove_arena(session: ProjectSession, arena_id: str) -> AreaRemoval:
     committed = session.project
     batch = committed.batch
     membrane, arena, image = _area_target(batch, arena_id)
-    linked = _linked(batch, image.id)
+    scope = area_removal(batch, arena_id)
+    linked = list(scope.image_ids)
     for linked_id in linked:
         if len(batch.arenas_on(linked_id)) < 2:
             name = batch.find_image(linked_id).original_name
@@ -2852,7 +2936,7 @@ def remove_arena(session: ProjectSession, arena_id: str) -> AreaRemoval:
                 " its area to another membrane",
                 ids=(arena.id,),
             )
-    going = [batch.area_on(membrane, i).id for i in linked]
+    going = scope.arena_ids
     number = batch.membrane_number(membrane)
     later = list(range(number + 1, len(batch.membranes) + 1))
 
@@ -2912,34 +2996,13 @@ def remove_arena(session: ProjectSession, arena_id: str) -> AreaRemoval:
         }
 
     cascade, _, _, emptied = _area_apply(session, "remove_arena", change, params, lambda _: linked)
-    after = session.project.batch
-    moved = [_moved_nets(batch, after, i) for i in linked]
-    remeasured = tuple(entry for nets in moved for entry in nets)
-    shares = [(abs(new - old) / old, band_id) for band_id, old, new in remeasured if old > 0]
-    largest = max(shares, key=lambda share: share[0], default=None)
+    remeasured, largest = _remeasured(batch, session.project.batch, linked)
     return AreaRemoval(
         cascade=cascade,
         remeasured=remeasured,
-        largest_change=None if largest is None else (largest[1], largest[0]),
+        largest_change=largest,
         renumbered=_renumbered(later) if emptied else None,
     )
-
-
-def _moved_nets(before: Batch, after: Batch, image_id: str) -> list[tuple[str, float, float]]:
-    """The bands on an image in both ``before`` and ``after`` whose net
-    moved, as ``(band id, net before, net after)``, protein by protein and
-    band by band as stored."""
-    nets = {
-        band.id: band.net
-        for protein in after.proteins_on(image_id)
-        for band in after.boxes_of(protein).bands
-    }
-    return [
-        (band.id, band.net, nets[band.id])
-        for protein in before.proteins_on(image_id)
-        for band in before.boxes_of(protein).bands
-        if band.id in nets and nets[band.id] != band.net
-    ]
 
 
 # The image kinds each calibration point source may be marked on.
@@ -3255,7 +3318,7 @@ def _snap_window(image: ImageRef, x: float, y: float | None) -> Rect:
     """The pixels of ``image`` a snap at ``(x, y)`` reads, or a ladder search
     at ``x`` down the whole image (``y`` None), with a pixel to spare: the
     window of :func:`~proteia.core.mwcal.refine_point` or
-    :func:`~proteia.core.mwcal.find_ladder`, for :func:`_masked`."""
+    :func:`~proteia.core.mwcal.find_ladder`, for :func:`_detector_pixels`."""
     if y is None:
         half = mwcal.FIND_HALF_X + 1
         return math.floor(x - half), 0, math.ceil(x + half), image.height
@@ -3277,11 +3340,10 @@ def _snapped(
 ) -> float | None:
     """Where the point's click meant (:func:`~proteia.core.mwcal.refine_point`),
     within the gaps between the points ``marked`` on its ladder; None when
-    nothing stands out there. It reads ``arena`` alone (:func:`_masked`)."""
+    nothing stands out there. It reads ``arena`` alone (:func:`_detector_pixels`)."""
     if point.x is None:  # unreachable: snapping asks for the point's x first
         raise RuntimeError("a calibration point without x cannot be snapped")
-    window = _snap_window(image, point.x, point.y)
-    array = _masked(session.pixels(image.id), image, arena, window)
+    array = _detector_pixels(session, image, arena, _snap_window(image, point.x, point.y))
     return mwcal.refine_point(
         array,
         point.x,
@@ -3429,12 +3491,9 @@ def set_marker_image(
                 " its image pixel for pixel",
                 ids=(image_id, marker.id),
             )
-        if _areas_of(batch, image.id) != _areas_of(batch, marker.id):
-            joined = any(
-                other.marker_image_id == marker.id and other.id != image_id
-                for other in batch.iter_images()
-            )
-            source, adopter = (marker, image) if joined else (image, marker)
+        direction = marker_adoption(batch, image.id, marker.id)
+        if direction is not None:
+            source, adopter = (marker, image) if direction == "image" else (image, marker)
             _refuse_unshown(batch, source, adopter)
     params: dict[str, JsonValue] = {
         "membrane_id": membrane.id,
@@ -3475,6 +3534,22 @@ def set_marker_image(
         lambda _: [] if adopter is None else [adopter.id],
     )
     return replace(_calibration_update(result), adopted_arena_ids=tuple(adopted))
+
+
+def marker_adoption(batch: Batch, image_id: str, marker_image_id: str) -> str | None:
+    """Which image takes the other's membrane areas when the image
+    ``image_id`` is linked to the marker image ``marker_image_id``
+    (:func:`set_marker_image`): ``"marker"`` (the marker takes the image's),
+    ``"image"`` (another image is linked to that marker already: the image
+    takes the group's), or None (they hold the same areas: nothing moves).
+    Whether the link is refused is not told."""
+    if _areas_of(batch, image_id) == _areas_of(batch, marker_image_id):
+        return None
+    joined = any(
+        other.marker_image_id == marker_image_id and other.id != image_id
+        for other in batch.iter_images()
+    )
+    return "image" if joined else "marker"
 
 
 def _areas_of(batch: Batch, image_id: str) -> dict[str, tuple[Outline | None, float]]:
@@ -3910,7 +3985,7 @@ def _proposal(
     # The membrane's area alone, as a row reads it (#243).
     area = session.project.batch.area_on(membrane, image.id)
     return mwcal.find_ladder(
-        _masked(session.pixels(image.id), image, area, _snap_window(image, x, None)),
+        _detector_pixels(session, image, area, _snap_window(image, x, None)),
         x,
         kda=calibration.ladder_kda,
         reference_kda=reference,
@@ -3987,7 +4062,7 @@ def snap_ladder(
     if not given:
         return ()
     # The membrane's area alone, down the ruler's lane (#243).
-    array = _masked(session.pixels(image.id), image, target.arena, _snap_window(image, x, None))
+    array = _detector_pixels(session, image, target.arena, _snap_window(image, x, None))
     source = _band_source(image)
     snapped = []
     for index, y in enumerate(given):
@@ -4039,7 +4114,7 @@ def _placed(
     keeps its band's y); ``hand`` otherwise. With a proposal asked for
     (``proposed``), also ``relabelled``: whether its MW differs from that of
     the proposal's tick at its y. Each image is read as a snap reads it: its
-    membrane's area alone (:func:`_masked`)."""
+    membrane's area alone (:func:`_detector_pixels`)."""
     if not applied:
         return []
     batch = session.project.batch
@@ -4049,7 +4124,7 @@ def _placed(
         if (where.id, x) not in reads:
             area = batch.area_on(membrane, where.id)
             window = _snap_window(where, x, None)
-            reads[where.id, x] = _masked(session.pixels(where.id), where, area, window)
+            reads[where.id, x] = _detector_pixels(session, where, area, window)
         return reads[where.id, x]
 
     source = _band_source(image)
@@ -4727,17 +4802,23 @@ def place_box(
     array = session.pixels(image.id)
     rects = [band.box.rect(own.box_size) for band in own.bands]
     if grow:
+        # The band grows within the area alone (#243): on the area's bounds,
+        # as the area shows them, which for the whole image is the image.
+        bx0, by0, bx1, by1 = arena.bounds(image)
+        bx0, by0, bx1, by1 = max(0, bx0), max(0, by0), min(width, bx1), min(height, by1)
+        shown = _detector_pixels(session, image, arena, (bx0, by0, bx1, by1))
         # The settings the export record reports (record.settings), passed explicitly.
-        grown = grow_box(
-            array,
-            (x, y),
+        found = grow_box(
+            shown[by0:by1, bx0:bx1],
+            (x - bx0, y - by0),
             image.background,
             rel_threshold=REL_THRESHOLD,
             noise_k=NOISE_K,
             dark_on_light=image.polarity.dark_on_light,
         )
-        if grown is None:
+        if found is None:
             raise OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})")
+        grown = (found[0] + bx0, found[1] + by0, found[2] + bx0, found[3] + by0)
         try:
             size, resized, rect = boxes.grow_to_fit(
                 rects, own.box_size, grown, width=width, height=height, pad=own.box_padding
@@ -5206,7 +5287,7 @@ def set_box_padding(
             box = band.box.rect(theirs.box_size)
             if boxes.overlaps_any(box, resized) and not boxes.overlaps_any(box, rects):
                 others.append(band.id)
-    remeasured, largest = _remeasured(batch, after, image.id, protein_id)
+    remeasured, largest = _remeasured(batch, after, [image.id], protein_id)
     return PaddingChange(
         box_size=size,
         fitted_size=fitted,
@@ -6128,7 +6209,7 @@ def _place_row(
     detector is given a copy of the pixels in which every pixel of the row,
     and of the ``reach`` rows above and below it that a row along a line may
     read, whose centre lies outside the area is the image's stored background
-    (:func:`_masked`), so a row dragged over a turned strip finds no band of
+    (:func:`_detector_pixels`), so a row dragged over a turned strip finds no band of
     the next strip; quantification still reads the pixels as stored. A row
     box that does not meet the area's bounds is refused before anything is
     detected, and a box the row would place (or a survivor it would resize)
@@ -6171,7 +6252,9 @@ def _place_row(
         raise misnumbered
     array = session.pixels(image.id)
     # What the detector reads: the area alone; the nets read the image.
-    seen = _masked(array, image, arena, (given[0], given[1] - reach, given[2], given[3] + reach))
+    seen = _detector_pixels(
+        session, image, arena, (given[0], given[1] - reach, given[2], given[3] + reach)
+    )
     right_to_left = runs is True or last is True
     # Pixels saturated as the over-exposure checks count them: a hollow band
     # is reported as over-exposed, not as two bands (#121). None for an image
@@ -6448,7 +6531,7 @@ def _place_row(
         )
     # The other proteins' nets on the image the row changed; the same drag
     # again, a no-op, changes none.
-    remeasured, largest = _remeasured(batch, session.project.batch, image.id, protein_id)
+    remeasured, largest = _remeasured(batch, session.project.batch, [image.id], protein_id)
     empty = tuple(
         (lane.lane, lane.reason, lane.snr, lane.expected_x)
         for lane in found.lanes

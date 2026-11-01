@@ -720,6 +720,7 @@ ALLOWED: dict[tuple[str, str, str, str], str] = {
         "a calibration point's image, not a protein's (#243: an area operation moves or"
         " keeps the points on its images, and an outline holds or leaves them)",
         "core/operations.py _held: point.image_id",
+        "core/operations.py area_removal: point.image_id",
         "core/operations.py assign_arena: p.image_id",
         "core/operations.py assign_arena.change: p.image_id",
         "core/operations.py remove_arena.change: p.image_id",

@@ -10460,7 +10460,9 @@ MW_NEUTRAL = frozenset(
     {
         "add_arena",
         "add_protein",
+        "area_removal",
         "edit_arena",
+        "marker_adoption",
         "calibration_fit",
         "clear_boxes",
         "compute",
