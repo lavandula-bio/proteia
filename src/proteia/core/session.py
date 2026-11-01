@@ -182,6 +182,18 @@ class ErrorCode(StrEnum):
     MW_REQUIRED = "mw_required"
     MW_OUTSIDE_CALIBRATION = "mw_outside_calibration"
     LANE_SPAN_REQUIRED = "lane_span_required"
+    # Membrane areas (#243). A membrane already has an area on the image; an
+    # outline would leave boxes, records or points outside its area; an image
+    # holding several areas is named where its membrane area is needed (or its
+    # last area would go); a click, box or row lies outside the membrane's area;
+    # another area on the image still covers all of it; a point lies inside two
+    # areas of one image.
+    ARENA_EXISTS = "arena_exists"
+    ARENA_IN_USE = "arena_in_use"
+    ARENA_REQUIRED = "arena_required"
+    OUT_OF_ARENA = "out_of_arena"
+    ARENA_COVERS_IMAGE = "arena_covers_image"
+    IN_TWO_ARENAS = "in_two_arenas"
 
 
 class OperationError(ValueError):
