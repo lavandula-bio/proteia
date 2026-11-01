@@ -2885,6 +2885,42 @@ def test_a_refusal_of_reading_an_image_already_imported_is_logged_once(
     assert logged_by_a_session() == expected
 
 
+def test_a_refusal_of_reading_another_file_under_an_id_is_logged_too(tmp_path, monkeypatch, caplog):
+    # A project folder replaced outside Proteia (a synced or restored copy)
+    # may hold another file under an image's id, which the session reads
+    # once it reloads the project: its refusal is logged too, as it is
+    # another stored file (its SHA-256).
+    s = session_on(tmp_path / "a", save_to_folder)
+    cause = struct.error("unpack requires a buffer of 4 bytes")
+
+    def damaged(path):
+        raise cause
+
+    def refused_and_logged(image: str) -> list[str]:
+        caplog.clear()
+        with monkeypatch.context() as patch, caplog.at_level(logging.INFO, logger="proteia"):
+            patch.setattr(imaging, "_read_tiff", damaged)
+            for _ in range(2):
+                with pytest.raises(OperationError):
+                    s.colour_pixels(image)  # never cached: read each time
+        return [
+            record.getMessage() for record in caplog.records if "failed:" in record.getMessage()
+        ]
+
+    image = import_blot(s, blot(), "β-actin µ.tif")
+    other = session_on(tmp_path / "b", save_to_folder)
+    assert import_blot(other, blot()[::-1], "GAPDH α.tif") == image
+    stored, copy = s.project.batch.find_image(image), other.project.batch.find_image(image)
+    assert (stored.file, stored.sha256 != copy.sha256) == (copy.file, True)
+    logged = refused_and_logged(image)
+    assert len(logged) == 1 and "(offered as 'β-actin µ.tif')" in logged[0]
+    for name in (storage.PROJECT_FILE, f"{storage.IMAGES_DIR}/{copy.file}"):
+        shutil.copyfile(other.folder / name, s.folder / name)  # restored from the copy
+    assert s.reload()
+    logged = refused_and_logged(image)
+    assert len(logged) == 1 and "(offered as 'GAPDH α.tif')" in logged[0]
+
+
 def _animations() -> dict[str, bytes]:
     """Animations main imported as one image, by the name they are offered
     under: 3 frames of the blot's size, which scikit-image moves to the
