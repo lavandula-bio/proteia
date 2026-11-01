@@ -24,11 +24,15 @@ it fails:
    install that stopped halfway, or another interpreter, makes it anew.
 3. **Bundle.** PyInstaller runs ``proteia.spec`` into ``WORK/dist/Proteia``
    (log: ``WORK/pyinstaller.log``). The bundle may hold no napari, Qt or Tcl
-   file, no Universal CRT DLL and no Visual C++ runtime file that neither the
-   Python build nor a package provides (``MSVCP140.dll``, #54), and no binary in
-   it may import such a file by name (``bundle.py imports`` reads the import
-   tables into ``WORK/pe-imports.json`` with the build environment's pefile);
-   it must hold the web client and the metadata the record reads.
+   file, no Universal CRT DLL and no Visual C++ runtime file other than those
+   the spec classified as the Python build's or a package's own copies
+   (``vc_runtime`` in its ``bundle-manifest.json``; System32's ``MSVCP140.dll``
+   is neither, #54). No binary in it may import a Visual C++ runtime file by
+   name that is not one of those in a folder Windows looks in for that binary,
+   and every file named like a binary must be a PE file (``bundle.py imports``
+   reads the import tables into ``WORK/pe-imports.json`` with the build
+   environment's pefile). It must hold the web client and the metadata the
+   record reads.
    ``LICENSE.txt`` and ``THIRD_PARTY_NOTICES.txt`` (``notices.py``) are added
    to it.
 4. **Self-test.** ``Proteia.exe --self-test`` (:mod:`proteia.selftest`) runs with
@@ -206,20 +210,29 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def bundle_problems(dist: Path, imports: Mapping[str, Sequence[str]]) -> list[str]:
+def bundle_problems(
+    dist: Path,
+    imports: Mapping[str, Sequence[str]],
+    not_pe: Mapping[str, str],
+    classified: Sequence[bundle.VcRuntime],
+) -> list[str]:
     """What the finished bundle folder must not lack or hold. ``imports`` maps
-    each of its binaries to the DLLs it imports (``bundle.py imports``)."""
+    each of its binaries to the DLLs it imports, and ``not_pe`` each other file
+    named like a binary to why it is not a PE file (``bundle.py imports``);
+    ``classified`` is the spec's classification of the Visual C++ runtime files
+    (the bundle manifest). The checks of DLLs take the files from those two maps."""
     contents = dist / bundle.CONTENTS
     paths = [path.relative_to(dist).as_posix() for path in dist.rglob("*")]
     problems = [f"{path} must not be in the bundle" for path in bundle.forbidden_paths(paths)]
-    problems += [f"{path}: a Universal CRT DLL" for path in paths if bundle.is_universal_crt(path)]
     problems += [
-        f"{path}: a Visual C++ runtime file that neither the Python build nor a package"
-        " provides, which the bundle leaves out (#54)"
-        for path in sorted(paths)
-        if bundle.is_left_out_vc_runtime(path)
+        f"{path}: not a valid PE file ({why}), so the DLLs it imports cannot be checked"
+        for path, why in sorted(not_pe.items())
     ]
-    problems += bundle.vc_import_problems(imports, paths)
+    binaries = sorted({*imports, *not_pe})
+    problems += [
+        f"{path}: a Universal CRT DLL" for path in binaries if bundle.is_universal_crt(path)
+    ]
+    problems += bundle.vc_runtime_problems(imports, classified)
     if not (contents / "proteia" / "web" / "static" / "index.html").is_file():
         problems.append("the web client (proteia/web/static) is missing")
     metadata = [path.name.split("-")[0] for path in contents.glob("*.dist-info")]
@@ -403,20 +416,24 @@ class Build:
              "--distpath", self.work / "dist", "--workpath", self.work / "pyinstaller", SPEC],
             cwd=HERE,
         )  # fmt: skip
+        # The spec's record, with its classification of the Visual C++ runtime files,
+        # which the bundle check and the notices re-check.
+        manifest_file = self.work / "pyinstaller" / "proteia" / "bundle-manifest.json"
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        self.summary["bundle_manifest"] = manifest
         # The import tables, read with pefile, which only the build environment has.
         imports_file = self.work / "pe-imports.json"
         self.run("pe-imports", [self.env_python, BUNDLE, "imports", self.dist, imports_file])
-        imports = json.loads(imports_file.read_text(encoding="utf-8"))
-        problems = bundle_problems(self.dist, imports)
+        imports, not_pe = bundle.read_imports(imports_file)
+        problems = bundle_problems(self.dist, imports, not_pe, bundle.read_vc_runtime(manifest))
         if problems:
             raise BuildError("the bundle is not right:\n  " + "\n  ".join(problems))
         shutil.copyfile(ROOT / "LICENSE", self.dist / "LICENSE.txt")
         argv: list[str | Path] = [self.env_python, NOTICES, self.dist, "--version", version]
+        argv += ["--manifest", manifest_file]
         if inno_license is not None:
             argv += ["--inno-license", inno_license]
         self.run("notices", argv)
-        manifest = self.work / "pyinstaller" / "proteia" / "bundle-manifest.json"
-        self.summary["bundle_manifest"] = json.loads(manifest.read_text(encoding="utf-8"))
         size, files = folder_size(self.dist)
         self.summary["bundle"] = {"bytes": size, "files": files}
 
