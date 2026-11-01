@@ -21,7 +21,7 @@ import tifffile
 from PIL import Image, ImageCms, ImageDraw, UnidentifiedImageError
 from skimage import io
 
-from conftest import lzw_encode, synthetic_blot, write_lzw_tiff
+from conftest import guards_in_place, lzw_encode, synthetic_blot, write_lzw_tiff
 from proteia import samples
 from proteia.core import imaging
 from proteia.core.imaging import (
@@ -2071,12 +2071,13 @@ def test_running_out_of_memory_while_reading_the_ink_set_is_not_a_damaged_header
     def run_out(*args, **kwargs):
         raise error("no room")
 
-    monkeypatch.setattr(imaging.tifffile, "TiffFile", run_out)
-    monkeypatch.setattr(imaging, "_pillow_mode", run_out)
-    with pytest.raises(error, match="^no room$"):
-        imaging.ink_set(path)
-    monkeypatch.undo()
+    with monkeypatch.context() as patch:  # only this patch is taken back below
+        patch.setattr(imaging.tifffile, "TiffFile", run_out)
+        patch.setattr(imaging, "_pillow_mode", run_out)
+        with pytest.raises(error, match="^no room$"):
+            imaging.ink_set(path)
     assert imaging.ink_set(path) is None  # a gray file: the failure alone raised
+    assert guards_in_place()
 
 
 def test_the_header_of_a_tiff_with_no_image_says_so(tmp_path, monkeypatch):
@@ -3144,11 +3145,12 @@ def test_a_layout_refused_in_a_file_of_one_frame_is_named_as_before(tmp_path, mo
     for name in ("one frame µ.png", "one frame α.jpg"):
         path = tmp_path / name
         Image.fromarray(_gray(np.uint8, 255)).save(path)
-        monkeypatch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
-        with pytest.raises(imaging.ReadingRefusal) as info:
-            imaging.read_file(path)
-        assert str(info.value) == f"{name}: unsupported image layout (2, 6, 8)"
-        monkeypatch.undo()
+        with monkeypatch.context() as patch:  # only this patch is taken back below
+            patch.setattr(io, "imread", lambda path: np.zeros((2, 6, 8), dtype=np.uint8))
+            with pytest.raises(imaging.ReadingRefusal) as info:
+                imaging.read_file(path)
+            assert str(info.value) == f"{name}: unsupported image layout (2, 6, 8)"
+        assert guards_in_place()
 
 
 _DAMAGED_WORDS = (
