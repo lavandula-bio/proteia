@@ -968,6 +968,44 @@ def test_set_channel_refuses_a_file_changed_or_missing(tmp_path):
     assert stored(s, image).measured_channel is GREEN
 
 
+@pytest.mark.parametrize("read", ["channel", "ladder", "set_channel", "measured"])
+def test_a_read_on_any_channel_is_refused_as_every_read_of_an_imported_image(
+    tmp_path, monkeypatch, read
+):
+    # Reading an image already in the project names it as imported, says what
+    # is wrong and no remedy (#234), whichever channel it is read on: the one
+    # it is measured on, another, or the mean for ladder work.
+    from PIL import UnidentifiedImageError
+
+    s = session_on(tmp_path, save_to_folder)
+    image = import_pixels(s, colour_blot(), "GFP µ.tif")
+    ops.set_channel(s, image, GREEN)
+    reopened = ops.open_project(s.folder, autosave=None)  # nothing cached
+    path = storage.image_path(reopened.folder, stored(reopened, image))
+
+    def unreadable(*args, **kwargs):
+        error = UnidentifiedImageError(f"cannot identify image file {str(path)!r}")
+        raise imaging._unreadable(path.name, error)
+
+    monkeypatch.setattr(session_module, "load_image", unreadable)
+    before = reopened.project
+    reads = {
+        "channel": lambda: reopened.channel_array(image, RED),
+        "ladder": lambda: reopened.calibration_pixels(image),
+        "set_channel": lambda: ops.set_channel(reopened, image, RED),
+        "measured": lambda: reopened.pixels(image),
+    }
+    with pytest.raises(OperationError) as info:
+        reads[read]()
+    assert (info.value.code, str(info.value), info.value.ids) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        "cannot read 'GFP µ.tif': it is damaged or not an image Proteia can read"
+        " (UnidentifiedImageError)",
+        (image,),
+    )
+    assert reopened.project is before
+
+
 def test_set_channel_refuses_an_image_read_in_a_way_proteia_no_longer_reads(tmp_path):
     # A CMYK file imported before #131 converted CMYK: its inks were read as
     # red, green and blue, which differed. Its stored numbers come from that
