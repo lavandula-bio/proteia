@@ -1663,8 +1663,8 @@ RETAKE = "check the imager's original capture, or shorten the exposure and image
 # the mean (#206).
 CHOOSE = (
     "; choose the channel that holds its bands for its image to check it there (if the imager"
-    " marked saturated pixels in a colour, the channel in which those marks look like the"
-    " strongest part of the band)"
+    " marked saturated pixels in a colour: that colour for light bands on a dark background,"
+    " one of the other two for dark bands on a light background)"
 )
 
 

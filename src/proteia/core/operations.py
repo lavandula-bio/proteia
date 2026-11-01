@@ -2468,8 +2468,9 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     the rule picked is picked again, and if that is another channel the image
     is measured on it, with its median, as a channel change measures it
     (:func:`set_channel`); a channel the user chose stays, with the evidence
-    measured again. One read of the file serves both: the evidence and the
-    array its bands are measured on, which the session then keeps. The
+    measured again. The file is read once: for the evidence, and, unless the
+    session holds the array of the channel kept, for the array its bands are
+    measured on, which the session then keeps. The
     choice's evidence cannot be dropped instead, for a chosen channel either:
     nothing would measure it again, and a second target's warning would be
     lost with no word.
@@ -2500,10 +2501,13 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
             if choice.source is ChannelSource.PICKED:
                 channel = picked
             choice = ChannelChoice(channel=channel, source=choice.source, **evidence)
-            array = to_analysis_array(pixels, channel=channel)[0]
+            if channel is image.measured_channel:  # the array the session holds, if it does
+                array = session.cached_pixels(image_id)
+            if array is None:  # made from this read, not read again; kept if bands use it
+                array = to_analysis_array(pixels, channel=channel)[0]
+                kept = {image_id: array} if bands else None
             if channel is not image.measured_channel:
                 background = estimate_background(array)
-            kept = {image_id: array} if bands else None
     if array is None and bands:
         array = _read_for_polarity(image, lambda: session.pixels(image_id))
     warnings = _processed_again(

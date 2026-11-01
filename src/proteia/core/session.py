@@ -572,6 +572,13 @@ class ProjectSession:
         with self.lock:
             return self._read_array(self._project.batch.find_image(image_id), channel)
 
+    def cached_pixels(self, image_id: str) -> np.ndarray | None:
+        """The image's analysis array if the session holds it (of the channel
+        the committed project measures it on, :meth:`pixels`), else None; it
+        reads nothing."""
+        with self.lock:
+            return self._pixels.get(image_id)
+
     def file_pixels(self, image_id: str) -> np.ndarray:
         """The image's stored file's pixels as read (2-D gray, or channels
         last: :func:`~proteia.core.imaging.read_file`), read-only, read and

@@ -97,7 +97,19 @@ _NONE_HELD: Final = "no channel held bands above its background"
 _IMAGEJ: Final = "To compare with ImageJ, measure the same channel (Image > Color > Split Channels)"
 _BY_DEFAULT: Final = "as ImageJ measures colour by default"
 _HOLDS_BANDS: Final = "the channel that holds its bands"
-_TO_CHOOSE: Final = f"choose {_HOLDS_BANDS} to measure it there (its boxes are measured again)."
+# Which channel holds the bands of an export whose imager marked its saturated
+# pixels in a colour, wherever the page or the results say to choose it: every
+# channel holds the bands there, and in two of them a mark reads as a hole in
+# the band, which hides its saturation. On light bands a mark is at the limit
+# in its own colour; on dark bands it is the hole there, and at the limit
+# (zero) in the other two.
+_MARKED: Final = (
+    "if the imager marked saturated pixels in a colour: that colour for light bands on a dark"
+    " background, one of the other two for dark bands on a light background"
+)
+_TO_CHOOSE: Final = (
+    f"choose {_HOLDS_BANDS} to measure it there (its boxes are measured again; {_MARKED})."
+)
 # The page's line for an image no channel was chosen or picked for: one
 # imported before Proteia picked a channel.
 _UNCHOSEN_LINE: Final = (
@@ -105,16 +117,9 @@ _UNCHOSEN_LINE: Final = (
 )
 # What to check first where no channel held bands: most often the polarity.
 _POLARITY: Final = "its polarity (Bands are"
-# How to choose the channel to check over-exposure on exactly (the next step of
-# clipping_not_checked on a lossless colour image measured on the mean). On an
-# export whose imager marked its saturated pixels in a colour, every channel
-# holds the bands, and in two of them a mark reads as a hole in the band, which
-# hides its saturation: the step says which channel keeps them.
-TO_CHECK: Final = (
-    f"choose {_HOLDS_BANDS} for its image to check it there (if the imager marked saturated"
-    " pixels in a colour, the channel in which those marks look like the strongest part of"
-    " the band)"
-)
+# How to choose the channel to check over-exposure on exactly: the next step of
+# clipping_not_checked on a lossless colour image measured on the mean.
+TO_CHECK: Final = f"choose {_HOLDS_BANDS} for its image to check it there ({_MARKED})"
 # What the channel_signal_elsewhere warning tells the user to do with a
 # channel that holds signal apart from the image's: measure it on a copy of
 # the image, on that channel, in the same project. For one channel, then for
@@ -246,8 +251,8 @@ def note(choice: ChannelChoice | None, image: str) -> str:
     if choice is None:
         return (
             f"{image} is measured on the mean of its red, green and blue, as Proteia measured"
-            " colour images before it chose a channel; choose a channel for it under Images to"
-            " measure it there (its boxes are measured again)"
+            f" colour images before it chose a channel; choose {_HOLDS_BANDS} for it under"
+            f" Images to measure it there (its boxes are measured again; {_MARKED})"
         )
     channel = choice.channel
     if choice.source is ChannelSource.CHOSEN:

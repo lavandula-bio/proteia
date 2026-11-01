@@ -1687,7 +1687,9 @@ def test_the_state_says_what_each_image_is_measured_on(tmp_path):
     # where no channel is offered, since the page shows neither there.
     unchosen = (
         "No channel chosen: measured on the mean of its red, green and blue. Choose the"
-        " channel that holds its bands to measure it there (its boxes are measured again)."
+        " channel that holds its bands to measure it there (its boxes are measured again; if"
+        " the imager marked saturated pixels in a colour: that colour for light bands on a dark"
+        " background, one of the other two for dark bands on a light background)."
     )
     older = {"measured": "mean", "source": None, "offered": True, "words": unchosen}
     assert channels() == {
