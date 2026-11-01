@@ -408,7 +408,12 @@ def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
 
 
 def named_refusal(
-    exc: ValueError | OSError, name: str, stored: PurePath, *, remedy: bool = True
+    exc: ValueError | OSError,
+    name: str,
+    stored: PurePath,
+    *,
+    remedy: bool = True,
+    log: bool = True,
 ) -> str:
     """Why reading refused the file named ``name`` (as the user chose it),
     whose stored copy is at ``stored``, in Proteia's words only (#234):
@@ -417,10 +422,10 @@ def named_refusal(
     errno or a file name) by its reason, which names no path; any other
     error of a library's as a file damaged or not an image Proteia can read,
     with the error's kind. A library's words may name the stored copy, so no
-    refusal holds them: they are logged, with the stored copy's path, for
-    diagnosis."""
+    refusal holds them: unless not ``log``, they are logged, with the stored
+    copy's path, for diagnosis."""
     library = exc.__cause__ if isinstance(exc, ReadingRefusal) else exc
-    if library is not None and not isinstance(library, ReadingRefusal):
+    if log and library is not None and not isinstance(library, ReadingRefusal):
         _log.info(
             "reading %s (offered as %r) failed: %s: %s", stored, name, _kind(library), library
         )

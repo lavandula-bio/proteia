@@ -2849,6 +2849,42 @@ def test_an_import_says_what_is_no_damage_and_what_to_do(tmp_path, monkeypatch, 
     np.testing.assert_array_equal(s.pixels(image_id), cropped.astype(np.float64))
 
 
+def test_a_refusal_of_reading_an_image_already_imported_is_logged_once(
+    tmp_path, monkeypatch, caplog
+):
+    # #234 review 3: the library's words were logged on every read of a
+    # stored file reading refuses (each view, each measure): they are logged
+    # once per stored file (image id and SHA-256) in a session, each image's
+    # own, and again in the next session.
+    s = session_on(tmp_path, save_to_folder)
+    images = [import_blot(s, blot(), name) for name in ("β-actin µ.tif", "GAPDH α.tif")]
+    cause = struct.error("unpack requires a buffer of 4 bytes")
+
+    def damaged(path):
+        raise cause
+
+    monkeypatch.setattr(imaging, "_read_tiff", damaged)
+
+    def logged_by_a_session() -> list[str]:
+        reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="proteia"):
+            for _ in range(3):
+                for image in images:
+                    for read in (reopened.pixels, reopened.colour_pixels):
+                        with pytest.raises(OperationError):
+                            read(image)
+        return [record.getMessage() for record in caplog.records]
+
+    def failed(image: str, name: str) -> str:
+        path = storage.image_path(s.folder, s.project.batch.find_image(image))
+        return f"reading {path} (offered as {name!r}) failed: struct.error: {cause}"
+
+    expected = [failed(images[0], "β-actin µ.tif"), failed(images[1], "GAPDH α.tif")]
+    assert logged_by_a_session() == expected
+    assert logged_by_a_session() == expected
+
+
 def _animations() -> dict[str, bytes]:
     """Animations main imported as one image, by the name they are offered
     under: 3 frames of the blot's size, which scikit-image moves to the

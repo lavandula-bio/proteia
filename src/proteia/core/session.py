@@ -397,6 +397,9 @@ class ProjectSession:
         # (image id, SHA-256) -> what its stored file's header says of reading it
         # (outdated_reading): whether it converts CMYK, or what is refused in it.
         self._headers: dict[tuple[str, str], bool | str] = {}
+        # (image id, SHA-256) of the stored files whose reading this session
+        # refused: what the library said is logged once per file (_read_checked).
+        self._refusals_logged: set[tuple[str, str]] = set()
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -555,7 +558,9 @@ class ProjectSession:
         never by its stored copy (:func:`~proteia.core.imaging.named_refusal`,
         #234), and says what is wrong without a remedy: the image is in the
         project already, and importing its file again would lose its boxes.
-        Called with the lock held."""
+        What the library said is logged at the first refusal of the stored
+        file (image id and SHA-256) in the session only, as every view and
+        measure reads it again. Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -566,7 +571,11 @@ class ProjectSession:
             )
 
         def refused(exc: ValueError | OSError, why: str | None = None) -> OperationError:
-            why = why or named_refusal(exc, image.original_name, path, remedy=False)
+            if why is None:
+                key = (image_id, image.sha256)
+                log = key not in self._refusals_logged
+                self._refusals_logged.add(key)
+                why = named_refusal(exc, image.original_name, path, remedy=False, log=log)
             return OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image_id,))
 
         try:
