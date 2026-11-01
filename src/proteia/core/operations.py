@@ -1471,8 +1471,10 @@ def import_image(
     (save the image again as a TIFF, PNG or JPEG file), whose library's words
     are logged instead; running out of memory (close other programs and try
     again, or save a smaller copy of a very large file) or of stack, which is
-    no damage, in a header check above too (#233, :func:`_reading`), which
-    then stores nothing; an error of the system, by its reason.
+    no damage, in a header check above too (#233, :func:`_reading`), and
+    running out of memory converting the pixels or taking their background
+    (:func:`_in_memory`), which then store nothing; an error of the system,
+    by its reason.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
@@ -1524,13 +1526,13 @@ def import_image(
         # file is no TIFF: a 1-bit PNG) is refused as read. Pixels of a known
         # bit depth, integers in the layout reading checked, convert without error.
         _refuse_pixel_type(original_name, pixel_type(read.pixels))
-        loaded = load_pixels(read)
+        loaded = _in_memory(lambda: load_pixels(read), path, original_name)
         if any(warning.code == "cmyk_converted" for warning in loaded.warnings):
             # Failing closed: inks the header check missed are refused as read,
             # never imported converted. Reading drops an alpha channel, so the
             # copy asked for is uncompressed by its bit depth alone.
             _refuse_inks(original_name, Inks("cmyk", True, loaded.bit_depth != 8))
-        background = estimate_background(loaded.array)
+        background = _in_memory(lambda: estimate_background(loaded.array), path, original_name)
         warnings = assess_processed(
             loaded.warnings,
             loaded.array,
@@ -1642,6 +1644,20 @@ def _reading[T](read: Callable[[Path], T], path: Path, original_name: str) -> T:
     try:
         return read(path)
     except EXHAUSTED as exc:
+        raise _refused_reading(exc, original_name, path) from exc
+
+
+def _in_memory[T](make: Callable[[], T], path: Path, original_name: str) -> T:
+    """``make()``, an import's conversion of the pixels of the file offered
+    as ``original_name`` (stored at ``path``) to its analysis array, or its
+    background, the steps a large blot most likely runs out of memory in: a
+    ``MemoryError`` is refused as reading's is (:func:`_refused_reading`,
+    whose next step a smaller copy of the file takes), not raised (#247
+    review). Running out of stack there is Proteia's own bug: raised as it
+    is, as any other error."""
+    try:
+        return make()
+    except MemoryError as exc:
         raise _refused_reading(exc, original_name, path) from exc
 
 

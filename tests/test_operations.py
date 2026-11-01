@@ -4292,22 +4292,100 @@ def _raising(error: BaseException):
 
 
 @pytest.mark.parametrize(
-    "where",
-    ["_refuse_inks", "_refuse_pixel_type", "load_pixels", "estimate_background", "_prepare"],
+    ("where", "kind"),
+    [
+        *[
+            (where, RecursionError)
+            for where in (
+                "_refuse_inks",
+                "_refuse_pixel_type",
+                "load_pixels",
+                "estimate_background",
+                "_prepare",
+            )
+        ],
+        *[(where, MemoryError) for where in ("_refuse_pixel_type", "assess_processed", "_prepare")],
+    ],
 )
-def test_running_out_in_the_imports_own_code_still_surfaces(tmp_path, monkeypatch, where):
+def test_running_out_in_the_imports_own_code_still_surfaces(tmp_path, monkeypatch, where, kind):
     # #233 review of #241: only the reading of the file is refused when it
     # runs out; running out of stack in Proteia's own code around it (a
     # check's refusal, the conversion and measuring of the pixels, the
     # change) is a bug, and surfaces as it does: raised as it is, and
-    # nothing is stored.
-    monkeypatch.setattr(ops, where, _raising(RecursionError("no room")))
+    # nothing is stored. So does running out of memory anywhere but in
+    # reading, converting the pixels and their background (#247 review).
+    monkeypatch.setattr(ops, where, _raising(kind("no room")))
     s = session_on(tmp_path, save_to_folder)
     saved = (s.folder / storage.PROJECT_FILE).read_bytes()
-    with pytest.raises(RecursionError, match="^no room$"):
+    with pytest.raises(kind, match="^no room$"):
         ops.import_image(s, io.BytesIO(_tiff_bytes(blot())), "gel µ.tif", kind=CHEMI, polarity=DARK)
     assert (_stored_files(s), s.project.next_id) == ([], 1)
     assert (s.folder / storage.PROJECT_FILE).read_bytes() == saved
+
+
+def _numpy_memory_error() -> MemoryError:
+    """numpy's MemoryError of an array it cannot allocate, of a private class."""
+    return np._core._exceptions._ArrayMemoryError((2**40,), np.dtype(np.float64))
+
+
+@pytest.mark.parametrize(
+    ("made", "kind"),
+    [
+        (lambda: MemoryError("no room"), "MemoryError"),
+        (_numpy_memory_error, "numpy._core._exceptions._ArrayMemoryError"),
+    ],
+    ids=["memory", "numpy's memory"],
+)
+@pytest.mark.parametrize("where", ["load_pixels", "estimate_background"])
+def test_running_out_of_memory_converting_an_imports_pixels_is_refused(
+    tmp_path, monkeypatch, caplog, where, made, kind
+):
+    # #247 review: the steps most likely to run out on a large blot, the
+    # conversion of the pixels to the analysis array (8 bytes a pixel) and
+    # their background (a median), answered 500. Running out of memory
+    # there is refused as reading's is, nothing stored, and its next step
+    # works as it says: a copy cropped to the blot imports.
+    error = made()
+    pixels = blot()
+    cropped = np.ascontiguousarray(pixels[:, :120])
+    real = getattr(ops, where)
+
+    def run_out_on_the_whole_blot(value, *args, **kwargs):
+        array = value.pixels if where == "load_pixels" else value
+        if array.shape[1] > cropped.shape[1]:
+            raise error
+        return real(value, *args, **kwargs)
+
+    monkeypatch.setattr(ops, where, run_out_on_the_whole_blot)
+    s = session_on(tmp_path, save_to_folder)
+    saved = (s.folder / storage.PROJECT_FILE).read_bytes()
+    with caplog.at_level(logging.INFO, logger="proteia"):
+        refused = _imports_nothing(
+            s,
+            lambda: ops.import_image(
+                s, io.BytesIO(_tiff_bytes(pixels)), "gel µ.tif", kind=CHEMI, polarity=DARK
+            ),
+        )
+    assert (refused.code, refused.ids, refused.detail, str(refused)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        (),
+        None,
+        f"cannot read 'gel µ.tif': {_RAN_OUT[MemoryError]}",
+    )
+    assert refused.__cause__ is error
+    assert (s.dirty, s.project.next_id, (s.folder / storage.PROJECT_FILE).read_bytes()) == (
+        False,
+        1,
+        saved,
+    )
+    stored = s.folder / storage.IMAGES_DIR / "img-1.tif"
+    assert [record.getMessage() for record in caplog.records] == [
+        f"reading {stored} (offered as 'gel µ.tif') failed: {kind}: {error}"
+    ]
+    image_id = ops.import_image(
+        s, io.BytesIO(_tiff_bytes(cropped)), "gel cropped µ.tif", kind=CHEMI, polarity=DARK
+    )
+    np.testing.assert_array_equal(s.pixels(image_id), cropped.astype(np.float64))
 
 
 def test_running_out_in_the_autosave_hook_of_an_import_still_surfaces(tmp_path):
