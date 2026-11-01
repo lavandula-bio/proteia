@@ -3,6 +3,8 @@
 - **Status**: Accepted
 - **Date**: 2026-09-27
 - **Deciders**: Roger Huang
+- **Amended**: 2026-11-01, the Visual C++ runtime the bundle carries, and the
+  install on a clean machine (see [Amendments](#amendments))
 
 ## Context
 
@@ -500,3 +502,54 @@ napari is expected to leave them out; that has not been verified.
 
 - Not tried: both tools that ADR 0001 named produced a working installer, so no
   further tool was evaluated.
+
+## Amendments
+
+**2026-11-01: the Visual C++ runtime, and the install on a clean machine (#54)**
+
+The Trade-offs and the License check say that the bundle carries `MSVCP140.dll`
+copied from the build machine. It no longer does, and the build now checks for it:
+
+- Microsoft lets only Visual Studio licensees redistribute the Visual C++ runtime
+  files that the Visual C++ Redistributable installs into `System32`. The bundle
+  therefore carries only the copies that come with the Python build
+  (`VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`) or with a package's wheel (NumPy's
+  `numpy.libs/msvcp140-<hash>.dll`; the SciPy 1.17.1 wheel carries none).
+  `THIRD_PARTY_NOTICES.txt` lists each copy and where it came from.
+- Five extension modules of scikit-image 0.26.0 import `MSVCP140.dll` by name:
+  `skimage.feature._cascade`, `_haar`, `_hessian_det_appx` and `brief_cy`, and
+  `skimage.util._remap`. scikit-image loads them only when those functions are
+  used, and Proteia uses none of them. They are left out of the bundle, so a later
+  use would fail the same way on every machine (`ModuleNotFoundError`), not only on
+  a Windows without the Visual C++ Redistributable.
+- The build fails if the bundle holds a Universal CRT DLL or a Visual C++ runtime
+  file that neither the Python build nor a package provides, or if a bundled
+  binary imports by name a Visual C++ runtime file that the bundle does not carry.
+  The import tables are read from the files, so the check does not depend on what
+  the self-test happens to run.
+
+The Checks for every installer build include an install, launch, and uninstall on
+a clean Windows machine. The CI runner has Python and the Visual C++
+Redistributable, so only a clean machine shows that the installer brings what it
+needs; the check is run again before each release. The first run, on 2026-11-01:
+
+- The machine was Windows Sandbox: a fresh Windows 11 24H2 (build 26100) with no
+  Python and without the Visual C++ Redistributable (no `msvcp140.dll`,
+  `vcruntime140.dll` or `vcruntime140_1.dll` in `System32`), its network off.
+- The installer was the one the `installer` workflow built from `main` at commit
+  03e530d: `Proteia-0.1.0.dev0-setup.exe`, 53,400,539 bytes, SHA-256
+  `fa7a2a5da143f0a3afa8ea778b09f6b4b293e28f4448b631ea528abc98e28e8b`.
+- A script run at logon installed it for the current user without prompts (exit
+  code 0, in 6 s): the program, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, the
+  uninstaller, the Start Menu shortcut, and the uninstall entry. It put no Visual
+  C++ runtime file into `System32`.
+- The installed self-test passed every step, and its 19 numbers equal those of the
+  build's frozen self-test.
+- Started from its Start Menu shortcut, Proteia answered `/api/status` in 1.8 s
+  (401 without the token) and served its page and script, and the browser opened
+  the page. Every one of the 201 modules the process loaded came from the
+  installation or the Windows folder; the Visual C++ runtime came from the
+  installation's own copies. A second launch reported the running instance, and
+  Quit ended Proteia with exit code 0.
+- The uninstaller removed the program, the shortcut, and the uninstall entry, and
+  kept the session log.
