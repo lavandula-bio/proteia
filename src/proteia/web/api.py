@@ -2109,6 +2109,7 @@ def _area_change(change: ops.AreaChange) -> dict[str, Any]:
         "curves_changed": list(change.curves_changed),
         "dropped_undetected": [list(key) for key in change.dropped_undetected],
         "handed_off": change.handed_off,
+        **_remeasured(change.remeasured, change.largest_change),
     }
 
 
