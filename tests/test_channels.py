@@ -1637,6 +1637,38 @@ def test_the_preview_shows_the_channel_measured(tmp_path):
     assert original not in (mean, green)  # the file's own colours, whatever is measured
 
 
+def test_a_channel_toggle_keeps_the_other_images_previews(tmp_path, monkeypatch):
+    # Eight previews are kept. An image toggled between its channels keeps one
+    # gray preview, of the channel it is measured on, so the other images'
+    # previews stay kept and are not drawn again.
+    workspace, session = _workspace(tmp_path)
+    images = [
+        import_pixels(session, colour_blot(crosstalk=0.4, seed=seed), f"blot {seed} µ.tif")
+        for seed in range(8)
+    ]
+    toggled, others = images[0], images[1:]
+    for image in images:
+        workspace.preview(session, image)
+    drawn: list[str] = []
+    real = session.pixels
+
+    def counting(image_id: str, *, keep: bool = True) -> np.ndarray:
+        drawn.append(image_id)
+        return real(image_id, keep=keep)
+
+    monkeypatch.setattr(session, "pixels", counting)
+    for channel in (GREEN, MEAN, BLUE, GREEN):
+        ops.set_channel(session, toggled, channel)
+        workspace.preview(session, toggled)
+    assert drawn == [toggled] * 4
+    for image in others:
+        workspace.preview(session, image)
+    assert drawn == [toggled] * 4  # every other image's preview was still kept
+    kept = [key for key in workspace._previews if key[0] == toggled]
+    assert kept == [(toggled, stored(session, toggled).sha256, GREEN, False)]
+    assert len(workspace._previews) == 8
+
+
 def test_an_original_colours_preview_is_kept_whatever_channel_is_measured(tmp_path, monkeypatch):
     workspace, session = _workspace(tmp_path)
     image = import_pixels(session, colour_blot(crosstalk=0.4), "GFP µ.tif")
@@ -1647,8 +1679,10 @@ def test_an_original_colours_preview_is_kept_whatever_channel_is_measured(tmp_pa
 
     monkeypatch.setattr(session, "colour_pixels", read_again)
     ops.set_channel(session, image, GREEN)
+    workspace.preview(session, image)  # its gray preview on green: the original stays
     assert workspace.preview(session, image, original=True) is first
     ops.undo(session)
+    workspace.preview(session, image)
     assert workspace.preview(session, image, original=True) is first
 
 
