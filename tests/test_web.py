@@ -1665,39 +1665,73 @@ def test_channel_changes_are_sent_one_after_another_in_the_order_made():
     # table's edits do), after the box edits in flight: so two changes reach
     # the server in the order chosen, each once the one before has its answer,
     # and a box placed or an undo asked for after it waits for it; none is
-    # sent once another project is asked for. A refusal shows the state again
-    # (the select goes back to the channel measured) before it is said.
+    # sent once another project is asked for. A change of the same image still
+    # waiting to be sent, with no edit made since, sends the newer channel
+    # instead (an arrow key changes a closed select once per key). When its
+    # entry goes (answered, refused or not run), the select shows the state
+    # shown again, which may be newer than its answer; a refusal of an image
+    # no longer in the project reads the project again.
     script = _code("app.js")
     _, change = _function(script, "function sendChannel(")
     queued = change.index("proteinPanel.queueEdit(")
     assert change.index("const after = pending();") < queued
-    sent = change.index('return await send("PUT", `/api/images/${imageId}/channel`, { channel })')
-    assert queued < sent < change.index("{ after },")
-    assert sent < change.index("answered();") < change.index("await reportChannel(error, imageId)")
+    sent = change.index(
+        'return await send("PUT", `/api/images/${imageId}/channel`, { channel: asked.channel })'
+    )
+    assert queued < change.index("asked.sent = true;") < sent < change.index("{ after },")
+    assert sent < change.index("await reportChannel(error, imageId)")
+    assert "asked.run.then(answered, answered);" in change
     assert "if (current()) {" in change
+    merged = change[: change.index("const asked = {")]
+    for condition in (
+        "!waiting.sent",
+        "proteinPanel.queue === waiting.tail",
+        "[...inFlight].every((edit) => waiting.made.has(edit))",
+    ):
+        assert condition in merged
+    assert "waiting.channel = channel;" in merged and "return waiting.run;" in merged
+    assert "asked.tail = proteinPanel.queue;" in change
+    assert "renderChannel(" in change[change.index("const answered = () => {") :]
     listener = script[script.index('$("channel").addEventListener("change"') :].split("\n});", 1)[0]
     assert "sendChannel(state.imageId, event.target.value)" in listener
     _, refused = _function(script, "function reportChannel(")
-    assert "render()" in refused
+    assert 'if (error.code === "unknown_id") {\n    await reread()' in refused
 
 
 def test_the_grey_preview_is_kept_under_the_channel_it_shows():
     # The page keeps each image's grey preview with the channel it shows: the
-    # one the server names (its header), once answered. A preview of another
-    # channel than the state shown measures is dropped and fetched again, so
-    # after a channel change, its undo or redo, or one made in another tab, the
-    # view draws the channel measured.
+    # one the server names (its header), once answered. One of another channel
+    # than the state shown measures is never drawn (the select and its line
+    # name the state's): it is dropped, and fetched again if it was asked for
+    # before that state, else the project is read again (the server measures
+    # another channel now). A preview dropped before its answer has its
+    # request aborted; one dropped while the view draws it is closed once the
+    # view draws another or is blanked.
     script = _code("app.js")
     assert f'const CHANNEL_HEADER = "{api.CHANNEL_HEADER}";' in script
     _, fetched = _function(script, "function bitmapOf(")
     assert "response.headers.get(CHANNEL_HEADER)" in fetched
+    assert "{ signal: held.controller.signal }" in fetched
     _, select = _function(script, "function select(")
-    assert "greyOf.get(previews.grey).channel !== measuredOf(image)" in select
+    assert "fetched.get(grey).shows.channel !== measuredOf(image)" in select
     assert "forgetGrey(previews)" in select
     _, view = _function(script, "function renderView(")
-    assert "shows.channel !== measuredOf(image)" in view and "shows.at !==" in view
+    mismatch = view.index("if (shows && shows.channel !== measuredOf(image)) {")
+    drawn = view.index("drawing(bitmap);")
+    assert mismatch < view.index("reread()", mismatch) < view.index("return;", mismatch) < drawn
+    assert "if (shows.at !== state.answered.revision) {" in view
+    blank = view.index("view.setImage(null, 0, 0);")
+    assert blank < view.index("drawing(null);") < mismatch
+    _, forget = _function(script, "function forgetPreview(")
+    assert "held.controller.abort();" in forget and "release(held.bitmap);" in forget
+    _, release = _function(script, "function release(")
+    assert "bitmap === drawnBitmap" in release and "retired.add(bitmap);" in release
+    _, drawing = _function(script, "function drawing(")
+    assert "old.close();" in drawing
     _, measured = _function(script, "function measuredOf(")
     assert 'image.channel ? image.channel.measured : "mean"' in measured
+    _, said = _function(script, "function sayColours(")
+    assert "measuredOf(image)" in said
 
 
 def _object_keys(script: str, name: str) -> set[str]:

@@ -1098,11 +1098,7 @@ class Workspace:
         given in the open project's answers, or no longer kept."""
         return self._charts.svg(key)
 
-    def preview(self, session: ProjectSession, image_id: str, *, original: bool = False) -> bytes:
-        """The image's preview PNG (:meth:`preview_and_channel`)."""
-        return self.preview_and_channel(session, image_id, original=original)[0]
-
-    def preview_and_channel(
+    def preview(
         self, session: ProjectSession, image_id: str, *, original: bool = False
     ) -> tuple[bytes, Channel | None]:
         """The image's preview PNG: of its gray analysis array, or, with
@@ -2249,7 +2245,7 @@ def image_preview(
     which have it). Either is read after the stored file's SHA-256 is checked:
     ``image_file_changed`` or ``unreadable_image`` (422) otherwise. A gray one
     names the channel its pixels are of (:data:`CHANNEL_HEADER`)."""
-    data, channel = workspace.preview_and_channel(session, image_id, original=colour == "original")
+    data, channel = workspace.preview(session, image_id, original=colour == "original")
     headers = {} if channel is None else {CHANNEL_HEADER: channel.value}
     return Response(data, media_type="image/png", headers=headers)
 

@@ -1672,16 +1672,16 @@ def test_the_preview_shows_the_channel_measured(tmp_path):
     workspace, session = _workspace(tmp_path)
     rgb = colour_blot(crosstalk=0.4)
     image = import_pixels(session, rgb, "GFP µ.tif")
-    mean = workspace.preview(session, image)
+    mean = workspace.preview(session, image)[0]
     assert mean == preview_png(rgb.mean(axis=-1))
     ops.set_channel(session, image, GREEN)
-    green = workspace.preview(session, image)
+    green = workspace.preview(session, image)[0]
     assert green == preview_png(rgb[..., 1].astype(np.float64)) != mean
     ops.undo(session)
-    assert workspace.preview(session, image) == mean
+    assert workspace.preview(session, image)[0] == mean
     ops.redo(session)
-    assert workspace.preview(session, image) == green
-    original = workspace.preview(session, image, original=True)
+    assert workspace.preview(session, image)[0] == green
+    original = workspace.preview(session, image, original=True)[0]
     assert original not in (mean, green)  # the file's own colours, whatever is measured
 
 
@@ -1696,24 +1696,24 @@ def test_a_preview_names_the_channel_it_shows(tmp_path):
     gray = import_pixels(session, rgb[..., 1], "gray α.tif")
     mean = preview_png(rgb.mean(axis=-1))
     green = preview_png(rgb[..., 1].astype(np.float64))
-    assert workspace.preview_and_channel(session, image) == (mean, MEAN)
-    assert workspace.preview_and_channel(session, image) == (mean, MEAN)  # kept
+    assert workspace.preview(session, image) == (mean, MEAN)
+    assert workspace.preview(session, image) == (mean, MEAN)  # kept
     ops.set_channel(session, image, BLUE)
     ops.set_channel(session, image, GREEN)
-    assert workspace.preview_and_channel(session, image) == (green, GREEN)
-    assert workspace.preview_and_channel(session, image) == (green, GREEN)  # kept
-    original, channel = workspace.preview_and_channel(session, image, original=True)
+    assert workspace.preview(session, image) == (green, GREEN)
+    assert workspace.preview(session, image) == (green, GREEN)  # kept
+    original, channel = workspace.preview(session, image, original=True)
     assert channel is None and original not in (mean, green)
     ops.undo(session)
-    assert workspace.preview_and_channel(session, image)[1] is BLUE
+    assert workspace.preview(session, image)[1] is BLUE
     ops.undo(session)
-    assert workspace.preview_and_channel(session, image) == (mean, MEAN)
+    assert workspace.preview(session, image) == (mean, MEAN)
     ops.redo(session)
-    assert workspace.preview_and_channel(session, image)[1] is BLUE
+    assert workspace.preview(session, image)[1] is BLUE
     # A gray file: its own values, for its original colours too.
-    plain = workspace.preview_and_channel(session, gray)
+    plain = workspace.preview(session, gray)
     assert plain[1] is MEAN
-    assert workspace.preview_and_channel(session, gray, original=True) == plain
+    assert workspace.preview(session, gray, original=True) == plain
 
 
 def test_a_channel_toggle_keeps_the_other_images_previews(tmp_path, monkeypatch):
@@ -1751,7 +1751,7 @@ def test_a_channel_toggle_keeps_the_other_images_previews(tmp_path, monkeypatch)
 def test_an_original_colours_preview_is_kept_whatever_channel_is_measured(tmp_path, monkeypatch):
     workspace, session = _workspace(tmp_path)
     image = import_pixels(session, colour_blot(crosstalk=0.4), "GFP µ.tif")
-    first = workspace.preview(session, image, original=True)
+    first = workspace.preview(session, image, original=True)[0]
 
     def read_again(image_id: str) -> np.ndarray:
         raise AssertionError("the original colours were read again")
@@ -1759,10 +1759,10 @@ def test_an_original_colours_preview_is_kept_whatever_channel_is_measured(tmp_pa
     monkeypatch.setattr(session, "colour_pixels", read_again)
     ops.set_channel(session, image, GREEN)
     workspace.preview(session, image)  # its gray preview on green: the original stays
-    assert workspace.preview(session, image, original=True) is first
+    assert workspace.preview(session, image, original=True)[0] is first
     ops.undo(session)
     workspace.preview(session, image)
-    assert workspace.preview(session, image, original=True) is first
+    assert workspace.preview(session, image, original=True)[0] is first
 
 
 def test_a_preview_is_kept_under_the_channel_it_was_drawn_from(tmp_path, monkeypatch):
@@ -1781,9 +1781,7 @@ def test_a_preview_is_kept_under_the_channel_it_was_drawn_from(tmp_path, monkeyp
 
     monkeypatch.setattr(session, "pixels", slow)
     drawn: list[tuple[bytes, Channel | None]] = []
-    reader = threading.Thread(
-        target=lambda: drawn.append(workspace.preview_and_channel(session, image))
-    )
+    reader = threading.Thread(target=lambda: drawn.append(workspace.preview(session, image)))
     reader.start()
     assert inside.wait(10)
     changer = threading.Thread(target=ops.set_channel, args=(session, image, GREEN))
@@ -1796,9 +1794,9 @@ def test_a_preview_is_kept_under_the_channel_it_was_drawn_from(tmp_path, monkeyp
     mean = preview_png(rgb.mean(axis=-1))
     assert drawn == [(mean, MEAN)]  # named as drawn, though green is measured by its answer
     assert stored(session, image).measured_channel is GREEN
-    assert workspace.preview(session, image) == preview_png(rgb[..., 1].astype(np.float64))
+    assert workspace.preview(session, image)[0] == preview_png(rgb[..., 1].astype(np.float64))
     ops.undo(session)
-    assert workspace.preview(session, image) == mean
+    assert workspace.preview(session, image)[0] == mean
 
 
 def test_a_preview_asked_before_a_channel_change_is_kept_under_the_new_one(tmp_path, monkeypatch):
@@ -1825,9 +1823,7 @@ def test_a_preview_asked_before_a_channel_change_is_kept_under_the_new_one(tmp_p
 
     monkeypatch.setattr(workspace, "_lock", Gate())
     drawn: list[tuple[bytes, Channel | None]] = []
-    reader = threading.Thread(
-        target=lambda: drawn.append(workspace.preview_and_channel(session, image))
-    )
+    reader = threading.Thread(target=lambda: drawn.append(workspace.preview(session, image)))
     reader.start()
     assert inside.wait(10)
     ops.set_channel(session, image, GREEN)
@@ -1837,6 +1833,6 @@ def test_a_preview_asked_before_a_channel_change_is_kept_under_the_new_one(tmp_p
     green = preview_png(rgb[..., 1].astype(np.float64))
     assert drawn == [(green, GREEN)]  # asked while on the mean: named as drawn, on green
     ops.undo(session)
-    assert workspace.preview(session, image) == preview_png(rgb.mean(axis=-1))
+    assert workspace.preview(session, image)[0] == preview_png(rgb.mean(axis=-1))
     ops.redo(session)
-    assert workspace.preview(session, image) == green
+    assert workspace.preview(session, image)[0] == green

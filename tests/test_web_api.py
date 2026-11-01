@@ -604,15 +604,15 @@ def test_original_colours_are_kept_with_the_last_previews_shown(tmp_path, monkey
         return colour_pixels(self, image_id)
 
     monkeypatch.setattr(type(session), "colour_pixels", counting)
-    colour = workspace.preview(session, image_id, original=True)
-    assert workspace.preview(session, image_id, original=True) == colour
+    colour = workspace.preview(session, image_id, original=True)[0]
+    assert workspace.preview(session, image_id, original=True)[0] == colour
     assert reads == [image_id]  # read once, then kept
 
     monkeypatch.setattr(api, "_PREVIEWS_KEPT", 1)
     # The gray one is another preview: kept in place of the colour one, the last shown.
-    assert workspace.preview(session, image_id) != colour
+    assert workspace.preview(session, image_id)[0] != colour
     assert image_id not in session._pixels  # neither holds the image in memory
-    assert workspace.preview(session, image_id, original=True) == colour
+    assert workspace.preview(session, image_id, original=True)[0] == colour
     assert reads == [image_id, image_id]
 
 
@@ -1154,7 +1154,7 @@ def test_a_preview_does_not_keep_the_full_image_in_memory(tmp_path):
             session, stream, "a.tif", kind="chemiluminescence", polarity="dark_on_light"
         )
     session._pixels.clear()  # as if the image had not been worked on in this session
-    assert workspace.preview(session, image_id).startswith(b"\x89PNG")
+    assert workspace.preview(session, image_id)[0].startswith(b"\x89PNG")
     assert image_id not in session._pixels
 
 
