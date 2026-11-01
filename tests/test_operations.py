@@ -13,6 +13,7 @@ path, from an imported file to the chart, to the golden numbers of
 import codecs
 import csv
 import dataclasses
+import errno
 import functools
 import hashlib
 import inspect
@@ -2324,8 +2325,8 @@ _SEVERAL_FRAMES = (
     " quantified; save one frame as its own file and import it again"
 )
 _UNIDENTIFIED = (
-    "it is not an image Proteia can read (a TIFF, PNG or JPEG file), or it is damaged; save the"
-    " image as a TIFF, PNG or JPEG file and import it again"
+    "it is damaged or not an image Proteia can read (UnidentifiedImageError); save the image"
+    " again as a TIFF, PNG or JPEG file and import that"
 )
 _GRAY_OR_RGB = "which Proteia does not convert to gray; save the image as a gray or RGB TIFF"
 # The refusals of #234 by the name the file is offered under: the file, and
@@ -2387,9 +2388,9 @@ def test_the_refusals_of_234_name_only_the_chosen_file_in_full(tmp_path):
         " import it again"
     )
     assert answers["not an image µ.png"] == (
-        "cannot read 'not an image µ.png': it is not an image Proteia can read (a TIFF, PNG or"
-        " JPEG file), or it is damaged; save the image as a TIFF, PNG or JPEG file and import it"
-        " again"
+        "cannot read 'not an image µ.png': it is damaged or not an image Proteia can read"
+        " (UnidentifiedImageError); save the image again as a TIFF, PNG or JPEG file and import"
+        " that"
     )
     assert answers["cielab µ.tif"] == (
         "cannot read 'cielab µ.tif': its pixels are stored in the CIELAB colour space, which"
@@ -2474,7 +2475,7 @@ def test_a_jpeg_of_several_pictures_is_imported_as_its_first_as_before(tmp_path,
         (
             "unknown µ.png",
             b"not an image at all",
-            "; save the image as a TIFF, PNG or JPEG file and import it again",
+            "; save the image again as a TIFF, PNG or JPEG file and import that",
         ),
         (
             "damaged α.tif",
@@ -2625,7 +2626,7 @@ _NAMING_THE_COPY = {
     "folder": (lambda path: OSError(f"no room in {path.parent}"), "OSError"),
     "file name": (lambda path: ValueError(f"{path.name} is cut short"), "ValueError"),
     "damaged": (
-        lambda path: imaging._damaged(path.name, OSError(f"at {path}")),
+        lambda path: imaging._unreadable(path.name, OSError(f"at {path}")),
         "OSError",
     ),
 }
@@ -2666,6 +2667,15 @@ def _imported_then_reopened(tmp_path: Path) -> tuple[ProjectSession, str]:
     return ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock()), image
 
 
+def _unidentified(path: Path) -> imaging.ReadingRefusal:
+    """Reading's refusal of the file at ``path`` that Pillow cannot tell the
+    format of, with Pillow's error, which names it by its full path."""
+    from PIL import UnidentifiedImageError
+
+    error = UnidentifiedImageError(f"cannot identify image file {str(path)!r}")
+    return imaging._unreadable(path.name, error)
+
+
 # How reading an image already in the project fails, by case: where (the
 # session's read of its pixels, of its colours, or of its bytes for their
 # SHA-256), what is raised for the stored copy at a path, and what the
@@ -2674,13 +2684,9 @@ def _imported_then_reopened(tmp_path: Path) -> tuple[ProjectSession, str]:
 _READING_AGAIN = {
     "unidentified": (
         "load_image",
-        lambda path: imaging.ReadingRefusal(
-            path.name,
-            "it is not an image Proteia can read (a TIFF, PNG or JPEG file), or it is damaged",
-            "save the image as a TIFF, PNG or JPEG file and import it again",
-        ),
-        "cannot read 'β-actin µ.tif': it is not an image Proteia can read (a TIFF, PNG or JPEG"
-        " file), or it is damaged",
+        _unidentified,
+        "cannot read 'β-actin µ.tif': it is damaged or not an image Proteia can read"
+        " (UnidentifiedImageError)",
     ),
     "several frames": (
         "load_image",
@@ -2703,7 +2709,7 @@ _READING_AGAIN = {
     ),
     "colours": (
         "read_colours",
-        lambda path: imaging._damaged(path.name, struct.error("bad bytes")),
+        lambda path: imaging._unreadable(path.name, struct.error("bad bytes")),
         "cannot read 'β-actin µ.tif': it is damaged or not an image Proteia can read"
         " (struct.error)",
     ),
@@ -2739,6 +2745,108 @@ def test_reading_an_image_already_imported_names_it_as_imported(tmp_path, monkey
     )
     assert "again" not in str(info.value)
     assert (reopened.project is before, reopened._pixels) == (True, {})
+
+
+def _nan_blot() -> np.ndarray:
+    """:func:`blot` as floating point, with one NaN pixel."""
+    pixels = (blot() / 65535).astype(np.float32)
+    pixels[3, 4] = np.nan
+    return pixels
+
+
+# What reading a TIFF meets that is no damage of the file, by case: what
+# its reader (imaging._read_tiff) raises, or gives as its pixels, and what
+# the refusal says is wrong, after "cannot read '<name>': ".
+_NO_DAMAGE = {
+    "memory": (
+        lambda: np._core._exceptions._ArrayMemoryError((2**40,), np.dtype(np.uint8)),
+        "Proteia ran out of memory reading it; close other programs and try again",
+    ),
+    "stack": (
+        lambda: RecursionError("maximum recursion depth exceeded"),
+        "Proteia ran out of stack reading it",
+    ),
+    "input/output": (lambda: OSError(errno.EIO, "Input/output error"), "Input/output error"),
+    "access": (lambda: PermissionError(errno.EACCES, "Permission denied"), "Permission denied"),
+    "nan": (_nan_blot, "it has NaN or infinite pixel values"),
+}
+
+
+def _reading_tiffs_as(made) -> object:
+    """A TIFF reader (imaging._read_tiff) that raises what ``made`` makes, or
+    gives it as the file's pixels."""
+
+    def read_tiff(path):
+        outcome = made()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome, False, None
+
+    return read_tiff
+
+
+@pytest.mark.parametrize("case", list(_NO_DAMAGE))
+def test_reading_an_image_already_imported_says_what_is_no_damage(tmp_path, monkeypatch, case):
+    # #234 review 3: running out of memory or of stack, an error of the
+    # system with no path (a network drive that drops) and Proteia's own
+    # refusal of NaN pixels were each said to be damage ("damaged or not an
+    # image Proteia can read (numpy._core._exceptions._ArrayMemoryError)").
+    # Each says what happened, with no advice to import the file.
+    made, words = _NO_DAMAGE[case]
+    reopened, image = _imported_then_reopened(tmp_path)
+    monkeypatch.setattr(imaging, "_read_tiff", _reading_tiffs_as(made))
+    # NaN pixels are refused in the analysis array; colours show them.
+    reads = [reopened.pixels] if case == "nan" else [reopened.pixels, reopened.colour_pixels]
+    for read in reads:
+        with pytest.raises(OperationError) as info:
+            read(image)
+        assert (info.value.code, info.value.ids, str(info.value)) == (
+            ErrorCode.UNREADABLE_IMAGE,
+            (image,),
+            f"cannot read 'β-actin µ.tif': {words}",
+        )
+        assert "import" not in str(info.value)
+
+
+@pytest.mark.parametrize("case", ["memory", "stack", "input/output", "access"])
+def test_an_import_says_what_is_no_damage_and_what_to_do(tmp_path, monkeypatch, case):
+    # #234 review 3: as reading an image already in the project, with what
+    # to do for the file: of memory, a smaller copy of a very large file (a
+    # copy cropped to the blot, done here, imports); of stack, the image
+    # saved again; of the system, nothing to do to the file.
+    made, words = _NO_DAMAGE[case]
+    steps = {
+        "memory": ", or, if the file is very large, save a smaller copy (such as one cropped to"
+        " the blot) and import that",
+        "stack": "; save the image again as a TIFF, PNG or JPEG file and import that",
+    }
+    real = imaging._read_tiff
+    pixels = blot()
+    cropped = pixels[:, :120]
+
+    def read_tiff(path):
+        read = real(path)
+        if read[0].size > cropped.size:  # runs out on the whole blot only
+            raise made()
+        return read
+
+    monkeypatch.setattr(imaging, "_read_tiff", read_tiff)
+    s = session_on(tmp_path)
+    refused = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(_tiff_bytes(pixels)), "gel µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert (refused.code, refused.ids, str(refused)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        (),
+        f"cannot read 'gel µ.tif': {words}{steps.get(case, '')}",
+    )
+    image_id = ops.import_image(
+        s, io.BytesIO(_tiff_bytes(cropped)), "gel cropped µ.tif", kind=CHEMI, polarity=DARK
+    )
+    np.testing.assert_array_equal(s.pixels(image_id), cropped.astype(np.float64))
 
 
 def _animations() -> dict[str, bytes]:

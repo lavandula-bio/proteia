@@ -1462,9 +1462,11 @@ def import_image(
     not convert; a file of more than one frame (an animated PNG, GIF or
     WebP: save one frame as its own file), refused here only
     (:func:`~proteia.core.imaging.check_frames`), so that one imported before
-    reads as it did; one Pillow cannot tell the format of, or one damaged
-    (save the image as, or again as, a TIFF, PNG or JPEG file), whose
-    library's words are logged instead.
+    reads as it did; one damaged, or that Pillow cannot tell the format of
+    (save the image again as a TIFF, PNG or JPEG file), whose library's words
+    are logged instead; running out of memory (close other programs and try
+    again, or save a smaller copy of a very large file) or of stack, which is
+    no damage; an error of the system, by its reason.
     """
     kind = _member(ImageKind, kind, "image kind")
     polarity = _member(Polarity, polarity, "polarity")
