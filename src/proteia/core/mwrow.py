@@ -270,31 +270,34 @@ def lane_span(batch: Batch, protein: Protein, fitted: mwcal.Calibration) -> Lane
     if n < 1:
         return None
     image = batch.image_of(protein)
+    arena = batch.arena_of(protein)
     replaced = {
         band.id
         for band in batch.boxes_of(protein).bands
         if band.band_index == 0 and not band.manually_edited and band.source in DETECTING_SOURCES
     }
-    anchors = lane_anchors(batch, image, without=replaced)
+    anchors = lane_anchors(batch, arena.id, without=replaced)
     span = span_of_anchors(anchors, n, image.width)
     if span is not None:
-        ids = tuple(lane_anchor_ids(batch, image, without=replaced))
+        ids = tuple(lane_anchor_ids(batch, arena.id, without=replaced))
         return LaneSpan(*span, "anchors", ids, image.id)
-    membrane = batch.membrane_of(image.id)
+    # The membrane's areas on the other images of the group: linked images
+    # hold the same areas, so the same lanes.
+    membrane = batch.membrane_of_protein(protein)
     group = batch.group_of(membrane, image.id)
-    best: tuple[int, str, list[tuple[float, int]]] | None = None
-    for other in batch.images_of(membrane):
-        if other.id == image.id or other.id not in group:
+    best: tuple[int, str, str, list[tuple[float, int]]] | None = None
+    for other in batch.arenas_of(membrane):
+        if other.image_id == image.id or other.image_id not in group:
             continue
-        found = lane_anchors(batch, other)
+        found = lane_anchors(batch, other.id)
         kept = _kept_lanes(found)
         if kept >= 2 and (best is None or kept > best[0]):
-            best = (kept, other.id, found)
+            best = (kept, other.image_id, other.id, found)
     if best is not None:
-        _, other_id, found = best
+        _, other_id, other_arena, found = best
         span = span_of_anchors(found, n, image.width)
         if span is not None:
-            ids = tuple(lane_anchor_ids(batch, batch.find_image(other_id)))
+            ids = tuple(lane_anchor_ids(batch, other_arena))
             return LaneSpan(*span, "group_anchors", ids, other_id)
     span = span_between_ladders(fitted, n, image.width)
     return None if span is None else LaneSpan(*span, "ladders")
@@ -333,7 +336,7 @@ def predict(batch: Batch, protein: Protein) -> Prediction | None:
     if not placed_on_add(batch, protein) or protein.expected_mw is None:
         return None
     image = batch.image_of(protein)
-    fitted = mwcal.calibration_for(batch, batch.membrane_of(image.id), image.id)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of_protein(protein), image.id)
     if not isinstance(fitted, mwcal.Calibration):  # never: placed_on_add found the curve
         return None
     mws = (protein.expected_mw,)

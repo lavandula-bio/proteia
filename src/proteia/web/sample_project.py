@@ -133,7 +133,7 @@ def _set_up(session: ProjectSession, files: dict[str, bytes]) -> None:
         samples.MARKER_FILE,
         kind=ImageKind.VISIBLE_MARKER,
         polarity=dark,
-        membrane_id=session.project.batch.membrane_of(blot).id,
+        membrane_id=session.project.batch.membranes_on(blot)[0].id,
     )
     ops.set_lanes(
         session,

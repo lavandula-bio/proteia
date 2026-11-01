@@ -223,6 +223,50 @@ def test_every_band_background_belongs_to_the_projects_method(project):
         revalidate(_edit(project, "band-10", background_mode="ring"))
 
 
+def test_a_legacy_level_on_a_drawn_area_is_one_level_for_the_area(project):
+    # On a drawn membrane area a legacy level is the median of the area's
+    # pixels (#243), which the model holds none of: any one level is taken
+    # for all the area's bands (band-10 to band-12, prot-7's row on
+    # arena-20), never two, nor a spread; over the whole image it stays the
+    # image's median.
+    from proteia.core.model import Outline
+
+    legacy = as_legacy(project)
+    images = {image.id: image for image in legacy.batch.images}
+    drawn = legacy.model_copy(deep=True)
+    for membrane in drawn.batch.membranes:
+        for arena in membrane.arenas:
+            image = images[arena.image_id]
+            arena.outline = Outline(x0=0, y0=0, x1=image.width, y1=image.height)
+    other = 199.5
+    level = legacy.batch.find_band("band-10")[1].background_level
+    assert level != other
+    area = drawn.model_copy(deep=True)
+    for band_id in ("band-10", "band-11", "band-12"):
+        _edit(area, band_id, background_level=other)
+    taken = revalidate(area)
+    assert {taken.batch.find_band(b)[1].background_level for b in ("band-10", "band-12")} == {other}
+    # The first band of the area apart, or a later one: both named, with their levels.
+    for band_id, named, levels in (
+        ("band-10", "band-10 and band-11", f"{other!r} and {level!r}"),
+        ("band-12", "band-10 and band-12", f"{level!r} and {other!r}"),
+    ):
+        with pytest.raises(ValidationError) as info:
+            revalidate(_edit(drawn.model_copy(deep=True), band_id, background_level=other))
+        assert (
+            f"bands {named} lie on one drawn membrane area at the levels {levels}: a"
+            " global_median background there is that area's median, the same for every band"
+            " on it"
+        ) in str(info.value)
+    with pytest.raises(
+        ValidationError,
+        match="band band-10: a global_median background on a drawn membrane area has no spread",
+    ):
+        revalidate(_edit(drawn.model_copy(deep=True), "band-10", background_spread=0.5))
+    with pytest.raises(ValidationError, match="its image's median, with no spread"):
+        revalidate(_edit(legacy.model_copy(deep=True), "band-10", background_level=other))
+
+
 def test_field_defaults():
     protein = Protein(
         id="prot-1",
