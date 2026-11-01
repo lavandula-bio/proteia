@@ -12,12 +12,18 @@ with the build environment's Python.
 from __future__ import annotations
 
 import argparse
+import enum
 import json
+import os
+import posixpath
 import re
+import struct
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Final
+from typing import Any, Final
 
 APP_NAME: Final = "Proteia"
 EXE_NAME: Final = "Proteia.exe"
@@ -102,14 +108,19 @@ VC_RUNTIME_FILES: Final = re.compile(rf"^({_VC_RUNTIME_NAMES})\.dll$", re.IGNORE
 # The same files under Microsoft's names or under one a package's wheel gave its
 # own copy (numpy.libs/msvcp140-<hash>.dll, as delvewheel names them).
 VC_RUNTIME_COPIES: Final = re.compile(rf"^({_VC_RUNTIME_NAMES})([-.][^\\/]*)?\.dll$", re.IGNORECASE)
-# Of those, the ones the Python runtime's Windows build includes, which its
-# LICENSE.txt covers (notices.py, section 1). Besides these the bundle carries
-# only packages' own copies, from their folders: Microsoft lets only Visual
-# Studio licensees redistribute the files, so the spec leaves out the copies
-# PyInstaller finds elsewhere (System32's MSVCP140.dll, #54).
+# Of those, the ones the Python runtime's Windows build includes, in its own
+# folder, which its LICENSE.txt covers (notices.py, section 1). Besides these the
+# bundle carries only packages' own copies, from their folders: Microsoft lets
+# only Visual Studio licensees redistribute the files, so the spec leaves out the
+# copies PyInstaller finds elsewhere (System32's MSVCP140.dll, #54).
 PYTHON_VC_RUNTIME: Final = frozenset({"vcruntime140.dll", "vcruntime140_1.dll"})
 # The bundle's folder next to Proteia.exe, which PyInstaller puts everything in.
 CONTENTS: Final = "_internal"
+# The suffixes of the files whose import tables the build reads.
+BINARY_SUFFIXES: Final = (".pyd", ".dll", ".exe")
+# The bundle manifest's key for the spec's classification of the Visual C++
+# runtime files (:func:`read_vc_runtime`).
+VC_RUNTIME_KEY: Final = "vc_runtime"
 # PyInstaller's own modules in the bundle (its runtime hooks and their helpers).
 PYINSTALLER_MODULES: Final = re.compile(r"^(pyi_rth_\w+|_pyi_rth_utils|pyimod\d\d_\w+)$")
 
@@ -129,116 +140,383 @@ def is_vc_runtime(name: str) -> bool:
     return VC_RUNTIME_FILES.match(PureWindowsPath(name).name) is not None
 
 
-def _is_python_vc_runtime(name: str) -> bool:
-    return PureWindowsPath(name).name.lower() in PYTHON_VC_RUNTIME
+def is_vc_runtime_copy(name: str) -> bool:
+    """Whether ``name`` (a file name or a path, either separator) is a Visual C++
+    runtime DLL under Microsoft's name or a package's own name for its copy
+    (:data:`VC_RUNTIME_COPIES`)."""
+    return VC_RUNTIME_COPIES.match(PureWindowsPath(name).name) is not None
 
 
-def from_package_folder(source: str, package_roots: Iterable[str]) -> bool:
-    """Whether ``source`` (a file's path on the build machine) lies in a folder
-    inside one of ``package_roots`` (the build environment's site-packages
-    folders): a file of an installed package, not one PyInstaller found elsewhere
-    (System32, the Python installation)."""
-    path = PureWindowsPath(source)
-    for root in map(PureWindowsPath, package_roots):
-        if path.is_relative_to(root) and len(path.relative_to(root).parts) > 1:
-            return True
-    return False
+class VcKind(enum.StrEnum):
+    """Where a Visual C++ runtime file PyInstaller collected came from: the
+    spec's classification (:func:`classify_vc_runtime`), which the bundle check
+    and the notices re-check (#54)."""
+
+    PYTHON = "python"  # the Python build's own copy, from its folder
+    WHEEL = "wheel"  # a package's own copy, from its folder in site-packages
+    ELSEWHERE = "elsewhere"  # found anywhere else (System32, say): left out
+
+
+# The kinds whose copies the bundle carries.
+CARRIED_KINDS: Final = frozenset({VcKind.PYTHON, VcKind.WHEEL})
+
+
+@dataclass(frozen=True)
+class VcRuntime:
+    """The spec's classification of one Visual C++ runtime file."""
+
+    path: str  # its path in the bundle folder: _internal/numpy.libs/msvcp140-<hash>.dll
+    kind: VcKind
+    folder: str | None = None  # WHEEL: the package's folder in site-packages (numpy.libs)
+    source: str | None = None  # ELSEWHERE: where PyInstaller found it
+
+    def to_json(self) -> dict[str, str]:
+        entry = {"path": self.path, "kind": str(self.kind)}
+        if self.folder is not None:
+            entry["folder"] = self.folder
+        if self.source is not None:
+            entry["source"] = self.source
+        return entry
+
+    @classmethod
+    def from_json(cls, entry: Mapping[str, Any]) -> VcRuntime:
+        """The entry :meth:`to_json` wrote; ``ValueError`` for an unknown kind."""
+        return cls(entry["path"], VcKind(entry["kind"]), entry.get("folder"), entry.get("source"))
+
+
+def read_vc_runtime(manifest: Mapping[str, Any]) -> list[VcRuntime]:
+    """The classification the bundle ``manifest`` records (none when it records
+    none, so that every Visual C++ runtime file in the bundle is unclassified)."""
+    return [VcRuntime.from_json(entry) for entry in manifest.get(VC_RUNTIME_KEY, [])]
+
+
+# Turns a path on the build machine into the one it stands for, links followed:
+# os.path.realpath, which on Windows also resolves a substituted drive and a
+# short (8.3) name.
+Resolve = Callable[[str], str]
+
+
+def _resolved(path: str, resolve: Resolve) -> PureWindowsPath:
+    return PureWindowsPath(resolve(str(path)))
+
+
+def package_folder(
+    source: str, package_roots: Iterable[str], resolve: Resolve = os.path.realpath
+) -> str | None:
+    """The folder of an installed package that ``source`` (a file's path on the
+    build machine) lies in, if any: its first part below one of ``package_roots``
+    (the build environment's site-packages folders), such as ``numpy.libs``. A
+    file directly in a root is no package's. Decided on resolved paths, so a
+    junction, a substituted drive or a short name gives the same answer."""
+    path = _resolved(source, resolve)
+    for root in package_roots:
+        root_path = _resolved(root, resolve)
+        if path.is_relative_to(root_path):
+            parts = path.relative_to(root_path).parts
+            if len(parts) > 1:
+                return parts[0]
+    return None
+
+
+def classify_vc_runtime(
+    name: str,
+    source: str,
+    package_roots: Iterable[str],
+    python_dir: str,
+    resolve: Resolve = os.path.realpath,
+) -> VcRuntime:
+    """The kind of the Visual C++ runtime file PyInstaller would put at ``name``
+    (in :data:`CONTENTS`) from ``source``: a package's own copy when ``source``
+    lies in a package's folder (:func:`package_folder`); the Python build's when
+    it is ``vcruntime140.dll`` or ``vcruntime140_1.dll`` directly in
+    ``python_dir``, the Python installation's folder (``sys.base_prefix``), both
+    resolved; otherwise from elsewhere, such as System32, which the bundle does
+    not carry (#54)."""
+    path = f"{CONTENTS}/{PureWindowsPath(name).as_posix()}"
+    folder = package_folder(source, package_roots, resolve)
+    if folder is not None:
+        return VcRuntime(path, VcKind.WHEEL, folder=folder)
+    if PureWindowsPath(name).name.lower() in PYTHON_VC_RUNTIME and _resolved(
+        source, resolve
+    ).parent == _resolved(python_dir, resolve):
+        return VcRuntime(path, VcKind.PYTHON)
+    return VcRuntime(path, VcKind.ELSEWHERE, source=str(source))
 
 
 def leave_out(
-    binaries: Iterable[tuple[str, str, str]], package_roots: Iterable[str]
-) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
+    binaries: Iterable[tuple[str, str, str]],
+    package_roots: Iterable[str],
+    python_dir: str,
+    resolve: Resolve = os.path.realpath,
+) -> tuple[list[tuple[str, str, str]], dict[str, list[str]], list[VcRuntime]]:
     """PyInstaller's ``binaries`` (``(name in the bundle, source, kind)``) without
-    the ones the bundle leaves out, and the names of those, by why: the Universal
-    CRT DLLs (:func:`is_universal_crt`), and the Visual C++ runtime files that are
-    neither the Python build's nor a package's own (:func:`from_package_folder`
-    with ``package_roots``), such as System32's ``MSVCP140.dll`` (#54)."""
+    the ones the bundle leaves out; the names of those, by why: the Universal CRT
+    DLLs (:func:`is_universal_crt`), and the Visual C++ runtime files from
+    elsewhere than the Python build or a package (such as System32's
+    ``MSVCP140.dll``, #54); and the classification of every Visual C++ runtime
+    file (:func:`classify_vc_runtime`), kept or not, by path."""
     roots = list(package_roots)
     kept: list[tuple[str, str, str]] = []
     left_out: dict[str, list[str]] = {"universal_crt": [], "vc_runtime": []}
+    classified: list[VcRuntime] = []
     for entry in binaries:
         name, source = entry[0], entry[1]
         if is_universal_crt(name):
             left_out["universal_crt"].append(name)
-        elif (
-            is_vc_runtime(name)
-            and not _is_python_vc_runtime(name)
-            and not from_package_folder(source, roots)
-        ):
-            left_out["vc_runtime"].append(name)
+            continue
+        if is_vc_runtime_copy(name):
+            vc = classify_vc_runtime(name, source, roots, python_dir, resolve)
+            classified.append(vc)
+            if vc.kind not in CARRIED_KINDS:
+                left_out["vc_runtime"].append(name)
+                continue
+        kept.append(entry)
+    left_out = {reason: sorted(names) for reason, names in left_out.items()}
+    return kept, left_out, sorted(classified, key=lambda vc: vc.path.lower())
+
+
+def dll_search_folders(binary: str) -> list[str]:
+    """The folders of the bundle (paths in it, ``.`` for the bundle folder) where
+    Windows looks for the DLLs the binary at ``binary`` (its path in the bundle
+    folder) imports by name. For a DLL or an extension module: :data:`CONTENTS`,
+    which the bootloader adds (``SetDllDirectoryW``); the binary's own folder,
+    which Python adds when it loads an extension module
+    (``LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR``); and, for a binary of a package, the
+    package's ``<name>.libs`` folder, which delvewheel's patch to the package's
+    ``__init__.py`` adds with ``os.add_dll_directory`` (NumPy's and SciPy's). For
+    an ``.exe``, its own folder only: Windows resolves its imports when its
+    process starts, before anything adds a folder. A DLL elsewhere in the bundle
+    is found only if something else loaded it first."""
+    own = posixpath.dirname(binary) or "."
+    if binary.lower().endswith(".exe"):
+        return [own]
+    folders = [CONTENTS, own]
+    parts = PurePosixPath(binary).parts
+    if len(parts) > 2 and parts[0] == CONTENTS:
+        folders.append(f"{CONTENTS}/{top_level('/'.join(parts[1:]))}.libs")
+    return list(dict.fromkeys(folders))
+
+
+def vc_runtime_problems(
+    imports: Mapping[str, Sequence[str]], classified: Iterable[VcRuntime]
+) -> list[str]:
+    """What is wrong with the Visual C++ runtime in the bundle: ``imports`` maps
+    each of its binaries (its path in the bundle folder) to the DLL names it
+    imports (:func:`bundle_imports`), and ``classified`` is the spec's
+    classification (:func:`read_vc_runtime`). Each Visual C++ runtime file among
+    the binaries must be one the spec classified as the Python build's or a
+    package's own copy; and each such DLL a binary imports by name must be one of
+    those in a folder Windows looks in for that binary (:func:`dll_search_folders`).
+    Otherwise Windows looks for it in System32, where only the Visual C++
+    Redistributable puts Microsoft's names (#54). A file the spec left out that the
+    bundle cannot do without is a problem of its own, reported first, and its
+    importers are not listed one by one: one of the Python build's two files, or
+    a package's renamed copy, which no Windows provides."""
+    in_bundle = {path.lower() for path in imports}
+    importers = Counter(name for dlls in imports.values() for name in {d.lower() for d in dlls})
+    problems = []
+    causes = set()
+    for vc in sorted(classified, key=lambda vc: vc.path.lower()):
+        name = PurePosixPath(vc.path).name.lower()
+        if vc.kind in CARRIED_KINDS or vc.path.lower() in in_bundle:
+            continue
+        if name in PYTHON_VC_RUNTIME:
+            problems.append(
+                f"{vc.path}: the Python build's own Visual C++ runtime file, which the spec"
+                f" left out: PyInstaller found it in {vc.source}, not directly in the Python"
+                " installation's folder (sys.base_prefix); bundled binaries that import it:"
+                f" {importers[name]}. Build with a Python whose own folder holds"
+                " vcruntime140.dll and vcruntime140_1.dll, such as an installed or"
+                " uv-managed CPython (#54)"
+            )
+        elif not is_vc_runtime(name):
+            problems.append(
+                f"{vc.path}: a package's renamed copy of the Visual C++ runtime, which the spec"
+                f" left out: PyInstaller found it in {vc.source}, outside every package folder"
+                " of the build environment, and no Windows provides it under that name;"
+                f" bundled binaries that import it: {importers[name]}. Install the package"
+                " that ships it in the build environment (uv.lock), or leave out what needs"
+                " it (bundle.py) (#54)"
+            )
         else:
-            kept.append(entry)
-    return kept, {reason: sorted(names) for reason, names in left_out.items()}
+            continue
+        causes.add(name)
+    by_path = {vc.path.lower(): vc for vc in classified}
+    carried = []
+    for path in sorted(imports):
+        if not is_vc_runtime_copy(path):
+            continue
+        vc = by_path.get(path.lower())
+        if vc is None:
+            problems.append(
+                f"{path}: a Visual C++ runtime file the spec's classification (the bundle"
+                " manifest) does not list, so nothing says where it came from; the bundle"
+                " carries only the Python build's copies and packages' own. Collect it as a"
+                " binary, which the spec classifies, or leave it out (proteia.spec) (#54)"
+            )
+        elif vc.kind not in CARRIED_KINDS:
+            problems.append(
+                f"{path}: a Visual C++ runtime file from {vc.source}, which is neither the"
+                " Python build's folder nor a package's; the bundle leaves such files out, so"
+                " find what added it after the spec left it out (a data entry of the same"
+                " name, say) (#54)"
+            )
+        else:
+            carried.append(PurePosixPath(path.lower()))
+    for binary in sorted(imports):
+        folders = dll_search_folders(binary)
+        searched = {folder.lower() for folder in folders}
+        provided = {path.name for path in carried if str(path.parent) in searched}
+        shown = ", ".join("the bundle folder" if folder == "." else folder for folder in folders)
+        for dll in sorted(set(imports[binary]), key=str.lower):
+            if not is_vc_runtime_copy(dll) or dll.lower() in provided or dll.lower() in causes:
+                continue
+            why = (
+                "it loads only where the Visual C++ Redistributable is installed"
+                if is_vc_runtime(dll)
+                else "no Windows provides it"
+            )
+            step = (
+                "an .exe finds it only in its own folder, before anything adds another, so"
+                " bundle a copy next to it or leave the program out (proteia.spec)"
+                if binary.lower().endswith(".exe")
+                else "leave the module out (bundle.py) or bundle a copy its package provides"
+            )
+            problems.append(
+                f"{binary} imports {dll}, a Visual C++ runtime file the bundle does not carry"
+                f" where Windows looks for it ({shown}): {why}; {step} (#54)"
+            )
+    return problems
 
 
-def _at_top(path: str) -> bool:
-    """Whether ``path`` (in the finished bundle folder) is directly in it or in
-    its :data:`CONTENTS` folder, where PyInstaller puts what no package holds."""
-    parts = PurePosixPath(path.replace("\\", "/")).parts
-    return len(parts) == 1 or (len(parts) == 2 and parts[0] == CONTENTS)
+class NotPE(Exception):
+    """A file named like a binary whose import tables cannot be read: not a PE
+    file, or a damaged one."""
 
 
-def is_left_out_vc_runtime(path: str) -> bool:
-    """Whether ``path`` (a file's path in the finished bundle folder) is a Visual
-    C++ runtime file the bundle leaves out: one at its top (:func:`_at_top`),
-    which no package provides, other than the Python build's."""
-    return _at_top(path) and is_vc_runtime(path) and not _is_python_vc_runtime(path)
+_PE_SIGNATURE: Final = b"PE" + bytes(2)
+# The optional header's kinds, by its magic: the name, and the size of its fields
+# before the data directories (the last of them, NumberOfRvaAndSizes, counts those).
+_OPTIONAL_HEADERS: Final = {0x10B: ("PE32", 96), 0x20B: ("PE32+", 112)}
 
 
-def vc_import_problems(imports: Mapping[str, Iterable[str]], files: Iterable[str]) -> list[str]:
-    """What is wrong with the DLLs the bundled binaries import: ``imports`` maps
-    each binary (its path in the bundle folder) to the DLL names it imports
-    (:func:`pe_imports`), and ``files`` are the paths of every file in the
-    bundle. A Visual C++ runtime DLL imported by name must be one the bundle
-    provides: a copy it holds and does not leave out (:func:`is_left_out_vc_runtime`).
-    Otherwise Windows loads it from System32, where only the Visual C++
-    Redistributable puts it (#54)."""
-    provided = {
-        PureWindowsPath(path).name.lower()
-        for path in files
-        if is_vc_runtime(path) and not is_left_out_vc_runtime(path)
-    }
-    return [
-        f"{binary} imports {dll}, a Visual C++ runtime file the bundle does not carry: it"
-        " loads only where the Visual C++ Redistributable is installed; leave the module out"
-        " (bundle.py) or bundle a copy its package provides (#54)"
-        for binary in sorted(imports)
-        for dll in sorted(set(imports[binary]), key=str.lower)
-        if is_vc_runtime(dll) and dll.lower() not in provided
-    ]
+def pe_header_problem(path: Path) -> str | None:
+    """Why the file at ``path`` is not a PE file whose import tables can be read,
+    as far as its headers tell (the standard library only): None when it starts
+    with a DOS header pointing at a PE signature, its optional header is a PE32 or
+    PE32+ one that holds its fields and data directories, and its section table
+    and every section it lists lie within the file. pefile reads a file cut short
+    without an error, and finds no imports in it."""
+    size = path.stat().st_size
+    if size == 0:
+        return "the file is empty"
+    with path.open("rb") as f:
+        dos = f.read(64)
+        if len(dos) < 64 or dos[:2] != b"MZ":
+            return "it does not start with a DOS header"
+        (offset,) = struct.unpack_from("<I", dos, 0x3C)
+        f.seek(offset)
+        coff = f.read(24)
+        if coff[:4] != _PE_SIGNATURE:
+            return "there is no PE signature where its DOS header points"
+        if len(coff) < 24:
+            return "its PE header runs past the end of the file"
+        (count,) = struct.unpack_from("<H", coff, 6)
+        (optional,) = struct.unpack_from("<H", coff, 20)
+        header = f.read(optional)
+        table = f.read(40 * count)
+    if len(header) < optional:
+        return "its optional header runs past the end of the file"
+    known = _OPTIONAL_HEADERS.get(int.from_bytes(header[:2], "little"))
+    if known is None:
+        return "its optional header is neither PE32 nor PE32+"
+    kind, fields = known
+    if optional < fields:
+        return f"its optional header ({optional} bytes) is shorter than its {kind} fields"
+    (directories,) = struct.unpack_from("<I", header, fields - 4)
+    if optional < fields + 8 * directories:
+        return (
+            f"its optional header ({optional} bytes) cannot hold its {directories} data directories"
+        )
+    if len(table) < 40 * count:
+        return "its section table runs past the end of the file"
+    for start in range(0, 40 * count, 40):
+        raw_size, raw_offset = struct.unpack_from("<II", table, start + 16)
+        if raw_size and raw_offset + raw_size > size:
+            name = table[start : start + 8].rstrip(bytes(1)).decode("ascii", "replace")
+            known = name and name.isascii() and name.isprintable()
+            section = repr(name) if known else f"number {start // 40 + 1}"
+            return f"its section {section} runs past the end of the file, which is cut short"
+    return None
 
 
 def pe_imports(path: Path) -> list[str]:
     """The DLL names the PE file ``path`` imports, at load time or delay-loaded,
-    as its import tables spell them. Needs pefile (the build environment's)."""
+    as its import tables spell them. Needs pefile (the build environment's).
+    ``NotPE`` when its headers say it is no PE file (:func:`pe_header_problem`),
+    pefile refuses it, or an import table its headers declare cannot be read."""
+    problem = pe_header_problem(path)
+    if problem is not None:
+        raise NotPE(problem)
     import pefile
 
-    pe = pefile.PE(str(path), fast_load=True)
+    entry = pefile.DIRECTORY_ENTRY
+    tables = {  # data directory: pefile's attribute, the table's name
+        entry["IMAGE_DIRECTORY_ENTRY_IMPORT"]: ("DIRECTORY_ENTRY_IMPORT", "import table"),
+        entry["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]: (
+            "DIRECTORY_ENTRY_DELAY_IMPORT",
+            "delay-import table",
+        ),
+    }
     try:
-        pe.parse_data_directories(
-            directories=[
-                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
-                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
-            ],
-            import_dllnames_only=True,
-        )
-        entries = [
-            *getattr(pe, "DIRECTORY_ENTRY_IMPORT", []),
-            *getattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT", []),
-        ]
-        return sorted({entry.dll.decode("ascii", "replace") for entry in entries}, key=str.lower)
+        pe = pefile.PE(str(path), fast_load=True)
+    except pefile.PEFormatError as exc:
+        raise NotPE(f"pefile cannot read it: {exc}") from exc
+    try:
+        try:
+            pe.parse_data_directories(directories=list(tables), import_dllnames_only=True)
+        except pefile.PEFormatError as exc:
+            raise NotPE(f"pefile cannot read its import tables: {exc}") from exc
+        declared = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        names = set()
+        for index, (attribute, table) in tables.items():
+            entries = getattr(pe, attribute, None)
+            if not entries and index < len(declared) and declared[index].VirtualAddress:
+                raise NotPE(f"pefile finds no entry in the {table} its headers declare")
+            names |= {item.dll.decode("ascii", "replace") for item in entries or []}
+        return sorted(names, key=str.lower)
     finally:
         pe.close()
 
 
-def bundle_imports(folder: Path) -> dict[str, list[str]]:
-    """Every PE file in the bundle ``folder`` (``.pyd``, ``.dll`` or ``.exe``, in
-    any case), by its path in it, with the DLL names it imports."""
-    return {
-        path.relative_to(folder).as_posix(): pe_imports(path)
-        for path in sorted(folder.rglob("*"))
-        if path.is_file() and path.suffix.lower() in (".pyd", ".dll", ".exe")
-    }
+def bundle_imports(folder: Path) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Every file in the bundle ``folder`` named like a binary (``.pyd``, ``.dll``
+    or ``.exe``, in any case), by its path in it: the DLL names each PE file
+    imports, and why each other one is not a PE file (:class:`NotPE`)."""
+    imports: dict[str, list[str]] = {}
+    not_pe: dict[str, str] = {}
+    for path in sorted(folder.rglob("*")):
+        if path.is_file() and path.suffix.lower() in BINARY_SUFFIXES:
+            name = path.relative_to(folder).as_posix()
+            try:
+                imports[name] = pe_imports(path)
+            except NotPE as exc:
+                not_pe[name] = str(exc)
+    return imports, not_pe
+
+
+def write_imports(
+    out: Path, imports: Mapping[str, Sequence[str]], not_pe: Mapping[str, str]
+) -> None:
+    """Write :func:`bundle_imports`'s answer to ``out`` as JSON."""
+    data = {"binaries": dict(imports), "not_pe": dict(not_pe)}
+    out.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+
+def read_imports(path: Path) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """What :func:`write_imports` wrote to ``path``."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data["binaries"], data["not_pe"]
 
 
 def numeric_version(version: str) -> tuple[int, int, int, int]:
@@ -347,16 +625,18 @@ def iss_app_id(iss: str) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``python bundle.py imports FOLDER OUT``: :func:`bundle_imports` of the
-    bundle ``FOLDER`` into the JSON file ``OUT``; build.py runs it with the build
-    environment's Python, which has pefile."""
+    bundle ``FOLDER`` into the JSON file ``OUT`` (:func:`write_imports`), files
+    that are not PE files included; build.py runs it with the build environment's
+    Python, which has pefile, and reads it with :func:`read_imports`."""
     parser = argparse.ArgumentParser(description="The DLLs a bundle's binaries import.")
     parser.add_argument("command", choices=["imports"])
     parser.add_argument("folder", type=Path)
     parser.add_argument("out", type=Path)
     args = parser.parse_args(argv)
-    imports = bundle_imports(args.folder)
-    args.out.write_text(json.dumps(imports, indent=1), encoding="utf-8")
-    print(f"bundle: the imports of {len(imports)} binaries in {args.out}")
+    imports, not_pe = bundle_imports(args.folder)
+    write_imports(args.out, imports, not_pe)
+    others = f"; {len(not_pe)} files named like binaries are not PE files" if not_pe else ""
+    print(f"bundle: the imports of {len(imports)} binaries in {args.out}{others}")
     return 0
 
 

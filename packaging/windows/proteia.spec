@@ -23,7 +23,9 @@
 #   the build stops if a bundled top-level name belongs to no distribution;
 # - no UPX, and a Windows version resource.
 # It writes bundle-manifest.json into the work folder: the distributions and
-# their versions, and what was left out.
+# their versions, what was left out, and where each Visual C++ runtime file came
+# from (the Python build, a package, or elsewhere), which build.py and
+# notices.py check the bundle against.
 
 import importlib.metadata
 import json
@@ -66,9 +68,12 @@ a = Analysis(  # noqa: F821
 )
 
 # A Visual C++ runtime file from a package's folder in the build environment's
-# site-packages is the package's own copy and stays; one found elsewhere goes.
+# site-packages is the package's own copy and stays, and so do vcruntime140.dll
+# and vcruntime140_1.dll from the Python installation's folder; one found
+# elsewhere goes. Paths are compared resolved. The classification of each goes
+# into the manifest, which the bundle check and the notices re-check.
 package_roots = {sysconfig.get_path("purelib"), sysconfig.get_path("platlib")}
-a.binaries, left_out = bundle.leave_out(a.binaries, package_roots)
+a.binaries, left_out, vc_runtime = bundle.leave_out(a.binaries, package_roots, sys.base_prefix)
 
 found, unknown = bundle.bundled_distributions(
     (name for name, _, _ in a.pure),
@@ -100,6 +105,7 @@ with open(os.path.join(workpath, "bundle-manifest.json"), "w", encoding="utf-8")
         "top_level": {name: sorted(names) for name, names in sorted(found.items())},
         "universal_crt_left_out": left_out["universal_crt"],
         "vc_runtime_left_out": left_out["vc_runtime"],
+        bundle.VC_RUNTIME_KEY: [vc.to_json() for vc in vc_runtime],
     }
     json.dump(manifest, f, indent=1)
 
