@@ -890,7 +890,11 @@ def test_an_angle_edit_crops_the_rings_that_reach_the_outline(tmp_path):
     strip_3 = {b.id for b in batch.boxes_of(batch.find_protein(proteins[2])).bands}
     assert moved and moved <= strip_3
     assert {band for band, _, _ in change.remeasured} == moved
-    assert change.largest_change is not None and change.largest_change[0] in moved
+    assert all((old, new) == (before[b], after[b]) for b, old, new in change.remeasured)
+    shares = {b: abs(new - old) / old for b, old, new in change.remeasured}
+    assert change.largest_change == max(
+        ((b, share) for b, share in shares.items()), key=lambda x: x[1]
+    )
     assert_nets_current(s)
     # Turned back, the same nets as before.
     ops.edit_arena(s, areas[2], angle_deg=0.0)
@@ -2327,3 +2331,16 @@ def test_drawing_an_area_refits_a_calibration_from_before_58(tmp_path):
     assert calibration.fit_method.value == "log_linear_piecewise"
     ops.undo(s)  # the project before it, as it was
     assert band_of(s, "band-12").apparent_mw == stored
+
+
+def test_what_a_drawn_area_s_rings_may_not_read(tmp_path):
+    # Worked out within the area's bounds, it is the image's whole mask of
+    # what lies outside: from the image's corner, and turned past its edges.
+    s, image, top, bottom = split(tmp_path)
+    ops.edit_arena(s, "arena-6", angle_deg=3.0)
+    batch = s.project.batch
+    ref = batch.find_image(image)
+    for arena_id in ("arena-4", "arena-6"):
+        arena = batch.find_arena(arena_id)[1]
+        whole = ~ops._inside_mask(arena, ref, (0, 0, ref.width, ref.height))
+        assert np.array_equal(ops._outside(arena, ref), whole), arena_id

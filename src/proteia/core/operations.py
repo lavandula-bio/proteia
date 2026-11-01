@@ -962,7 +962,7 @@ def _quantify_image(
         if not here:
             continue
         unreadable = None
-        if context.area[1] is not None:  # a drawn outline: nothing past it is read
+        if arena.outline is not None:  # a drawn outline: nothing past it is read
             unreadable = _outside(arena, image)
         found.extend(
             band_backgrounds(
@@ -2953,9 +2953,7 @@ def add_arena(
             "lane_table_id": result.lane_table_id,
         }
 
-    result = _area_apply(session, "add_arena", change, params, lambda _: linked)
-    remeasured, largest = _remeasured(batch, session.project.batch, linked)
-    return replace(result, remeasured=remeasured, largest_change=largest)
+    return _area_apply(session, "add_arena", change, params, lambda _: linked)
 
 
 def _can_cut(area: Arena, drawn: Outline | None, angle: float) -> bool:
