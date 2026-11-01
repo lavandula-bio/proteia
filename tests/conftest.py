@@ -93,7 +93,7 @@ def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(webbrowser, "_browsers", browsers)
     monkeypatch.setattr(webbrowser, "_tryorder", [_NO_BROWSER])
     state = tmp_path_factory.mktemp("user-state")
-    _temporary_base = tmp_path_factory.getbasetemp()
+    _temporary_base = tmp_path_factory.getbasetemp().resolve()
     for name in _STATE_VARIABLES:
         monkeypatch.setenv(name, str(state))
 
@@ -211,9 +211,13 @@ def _import_refusals_name_the_file_as_chosen(monkeypatch):
 
 def _a_tests_own(folder: str | None) -> bool:
     """Whether ``folder`` is in the folder pytest makes this run's temporary
-    folders in (never the user's own state folder)."""
+    folders in (never the user's own state folder): an absolute path (an
+    empty or relative one would be taken from the working folder, and Linux
+    reads no relative one), and there wherever a link in it leads."""
     base = _temporary_base
-    return bool(folder) and base is not None and Path(os.path.abspath(folder)).is_relative_to(base)
+    if folder is None or base is None or not os.path.isabs(folder):
+        return False
+    return Path(folder).resolve().is_relative_to(base)
 
 
 def guards_in_place() -> bool:
@@ -239,16 +243,23 @@ class GuardsTakenBack(AssertionError):
     """A test ended with the guards of the autouse fixtures above taken back."""
 
 
+# The fixture below asks for monkeypatch and for both guards (which ask for
+# monkeypatch too). pytest sets up a conftest's autouse fixtures in the order
+# of their names, which would put it first: it would then finish after
+# monkeypatch took everything back, so every test would fail it, and a guard
+# that failed to set up would read as one taken back. Asked for, they are set
+# up before it and finish after it.
 @pytest.fixture(autouse=True)
-def _guards_stay_in_place(monkeypatch):
+def _guards_stay_in_place(
+    monkeypatch, _keep_tests_off_the_desktop, _import_refusals_name_the_file_as_chosen
+):
     """Every test ends with the guards above in place (#250).
     ``monkeypatch.undo()`` takes them back with the test's own patches, and
     whatever the test does after it runs unguarded; a test takes back only
     its own, with ``monkeypatch.context()``. Checked after the test and its
-    own fixtures, before ``monkeypatch`` takes everything back (this fixture
-    asks for it, so it finishes first): the test's teardown fails, whether
-    the test passed or failed (an expected failure's too: see
-    :func:`pytest_runtest_makereport`)."""
+    own fixtures, before ``monkeypatch`` takes everything back: the test's
+    teardown fails, whether the test passed or failed (an expected failure's
+    too: see :func:`pytest_runtest_makereport`)."""
     yield
     if not guards_in_place():
         raise GuardsTakenBack(
@@ -258,13 +269,21 @@ def _guards_stay_in_place(monkeypatch):
         )
 
 
+def _guards_taken_back(error: BaseException) -> bool:
+    """Whether ``error``, raised at a test's teardown, is (or, as pytest
+    groups the errors of two finalizers, holds) :class:`GuardsTakenBack`."""
+    if isinstance(error, BaseExceptionGroup):
+        return error.subgroup(GuardsTakenBack) is not None
+    return isinstance(error, GuardsTakenBack)
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_makereport(item, call):
     """pytest takes an error in the teardown of a test expected to fail
     (``xfail``) for the failure expected; one of :func:`_guards_stay_in_place`
-    is an error still."""
+    is an error still, alone or with others."""
     report = yield
-    if call.when == "teardown" and call.excinfo and call.excinfo.errisinstance(GuardsTakenBack):
+    if call.when == "teardown" and call.excinfo and _guards_taken_back(call.excinfo.value):
         report.outcome = "failed"
         if hasattr(report, "wasxfail"):
             del report.wasxfail

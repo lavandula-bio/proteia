@@ -2076,8 +2076,8 @@ def test_running_out_of_memory_while_reading_the_ink_set_is_not_a_damaged_header
         patch.setattr(imaging, "_pillow_mode", run_out)
         with pytest.raises(error, match="^no room$"):
             imaging.ink_set(path)
-    assert imaging.ink_set(path) is None  # a gray file: the failure alone raised
     assert guards_in_place()
+    assert imaging.ink_set(path) is None  # a gray file: the failure alone raised
 
 
 def test_the_header_of_a_tiff_with_no_image_says_so(tmp_path, monkeypatch):
