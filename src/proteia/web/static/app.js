@@ -1355,6 +1355,39 @@ function imageNames(ids) {
     .map((image) => isolate(image.original_name));
 }
 
+// --- Changes made outside Proteia (#101) ---
+
+// The notice dismissed on this page: {open_id, message}, or null. It stays
+// hidden while the project shown is that opening and the notice says that.
+let dismissedOutside = null;
+
+// Show what the state says of changes made to the project's files outside
+// Proteia (its outside_change: a project.json kept in a conflict copy, or
+// written again, or the copies its folder holds), in the server's words, at
+// the top of the panel, unless dismissed for this opening and message. Drawn
+// from every state shown, so no way of showing a project misses it.
+function renderOutsideChange(project) {
+  const change = project.outside_change;
+  const dismissed =
+    change !== null &&
+    dismissedOutside !== null &&
+    dismissedOutside.open_id === project.open_id &&
+    dismissedOutside.message === change.message;
+  $("outside-change").hidden = change === null || dismissed;
+  $("outside-change-text").textContent = change === null ? "" : change.message;
+}
+
+// Dismiss hides the notice for this opening; the button goes with it, so the
+// keyboard goes to Projects…, which every project shown has.
+$("outside-change-dismiss").addEventListener("click", () => {
+  const project = state.project;
+  if (project && project.outside_change) {
+    dismissedOutside = { open_id: project.open_id, message: project.outside_change.message };
+  }
+  $("outside-change").hidden = true;
+  $("switch-project").focus();
+});
+
 function render() {
   $("lane-picker").hidden = true; // its question was about the state before
   const project = state.project;
@@ -1372,6 +1405,7 @@ function render() {
   $("project-name").textContent = project.name;
   $("project-name").title = project.name; // whole, when the header cuts it short
   renderHistory(project.history);
+  renderOutsideChange(project);
   $("save-state").textContent = project.save_error
     ? `Not saved: ${project.save_error}`
     : project.saved

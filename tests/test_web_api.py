@@ -3006,10 +3006,10 @@ def test_a_reopen_reads_no_file_while_an_operation_runs_or_changes_are_unsaved(
     assert workspace.view(session)[0] == 2 and not session.project.batch.only_lanes()
 
     # Unsaved changes: the file is older than the session, not changed outside.
-    def refuse(project: Project, folder: Path) -> Path:
+    def refuse(folder: Path, data: bytes, *, expect: str | None, create: bool = False) -> None:
         raise PermissionError(13, "held by another process", str(folder))
 
-    monkeypatch.setattr(storage, "save_project", refuse)
+    monkeypatch.setattr(storage, "write_project_file", refuse)  # how a session saves (#101)
     api.ops.set_lanes(session, [api.ops.LaneInput("drug")])
     assert session.dirty
     project = session.project

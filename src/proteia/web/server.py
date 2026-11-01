@@ -209,7 +209,8 @@ def create_app(
     @app.post("/api/quit", status_code=202)
     def quit_app(request: Request) -> dict[str, str]:
         # Unsaved changes (a failed autosave) are saved first; if that fails the
-        # answer is 409 unsaved_changes and Proteia keeps running.
+        # answer is 409 unsaved_changes and Proteia keeps running, unless the
+        # project's folder was removed or moved outside Proteia (#101).
         request.app.state.workspace.flush()
         _log.info("quit from the page")
         on_quit()

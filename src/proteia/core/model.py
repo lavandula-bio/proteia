@@ -163,6 +163,13 @@ def format_timestamp(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def local_minute(moment: datetime) -> str:
+    """An aware ``moment`` as file names give it: the computer's local date and
+    time to the minute, ``2026-09-27 1532``, which holds no character any file
+    system refuses (an export's folder, a conflict copy of ``project.json``)."""
+    return moment.astimezone().strftime("%Y-%m-%d %H%M")
+
+
 class UnknownIdError(LookupError):
     """No object with this id in the batch."""
 

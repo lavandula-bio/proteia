@@ -41,6 +41,13 @@
 
 <main id="workspace" class="workspace" hidden>
   <aside class="panel">
+    <!-- What changed in the project's files outside Proteia (#101): the state's
+      outside_change, in the server's words, until dismissed for this opening
+      (app.js renderOutsideChange). In the panel, so the view never moves. -->
+    <div id="outside-change" class="outside-change" role="status" hidden>
+      <p id="outside-change-text"></p>
+      <button id="outside-change-dismiss" type="button">Dismiss</button>
+    </div>
     <section>
       <h2>Images</h2>
       <ul id="images" class="choices"></ul>
