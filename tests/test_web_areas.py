@@ -102,7 +102,7 @@ def test_area_routes(client, tmp_path):
     assert (status, payload["code"]) == (422, "arena_required")
 
 
-def test_e30_404_then_state(client, tmp_path):
+def test_an_unknown_area_answers_404_then_the_state(client, tmp_path):
     strips_project(client, tmp_path)
     for method, path, body in (
         ("PUT", "/api/arenas/arena-99", {"angle_deg": 1.0}),

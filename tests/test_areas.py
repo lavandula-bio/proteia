@@ -92,7 +92,7 @@ def box_all(s, protein: str, y: int) -> list[str]:
     ]
 
 
-# --- Drawing the first areas (E32, E9) ---
+# --- Drawing the first areas ---
 
 
 def test_second_area_needs_first_outlined(tmp_path):
@@ -141,7 +141,7 @@ def test_second_area_needs_first_outlined(tmp_path):
     }
 
 
-def test_e1_then_drag(tmp_path):
+def test_a_flat_outline_is_refused_then_a_drag_draws_it(tmp_path):
     s, image = one_image(tmp_path)
     ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
     for flat in ((10, 60, 10, 90), (10, 60, 90, 60)):
@@ -171,7 +171,7 @@ def test_area_past_edge(tmp_path):
     ops.add_arena(s, image, (0, 50, 140, 100))
 
 
-def test_e3_bounds(tmp_path):
+def test_an_area_turns_at_most_45_degrees(tmp_path):
     s, image = one_image(tmp_path)
     for angle in (45.0, -45.0, 45, -0.0):
         ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50), angle_deg=angle)
@@ -194,7 +194,7 @@ def test_e3_bounds(tmp_path):
         )
 
 
-def test_e4_then_edit(tmp_path):
+def test_a_second_area_of_a_membrane_on_an_image_is_refused(tmp_path):
     s, image, _, _ = split(tmp_path)
     error = refused(
         lambda: ops.add_arena(s, image, (0, 0, 100, 50), membrane_id="mem-2"),
@@ -220,7 +220,7 @@ def test_an_area_for_an_existing_membrane_on_another_image(tmp_path):
         ops.add_arena(s, other, (0, 0, 200, 50), membrane_id="mem-99")
 
 
-def test_e5_remove_listed_then_edit(tmp_path):
+def test_an_outline_that_strands_boxes_names_them(tmp_path):
     s, image = one_image(tmp_path)
     gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
     bands = box_all(s, gapdh, 24)
@@ -242,7 +242,7 @@ def test_e5_remove_listed_then_edit(tmp_path):
     ops.edit_arena(s, "arena-4", outline=(0, 0, 70, 100))
 
 
-def test_e5_names_not_detected_marks(tmp_path):
+def test_an_outline_that_strands_a_record_names_it(tmp_path):
     s, image = one_image(tmp_path)
     p53 = ops.add_protein(s, "p53", Role.TARGET, image)
     placed = ops.detect_row_boxes(s, p53, (10, 64, 190, 90))  # the bottom strip's row
@@ -272,7 +272,7 @@ def test_e5_names_not_detected_marks(tmp_path):
     assert error.detail["undetected"] == [[p53, 2, 0]]
 
 
-def test_e6_then_assign(tmp_path):
+def test_the_only_area_of_an_image_stays(tmp_path):
     s, image = one_image(tmp_path)
     error = refused(lambda: ops.remove_arena(s, "arena-4"), ErrorCode.ARENA_REQUIRED)
     assert str(error) == (
@@ -286,7 +286,7 @@ def test_e6_then_assign(tmp_path):
     assert s.project.batch.membranes == []
 
 
-def test_e7_with_arena_id(tmp_path):
+def test_a_protein_on_an_image_of_several_membranes_names_its_area(tmp_path):
     s, image, _, _ = split(tmp_path)
     error = refused(
         lambda: ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image), ErrorCode.ARENA_REQUIRED
@@ -304,7 +304,7 @@ def test_e7_with_arena_id(tmp_path):
         )
 
 
-def test_e8_arena_route(tmp_path):
+def test_marks_on_an_image_of_several_membranes_name_their_area(tmp_path):
     s, image, _, _ = split(tmp_path)
     error = refused(
         lambda: ops.add_calibration_point(s, image, 70.0, 50.0, STRIP_EDGE, x=5.0, snap=False),
@@ -339,7 +339,7 @@ def test_e8_arena_route(tmp_path):
     assert [len(m.calibration.points) for m in s.project.batch.membranes] == [0, 0]
 
 
-def test_e9_click_inside(tmp_path):
+def test_a_click_outside_the_area_is_refused(tmp_path):
     s, image, top, bottom = split(tmp_path)
     error = refused(
         lambda: ops.place_box(s, bottom, 40, 24, lane_index=0, grow=False),
@@ -353,7 +353,7 @@ def test_e9_click_inside(tmp_path):
     ops.place_box(s, bottom, 100, 75, lane_index=1, grow=True)
 
 
-def test_e10_move_inside(tmp_path):
+def test_a_box_moved_out_of_its_area_is_refused(tmp_path):
     s, image, top, _ = split(tmp_path)
     band = ops.place_box(s, top, 40, 24, lane_index=0, grow=False)
     rect = s.project.batch.find_band(band)[1].box.rect(
@@ -367,7 +367,7 @@ def test_e10_move_inside(tmp_path):
     ops.move_box(s, band, (rect[0], rect[1] + 10, rect[2], rect[3] + 10))
 
 
-def test_e10_resized_boxes_leave_the_area(tmp_path):
+def test_boxes_resized_out_of_their_area_are_refused(tmp_path):
     s, image, top, _ = split(tmp_path)
     ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 30))
     band = ops.place_box(s, top, 40, 24, lane_index=0, grow=False)  # 3 x 3, centred at y 24.5
@@ -382,7 +382,7 @@ def test_e10_resized_boxes_leave_the_area(tmp_path):
     assert "the box's centre would lie outside membrane 1's area" in str(error)
 
 
-def test_e12_then_drag_inside(tmp_path):
+def test_a_row_box_off_its_area_is_refused(tmp_path):
     s, image, top, bottom = split(tmp_path)
     error = refused(lambda: ops.detect_row_boxes(s, top, (10, 60, 190, 90)), ErrorCode.OUT_OF_ARENA)
     assert str(error) == (
@@ -406,7 +406,7 @@ def side_by_side(tmp_path: Path, right: tuple[int, int, int, int] = (130, 0, 200
     return s, image, ops.add_protein(s, "β-catenin", Role.TARGET, arena_id="arena-4")
 
 
-def test_e11_slots_outside_then_redraw(tmp_path):
+def test_lane_slots_of_a_row_outside_its_area_are_refused(tmp_path):
     # Lane 3 lies in membrane 2's area: the row reads none of it, and its
     # slot there is refused, as the row's lanes run past the area.
     s, image, protein = side_by_side(tmp_path)
@@ -425,7 +425,7 @@ def test_e11_slots_outside_then_redraw(tmp_path):
     assert all(placed.band_ids)
 
 
-def test_e11_bands_found_outside(tmp_path, monkeypatch):
+def test_bands_a_row_finds_outside_its_area_are_refused(tmp_path, monkeypatch):
     # Were the row to read the whole image, lane 3's band, in membrane 2's
     # area, would be found: refused, naming its lane.
     s, image, protein = side_by_side(tmp_path)
@@ -452,7 +452,7 @@ def test_a_row_box_in_two_areas(tmp_path):
     assert "lies inside both membrane 1's and membrane 2's areas" in str(error)
 
 
-def test_e14_then_new_membrane(tmp_path):
+def test_an_area_given_to_a_membrane_already_there_is_refused(tmp_path):
     s, image, top, _ = split(tmp_path)
     error = refused(lambda: ops.assign_arena(s, "arena-4", "mem-5"), ErrorCode.ARENA_EXISTS)
     assert str(error) == (
@@ -468,7 +468,7 @@ def test_e14_then_new_membrane(tmp_path):
     assert s.project.batch.membrane_of_protein(s.project.batch.find_protein(top)).id == "mem-11"
 
 
-def test_e30_unknown_area(tmp_path):
+def test_an_unknown_area_is_worded_for_another_window(tmp_path):
     s, _ = one_image(tmp_path)
     for call in (
         lambda: ops.edit_arena(s, "arena-99", angle_deg=1.0),
@@ -485,7 +485,7 @@ def test_e30_unknown_area(tmp_path):
         assert info.value.detail == {"arena_id": "arena-99"}
 
 
-# --- Overlapping areas (E33) ---
+# --- Overlapping areas ---
 
 
 def test_overlapping_areas_redraw_then_place(tmp_path):
@@ -531,7 +531,7 @@ def test_box_on_area_edge(tmp_path):
 
 
 def corner_project(tmp_path: Path):
-    """S22: 1000x600, one membrane over the whole image, boxes centred near
+    """1000x600, one membrane over the whole image, boxes centred near
     each corner and a ladder mark at (3, 595)."""
     s = session_on(tmp_path)
     bands = [(x, y, 3.0, 2.0, 20000.0) for x, y in ((12, 10), (988, 10), (12, 590), (988, 590))]
@@ -800,7 +800,7 @@ def test_marker_adoption_refusals(tmp_path):
     ops.remove_arena(s, area_on(s, marker, 2))
     ops.set_marker_image(s, exposure, marker)
     # (iii) M linked from E already: a second exposure takes the group's areas.
-    second = import_blot(s, two_strips(), "E2.tif", membrane_id="mem-2")
+    second = import_blot(s, two_strips(), "exposure 2.tif", membrane_id="mem-2")
     update = ops.set_marker_image(s, second, marker)
     batch = s.project.batch
     assert [m.id for m, _ in batch.arenas_on(second)] == ["mem-2", "mem-5", "mem-7"]
@@ -860,7 +860,7 @@ def tilted(shape, strips, lanes=10, pitch=100.0):
 
 
 def rotated_strips(tmp_path: Path):
-    """S6: three strips 1000 px wide and 40 high on a 1100x320 image, ten
+    """Three strips 1000 px wide and 40 high on a 1100x320 image, ten
     lanes each: strip 1 at +4° centred (550, 70); strip 2 parallel to it, 6 px
     below it across its width, with stronger bands; strip 3 at -3° centred
     (550, 250). A 4° strip rises 69.9 px across its width, so strip 1's bounds
@@ -917,7 +917,7 @@ def test_rotated_strips_row_drag_refuses_neighbour_bands(tmp_path, monkeypatch):
     assert info.value.code in (ErrorCode.ROW_OFF_LINE, ErrorCode.OUT_OF_ARENA)
 
 
-def test_e11_next_step_on_rotated_strip(tmp_path):
+def test_a_row_over_a_turned_strip_reads_it_alone(tmp_path):
     s, image, (_, _, c) = rotated_strips(tmp_path)
     # Strip 3 at -3°: a drag over its bounds, then one inside it, both read it alone.
     batch = s.project.batch
@@ -972,7 +972,7 @@ def test_mask_matches_contains():
 
 
 def mirrored(tmp_path: Path):
-    """S16: two strips on one image, each with a protein boxed in lanes 1 and
+    """Two strips on one image, each with a protein boxed in lanes 1 and
     2: strip 1 numbered left to right (lane 1 at x 40), strip 2 right to left
     (lane 1 at x 160)."""
     s, image, top, bottom = split(tmp_path)
@@ -1031,7 +1031,7 @@ def strip_y(k: int) -> int:
 
 
 def nine_strips(tmp_path: Path, lanes: int = 6):
-    """S2: nine strips on one image, 12 rows each with 6 px gaps (strip k's
+    """Nine strips on one image, 12 rows each with 6 px gaps (strip k's
     area y_k - 6 to y_k + 6, y_k = 12 + 18 k), ``lanes`` lanes 30 px apart,
     each strip a membrane with one protein boxed (14x8) on its band in every
     lane. The rings of one strip's bands reach the next strip's boxes."""
@@ -1171,7 +1171,7 @@ def others_unchanged(s, before, proteins):
     " a ring leaves out every box on the image, so moving one membrane's box moves the nets"
     " of another membrane's bands whose rings reach it, until that rule is decided (#243)",
 )
-def test_t2_6_boxes(tmp_path):
+def test_a_box_edit_of_one_membrane_leaves_the_others_nets(tmp_path):
     s, image, areas, proteins = nine_strips(tmp_path)
     before = s.project.batch.model_copy(deep=True)
     edit_strip_1(s, areas, proteins, "boxes")
@@ -1179,7 +1179,7 @@ def test_t2_6_boxes(tmp_path):
 
 
 @pytest.mark.parametrize("what", ["lanes", "calibration"])
-def test_t2_6_lanes_and_calibration(tmp_path, what):
+def test_lanes_and_marks_of_one_membrane_leave_the_others_alone(tmp_path, what):
     # Under the current rule too: the nets do not read the lane table or the
     # marks, and each membrane's curve is its own.
     s, image, areas, proteins = nine_strips(tmp_path)
