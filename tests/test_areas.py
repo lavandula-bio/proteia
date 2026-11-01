@@ -22,6 +22,7 @@ from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.core.model import (
     Arena,
+    ArenaSource,
     CalibrationPointSource,
     ImageKind,
     Outline,
@@ -34,12 +35,20 @@ from proteia.core.operations import ErrorCode, LaneInput, OperationError, RingCo
 from proteia.core.project import lane_anchors
 from proteia.core.results import compute_results
 from proteia.core.storage import content_hash
-from test_operations import assert_nets_current, import_blot, session_on
+from test_operations import assert_mw_current, assert_nets_current, import_blot, session_on
 
 STRIPS = "two strips µ.tif"
 CHEMI_MARKER = CalibrationPointSource.CHEMILUMINESCENCE_MARKER
 STRIP_EDGE = CalibrationPointSource.STRIP_EDGE
 LANE_X = (40, 100, 160)
+# The next steps a refusal of an outline that would leave boxes outside
+# their area gives, for an area not turned and an outline not turned.
+CUT_STEP = (
+    "; draw the outline around them; or cut the area in two: draw the outline to three of"
+    " its edges, its fourth edge across the area with each protein's boxes all on one side of"
+    " it, and the far side becomes a new membrane's area with what lies there; or move or"
+    " remove them first"
+)
 
 
 def two_strips() -> np.ndarray:
@@ -231,8 +240,7 @@ def test_an_outline_that_strands_boxes_names_them(tmp_path):
     )
     assert str(error) == (
         "the new outline would leave the boxes of 'GAPDH' in lanes 2, 3 and the 100 kDa ladder"
-        f" mark on {STRIPS!r} outside membrane 1's area; draw the outline around them, or move"
-        " or remove them first"
+        f" mark on {STRIPS!r} outside membrane 1's area" + CUT_STEP
     )
     assert error.ids == ("arena-4", bands[1], bands[2])
     assert error.detail["band_ids"] == bands[1:]
@@ -271,6 +279,214 @@ def test_an_outline_that_strands_a_record_names_it(tmp_path):
     )
     assert "a not-detected mark of 'p53' in lane 3" in str(error)
     assert error.detail["undetected"] == [[p53, 2, 0]]
+
+
+# --- An area holding two membranes' rows, cut in two ---
+
+
+def two_rows(tmp_path: Path):
+    """The two strips as a project from before membrane areas holds them: one
+    membrane, its area the whole image (arena-4), p53 µ boxed on the top strip
+    and GAPDH, its loading control, on the bottom one."""
+    s, image = one_image(tmp_path)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, image)
+    p53 = ops.add_protein(s, "p53 µ", Role.TARGET, image, loading_control_ids=[gapdh])
+    box_all(s, p53, 24)
+    box_all(s, gapdh, 76)
+    return s, image, p53, gapdh
+
+
+WHOLE = None
+CUTS = [
+    # (the area's outline, its angle, the outline drawn, its angle, the far side)
+    (WHOLE, 0.0, (0, 0, 200, 50), 0.0, (0, 50, 200, 100)),  # the bottom edge across
+    (WHOLE, 0.0, (0, 50, 200, 100), 0.0, (0, 0, 200, 50)),  # the top edge across
+    (WHOLE, 0.0, (0, 0, 70, 100), 0.0, (70, 0, 200, 100)),  # the right edge across
+    (WHOLE, 0.0, (130, 0, 200, 100), 0.0, (0, 0, 130, 100)),  # the left edge across
+    (WHOLE, 0.0, (-5, -5, 205, 50), 0.0, (0, 50, 200, 100)),  # past the image's edges
+    (WHOLE, 3.0, (0, 0, 200, 50), 0.0, (0, 50, 200, 100)),  # a whole image's angle reads nothing
+    (WHOLE, 0.0, (10, 5, 190, 45), 0.0, None),  # in from every side
+    (WHOLE, 0.0, (10, 0, 200, 50), 0.0, None),  # in from two sides
+    (WHOLE, 0.0, (0, 0, 200, 100), 0.0, None),  # over all of it
+    (WHOLE, 0.0, (0, 0, 200, 50), 1.0, None),  # turned
+    ((0, 0, 100, 100), 0.0, (0, 0, 100, 40), 0.0, (0, 40, 100, 100)),  # a drawn area
+    ((0, 0, 100, 100), 0.0, (150, 0, 200, 50), 0.0, None),  # beside it, not across it
+    ((-20, 0, 220, 50), 0.0, (0, 0, 120, 50), 0.0, (120, 0, 200, 50)),  # as it lies in the image
+    ((0, 0, 200, 50), 2.0, (0, 0, 200, 30), 0.0, None),  # a turned area
+]
+
+
+@pytest.mark.parametrize(("old", "turn", "drawn", "angle", "far"), CUTS)
+def test_which_redraws_cut_an_area_in_two(tmp_path, old, turn, drawn, angle, far):
+    s, image = one_image(tmp_path)
+    found = s.project.batch.find_image(image)
+    area = Arena(
+        id="arena-4",
+        image_id=image,
+        outline=None if old is None else Outline(x0=old[0], y0=old[1], x1=old[2], y1=old[3]),
+        angle_deg=turn,
+        source=ArenaSource.MANUAL,
+    )
+    drawn = Outline(x0=drawn[0], y0=drawn[1], x1=drawn[2], y1=drawn[3])
+    rest = ops._cut_rest(area, found, drawn, angle)
+    assert rest == (None if far is None else Outline(x0=far[0], y0=far[1], x1=far[2], y1=far[3]))
+
+
+def test_an_area_cut_in_two_gives_the_far_side_a_new_membrane(tmp_path):
+    s, image, p53, gapdh = two_rows(tmp_path)
+    measured = nets(s)
+    # Drawn around the top strip alone: the bottom strip's boxes would be left out.
+    error = refused(
+        lambda: ops.edit_arena(s, "arena-4", outline=(10, 5, 190, 45)), ErrorCode.ARENA_IN_USE
+    )
+    assert str(error) == (
+        "the new outline would leave the boxes of 'GAPDH' in lanes 1, 2, 3 outside membrane 1's"
+        " area" + CUT_STEP
+    )
+    # That step, taken as it reads: the outline to the image's top and sides,
+    # its bottom edge across the image between the strips.
+    before, count = s.project, len(s.project.log)
+    change = ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
+    cut = s.project
+    batch = cut.batch
+    assert len(cut.log) == count + 1
+    [(first, kept), (second, rest)] = batch.arenas_on(image)
+    assert (kept.id, kept.outline) == ("arena-4", Outline(x0=0, y0=0, x1=200, y1=50))
+    assert (rest.outline, rest.angle_deg, rest.source) == (
+        Outline(x0=0, y0=50, x1=200, y1=100),
+        0.0,
+        ArenaSource.MANUAL,
+    )
+    assert first.lane_table_id == second.lane_table_id
+    assert (change.arena_ids, change.membrane_id) == (("arena-4",), first.id)
+    assert (change.rest_membrane_id, change.rest_arena_ids) == (second.id, (rest.id,))
+    assert (change.moved_proteins, change.moved_points) == ((gapdh,), 0)
+    assert (change.curves_changed, change.dropped_undetected, change.mw_lost) == ((), (), ())
+    assert change.handed_off == "the rest of membrane 1's area is now membrane 2's, with 'GAPDH'"
+    assert batch.arena_id_of(batch.find_protein(p53)) == "arena-4"
+    assert batch.arena_id_of(batch.find_protein(gapdh)) == rest.id
+    assert batch.find_protein(p53).loading_control_ids == [gapdh]  # still its loading control
+    assert nets(s) == measured  # the rings read the image as before
+    params = cut.log[-1].params
+    assert (params["rest_membrane_id"], params["rest_arena_ids"]) == (second.id, [rest.id])
+    assert (params["moved_proteins"], params["moved_points"]) == ([gapdh], [])
+    # The bottom strip's boxes are placed in its own area now: one taken out
+    # and put back, its lane proposed from the strip's own boxes.
+    third = next(b.id for b in batch.boxes_of(batch.find_protein(gapdh)).bands if b.lane_index == 2)
+    ops.remove_box(s, third)
+    band = ops.place_box(s, gapdh, 160, 76, grow=False)
+    assert s.project.batch.find_band(band)[1].lane_index == 2
+    assert s.project.batch.arena_id_of(s.project.batch.find_protein(gapdh)) == rest.id
+    # The cut is one change: one undo puts the image back as it was.
+    ops.undo(s)
+    ops.undo(s)
+    assert content_hash(s.project) == content_hash(cut)
+    ops.undo(s)
+    assert content_hash(s.project) == content_hash(before)
+    ops.redo(s)
+    assert content_hash(s.project) == content_hash(cut)
+
+
+def test_a_cut_needs_each_row_on_one_side(tmp_path):
+    s, image, p53, gapdh = two_rows(tmp_path)
+    actin = ops.add_protein(s, "β-actin", Role.TARGET, image)
+    ops.place_box(s, actin, 40, 40, lane_index=0, grow=False)
+    lower = ops.place_box(s, actin, 100, 60, lane_index=1, grow=False)
+    before = s.project
+    # GAPDH would go with the rest, but one box of β-actin lies past the cut.
+    error = refused(
+        lambda: ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50)), ErrorCode.ARENA_IN_USE
+    )
+    assert str(error) == (
+        "the new outline would leave the box of 'β-actin' in lane 2 outside membrane 1's area"
+        + CUT_STEP
+    )
+    assert error.detail["band_ids"] == [lower]
+    # Across the lanes, every row lies on both sides: nothing to hand over.
+    error = refused(
+        lambda: ops.edit_arena(s, "arena-4", outline=(0, 0, 130, 100)), ErrorCode.ARENA_IN_USE
+    )
+    assert str(error) == (
+        "the new outline would leave the box of 'GAPDH' in lane 3 and the box of 'p53 µ' in lane 3"
+        " outside membrane 1's area" + CUT_STEP
+    )
+    # A turned outline cuts nothing, and the step is not offered.
+    error = refused(
+        lambda: ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50), angle_deg=1.0),
+        ErrorCode.ARENA_IN_USE,
+    )
+    assert str(error).endswith("; draw the outline around them, or move or remove them first")
+    assert s.project is before
+    # β-actin's box moved above the cut: the same cut hands GAPDH over.
+    size = s.project.batch.boxes_of(s.project.batch.find_protein(actin)).box_size
+    x0, y0, x1, y1 = s.project.batch.find_band(lower)[1].box.rect(size)
+    ops.move_box(s, lower, (x0, y0 - 20, x1, y1 - 20))
+    change = ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
+    assert change.moved_proteins == (gapdh,)
+
+
+def test_a_cut_reaches_the_linked_marker_and_its_ladder(tmp_path):
+    s = session_on(tmp_path)
+    exposure = import_blot(s, two_strips(), "E.tif")
+    ops.set_lanes(s, [LaneInput("a"), LaneInput("b"), LaneInput("c")])
+    membrane = s.project.batch.membrane_of(exposure).id
+    marker = import_blot(
+        s, two_strips(), "M marker.tif", kind=ImageKind.VISIBLE_MARKER, membrane_id=membrane
+    )
+    ops.set_marker_image(s, exposure, marker)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, exposure)
+    p53 = ops.add_protein(s, "p53 µ", Role.TARGET, exposure, loading_control_ids=[gapdh])
+    box_all(s, p53, 24)
+    box_all(s, gapdh, 76)
+    # One ladder marked down the marker, as before areas: two marks above the
+    # cut to come.
+    for y, kda in ((10.0, 250.0), (40.0, 100.0)):
+        ops.add_calibration_point(s, marker, y, kda, STRIP_EDGE, x=5.0, snap=False)
+
+    def mws(protein: str) -> list:
+        batch = s.project.batch
+        return [band.apparent_mw for band in batch.boxes_of(batch.find_protein(protein)).bands]
+
+    # GAPDH, below the marks' range, has no MW; cut off, it is read with no
+    # curve at all, and its image is told as one whose curve changed.
+    assert mws(gapdh) == [None, None, None] and None not in mws(p53)
+    change = ops.edit_arena(s, area_on(s, exposure), outline=(0, 0, 200, 50))
+    assert (change.moved_points, change.curves_changed, change.mw_lost) == (0, (exposure,), ())
+    assert_mw_current(s)
+    ops.undo(s)
+    # And one mark below the cut.
+    ops.add_calibration_point(s, marker, 90.0, 25.0, STRIP_EDGE, x=5.0, snap=False)
+    assert None not in mws(p53) + mws(gapdh)
+    before = s.project
+    change = ops.edit_arena(s, area_on(s, exposure), outline=(0, 0, 200, 50))
+    batch = s.project.batch
+    first, second = batch.membranes
+    for image_id in (exposure, marker):
+        assert [(m.id, a.outline) for m, a in batch.arenas_on(image_id)] == [
+            (first.id, Outline(x0=0, y0=0, x1=200, y1=50)),
+            (second.id, Outline(x0=0, y0=50, x1=200, y1=100)),
+        ]
+    assert change.rest_arena_ids == (area_on(s, exposure, 2), area_on(s, marker, 2))
+    assert [(p.y, p.mw) for p in first.calibration.points] == [(10.0, 250.0), (40.0, 100.0)]
+    assert [(p.y, p.mw) for p in second.calibration.points] == [(90.0, 25.0)]
+    assert (change.moved_proteins, change.moved_points) == ((gapdh,), 1)
+    assert change.curves_changed == (exposure, marker)  # membrane 1's curve, one mark less
+    assert change.handed_off == (
+        "the rest of membrane 1's area is now membrane 2's, with 'GAPDH' and 1 ladder mark"
+    )
+    # Membrane 2 is left one mark: GAPDH's bands lose their apparent MW, and are told.
+    assert [(lost["membrane"], lost["bands"]) for lost in change.mw_lost] == [(2, 3)]
+    assert mws(gapdh) == [None, None, None] and None not in mws(p53)
+    assert_mw_current(s)
+    assert_nets_current(s)
+    ops.undo(s)
+    assert content_hash(s.project) == content_hash(before)
+    # A second mark below the cut: the bottom strip keeps a curve of its own.
+    ops.add_calibration_point(s, marker, 60.0, 55.0, STRIP_EDGE, x=5.0, snap=False)
+    change = ops.edit_arena(s, area_on(s, marker), outline=(0, 0, 200, 50))
+    assert (change.moved_points, change.mw_lost) == (2, ())
+    assert None not in mws(p53) + mws(gapdh)
+    assert_mw_current(s)
 
 
 def test_the_only_area_of_an_image_stays(tmp_path):
@@ -1376,12 +1592,28 @@ def test_a_lane_is_proposed_from_the_boxes_of_the_area(tmp_path):
     s, image, top, bottom = split(tmp_path)
     ops.place_box(s, top, 40, 24, lane_index=0, grow=False)
     ops.place_box(s, top, 100, 24, lane_index=1, grow=False)
-    # The bottom strip has no lane spacing of its own yet.
+    ops.place_box(s, bottom, 40, 76, lane_index=0, grow=False)
+    # The bottom strip has a box of its own, so it reads its own lanes: one so far.
     error = refused(lambda: ops.place_box(s, bottom, 160, 76, grow=False), ErrorCode.LANE_REQUIRED)
     assert str(error) == (
         "choose the lane: position proposes one only once boxes in two lanes of membrane 2's"
         " area show the lane spacing"
     )
+
+
+def test_an_area_without_boxes_reads_the_lanes_of_its_image(tmp_path):
+    s, image, top, bottom = split(tmp_path)
+    ops.place_box(s, top, 40, 24, lane_index=0, grow=False)
+    ops.place_box(s, top, 100, 24, lane_index=1, grow=False)
+    batch = s.project.batch
+    # No box on the bottom strip yet: every box on the image anchors it, as
+    # on an image of one membrane, so a click there is given a lane.
+    assert lane_anchors(batch, "arena-6") == lane_anchors(batch, "arena-4")
+    assert lane_anchors(batch, "arena-6") == [(40.5, 0), (100.5, 1)]
+    band = ops.place_box(s, bottom, 160, 76, grow=False)
+    assert s.project.batch.find_band(band)[1].lane_index == 2
+    # From its first box on, its own boxes alone.
+    assert lane_anchors(s.project.batch, "arena-6") == [(160.5, 2)]
 
 
 def test_a_box_moved_into_two_areas_is_refused(tmp_path):

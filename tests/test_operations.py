@@ -271,13 +271,13 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
 
 
 def expected_mw(session: ProjectSession, band_id: str) -> float | None:
-    """A band's apparent MW recomputed (#58): its image's calibration at its
-    box's centre, at its protein's box size; None without a curve or outside
-    its range."""
+    """A band's apparent MW recomputed (#58): its image's calibration (of its
+    protein's membrane, #243) at its box's centre, at its protein's box size;
+    None without a curve or outside its range."""
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
     image_id = batch.image_id_of(protein)
-    fitted = mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of_protein(protein), image_id)
     if not isinstance(fitted, mwcal.Calibration):
         return None
     size = batch.boxes_of(protein).box_size
@@ -10453,6 +10453,7 @@ MW_WRITERS = frozenset(
         "clear_calibration",
         "set_ladder_points",
         "assign_arena",
+        "edit_arena",
         "remove_arena",
     }
 )
@@ -10461,7 +10462,6 @@ MW_NEUTRAL = frozenset(
         "add_arena",
         "add_protein",
         "area_removal",
-        "edit_arena",
         "marker_adoption",
         "calibration_fit",
         "clear_boxes",
@@ -10568,7 +10568,11 @@ def test_mw_current_after_each_operation(tmp_path):
     # both, removed.
     area = s.project.batch.arenas_on(c.blot)[0][1].id
     step("assign_arena", lambda: ops.assign_arena(s, area, None))
-    ops.edit_arena(s, area, outline=(0, 0, CAL_W, CAL_H))
+    # The pair's area cut below the 70 kDa marks: the row and the marks below
+    # go to a new membrane, and both membranes are refitted.
+    step("edit_arena", lambda: ops.edit_arena(s, area, outline=(0, 0, CAL_W, 85)))
+    assert len(s.project.batch.membranes) == 2
+    assert all(band.apparent_mw is not None for band in boxes_of(s, c.protein).bands)
     corner = ops.add_arena(s, c.blot, (0, 0, 20, 20)).arena_ids[0]
     step("remove_arena", lambda: ops.remove_arena(s, corner))
     step("remove_image", lambda: ops.remove_image(s, c.marker))

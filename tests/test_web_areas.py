@@ -112,6 +112,38 @@ def test_area_routes(client, tmp_path):
     assert (status, payload["code"]) == (422, "arena_required")
 
 
+def test_a_cut_answers_what_went_to_the_new_membrane(client, tmp_path):
+    strips_project(client, tmp_path)
+    ids = []
+    for name, y in (("p53 µ", 24), ("GAPDH", 76)):
+        project = client.ok(
+            "POST", "/api/proteins", {"name": name, "role": "target", "image_id": "img-1"}
+        )["project"]
+        [protein] = [p for p in project["proteins"] if p["name"] == name]
+        ids.append(protein["id"])
+        for lane, x in enumerate((40, 100, 160)):
+            body = {"protein_id": protein["id"], "x": x, "y": y, "lane_index": lane, "grow": False}
+            client.ok("POST", "/api/boxes", body)
+    answer = client.ok("PUT", "/api/arenas/arena-4", {"outline": [0, 0, 200, 50]})
+    project = answer["project"]
+    [first, second] = project["membranes"]
+    assert (answer["arena_ids"], answer["membrane_id"]) == (["arena-4"], first["id"])
+    assert (answer["rest_membrane_id"], answer["rest_arena_ids"]) == (
+        second["id"],
+        second["arena_ids"],
+    )
+    assert (answer["moved_proteins"], answer["moved_points"]) == ([ids[1]], 0)
+    assert answer["handed_off"] == "the rest of membrane 1's area is now membrane 2's, with 'GAPDH'"
+    assert [p["arena_id"] for p in project["proteins"]] == ["arena-4", *second["arena_ids"]]
+    # An edit that leaves no row outside hands nothing over.
+    answer = client.ok("PUT", "/api/arenas/arena-4", {"outline": [0, 0, 200, 49]})
+    assert (answer["handed_off"], answer["rest_membrane_id"], answer["moved_proteins"]) == (
+        None,
+        None,
+        [],
+    )
+
+
 def test_an_unknown_area_answers_404_then_the_state(client, tmp_path):
     strips_project(client, tmp_path)
     for method, path, body in (
