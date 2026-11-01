@@ -2759,18 +2759,22 @@ $("import-polarity").addEventListener("change", (event) => {
 // --- Requantifying: the local background, and looking for over-exposure ---
 
 // The background method of a project quantified before the local background:
-// each net above its image's median. It stays until the project is requantified.
+// each net above its image's median, or its drawn membrane area's (#243). It
+// stays until the project is requantified.
 const LEGACY_BACKGROUND = "global_median";
 
 // What the offer says for each reason to requantify (requantifyReason): the
 // legacy background, which moves every net, or boxes on a lossy, colour or
 // CMYK image measured before Proteia looked for pixels near the detector limit
 // there (#112). The note is its own tooltip too, whole where it is cut short.
+// The legacy title holds with drawn membrane areas or without (the Checks say
+// which median the project's nets use).
 const REQUANTIFY_OFFERS = {
   background: {
     label: "Requantify with local background",
     title:
-      "The nets use the whole-image median background, as measured before the local background.",
+      "The nets use the median background of the whole image, or of a drawn membrane area," +
+      " as measured before the local background.",
     note: "Nets move to the local ring background; Undo takes it back.",
   },
   overExposure: {

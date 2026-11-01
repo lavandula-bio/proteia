@@ -84,6 +84,16 @@ _CHECKED_VALUES_CHOSEN: Final = (
     " blue), whose values are that channel's: measured_on names each image's channel and the"
     " over-exposure check its bands get (exact, near_limit or none)"
 )
+# What a ring leaves out, and the median a ring with too little membrane takes
+# (after quantify's own words), in a project with a membrane area drawn on an
+# image (#243): each area is the image cut out along its outline.
+_RING_EXCLUDE_ON_AREAS: Final = (
+    "every box on its own membrane area, dilated by its gap, and every pixel outside a drawn"
+    " area's outline"
+)
+_IMAGE_FALLBACK_ON_AREAS: Final = (
+    "; on a drawn membrane area, the median of the pixels inside its outline"
+)
 
 
 def software_versions() -> dict[str, str | None]:
@@ -181,9 +191,23 @@ def project_settings(project: Project) -> dict[str, JsonValue]:
     ``saturated_at`` points there. They describe what each image is measured
     on, not who chose it: while every image is on the mean (no choice, or the
     user's choice of it) they are :func:`settings` word for word, which say
-    that already."""
+    that already. Once a membrane area is drawn on an image (#243), the
+    background's ring says that it leaves out the boxes of its own area and
+    every pixel outside a drawn outline, and its image fallback that a drawn
+    area takes the median of its own pixels; while every area covers its
+    whole image, word for word as before."""
     found = {**settings(), "background_method": project.background_method}
-    images = list(project.batch.iter_images())
+    batch = project.batch
+    images = list(batch.iter_images())
+    if any(arena.outline is not None for image in images for _, arena in batch.arenas_on(image.id)):
+        background = cast(dict[str, JsonValue], found["background"])
+        ring = cast(dict[str, JsonValue], background["ring"])
+        fallbacks = cast(dict[str, JsonValue], background["fallbacks"])
+        found["background"] = {
+            **background,
+            "ring": {**ring, "exclude": _RING_EXCLUDE_ON_AREAS},
+            "fallbacks": {**fallbacks, "image": f"{fallbacks['image']}{_IMAGE_FALLBACK_ON_AREAS}"},
+        }
     if all(image.measured_channel is Channel.MEAN for image in images):
         return found
     clipped = cast(dict[str, JsonValue], found["possibly_clipped"])

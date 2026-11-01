@@ -485,16 +485,24 @@ def _background_notices(
     a ring cut short (``background_fallback``), and a background uneven around
     the box, its spread moving the net by more than
     :data:`~proteia.core.quantify.BACKGROUND_UNEVEN_LIMIT` of it
-    (``background_uneven``, also for any spread under a net of 0)."""
+    (``background_uneven``, also for any spread under a net of 0). On a drawn
+    membrane area (#243), whose outline cuts a ring as the image edge does,
+    the first names the outline too."""
     size = batch.boxes_of(protein).box_size
     shown = [(i, band) for i, band in enumerate(bands) if band is not None and included[i]]
     cut = tuple(i for i, band in shown if band.background_mode in _FALLBACK_MODES)
     if cut:
+        drawn = batch.find_arena(batch.arena_id_of(protein))[1].outline is not None
+        edges, cropping = (
+            ("the image edge, its membrane area's outline", "cropping or drawing the outline")
+            if drawn
+            else ("the image edge", "cropping")
+        )
         note(
             NoticeCode.BACKGROUND_FALLBACK,
             f"{protein.name!r} has too little membrane around its box in {lanes_phrase(cut)}:"
-            " the image edge or other boxes cut it, so the background there is estimated"
-            f" less surely; when cropping, leave about {size.height} px above and below the"
+            f" {edges} or other boxes cut it, so the background there is estimated"
+            f" less surely; when {cropping}, leave about {size.height} px above and below the"
             f" bands and {round(0.4 * size.width)} px beside them (one box height, 0.4"
             " box width)",
             protein_ids=(protein.id,),
@@ -1675,19 +1683,25 @@ def _compute(
             protein_ids=extra,
         )
     # A project quantified before #83 keeps the whole-image median until it is
-    # requantified; every band then has this mode (the model keeps one method).
-    legacy = tuple(
-        p.id
+    # requantified, or a drawn membrane area's median on one (#243); every band
+    # then has this mode (the model keeps one method).
+    legacy = [
+        p
         for p in batch.proteins
         if any(b.background_mode == "global_median" for b in batch.boxes_of(p).bands)
-    )
+    ]
     if legacy:
+        drawn = any(batch.find_arena(batch.arena_id_of(p))[1].outline is not None for p in legacy)
+        median = (
+            "the median background of the whole image, or of a drawn membrane area,"
+            if drawn
+            else "the whole-image median background,"
+        )
         note(
             NoticeCode.LEGACY_BACKGROUND,
-            "nets use the whole-image median background, as measured before the local"
-            " background; requantify to measure each band's background from the membrane"
-            " around its box",
-            protein_ids=legacy,
+            f"nets use {median} as measured before the local background; requantify to"
+            " measure each band's background from the membrane around its box",
+            protein_ids=tuple(p.id for p in legacy),
         )
     for image_id, why in outdated.items():  # an image with no band has no nets to warn about
         measured = tuple(p.id for p in batch.proteins_on(image_id) if batch.boxes_of(p).bands)

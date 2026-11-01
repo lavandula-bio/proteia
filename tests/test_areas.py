@@ -11,6 +11,7 @@ its marker holds the same areas, so an area operation on one acts on both.
 The angle is recorded only: no net and no apparent MW changes with it.
 """
 
+import json
 import math
 from pathlib import Path
 
@@ -1788,6 +1789,112 @@ def test_a_legacy_project_on_drawn_areas_is_logged_as_measured_there(tmp_path, c
         f"in {FOLDER!r}: the nets are measured with the legacy background (global_median),"
         " each image's or drawn membrane area's median, until the project is requantified"
     ) in caplog.messages
+
+
+def notices_of(s, code: str) -> dict[tuple[str, ...], str]:
+    """The messages of the committed project's notices of ``code``, by their proteins."""
+    return {n.protein_ids: n.message for n in ops.compute(s).notices if n.code == code}
+
+
+def test_a_ring_cut_short_on_a_drawn_area_names_its_outline(tmp_path):
+    # The outline cuts the ring as the image edge does, and is drawn with
+    # the same margin; on an image of one membrane the words are as before.
+    s, image, (top, bottom) = two_levels_split(tmp_path)
+    batch = s.project.batch
+    proteins = [batch.find_band(band)[0].id for band in (top, bottom)]
+    names = {proteins[0]: "β-catenin", proteins[1]: "p53 µ"}
+    assert notices_of(s, "background_fallback") == {
+        (protein,): (
+            f"{names[protein]!r} has too little membrane around its box in lane 1: the image"
+            " edge, its membrane area's outline or other boxes cut it, so the background there"
+            " is estimated less surely; when cropping or drawing the outline, leave about 10 px"
+            " above and below the bands and 8 px beside them (one box height, 0.4 box width)"
+        )
+        for protein in proteins
+    }
+    s2 = session_on(tmp_path / "one")
+    image = import_blot(s2, two_levels()[:20], "one level µ.tif")
+    ops.set_lanes(s2, [LaneInput("vehicle")])
+    protein = ops.add_protein(s2, "β-catenin", Role.TARGET, image, box_size=LEVEL_BOX)
+    ops.place_box(s2, protein, 15, 10, lane_index=0, grow=False)
+    assert notices_of(s2, "background_fallback") == {
+        (protein,): (
+            "'β-catenin' has too little membrane around its box in lane 1: the image edge or"
+            " other boxes cut it, so the background there is estimated less surely; when"
+            " cropping, leave about 10 px above and below the bands and 8 px beside them (one"
+            " box height, 0.4 box width)"
+        )
+    }
+
+
+def test_a_legacy_project_on_drawn_areas_is_told_which_median_its_nets_use(tmp_path):
+    # Its nets are above each drawn area's median (test_results: the whole
+    # image's, word for word, on images of one membrane).
+    s, image, bands = two_levels_split(tmp_path, legacy=True)
+    batch = s.project.batch
+    proteins = tuple(batch.find_band(band)[0].id for band in bands)
+    assert notices_of(s, "legacy_background") == {
+        proteins: (
+            "nets use the median background of the whole image, or of a drawn membrane area,"
+            " as measured before the local background; requantify to measure each band's"
+            " background from the membrane around its box"
+        )
+    }
+
+
+def recorded_settings(s) -> dict:
+    from proteia.core import record
+
+    return record.build_record(s.project, exported_at="2026-11-01T12:00:00.000Z", files={})[
+        "settings"
+    ]
+
+
+def test_the_record_says_how_drawn_areas_are_measured(tmp_path):
+    # Each area is the image cut out along its outline: the rings leave out
+    # the boxes of their own area and read inside a drawn outline alone, and
+    # a ring too short takes the area's median. Every other setting as
+    # without areas; on images of one membrane, the settings word for word.
+    from proteia.core import record
+    from proteia.core.model import Channel
+
+    s, image, _ = two_levels_split(tmp_path)
+    plain = {**record.settings(), "background_method": "ring_median_v1"}
+    got = recorded_settings(s)
+    background, before = got["background"], plain["background"]
+    assert background["ring"] == {
+        **before["ring"],
+        "exclude": (
+            "every box on its own membrane area, dilated by its gap, and every pixel outside a"
+            " drawn area's outline"
+        ),
+    }
+    assert background["fallbacks"] == {
+        **before["fallbacks"],
+        "image": (
+            "< max(10, 0.25 box area) ring pixels: image median; on a drawn membrane area, the"
+            " median of the pixels inside its outline"
+        ),
+    }
+    assert list(background) == list(before) and list(background["ring"]) == list(before["ring"])
+    others = {k: v for k, v in background.items() if k not in ("ring", "fallbacks")}
+    assert others == {k: v for k, v in before.items() if k not in ("ring", "fallbacks")}
+    assert {k: v for k, v in got.items() if k != "background"} == {
+        k: v for k, v in plain.items() if k != "background"
+    }
+    # The whole image again (the second area removed, the first redrawn
+    # over it): word for word, to the byte.
+    ops.remove_arena(s, area_on(s, image, 2))
+    ops.edit_arena(s, area_on(s, image), outline=None)
+    assert s.project.batch.arenas_on(image)[0][1].outline is None
+    assert json.dumps(recorded_settings(s)) == json.dumps(plain)
+    # With a channel chosen too, each says its own.
+    rgb = np.dstack([np.full_like(two_levels(), 5000), two_levels(), np.zeros_like(two_levels())])
+    s, image, _ = two_levels_split(tmp_path / "colour", rgb)
+    ops.set_channel(s, image, Channel.GREEN)
+    got = recorded_settings(s)
+    assert got["background"]["fallbacks"]["image"].endswith("the pixels inside its outline")
+    assert got["measured_on"] == {image: {"channel": "green", "check": "exact"}}
 
 
 def edit_strip_1(s, areas, proteins, what):
