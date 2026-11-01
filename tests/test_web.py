@@ -11,6 +11,7 @@ import http.client
 import importlib.metadata
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -33,6 +34,7 @@ from proteia.core import export, mwcal, results, rowdetect
 from proteia.core import operations as ops
 from proteia.core.model import ImageKind, Polarity
 from proteia.web import api, cli, handoff, launch, projects, server
+from proteia.web.browser import NotOpened
 from proteia.web.launch import INSTANCE_FILE, LOCK_FILE, REDIRECT_FILE
 
 OMIT = object()  # send no Host header
@@ -327,6 +329,7 @@ class _FakeInstance:
     token = "s" * 43
     taken = 0
     unread = ()
+    unopened: NotOpened | None = None
 
     def __init__(self) -> None:
         self.served = False
@@ -367,6 +370,62 @@ def test_main_prints_a_non_ascii_path_to_a_narrow_console(state, monkeypatch):
     assert launch.main([]) == 0
     stdout.flush()
     assert b"\\xb5" in stdout.buffer.getvalue()  # the micro sign, escaped
+
+
+# Why the page may not have reached a browser (#251), as browser.open_page says it.
+MISSED = (
+    "Windows names no browser for web links (http), so the page was opened as a file"
+    " instead, which may not reach a browser."
+)
+BY_HAND = "If no browser window opens, open this file in a browser:"
+
+
+def test_main_says_the_page_opens_in_the_browser_when_one_took_it(state, monkeypatch, capsys):
+    # As before #251, when the browser took the page.
+    fake = _FakeInstance()
+    monkeypatch.setattr(launch, "start", lambda **kwargs: fake)
+    assert launch.main([]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "Proteia is running at http://127.0.0.1:1234/ and opens in your browser.",
+        f"{BY_HAND} {fake.redirect_path}",
+        "To quit, use Quit on the page, or press Ctrl+C here.",
+    ]
+
+
+def test_main_names_the_file_to_open_when_the_page_may_not_reach_a_browser(
+    state, monkeypatch, capsys
+):
+    # #251: with no browser named for http the page is opened as before, and
+    # the console says why, and which file to open by hand; the first launch
+    # no longer says it opens in the browser.
+    fake = _FakeInstance()
+    fake.unopened = NotOpened(fake.redirect_path, MISSED)
+    monkeypatch.setattr(launch, "start", lambda **kwargs: fake)
+    assert launch.main([]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "Proteia is running at http://127.0.0.1:1234/.",
+        MISSED,
+        f"{BY_HAND} {fake.redirect_path}",
+        "To quit, use Quit on the page, or press Ctrl+C here.",
+    ]
+    page = state / "µ" / "open-proteia.html"
+    opened = launch.Opened(unopened=NotOpened(page, MISSED))
+    monkeypatch.setattr(launch, "start", lambda **kwargs: opened)
+    assert launch.main([]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "Proteia is already running.",
+        MISSED,
+        f"{BY_HAND} {page}",
+    ]
+
+    def older(**kwargs):
+        raise launch.HandoffError("older", opened=True, unopened=NotOpened(page, MISSED))
+
+    monkeypatch.setattr(launch, "start", older)
+    assert launch.main([]) == 1
+    console = capsys.readouterr()
+    assert console.out.splitlines() == ["Proteia is already running.", MISSED, f"{BY_HAND} {page}"]
+    assert console.err.splitlines() == ["older"]
 
 
 @pytest.mark.parametrize(("token", "port"), [("short", 8080), ("x" * 43, 0), ("x" * 43, 70000)])
@@ -781,6 +840,55 @@ def test_an_older_running_proteia_is_opened_and_handed_nothing(
     assert waiting(served.instance) == [] and staged_bytes(served.instance) == []
     # With no paths to hand over, it is opened as ever.
     assert launch.start(folder=tmp_path / "state", opener=opener) == launch.Opened()
+
+
+class Misses(Opener):
+    """An opener whose browser may not have taken the page, as
+    browser.open_page says it when Windows names no browser for http."""
+
+    def __call__(self, url: str) -> NotOpened:
+        super().__call__(url)
+        return NotOpened(Path.from_uri(url), MISSED)
+
+
+def test_a_launch_keeps_why_its_page_may_not_have_reached_a_browser(
+    served, tmp_path, monkeypatch, caplog
+):
+    # #251: on each way a launch opens the page, what the opener said of it
+    # is kept for the console; the session log gets the reason (never the
+    # page's path, which holds the user's profile folder).
+    state = tmp_path / "state"
+    missed = NotOpened(state / REDIRECT_FILE, MISSED)
+    first = launch.start(folder=tmp_path / "other µ", opener=Misses())  # a new instance
+    try:
+        assert first.unopened == NotOpened(tmp_path / "other µ" / REDIRECT_FILE, MISSED)
+    finally:
+        first.close()
+    assert launch.start(folder=state, opener=Misses()) == launch.Opened(unopened=missed)
+    a, b = scans(tmp_path, "a.tif", "b.tif")
+    handed = launch.start(folder=state, opener=Misses(), command_line=command(a))
+    assert (handed.merged, handed.unopened) == (False, missed)
+    joined = launch.start(folder=state, opener=Misses(), command_line=command(b))
+    assert (joined.merged, joined.unopened) == (True, None)  # it opened no tab
+    _older(monkeypatch)
+    with pytest.raises(launch.HandoffError) as refused:
+        launch.start(folder=state, opener=Misses(), command_line=command(a))
+    assert (refused.value.opened, refused.value.unopened) == (True, missed)
+    said = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "proteia.web.launch" and record.levelno == logging.WARNING
+    ]
+    assert said == [f"the page may not have reached a browser: {MISSED}"] * 4
+    logged = [record.getMessage() for record in caplog.records]
+    assert not any(str(tmp_path) in line or served.instance.token in line for line in logged)
+
+
+def test_a_launch_whose_opener_says_nothing_of_the_page_keeps_nothing(served, tmp_path):
+    # A stand-in that records the address (True, None or anything else).
+    state = tmp_path / "state"
+    assert launch.start(folder=state, opener=lambda url: None) == launch.Opened()
+    assert launch.start(folder=state, opener=lambda url: False) == launch.Opened()
 
 
 def test_a_refused_path_reaches_the_page_as_a_bounded_name(served, tmp_path):

@@ -12,15 +12,32 @@ from pathlib import Path
 
 import pytest
 
-from conftest import guards_in_place
+from conftest import DESKTOP_CALLS, guards_in_place
 from proteia.core import operations
 from proteia.core.session import ProjectSession
-from proteia.web import launch
+from proteia.web import browser, launch
 
 
 def test_the_real_browser_cannot_be_opened_from_a_test():
     with pytest.raises(AssertionError, match="real browser"):
         webbrowser.open("http://127.0.0.1:1/")
+
+
+def test_the_browser_windows_names_for_http_is_neither_asked_for_nor_started(tmp_path):
+    # #251: a launch on Windows asks the shell which browser it names for
+    # http (the user's registry) and starts it; a test does neither, whatever
+    # the system it runs on.
+    with pytest.raises(AssertionError, match="asked Windows for the browser"):
+        browser._http_handler()
+    with pytest.raises(AssertionError, match="tried to start the browser"):
+        browser._start("b.exe", "b.exe page")
+    page = (tmp_path / "open-proteia.html").as_uri()
+    with pytest.raises(AssertionError, match="asked Windows for the browser"):
+        browser.open_page(page, windows=True, environ={})
+    with pytest.raises(AssertionError, match="tried to start the browser"):
+        browser.open_page(
+            page, windows=True, environ={}, handler=lambda: browser.Handler("b.exe", "b.exe %1")
+        )
 
 
 def test_the_state_folder_is_the_test_s_own():
@@ -42,6 +59,18 @@ def _held(owner: object, name: str):
         patch.setattr(owner, name, lambda *args, **kwargs: checked(*args, **kwargs))
 
     return change
+
+
+def _own_back(name: str):
+    """The change that puts back Proteia's own ``browser.<name>`` (the
+    question to the shell, or the start of the browser), unguarded."""
+    return lambda patch, own, base: patch.setattr(browser, name, DESKTOP_CALLS[name])
+
+
+def _stood_in(name: str):
+    """The change that puts a test's own stand-in for ``browser.<name>``
+    over the guard's (as test_web_browser does)."""
+    return lambda patch, own, base: patch.setattr(browser, name, lambda *args: None)
 
 
 def _browsers(order: list[str] | None):
@@ -67,6 +96,10 @@ def _state(variable: str, folder):
         pytest.param(_held(ProjectSession, "_read_checked"), True, id="read-held"),
         pytest.param(_browsers(None), False, id="browsers-not-looked-up"),
         pytest.param(_browsers(["firefox", "proteia-test-guard"]), False, id="real-browser-first"),
+        pytest.param(_own_back("_http_handler"), False, id="shell-question-back"),
+        pytest.param(_own_back("_start"), False, id="browser-start-back"),
+        pytest.param(_stood_in("_http_handler"), True, id="shell-question-stood-in"),
+        pytest.param(_stood_in("_start"), True, id="browser-start-stood-in"),
         pytest.param(_state("LOCALAPPDATA", lambda own, base: base.parent), False, id="local-out"),
         pytest.param(
             _state("XDG_STATE_HOME", lambda own, base: base.parent / f"{base.name}0"),
