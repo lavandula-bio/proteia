@@ -727,14 +727,24 @@ export class CalibrationPanel {
         on(other.id).some((membrane) => mine.includes(membrane)) &&
         (other.kind === "visible_marker" || other.kind === "merged"),
     );
-    // A link makes the two images hold the same membrane areas (#243): said
-    // before it is made, where the image's areas are drawn.
-    const drawn = this.project.arenas.some(
-      (area) => area.image_id === image.id && area.outline !== null,
-    );
+    // A link makes the two images hold the same membrane areas (#243): which
+    // one takes the other's is said before it is made, as the server says the
+    // link would go (the marker takes the image's, or, linked from another
+    // image already, gives the image the group's).
+    const takes = image.link_areas || {};
+    const name = isolate(image.original_name);
     const follow = $("marker-follow");
-    follow.hidden = !drawn || !markers.length;
-    follow.textContent = `Its membrane areas will follow ${isolate(image.original_name)}.`;
+    const told = markers
+      .filter((marker) => marker.id !== image.marker_image_id && takes[marker.id])
+      .map((marker) => {
+        const other = isolate(marker.original_name);
+        return takes[marker.id] === "marker"
+          ? `A link to ${other} gives ${other} the membrane areas of ${name}.`
+          : `A link to ${other} gives ${name} the membrane areas of ${other}, as the images` +
+              " linked to it hold them.";
+      });
+    follow.hidden = !told.length;
+    follow.textContent = told.join(" ");
     const shown = JSON.stringify([
       this.project.open_id,
       image.id,

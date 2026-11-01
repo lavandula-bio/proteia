@@ -11,7 +11,7 @@
 // draws what the server gives: an area's corners and bounds come from the
 // state, never worked out here; only an outline being drawn, not sent yet, is
 // drawn from its own corners and angle.
-import { $, counted, isolate, sentence } from "/static/dom.js";
+import { $, counted, inWords, isolate, sentence } from "/static/dom.js";
 
 export const MAX_ANGLE = 45; // degrees either way, as the server takes
 export const DISCARDED = "The unfinished membrane area was discarded.";
@@ -50,14 +50,28 @@ function lower(label) {
   return label.charAt(0).toLowerCase() + label.slice(1);
 }
 
-// The images linked to `image` by a marker link (its marker, the images it is
-// the marker of): they hold the same areas.
-function linkedTo(project, image) {
-  return project.images.filter(
-    (other) =>
-      other.id !== image.id &&
-      (other.id === image.marker_image_id || other.marker_image_id === image.id),
-  );
+// What removing an area takes, as the server's removal scope gives it (the
+// membrane's area on every linked image, the proteins on them and their
+// boxes), in the confirmation's words.
+function removalWords(project, area) {
+  const removal = area.removal;
+  const images = removal.image_ids
+    .map((id) => project.images.find((each) => each.id === id))
+    .filter(Boolean)
+    .map((each) => isolate(each.original_name));
+  const names = removal.protein_ids
+    .map((id) => project.proteins.find((each) => each.id === id))
+    .filter(Boolean)
+    .map((each) => `'${isolate(each.name)}'`);
+  let what = " Undo brings it back.";
+  if (names.length) {
+    const who = names.length === 1 ? `The protein ${names[0]}` : `The proteins ${inWords(names)}`;
+    const theirs = names.length === 1 ? "its" : "their";
+    const boxes = removal.boxes ? ` and ${theirs} ${counted(removal.boxes, "box", "boxes")}` : "";
+    const verb = names.length === 1 && !removal.boxes ? "goes" : "go";
+    what = ` ${who}${boxes} ${verb} too; Undo brings them back.`;
+  }
+  return { images: inWords(images), what };
 }
 
 const FIELDS = ["x0", "y0", "x1", "y1"];
@@ -544,8 +558,9 @@ export class AreaPanel {
     }
   }
 
-  // Remove: confirmed first, naming what goes with it (and the linked image,
-  // whose area goes too); the confirm is about the area it named.
+  // Remove: confirmed first, naming what goes with it as the server's removal
+  // scope says (every linked image, whose area goes too, and the proteins on
+  // them); the confirm is about the area it named.
   async remove(area) {
     const project = this.project;
     const image = project.images.find((each) => each.id === area.image_id);
@@ -553,13 +568,8 @@ export class AreaPanel {
       return;
     }
     const label = labelOf(project, area.membrane_id);
-    const linked = linkedTo(project, image);
-    const files = [image, ...linked].map((each) => isolate(each.original_name)).join(" and ");
-    const proteins = project.proteins.filter((protein) => protein.arena_id === area.id).length;
-    const what = proteins
-      ? ` Its ${counted(proteins, "protein's boxes go", "proteins' boxes go")} too; Undo brings them back.`
-      : " Undo brings it back.";
-    if (!window.confirm(`Remove ${lower(label)}'s area on ${files}?${what}`)) {
+    const { images, what } = removalWords(project, area);
+    if (!window.confirm(`Remove ${lower(label)}'s area on ${images}?${what}`)) {
       return;
     }
     const areas = areasOn(project, image.id);

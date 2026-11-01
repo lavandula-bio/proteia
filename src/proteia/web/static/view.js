@@ -89,8 +89,6 @@ function hasCaret(element) {
   );
 }
 
-// The row box dragged between two image points, as the server takes it: the
-// corners rounded to whole pixels, x0 < x1 and y0 < y1 (end exclusive).
 // A membrane area being drawn or edited (not sent yet): its corners in image
 // pixels, top left, top right, bottom right, bottom left, as the server turns
 // an outline (a positive angle runs its right side lower). Only an unsent
@@ -116,6 +114,8 @@ const AREA_HANDLE_GAP = 24; // screen px from the top edge's middle to the turni
 const AREA_HANDLE_RADIUS = 7; // its radius: 14 px across
 const AREA_CORNER = 12; // the corner marks of an outline being drawn, px across
 
+// The row box dragged between two image points, as the server takes it: the
+// corners rounded to whole pixels, x0 < x1 and y0 < y1 (end exclusive).
 function rowRect(a, b) {
   const x0 = Math.round(Math.min(a.x, b.x));
   const y0 = Math.round(Math.min(a.y, b.y));
