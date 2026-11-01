@@ -83,10 +83,12 @@ while the area holds none (:func:`~proteia.core.project.lane_anchors`), and
 redrawing an area to cut it in two hands the rows past the cut to a new
 membrane (:func:`edit_arena`). Each membrane has its own
 calibration on an image it shares. Which boxes a band's ring leaves out, and
-which pixels it reads, is one function's (:func:`_ring_context`): every box on
-the image, and every pixel, whatever areas are drawn, so an area's outline or
-angle changes no net; an area operation re-quantifies an image only where that
-function says a ring changed.
+which pixels it reads, is one function's (:func:`_ring_context`): drawing an
+outline is cutting the image there, so a ring leaves out the boxes of its own
+area and reads the pixels inside its outline alone, and an area over the
+whole image reads all of it, as before areas; an area operation re-quantifies
+an image only where that function says a ring changed, and an outline or
+angle edit answers whose nets moved.
 
 Molecular weights (#58). A band's ``apparent_mw`` is its image's calibration
 (:func:`~proteia.core.mwcal.calibration_for`: the image's register group,
@@ -884,30 +886,32 @@ def area_key(arena: Arena) -> AreaKey:
 
 @dataclass(frozen=True)
 class RingContext:
-    """What one row's bands' background rings may read (:func:`_ring_context`):
-    the rows whose boxes every ring leaves out (the row's own among them), and
-    the membrane area outside which no ring reads a pixel (None: anywhere on
-    the image)."""
+    """What the background rings of the bands on one membrane area read
+    (:func:`_ring_context`): the pixels inside the area's outline alone
+    (``area``; its outline None: the whole image), leaving out the boxes of
+    the rows ``left_out``."""
 
+    area: AreaKey
     left_out: frozenset[str]  # row ids
-    read_within: AreaKey | None = None
 
 
-def _ring_context(batch: Batch, image_id: str, row_id: str) -> RingContext:
-    """Which boxes the background rings of a row's bands leave out, and which
-    pixels they may read: the one place this rule lives (#243). Every ring
-    leaves out every box on the image, whichever membrane area it is on, and
-    reads across the areas' outlines, as on an image of one membrane, so a
-    membrane's nets are those its boxes give on the image whatever areas are
-    drawn on it; an edit of one membrane's boxes moves the nets of another's
-    bands whose rings reach it, as it moves another protein's on one image.
-    ``row_id`` is the row whose rings are measured. Only rows with boxes are
-    left out: a row without any changes no ring, so its coming or going reads
-    no pixel (:func:`_area_apply`)."""
+def _ring_context(batch: Batch, arena: Arena) -> RingContext:
+    """Which boxes the background rings of the bands on a membrane area leave
+    out, and which pixels they read: the one place this rule lives (#243).
+    Drawing an outline is cutting the image there: the rings leave out the
+    boxes of the rows on the area that have any and read the pixels inside its
+    outline alone, so no other membrane's boxes or pixels shape a net, and a
+    band near the outline is measured from the membrane inside it; an area
+    over the whole image reads all of it, as before areas, so an image of one
+    membrane keeps its numbers. A row without boxes changes no ring, so its
+    coming or going reads no pixel (:func:`_area_apply`)."""
     return RingContext(
+        area=area_key(arena),
         left_out=frozenset(
-            row.id for protein, row in batch.rows_on(image_id) if batch.boxes_of(protein).bands
-        )
+            row.id
+            for protein, row in batch.rows_on_arena(arena.id)
+            if batch.boxes_of(protein).bands
+        ),
     )
 
 
@@ -915,9 +919,10 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     """The one writer of a band's net, background fields and clipping flags:
     quantify every band on one image, of every protein, together (protein order,
     then band order; the results do not depend on it). Which boxes each band's
-    ring leaves out, and which pixels it reads, is :func:`_ring_context`'s:
-    the rows that share a context are measured in one pass, which leaves out
-    every box of the context's rows. ``array`` is the image's analysis array.
+    ring leaves out, and which pixels it reads, is :func:`_ring_context`'s: the
+    bands of one membrane area are measured in one pass, which leaves out every
+    box there, reading inside a drawn outline alone. ``array`` is the image's
+    analysis array.
 
     Under the project's legacy method (``global_median``) each level is the
     image's median and each net floors every pixel at 0, as before #83;
@@ -932,40 +937,28 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
     """
     batch = draft.batch
     image = batch.find_image(image_id)
-    rows = [
-        (row.id, protein)
-        for protein, row in batch.rows_on(image_id)
-        if batch.boxes_of(protein).bands
-    ]
-    contexts: dict[RingContext, list[tuple[str, Protein]]] = {}
-    for row_id, protein in rows:
-        contexts.setdefault(_ring_context(batch, image_id, row_id), []).append((row_id, protein))
     placed: list[tuple[BoxSize, Band]] = []
     found: list[BandBackground] = []
     dark_on_light = image.polarity.dark_on_light
-    clamp: NetClamp
-    for context, measured in contexts.items():
+    legacy = draft.background_method == LEGACY_BACKGROUND_METHOD
+    for _, arena in batch.arenas_on(image_id):
+        context = _ring_context(batch, arena)
         here = [
             (batch.boxes_of(protein).box_size, band)
-            for _, protein in measured
+            for protein, row in batch.rows_on_arena(arena.id)
+            if row.id in context.left_out
             for band in batch.boxes_of(protein).bands
         ]
         placed.extend(here)
-        if draft.background_method == LEGACY_BACKGROUND_METHOD:
-            legacy = BandBackground(level=image.background, mode="global_median", spread=0.0)
-            found.extend([legacy] * len(here))
+        if legacy:
+            level = BandBackground(level=image.background, mode="global_median", spread=0.0)
+            found.extend([level] * len(here))
             continue
-        ids = {row_id for row_id, _ in measured}
-        others = [
-            band.box.rect(batch.boxes_of(protein).box_size)
-            for row_id, protein in rows
-            if row_id in context.left_out and row_id not in ids
-            for band in batch.boxes_of(protein).bands
-        ]
+        if not here:
+            continue
         unreadable = None
-        if context.read_within is not None:
-            _, area = batch.find_arena(context.read_within[0])
-            unreadable = ~_inside_mask(area, image, (0, 0, image.width, image.height))
+        if context.area[1] is not None:  # a drawn outline: nothing past it is read
+            unreadable = ~_inside_mask(arena, image, (0, 0, image.width, image.height))
         found.extend(
             band_backgrounds(
                 array,
@@ -974,11 +967,10 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
                 dark_on_light=dark_on_light,
                 integral=image.bit_depth is not None,
                 fallback=image.background,
-                others=others,
                 unreadable=unreadable,
             )
         )
-    clamp = "pixel" if draft.background_method == LEGACY_BACKGROUND_METHOD else RING_CLAMP
+    clamp: NetClamp = "pixel" if legacy else RING_CLAMP
     depth, near_depth = image.exact_check_depth, image.near_check_depth
     for (size, band), background in zip(placed, found, strict=True):
         band.net = net_signal(
@@ -2474,6 +2466,10 @@ class AreaChange:
     curves_changed: tuple[str, ...] = ()
     dropped_undetected: tuple[tuple[str, int, int], ...] = ()
     handed_off: str | None = None
+    # The bands on those images whose net the edit moved, and the largest
+    # change (as RowPlacement gives them): a drawn area's rings read inside it.
+    remeasured: tuple[tuple[str, float, float], ...] = ()
+    largest_change: tuple[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -2728,10 +2724,11 @@ def _areas_refusal(
 
 
 def _rings(batch: Batch, image_id: str) -> dict[str, RingContext]:
-    """Each boxed row's ring context on an image (:func:`_ring_context`); {}
-    for an image without one (or one the batch does not hold)."""
+    """Each boxed row's ring context on an image (:func:`_ring_context`, its
+    area's); {} for an image without one (or one the batch does not hold)."""
+    contexts = {arena.id: _ring_context(batch, arena) for _, arena in batch.arenas_on(image_id)}
     return {
-        row.id: _ring_context(batch, image_id, row.id)
+        row.id: contexts[batch.arena_id_of(protein)]
         for protein, row in batch.rows_on(image_id)
         if batch.boxes_of(protein).bands
     }
@@ -2747,15 +2744,17 @@ def _area_apply[T](
     """:func:`_apply` for an operation on membrane areas, which moves no box:
     the images (``image_ids`` of the draft) on which it changes what a ring
     reads (:func:`_ring_context`) are re-quantified in the same change, their
-    pixels read after a first pass shows which; on the others no net can
-    change, so no pixel is read."""
+    pixels read after a first pass shows which: those where a row with boxes
+    that stays, or comes, is read otherwise. A row that goes takes its nets
+    with it; on the others no net can change, so no pixel is read."""
     committed = session.project
     trial, _ = _prepare(session, change)
-    stale = [
-        image_id
-        for image_id in dict.fromkeys(image_ids(trial))
-        if (after := _rings(trial.batch, image_id)) and after != _rings(committed.batch, image_id)
-    ]
+
+    def read_otherwise(image_id: str) -> bool:
+        before = _rings(committed.batch, image_id)
+        return any(before.get(row) != ring for row, ring in _rings(trial.batch, image_id).items())
+
+    stale = [image_id for image_id in dict.fromkeys(image_ids(trial)) if read_otherwise(image_id)]
     arrays = {image_id: session.pixels(image_id) for image_id in stale}
 
     def requantified(draft: Project) -> T:
@@ -2844,7 +2843,8 @@ def add_arena(
     table of the image's first area's membrane. Its ``source`` is ``manual``.
     On an image linked to others by marker links, the same area is drawn on
     each, in one change: linked images hold the same areas. Nothing is
-    measured again: the rings read the image as before. The membrane's fit is
+    measured again: the other areas' rings read their own areas, as before
+    (``remeasured`` stays empty). The membrane's fit is
     refreshed in the same change (:func:`_refresh_mw`), as its marker links
     now include those of these images.
 
@@ -2931,7 +2931,9 @@ def add_arena(
             "lane_table_id": result.lane_table_id,
         }
 
-    return _area_apply(session, "add_arena", change, params, lambda _: linked)
+    result = _area_apply(session, "add_arena", change, params, lambda _: linked)
+    remeasured, largest = _remeasured(batch, session.project.batch, linked)
+    return replace(result, remeasured=remeasured, largest_change=largest)
 
 
 def _can_cut(area: Arena, drawn: Outline | None, angle: float) -> bool:
@@ -3020,9 +3022,11 @@ def edit_arena(
     for the whole image, which only an image's only area may cover) and/or
     its ``angle_deg``; ``KEEP`` leaves one as it is. The edited area's
     ``source`` becomes ``manual``. On linked images the membrane's area on
-    each is redrawn alike, in one change. No box moves and nothing is
-    measured again: the rings read the image as before, so no net changes.
-    The same outline and angle are a no-op.
+    each is redrawn alike, in one change. No box moves; a drawn area's rings
+    read inside its outline alone (:func:`_ring_context`), so the images are
+    measured again where a ring reaches the outline, and the answer says whose
+    nets moved (``remeasured``, ``largest_change``); a whole-image area's angle
+    changes no number. The same outline and angle are a no-op.
 
     A cut. An image holding two membranes' rows on one area (a project from
     before areas: two strips on one image) is split by redrawing the area so
@@ -3132,7 +3136,9 @@ def edit_arena(
             }
         return entry
 
-    return _area_apply(session, "edit_arena", change, params, lambda _: linked)
+    result = _area_apply(session, "edit_arena", change, params, lambda _: linked)
+    remeasured, largest = _remeasured(batch, session.project.batch, linked)
+    return replace(result, remeasured=remeasured, largest_change=largest)
 
 
 def _cut_off(

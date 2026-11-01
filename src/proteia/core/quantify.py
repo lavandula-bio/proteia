@@ -233,7 +233,6 @@ def band_backgrounds(
     dark_on_light: bool,
     integral: bool,
     fallback: float,
-    others: Sequence[Rect] = (),
     unreadable: np.ndarray | None = None,
 ) -> list[BandBackground]:
     """The ring_median background of every box on one image, in input order.
@@ -247,17 +246,16 @@ def band_backgrounds(
     ``fallback`` is the image-mode level: the image median
     (:func:`estimate_background`, stored as ``ImageRef.background``).
 
-    ``others`` are boxes whose zones every ring excludes too, without being
-    measured (a caller that measures the boxes on an image in parts), and
-    ``unreadable``, an image-shaped mask, pixels no ring may read; by default
-    none, so every box on the image is passed in ``rects``.
+    ``unreadable``, an image-shaped mask, holds the pixels no ring may read
+    (outside the membrane area whose boxes ``rects`` are, #243); by default
+    none.
 
     Raises ValueError if the lists differ in length, a rect is not its size, or
     a box extends beyond the image bounds.
     """
     gray = to_grayscale(array)
     boxes = _checked_rects(gray.shape, rects, sizes)
-    excluded = _exclusion_mask(gray.shape, [*boxes, *(tuple(int(v) for v in r) for r in others)])
+    excluded = _exclusion_mask(gray.shape, boxes)
     if unreadable is not None:
         excluded |= unreadable
     sign = -1.0 if dark_on_light else 1.0
