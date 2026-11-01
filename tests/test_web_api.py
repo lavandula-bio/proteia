@@ -1571,6 +1571,39 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     )
     answers["POST /api/undo"] = client.ok("POST", "/api/undo")
     answers["POST /api/redo"] = client.ok("POST", "/api/redo")
+    # Membrane areas (#243), on a third image split in two.
+    _, third = upload(client, blot_bytes(tmp_path), name="third.tif")
+    shown = next(i for i in third["project"]["images"] if i["id"] == third["image_id"])
+    [area] = shown["arena_ids"]
+    answers["PUT /api/arenas/{arena_id}"] = client.ok(
+        "PUT", f"/api/arenas/{area}", {"outline": [0, 0, W, H // 2]}
+    )
+    answers["POST /api/arenas"] = client.ok(
+        "POST", "/api/arenas", {"image_id": third["image_id"], "outline": [0, H // 2, W, H]}
+    )
+    [split] = answers["POST /api/arenas"]["arena_ids"]
+    marks = f"/api/arenas/{split}/calibration/left"
+    edge = {"y": float(H - 5), "mw": 100, "source": "strip_edge", "x": 5.0, "snap": False}
+    answers["POST /api/arenas/{arena_id}/calibration/{side}/points"] = client.ok(
+        "POST", f"{marks}/points", edge
+    )
+    answers["PATCH /api/arenas/{arena_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "PATCH", f"{marks}/points/100", {"y": float(H - 6)}
+    )
+    answers["DELETE /api/arenas/{arena_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "DELETE", f"{marks}/points/100"
+    )
+    ruler = {"x": 5.0, "points": [{"y": float(H - 20), "mw": 100}, {"y": float(H - 4), "mw": 50}]}
+    answers["PUT /api/arenas/{arena_id}/calibration/{side}/ladder"] = client.ok(
+        "PUT", f"{marks}/ladder", ruler
+    )
+    answers["DELETE /api/arenas/{arena_id}/calibration"] = client.ok(
+        "DELETE", f"/api/arenas/{split}/calibration"
+    )
+    answers["PUT /api/arenas/{arena_id}/membrane"] = client.ok(
+        "PUT", f"/api/arenas/{split}/membrane", {"membrane_id": None}
+    )
+    answers["DELETE /api/arenas/{arena_id}"] = client.ok("DELETE", f"/api/arenas/{split}")
     # A row box over the three declared lanes, on the image that kept the blot's polarity.
     body = {"name": "GAPDH", "role": "loading control", "image_id": second["image_id"]}
     other = client.ok("POST", "/api/proteins", body)["protein_id"]
@@ -1639,6 +1672,8 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         # Only read: they answer what they found, not the project.
         "POST /api/images/{image_id}/ladder-proposal",
         "POST /api/images/{image_id}/ladder-snap",
+        "POST /api/arenas/{arena_id}/ladder-proposal",
+        "POST /api/arenas/{arena_id}/ladder-snap",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -6218,7 +6253,9 @@ def test_calibration_routes(client, tmp_path):
     assert project["membranes"] == [
         {
             "id": membrane,
+            "label": "Membrane 1",
             "image_ids": [image_id],
+            "arena_ids": project["images"][0]["arena_ids"],
             "ladder": None,
             "ladder_kda": [],
             "groups": [{"image_ids": [image_id], "points": [], "fit": None}],

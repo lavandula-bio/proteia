@@ -78,7 +78,7 @@ from pydantic import JsonValue
 
 from proteia.core import mwrow
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
-from proteia.core.model import Batch, ImageRef, Membrane, Project, Protein
+from proteia.core.model import Arena, Batch, ImageRef, Membrane, Project, Protein
 from proteia.core.operations import calibration_fit, unassessed_images
 from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import HistoryStep, ProjectSession
@@ -169,10 +169,32 @@ def _membrane(batch: Batch, membrane: Membrane) -> JsonValue:
         )
     return {
         "id": membrane.id,
+        "label": f"Membrane {batch.membrane_number(membrane)}",
         "image_ids": [image.id for image in images],
+        "arena_ids": [arena.id for arena in batch.arenas_of(membrane)],
         "ladder": calibration.ladder,
         "ladder_kda": list(calibration.ladder_kda),
         "groups": groups,
+    }
+
+
+def _arena(batch: Batch, membrane: Membrane, arena: Arena) -> JsonValue:
+    """A membrane area as the page draws it (#243): its outline before its
+    turn (null: the whole image), its angle and source, and its ``corners``
+    (top left, top right, bottom right, bottom left, turned) and ``bounds``
+    (the whole pixels they span) from the model's geometry, so the page
+    draws what the server checks."""
+    image = batch.find_image(arena.image_id)
+    outline = arena.outline
+    return {
+        "id": arena.id,
+        "membrane_id": membrane.id,
+        "image_id": arena.image_id,
+        "outline": None if outline is None else [outline.x0, outline.y0, outline.x1, outline.y1],
+        "angle_deg": arena.angle_deg,
+        "source": arena.source.value,
+        "corners": [[x, y] for x, y in arena.corners(image)],
+        "bounds": list(arena.bounds(image)),
     }
 
 
@@ -197,10 +219,12 @@ def project_state(
     ``action`` (null when there is none)."""
     undo, redo = session.history_steps
     batch = project.batch
+    on = {image.id: batch.arenas_on(image.id) for image in batch.iter_images()}
     images: list[JsonValue] = [
         {
             "id": image.id,
-            "membrane_id": membrane.id,
+            "membrane_id": on[image.id][0][0].id,  # its first area's
+            "arena_ids": [arena.id for _, arena in on[image.id]],
             "original_name": image.original_name,
             "kind": image.kind.value,
             "polarity": image.polarity.value,
@@ -214,13 +238,17 @@ def project_state(
                 for warning in image.import_warnings
             ],
         }
-        for membrane in batch.membranes
-        for image in batch.images_of(membrane)
+        for image in batch.iter_images()
     ]
-    anchors = {image.id: lane_anchors(batch, image) for image in batch.iter_images()}
+    anchors = {
+        arena.id: lane_anchors(batch, arena.id)
+        for membrane in batch.membranes
+        for arena in batch.arenas_of(membrane)
+    }
     proteins: list[JsonValue] = []
     for protein in batch.proteins:
         boxes, image_id = batch.boxes_of(protein), batch.image_id_of(protein)
+        arena_id = batch.arena_id_of(protein)
         size, fitted, padding = boxes.box_size, boxes.fitted_size, boxes.box_padding
         predicted = mwrow.predict(batch, protein)
         proteins.append(
@@ -229,6 +257,7 @@ def project_state(
                 "name": protein.name,
                 "role": protein.role.value,
                 "image_id": image_id,
+                "arena_id": arena_id,
                 "loading_control_ids": list(protein.loading_control_ids),  # the series order
                 "expected_mw": protein.expected_mw,
                 "mw_tolerance": protein.mw_tolerance,
@@ -263,7 +292,7 @@ def project_state(
                     }
                     for record in boxes.undetected
                 ],
-                "missing_lanes": _missing_lanes(batch, protein, anchors[image_id], predicted),
+                "missing_lanes": _missing_lanes(batch, protein, anchors[arena_id], predicted),
                 "predicted_row": _predicted_row(predicted),
             }
         )
@@ -285,6 +314,11 @@ def project_state(
         ],
         "reference_condition": batch.reference_condition,
         "images": images,
+        "arenas": [
+            _arena(batch, membrane, arena)
+            for membrane in batch.membranes
+            for arena in batch.arenas_of(membrane)
+        ],
         "membranes": [_membrane(batch, membrane) for membrane in batch.membranes],
         "proteins": proteins,
         "saved": not session.dirty,
