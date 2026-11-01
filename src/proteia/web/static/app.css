@@ -279,6 +279,80 @@ button:disabled {
   color: var(--muted);
 }
 
+/* Membranes on this image (#243): an item per membrane area, its controls
+   wrapping under its name; the editor of an outline being drawn. */
+.area-list {
+  list-style: none;
+  margin: 0 0 0.4rem;
+  padding: 0;
+}
+
+.area-list .area {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+  margin-bottom: 0.4rem;
+}
+
+.area-pick {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.area.chosen .area-pick {
+  background: var(--chosen);
+  font-weight: 600;
+}
+
+.area-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+.area-controls select {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.area-editor {
+  margin-top: 0.4rem;
+}
+
+.area-keys {
+  margin: 0.3rem 0;
+  padding: 0.3rem 0.4rem;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+.area-keys:focus-visible {
+  outline: 2px solid Highlight;
+  outline-offset: 1px;
+}
+
+.area-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+  gap: 0 0.4rem;
+}
+
+.area-fields input {
+  width: 100%;
+}
+
+.area-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
 .actions {
   display: flex;
   gap: 0.4rem;

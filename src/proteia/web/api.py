@@ -248,7 +248,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
@@ -427,14 +427,35 @@ def _not_saved(exc: Exception) -> UnsavedChangesError:
     return UnsavedChangesError(f"the open project could not be saved: {exc}")
 
 
-def _dropped(session: ProjectSession) -> None:
+# Why a project closed by a switch kept changes it could not save: its folder
+# was removed or moved outside Proteia (ProjectRemovedError), in the page's words.
+REMOVED_WHY: Final = (
+    "its folder, or its project.json and an image file, were removed or moved outside Proteia"
+)
+# How many closed openings the workspace remembers for a page that follows (closed).
+CLOSED_KEPT: Final = 16
+
+
+def _dropped(session: ProjectSession, *, extra: Mapping[str, Any] | None = None) -> None:
     """Log that ``session``, closed, had changes not saved because its folder
     was removed or moved outside Proteia, which no save makes again (#101)."""
     if session.dirty and isinstance(session.save_error, ProjectRemovedError):
         _log.warning(
-            "closed %r with changes not saved: its folder was removed or moved outside Proteia",
-            session.folder.name,
+            "closed %r with changes not saved: %s", session.folder.name, REMOVED_WHY, extra=extra
         )
+
+
+def _closed(session: ProjectSession, open_id: int) -> dict[str, Any]:
+    """What a page that follows a switch is told of the opening ``open_id`` of
+    ``session`` that the switch closed (#101): its project's name, whether its
+    changes were all saved, and, if not, why, in words with no path
+    (:data:`REMOVED_WHY`, or that its last save failed, which the log says)."""
+    saved = not session.dirty
+    why = None
+    if not saved:
+        removed = isinstance(session.save_error, ProjectRemovedError)
+        why = REMOVED_WHY if removed else "Proteia could not save them"
+    return {"open_id": open_id, "name": session.folder.name, "saved": saved, "why": why}
 
 
 class UploadTooLargeError(ValueError):
@@ -593,6 +614,8 @@ class Workspace:
         # _preview_key -> preview PNG, least recently shown first.
         self._previews: OrderedDict[_PreviewKey, bytes] = OrderedDict()
         self._charts = ChartStore()
+        # The openings switches closed, by open id, oldest first (closed).
+        self._closed: OrderedDict[int, dict[str, Any]] = OrderedDict()
 
     def current(self, opening: int | None = None) -> ProjectSession:
         """The open project's session; with ``opening``, only if that is its open
@@ -765,13 +788,17 @@ class Workspace:
         except (OSError, ProjectError) as exc:
             raise _not_saved(exc) from exc
 
-    def flush(self) -> None:
+    def flush(self) -> str | None:
         """Save the open project if it has unsaved changes (an autosave failed);
         :class:`UnsavedChangesError` if that fails again, unless its folder was
-        removed or moved outside Proteia (:meth:`_save`)."""
+        removed or moved outside Proteia (:meth:`_save`): then what closing it
+        drops, in words, for the launcher to say as it stops; else None."""
         session = self._peek()
         if session is not None and session.dirty:
             self._save(session)
+            if isinstance(session.save_error, ProjectRemovedError):
+                return f"{session.folder.name!r} was closed with changes not saved: {REMOVED_WHY}"
+        return None
 
     def _switch(
         self,
@@ -848,7 +875,20 @@ class Workspace:
                     "%r was closed with changes that could not be saved: %s", old.folder.name, exc
                 )
         _dropped(old)
+        with self._lock:  # for a page that follows: whether it was saved (closed)
+            closed = _closed(old, self._open_ids[old])
+            self._closed[closed["open_id"]] = closed
+            while len(self._closed) > CLOSED_KEPT:
+                self._closed.popitem(last=False)
         return session
+
+    def closed(self) -> list[dict[str, Any]]:
+        """The openings switches closed, the last :data:`CLOSED_KEPT`, oldest
+        first: each one's open id, project name, whether its changes were all
+        saved and why not (#101), for a page that follows another tab's
+        switch to say what became of the project it showed."""
+        with self._lock:
+            return list(self._closed.values())
 
     def _opened(self, session: ProjectSession) -> None:
         """Make ``session`` the open one, under the next open id."""
@@ -874,7 +914,7 @@ class Workspace:
             session = self._peek()
             if session is not None:
                 session.close()
-                _dropped(session)
+                _dropped(session, extra=logs.FILE_ONLY)  # the launcher says it (flush)
         self.inbox.close()
 
     def create(self, name: object) -> ProjectSession:
@@ -968,7 +1008,7 @@ class Workspace:
                 except OSError as exc:
                     refused.append(NotImported(file.file_id, file.name, "file_error", _reason(exc)))
                     continue
-                membranes[index] = session.project.batch.membrane_of(image_id).id
+                membranes[index] = session.project.batch.membranes_on(image_id)[0].id
                 imported.append(
                     Imported(
                         file.file_id,
@@ -1272,7 +1312,9 @@ ExpectedMw = StrictFloat | None
 class ProteinBody(_Body):
     name: str
     role: str
-    image_id: str
+    # The image, while it holds one membrane's area, or the membrane area (#243): one of them.
+    image_id: str | None = None
+    arena_id: str | None = None
     expected_mw: ExpectedMw = None
     loading_control_ids: list[str] = []
     box_size: tuple[PositiveInt, PositiveInt] | None = None  # width, height
@@ -1415,6 +1457,30 @@ class MwRowBody(_Body):
     protein_id: str
     # x0, x1 of the lanes, end-exclusive; absent or null: read from the image
     span: tuple[RowCoordinate, RowCoordinate] | None = None
+
+
+class ArenaBody(_Body):
+    """A membrane area drawn on an image (#243): its outline before its turn,
+    ``[x0, y0, x1, y1]`` in image pixels, its angle in degrees, and its
+    membrane (null: a new one)."""
+
+    image_id: str
+    outline: tuple[RowCoordinate, RowCoordinate, RowCoordinate, RowCoordinate]
+    angle_deg: StrictFloat = 0.0
+    membrane_id: str | None = None
+
+
+class ArenaEditBody(_Body):
+    """A membrane area redrawn: its outline (null: the whole image) and its
+    angle. A field left out keeps its value: only the fields the request set
+    are passed on, so these defaults are never used."""
+
+    outline: tuple[RowCoordinate, RowCoordinate, RowCoordinate, RowCoordinate] | None = None
+    angle_deg: StrictFloat = 0.0
+
+
+class ArenaMembraneBody(_Body):
+    membrane_id: str | None  # required: null gives the area to a new membrane
 
 
 class LaneIndexBody(_Body):
@@ -1664,6 +1730,7 @@ def _calibration_update(update: ops.CalibrationUpdate) -> dict[str, Any]:
         "fit": None if update.fit is None else update.fit.as_json(),
         "curves_changed": list(update.curves_changed),
         "dropped_undetected": [list(key) for key in update.dropped_undetected],
+        "adopted_arena_ids": list(update.adopted_arena_ids),
     }
 
 
@@ -1922,7 +1989,10 @@ def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 @router.get("/project")
 def get_project(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace, session)
+    """The open project's state and results, and ``closed``: the openings
+    switches closed (:meth:`Workspace.closed`), for a page that follows
+    another tab's switch to say whether the project it showed was saved."""
+    return _answer(workspace, session, closed=workspace.closed())
 
 
 def _export_folder(project: Path, folder: str) -> Path:
@@ -2093,6 +2163,106 @@ def set_ladder(
     return _answer(workspace, session)
 
 
+# --- Membrane areas (#243) ---
+
+
+def _area_id(arena_id: str) -> str:
+    """A membrane area's id as a route names it; any other id is no area
+    (``UnknownIdError``, worded as for an area another window removed)."""
+    if not arena_id.startswith("arena-"):
+        raise UnknownIdError(
+            "that membrane area no longer exists; it may have been removed in another window",
+            detail={"arena_id": arena_id},
+        )
+    return arena_id
+
+
+def _area_change(change: ops.AreaChange) -> dict[str, Any]:
+    """What drawing or redrawing an area did (:class:`~proteia.core.operations.AreaChange`):
+    after a cut, also what went to the new membrane (``handed_off``, in words;
+    null and empty otherwise)."""
+    return {
+        "arena_ids": list(change.arena_ids),
+        "membrane_id": change.membrane_id,
+        "new_membrane": change.new_membrane,
+        "mw_lost": list(change.mw_lost),
+        "rest_membrane_id": change.rest_membrane_id,
+        "rest_arena_ids": list(change.rest_arena_ids),
+        "moved_proteins": list(change.moved_proteins),
+        "moved_points": change.moved_points,
+        "curves_changed": list(change.curves_changed),
+        "dropped_undetected": [list(key) for key in change.dropped_undetected],
+        "handed_off": change.handed_off,
+        **_remeasured(change.remeasured, change.largest_change),
+    }
+
+
+@router.post("/arenas", status_code=201)
+def add_arena(body: ArenaBody, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Draw a membrane's area on an image (:func:`~proteia.core.operations.add_arena`)."""
+    change = ops.add_arena(
+        session,
+        body.image_id,
+        body.outline,
+        angle_deg=body.angle_deg,
+        membrane_id=body.membrane_id,
+    )
+    return _answer(workspace, session, **_area_change(change))
+
+
+@router.put("/arenas/{arena_id}")
+def edit_arena(
+    arena_id: str, body: ArenaEditBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Redraw a membrane area (:func:`~proteia.core.operations.edit_arena`): only
+    the fields the request set; ``outline`` null is the whole image."""
+    given = body.model_dump(exclude_unset=True)
+    change = ops.edit_arena(
+        session,
+        _area_id(arena_id),
+        outline=given.get("outline", ops.KEEP),
+        angle_deg=given.get("angle_deg", ops.KEEP),
+    )
+    return _answer(workspace, session, **_area_change(change))
+
+
+@router.put("/arenas/{arena_id}/membrane")
+def assign_arena(
+    arena_id: str, body: ArenaMembraneBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Give a membrane area to another membrane, or a new one with null
+    (:func:`~proteia.core.operations.assign_arena`)."""
+    moved = ops.assign_arena(session, _area_id(arena_id), body.membrane_id)
+    return _answer(
+        workspace,
+        session,
+        arena_ids=list(moved.arena_ids),
+        membrane_id=moved.membrane_id,
+        new_membrane=moved.new_membrane,
+        moved_proteins=list(moved.moved_proteins),
+        moved_points=moved.moved_points,
+        curves_changed=list(moved.curves_changed),
+        dropped_undetected=[list(key) for key in moved.dropped_undetected],
+        removed_membrane=moved.removed_membrane,
+        renumbered=moved.renumbered,
+        mw_lost=list(moved.mw_lost),
+    )
+
+
+@router.delete("/arenas/{arena_id}")
+def remove_arena(arena_id: str, session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
+    """Remove a membrane area with what is on it
+    (:func:`~proteia.core.operations.remove_arena`)."""
+    removal = ops.remove_arena(session, _area_id(arena_id))
+    return _answer(
+        workspace,
+        session,
+        **_cascade(removal.cascade),
+        **_remeasured(removal.remeasured, removal.largest_change),
+        renumbered=removal.renumbered,
+    )
+
+
 @router.post("/images/{image_id}/calibration/{side}/points", status_code=201)
 def add_calibration_point(
     image_id: str, side: str, body: PointBody, session: OpenSession, workspace: WorkspaceDep
@@ -2181,7 +2351,8 @@ def propose_ladder(image_id: str, body: LadderProposalBody, session: OpenSession
     the two: a page's copy of the project may be older."""
     with session.transaction():
         proposal = ops.propose_ladder(session, image_id, body.x, body.side)
-        kda = session.project.batch.membrane_of(image_id).calibration.ladder_kda
+        membrane, _ = ops.calibration_scope(session.project.batch, image_id)
+        kda = membrane.calibration.ladder_kda
     return {
         "proposal": None if proposal is None else ops.proposal_json(proposal),
         "ladder_kda": list(kda),
@@ -2213,7 +2384,8 @@ def _check_ladder_kda(
     ``UnknownIdError``."""
     if ladder_kda is None:
         return
-    if not _same_ladder(session.project.batch.membrane_of(image_id), ladder_kda):
+    membrane, _ = ops.calibration_scope(session.project.batch, image_id)
+    if not _same_ladder(membrane, ladder_kda):
         raise CalibrationChangedError("ladder_kda", mark=True)
 
 
@@ -2222,11 +2394,10 @@ def _check_ruler_scope(session: ProjectSession, image_id: str, body: LadderPoint
     them, are no longer the membrane's and the image's (a field left out is
     not checked): MWs as :func:`_same_ladder` compares them; the group as a
     set. An unknown image is ``UnknownIdError``."""
-    batch = session.project.batch
-    membrane = batch.membrane_of(image_id)
+    membrane, group = ops.calibration_scope(session.project.batch, image_id)
     if body.ladder_kda is not None and not _same_ladder(membrane, body.ladder_kda):
         raise CalibrationChangedError("ladder_kda")
-    if body.group is not None and set(body.group) != batch.group_of(membrane, image_id):
+    if body.group is not None and set(body.group) != group:
         raise CalibrationChangedError("group")
 
 
@@ -2261,6 +2432,77 @@ def set_ladder_points(
         points=list(update.points),
         sides_swapped=update.sides_swapped,
     )
+
+
+# The calibration routes addressed by a membrane area (#243): on an image of
+# several membranes the image routes refuse (arena_required), so the page names
+# the membrane by its area there; each answers as its image route does.
+
+
+@router.post("/arenas/{arena_id}/calibration/{side}/points", status_code=201)
+def add_area_calibration_point(
+    arena_id: str, side: str, body: PointBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """:func:`add_calibration_point` on a membrane area."""
+    return add_calibration_point(_area_id(arena_id), side, body, session, workspace)
+
+
+@router.patch("/arenas/{arena_id}/calibration/{side}/points/{mw}")
+def edit_area_calibration_point(
+    arena_id: str,
+    side: str,
+    mw: UrlKda,
+    body: PointEditBody,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+) -> dict[str, Any]:
+    """:func:`edit_calibration_point` on a membrane area."""
+    return edit_calibration_point(_area_id(arena_id), side, mw, body, session, workspace)
+
+
+@router.delete("/arenas/{arena_id}/calibration/{side}/points/{mw}")
+def remove_area_calibration_point(
+    arena_id: str, side: str, mw: UrlKda, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """:func:`remove_calibration_point` on a membrane area."""
+    return remove_calibration_point(_area_id(arena_id), side, mw, session, workspace)
+
+
+@router.delete("/arenas/{arena_id}/calibration")
+def clear_area_calibration(
+    arena_id: str,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+    side: Literal["left", "right"] | None = None,
+) -> dict[str, Any]:
+    """:func:`clear_calibration` on a membrane area."""
+    return clear_calibration(_area_id(arena_id), session, workspace, side)
+
+
+@router.post("/arenas/{arena_id}/ladder-proposal")
+def propose_area_ladder(
+    arena_id: str, body: LadderProposalBody, session: OpenSession
+) -> dict[str, Any]:
+    """:func:`propose_ladder` on a membrane area: it reads that area alone."""
+    return propose_ladder(_area_id(arena_id), body, session)
+
+
+@router.post("/arenas/{arena_id}/ladder-snap")
+def snap_area_ladder(arena_id: str, body: LadderSnapBody, session: OpenSession) -> dict[str, Any]:
+    """:func:`snap_ladder` on a membrane area: it reads that area alone."""
+    return snap_ladder(_area_id(arena_id), body, session)
+
+
+@router.put("/arenas/{arena_id}/calibration/{side}/ladder")
+def set_area_ladder_points(
+    arena_id: str,
+    side: str,
+    body: LadderPointsBody,
+    session: OpenSession,
+    workspace: WorkspaceDep,
+) -> dict[str, Any]:
+    """:func:`set_ladder_points` on a membrane area."""
+    return set_ladder_points(_area_id(arena_id), side, body, session, workspace)
 
 
 @router.get("/images/{image_id}/preview")
@@ -2331,6 +2573,7 @@ def add_protein(body: ProteinBody, session: OpenSession, workspace: WorkspaceDep
             body.name,
             body.role,
             body.image_id,
+            arena_id=body.arena_id,
             expected_mw=body.expected_mw,
             loading_control_ids=body.loading_control_ids,
             box_size=size,
@@ -2678,7 +2921,7 @@ def install(app: FastAPI, workspace: Workspace) -> None:
     app.include_router(router)
     answers: dict[type[Exception], Callable[[Exception], JSONResponse]] = {
         OperationError: lambda e: _error(422, e.code.value, str(e), e.ids, e.detail),
-        UnknownIdError: lambda e: _error(404, "unknown_id", str(e)),
+        UnknownIdError: lambda e: _error(404, "unknown_id", str(e), detail=e.detail),
         FolderNotFoundError: lambda e: _error(404, "folder_not_found", str(e)),
         NoProjectError: lambda e: _error(409, "no_project", str(e)),
         NoStateFolderError: lambda e: _error(409, "no_state_folder", str(e)),

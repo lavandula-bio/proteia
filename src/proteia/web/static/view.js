@@ -89,6 +89,31 @@ function hasCaret(element) {
   );
 }
 
+// A membrane area being drawn or edited (not sent yet): its corners in image
+// pixels, top left, top right, bottom right, bottom left, as the server turns
+// an outline (a positive angle runs its right side lower). Only an unsent
+// outline is drawn from here; a stored area's corners come from the server.
+function turnedCorners(outline, angle) {
+  const [x0, y0, x1, y1] = outline;
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  const a = (x1 - x0) / 2;
+  const b = (y1 - y0) / 2;
+  const t = (angle * Math.PI) / 180;
+  const c = Math.cos(t);
+  const s = Math.sin(t);
+  return [
+    [-a, -b],
+    [a, -b],
+    [a, b],
+    [-a, b],
+  ].map(([u, v]) => [cx + u * c - v * s, cy + u * s + v * c]);
+}
+
+const AREA_HANDLE_GAP = 24; // screen px from the top edge's middle to the turning handle
+const AREA_HANDLE_RADIUS = 7; // its radius: 14 px across
+const AREA_CORNER = 12; // the corner marks of an outline being drawn, px across
+
 // The row box dragged between two image points, as the server takes it: the
 // corners rounded to whole pixels, x0 < x1 and y0 < y1 (end exclusive).
 function rowRect(a, b) {
@@ -155,6 +180,15 @@ export class ImageView {
     this.spaceTaken = false; // ...and its default (a scroll) was prevented
     this.spacePanned = false; // ...and a drag panned with it: its release presses nothing
     this.spaceTyped = null; // {field, value, start, end}: the text field it types into, before
+    // #243: the membrane areas on the image ({id, corners, color, whole,
+    // label, hidden}), the chosen one's id (drawn heavier and solid; null when
+    // the image holds one), and the outline being drawn or edited ({outline,
+    // angle, color}) or null. While one is drawn, a drag on the image draws
+    // its rectangle, moves it (from inside it) or turns it (from the handle
+    // above it): handlers.area(outline, angle); it places no box.
+    this.areas = [];
+    this.chosenArea = null;
+    this.areaTool = null;
     this.bindEvents();
     new ResizeObserver(() => this.resize()).observe(canvas);
   }
@@ -191,6 +225,20 @@ export class ImageView {
     this.ghosts = ghosts;
     this.marks = marks;
     this.selectedId = selectedId;
+    this.draw();
+  }
+
+  // The membrane areas drawn on the image, and the chosen one (#243).
+  setAreas(areas, chosenId) {
+    this.areas = areas;
+    this.chosenArea = chosenId;
+    this.draw();
+  }
+
+  // The outline being drawn or edited ({outline, angle, color}), or null.
+  setAreaTool(tool) {
+    this.areaTool = tool;
+    this.showCursor();
     this.draw();
   }
 
@@ -302,6 +350,11 @@ export class ImageView {
     // Over the image's own pixels, whatever the bitmap's size, so boxes stay on them.
     ctx.drawImage(this.bitmap, 0, 0, this.width, this.height);
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0); // overlays in screen pixels
+    for (const area of this.areas) {
+      if (!area.hidden) {
+        this.drawArea(area, area.id === this.chosenArea);
+      }
+    }
     for (const ghost of this.ghosts) {
       this.drawRect(ghost.rect, ghost.color, { dashed: true, label: ghost.label });
     }
@@ -320,6 +373,7 @@ export class ImageView {
         selected: box.id === this.selectedId,
         label: box.label,
         clipped: box.clipped,
+        faint: Boolean(box.dim), // another membrane's box on this image
       });
       if (box.fitted) {
         this.drawRect(shift(box.fitted), color, { faint: true }); // its fitted size, inside
@@ -332,6 +386,12 @@ export class ImageView {
     }
     if (this.ruler) {
       this.drawRuler(this.ruler);
+    }
+    if (this.areaTool) {
+      const drawn = g && g.kind === "area" ? this.areaStep(g) : this.areaTool;
+      if (drawn.outline) {
+        this.drawAreaTool({ ...this.areaTool, ...drawn });
+      }
     }
     if (g && g.kind === "row") {
       const label = `Row box → ${counted(g.row.lanes, "lane", "lanes")}`;
@@ -402,6 +462,132 @@ export class ImageView {
       ctx.fillText(label, x0 + 3, y0 - 2);
     }
     ctx.restore();
+  }
+
+  // A membrane area: its turned outline, from the corners the server gave.
+  // The chosen one solid and heavier, haloed; the others dashed; the whole
+  // image of an image of one membrane a thin frame.
+  drawArea(area, chosen) {
+    const ctx = this.context;
+    const points = area.corners.map(([x, y]) => this.toScreen(x, y));
+    const path = () => {
+      ctx.beginPath();
+      points.forEach(([x, y], index) => (index ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      ctx.closePath();
+    };
+    ctx.save();
+    if (chosen) {
+      ctx.lineWidth = 5;
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+      path();
+      ctx.stroke();
+    }
+    ctx.strokeStyle = area.color;
+    ctx.lineWidth = chosen ? 3 : area.whole ? 1 : 1.5;
+    ctx.setLineDash(chosen || area.whole ? [] : [8, 5]);
+    path();
+    ctx.stroke();
+    if (area.label) {
+      const [x, y] = points.reduce((low, point) => (point[1] < low[1] ? point : low));
+      ctx.setLineDash([]);
+      ctx.font = LABEL_FONT;
+      ctx.textBaseline = "bottom";
+      const width = ctx.measureText(area.label).width + 8;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+      ctx.fillRect(x, y - 17, width, 16);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(area.label, x + 4, y - 3);
+    }
+    ctx.restore();
+  }
+
+  // The outline being drawn: dashed over a dark edge, a mark at each corner and
+  // the turning handle above its top edge.
+  drawAreaTool(tool) {
+    const ctx = this.context;
+    const points = turnedCorners(tool.outline, tool.angle).map(([x, y]) => this.toScreen(x, y));
+    const path = () => {
+      ctx.beginPath();
+      points.forEach(([x, y], index) => (index ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      ctx.closePath();
+    };
+    ctx.save();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.75)";
+    path();
+    ctx.stroke();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = tool.color;
+    ctx.setLineDash([6, 4]);
+    path();
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = tool.color;
+    for (const [x, y] of points) {
+      ctx.fillRect(x - AREA_CORNER / 2, y - AREA_CORNER / 2, AREA_CORNER, AREA_CORNER);
+      ctx.strokeRect(x - AREA_CORNER / 2, y - AREA_CORNER / 2, AREA_CORNER, AREA_CORNER);
+    }
+    const [hx, hy] = this.areaHandle(tool);
+    const [mx, my] = [(points[0][0] + points[1][0]) / 2, (points[0][1] + points[1][1]) / 2];
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.75)";
+    ctx.lineWidth = 2;
+    stroke(ctx, mx, my, hx, hy);
+    ctx.beginPath();
+    ctx.arc(hx, hy, AREA_HANDLE_RADIUS, 0, 2 * Math.PI);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = tool.color;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // The turning handle of the outline being drawn, in screen pixels: above
+  // its top edge's middle, out from it.
+  areaHandle(tool) {
+    const [p0, p1] = turnedCorners(tool.outline, tool.angle);
+    const [mx, my] = this.toScreen((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2);
+    const t = (tool.angle * Math.PI) / 180;
+    return [mx + AREA_HANDLE_GAP * Math.sin(t), my - AREA_HANDLE_GAP * Math.cos(t)];
+  }
+
+  // What a press at canvas point `at` (image point `point`) does to the
+  // outline being drawn: "turn" on its handle, "move" inside it, else "draw".
+  areaPartAt(at, point) {
+    const tool = this.areaTool;
+    if (!tool.outline) {
+      return "draw";
+    }
+    const [hx, hy] = this.areaHandle(tool);
+    if (Math.hypot(at.x - hx, at.y - hy) <= AREA_HANDLE_RADIUS + 3) {
+      return "turn";
+    }
+    const [x0, y0, x1, y1] = tool.outline;
+    const t = (tool.angle * Math.PI) / 180;
+    const dx = point.x - (x0 + x1) / 2;
+    const dy = point.y - (y0 + y1) / 2;
+    const u = dx * Math.cos(t) + dy * Math.sin(t);
+    const v = dy * Math.cos(t) - dx * Math.sin(t);
+    return Math.abs(u) <= (x1 - x0) / 2 && Math.abs(v) <= (y1 - y0) / 2 ? "move" : "draw";
+  }
+
+  // The outline as a drag of it under way puts it: {outline, angle}.
+  areaStep(g) {
+    const tool = this.areaTool;
+    if (g.areaPart === "draw" || !tool.outline) {
+      return { outline: rowRect(g.start, g.end), angle: tool.angle };
+    }
+    const [x0, y0, x1, y1] = tool.outline;
+    if (g.areaPart === "move") {
+      const dx = Math.round(g.end.x - g.start.x);
+      const dy = Math.round(g.end.y - g.start.y);
+      return { outline: [x0 + dx, y0 + dy, x1 + dx, y1 + dy], angle: tool.angle };
+    }
+    const degrees =
+      (Math.atan2(g.end.y - (y0 + y1) / 2, g.end.x - (x0 + x1) / 2) * 180) / Math.PI + 90;
+    const turned = ((((degrees + 180) % 360) + 360) % 360) - 180;
+    const angle = Math.round(Math.max(-45, Math.min(45, turned)) * 10) / 10;
+    return { outline: tool.outline, angle };
   }
 
   // A tick's label in a dark box, beside `edge` (screen x) at height `sy`: on
@@ -538,7 +724,7 @@ export class ImageView {
 
   boxAt(point) {
     for (let i = this.boxes.length - 1; i >= 0; i -= 1) {
-      if (inside(this.boxes[i].rect, point.x, point.y)) {
+      if (!this.boxes[i].dim && inside(this.boxes[i].rect, point.x, point.y)) {
         return this.boxes[i];
       }
     }
@@ -662,8 +848,10 @@ export class ImageView {
       }
       // A ladder being marked or adjusted (#58) takes the press before a box.
       const at = this.toCanvas(event);
-      const calibrating = this.ruler !== null || this.pickTool !== null;
-      const part = pan ? null : this.rulerAt(at);
+      // An outline being drawn (#243) takes the press before anything else.
+      const areaPart = !pan && this.areaTool ? this.areaPartAt(at, point) : null;
+      const calibrating = this.ruler !== null || this.pickTool !== null || areaPart !== null;
+      const part = pan || areaPart ? null : this.rulerAt(at);
       const tick = pan || calibrating ? null : this.ladderTickAt(at);
       const box = pan || calibrating || tick ? null : this.boxAt(point);
       const onImage = point.x >= 0 && point.y >= 0 && point.x < this.width && point.y < this.height;
@@ -673,6 +861,7 @@ export class ImageView {
         boxId: box ? box.id : null,
         part, // the part of the ruler pressed, or null
         tick, // the ladder mark pressed, or null
+        areaPart, // what a drag does to the outline being drawn, or null
         axis: null, // the way a drag of the ruler's line goes, once it is a drag
         calibrating, // a click here is a pick, or does nothing beside the ruler
         // What a drag from here boxes: a row, from the membrane only.
@@ -709,7 +898,17 @@ export class ImageView {
       const sx = event.clientX - g.startX;
       const sy = event.clientY - g.startY;
       if (g.kind === "press" && Math.hypot(sx, sy) > CLICK_SLOP) {
-        g.kind = g.part ? "ruler" : g.tick ? "point" : g.boxId ? "move" : g.row ? "row" : "pan";
+        g.kind = g.areaPart
+          ? "area"
+          : g.part
+            ? "ruler"
+            : g.tick
+              ? "point"
+              : g.boxId
+                ? "move"
+                : g.row
+                  ? "row"
+                  : "pan";
         // The ruler's line goes the way the drag first went: up and down, or sideways.
         g.axis = Math.abs(sx) > Math.abs(sy) ? "x" : "y";
         this.showCursor();
@@ -722,7 +921,7 @@ export class ImageView {
         g.dx = Math.round(sx / this.scale);
         g.dy = Math.round(sy / this.scale);
         this.draw();
-      } else if (g.kind === "row") {
+      } else if (g.kind === "row" || g.kind === "area") {
         g.end = this.toImage(event);
         this.draw();
       } else if (g.kind === "ruler") {
@@ -750,7 +949,14 @@ export class ImageView {
         return;
       }
       const clicked = { clientX: event.clientX, clientY: event.clientY };
-      if (g.kind === "ruler") {
+      if (g.kind === "area") {
+        if (this.areaTool) {
+          const { outline, angle } = this.areaStep(g);
+          this.handlers.area(outline, angle);
+        }
+      } else if (g.kind === "press" && g.areaPart) {
+        // A click while an outline is drawn does nothing: no box is placed.
+      } else if (g.kind === "ruler") {
         this.handlers.ruler(this.rulerStep(g, "drop", event));
       } else if (g.kind === "point") {
         const y = g.tick.y + g.dy;
@@ -933,7 +1139,10 @@ export class ImageView {
     const g = this.gesture;
     this.canvas.classList.toggle("grabbing", Boolean(g && g.kind === "pan"));
     this.canvas.classList.toggle("grab", this.spaceHeld && !g);
-    this.canvas.classList.toggle("picking", this.pickTool !== null && !this.spaceHeld);
+    this.canvas.classList.toggle(
+      "picking",
+      (this.pickTool !== null || this.areaTool !== null) && !this.spaceHeld,
+    );
     if (this.spaceHeld || (g && g.kind === "pan")) {
       this.canvas.dataset.over = "";
     }

@@ -54,7 +54,14 @@ from pydantic import JsonValue, TypeAdapter
 
 import proteia
 from proteia.core import analyze, export, grow, ladders, mwcal, mwrow, quantify, rowdetect, storage
-from proteia.core.model import Channel, LogEntry, Project, Timestamp, lane_number
+from proteia.core.model import (
+    LEGACY_BACKGROUND_METHOD,
+    Channel,
+    LogEntry,
+    Project,
+    Timestamp,
+    lane_number,
+)
 from proteia.core.results import Results, mw_check_settings
 
 RECORD_FORMAT: Final = 1
@@ -83,6 +90,22 @@ _CHECKED_VALUES_CHOSEN: Final = (
     f"{_CHECKED_VALUES}, except on an image measured on one of its channels (red, green or"
     " blue), whose values are that channel's: measured_on names each image's channel and the"
     " over-exposure check its bands get (exact, near_limit or none)"
+)
+# What a ring leaves out, and the median a ring with too little membrane takes
+# (after quantify's own words), in a project with a membrane area drawn on an
+# image (#243): each area is the image cut out along its outline.
+_RING_EXCLUDE_ON_AREAS: Final = (
+    "every box on its own membrane area, dilated by its gap, and every pixel outside a drawn"
+    " area's outline"
+)
+_IMAGE_FALLBACK_ON_AREAS: Final = (
+    "; on a drawn membrane area, the median of the pixels inside its outline"
+)
+# Which median a band's level is under the legacy method (global_median), said
+# only once a membrane area is drawn: the image's, or a drawn area's own.
+_LEGACY_LEVEL_ON_AREAS: Final = (
+    "each band's level: its image's median; on a drawn membrane area, the median of the pixels"
+    " inside its outline"
 )
 
 
@@ -181,9 +204,26 @@ def project_settings(project: Project) -> dict[str, JsonValue]:
     ``saturated_at`` points there. They describe what each image is measured
     on, not who chose it: while every image is on the mean (no choice, or the
     user's choice of it) they are :func:`settings` word for word, which say
-    that already."""
+    that already. Once a membrane area is drawn on an image (#243), the
+    background's ring says that it leaves out the boxes of its own area and
+    every pixel outside a drawn outline, and its image fallback that a drawn
+    area takes the median of its own pixels; under the legacy method,
+    ``global_median_level``, after the method, says the same of every level.
+    While every area covers its whole image, word for word as before."""
     found = {**settings(), "background_method": project.background_method}
-    images = list(project.batch.iter_images())
+    batch = project.batch
+    images = list(batch.iter_images())
+    if any(arena.outline is not None for image in images for _, arena in batch.arenas_on(image.id)):
+        background = cast(dict[str, JsonValue], found["background"])
+        ring = cast(dict[str, JsonValue], background["ring"])
+        fallbacks = cast(dict[str, JsonValue], background["fallbacks"])
+        found["background"] = {
+            **background,
+            "ring": {**ring, "exclude": _RING_EXCLUDE_ON_AREAS},
+            "fallbacks": {**fallbacks, "image": f"{fallbacks['image']}{_IMAGE_FALLBACK_ON_AREAS}"},
+        }
+        if project.background_method == LEGACY_BACKGROUND_METHOD:
+            found["global_median_level"] = _LEGACY_LEVEL_ON_AREAS
     if all(image.measured_channel is Channel.MEAN for image in images):
         return found
     clipped = cast(dict[str, JsonValue], found["possibly_clipped"])

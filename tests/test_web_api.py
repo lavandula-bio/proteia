@@ -187,6 +187,12 @@ def ready(client: Client, tmp_path: Path, **blot: Any) -> tuple[str, str]:
     return image_id, answer["protein_id"]
 
 
+def state_of(answer: dict) -> dict[str, Any]:
+    """The project state and results of a route's answer: what a read of the
+    project answers too, beside what switches closed (#101)."""
+    return {"project": answer["project"], "results": answer["results"]}
+
+
 def bands(answer: dict) -> dict[str, dict]:
     return {
         band["id"]: band for protein in answer["project"]["proteins"] for band in protein["bands"]
@@ -913,10 +919,7 @@ def test_boxes_are_exchanged_in_image_pixels(client, tmp_path):
     moved = client.ok("PUT", f"/api/boxes/{answer['band_id']}", {"rect": target})
     assert bands(moved)[answer["band_id"]]["rect"] == target
     # What is drawn, and the results computed from the same snapshot.
-    assert client.ok("GET", "/api/project") == {
-        "project": moved["project"],
-        "results": moved["results"],
-    }
+    assert state_of(client.ok("GET", "/api/project")) == state_of(moved)
 
 
 def test_boxes_are_placed_relaned_and_removed_through_the_operations(client, tmp_path):
@@ -1672,6 +1675,39 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     )
     answers["POST /api/undo"] = client.ok("POST", "/api/undo")
     answers["POST /api/redo"] = client.ok("POST", "/api/redo")
+    # Membrane areas (#243), on a third image split in two.
+    _, third = upload(client, blot_bytes(tmp_path), name="third.tif")
+    shown = next(i for i in third["project"]["images"] if i["id"] == third["image_id"])
+    [area] = shown["arena_ids"]
+    answers["PUT /api/arenas/{arena_id}"] = client.ok(
+        "PUT", f"/api/arenas/{area}", {"outline": [0, 0, W, H // 2]}
+    )
+    answers["POST /api/arenas"] = client.ok(
+        "POST", "/api/arenas", {"image_id": third["image_id"], "outline": [0, H // 2, W, H]}
+    )
+    [split] = answers["POST /api/arenas"]["arena_ids"]
+    marks = f"/api/arenas/{split}/calibration/left"
+    edge = {"y": float(H - 5), "mw": 100, "source": "strip_edge", "x": 5.0, "snap": False}
+    answers["POST /api/arenas/{arena_id}/calibration/{side}/points"] = client.ok(
+        "POST", f"{marks}/points", edge
+    )
+    answers["PATCH /api/arenas/{arena_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "PATCH", f"{marks}/points/100", {"y": float(H - 6)}
+    )
+    answers["DELETE /api/arenas/{arena_id}/calibration/{side}/points/{mw}"] = client.ok(
+        "DELETE", f"{marks}/points/100"
+    )
+    ruler = {"x": 5.0, "points": [{"y": float(H - 20), "mw": 100}, {"y": float(H - 4), "mw": 50}]}
+    answers["PUT /api/arenas/{arena_id}/calibration/{side}/ladder"] = client.ok(
+        "PUT", f"{marks}/ladder", ruler
+    )
+    answers["DELETE /api/arenas/{arena_id}/calibration"] = client.ok(
+        "DELETE", f"/api/arenas/{split}/calibration"
+    )
+    answers["PUT /api/arenas/{arena_id}/membrane"] = client.ok(
+        "PUT", f"/api/arenas/{split}/membrane", {"membrane_id": None}
+    )
+    answers["DELETE /api/arenas/{arena_id}"] = client.ok("DELETE", f"/api/arenas/{split}")
     # A row box over the three declared lanes, on the image that kept the blot's polarity.
     body = {"name": "GAPDH", "role": "loading control", "image_id": second["image_id"]}
     other = client.ok("POST", "/api/proteins", body)["protein_id"]
@@ -1740,6 +1776,8 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
         # Only read: they answer what they found, not the project.
         "POST /api/images/{image_id}/ladder-proposal",
         "POST /api/images/{image_id}/ladder-snap",
+        "POST /api/arenas/{arena_id}/ladder-proposal",
+        "POST /api/arenas/{arena_id}/ladder-snap",
     }
     routes = {f"{method} {route.path}" for route in api.router.routes for method in route.methods}
     assert routes - others == set(answers)
@@ -1760,7 +1798,7 @@ def test_a_repeated_read_reuses_the_results_of_its_revision(client, monkeypatch)
     calls: list = []
     _counting(monkeypatch, calls)
     created = client.ok("POST", "/api/projects", {"name": "Blot"})
-    assert client.ok("GET", "/api/project") == created
+    assert state_of(client.ok("GET", "/api/project")) == state_of(created)
     defaults = {"plot_conditions": None, "error_type": ErrorType.SD, "method": ReduceMethod.MEAN}
     assert calls == [("Blot", defaults)]
 
@@ -1906,7 +1944,7 @@ def test_a_box_size_change_recentres_every_box_and_changes_the_nets(client, tmp_
     assert logged(client)[-1] == "set_box_size"
 
     same = client.ok("PUT", path, {"width": 20, "height": 16})  # a no-op: no log entry
-    assert same == client.ok("GET", "/api/project")
+    assert state_of(same) == state_of(client.ok("GET", "/api/project"))
     assert same["project"]["revision"] == answer["project"]["revision"]
     assert logged(client).count("set_box_size") == 1
     body = {"width": 20, "height": 16}
@@ -1963,7 +2001,7 @@ def test_the_box_size_route_takes_the_fitted_size_the_state_shows(client, tmp_pa
     path = f"/api/proteins/{target}/box-size"
 
     same = client.ok("PUT", path, state["fitted_size"])  # a no-op: no log entry
-    assert same == client.ok("GET", "/api/project")
+    assert state_of(same) == state_of(client.ok("GET", "/api/project"))
     assert same["project"]["revision"] == before["project"]["revision"]
     assert protein_of(same, target) == state
     assert "set_box_size" not in logged(client)
@@ -2810,7 +2848,7 @@ def test_reopening_the_open_project_answers_its_open_session(client, tmp_path, m
     reopened = client.ok("POST", "/api/projects/open", {"name": name})
     assert client.workspace.current() is session
     assert reopened == {"project": declared["project"], "results": declared["results"]}
-    assert reopened == client.ok("GET", "/api/project")
+    assert reopened == state_of(client.ok("GET", "/api/project"))
     assert calls == []  # the open project's kept results
     assert client.ok("GET", "/api/projects")["open"] == "Café µ"
 
@@ -3376,11 +3414,11 @@ def test_a_row_box_boxes_every_lane_and_answers_the_nets_and_the_chart(client, t
         TARGET_ROW_BOX,
     )
     read = client.ok("GET", "/api/project")
-    assert read == {"project": answer["project"], "results": answer["results"]}
+    assert state_of(read) == state_of(answer)
 
     # The same drag again replaces each box in place with itself: nothing changes.
     again = drag(client, target)
-    assert {"project": again["project"], "results": again["results"]} == read
+    assert state_of(again) == state_of(read)
     assert again["band_ids"] == again["replaced_band_ids"] == band_ids
     assert logged(client).count("detect_row_boxes") == 1
 
@@ -6350,7 +6388,9 @@ def test_calibration_routes(client, tmp_path):
     assert project["membranes"] == [
         {
             "id": membrane,
+            "label": "Membrane 1",
             "image_ids": [image_id],
+            "arena_ids": project["images"][0]["arena_ids"],
             "ladder": None,
             "ladder_kda": [],
             "groups": [{"image_ids": [image_id], "points": [], "fit": None}],

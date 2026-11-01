@@ -439,12 +439,16 @@ class Instance:
                 self.server.run(sockets=[self.sock])
         finally:
             try:
+                dropped = None
                 try:
-                    self.workspace.flush()
+                    dropped = self.workspace.flush()
                 except UnsavedChangesError as exc:
                     print(f"Proteia stopped, but {exc}", file=sys.stderr)
                     _log.warning("Proteia stopped, but %s", exc, extra=logs.FILE_ONLY)
                 self.workspace.close()
+                if dropped is not None:  # its folder removed outside Proteia (#101)
+                    print(f"Proteia stopped, but {dropped}", file=sys.stderr)
+                    _log.warning("Proteia stopped, but %s", dropped, extra=logs.FILE_ONLY)
             finally:
                 self.close()
 

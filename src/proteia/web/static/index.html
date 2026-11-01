@@ -38,13 +38,18 @@
 </header>
 
 <p id="status" class="status" role="status">Connecting to Proteia…</p>
+<!-- The notice of a change outside Proteia (#101), for a screen reader: a live
+  region always there, its text set once the notice is shown (app.js
+  renderOutsideChange), so each new notice is read once. -->
+<p id="outside-change-said" class="sr-only" role="status"></p>
 
 <main id="workspace" class="workspace" hidden>
   <aside class="panel">
     <!-- What changed in the project's files outside Proteia (#101): the state's
       outside_change, in the server's words, until dismissed for this opening
-      (app.js renderOutsideChange). In the panel, so the view never moves. -->
-    <div id="outside-change" class="outside-change" role="status" hidden>
+      and notice (app.js renderOutsideChange). In the panel, so the view never
+      moves; a screen reader hears it from outside-change-said. -->
+    <div id="outside-change" class="outside-change" hidden>
       <p id="outside-change-text"></p>
       <button id="outside-change-dismiss" type="button">Dismiss</button>
     </div>
@@ -53,6 +58,37 @@
       <ul id="images" class="choices"></ul>
       <div id="image-controls" hidden>
         <ul id="image-warnings" class="notices"></ul>
+        <!-- Where each membrane lies on the image shown (areas.js): one item per
+          membrane area, and an editor for an outline being drawn. -->
+        <fieldset id="areas" class="group areas" hidden>
+          <legend>Membranes on this image</legend>
+          <ul id="area-list" class="area-list"></ul>
+          <button id="area-add" type="button" aria-describedby="area-hint">Add membrane area</button>
+          <p id="area-hint" class="hint note" hidden></p>
+          <div id="area-editor" class="area-editor" hidden>
+            <p id="area-editor-title" class="note"></p>
+            <p id="area-margin" class="note">Each band's background is read only inside this
+              outline: leave a margin around the bands.</p>
+            <div id="area-keys" class="area-keys" tabindex="0" role="group"
+              aria-labelledby="area-editor-title area-keys-text">
+              <span id="area-keys-text">Drag on the image to draw it, inside it to move it, the
+                handle above it to turn it. Here: arrow keys move it (Shift: 10 px), [ and ]
+                turn it (Shift: 1°).</span>
+            </div>
+            <div class="area-fields">
+              <label class="field">x0 <input id="area-x0" type="number" step="1"></label>
+              <label class="field">y0 <input id="area-y0" type="number" step="1"></label>
+              <label class="field">x1 <input id="area-x1" type="number" step="1"></label>
+              <label class="field">y1 <input id="area-y1" type="number" step="1"></label>
+              <label class="field">Angle (°) <input id="area-angle" type="number" min="-45"
+                max="45" step="0.1"></label>
+            </div>
+            <div class="area-actions">
+              <button id="area-done" type="button">Done</button>
+              <button id="area-cancel" type="button">Cancel</button>
+            </div>
+          </div>
+        </fieldset>
         <label class="field">Bands are
           <select id="polarity">
             <option value="dark_on_light">dark on a light background</option>
@@ -75,8 +111,9 @@
           image of its membrane taken with it, the same size pixel for pixel; one
           of another size is listed disabled, its tooltip says why. -->
         <label id="marker-field" class="field" hidden>Marker image
-          <select id="marker-image" aria-describedby="marker-none"></select>
+          <select id="marker-image" aria-describedby="marker-none marker-follow"></select>
         </label>
+        <p id="marker-follow" class="hint note" hidden></p>
         <p id="marker-none" class="hint note" hidden>No marker or merged image on this membrane
           yet: import one onto it to link it.</p>
         <button id="remove-image" type="button">Remove this image</button>

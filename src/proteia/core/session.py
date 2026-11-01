@@ -98,6 +98,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import Final, Literal
 
 import numpy as np
@@ -125,6 +126,7 @@ from proteia.core.model import (
     Project,
     format_timestamp,
 )
+from proteia.core.quantify import estimate_background
 
 _log = logging.getLogger(__name__)
 
@@ -227,6 +229,18 @@ class ErrorCode(StrEnum):
     MW_REQUIRED = "mw_required"
     MW_OUTSIDE_CALIBRATION = "mw_outside_calibration"
     LANE_SPAN_REQUIRED = "lane_span_required"
+    # Membrane areas (#243). A membrane already has an area on the image; an
+    # outline would leave boxes, records or points outside its area; an image
+    # holding several areas is named where its membrane area is needed (or its
+    # last area would go); a click, box or row lies outside the membrane's area;
+    # another area on the image still covers all of it; a point lies inside two
+    # areas of one image.
+    ARENA_EXISTS = "arena_exists"
+    ARENA_IN_USE = "arena_in_use"
+    ARENA_REQUIRED = "arena_required"
+    OUT_OF_ARENA = "out_of_arena"
+    ARENA_COVERS_IMAGE = "arena_covers_image"
+    IN_TWO_ARENAS = "in_two_arenas"
 
 
 class OperationError(ValueError):
@@ -322,11 +336,16 @@ def _log_opened(folder: Path, project: Project, *, again: bool = False) -> None:
     if project.background_method == LEGACY_BACKGROUND_METHOD and any(
         batch.boxes_of(protein).bands for protein in batch.proteins
     ):
+        # A drawn membrane area is its image cut out, with its own median (#243).
+        drawn = any(
+            arena.outline is not None for m in batch.membranes for arena in batch.arenas_of(m)
+        )
         _log.info(
-            "in %r: the nets are measured with the legacy background (%s), each image's"
+            "in %r: the nets are measured with the legacy background (%s), each image's%s"
             " median, until the project is requantified",
             folder.name,
             LEGACY_BACKGROUND_METHOD,
+            " or drawn membrane area's" if drawn else "",
         )
 
 
@@ -491,32 +510,36 @@ def divergence(ours: Sequence[LogEntry], base: int, theirs: Sequence[LogEntry]) 
     )
 
 
-@dataclass(frozen=True)
-class Resolution:
+class Resolution(Enum):
     """What a save does with a ``project.json`` changed outside Proteia (#101):
-    which version goes into the conflict copy (``copy``: the file as found,
-    ``"outside"``, or the session's version, ``"session"``), and what the
-    session does then (``then``: write its version over the file, ``"save"``,
-    or take the file on disk as the project, ``"switch"``)."""
+    which version goes into the conflict copy and what the session does then.
+    Only the two that make sense exist."""
 
-    copy: Literal["outside", "session"]
-    then: Literal["save", "switch"]
+    # Keep the file as found in a conflict copy beside it, then save over it:
+    # the maintainer's 2026-11-01 choice, and the only one a save carries out.
+    SET_ASIDE_OUTSIDE = "set_aside_outside"
+    # Keep the session's version in the copy, then take the file on disk as the
+    # project (an option for two versions that forked): not carried out; see resolve.
+    SET_ASIDE_SESSION = "set_aside_session"
 
 
-# Keep the file as found in a conflict copy beside it, then save over it: the
-# maintainer's 2026-11-01 choice, and the only resolution a save carries out.
-SET_ASIDE_OUTSIDE: Final = Resolution(copy="outside", then="save")
+SET_ASIDE_OUTSIDE: Final = Resolution.SET_ASIDE_OUTSIDE
 
 
 def resolve(divergence: Divergence | None) -> Resolution:
     """What a save does when ``project.json`` changed outside Proteia: the one
-    place that decides it. ``divergence`` is None for a file that does not
-    read as a project. Today always :data:`SET_ASIDE_OUTSIDE`. A later rule is
-    decided here: at a fork (``Lineage.FORK``), the session's version into
-    the copy and a switch to the file (``Resolution("session", "switch")``,
-    :meth:`ProjectSession._read_again` reads it); for a version that only
-    extends the base (``Lineage.EXTENDS_BASE``), a switch and the change made
-    again on it."""
+    place that chooses it. ``divergence`` is None for a file that does not
+    read as a project. Today always :data:`SET_ASIDE_OUTSIDE`.
+
+    It isolates the choice, not its carrying out: :meth:`ProjectSession._write`
+    carries out ``SET_ASIDE_OUTSIDE`` only, and raises for any other. Another
+    rule (``SET_ASIDE_SESSION`` at a fork, ``Lineage.FORK``; making the change
+    again on a version that only extends the base) also needs the write
+    itself changed (the session's bytes into the copy, the file read again
+    with :meth:`ProjectSession._read_again` from inside the autosave, which
+    the end of :meth:`ProjectSession.save` must then not undo), a new opening
+    for the page (the workspace's open id), the page's showing of it, and the
+    notices' words."""
     return SET_ASIDE_OUTSIDE
 
 
@@ -532,11 +555,13 @@ def _changes(count: int) -> str:
     return f"{count} change" if count == 1 else f"{count} changes"
 
 
-# The step that takes a version Proteia set aside back, in its notices.
+# The step that takes a version Proteia set aside back, in its notices: it
+# works with one project only, and where file name extensions are hidden.
 _GO_ON = (
-    "To go on from {which} instead: open another project, rename project.json in the"
-    " project's folder (to 'project mine.json', say) and rename {copy} to project.json,"
-    " then open {name!r} again."
+    "To go on from {which} instead: quit Proteia, then in the project's folder rename"
+    " project.json to project mine.json and {copy} to project.json (where file name"
+    " extensions are hidden they show without .json: type project mine and project),"
+    " then start Proteia and open {name!r}."
 )
 
 
@@ -549,7 +574,7 @@ def _set_aside_notice(
     said = (
         f"{name!r} was changed outside Proteia after Proteia last opened or saved it."
         f" Proteia kept that version as {copy!r} in the project's folder, set aside on {day}"
-        f" at {hour}, and saved its own as usual."
+        f" at {hour}, and saves its own in its place."
     )
     if version.newer is not None:
         return (
@@ -605,11 +630,19 @@ def _found_notice(name: str, copies: Sequence[str]) -> str:
         listed = f"{', '.join(shown[:-1])} and {shown[-1]}"
     else:
         listed = shown[0]
-    held = "1 version" if len(copies) == 1 else f"{len(copies)} versions"
-    go_on = _GO_ON.format(which="one", copy="that copy", name=name)
+    if len(copies) == 1:
+        held, kept = "1 version", "Proteia never deletes it; once you delete it, this notice goes."
+        go_on = _GO_ON.format(which="it", copy="the copy", name=name)
+    else:
+        held = f"{len(copies)} versions"
+        kept = (
+            "Proteia never deletes them; once you delete those you do not need, this notice"
+            " goes with the last."
+        )
+        go_on = _GO_ON.format(which="one", copy="that copy", name=name)
     return (
         f"The folder of {name!r} holds {held} of the project that Proteia set aside when it was"
-        f" changed outside Proteia: {listed}. Proteia never deletes them. {go_on}"
+        f" changed outside Proteia: {listed}. {kept} {go_on}"
     )
 
 
@@ -645,10 +678,12 @@ class ProjectSession:
         # bytes it holds and when it was kept, so a save that meets the same
         # bytes again (one that failed after the copy) keeps no second one.
         self._copy: tuple[str, str, datetime] | None = None
-        # What the page says of this opening's last change outside Proteia,
-        # and the conflict copies this opening kept, newest first; replaced
-        # whole, so outside_change reads them without the lock.
-        self._said: str | None = None
+        # What the page says of this opening's last change outside Proteia
+        # (its event number and words: _say), and the conflict copies this
+        # opening kept, newest first; replaced whole, so outside_change reads
+        # them without the lock. _events counts the notices of the session.
+        self._said: tuple[int, str] | None = None
+        self._events = 0
         self._kept: tuple[str, ...] = ()
         # The conflict copies in the folder when it was opened or read again.
         self._found: tuple[str, ...] = ()
@@ -666,6 +701,9 @@ class ProjectSession:
         # work on images measured on another channel, by image id; None
         # between operations, so none is kept (calibration_pixels).
         self._calibration_reads: dict[str, np.ndarray] | None = None
+        # Their medians, worked out when a ladder read masks a pixel with one
+        # (calibration_background); kept and dropped with them.
+        self._calibration_medians: dict[str, float] | None = None
         # (image id, SHA-256) -> how its stored file holds colour (file_colours).
         self._file_colours: dict[tuple[str, str], FileColours | None] = {}
         # (image id, SHA-256) -> what its stored file's header says of reading it
@@ -782,6 +820,24 @@ class ProjectSession:
             if reads is not None:
                 reads[image_id] = array
             return array
+
+    def calibration_background(self, image_id: str) -> float:
+        """The median of the image's mean array (:meth:`calibration_pixels`),
+        which a ladder read takes off its membrane area: the stored
+        ``background`` when the image is measured on the mean; else worked out
+        once per operation, as its array is read, and not kept after it
+        (outside an operation, each time). Raises as :meth:`pixels` does."""
+        with self.lock:
+            image = self._project.batch.find_image(image_id)
+            if image.measured_channel is Channel.MEAN:
+                return image.background
+            medians = self._calibration_medians
+            if medians is not None and image_id in medians:
+                return medians[image_id]
+            level = estimate_background(self.calibration_pixels(image_id))
+            if medians is not None:
+                medians[image_id] = level
+            return level
 
     def channel_array(self, image_id: str, channel: Channel) -> np.ndarray:
         """The image's read-only analysis array of ``channel`` (#206), read and
@@ -950,17 +1006,26 @@ class ProjectSession:
     def outside_change(self) -> dict[str, JsonValue] | None:
         """What the page says of changes made to the project's files outside
         Proteia (#101), or None: ``message``, the notice of this opening's
-        last one (a ``project.json`` kept in a conflict copy, or one written
-        again), else of the conflict copies the folder held when the project
-        was opened or read again; ``copies``, the conflict copies this opening
-        kept, else those found, newest first. Read without the lock, as
-        ``save_error`` is."""
+        last one (a ``project.json`` kept in a conflict copy, said as the copy
+        is made, or one written again), else of the conflict copies the folder
+        held when the project was opened or read again; ``event``, which of
+        them it is (the session counts its notices from 1; 0 for the copies
+        found), so a page that dismissed one shows the next even in the same
+        words; ``copies``, the conflict copies this opening kept, else those
+        found, newest first. Read without the lock, as ``save_error`` is."""
         said, kept, found = self._said, self._kept, self._found
         if said is None:
             if not found:
                 return None
-            said = _found_notice(self._folder.name, found)
-        return {"message": said, "copies": list(kept or found)}
+            said = (0, _found_notice(self._folder.name, found))
+        event, message = said
+        return {"event": event, "message": message, "copies": list(kept or found)}
+
+    def _say(self, message: str) -> None:
+        """Make ``message`` this opening's notice of a change outside Proteia,
+        as its next event (:attr:`outside_change`). Called with the lock held."""
+        self._events += 1
+        self._said = (self._events, message)
 
     def save(self) -> Path:
         """Write ``project.json`` now and return its path; then delete the orphans
@@ -975,6 +1040,8 @@ class ProjectSession:
             try:
                 self._write(project)
             except (OSError, storage.ProjectError) as exc:
+                if isinstance(exc, storage.ProjectFileUnreadError):  # its path: the log only
+                    _log.warning("in %r: %s", self._folder.name, exc.__cause__)
                 self.save_error = exc
                 raise
             self._saved_files = _referenced_files(project)
@@ -1025,33 +1092,31 @@ class ProjectSession:
                 else:
                     outside = (found, expect, version)
         storage.check_images(project, folder)
-        said = None
         if outside is not None:
             found_bytes, digest, version = outside
             split = None
             if version.project is not None:
                 split = divergence(project.log, self._base.log, version.project.log)
             resolution = resolve(split)
-            if resolution != SET_ASIDE_OUTSIDE:  # never: the only resolution built (#101)
+            if resolution is not SET_ASIDE_OUTSIDE:  # never: the only resolution built (#101)
                 raise NotImplementedError(f"no save for {resolution}")
-            copy, moment = self._keep_copy(found_bytes, digest)
-            said = _set_aside_notice(name, copy, moment, version, split)
-            _log.warning(
-                "in %r: its project.json was changed outside Proteia; kept that version as %r"
-                " and saved Proteia's (%s)",
-                name,
-                copy,
-                _outside_summary(version, split),
-            )
+            copy, moment, new = self._keep_copy(found_bytes, digest)
+            if new:  # said as it is made, whether the save then goes through or not
+                self._say(_set_aside_notice(name, copy, moment, version, split))
+                _log.warning(
+                    "in %r: its project.json was changed outside Proteia; kept that version as"
+                    " %r and saves Proteia's (%s)",
+                    name,
+                    copy,
+                    _outside_summary(version, split),
+                )
         storage.write_project_file(folder, data, expect=expect)
         self._base = _written(data, project)
         if found is None:
-            said = _rewritten_notice(name)
+            self._say(_rewritten_notice(name))
             _log.warning(
                 "in %r: its project.json was removed outside Proteia; wrote it again", name
             )
-        if said is not None:
-            self._said = said
 
     def _base_canonical(self) -> str | None:
         """The SHA-256 of the base's canonical form (:class:`_Base`), computed
@@ -1062,19 +1127,20 @@ class ProjectSession:
             base = self._base = dataclasses.replace(base, canonical=canonical, parsed=None)
         return base.canonical
 
-    def _keep_copy(self, data: bytes, digest: str) -> tuple[str, datetime]:
+    def _keep_copy(self, data: bytes, digest: str) -> tuple[str, datetime, bool]:
         """The conflict copy that keeps ``data`` (SHA-256 ``digest``), the
-        ``project.json`` found changed outside Proteia, and when it was kept: the
-        one this session kept last if it still holds them, else a new one (its
-        moment from the session clock). Called with the lock held."""
+        ``project.json`` found changed outside Proteia, when it was kept, and
+        whether it is new: the one this session kept last if it still holds
+        them, else a new one (its moment from the session clock). Called with
+        the lock held."""
         kept = self._copy
         if kept is not None and kept[1] == digest and storage.holds(self._folder / kept[0], data):
-            return kept[0], kept[2]
+            return kept[0], kept[2], False
         moment = self.clock()
         copy = storage.keep_conflict_copy(self._folder, data, moment)
         self._copy = (copy, digest, moment)
         self._kept = (copy, *self._kept)
-        return copy, moment
+        return copy, moment, True
 
     def _commit(
         self,
@@ -1148,6 +1214,8 @@ class ProjectSession:
                 self._pixels.pop(image_id, None)
             if self._calibration_reads:  # read for the project before this commit
                 self._calibration_reads.clear()
+            if self._calibration_medians:
+                self._calibration_medians.clear()
             # The history moves with the commit, before the hook saves (and so
             # deletes the files no state references any more).
             if move is _Move.PUSH:
@@ -1194,6 +1262,7 @@ class ProjectSession:
             outermost = self._calibration_reads is None
             if outermost:
                 self._calibration_reads = {}
+                self._calibration_medians = {}
             try:
                 yield
             except (OperationError, LookupError):
@@ -1203,6 +1272,7 @@ class ProjectSession:
             finally:
                 if outermost:
                     self._calibration_reads = None
+                    self._calibration_medians = None
 
     def _opening_state(self) -> _State:
         """The committed project as the state the session's history begins with.
@@ -1439,32 +1509,57 @@ class ProjectSession:
 
     def _named_by_versions(self) -> frozenset[str] | None:
         """The image files (lowercase names) that the other versions of the
-        project in its folder name anywhere in their text (#101): every
-        version file (:func:`~proteia.core.storage.is_version`), each read once
-        while its size, modification time and file id stay the same, and
-        ``project.json`` itself while it is not the session's base. None when
-        that is unknown: the folder cannot be listed, a file cannot be read, or
-        ``project.json`` is missing. Called with the lock held."""
+        project in its folder name anywhere in their text (:meth:`_versions_name`),
+        or None when what one of them names is unknown: for a cleanup, which
+        then deletes no image file. Called with the lock held."""
+        names, whole = self._versions_name()
+        return names if whole else None
+
+    def _versions_name(self) -> tuple[frozenset[str], bool]:
+        """The image files (lowercase names) that the other versions of the
+        project in its folder name anywhere in their text (#101), and whether
+        that is all of them: every version file
+        (:func:`~proteia.core.storage.is_version`), each read once while its
+        size, modification time and file id stay the same, and ``project.json``
+        itself while it is not the session's base. Not all when the folder
+        cannot be listed, a version cannot be read (held, a path too long for
+        Windows, text not in its encoding), or ``project.json`` is missing or
+        cannot be read; the names of those read are given all the same.
+        Called with the lock held."""
         names: set[str] = set()
+        whole = True
         try:
             found = storage.read_project_file(self._folder)
-            if found is None:
-                return None
-            if hashlib.sha256(found).hexdigest() != self._base.sha256:
-                names.update(storage.image_names(found))
-            for path in self._folder.iterdir():
-                if storage.is_version(path.name) and path.is_file():
-                    names.update(self._version_names(path))
         except OSError:
-            return None
-        return frozenset(name.lower() for name in names)
+            found = None  # unknown, as when it is missing
+        if found is None:
+            whole = False
+        elif hashlib.sha256(found).hexdigest() != self._base.sha256:
+            try:
+                names.update(storage.version_names(found))
+            except ValueError:  # not in its encoding: what it names is unknown
+                whole = False
+        try:
+            paths = list(self._folder.iterdir())
+        except OSError:
+            paths, whole = [], False
+        for path in paths:
+            if storage.is_version(path.name):
+                try:
+                    names.update(self._version_names(path))
+                except (OSError, ValueError):
+                    whole = False
+        return frozenset(name.lower() for name in names), whole
 
     def _version_names(self, path: Path) -> frozenset[str]:
         """The image names the version file ``path`` holds
-        (:func:`~proteia.core.storage.named_images`), kept by its name and read
-        again once its size, modification time or file id changed. An
-        ``OSError`` propagates."""
+        (:func:`~proteia.core.storage.named_images`; none for a folder), kept
+        by its name and read again once its size, modification time or file id
+        changed. An ``OSError`` (one that cannot be looked at, as a path past
+        Windows' limit, too) and a ``UnicodeDecodeError`` propagate."""
         stat = path.stat()
+        if not S_ISREG(stat.st_mode):
+            return frozenset()  # a folder of that name holds no version
         key = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
         cached = self._versions.get(path.name)
         if cached is not None and cached[0] == key:
@@ -1477,15 +1572,16 @@ class ProjectSession:
         """The number of the id an image imported now takes: the first from
         ``next_id`` on that no file in ``images/`` holds (an image of another
         version, or one cleanup could not delete) and that no other version of
-        the project names (:meth:`_named_by_versions`: an image that the
-        version's computer stored, which has not arrived yet), whatever the
-        suffix and case (#101). Called with the lock held."""
+        the project names (:meth:`_versions_name`, those it could read when it
+        could not read them all: an image that the version's computer stored,
+        which has not arrived yet), whatever the suffix and case (#101). Called
+        with the lock held."""
         held: set[int] = set()
         try:
             names = [path.name for path in (self._folder / storage.IMAGES_DIR).iterdir()]
         except OSError:
             names = []
-        for name in (*names, *(self._named_by_versions() or ())):
+        for name in (*names, *self._versions_name()[0]):
             if match := _IMAGE_FILE.match(name):
                 held.add(int(match[1]))
         number = self._project.next_id

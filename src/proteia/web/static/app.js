@@ -4,6 +4,7 @@
 // calibration and checks. Every edit, and
 // every undo and redo, goes to the server, which answers with the stored
 // project and its results; the page only draws what it is given.
+import { AreaPanel, areasOn } from "/static/areas.js";
 import { CalibrationPanel } from "/static/calibration.js";
 import { ChartCards } from "/static/charts.js";
 import { DiagnosticsDialog } from "/static/diagnostics.js";
@@ -180,6 +181,10 @@ const state = {
   results: null, // the results computed from that same state
   answered: null, // {open_id, revision} of that state
   imageId: null,
+  // The membrane area chosen on the image shown (#243), and on each image the
+  // one chosen there last (image id -> area id): kept while it exists.
+  arenaId: null,
+  areaFor: new Map(),
   proteinId: null, // the protein a click on the image places a box of
   boxId: null,
   // image id -> {grey, original}: Promises of its previews' ImageBitmaps, each
@@ -446,6 +451,25 @@ const view = new ImageView($("view"), {
   pick: (x, y, where) => calibration.pick(x, y, where),
   ruler: (step) => calibration.ruler(step),
   ladderPoint: (step) => calibration.ladderPoint(step),
+  // An outline being drawn, drawn, moved or turned by a drag (#243).
+  area: (outline, angle) => areaPanel.fromView(outline, angle),
+});
+
+// "Membranes on this image" (#243): its edits are edits, in order with the
+// others; a refusal another part of the page says (project_changed) is said there.
+const areaPanel = new AreaPanel(view, {
+  edit: (method, path, json, options) => edit(method, path, json, options),
+  refusal: (error, text) => report(error, text),
+  status: (text) => showStatus(text),
+  reread: () => reread().catch(report),
+  settled: () => pending(),
+  choose: (imageId, arenaId) => {
+    state.areaFor.set(imageId, arenaId);
+    if (state.project && state.imageId === imageId) {
+      select();
+      render();
+    }
+  },
 });
 
 const proteinPanel = new ProteinPanel({
@@ -576,6 +600,7 @@ function showOpened(answer) {
     forgetBitmap(id);
   }
   state.originalColours.clear();
+  state.areaFor.clear(); // area ids repeat across projects too
   proteinPanel.forgetTyped();
   laneTable.forgetTyped();
   calibration.forget(); // a ruler or a tool belongs to the image it was on
@@ -637,7 +662,7 @@ async function openProject(path, name, json) {
       return null;
     }
     $("projects-dialog").close();
-    showStatus("");
+    showStatus(areaPanel.takeDiscarded());
     return answer;
   } catch (error) {
     $("projects-error").textContent = error.message;
@@ -733,7 +758,15 @@ function followOpening({ refused = null, note = null } = {}) {
         return;
       }
       showOpened(answer);
-      showStatus([followedText(before, answer.project, follow.refused), ...follow.notes].join(" "));
+      showStatus(
+        [
+          followedText(before, answer.project, follow.refused, answer.closed),
+          ...follow.notes,
+          areaPanel.takeDiscarded(),
+        ]
+          .filter(Boolean)
+          .join(" "),
+      );
     } catch (error) {
       report(error);
     } finally {
@@ -743,16 +776,29 @@ function followOpening({ refused = null, note = null } = {}) {
   return follow.done;
 }
 
-// Why the page now shows `project` in place of `before`, and what the
-// requests `refused` did not do (keys of NOT_DONE).
-function followedText(before, project, refused) {
+// Why the page now shows `project` in place of `before`, what became of
+// `before` (`closed`: the openings switches closed, as the server answered
+// them), and what the requests `refused` did not do (keys of NOT_DONE).
+function followedText(before, project, refused, closed) {
   const now = isolate(project.name);
   const why =
     project.name === before.name
       ? `${now} was opened again, in another tab or after a change outside Proteia;` +
         " it is shown as it is now."
-      : `Proteia now shows ${now}, opened in another tab; ${isolate(before.name)} is saved.`;
+      : `Proteia now shows ${now}, opened in another tab; ${closedText(before, closed)}`;
   return [why, ...[...refused].map((kind) => NOT_DONE[kind])].join(" ");
+}
+
+// What became of the project `before` showed, as the switch that closed its
+// opening recorded it (#101): saved, or closed with changes not saved and why.
+// Unrecorded (closed long ago), only that it was closed.
+function closedText(before, closed) {
+  const name = isolate(before.name);
+  const entry = (closed || []).find((item) => item.open_id === before.open_id);
+  if (!entry) {
+    return `${name} was closed.`;
+  }
+  return entry.saved ? `${name} is saved.` : `${name} was closed with changes not saved: ${entry.why}.`;
 }
 
 let checking = null; // the check under way (checkOpening), or null
@@ -1314,7 +1360,21 @@ function select() {
   if (!images.some((image) => image.id === state.imageId)) {
     state.imageId = images.length ? images[0].id : null;
   }
-  const proteins = project.proteins.filter((p) => p.image_id === state.imageId);
+  // The area chosen on this image, while it is there; else its first (#243).
+  const areas = state.imageId ? areasOn(project, state.imageId) : [];
+  const remembered = state.areaFor.get(state.imageId);
+  state.arenaId = areas.some((area) => area.id === remembered)
+    ? remembered
+    : areas.length
+      ? areas[0].id
+      : null;
+  for (const [imageId, arenaId] of [...state.areaFor]) {
+    if (!project.arenas.some((area) => area.id === arenaId && area.image_id === imageId)) {
+      state.areaFor.delete(imageId);
+    }
+  }
+  // The proteins on the chosen area: on an image of one membrane, those on the image.
+  const proteins = project.proteins.filter((p) => p.arena_id === state.arenaId);
   if (!proteins.some((p) => p.id === state.proteinId)) {
     state.proteinId = proteins.length ? proteins[0].id : null;
   }
@@ -1357,24 +1417,43 @@ function imageNames(ids) {
 
 // --- Changes made outside Proteia (#101) ---
 
-// The notice dismissed on this page: {open_id, message}, or null. It stays
-// hidden while the project shown is that opening and the notice says that.
+// The notice dismissed on this page, and the one a screen reader was last
+// given: {open_id, event}, or null. A notice is one event of one opening
+// (outside_change.event), so the next shows even in the same words.
 let dismissedOutside = null;
+let saidOutside = null;
+
+// Whether `seen` is the notice `change` of the opening shown in `project`.
+function sameNotice(seen, project, change) {
+  return seen !== null && seen.open_id === project.open_id && seen.event === change.event;
+}
 
 // Show what the state says of changes made to the project's files outside
 // Proteia (its outside_change: a project.json kept in a conflict copy, or
 // written again, or the copies its folder holds), in the server's words, at
-// the top of the panel, unless dismissed for this opening and message. Drawn
-// from every state shown, so no way of showing a project misses it.
+// the top of the panel, unless that notice of this opening was dismissed.
+// Drawn from every state shown, so no way of showing a project misses it.
+// The live region, always there, gets the words of each new notice once the
+// notice is shown, so a screen reader reads it once. A notice that appears,
+// or whose words change, pushes down what the panel holds below it: the
+// control in the panel that has the focus (the one just edited) is kept in
+// the window, the panel scrolled the least that shows it.
 function renderOutsideChange(project) {
   const change = project.outside_change;
-  const dismissed =
-    change !== null &&
-    dismissedOutside !== null &&
-    dismissedOutside.open_id === project.open_id &&
-    dismissedOutside.message === change.message;
-  $("outside-change").hidden = change === null || dismissed;
-  $("outside-change-text").textContent = change === null ? "" : change.message;
+  const shown = change !== null && !sameNotice(dismissedOutside, project, change);
+  const notice = $("outside-change");
+  const text = shown ? change.message : "";
+  const moved = shown && (notice.hidden || $("outside-change-text").textContent !== text);
+  $("outside-change-text").textContent = text;
+  notice.hidden = !shown;
+  const focused = document.activeElement;
+  if (moved && focused && focused !== document.body && notice.parentElement.contains(focused)) {
+    focused.scrollIntoView({ block: "nearest" });
+  }
+  if (shown && !sameNotice(saidOutside, project, change)) {
+    saidOutside = { open_id: project.open_id, event: change.event };
+    $("outside-change-said").textContent = change.message;
+  }
 }
 
 // Dismiss hides the notice for this opening; the button goes with it, so the
@@ -1382,7 +1461,7 @@ function renderOutsideChange(project) {
 $("outside-change-dismiss").addEventListener("click", () => {
   const project = state.project;
   if (project && project.outside_change) {
-    dismissedOutside = { open_id: project.open_id, message: project.outside_change.message };
+    dismissedOutside = { open_id: project.open_id, event: project.outside_change.event };
   }
   $("outside-change").hidden = true;
   $("switch-project").focus();
@@ -1412,9 +1491,11 @@ function render() {
       ? "Saved"
       : "Saving…";
   const image = project.images.find((i) => i.id === state.imageId) || null;
+  const arena = project.arenas.find((a) => a.id === state.arenaId) || null;
   renderImages(project, image);
-  calibration.render(project, image);
-  proteinPanel.render(project, image, state.proteinId, state.results);
+  areaPanel.render(project, image, arena);
+  calibration.render(project, image, arena);
+  proteinPanel.render(project, image, state.proteinId, state.results, arena);
   renderBox(project);
   renderNotices(project);
   renderHint(project, image);
@@ -1487,16 +1568,18 @@ function renderMembranes(project) {
   const select = $("import-membrane");
   const kept = membranesOpening === project.open_id ? select.value : "";
   membranesOpening = project.open_id;
-  const membranes = new Map(); // membrane id -> its images
-  for (const image of project.images) {
-    if (!membranes.has(image.membrane_id)) {
-      membranes.set(image.membrane_id, []);
+  const membranes = new Map(); // membrane id -> {label, images}
+  for (const membrane of project.membranes) {
+    const images = membrane.image_ids
+      .map((id) => project.images.find((image) => image.id === id))
+      .filter(Boolean);
+    if (images.length) {
+      membranes.set(membrane.id, { label: membrane.label, images });
     }
-    membranes.get(image.membrane_id).push(image);
   }
-  const firstNames = [...membranes.values()].map((images) => images[0].original_name);
+  const firstNames = [...membranes.values()].map(({ images }) => images[0].original_name);
   const options = [new Option("New membrane", "")];
-  for (const [id, images] of membranes) {
+  for (const [id, { label, images }] of membranes) {
     const first = images[0];
     const notes = [];
     if (firstNames.filter((name) => name === first.original_name).length > 1) {
@@ -1507,7 +1590,7 @@ function renderMembranes(project) {
       notes.push(`and ${images.length - 1} more`);
     }
     const more = notes.length ? ` (${notes.join(", ")})` : "";
-    options.push(new Option(`Same as ${isolate(first.original_name)}${more}`, id));
+    options.push(new Option(`${label}: same as ${isolate(first.original_name)}${more}`, id));
   }
   select.replaceChildren(...options);
   select.value = membranes.has(kept) ? kept : "";
@@ -1608,7 +1691,7 @@ function renderNotices(project) {
     }
   }
   const missing = [];
-  for (const protein of project.proteins.filter((p) => p.image_id === state.imageId)) {
+  for (const protein of project.proteins.filter((p) => p.arena_id === state.arenaId)) {
     if (protein.missing_lanes.length && protein.bands.length) {
       const lanes = protein.missing_lanes.map((m) => m.lane_index + 1);
       const which = `lane${lanes.length > 1 ? "s" : ""} ${lanes.join(", ")}`;
@@ -1633,11 +1716,11 @@ function renderNotices(project) {
 // this signal image and the lanes are declared ({proteinId, color, lanes});
 // otherwise null, and the drag pans.
 function rowTool(project, image) {
-  if (calibration.busy()) {
-    return null; // a ladder is being found, marked or adjusted: a drag pans
+  if (calibration.busy() || areaPanel.drafting()) {
+    return null; // a ladder is being found, marked or adjusted, or an outline drawn
   }
   const protein = image
-    ? project.proteins.find((p) => p.id === state.proteinId && p.image_id === image.id)
+    ? project.proteins.find((p) => p.id === state.proteinId && p.arena_id === state.arenaId)
     : null;
   if (!protein || image.kind === "visible_marker" || !project.lanes.length) {
     return null;
@@ -1866,6 +1949,9 @@ function renderView(project) {
   const marks = [];
   for (const protein of project.proteins.filter((p) => p.image_id === image.id)) {
     const color = colorOf(project, protein.id);
+    // Another membrane's protein on this image (#243): its boxes drawn faint,
+    // and not taken by a click; its lanes without a box not offered.
+    const dim = protein.arena_id !== state.arenaId;
     // The chosen protein's padded boxes show their fitted size inside. Not a
     // box at the image's edge: the padding may have shifted it inward, off
     // the fit's centre, and the outline would be drawn off the fit.
@@ -1881,11 +1967,12 @@ function renderView(project) {
         color,
         clipped: band.clipped === true,
         label: `${band.lane_index + 1}${overExposureLabel(band)}`,
+        dim,
       });
     }
     const { width, height } = protein.box_size;
     for (const missing of protein.missing_lanes) {
-      if (missing.x === null || missing.y === null) {
+      if (dim || missing.x === null || missing.y === null) {
         continue;
       }
       const x0 = Math.round(missing.x - width / 2);
@@ -1898,7 +1985,7 @@ function renderView(project) {
         laneIndex: missing.lane_index,
       });
     }
-    for (const record of protein.undetected) {
+    for (const record of dim ? [] : protein.undetected) {
       const band = record.band_index ? ` band ${record.band_index + 1}` : "";
       marks.push({
         rect: record.region,
@@ -2372,6 +2459,7 @@ function selectBox(boxId) {
     return; // gone meanwhile (an undo)
   }
   state.imageId = found.protein.image_id;
+  state.areaFor.set(found.protein.image_id, found.protein.arena_id);
   state.boxId = boxId;
   select();
   render();
@@ -2477,6 +2565,21 @@ async function placeRow(rect, proteinId) {
   const protein = state.project.proteins.find((p) => p.id === proteinId);
   if (!protein) {
     return;
+  }
+  // A row box that does not meet its membrane's area is refused here (the
+  // server refuses it too): its bounds, as the server gives them (#243).
+  const area = state.project.arenas.find((a) => a.id === protein.arena_id);
+  if (area && area.outline !== null) {
+    const [bx0, by0, bx1, by1] = area.bounds;
+    if (!(rect[0] < bx1 && bx0 < rect[2] && rect[1] < by1 && by0 < rect[3])) {
+      const membrane = state.project.membranes.find((m) => m.id === area.membrane_id);
+      const label = membrane ? membrane.label.toLowerCase() : "the membrane";
+      showStatus(
+        `Row box of ${protein.name} not placed: The row box lies outside ${label}'s area;` +
+          " drag across that membrane's lanes.",
+      );
+      return;
+    }
   }
   const opened = shownOpening();
   let before = null;
@@ -2722,18 +2825,19 @@ $("import-polarity").addEventListener("change", (event) => {
 // --- Requantifying: the local background, and looking for over-exposure ---
 
 // The background method of a project quantified before the local background:
-// each net above its image's median. It stays until the project is requantified.
+// each net above its image's median, or its drawn membrane area's (#243). It
+// stays until the project is requantified.
 const LEGACY_BACKGROUND = "global_median";
 
 // What the offer says for each reason to requantify (requantifyReason): the
 // legacy background, which moves every net, or boxes on a lossy, colour or
 // CMYK image measured before Proteia looked for pixels near the detector limit
 // there (#112). The note is its own tooltip too, whole where it is cut short.
+// The legacy background's tooltip is the server's (the state's
+// legacy_background), which says which median the nets use (#243).
 const REQUANTIFY_OFFERS = {
   background: {
     label: "Requantify with local background",
-    title:
-      "The nets use the whole-image median background, as measured before the local background.",
     note: "Nets move to the local ring background; Undo takes it back.",
   },
   overExposure: {
@@ -2774,7 +2878,7 @@ function renderRequantify(project) {
     const offer = REQUANTIFY_OFFERS[reason];
     const button = $("requantify");
     button.textContent = offer.label;
-    button.title = offer.title;
+    button.title = reason === "background" ? project.legacy_background : offer.title;
     const note = $("requantify-note");
     note.textContent = offer.note;
     note.title = offer.note;
@@ -3083,6 +3187,10 @@ const ACTION_WORDS = {
   remove_calibration_point: "remove ladder mark",
   clear_calibration: "clear ladder marks",
   set_ladder_points: "apply ladder",
+  add_arena: "add membrane area",
+  edit_arena: "edit membrane area",
+  assign_arena: "change area's membrane",
+  remove_arena: "remove membrane area",
   requantify: "requantify",
   undo: "undo",
   redo: "redo",
@@ -3171,6 +3279,9 @@ function takeStep(direction, { seq = null, back = () => $("clear-boxes") } = {})
   if (!state.project || $("workspace").hidden) {
     return;
   }
+  // An outline being drawn is dropped first, unsent: the step takes back the
+  // last change sent (#243).
+  areaPanel.discard();
   const had = document.activeElement;
   const from = seq !== null ? back : null; // taken from the status line
   const offered = state.project.history[direction]; // what the page showed when asked
@@ -3320,6 +3431,10 @@ document.addEventListener("keydown", (event) => {
     // First a ladder's popup, tool or ruler (#58); the view took the key
     // already if it cancelled a drag, which then drops nothing more.
     if (calibration.escape({ gestureCancelled: event.defaultPrevented })) {
+      return;
+    }
+    // Then an outline being drawn (#243), unless the key cancelled its drag.
+    if (!event.defaultPrevented && areaPanel.escape()) {
       return;
     }
     state.boxId = null;

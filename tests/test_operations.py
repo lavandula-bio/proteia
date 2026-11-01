@@ -228,31 +228,42 @@ def import_before_224(
 def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None = None) -> None:
     """The operations' invariant: every stored net, background (level, mode,
     spread) and clipping flag (exact or possible) equals, exactly, its value recomputed from the
-    session's pixels, image by image, with every box on the image (every
-    protein's, each with its size) measured together under the project's
-    background method. ``only`` limits the check to those images.
+    session's pixels, membrane area by membrane area, with every box on the
+    area (every protein's, each with its size) measured together under the
+    project's background method, its rings reading no pixel outside a drawn
+    area's outline (#243), whose pixels' median is the level its bands fall
+    back to, and the legacy method's level, as its image's median is for
+    an area over the whole image. ``only`` limits the check to those images.
     """
     project = session.project
     batch = project.batch
     legacy = project.background_method == "global_median"
-    for image in batch.iter_images():
-        if only is not None and image.id not in only:
-            continue
+    areas = [
+        (image, arena)
+        for image in batch.iter_images()
+        for _, arena in batch.arenas_on(image.id)
+        if only is None or image.id in only
+    ]
+    for image, arena in areas:
         placed = [  # each band with its protein's boxes (their size)
             (batch.boxes_of(p), b)
-            for p in batch.proteins
-            if batch.image_id_of(p) == image.id
+            for p, _ in batch.rows_on_arena(arena.id)
             for b in batch.boxes_of(p).bands
         ]
         if not placed:
             continue
+        outside = None
         pixels = session.pixels(image.id)
+        median = image.background
+        if arena.outline is not None:
+            outside = ~ops._inside_mask(arena, image, (0, 0, image.width, image.height))
+            median = float(np.median(np.asarray(pixels)[~outside]))
         dark = image.polarity.dark_on_light
         rects = [band.box.rect(protein.box_size) for protein, band in placed]
         sizes = [(protein.box_size.width, protein.box_size.height) for protein, _ in placed]
         integral = image.bit_depth is not None
         if legacy:
-            found = [BandBackground(image.background, "global_median", 0.0)] * len(placed)
+            found = [BandBackground(median, "global_median", 0.0)] * len(placed)
             clamp = "pixel"
         else:
             found = band_backgrounds(
@@ -261,7 +272,8 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 sizes,
                 dark_on_light=dark,
                 integral=integral,
-                fallback=image.background,
+                fallback=median,
+                unreadable=outside,
             )
             clamp = RING_CLAMP
         # On the channel the session's pixels are of (#206).
@@ -279,6 +291,8 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 pixels, band.box, size, bit_depth=near_depth, dark_on_light=dark
             )
             assert band.possibly_clipped is possibly, band.id
+        if outside is not None:
+            continue  # the product's entry point reads an image of one membrane
         # The product's one entry point gives the same nets.
         method = "global_median" if legacy else "ring_median"
         nets = quantify_nets(
@@ -288,13 +302,13 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
 
 
 def expected_mw(session: ProjectSession, band_id: str) -> float | None:
-    """A band's apparent MW recomputed (#58): its image's calibration at its
-    box's centre, at its protein's box size; None without a curve or outside
-    its range."""
+    """A band's apparent MW recomputed (#58): its image's calibration (of its
+    protein's membrane, #243) at its box's centre, at its protein's box size;
+    None without a curve or outside its range."""
     batch = session.project.batch
     protein, band = batch.find_band(band_id)
     image_id = batch.image_id_of(protein)
-    fitted = mwcal.calibration_for(batch, batch.membrane_of(image_id), image_id)
+    fitted = mwcal.calibration_for(batch, batch.membrane_of_protein(protein), image_id)
     if not isinstance(fitted, mwcal.Calibration):
         return None
     size = batch.boxes_of(protein).box_size
@@ -9826,7 +9840,7 @@ def test_lane_anchors_of_some_bands_only(tmp_path):
     other_protein_in_lanes(s, image, case, (2, 3))
     own = {band_id for band_id in ops.detect_row_boxes(s, protein, case.row).band_ids if band_id}
     batch = s.project.batch
-    ref = batch.find_image(image)
+    ref = batch.arenas_on(image)[0][1].id
 
     mine, others = lane_anchors(batch, ref, only=own), lane_anchors(batch, ref, without=own)
     assert sorted(lane for _, lane in mine) == list(range(6))
@@ -11917,11 +11931,19 @@ MW_WRITERS = frozenset(
         "remove_calibration_point",
         "clear_calibration",
         "set_ladder_points",
+        "add_arena",
+        "assign_arena",
+        "edit_arena",
+        "remove_arena",
     }
 )
 MW_NEUTRAL = frozenset(
     {
         "add_protein",
+        "area_removal",
+        "area_removals",
+        "marker_adoption",
+        "marker_adoptions",
         "calibration_fit",
         "clear_boxes",
         "compute",
@@ -12023,6 +12045,20 @@ def test_mw_current_after_each_operation(tmp_path):
         "set_ladder_points",
         lambda: ops.set_ladder_points(s, c.marker, RIGHT, right, x=CAL_RIGHT_X),
     )
+    # A membrane area (#243): the linked pair's given to a new membrane, with
+    # its rows and points (the same curve); a second membrane's corner area on
+    # both, removed.
+    area = s.project.batch.arenas_on(c.blot)[0][1].id
+    step("assign_arena", lambda: ops.assign_arena(s, area, None))
+    # The pair's area cut below the 70 kDa marks: the row and the marks below
+    # go to a new membrane, and both membranes are refitted.
+    step("edit_arena", lambda: ops.edit_arena(s, area, outline=(0, 0, CAL_W, 85)))
+    assert len(s.project.batch.membranes) == 2
+    assert all(band.apparent_mw is not None for band in boxes_of(s, c.protein).bands)
+    made: list[str] = []
+    step("add_arena", lambda: made.extend(ops.add_arena(s, c.blot, (0, 0, 20, 20)).arena_ids))
+    corner = made[0]
+    step("remove_arena", lambda: ops.remove_arena(s, corner))
     step("remove_image", lambda: ops.remove_image(s, c.marker))
     assert ran == MW_WRITERS
     calibration = s.project.batch.membranes[0].calibration

@@ -1546,6 +1546,7 @@ def test_every_module_the_page_imports_is_served(running):
                 pending.append(target)
     assert seen == {
         "/static/app.js",
+        "/static/areas.js",
         "/static/calibration.js",
         "/static/charts.js",
         "/static/diagnostics.js",
@@ -1808,12 +1809,13 @@ def _logged_actions() -> set[str]:
     core = Path(ops.__file__).parent
     operations = (core / "operations.py").read_text(encoding="utf-8")
     session = (core / "session.py").read_text(encoding="utf-8")
-    applied = re.findall(r'\b_apply\(\s*session,\s*"(\w+)"', operations)
+    applied = re.findall(r'\b_(?:area_)?apply\(\s*session,\s*"(\w+)"', operations)
     # The commit rows share (_place_row) applies the action its callers name,
     # each as action="..." (found below).
     shared = re.findall(r"\b_apply\(\s*session,\s*action,", operations)
     # Each call is found, however it is laid out.
-    assert len(applied) + len(shared) == len(re.findall(r"(?<!def )\b_apply\(", operations))
+    calls = re.findall(r"(?<!def )\b_(?:area_)?apply\(", operations)
+    assert len(applied) + len(shared) == len(calls)
     moves = re.findall(r'\._move\("(\w+)"\)', operations)
     own = re.findall(r'\baction="(\w+)"', operations + session)
     return {*applied, *moves, *own}
@@ -1927,6 +1929,28 @@ def test_the_page_offers_to_requantify_boxes_not_assessed_for_over_exposure():
     assert "before.background_method === LEGACY_BACKGROUND" in shown
     words = app[app.index("const ACTION_WORDS = {") :].split("\n};", 1)[0]
     assert 'requantify: "requantify",' in words
+
+
+def test_the_legacy_offer_takes_its_tooltip_from_the_state():
+    # Which median a legacy project's nets use is the server's to say (#243:
+    # a drawn area's own): the offer's tooltip is the state's
+    # legacy_background, and the page holds no words of its own for it. The
+    # first HTML keeps the words of a project without drawn areas, as before.
+    app = _code("app.js")
+    offers = app.split("const REQUANTIFY_OFFERS = {", 1)[1].split("\n};", 1)[0]
+    background = offers.split("background: {", 1)[1].split("},", 1)[0]
+    assert "title" not in background and "median" not in offers
+    _, render = _function(app, "function renderRequantify(")
+    assert (
+        'button.title = reason === "background" ? project.legacy_background : offer.title;'
+        in render
+    )
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    button = html.split('<button id="requantify"', 1)[1].split(">", 1)[0]
+    assert (
+        'title="The nets use the whole-image median background, as measured before the local'
+        ' background."'
+    ) in " ".join(button.split())
 
 
 def test_every_request_of_the_page_goes_through_request():

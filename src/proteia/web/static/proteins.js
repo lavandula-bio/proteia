@@ -145,11 +145,18 @@ export class ProteinPanel {
     this.closeAdd(false);
   }
 
-  render(project, image, proteinId, results = null) {
+  // `arena` is the membrane area chosen on the image (#243): the proteins on
+  // it are listed, and a protein added goes on it.
+  render(project, image, proteinId, results = null, arena = null) {
     this.project = project;
     this.results = results;
     this.image = image;
-    const proteins = image ? project.proteins.filter((p) => p.image_id === image.id) : [];
+    this.arena = arena;
+    const proteins = image
+      ? project.proteins.filter((p) =>
+          arena ? p.arena_id === arena.id : p.image_id === image.id,
+        )
+      : [];
     this.protein = proteins.find((p) => p.id === proteinId) || null;
     rebuild($("proteins"), () => this.buildList(proteins));
     this.renderAdd();
@@ -283,10 +290,13 @@ export class ProteinPanel {
       return;
     }
     const opening = this.opening;
+    // On an image of several membranes, the area chosen names the membrane.
+    const several =
+      this.arena && this.project.arenas.filter((a) => a.image_id === this.image.id).length > 1;
     const body = {
       name: $("add-protein-name").value,
       role: $("add-protein-role").value,
-      image_id: this.image.id,
+      ...(several ? { arena_id: this.arena.id } : { image_id: this.image.id }),
     };
     // After the edits, undos and redos asked for before it, so none takes it back.
     const before = this.queue;
@@ -463,9 +473,10 @@ export class ProteinPanel {
     }
   }
 
+  // The membrane a protein is on: its membrane area's (#243).
   membraneOf(protein) {
-    const image = this.project.images.find((i) => i.id === protein.image_id);
-    return image ? image.membrane_id : null;
+    const area = this.project.arenas.find((a) => a.id === protein.arena_id);
+    return area ? area.membrane_id : null;
   }
 
   renderLoadings(protein) {
