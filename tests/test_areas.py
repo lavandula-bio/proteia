@@ -1823,6 +1823,24 @@ def test_a_legacy_area_drawn_back_over_the_whole_image_takes_its_median(tmp_path
     assert level_of(s, band)[1] == 10595.0
 
 
+def test_a_legacy_area_left_unmeasured_by_a_commit_is_refused(tmp_path, monkeypatch):
+    # The first pass alone sets a whole-image area's legacy levels: were the
+    # commit to skip measuring an area drawn back over its image (here no
+    # ring is told to read otherwise), the model refuses it rather than keep
+    # a level its net was not measured above.
+    s, image, band = legacy_on_one_drawn_area(tmp_path)
+    before = s.project
+    monkeypatch.setattr(ops, "_rings", lambda batch, image_id: {})
+    error = refused(
+        lambda: ops.edit_arena(s, area_on(s, image), outline=None), ErrorCode.INVALID_INPUT
+    )
+    assert str(error) == (
+        f"band {band}: a global_median background is its image's median, with no spread"
+    )
+    assert s.project is before
+    assert level_of(s, band) == ("global_median", 1090.0, 0.0, 21800.0)
+
+
 def test_a_legacy_exposure_taking_its_marker_group_s_whole_area_takes_its_median(tmp_path):
     # E2's drawn area holds legacy bands; linked to a marker whose group
     # holds whole-image areas, E2 takes the group's area, and its bands the

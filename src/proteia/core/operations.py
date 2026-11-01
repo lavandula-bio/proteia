@@ -2872,9 +2872,11 @@ def _area_apply[T](
 
     Under the legacy method a band's level is its area's median (#243), which
     a draft whose drawn area now covers its whole image would hold until it is
-    measured: the change itself first sets the bands of every whole-image area
-    to their image's stored median, which needs no pixel, so the first pass
-    validates; the measuring writes the same."""
+    measured: the first pass alone first sets the bands of every whole-image
+    area to their image's stored median, which needs no pixel, so it
+    validates. The commit sets no level but by measuring, so an area left
+    unmeasured there is refused by the model's check, never committed with
+    a level its net was not measured above."""
     committed = session.project
 
     def settled(draft: Project) -> T:
@@ -2898,7 +2900,7 @@ def _area_apply[T](
     arrays = {image_id: session.pixels(image_id) for image_id, areas in stale.items() if areas}
 
     def requantified(draft: Project) -> T:
-        result = settled(draft)
+        result = change(draft)
         for image_id, array in arrays.items():
             _quantify_image(draft, image_id, array, areas=stale[image_id])
         return result

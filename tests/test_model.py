@@ -223,12 +223,6 @@ def test_every_band_background_belongs_to_the_projects_method(project):
         revalidate(_edit(project, "band-10", background_mode="ring"))
 
 
-DRAWN_ONE_LEVEL = (
-    "a global_median background on a drawn membrane area is that area's median, the same for"
-    " every band on it, with no spread"
-)
-
-
 def test_a_legacy_level_on_a_drawn_area_is_one_level_for_the_area(project):
     # On a drawn membrane area a legacy level is the median of the area's
     # pixels (#243), which the model holds none of: any one level is taken
@@ -245,16 +239,29 @@ def test_a_legacy_level_on_a_drawn_area_is_one_level_for_the_area(project):
             image = images[arena.image_id]
             arena.outline = Outline(x0=0, y0=0, x1=image.width, y1=image.height)
     other = 199.5
-    assert legacy.batch.find_band("band-10")[1].background_level != other
+    level = legacy.batch.find_band("band-10")[1].background_level
+    assert level != other
     area = drawn.model_copy(deep=True)
     for band_id in ("band-10", "band-11", "band-12"):
         _edit(area, band_id, background_level=other)
     taken = revalidate(area)
     assert {taken.batch.find_band(b)[1].background_level for b in ("band-10", "band-12")} == {other}
-    for band_id in ("band-10", "band-12"):  # the first band of the area, or a later one, apart
-        with pytest.raises(ValidationError, match=f"band band-1[12]: {DRAWN_ONE_LEVEL}"):
+    # The first band of the area apart, or a later one: both named, with their levels.
+    for band_id, named, levels in (
+        ("band-10", "band-10 and band-11", f"{other!r} and {level!r}"),
+        ("band-12", "band-10 and band-12", f"{level!r} and {other!r}"),
+    ):
+        with pytest.raises(ValidationError) as info:
             revalidate(_edit(drawn.model_copy(deep=True), band_id, background_level=other))
-    with pytest.raises(ValidationError, match=f"band band-10: {DRAWN_ONE_LEVEL}"):
+        assert (
+            f"bands {named} lie on one drawn membrane area at the levels {levels}: a"
+            " global_median background there is that area's median, the same for every band"
+            " on it"
+        ) in str(info.value)
+    with pytest.raises(
+        ValidationError,
+        match="band band-10: a global_median background on a drawn membrane area has no spread",
+    ):
         revalidate(_edit(drawn.model_copy(deep=True), "band-10", background_spread=0.5))
     with pytest.raises(ValidationError, match="its image's median, with no spread"):
         revalidate(_edit(legacy.model_copy(deep=True), "band-10", background_level=other))

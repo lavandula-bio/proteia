@@ -1834,43 +1834,57 @@ class Project(_Model):
         images = {image.id: image for image in batch.images}
         # A drawn area's level is the median of its pixels (#243), which the
         # model, holding none, cannot check: one level for every band on the
-        # area, its first band's (None until one is met).
+        # area, its first band's.
         drawn = {
             arena.id
             for membrane in batch.membranes
             for arena in membrane.arenas
             if arena.outline is not None
         }
-        medians: dict[str, float | None] = {
-            arena.id: None if arena.id in drawn else images[arena.image_id].background
+        medians = {
+            arena.id: images[arena.image_id].background
             for membrane in batch.membranes
             for arena in membrane.arenas
+            if arena.id not in drawn
         }
+        firsts: dict[str, Band] = {}
         for protein in batch.proteins:
             for row in protein.rows:
                 for band in row.bands:
                     area = row.arena_id
-                    if legacy and medians[area] is None:
-                        medians[area] = band.background_level
-                    self._check_legacy_band(band, legacy, medians[area], area in drawn)
+                    first = firsts.setdefault(area, band) if area in drawn else None
+                    self._check_legacy_band(band, legacy, medians.get(area), first)
         return self
 
     def _check_legacy_band(
-        self, band: Band, legacy: bool, median: float | None, drawn: bool
+        self, band: Band, legacy: bool, median: float | None, first: Band | None
     ) -> None:
+        """The legacy values of one band: over a whole image, its image's
+        ``median``; on a drawn area, the level of the ``first`` band there."""
         if (band.background_mode == LEGACY_BACKGROUND_METHOD) != legacy:
             raise ValueError(
                 f"band {band.id}: background mode {band.background_mode!r} does not"
                 f" belong to the project's background method {self.background_method!r}"
             )
-        if legacy and (band.background_level != median or band.background_spread != 0):
-            what = (
-                "on a drawn membrane area is that area's median, the same for every band on it"
-                if drawn
-                else "is its image's median"
-            )
+        if not legacy:
+            return
+        if first is None:
+            if band.background_level != median or band.background_spread != 0:
+                raise ValueError(
+                    f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background is its"
+                    " image's median, with no spread"
+                )
+        elif band.background_spread != 0:
             raise ValueError(
-                f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background {what}, with no spread"
+                f"band {band.id}: a {LEGACY_BACKGROUND_METHOD} background on a drawn membrane"
+                " area has no spread"
+            )
+        elif band.background_level != first.background_level:
+            raise ValueError(
+                f"bands {first.id} and {band.id} lie on one drawn membrane area at the levels"
+                f" {first.background_level!r} and {band.background_level!r}: a"
+                f" {LEGACY_BACKGROUND_METHOD} background there is that area's median, the same"
+                " for every band on it"
             )
 
     @model_validator(mode="after")
