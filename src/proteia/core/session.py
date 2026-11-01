@@ -90,6 +90,7 @@ from proteia.core.imaging import (
     load_image,
     named_refusal,
     read_colours,
+    refusal_cause,
 )
 from proteia.core.model import (
     IMAGE_SUFFIXES,
@@ -106,6 +107,11 @@ _log = logging.getLogger(__name__)
 # The undoable steps a session keeps. A count, not a byte budget: a state is its
 # compressed content, about 24 KiB for a batch of 960 bands.
 UNDO_LIMIT: Final = 100
+
+# The causes of refusing to read a stored file whose logging a session
+# remembers (#246), so that each is logged once however often the file is
+# read; past this, the oldest is forgotten, and logged again if met again.
+_LOGGED_CAUSES: Final = 256
 
 # Proteia's image names (img-N.<suffix>) and the temp files storage writes while
 # storing or saving (.img-N.<suffix>.<random>.part/.tmp): the only orphans cleanup
@@ -405,9 +411,10 @@ class ProjectSession:
         # (image id, SHA-256) -> what its stored file's header says of reading it
         # (outdated_reading): whether it converts CMYK, or what is refused in it.
         self._headers: dict[tuple[str, str], bool | str] = {}
-        # (image id, SHA-256) of the stored files whose reading this session
-        # refused: what the library said is logged once per file (_read_checked).
-        self._refusals_logged: set[tuple[str, str]] = set()
+        # (image id, SHA-256, cause) of the refusals of reading a stored file
+        # this session logged, oldest first: what the library said is logged
+        # once per cause of each file (_read_checked), of the last _LOGGED_CAUSES.
+        self._refusals_logged: dict[tuple[str, str, tuple[str, str]], None] = {}
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -604,9 +611,10 @@ class ProjectSession:
         never by its stored copy (:func:`~proteia.core.imaging.named_refusal`,
         #234), and says what is wrong without a remedy: the image is in the
         project already, and importing its file again would lose its boxes.
-        What the library said is logged at the first refusal of the stored
-        file (image id and SHA-256) in the session only, as every view and
-        measure reads it again. Called with the lock held."""
+        What the library said is logged once per cause (its error's kind and
+        words, :func:`~proteia.core.imaging.refusal_cause`) of the stored
+        file (image id and SHA-256) in the session, as every view and measure
+        reads it again (#246). Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -618,9 +626,14 @@ class ProjectSession:
 
         def refused(exc: ValueError | OSError, why: str | None = None) -> OperationError:
             if why is None:
-                key = (image_id, image.sha256)
-                log = key not in self._refusals_logged
-                self._refusals_logged.add(key)
+                cause = refusal_cause(exc)
+                logged = self._refusals_logged
+                key = (image_id, image.sha256, cause)
+                log = cause is not None and key not in logged
+                if log:
+                    if len(logged) >= _LOGGED_CAUSES:
+                        del logged[next(iter(logged))]  # the oldest
+                    logged[key] = None
                 why = named_refusal(exc, image.original_name, path, remedy=False, log=log)
             return OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image_id,))
 

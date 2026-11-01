@@ -40,6 +40,7 @@ from pydantic import BaseModel
 
 from proteia.core import imaging, operations
 from proteia.core.model import Project, apply_change
+from proteia.core.session import ProjectSession
 from proteia.core.storage import image_path, migrate
 
 
@@ -83,11 +84,12 @@ _DRIVE = re.compile(r"\b[A-Za-z]:[\\/]")
 
 
 def stored_copy_or_path_in(message: str, original_name: str, folder: Path) -> bool:
-    """Whether ``message``, an import's refusal of a file offered as
-    ``original_name`` into the project at ``folder``, names an image's
-    stored copy (``img-1.tif``) or shows a local path: the project folder,
-    the folder it is in, or any Windows path (#234). The offered name itself
-    may hold anything."""
+    """Whether ``message``, a refusal of reading a file offered as
+    ``original_name`` into the project at ``folder`` (on its import, or as
+    an image already in the project), names an image's stored copy
+    (``img-1.tif``) or shows a local path: the project folder, the folder it
+    is in, or any Windows path (#234). The offered name itself may hold
+    anything."""
     rest = message.replace(repr(original_name), "").replace(original_name, "")
     if _STORED_COPY.search(rest) or _DRIVE.search(rest):
         return True
@@ -135,12 +137,25 @@ def library_words_in(error: operations.OperationError) -> bool:
     return False
 
 
+def _check_refusal(what: str, error: operations.OperationError, name: object, folder) -> None:
+    """Fail ``what``, the refusal ``error`` of reading a file offered as
+    ``name`` into the project at ``folder``, if it names a stored copy,
+    shows a path or holds a library's words."""
+    if isinstance(name, str) and folder is not None:
+        where = stored_copy_or_path_in(str(error), name, folder)
+        assert not where, f"{what} names a stored copy or a path: {error}"
+    assert not library_words_in(error), f"{what} holds a library's words: {error}"
+
+
 @pytest.fixture(autouse=True)
 def _import_refusals_name_the_file_as_chosen(monkeypatch):
-    """No import refusal that any test meets names the image's stored copy,
-    shows a local path or holds a library's words (#234), whatever else the
-    test checks: each refusal of :func:`~proteia.core.operations.import_image`
-    is checked as it is raised."""
+    """No refusal of reading a file that any test meets names the image's
+    stored copy, shows a local path or holds a library's words (#234),
+    whatever else the test checks: each refusal of
+    :func:`~proteia.core.operations.import_image`, and since #246 each of
+    reading an image already in the project
+    (:meth:`~proteia.core.session.ProjectSession._read_checked`: its pixels,
+    on any channel, and its colours), is checked as it is raised."""
     real = operations.import_image
 
     @functools.wraps(real)
@@ -149,15 +164,24 @@ def _import_refusals_name_the_file_as_chosen(monkeypatch):
             return real(*args, **kwargs)
         except operations.OperationError as exc:
             call = _IMPORT_IMAGE.bind(*args, **kwargs)
-            name = call.arguments["original_name"]
-            folder = getattr(call.arguments["session"], "folder", None)
-            if isinstance(name, str) and folder is not None:
-                where = stored_copy_or_path_in(str(exc), name, folder)
-                assert not where, f"an import refusal names a stored copy or a path: {exc}"
-            assert not library_words_in(exc), f"an import refusal holds a library's words: {exc}"
+            session = call.arguments["session"]
+            folder = getattr(session, "folder", None)
+            _check_refusal("an import refusal", exc, call.arguments["original_name"], folder)
+            raise
+
+    real_read = ProjectSession._read_checked
+
+    @functools.wraps(real_read)
+    def read_checked(self, image, read):
+        try:
+            return real_read(self, image, read)
+        except operations.OperationError as exc:
+            what = "a refusal of reading an imported image"
+            _check_refusal(what, exc, image.original_name, self.folder)
             raise
 
     monkeypatch.setattr(operations, "import_image", import_image)
+    monkeypatch.setattr(ProjectSession, "_read_checked", read_checked)
 
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units

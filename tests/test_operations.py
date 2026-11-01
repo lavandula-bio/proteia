@@ -2718,6 +2718,17 @@ _READING_AGAIN = {
         lambda path: PermissionError(13, "Permission denied", str(path)),
         "cannot read 'β-actin µ.tif': Permission denied",
     ),
+    # #246: Proteia's own read of the bytes is the disk's, whatever its errno.
+    "bytes, input/output": (
+        "file_digest",
+        lambda path: OSError(errno.EIO, "Input/output error"),
+        "cannot read 'β-actin µ.tif': Input/output error",
+    ),
+    "bytes, invalid argument": (
+        "file_digest",
+        lambda path: OSError(errno.EINVAL, "Invalid argument"),
+        "cannot read 'β-actin µ.tif': Invalid argument",
+    ),
 }
 
 
@@ -2854,8 +2865,8 @@ def test_a_refusal_of_reading_an_image_already_imported_is_logged_once(
 ):
     # #234 review 3: the library's words were logged on every read of a
     # stored file reading refuses (each view, each measure): they are logged
-    # once per stored file (image id and SHA-256) in a session, each image's
-    # own, and again in the next session.
+    # once per stored file (image id and SHA-256) and cause in a session
+    # (#246), each image's own, and again in the next session.
     s = session_on(tmp_path, save_to_folder)
     images = [import_blot(s, blot(), name) for name in ("β-actin µ.tif", "GAPDH α.tif")]
     cause = struct.error("unpack requires a buffer of 4 bytes")
@@ -2919,6 +2930,199 @@ def test_a_refusal_of_reading_another_file_under_an_id_is_logged_too(tmp_path, m
     assert s.reload()
     logged = refused_and_logged(image)
     assert len(logged) == 1 and "(offered as 'GAPDH α.tif')" in logged[0]
+
+
+def test_each_cause_of_refusing_a_stored_file_is_logged_once(tmp_path, monkeypatch, caplog):
+    # #246: the first refusal of a stored file used its log up, so a later
+    # one of other library words was not logged. Each cause is logged once
+    # per stored file in a session; the causes kept are bounded (two here),
+    # and one pushed out by newer ones is logged again when it is met again.
+    reopened, image = _imported_then_reopened(tmp_path)
+    path = storage.image_path(reopened.folder, reopened.project.batch.find_image(image))
+    causes = [struct.error(f"unpack requires a buffer of {n} bytes") for n in (4, 8, 16)]
+    raised = {}
+
+    def damaged(path):
+        raise raised["cause"]
+
+    monkeypatch.setattr(imaging, "_read_tiff", damaged)
+    monkeypatch.setattr(session_module, "_LOGGED_CAUSES", 2)
+
+    def logged_reading_with(index: int) -> list[str]:
+        raised["cause"] = causes[index]
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="proteia"):
+            for read in (reopened.pixels, reopened.colour_pixels):
+                with pytest.raises(OperationError):
+                    read(image)
+        return [record.getMessage() for record in caplog.records]
+
+    def failed(index: int) -> list[str]:
+        offered = "(offered as 'β-actin µ.tif')"
+        return [f"reading {path} {offered} failed: struct.error: {causes[index]}"]
+
+    assert [logged_reading_with(index) for index in (0, 1, 0, 1)] == [failed(0), failed(1), [], []]
+    assert logged_reading_with(2) == failed(2)  # the oldest, the first, pushed out
+    assert len(reopened._refusals_logged) == 2
+    assert [logged_reading_with(index) for index in (1, 2, 0)] == [[], [], failed(0)]
+
+
+def test_a_session_remembers_the_last_256_causes_of_refusals_it_logged(tmp_path, monkeypatch):
+    # #246: the causes kept do not grow without bound: of 300 distinct ones
+    # of a stored file, the last 256 are kept.
+    reopened, image = _imported_then_reopened(tmp_path)
+    raised = {}
+
+    def damaged(path):
+        raise raised["cause"]
+
+    monkeypatch.setattr(imaging, "_read_tiff", damaged)
+    for index in range(300):
+        raised["cause"] = struct.error(f"cause {index}")
+        with pytest.raises(OperationError):
+            reopened.pixels(image)
+    kept = [cause for _, _, (_, cause) in reopened._refusals_logged]
+    assert kept == [f"cause {index}" for index in range(44, 300)]
+
+
+# A library's error of the system's as it decodes a file (#246), by the
+# decoder: what is made to raise it, the file and the name it is offered
+# under, and the same image saved again as a file another decoder reads.
+def _decoders() -> dict[str, tuple[object, str, str, bytes, str, bytes]]:
+    from PIL import Image, ImageFile
+
+    gray = _gray8()
+    return {
+        "tifffile": (
+            tifffile.TiffPageSeries,
+            "asarray",
+            "gel µ.tif",
+            _tiff_bytes(gray),
+            "gel saved again α.png",
+            _encoded(Image.fromarray(gray), "PNG").read(),
+        ),
+        "pillow": (
+            ImageFile.ImageFile,
+            "load",
+            "gel α.png",
+            _encoded(Image.fromarray(gray), "PNG").read(),
+            "gel saved again µ.tif",
+            _tiff_bytes(gray),
+        ),
+    }
+
+
+_DAMAGED_OSERROR = "it is damaged or not an image Proteia can read (OSError)"
+
+
+def _raises(error: BaseException):
+    def raising(*args, **kwargs):
+        raise error
+
+    return raising
+
+
+@pytest.mark.parametrize("decoder", list(_decoders()))
+def test_an_invalid_argument_from_a_decoder_is_refused_as_a_file_to_save_again(
+    tmp_path, monkeypatch, caplog, decoder
+):
+    # #246: a damaged file whose offsets make a decoder seek or read where
+    # the system refuses was refused as "cannot read 'gel µ.tif': Invalid
+    # argument", with no next step, as if the system were at fault. It is
+    # a file Proteia cannot read; the error is logged; the image saved
+    # again as the refusal says imports.
+    owner, name, offered, data, again, saved_again = _decoders()[decoder]
+    error = OSError(errno.EINVAL, "Invalid argument")
+    monkeypatch.setattr(owner, name, _raises(error))
+    s = session_on(tmp_path)
+    with caplog.at_level(logging.INFO, logger="proteia"):
+        refused = _imports_nothing(
+            s, lambda: ops.import_image(s, io.BytesIO(data), offered, kind=CHEMI, polarity=DARK)
+        )
+    assert (refused.code, str(refused)) == (
+        ErrorCode.UNREADABLE_IMAGE,
+        f"cannot read {offered!r}: {_DAMAGED_OSERROR}; save the image again as a TIFF, PNG or"
+        " JPEG file and import that",
+    )
+    assert refused.__cause__.__cause__ is error
+    stored = s.folder / storage.IMAGES_DIR / f"img-1{Path(offered).suffix}"
+    assert [record.getMessage() for record in caplog.records] == [
+        f"reading {stored} (offered as {offered!r}) failed: OSError: {error}"
+    ]
+    image_id = ops.import_image(s, io.BytesIO(saved_again), again, kind=CHEMI, polarity=DARK)
+    np.testing.assert_array_equal(s.pixels(image_id), _gray8().astype(np.float64))
+
+
+def test_an_invalid_argument_from_a_decoder_while_the_disk_fails_keeps_its_reason(
+    tmp_path, monkeypatch
+):
+    # #246: a drive that drops may give EINVAL on Windows too: when Proteia
+    # cannot read the file's bytes either, the error is the disk's, given by
+    # its reason as before.
+    error = OSError(errno.EINVAL, "Invalid argument")
+    monkeypatch.setattr(tifffile.TiffPageSeries, "asarray", _raises(error))
+
+    class Dropped(io.RawIOBase):
+        def readable(self) -> bool:
+            return True
+
+        def readinto(self, buffer) -> int:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+    real = Path.open
+
+    def open_(self, mode="r", *args, **kwargs):
+        if mode == "rb" and self.parent.name == storage.IMAGES_DIR:
+            return Dropped()
+        return real(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_)
+    s = session_on(tmp_path)
+    refused = _imports_nothing(
+        s,
+        lambda: ops.import_image(
+            s, io.BytesIO(_tiff_bytes(blot())), "gel µ.tif", kind=CHEMI, polarity=DARK
+        ),
+    )
+    assert str(refused) == "cannot read 'gel µ.tif': Invalid argument"
+    assert refused.__cause__ is error
+
+
+def test_an_invalid_argument_from_a_decoder_of_an_image_in_the_project_is_the_files(
+    tmp_path, monkeypatch
+):
+    # #246: as on import, without the remedy (importing the file again would
+    # lose the image's boxes); its pixels and its colours alike.
+    reopened, image = _imported_then_reopened(tmp_path)
+    monkeypatch.setattr(
+        tifffile.TiffPageSeries, "asarray", _raises(OSError(errno.EINVAL, "Invalid argument"))
+    )
+    for read in (reopened.pixels, reopened.colour_pixels):
+        with pytest.raises(OperationError) as info:
+            read(image)
+        assert (info.value.code, info.value.ids, str(info.value)) == (
+            ErrorCode.UNREADABLE_IMAGE,
+            (image,),
+            f"cannot read 'β-actin µ.tif': {_DAMAGED_OSERROR}",
+        )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "img-1.tif: its pixels are cut short",
+        "cannot read 'β-actin µ.tif': image file is truncated",
+    ],
+)
+def test_the_guard_checks_refusals_of_reading_an_imported_image(tmp_path, monkeypatch, message):
+    # #246: the test guard (conftest) checked an import's refusals only for
+    # a stored copy's name, a path or a library's words; a refusal of
+    # reading an image already in the project is checked too.
+    reopened, image = _imported_then_reopened(tmp_path)
+    refusal = OperationError(ErrorCode.UNREADABLE_IMAGE, message, ids=(image,))
+    monkeypatch.setattr(session_module, "load_image", _raises(refusal))
+    with pytest.raises(AssertionError, match="^a refusal of reading an imported image"):
+        reopened.pixels(image)
 
 
 def _animations() -> dict[str, bytes]:

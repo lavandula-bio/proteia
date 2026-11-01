@@ -54,11 +54,13 @@ For display only, :func:`read_colours` reads a file in its own colours, and
 
 from __future__ import annotations
 
+import errno
 import io
 import logging
 import os
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import ClassVar, Final, Literal, NamedTuple
@@ -404,6 +406,52 @@ def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
     return ReadingRefusal(name, _DAMAGED.format(_kind(error)), _SAVE_AGAIN)
 
 
+# How much of a file Proteia reads at a time to tell whether the disk gives
+# it (_disk_reads).
+_DISK_CHUNK: Final = 1 << 20
+
+
+def _disk_reads(path: Path) -> bool:
+    """Whether the disk gives Proteia every byte of the file at ``path``."""
+    try:
+        with path.open("rb") as file:
+            while file.read(_DISK_CHUNK):
+                pass
+    except OSError:
+        return False
+    return True
+
+
+@contextmanager
+def _decoding(path: Path) -> Iterator[None]:
+    """A library's decoding of the file at ``path``, which it opens by its
+    path (#246). An error of the system's that it raises naming no file
+    comes of a seek or a read once the file is open (an open names it).
+    EINVAL, which a seek or read at an offset a damaged file gives, is the
+    file's: it is refused as one Proteia cannot read (:func:`_unreadable`,
+    with the error as its cause). Unless the disk does not give Proteia
+    the file's bytes either: on Windows a drive that drops may give EINVAL
+    too, the C runtime's errno for a Windows error it has none for. Any
+    other such error is the disk's, raised as it is, as is one of
+    Proteia's own reads (whether a file is a TIFF, its SHA-256)."""
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno != errno.EINVAL or exc.filename is not None or not _disk_reads(path):
+            raise
+        raise _unreadable(path.name, exc) from exc
+
+
+def refusal_cause(exc: BaseException) -> tuple[str, str] | None:
+    """What a refusal of reading (:func:`named_refusal`) logs of ``exc``:
+    the kind and the words of the error of a library's or of the system's
+    that caused it; None for a refusal of Proteia's own, which logs none."""
+    library = exc.__cause__ if isinstance(exc, ReadingRefusal) else exc
+    if library is None or isinstance(library, ReadingRefusal):
+        return None
+    return _kind(library), str(library)
+
+
 def named_refusal(
     exc: ValueError | OSError,
     name: str,
@@ -416,16 +464,16 @@ def named_refusal(
     whose stored copy is at ``stored``, in Proteia's words only (#234):
     reading's own refusal for that name (:class:`ReadingRefusal`, with its
     remedy unless not ``remedy``); an error of the system's (one with an
-    errno or a file name) by its reason, which names no path; any other
-    error of a library's as a file damaged or not an image Proteia can read,
-    with the error's kind. A library's words may name the stored copy, so no
-    refusal holds them: unless not ``log``, they are logged, with the stored
-    copy's path, for diagnosis."""
-    library = exc.__cause__ if isinstance(exc, ReadingRefusal) else exc
-    if log and library is not None and not isinstance(library, ReadingRefusal):
-        _log.info(
-            "reading %s (offered as %r) failed: %s: %s", stored, name, _kind(library), library
-        )
+    errno or a file name) by its reason, which names no path (reading has
+    refused one a decoder raised for the file already, :func:`_decoding`);
+    any other error of a library's as a file damaged or not an image
+    Proteia can read, with the error's kind. A library's words may name the
+    stored copy, so no refusal holds them: unless not ``log``, they are
+    logged, with the stored copy's path, for diagnosis
+    (:func:`refusal_cause`)."""
+    cause = refusal_cause(exc)
+    if log and cause is not None:
+        _log.info("reading %s (offered as %r) failed: %s: %s", stored, name, *cause)
     if isinstance(exc, ReadingRefusal):
         return exc.refusal(name, remedy=remedy)
     if isinstance(exc, OSError) and (exc.errno is not None or exc.filename is not None):
@@ -707,15 +755,17 @@ def read_file(path: str | os.PathLike[str]) -> FilePixels:
     single image. Its pixels are not yet converted to the analysis array, so
     that an import can refuse their type first (#224). Its own refusals are
     :class:`ReadingRefusal`, which an import gives for the name the file was
-    chosen under (#234)."""
+    chosen under (#234); since #246 one of them is a damaged file whose
+    decoder the system refuses a seek or read for (:func:`_decoding`)."""
     path = Path(path)
     try:
-        if path.suffix.lower() in TIFF_SUFFIXES:
-            pixels, lossy, cmyk = _read_tiff(path)
-            palette = False
-        else:
-            pixels, cmyk, palette = _read_other(path)
-            lossy = path.suffix.lower() in LOSSY_SUFFIXES
+        with _decoding(path):
+            if path.suffix.lower() in TIFF_SUFFIXES:
+                pixels, lossy, cmyk = _read_tiff(path)
+                palette = False
+            else:
+                pixels, cmyk, palette = _read_other(path)
+                lossy = path.suffix.lower() in LOSSY_SUFFIXES
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, SyntaxError from Pillow, ...
@@ -1403,7 +1453,8 @@ def read_colours(path: str | os.PathLike[str]) -> np.ndarray:
     if pixels.ndim != 2 or path.suffix.lower() not in TIFF_SUFFIXES:
         return pixels
     try:
-        photometric, colormap = _tiff_colours(path)
+        with _decoding(path):
+            photometric, colormap = _tiff_colours(path)
     except (ValueError, OSError):
         raise
     except Exception as exc:
