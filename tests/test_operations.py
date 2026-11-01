@@ -990,7 +990,9 @@ def test_the_cleanup_keeps_an_image_file_named_in_any_backup(tmp_path):
     planted = ("img-7.tif", "IMG-8.TIFF", "img-9.png", "img-27.tif", "img-33.tif")
     for name in planted:
         (images / name).write_bytes(b"an image no project.json references")
-    known(s, *(images / name for name in planted))  # else none is deleted (#101)
+    ops.set_reference_condition(s, "vehicle")  # saved, then cleaned up
+    assert all((images / name).is_file() for name in planted)  # never known (#101)
+    known(s, *(images / name for name in planted))  # as if the session stored them
     # A backup is read as bytes, whatever its schema, even one that no longer
     # loads; its name is compared ignoring case, as Windows does. Only an id
     # below next_id is kept: a backup's images hold no other (a migration only
@@ -1018,8 +1020,9 @@ def _crash_after_an_import(folder: Path) -> None:
 
 def test_a_stored_name_in_a_backup_s_text_never_blocks_the_next_import(tmp_path):
     # An original name kept in a backup reads as a stored name too, here the
-    # name of the id the next import takes: the leftover file of that id goes
-    # all the same, as no backup's image can hold that id.
+    # name of the id the next import takes. No backup's image can hold that
+    # id, so the backup never keeps the leftover file of that id; but no
+    # session knows that file (#101): it stays, and the import skips its id.
     folder = v1_folder(tmp_path)
     path = folder / storage.PROJECT_FILE
     doc = json.loads(path.read_bytes())
@@ -1032,9 +1035,13 @@ def test_a_stored_name_in_a_backup_s_text_never_blocks_the_next_import(tmp_path)
     assert leftover.exists()
 
     s = ops.open_project(folder, clock=FakeClock())
-    assert import_blot(s, blot(), "β.tif") == "img-27"
+    left = leftover.read_bytes()
+    assert import_blot(s, blot(), "β.tif") == "img-28"
     assert load_project(folder) == s.project
-    assert leftover.read_bytes() == (folder.parent / "sources" / "β.tif").read_bytes()
+    assert leftover.read_bytes() == left
+    assert (folder / "images" / "img-28.tif").read_bytes() == (
+        folder.parent / "sources" / "β.tif"
+    ).read_bytes()
 
 
 def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, monkeypatch):
@@ -1054,7 +1061,9 @@ def test_a_backup_that_cannot_be_read_never_blocks_the_next_import(tmp_path, mon
         return read_bytes(path)
 
     s = ops.open_project(folder, clock=FakeClock())
-    known(s, below)  # img-27 it never knew: left, and its id skipped (#101)
+    ops.set_reference_condition(s, "vehicle")  # saved, then cleaned up
+    assert below.exists() and leftover.exists()  # files it never knew (#101)
+    known(s, below)  # as if the session stored it; img-27 still unknown
     with monkeypatch.context() as patch:
         patch.setattr(Path, "read_bytes", locked)
         assert import_blot(s, blot(), "β.tif") == "img-28"  # saved, then cleaned up
@@ -1436,11 +1445,22 @@ def test_refused_import_leaves_no_file(tmp_path, name, data, max_bytes, code):
     assert recorder.actions == []
 
 
-def test_import_removes_orphans_that_hold_its_id(tmp_path):
+def test_import_removes_orphans_that_hold_its_id(tmp_path, monkeypatch):
     s = session_on(tmp_path, save_to_folder)
     images = s.folder / "images"
-    (images / "img-1.tif").write_bytes(b"left by an import this session never saved")
-    known(s, images / "img-1.tif")
+    # Left by an import this session refused, whose own delete failed (held).
+    real = Path.unlink
+
+    def held(path: Path, *args, **kwargs) -> None:
+        if path.name == "img-1.tif":
+            raise PermissionError(13, "held by another process", str(path))
+        real(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", held)
+        with pytest.raises(OperationError):
+            ops.import_image(s, io.BytesIO(b"not a tiff"), "bad.tif", kind=CHEMI, polarity=DARK)
+    assert listing(s) == ["img-1.tif"]
     (images / ".img-1.tif.x.part").write_bytes(b"left by a crash")
     (images / "notes.txt").write_text("the user's own file", encoding="utf-8")
     image_id = import_blot(s, blot(), "β.tif")
@@ -6216,6 +6236,8 @@ def test_orphan_cleanup_keeps_files_that_only_start_like_proteia_names(tmp_path)
     for name in ("img-1.tif.bak", "img-2.orig.png", "img-01.tif", "notes.txt"):
         (images / name).write_bytes(b"the user's own file")
     (images / "IMG-9.TIF").write_bytes(b"a Proteia file in other case, no longer referenced")
+    ops.save(s)
+    assert "IMG-9.TIF" in listing(s)  # a file the session never knew (#101)
     known(s, images / "img-9.tif")  # known in any case, as Windows compares names
     ops.save(s)
     assert listing(s) == ["img-01.tif", "img-1.tif", "img-1.tif.bak", "img-2.orig.png", "notes.txt"]

@@ -70,12 +70,20 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   after no state references it: once the undo limit drops the last such state,
   a new change clears the redo that held it, or the session is closed or
   reloads; or else at the next session's first save. Only image files the
-  session knows are deleted: those the ``project.json`` it read names, and
-  those whose import the project's log records, with the bytes that import
-  stored (every image a session holds is one or the other). One it never
-  knew stays (an image another computer imported, synced before
-  the ``project.json`` that names it; or one an earlier session stored but
-  never saved, which only takes disk space), and an import skips its id.
+  session knows are deleted: those of the images the ``project.json`` it
+  read references, those it stored itself, and those whose import the
+  project's log records, with the bytes that import stored (every image a
+  session holds is one of these). A name that only appears in a file's
+  text (an original name, a backup, another version) keeps the file of
+  that name, and never lets a cleanup delete it. A file the session never
+  knew stays, and an import skips its id: an image another computer
+  imported, synced before the ``project.json`` that references it (#101).
+  The cost is files that only take disk space, which the user can delete:
+  the file of an import whose save failed before Proteia stopped; the
+  images only a conflict copy named, once the user deletes the copy (they
+  are the other computer's); the images imported after an older
+  ``project.json`` that the user restored, which neither it nor its log
+  knows; and an image a migration dropped, once its backup is deleted.
 
 Refusals raise :class:`OperationError`, whose :class:`ErrorCode` is stable for
 clients (e.g. to map onto HTTP statuses).
@@ -666,7 +674,6 @@ class ProjectSession:
         autosave: AutosaveHook | None,
         saved_files: Iterable[str],
         base: _Base,
-        known: Iterable[str] = (),
         clock: Clock = utc_now,
     ) -> None:
         self._project = project
@@ -716,11 +723,12 @@ class ProjectSession:
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The image files this session knows (lowercase names): those the
-        # project.json it read (at open, or again) names. With the images whose
-        # import the log records (the session's own imports among them), the
-        # only image files its cleanup deletes (#101): a file synced before the
-        # project.json that names it is never deleted.
-        self._known = {name.lower() for name in (*saved_files, *known)}
+        # project.json it read (at open, or again) references, and those it
+        # stored whose delete failed (operations.import_image). With the images
+        # whose import the log records (the session's own imports among them),
+        # the only image files its cleanup deletes (#101): a file synced before
+        # the project.json that references it is never deleted.
+        self._known = {name.lower() for name in saved_files}
         # The undo history: the states committed in this session, oldest first,
         # from the one it began with (added at its first change), and the index of
         # the committed one; empty and -1 before the first change and after close.
@@ -1410,9 +1418,7 @@ class ProjectSession:
         self._base = _read(saved, project, migrated=migrated)
         self._copy, self._said, self._kept = None, None, ()
         self._saved_files = _referenced_files(project)
-        self._known.update(
-            name.lower() for name in (*self._saved_files, *storage.image_names(saved))
-        )
+        self._known.update(name.lower() for name in self._saved_files)
         self._pixels = {}
         self._states, self._cursor = [], -1
         self._steps = (None, None)
@@ -1719,7 +1725,6 @@ def open_project(
         autosave=autosave,
         saved_files=_referenced_files(project),
         base=_read(data, project, migrated=migrated),
-        known=storage.image_names(data),
         clock=clock,
     )
     _log_opened(session.folder, project)

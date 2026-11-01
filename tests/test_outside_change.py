@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from conftest import FakeClock, known, sample_doc_v1
+from conftest import FakeClock, sample_doc_v1
 from proteia.core import operations as ops
 from proteia.core import storage
 from proteia.core.model import ImageKind, LogEntry, Polarity, Project, Role
@@ -847,7 +847,7 @@ def test_a_file_removed_while_the_save_writes_is_written_at_the_next_save(tmp_pa
 
 def test_a_version_file_is_read_once_while_it_stays_the_same(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, _ = _planted(s)
+    below, _, _ = _planted(s, monkeypatch)
     (s.folder / "project mine.json").write_bytes(f'{{"x": "{below.name}"}}'.encode())
     read: list[str] = []
     real = storage.named_images
@@ -969,9 +969,11 @@ def test_a_reload_remembers_the_bytes_it_parsed(tmp_path, monkeypatch):
 
 def test_a_change_after_the_replace_keeps_its_images_from_the_cleanup(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    left = s.folder / storage.IMAGES_DIR / "img-50.tif"
-    left.write_bytes(tiff(50))  # what the other version imported
-    known(s, left)  # so only the version's name keeps it
+    removed = imported(s, 50)  # this version removes it; the other still holds it
+    ops.remove_image(s, removed)
+    s.close(remove_files=False)  # the history released: only the version keeps it
+    left = s.folder / storage.IMAGES_DIR / f"{removed}.tif"
+    outside = f'{{"file": "{left.name}"}}'.encode()
     real = storage._fsync_dir
     done: list[bool] = []
 
@@ -979,13 +981,13 @@ def test_a_change_after_the_replace_keeps_its_images_from_the_cleanup(tmp_path, 
         real(directory)
         if directory == s.folder and not done:  # right after the replace
             done.append(True)
-            (s.folder / storage.PROJECT_FILE).write_bytes(b'{"file": "img-50.tif"}')
+            (s.folder / storage.PROJECT_FILE).write_bytes(outside)
 
     monkeypatch.setattr(storage, "_fsync_dir", fsync_dir)
     edit(s, "a")
     assert left.is_file()  # the cleanup read the file again
     edit(s, "b")
-    assert (s.folder / COPY).read_bytes() == b'{"file": "img-50.tif"}' and left.is_file()
+    assert (s.folder / COPY).read_bytes() == outside and left.is_file()
 
 
 # --- Opening again ---
@@ -1191,32 +1193,70 @@ def test_a_held_orphan_at_next_id_no_longer_refuses_an_import(tmp_path, monkeypa
     assert held.read_bytes() == b"left by an import that was never saved"
 
 
-def _planted(s: ProjectSession) -> tuple[Path, Path]:
-    """Two image files no project references, which the session knows: one
-    below next_id, one above."""
+def _refused_and_held(s: ProjectSession, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The file of an import refused after storing it, whose own delete failed
+    (another program held the new file, as an antivirus does): at next_id."""
+    stored = s.folder / storage.IMAGES_DIR / f"img-{s.project.next_id}.tif"
+    real = Path.unlink
+    held: list[Path] = []
+
+    def unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == stored:
+            held.append(path)
+            raise PermissionError(13, "held by another process", str(path))
+        real(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", unlink)
+        with pytest.raises(ops.OperationError):
+            ops.import_image(s, io.BytesIO(b"not a tiff"), "bad.tif", kind=CHEMI, polarity=DARK)
+    assert held == [stored] and stored.is_file()
+    return stored
+
+
+def _released(s: ProjectSession, seed: int) -> Path:
+    """The file of an image this session imported and removed, its history
+    then released and nothing deleted: an orphan the session knows, which a
+    cleanup deletes once nothing keeps it (#101)."""
+    removed = imported(s, seed)
+    ops.remove_image(s, removed)
+    s.close(remove_files=False)
+    return s.folder / storage.IMAGES_DIR / f"{removed}.tif"
+
+
+def _planted(s: ProjectSession, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
+    """Three image files no project references: two the session knows, which a
+    cleanup deletes once nothing keeps them, one below next_id (an image it
+    imported and removed, its history then released) and one at next_id (an
+    import refused after storing, its delete failed); and one it never knew
+    (another computer's image, synced before the project.json that names it),
+    which no cleanup deletes (#101)."""
+    removed = imported(s, 30)
+    ops.remove_image(s, removed)  # kept while the removal can be undone
+    above = _refused_and_held(s, monkeypatch)
+    s.close(remove_files=False)  # the history released, nothing deleted
     folder = s.folder / storage.IMAGES_DIR
-    below, above = folder / "img-3.tif", folder / f"img-{s.project.next_id + 4}.tif"
-    for path in (below, above):
-        path.write_bytes(b"an image no project.json references")
-    known(s, below, above)
-    return below, above
+    below, stranger = folder / f"{removed}.tif", folder / f"img-{s.project.next_id + 4}.tif"
+    stranger.write_bytes(tiff(31))
+    assert int(removed.removeprefix("img-")) < s.project.next_id and below.is_file()
+    return below, above, stranger
 
 
-def test_a_version_that_does_not_parse_keeps_the_images_its_text_names(tmp_path):
+def test_a_version_that_does_not_parse_keeps_the_images_its_text_names(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, stranger = _planted(s, monkeypatch)
     version = s.folder / "project.conflict 2026-10-01 0800.json"
     version.write_bytes(f'{{"cut": "{below.name}", {above.name.upper()}'.encode())
     edit(s, "a")
     assert below.is_file() and above.is_file()
     version.unlink()
     edit(s, "b")
-    assert not below.exists() and not above.exists()
+    assert not below.exists() and not above.exists() and stranger.is_file()
 
 
 def test_while_a_version_cannot_be_read_no_image_file_is_deleted(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, stranger = _planted(s, monkeypatch)
     temp = s.folder / storage.IMAGES_DIR / ".img-9.tif.x.part"
     temp.write_bytes(b"left by a crash")
     (s.folder / "project.conflict 2026-10-01 0800.json").write_bytes(b"{}")
@@ -1229,12 +1269,12 @@ def test_while_a_version_cannot_be_read_no_image_file_is_deleted(tmp_path, monke
         edit(s, "a")
         assert below.is_file() and above.is_file() and not temp.exists()
     edit(s, "b")
-    assert not below.exists() and not above.exists()
+    assert not below.exists() and not above.exists() and stranger.is_file()
 
 
-def test_a_missing_project_json_keeps_every_image_file_at_close(tmp_path):
+def test_a_missing_project_json_keeps_every_image_file_at_close(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, _ = _planted(s, monkeypatch)
     (s.folder / storage.PROJECT_FILE).unlink()
     s.close()
     assert below.is_file() and above.is_file()
@@ -1243,7 +1283,7 @@ def test_a_missing_project_json_keeps_every_image_file_at_close(tmp_path):
 @pytest.mark.parametrize("doubt", ["held", "not in its encoding", "not listable"])
 def test_doubt_of_project_json_or_its_folder_keeps_every_image_file(tmp_path, monkeypatch, doubt):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, stranger = _planted(s, monkeypatch)
     temp = s.folder / storage.IMAGES_DIR / ".img-9.tif.x.part"
     temp.write_bytes(b"left by a crash")
     if doubt == "not in its encoding":  # changed outside, not yet kept in a copy
@@ -1262,15 +1302,15 @@ def test_doubt_of_project_json_or_its_folder_keeps_every_image_file(tmp_path, mo
         elif doubt == "not listable":
             patch.setattr(Path, "iterdir", iterdir)
         s.close()
-    assert below.is_file() and above.is_file() and not temp.exists()
+    assert below.is_file() and above.is_file() and stranger.is_file() and not temp.exists()
 
 
-def test_a_folder_named_like_a_version_is_none(tmp_path):
+def test_a_folder_named_like_a_version_is_none(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, stranger = _planted(s, monkeypatch)
     (s.folder / "old.json").mkdir()
     edit(s)  # saved, then cleaned up
-    assert not below.exists() and not above.exists()
+    assert not below.exists() and not above.exists() and stranger.is_file()
 
 
 @pytest.mark.parametrize(
@@ -1284,27 +1324,27 @@ def test_a_folder_named_like_a_version_is_none(tmp_path):
         ("project.json.old", False),  # no .json file
     ],
 )
-def test_any_json_beside_project_json_keeps_the_images_it_names(tmp_path, name, kept):
+def test_any_json_beside_project_json_keeps_the_images_it_names(tmp_path, monkeypatch, name, kept):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, stranger = _planted(s, monkeypatch)
     version = s.folder / name
     version.parent.mkdir(exist_ok=True)
     version.write_bytes(f'{{"images": ["{below.name}", "{above.name}"]}}'.encode())
     edit(s)
-    assert (below.is_file(), above.is_file()) == (kept, kept)
+    assert (below.is_file(), above.is_file(), stranger.is_file()) == (kept, kept, True)
 
 
-def test_a_backup_keeps_only_the_images_below_next_id(tmp_path):
+def test_a_backup_keeps_only_the_images_below_next_id(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, _ = _planted(s, monkeypatch)
     (s.folder / "project.schema9.json").write_bytes(f"{below.name} {above.name}".encode())
     edit(s)
     assert below.is_file() and not above.exists()
 
 
-def test_a_version_file_is_read_again_once_it_changed(tmp_path):
+def test_a_version_file_is_read_again_once_it_changed(tmp_path, monkeypatch):
     s = opened(tmp_path)
-    below, above = _planted(s)
+    below, above, _ = _planted(s, monkeypatch)
     version = s.folder / "project mine.json"
     first = f'{{"a": "{below.name}"}}'.encode()
     version.write_bytes(first)
@@ -1313,12 +1353,12 @@ def test_a_version_file_is_read_again_once_it_changed(tmp_path):
     stat = version.stat()
     # Replaced by another file of the same size and time (a sync keeps the remote's).
     replaced = s.folder / "replaced.tmp"
-    replaced.write_bytes(f'{{"b": "{below.name.replace("3", "4")}"}}'.encode())
+    replaced.write_bytes(b'{"b": "img-9.tif"}')
     assert replaced.stat().st_size == len(first)
     os.utime(replaced, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     os.replace(replaced, version)
     edit(s, "b")
-    assert not below.exists()  # read again: it names img-4 now
+    assert not below.exists()  # read again: it names img-9 now
 
 
 def test_named_images_finds_a_name_across_two_reads(tmp_path, monkeypatch):
@@ -1489,9 +1529,7 @@ def test_an_outside_version_in_another_encoding_keeps_its_images(tmp_path, encod
 
 def test_a_version_not_in_its_encoding_keeps_every_image_file(tmp_path):
     s = opened(tmp_path)
-    other = elsewhere(s)
-    theirs = imported(other, 5)  # an orphan here, which no version names below
-    theirs_file = s.folder / storage.IMAGES_DIR / f"{theirs}.tif"
+    theirs_file = _released(s, 5)  # an orphan, which no version names below
     version = s.folder / "project-LAB-PC.json"
     version.write_bytes(b"\xff\xfe" + b"\x00\xd8")  # UTF-16 with a lone surrogate
     edit(s, "a")
@@ -1533,9 +1571,7 @@ def test_named_images_reads_a_utf16_file_across_its_parts(tmp_path, monkeypatch)
 def test_a_version_that_cannot_be_looked_at_keeps_every_image_file(tmp_path, monkeypatch):
     # A version whose whole path is past Windows' limit cannot be stat'ed: doubt.
     s = opened(tmp_path)
-    other = elsewhere(s)
-    theirs = imported(other, 5)
-    theirs_file = s.folder / storage.IMAGES_DIR / f"{theirs}.tif"
+    theirs_file = _released(s, 5)  # an orphan, which no version names
     version = s.folder / "project-LAB-PC.json"
     version.write_bytes(b"{}")
     real = Path.stat
@@ -1652,6 +1688,23 @@ def test_files_the_session_or_its_log_knew_are_still_cleaned_up(tmp_path):
     assert not (s.folder / storage.IMAGES_DIR / f"{again}.tif").exists()
 
 
+def test_the_images_a_file_read_again_references_are_known(tmp_path):
+    # Known by its reference, whatever the log says: here the import's entry
+    # does not record the bytes it stored.
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs = imported(other, 5)
+    doc = json.loads(storage.project_to_json(other.project))
+    for entry in doc["log"]:
+        if entry["action"] == "import_image" and entry["params"]["image_id"] == theirs:
+            del entry["params"]["sha256"]
+    (s.folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
+    assert s.reload()
+    ops.remove_image(s, theirs)
+    s.close()  # the history released, then cleaned up
+    assert not (s.folder / storage.IMAGES_DIR / f"{theirs}.tif").exists()
+
+
 def test_another_image_at_an_id_this_history_imported_is_never_deleted(tmp_path, monkeypatch):
     # Two versions that each took the same id: this one imported, removed and
     # dropped its image; the other computer's, of other bytes, arrives there.
@@ -1684,22 +1737,70 @@ def test_another_image_at_an_id_this_history_imported_is_never_deleted(tmp_path,
     assert not theirs.exists()
 
 
-def test_files_named_in_the_project_json_read_are_known(tmp_path):
-    # At an open, and when the file is read again.
+def test_a_name_in_the_project_json_s_text_never_makes_a_file_known(tmp_path):
+    # Read at an open or again, a name the file's text holds (here an original
+    # name) is no image of the project: the file of that name stays.
     s = opened(tmp_path)
     folder = s.folder
+    planted = []
     for when in ("open", "reload"):
-        planted = folder / storage.IMAGES_DIR / f"img-{40 if when == 'open' else 41}.tif"
-        planted.write_bytes(b"named only in the file's text")
+        planted.append(folder / storage.IMAGES_DIR / f"img-{40 + len(planted)}.tif")
+        planted[-1].write_bytes(b"named only in the file's text")
         doc = json.loads(file_bytes(s))
-        doc["batch"]["images"][0]["original_name"] = f"was {planted.name}"
+        doc["batch"]["images"][0]["original_name"] = f"was {planted[-1].name}"
         (folder / storage.PROJECT_FILE).write_bytes(storage.document_bytes(doc))
         if when == "open":
             s = ops.open_project(folder, clock=FakeClock())
         else:
             assert s.reload()
-        edit(s, when)  # saved, then cleaned up: the file is an orphan it knows
-        assert not planted.exists(), when
+        edit(s, when)  # saved, then cleaned up
+        assert all(path.is_file() for path in planted), when
+    s.close()
+    assert all(path.is_file() for path in planted)
+
+
+def test_another_computers_image_named_in_this_project_s_text_is_never_deleted(tmp_path):
+    # This computer imported a file whose name is the stored name of the other
+    # computer's next image; that image's file is synced before its project.json.
+    s = opened(tmp_path, images=0)
+    other = elsewhere(s)
+    imported(other, 7)
+    theirs = imported(other, 8)
+    ours = imported(s, 3, f"{theirs}.tif")
+    assert ours != theirs
+    s.close()
+    later = ops.open_project(s.folder, clock=FakeClock())  # reads the file naming it
+    synced = s.folder / storage.IMAGES_DIR / f"{theirs}.tif"
+    synced.write_bytes(tiff(8))
+    edit(later)  # saved, then cleaned up
+    later.close()
+    assert synced.read_bytes() == tiff(8)
+
+
+def test_a_refused_imports_file_its_delete_left_goes_at_the_next_cleanup(tmp_path, monkeypatch):
+    # The session stored it: unlike a file it never knew, it is its own.
+    s = opened(tmp_path)
+    left = _refused_and_held(s, monkeypatch)
+    edit(s)  # saved, then cleaned up: no longer held
+    assert not left.exists()
+
+
+def test_images_only_a_deleted_conflict_copy_named_stay(tmp_path):
+    # The cost: they are the other computer's images, which this computer never
+    # knew. The user deletes the copy; the files stay, their ids skipped.
+    s = opened(tmp_path)
+    other = elsewhere(s)
+    theirs = imported(other, 5)
+    put(s.folder, other.project)
+    edit(s, "a")  # keeps their version in a copy
+    (s.folder / COPY).unlink()  # the user discards that version
+    edit(s, "b")
+    assert imported(s, 6) != theirs
+    s.close()
+    later = ops.open_project(s.folder, clock=FakeClock())
+    edit(later, "c")
+    later.close()
+    assert (s.folder / storage.IMAGES_DIR / f"{theirs}.tif").read_bytes() == tiff(5)
 
 
 # --- The page and the web routes ---
