@@ -2579,7 +2579,7 @@ def _components(batch: Batch) -> dict[str, tuple[str, ...]]:
 
     for image in batch.iter_images():
         marker = image.marker_image_id
-        if marker is not None and marker in root:
+        if marker is not None:  # an image of the batch (the model checks it)
             root[find(image.id)] = find(marker)
     members: dict[str, list[str]] = {}
     for image in batch.iter_images():

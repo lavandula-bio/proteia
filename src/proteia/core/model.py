@@ -770,7 +770,7 @@ class Arena(_Model):
         """Whether the point (x, y) lies in the area past its edge
         (:meth:`contains` less the edge)."""
         frame = self.frame()
-        if frame is None:
+        if frame is None:  # never: a whole-image area is its image's only one, sharing no point
             return 0 < x < image.width and 0 < y < image.height
         return frame.inside(x, y)
 
