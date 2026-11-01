@@ -28,6 +28,7 @@ import functools
 import hashlib
 import inspect
 import json
+import os
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -182,6 +183,23 @@ def _import_refusals_name_the_file_as_chosen(monkeypatch):
 
     monkeypatch.setattr(operations, "import_image", import_image)
     monkeypatch.setattr(ProjectSession, "_read_checked", read_checked)
+
+
+def guards_in_place() -> bool:
+    """Whether the guards of the autouse fixtures above are all in place, as
+    a test that takes its own patches back checks it took back only its own
+    (``monkeypatch.undo()`` takes these back too): the refusal checks wrap
+    the import and the session's reads, the browser that fails the test is
+    the only one, and the state folder is the test's own."""
+    import webbrowser
+
+    state = [os.environ.get(name, "") for name in ("LOCALAPPDATA", "XDG_STATE_HOME")]
+    return (
+        hasattr(operations.import_image, "__wrapped__")
+        and hasattr(ProjectSession._read_checked, "__wrapped__")
+        and getattr(webbrowser, "_tryorder", None) == ["proteia-test-guard"]
+        and all(Path(folder).name.startswith("user-state") for folder in state)
+    )
 
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units

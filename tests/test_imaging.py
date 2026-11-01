@@ -3061,6 +3061,65 @@ def test_animation_is_told_by_pillow_and_a_failing_check_is_none():
             imaging._animated(broken(error))
 
 
+@pytest.mark.parametrize(
+    "made",
+    [
+        lambda: OSError(errno.EIO, "Input/output error"),
+        lambda: PermissionError(errno.EACCES, "Permission denied"),
+        lambda: OSError(None, "The drive was disconnected", "img-1.png"),
+    ],
+    ids=["input/output", "access", "naming the file"],
+)
+def test_an_error_of_the_systems_in_the_frame_check_is_no_answer(tmp_path, monkeypatch, made):
+    # #248 review: the frame check took any error for a still image, so a
+    # drive's that a read trying again may not meet skipped the refusal of
+    # an animation (scikit-image reads frames 3 pixels wide as channels).
+    # An error of the system's, opening the file or telling its frames, is
+    # raised as it is; a library's of a damaged file is still no answer.
+    path = tmp_path / "two frames µ.png"
+    narrow = [Image.fromarray(np.full((40, 3), level, dtype=np.uint8)) for level in (60, 120)]
+    narrow[0].save(path, save_all=True, append_images=narrow[1:])
+
+    class Broken:
+        format = "PNG"
+
+        def __init__(self, error: BaseException) -> None:
+            self.error = error
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        @property
+        def is_animated(self):
+            raise self.error
+
+    def raising(error: BaseException):
+        def open_(*args, **kwargs):
+            raise error
+
+        return open_
+
+    error = made()
+    assert imaging._animated(Broken(OSError("broken frame"))) is False
+    with pytest.raises(OSError) as raised:
+        imaging._animated(Broken(error))
+    assert raised.value is error
+    for opened in (raising(error), lambda *args, **kwargs: Broken(error)):
+        with monkeypatch.context() as patch:
+            patch.setattr(Image, "open", opened)
+            with pytest.raises(OSError) as raised:
+                imaging.check_frames(path)
+        assert raised.value is error
+    with monkeypatch.context() as patch:  # a damaged file's: left to reading
+        patch.setattr(Image, "open", raising(OSError("cannot identify image file")))
+        assert imaging.check_frames(path) is None
+    with pytest.raises(imaging.ReadingRefusal):  # with the drive back: refused for its frames
+        imaging.check_frames(path)
+
+
 @pytest.mark.parametrize("suffix", [".jpg", ".jpeg"])
 @pytest.mark.parametrize("case", list(_MPO_SIZES))
 def test_a_jpeg_of_several_pictures_reads_as_its_first_as_before(tmp_path, case, suffix):
@@ -3176,15 +3235,18 @@ def test_a_refusal_of_reading_logs_its_cause_and_names_no_one_else(caplog):
     ]
 
 
-# What a refusal of an error of the system's says to do (#246): its drive
-# or the file may be at fault (EINVAL is both a decoder's seek where a
-# damaged file points and a drive that drops, on Windows), so the step
-# holds for both; an import adds the image saved again, which an image
-# already in the project could not take without losing its boxes.
-_CHECK_THE_DRIVE = "check that the file and its drive can be read, then try again"
+# What a refusal of an error of the system's says to do (#246): the file
+# read is the stored copy in the project's folder, whose drive or the file
+# itself may be at fault (EINVAL is both a decoder's seek where a damaged
+# file points and a drive that drops, on Windows), so the step holds for
+# both: if it still fails, an import says to save the image again, which an
+# image already in the project could not take without losing its boxes; of
+# that, the refusal says the file may be damaged.
+_CHECK_THE_DRIVE = "check that the project's folder and its drive can be read, then try again"
 _SAVE_IT_AGAIN = (
     "; if it still fails, save the image again as a TIFF, PNG or JPEG file and import that"
 )
+_MAY_BE_DAMAGED = "; if it still fails, the file may be damaged"
 
 
 def test_a_refusal_gives_the_systems_reason_without_its_path_and_what_to_do():
@@ -3214,7 +3276,10 @@ def test_a_refusal_gives_the_systems_reason_without_its_path_and_what_to_do():
         "Invalid argument",
         "OSError",
     ]
-    for remedy, steps in ((True, f"{_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}"), (False, _CHECK_THE_DRIVE)):
+    for remedy, steps in (
+        (True, f"{_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}"),
+        (False, f"{_CHECK_THE_DRIVE}{_MAY_BE_DAMAGED}"),
+    ):
         answers = [
             imaging.named_refusal(error, "gel µ.png", stored, remedy=remedy) for error in errors
         ]

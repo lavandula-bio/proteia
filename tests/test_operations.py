@@ -41,6 +41,7 @@ import proteia
 from conftest import (
     V1_CONTENT_HASH,
     FakeClock,
+    guards_in_place,
     make_project,
     make_project_with_clashing_names,
     make_project_with_undetected,
@@ -126,6 +127,7 @@ from test_background_truth import _fold_changes as truth_fold_changes
 from test_background_truth import _worst as truth_worst
 from test_imaging import (
     _CHECK_THE_DRIVE,
+    _MAY_BE_DAMAGED,
     _MPO_SIZES,
     _SAVE_IT_AGAIN,
     _cmyk_profile,
@@ -2728,17 +2730,17 @@ _READING_AGAIN = {
     "bytes": (
         "file_digest",
         lambda path: PermissionError(13, "Permission denied", str(path)),
-        f"cannot read 'β-actin µ.tif': Permission denied; {_CHECK_THE_DRIVE}",
+        f"cannot read 'β-actin µ.tif': Permission denied; {_CHECK_THE_DRIVE}{_MAY_BE_DAMAGED}",
     ),
     "bytes, input/output": (
         "file_digest",
         lambda path: OSError(errno.EIO, "Input/output error"),
-        f"cannot read 'β-actin µ.tif': Input/output error; {_CHECK_THE_DRIVE}",
+        f"cannot read 'β-actin µ.tif': Input/output error; {_CHECK_THE_DRIVE}{_MAY_BE_DAMAGED}",
     ),
     "bytes, invalid argument": (
         "file_digest",
         lambda path: OSError(errno.EINVAL, "Invalid argument"),
-        f"cannot read 'β-actin µ.tif': Invalid argument; {_CHECK_THE_DRIVE}",
+        f"cannot read 'β-actin µ.tif': Invalid argument; {_CHECK_THE_DRIVE}{_MAY_BE_DAMAGED}",
     ),
 }
 
@@ -2819,8 +2821,10 @@ def test_reading_an_image_already_imported_says_what_is_no_damage(tmp_path, monk
     # system with no path (a network drive that drops) and Proteia's own
     # refusal of NaN pixels were each said to be damage ("damaged or not an
     # image Proteia can read (numpy._core._exceptions._ArrayMemoryError)").
-    # Each says what happened, with no advice to import the file.
+    # Each says what happened, with no advice to import the file; of the
+    # system's, that if it still fails the file may be damaged (#246).
     made, words = _NO_DAMAGE[case]
+    then = {"input/output": _MAY_BE_DAMAGED, "access": _MAY_BE_DAMAGED}.get(case, "")
     reopened, image = _imported_then_reopened(tmp_path)
     monkeypatch.setattr(imaging, "_read_tiff", _reading_tiffs_as(made))
     # NaN pixels are refused in the analysis array; colours show them.
@@ -2831,7 +2835,7 @@ def test_reading_an_image_already_imported_says_what_is_no_damage(tmp_path, monk
         assert (info.value.code, info.value.ids, str(info.value)) == (
             ErrorCode.UNREADABLE_IMAGE,
             (image,),
-            f"cannot read 'β-actin µ.tif': {words}",
+            f"cannot read 'β-actin µ.tif': {words}{then}",
         )
         assert "import" not in str(info.value)
 
@@ -3035,8 +3039,8 @@ def test_a_session_remembers_the_last_256_causes_of_refusals_it_logged(tmp_path,
         with pytest.raises(OperationError):
             reopened.pixels(image)
     kept = list(reopened._refusals_logged)
-    assert [(kind, number) for _, _, kind, number in kept] == [
-        (OSError, number) for number in range(1044, 1300)
+    assert [key[2:] for key in kept] == [
+        (OSError, OSError, number, True) for number in range(1044, 1300)
     ]
 
 
@@ -3125,35 +3129,38 @@ def test_an_error_of_the_systems_reading_a_file_on_import_says_what_to_do(
     # Invalid argument"), with no next step; a damaged file whose offsets
     # make a decoder seek where the system refuses gives one (EINVAL), and
     # so may a drive that drops, which the error cannot tell apart. The
-    # refusal gives its reason and a next step true of both: check the file
-    # and its drive and try again; if it still fails, save the image again.
-    # #248 review: an LZW TIFF's decoding took it for its compression. Each
-    # half of the step is done as it says.
+    # refusal gives its reason and a next step true of both: check the
+    # project's folder and its drive and try again; if it still fails, save
+    # the image again. #248 review: an LZW TIFF's decoding took it for its
+    # compression. Each half of the step is done as it says.
     error, kind, reason, (owner, name), offered, data, again, saved_again = (
         _system_errors_on_import(tmp_path)[case]
     )
-    monkeypatch.setattr(owner, name, _raises(error))
     s = session_on(tmp_path)
-    with caplog.at_level(logging.INFO, logger="proteia"):
-        refused = _imports_nothing(
-            s, lambda: ops.import_image(s, io.BytesIO(data), offered, kind=CHEMI, polarity=DARK)
+    with monkeypatch.context() as failing:  # only this patch is taken back below
+        failing.setattr(owner, name, _raises(error))
+        with caplog.at_level(logging.INFO, logger="proteia"):
+            refused = _imports_nothing(
+                s,
+                lambda: ops.import_image(s, io.BytesIO(data), offered, kind=CHEMI, polarity=DARK),
+            )
+        assert (refused.code, refused.ids, str(refused)) == (
+            ErrorCode.UNREADABLE_IMAGE,
+            (),
+            f"cannot read {offered!r}: {reason}; {_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}",
         )
-    assert (refused.code, refused.ids, str(refused)) == (
-        ErrorCode.UNREADABLE_IMAGE,
-        (),
-        f"cannot read {offered!r}: {reason}; {_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}",
-    )
-    assert refused.__cause__ is error
-    stored = s.folder / storage.IMAGES_DIR / f"img-1{Path(offered).suffix}"
-    assert [record.getMessage() for record in caplog.records] == [
-        f"reading {stored} (offered as {offered!r}) failed: {kind}: {error}"
-    ]
-    # Still failing: the image saved again imports.
-    image_id = ops.import_image(s, io.BytesIO(saved_again), again, kind=CHEMI, polarity=DARK)
-    np.testing.assert_array_equal(s.pixels(image_id), _gray8().astype(np.float64))
-    monkeypatch.undo()  # the drive can be read again: the file imports
+        assert refused.__cause__ is error
+        stored = s.folder / storage.IMAGES_DIR / f"img-1{Path(offered).suffix}"
+        assert [record.getMessage() for record in caplog.records] == [
+            f"reading {stored} (offered as {offered!r}) failed: {kind}: {error}"
+        ]
+        # Still failing: the image saved again imports.
+        image_id = ops.import_image(s, io.BytesIO(saved_again), again, kind=CHEMI, polarity=DARK)
+        np.testing.assert_array_equal(s.pixels(image_id), _gray8().astype(np.float64))
+    # The drive can be read again: the file imports, with the guards in place.
     ops.import_image(s, io.BytesIO(data), offered, kind=CHEMI, polarity=DARK)
     assert [image.original_name for image in s.project.batch.iter_images()] == [again, offered]
+    assert guards_in_place()
 
 
 @pytest.mark.parametrize(
@@ -3168,21 +3175,22 @@ def test_an_error_of_the_systems_reading_a_file_on_import_says_what_to_do(
 def test_an_error_of_the_systems_decoding_an_image_in_the_project_says_what_to_do(
     tmp_path, monkeypatch, made, reason
 ):
-    # #246: as on import, with the first half of the step only: the image is
-    # in the project already, and importing it again would lose its boxes.
-    # Its pixels and its colours alike.
+    # #246: as on import, but if it still fails, the file may be damaged:
+    # the image is in the project already, and importing it again would lose
+    # its boxes. Its pixels and its colours alike.
     reopened, image = _imported_then_reopened(tmp_path)
-    monkeypatch.setattr(tifffile.TiffPageSeries, "asarray", _raises(made()))
-    for read in (reopened.pixels, reopened.colour_pixels):
-        with pytest.raises(OperationError) as info:
-            read(image)
-        assert (info.value.code, info.value.ids, str(info.value)) == (
-            ErrorCode.UNREADABLE_IMAGE,
-            (image,),
-            f"cannot read 'β-actin µ.tif': {reason}; {_CHECK_THE_DRIVE}",
-        )
-    monkeypatch.undo()  # the drive can be read again
-    assert reopened.pixels(image).shape == (H, W)
+    with monkeypatch.context() as failing:  # only this patch is taken back below
+        failing.setattr(tifffile.TiffPageSeries, "asarray", _raises(made()))
+        for read in (reopened.pixels, reopened.colour_pixels):
+            with pytest.raises(OperationError) as info:
+                read(image)
+            assert (info.value.code, info.value.ids, str(info.value)) == (
+                ErrorCode.UNREADABLE_IMAGE,
+                (image,),
+                f"cannot read 'β-actin µ.tif': {reason}; {_CHECK_THE_DRIVE}{_MAY_BE_DAMAGED}",
+            )
+    assert reopened.pixels(image).shape == (H, W)  # the drive can be read again
+    assert guards_in_place()
 
 
 @pytest.mark.parametrize(
@@ -3201,6 +3209,90 @@ def test_the_guard_checks_refusals_of_reading_an_imported_image(tmp_path, monkey
     monkeypatch.setattr(session_module, "load_image", _raises(refusal))
     with pytest.raises(AssertionError, match="^a refusal of reading an imported image"):
         reopened.pixels(image)
+
+
+def test_the_guards_are_told_to_be_in_place(monkeypatch):
+    # #248 review: monkeypatch.undo() takes back the guards of the autouse
+    # fixtures too (the refusal checks, the browser, the state folder), so a
+    # test that took back its own patches that way ran the rest unguarded.
+    # The check a test makes after taking back its own tells them apart.
+    assert guards_in_place()
+    monkeypatch.undo()  # nothing runs after this but the check
+    assert not guards_in_place()
+
+
+def test_causes_are_told_apart_by_the_refusal_and_whether_the_system_raised_them(
+    tmp_path, monkeypatch, caplog
+):
+    # #248 review: of no errno, an error of the system's (one naming a file)
+    # and a library's OSError are two causes; so are an error and a refusal
+    # of reading caused by an error of that type. Each is logged once.
+    reopened, image = _imported_then_reopened(tmp_path)
+    raised = {}
+
+    def damaged(path):
+        raise raised["error"]
+
+    def refusal_from(error: BaseException) -> imaging.ReadingRefusal:
+        try:
+            raise imaging.ReadingRefusal(path.name, "its strips are cut short") from error
+        except imaging.ReadingRefusal as refusal:
+            return refusal
+
+    path = storage.image_path(reopened.folder, reopened.project.batch.find_image(image))
+    makers = {
+        "the system's": lambda: OSError(None, "The drive was disconnected", str(path)),
+        "a library's": lambda: OSError("image file is truncated"),
+        "an error": lambda: ValueError("no strips"),
+        "a refusal from it": lambda: refusal_from(ValueError("no strips")),
+    }
+    monkeypatch.setattr(imaging, "_read_tiff", damaged)
+
+    def logs(name: str) -> bool:
+        raised["error"] = makers[name]()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="proteia"):
+            with pytest.raises(OperationError):
+                reopened.pixels(image)
+        return bool(caplog.records)
+
+    met = ["the system's", "a library's", "an error", "a refusal from it"]
+    assert [logs(name) for name in met + met] == [True] * 4 + [False] * 4
+
+
+def test_an_error_of_the_systems_in_an_imports_frame_check_does_not_skip_it(tmp_path, monkeypatch):
+    # #248 review: the frame check took a drive's error for a still image;
+    # an animation of frames 3 pixels wide, which scikit-image reads as the
+    # channels of one image, was then imported as one wrong image. It is
+    # refused for the drive, and with the drive back for its frames.
+    from PIL import Image
+
+    narrow = [Image.fromarray(np.full((40, 3), level, dtype=np.uint8)) for level in (60, 120)]
+    data = _encoded(narrow[0], "PNG", save_all=True, append_images=narrow[1:]).read()
+    real = Image.open
+
+    def open_(*args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "check_frames":
+            raise OSError(errno.EIO, "Input/output error")
+        return real(*args, **kwargs)
+
+    s = session_on(tmp_path)
+    with monkeypatch.context() as failing:
+        failing.setattr(Image, "open", open_)
+        refused = _imports_nothing(
+            s,
+            lambda: ops.import_image(
+                s, io.BytesIO(data), "frames µ.png", kind=CHEMI, polarity=DARK
+            ),
+        )
+    assert str(refused) == (
+        f"cannot read 'frames µ.png': Input/output error; {_CHECK_THE_DRIVE}{_SAVE_IT_AGAIN}"
+    )
+    again = _imports_nothing(
+        s, lambda: ops.import_image(s, io.BytesIO(data), "frames µ.png", kind=CHEMI, polarity=DARK)
+    )
+    assert str(again) == f"cannot read 'frames µ.png': {_SEVERAL_FRAMES}"
+    assert guards_in_place()
 
 
 def _animations() -> dict[str, bytes]:
