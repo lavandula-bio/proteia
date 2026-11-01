@@ -181,7 +181,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Concatenate, Final, cast
+from typing import Any, BinaryIO, Concatenate, Final, Literal, cast
 
 import numpy as np
 from pydantic import JsonValue, ValidationError
@@ -264,6 +264,7 @@ from proteia.core.model import (
     lane_number,
     lanes_phrase,
     overlaps,
+    takes_point,
 )
 from proteia.core.names import (
     TextError,
@@ -333,6 +334,7 @@ __all__ = [
     "add_calibration_point",
     "add_protein",
     "area_removal",
+    "area_removals",
     "assign_arena",
     "calibration_fit",
     "clear_boxes",
@@ -348,6 +350,7 @@ __all__ = [
     "export_lane_table",
     "import_image",
     "marker_adoption",
+    "marker_adoptions",
     "move_box",
     "new_project",
     "open_project",
@@ -1050,14 +1053,19 @@ def _detector_pixels(
     click, a ladder search, a snap; :func:`_shown`), so that each reads the
     area alone. A row and a seed click read the channel the image is measured
     on; a ladder's reads (``calibration``) the mean of its colours, as every
-    molecular-weight read does (#206), off the area at the mean's own median.
-    Quantification reads the stored pixels instead."""
+    molecular-weight read does (#206), off the area at the mean's own median
+    (:meth:`~proteia.core.session.ProjectSession.calibration_background`, asked
+    for only when a pixel is masked). Quantification reads the stored pixels
+    instead."""
     if not calibration:
         return _shown(session.pixels(image.id), image, area, window, lambda: image.background)
-    array = session.calibration_pixels(image.id)
-    if image.measured_channel is Channel.MEAN:  # the measured array: its median is stored
-        return _shown(array, image, area, window, lambda: image.background)
-    return _shown(array, image, area, window, lambda: estimate_background(array))
+    return _shown(
+        session.calibration_pixels(image.id),
+        image,
+        area,
+        window,
+        lambda: session.calibration_background(image.id),
+    )
 
 
 def _shown(
@@ -1146,19 +1154,33 @@ def _area_target(batch: Batch, arena_id: object) -> tuple[Membrane, Arena, Image
 def _sharing_refusal(
     batch: Batch, arena: Arena, image: ImageRef, x: float, y: float
 ) -> OperationError | None:
-    """``IN_TWO_ARENAS`` when the point ``(x, y)`` on ``arena``'s image also
-    lies in another membrane area there, else None."""
+    """``IN_TWO_ARENAS`` when another membrane area on ``arena``'s image takes
+    the point ``(x, y)`` (:func:`~proteia.core.model.takes_point`): it lies
+    inside both, or on the edge they share and the other's membrane comes
+    first; else None."""
+    own = batch.find_arena(arena.id)[0]
+    number = batch.membrane_number(own)
     for membrane, other in batch.arenas_on(image.id):
-        if other.id != arena.id and other.contains(image, x, y):
-            own = batch.find_arena(arena.id)[0]
-            first, second = sorted((own, membrane), key=batch.membrane_number)
+        if other.id == arena.id:
+            continue
+        if not takes_point(arena, other, batch.membrane_number(membrane) < number, image, x, y):
+            continue
+        first, second = sorted((own, membrane), key=batch.membrane_number)
+        words = _membrane_words(batch, first), _membrane_words(batch, second)
+        if arena.inside(image, x, y) or other.inside(image, x, y):
             return OperationError(
                 ErrorCode.IN_TWO_ARENAS,
-                f"({x:g}, {y:g}) lies inside both {_membrane_words(batch, first)}'s and"
-                f" {_membrane_words(batch, second)}'s areas on {image.original_name!r}; redraw"
-                " one of them so they do not overlap there",
+                f"({x:g}, {y:g}) lies inside both {words[0]}'s and {words[1]}'s areas on"
+                f" {image.original_name!r}; redraw one of them so they do not overlap there",
                 ids=(arena.id, other.id),
             )
+        return OperationError(
+            ErrorCode.IN_TWO_ARENAS,
+            f"({x:g}, {y:g}) lies on the edge {words[0]}'s and {words[1]}'s areas share on"
+            f" {image.original_name!r}, which belongs to {words[0]}'s area; place it inside"
+            f" {words[1]}'s area, past that edge, or redraw the areas",
+            ids=(arena.id, other.id),
+        )
     return None
 
 
@@ -2429,9 +2451,10 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
 class AreaChange:
     """What :func:`add_arena` or :func:`edit_arena` did: the areas made or
     edited, one per linked image, in image order; the membrane they are of;
-    and the membranes it left with fewer than two ladder marks whose bands
-    lost their apparent MW (``mw_lost``: ``{membrane_id, membrane, bands,
-    message}``, ``membrane`` its number).
+    and the register groups of membranes it left with fewer than two ladder
+    marks whose bands lost their apparent MW (``mw_lost``: ``{membrane_id,
+    membrane, image_ids, bands, message}``, ``membrane`` its number:
+    :func:`_mw_lost`).
 
     An edit that cut its area in two also gives the new membrane the far side
     went to (``rest_membrane_id``) and its areas (``rest_arena_ids``), the
@@ -2538,20 +2561,30 @@ def _centre_inside(outline: Outline, image: ImageRef) -> None:
 def _linked(batch: Batch, image_id: str) -> list[str]:
     """The images linked to ``image_id`` by marker links, directly or through
     another, itself included, in batch order: they hold the same membrane
-    areas, so an area operation on one acts on all."""
-    neighbours: dict[str, set[str]] = {}
+    areas, so an area operation on one acts on all (:func:`_components`)."""
+    return list(_components(batch).get(image_id, (image_id,)))
+
+
+def _components(batch: Batch) -> dict[str, tuple[str, ...]]:
+    """Each image of the batch with the images linked to it by marker links,
+    directly or through another, itself included, in batch order: one pass
+    over the links."""
+    root = {image.id: image.id for image in batch.iter_images()}
+
+    def find(image_id: str) -> str:
+        while root[image_id] != image_id:
+            root[image_id] = root[root[image_id]]
+            image_id = root[image_id]
+        return image_id
+
     for image in batch.iter_images():
         marker = image.marker_image_id
-        if marker is not None:
-            neighbours.setdefault(image.id, set()).add(marker)
-            neighbours.setdefault(marker, set()).add(image.id)
-    found, todo = {image_id}, [image_id]
-    while todo:
-        for other in neighbours.get(todo.pop(), ()):
-            if other not in found:
-                found.add(other)
-                todo.append(other)
-    return [image.id for image in batch.iter_images() if image.id in found]
+        if marker is not None and marker in root:
+            root[find(image.id)] = find(marker)
+    members: dict[str, list[str]] = {}
+    for image in batch.iter_images():
+        members.setdefault(find(image.id), []).append(image.id)
+    return {image_id: tuple(members[find(image_id)]) for image_id in root}
 
 
 def _order_images(batch: Batch) -> None:
@@ -2633,16 +2666,18 @@ def _held(batch: Batch, membrane: Membrane, arena: Arena, image: ImageRef) -> li
 
 
 def _areas_refusal(
-    batch: Batch, image_ids: Iterable[str], *, cut: bool = False
+    batch: Batch, image_ids: Iterable[str], *, cut: Literal["offer", "drawn"] | None = None
 ) -> OperationError | None:
     """On a draft ``batch`` whose membrane areas on ``image_ids`` an
     operation changed: the boxes, not-detected records and calibration
     points there that would lie outside their membrane's area
     (``ARENA_IN_USE``, naming those of the first membrane holding any, with
     their ids) or inside a second area too (``IN_TWO_ARENAS``); None when
-    every one belongs. With ``cut`` (an unturned outline drawn for an
-    unturned area, which can cut it in two: :func:`_cut_rest`), a refusal
-    naming boxes or records offers that cut as a next step."""
+    every one belongs. A refusal naming boxes or records offers to cut the
+    area in two for an outline that could (``cut`` ``offer``: an unturned
+    outline of an unturned area, :func:`_can_cut`); for one that cuts it
+    (``drawn``: :func:`_cut_rest`), what still lies past the cut, its row
+    partly inside, says that a cut takes each row to one side whole."""
     shared: OperationError | None = None
     for image_id in image_ids:
         image = batch.find_image(image_id)
@@ -2661,18 +2696,26 @@ def _areas_refusal(
                 else:
                     records.append((cast(Protein, held.protein), cast(UndetectedBand, held.record)))
             if bands or records or points:
-                steps = "draw the outline around them, or move or remove them first"
-                if cut and (bands or records):
+                steps = "; draw the outline around them, or move or remove them first"
+                if cut == "offer" and (bands or records):
                     steps = (
-                        "draw the outline around them; or cut the area in two: draw the outline"
-                        " to three of its edges, its fourth edge across the area with each"
-                        " protein's boxes all on one side of it, and the far side becomes a new"
-                        " membrane's area with what lies there; or move or remove them first"
+                        "; draw the outline around them; or cut the area in two: draw the"
+                        " outline to three of its edges, its fourth edge across the area with"
+                        " each protein's boxes all on one side of it, and the far side becomes a"
+                        " new membrane's area with what lies there; or move or remove them first"
+                    )
+                elif cut == "drawn":
+                    whole = (
+                        ", and a cut takes each row to one side whole" if bands or records else ""
+                    )
+                    steps = (
+                        f"{whole}; draw its edge across the area past them, or move or remove"
+                        " them first"
                     )
                 return OperationError(
                     ErrorCode.ARENA_IN_USE,
                     f"the new outline would leave {_things(image, bands, records, points)}"
-                    f" outside {_membrane_words(batch, membrane)}'s area; {steps}",
+                    f" outside {_membrane_words(batch, membrane)}'s area{steps}",
                     ids=(arena.id, *(band.id for _, band in bands)),
                     detail={
                         "membrane_id": membrane.id,
@@ -2737,9 +2780,11 @@ def _renumbered(numbers: Sequence[int]) -> str | None:
 
 
 def _mw_lost(before: Batch, after: Batch) -> tuple[dict[str, JsonValue], ...]:
-    """The membranes of ``after`` left with fewer than two ladder marks whose
-    rows' bands had an apparent MW in ``before`` and have none now (#243),
-    each with how many and the words a page shows."""
+    """The register groups of the membranes of ``after`` left with fewer than
+    two ladder marks whose rows' bands had an apparent MW in ``before`` and
+    have none now (#243), each with its membrane, its images (batch order),
+    how many bands and the words a page shows, which name the images when the
+    membrane has several groups."""
     had = {
         band.id
         for protein in before.proteins
@@ -2748,25 +2793,36 @@ def _mw_lost(before: Batch, after: Batch) -> tuple[dict[str, JsonValue], ...]:
     }
     lost: list[dict[str, JsonValue]] = []
     for membrane in after.membranes:
-        if len(membrane.calibration.points) >= mwcal.MIN_LADDER_POINTS:
-            continue
-        bands = [
-            band
-            for arena in after.arenas_of(membrane)
-            for protein, _ in after.rows_on_arena(arena.id)
-            for band in after.boxes_of(protein).bands
-            if band.id in had and band.apparent_mw is None
-        ]
-        if bands:
+        groups = after.register_groups(membrane)
+        for group in groups:
+            marks = [point for point in membrane.calibration.points if point.image_id in group]
+            if len(marks) >= mwcal.MIN_LADDER_POINTS:
+                continue
+            bands = [
+                band
+                for arena in after.arenas_of(membrane)
+                if arena.image_id in group
+                for protein, _ in after.rows_on_arena(arena.id)
+                for band in after.boxes_of(protein).bands
+                if band.id in had and band.apparent_mw is None
+            ]
+            if not bands:
+                continue
             number = after.membrane_number(membrane)
+            images = [image for image in after.iter_images() if image.id in group]
+            where, there = "", ""
+            if len(groups) > 1:
+                where = f" on {in_words([repr(image.original_name) for image in images])}"
+                there = " there"
             lost.append(
                 {
                     "membrane_id": membrane.id,
                     "membrane": number,
+                    "image_ids": [image.id for image in images],
                     "bands": len(bands),
                     "message": f"Membrane {number} has fewer than {mwcal.MIN_LADDER_POINTS}"
-                    f" ladder marks: {len(bands)} bands lost their apparent MW; mark its"
-                    " ladder to read them again",
+                    f" ladder marks{where}: {len(bands)} bands lost their apparent MW; mark"
+                    f" its ladder{there} to read them again",
                 }
             )
     return tuple(lost)
@@ -2788,7 +2844,9 @@ def add_arena(
     table of the image's first area's membrane. Its ``source`` is ``manual``.
     On an image linked to others by marker links, the same area is drawn on
     each, in one change: linked images hold the same areas. Nothing is
-    measured again: the rings read the image as before.
+    measured again: the rings read the image as before. The membrane's fit is
+    refreshed in the same change (:func:`_refresh_mw`), as its marker links
+    now include those of these images.
 
     Refused, changing nothing: an unknown image or membrane
     (``UnknownIdError``); an outline that is not four whole pixels or has no
@@ -2829,6 +2887,7 @@ def add_arena(
         )
     linked = _linked(batch, image_id)
     table = batch.lane_table_of(on[0][0]).id  # an image holds an area
+    committed = session.project
 
     def change(draft: Project) -> AreaChange:
         b = draft.batch
@@ -2852,6 +2911,7 @@ def add_arena(
         refusal = _areas_refusal(b, linked)
         if refusal is not None:
             raise refusal
+        _refresh_mw(committed, draft)  # the membrane's marker links, now on these images
         return AreaChange(
             arena_ids=tuple(made),
             membrane_id=target.id,
@@ -2980,9 +3040,14 @@ def edit_arena(
     or the whole image for an area that shares its image (``INVALID_INPUT``);
     its centre outside the image (``OUT_OF_IMAGE``); boxes, not-detected
     records or calibration points the new outline would leave outside the area
-    after any cut (``ARENA_IN_USE``, naming them, and for an unturned outline
-    of an unturned area offering the cut) or put inside a second area too
-    (``IN_TWO_ARENAS``).
+    after any cut (``ARENA_IN_USE``, naming them; for an unturned outline of
+    an unturned area offering the cut, and after a cut saying that it takes
+    each row to one side whole) or put inside a second area too
+    (``IN_TWO_ARENAS``). What lies on the cut line stays with the outline
+    drawn: a point on the edge two areas share belongs to the earlier
+    membrane's (:func:`~proteia.core.model.takes_point`), and the far side's
+    membrane is the last. The far side's membrane takes the ladder (product
+    and MWs) its marks were read with.
 
     The log entry holds ``arena_id``, ``outline`` (null: the whole image) and
     ``angle_deg`` as they took effect, and every area it redrew
@@ -3008,6 +3073,7 @@ def edit_arena(
             arena_ids=tuple(batch.area_on(membrane, i).id for i in linked), membrane_id=membrane.id
         )
     rest = _cut_rest(arena, image, drawn, angle)
+    cut = None if not _can_cut(arena, drawn, angle) else "offer" if rest is None else "drawn"
     moving: tuple[str, ...] = ()
     marks: tuple[CalibrationPoint, ...] = ()
     if rest is not None:  # so drawn is an outline
@@ -3027,7 +3093,7 @@ def edit_arena(
         handed = None
         if moving and rest is not None:
             handed = _cut_off(draft, edited, linked, rest, moving, marks)
-        refusal = _areas_refusal(b, linked, cut=_can_cut(arena, drawn, angle))
+        refusal = _areas_refusal(b, linked, cut=cut)
         if refusal is not None:
             raise refusal
         if handed is None:  # no row and no point moved: no apparent MW changed
@@ -3083,6 +3149,7 @@ def _cut_off(
     calibration points ``points`` (:func:`_cut_plan`'s, read before the change)."""
     b = draft.batch
     new = Membrane(id=draft.new_id("mem"), lane_table_id=b.lane_table_of(membrane).id)
+    _take_ladder(new, membrane)
     b.membranes.append(new)
     areas: dict[str, str] = {}  # image id -> the new membrane's area there
     for image_id in image_ids:
@@ -3104,6 +3171,28 @@ def _cut_off(
     return new  # the last membrane, on images listed already: their order stands
 
 
+def _ladder(membrane: Membrane) -> tuple[str | None, tuple[float, ...]]:
+    """A membrane's ladder as its marks are read with it: its product and MWs."""
+    return membrane.calibration.ladder, tuple(membrane.calibration.ladder_kda)
+
+
+def _take_ladder(new: Membrane, old: Membrane) -> None:
+    """Give a draft membrane made from ``old``'s area ``old``'s ladder, which the
+    marks it takes were read with."""
+    new.calibration.ladder = old.calibration.ladder
+    new.calibration.ladder_kda = list(old.calibration.ladder_kda)
+
+
+def _ladder_words(membrane: Membrane) -> str:
+    """A membrane's ladder as a refusal names it: the preset's product and
+    system, a custom ladder's name, or "not chosen"."""
+    name = membrane.calibration.ladder
+    if name is None:
+        return "not chosen"
+    preset = ladders.preset(name)
+    return repr(name) if preset is None else f"{preset.product} ({preset.system})"
+
+
 @_locked
 def assign_arena(session: ProjectSession, arena_id: str, membrane_id: str | None) -> AreaAssignment:
     """Give a membrane area to another membrane, ``membrane_id``, or to a new
@@ -3114,13 +3203,19 @@ def assign_arena(session: ProjectSession, arena_id: str, membrane_id: str | None
     change. Both membranes are refitted (:func:`_refresh_mw`); the old one,
     left without an area, is removed, and the later membranes are renumbered.
 
+    A new membrane takes the old one's ladder (its product and MWs), which
+    its marks were read with.
+
     Refused, changing nothing: an unknown area or membrane
     (``UnknownIdError``); the membrane it already belongs to (``INVALID_INPUT``);
     a membrane that already holds an area on one of those images
-    (``ARENA_EXISTS``: choose another membrane, or a new one); calibration
-    points that would conflict in the target's register groups (the refusals
-    of :func:`set_marker_image`, which cannot arise: the target holds no
-    area on the images that move).
+    (``ARENA_EXISTS``: choose another membrane, or a new one); an area whose
+    images hold calibration points of the old membrane, for a membrane of
+    another ladder (``INVALID_INPUT``: choose the same ladder for both, or
+    remove the marks); calibration points that would conflict in the
+    target's register groups (the refusals of :func:`set_marker_image`, which
+    cannot arise: the target holds no area on the images that move, so no
+    point there).
 
     The log entry holds ``arena_id``, ``membrane_id`` (the target's),
     ``new_membrane``, ``from_membrane_id``, ``arena_ids`` (every area moved),
@@ -3146,6 +3241,16 @@ def assign_arena(session: ProjectSession, arena_id: str, membrane_id: str | None
                     ids=(held.id,),
                 )
     moving = [p for p in source.calibration.points if p.image_id in linked]
+    if membrane_id is not None and moving and _ladder(target) != _ladder(source):
+        what = f"{len(moving)} ladder mark" if len(moving) == 1 else f"{len(moving)} ladder marks"
+        raise OperationError(
+            ErrorCode.INVALID_INPUT,
+            f"the {what} on {_membrane_words(batch, source)}'s area would join"
+            f" {_membrane_words(batch, target)}, whose ladder is {_ladder_words(target)}, while"
+            f" {_membrane_words(batch, source)}'s is {_ladder_words(source)}; choose the same"
+            " ladder for both membranes first, or remove the marks from this area",
+            ids=(arena.id,),
+        )
     rows = [p.id for i in linked for p, _ in batch.rows_on_arena(batch.area_on(source, i).id)]
     number = batch.membrane_number(source)
     later = list(range(number + 1, len(batch.membranes) + 1))
@@ -3156,6 +3261,7 @@ def assign_arena(session: ProjectSession, arena_id: str, membrane_id: str | None
         old = _find_membrane(b, source.id)
         if membrane_id is None:
             new = Membrane(id=draft.new_id("mem"), lane_table_id=b.lane_table_of(old).id)
+            _take_ladder(new, old)
             b.membranes.append(new)
         else:
             new = _find_membrane(b, membrane_id)
@@ -3229,12 +3335,49 @@ def area_removal(batch: Batch, arena_id: str) -> AreaScope:
     takes it (the page's confirmation names it): it follows the marker links
     from image to image, so it reaches every linked image."""
     membrane, _, image = _area_target(batch, arena_id)
-    linked = _linked(batch, image.id)
+    return _scope(batch, membrane, tuple(_linked(batch, image.id)), _proteins_by_area(batch))
+
+
+def area_removals(batch: Batch) -> dict[str, AreaScope]:
+    """:func:`area_removal` of every membrane area of the batch, by area id,
+    built at once (for a page state, which shows each one's): the linked
+    images and the proteins on each area are found once, and the areas of one
+    membrane on linked images share one scope."""
+    components = _components(batch)
+    proteins = _proteins_by_area(batch)
+    scopes: dict[str, AreaScope] = {}
+    for membrane in batch.membranes:
+        shared: dict[tuple[str, ...], AreaScope] = {}
+        for arena in batch.arenas_of(membrane):
+            linked = components[arena.image_id]
+            if linked not in shared:
+                shared[linked] = _scope(batch, membrane, linked, proteins)
+            scopes[arena.id] = shared[linked]
+    return scopes
+
+
+def _proteins_by_area(batch: Batch) -> dict[str, list[Protein]]:
+    """The proteins of the batch by the id of the area their row is on, in batch order."""
+    found: dict[str, list[Protein]] = {}
+    for protein in batch.proteins:
+        found.setdefault(batch.arena_id_of(protein), []).append(protein)
+    return found
+
+
+def _scope(
+    batch: Batch,
+    membrane: Membrane,
+    linked: tuple[str, ...],
+    proteins: Mapping[str, list[Protein]],
+) -> AreaScope:
+    """What removing ``membrane``'s area on the images ``linked`` takes
+    (:func:`area_removal`), ``proteins`` the batch's by area (:func:`_proteins_by_area`)."""
     going = tuple(batch.area_on(membrane, linked_id).id for linked_id in linked)
-    gone = [p for p in batch.proteins if batch.arena_id_of(p) in going]
+    held = {p.id for arena_id in going for p in proteins.get(arena_id, ())}
+    gone = [p for p in batch.proteins if p.id in held]
     return AreaScope(
         arena_ids=going,
-        image_ids=tuple(linked),
+        image_ids=linked,
         protein_ids=tuple(p.id for p in gone),
         boxes=sum(len(batch.boxes_of(p).bands) for p in gone),
         records=sum(len(batch.boxes_of(p).undetected) for p in gone),
@@ -3885,12 +4028,57 @@ def marker_adoption(batch: Batch, image_id: str, marker_image_id: str) -> str | 
     ``"image"`` (another image is linked to that marker already: the image
     takes the group's), or None (they hold the same areas: nothing moves).
     Whether the link is refused is not told."""
-    if _areas_of(batch, image_id) == _areas_of(batch, marker_image_id):
-        return None
     joined = any(
         other.marker_image_id == marker_image_id and other.id != image_id
         for other in batch.iter_images()
     )
+    return _adoption(_areas_of(batch, image_id), _areas_of(batch, marker_image_id), joined)
+
+
+def marker_adoptions(batch: Batch) -> dict[str, dict[str, str | None]]:
+    """For each chemiluminescence image, each image of its membranes it may
+    take as its marker (a visible-light marker or merged image, batch order)
+    with :func:`marker_adoption`'s answer, built at once (for a page state):
+    every image's areas and every marker's links are read once."""
+    areas: dict[str, dict[str, tuple[Outline | None, float]]] = {
+        image.id: {} for image in batch.iter_images()
+    }
+    for membrane in batch.membranes:
+        for arena in batch.arenas_of(membrane):
+            areas[arena.image_id][membrane.id] = (arena.outline, arena.angle_deg)
+    linking: dict[str, set[str]] = {}
+    for image in batch.iter_images():
+        if image.marker_image_id is not None:
+            linking.setdefault(image.marker_image_id, set()).add(image.id)
+    markers = [
+        image
+        for image in batch.iter_images()
+        if image.kind in (ImageKind.VISIBLE_MARKER, ImageKind.MERGED)
+    ]
+    return {
+        image.id: {
+            marker.id: _adoption(
+                areas[image.id],
+                areas[marker.id],
+                bool(linking.get(marker.id, set()) - {image.id}),
+            )
+            for marker in markers
+            if not areas[image.id].keys().isdisjoint(areas[marker.id])
+        }
+        for image in batch.iter_images()
+        if image.kind is ImageKind.CHEMILUMINESCENCE
+    }
+
+
+def _adoption(
+    image_areas: Mapping[str, tuple[Outline | None, float]],
+    marker_areas: Mapping[str, tuple[Outline | None, float]],
+    joined: bool,
+) -> str | None:
+    """:func:`marker_adoption` from the two images' areas (:func:`_areas_of`)
+    and whether another image is linked to the marker (``joined``)."""
+    if image_areas == marker_areas:
+        return None
     return "image" if joined else "marker"
 
 

@@ -100,6 +100,7 @@ from proteia.core.model import (
     Project,
     format_timestamp,
 )
+from proteia.core.quantify import estimate_background
 
 _log = logging.getLogger(__name__)
 
@@ -412,6 +413,9 @@ class ProjectSession:
         # work on images measured on another channel, by image id; None
         # between operations, so none is kept (calibration_pixels).
         self._calibration_reads: dict[str, np.ndarray] | None = None
+        # Their medians, worked out when a ladder read masks a pixel with one
+        # (calibration_background); kept and dropped with them.
+        self._calibration_medians: dict[str, float] | None = None
         # (image id, SHA-256) -> how its stored file holds colour (file_colours).
         self._file_colours: dict[tuple[str, str], FileColours | None] = {}
         # (image id, SHA-256) -> what its stored file's header says of reading it
@@ -521,6 +525,24 @@ class ProjectSession:
             if reads is not None:
                 reads[image_id] = array
             return array
+
+    def calibration_background(self, image_id: str) -> float:
+        """The median of the image's mean array (:meth:`calibration_pixels`),
+        which a ladder read takes off its membrane area: the stored
+        ``background`` when the image is measured on the mean; else worked out
+        once per operation, as its array is read, and not kept after it
+        (outside an operation, each time). Raises as :meth:`pixels` does."""
+        with self.lock:
+            image = self._project.batch.find_image(image_id)
+            if image.measured_channel is Channel.MEAN:
+                return image.background
+            medians = self._calibration_medians
+            if medians is not None and image_id in medians:
+                return medians[image_id]
+            level = estimate_background(self.calibration_pixels(image_id))
+            if medians is not None:
+                medians[image_id] = level
+            return level
 
     def channel_array(self, image_id: str, channel: Channel) -> np.ndarray:
         """The image's read-only analysis array of ``channel`` (#206), read and
@@ -752,6 +774,8 @@ class ProjectSession:
                 self._pixels.pop(image_id, None)
             if self._calibration_reads:  # read for the project before this commit
                 self._calibration_reads.clear()
+            if self._calibration_medians:
+                self._calibration_medians.clear()
             # The history moves with the commit, before the hook saves (and so
             # deletes the files no state references any more).
             if move is _Move.PUSH:
@@ -798,6 +822,7 @@ class ProjectSession:
             outermost = self._calibration_reads is None
             if outermost:
                 self._calibration_reads = {}
+                self._calibration_medians = {}
             try:
                 yield
             except (OperationError, LookupError):
@@ -807,6 +832,7 @@ class ProjectSession:
             finally:
                 if outermost:
                     self._calibration_reads = None
+                    self._calibration_medians = None
 
     def _opening_state(self) -> _State:
         """The committed project as the state the session's history begins with.

@@ -766,6 +766,14 @@ class Arena(_Model):
             return 0 <= x <= image.width and 0 <= y <= image.height
         return frame.holds(x, y)
 
+    def inside(self, image: ImageRef, x: float, y: float) -> bool:
+        """Whether the point (x, y) lies in the area past its edge
+        (:meth:`contains` less the edge)."""
+        frame = self.frame()
+        if frame is None:
+            return 0 < x < image.width and 0 < y < image.height
+        return frame.inside(x, y)
+
     def corners(self, image: ImageRef) -> list[tuple[float, float]]:
         """The area's corners in pixels of ``image``: top left, top right,
         bottom right, bottom left, before the turn (the image's own for the
@@ -814,6 +822,12 @@ class AreaFrame:
         (to a billionth of a pixel)."""
         u, v = self.along(x, y)
         return abs(u) <= self.half_width + ON_EDGE and abs(v) <= self.half_height + ON_EDGE
+
+    def inside(self, x: float, y: float) -> bool:
+        """Whether ``(x, y)`` lies in the turned outline past its edge (by
+        more than a billionth of a pixel)."""
+        u, v = self.along(x, y)
+        return abs(u) < self.half_width - ON_EDGE and abs(v) < self.half_height - ON_EDGE
 
 
 class LaneTable(_Model):
@@ -1156,10 +1170,30 @@ class LogEntry(_Model):
 _NEWER: Final = "which this Proteia build cannot read; open the project with a newer build"
 
 
-def _sharing(others: Iterable[Arena], image: ImageRef, x: float, y: float) -> Arena | None:
-    """The first of ``others`` (other areas of the image) that also holds the
-    point ``(x, y)``, or None: a box, record or point belongs to one area."""
-    return next((other for other in others if other.contains(image, x, y)), None)
+def takes_point(
+    own: Arena, other: Arena, other_first: bool, image: ImageRef, x: float, y: float
+) -> bool:
+    """Whether ``other``, another membrane area of ``own``'s image, takes the
+    point ``(x, y)`` that ``own`` holds: ``other`` holds it too, and the point
+    lies past the edge of one of them, or on the edge of both (the line two
+    areas share, as when one is cut from the other) with ``other``'s membrane
+    the earlier (``other_first``). A box, a not-detected record and a
+    calibration point belong to one area, so a point on a shared edge belongs
+    to the earlier membrane's."""
+    if not other.contains(image, x, y):
+        return False
+    return other_first or own.inside(image, x, y) or other.inside(image, x, y)
+
+
+def _sharing(
+    own: Arena, others: Iterable[tuple[Arena, bool]], image: ImageRef, x: float, y: float
+) -> Arena | None:
+    """The first of ``others`` (other areas of the image, each with whether
+    its membrane comes before ``own``'s) that takes the point ``(x, y)`` from
+    ``own`` (:func:`takes_point`), or None."""
+    return next(
+        (other for other, first in others if takes_point(own, other, first, image, x, y)), None
+    )
 
 
 class Batch(_Model):
@@ -1384,19 +1418,20 @@ class Batch(_Model):
 
     def _check_shared_images(
         self, images: dict[str, ImageRef], twice: set[str]
-    ) -> dict[str, list[Arena]]:
+    ) -> dict[str, list[tuple[Arena, bool]]]:
         """An image holding several membranes' areas holds none over the
         whole image: each has its outline (a whole-image area would hold every
         point of the others). Gives, per area, the other areas of its image
         whose bounds meet its own, the only ones that can share a point with it
         (:meth:`Arena.bounds`: whole pixels past its corners, so past the
-        edge's tolerance too).
+        edge's tolerance too), each with whether its membrane comes first
+        (:func:`takes_point`).
         The areas of an image listed ``twice`` are left to the id check."""
         on: dict[str, list[Arena]] = {}
         for membrane in self.membranes:
             for arena in membrane.arenas:
                 on.setdefault(arena.image_id, []).append(arena)
-        others: dict[str, list[Arena]] = {}
+        others: dict[str, list[tuple[Arena, bool]]] = {}
         for image_id, arenas in on.items():
             image = images.get(image_id)
             if image is None or image_id in twice or len(arenas) < 2:
@@ -1409,10 +1444,11 @@ class Batch(_Model):
                         " over the whole image"
                     )
             bounds = {arena.id: arena.bounds(image) for arena in arenas}
+            rank = {arena.id: number for number, arena in enumerate(arenas)}  # membrane order
             for arena in arenas:
                 x0, y0, x1, y1 = bounds[arena.id]
                 others[arena.id] = [
-                    other
+                    (other, rank[other.id] < rank[arena.id])
                     for other in arenas
                     if other is not arena
                     and bounds[other.id][0] <= x1
@@ -1485,7 +1521,10 @@ class Batch(_Model):
         return self
 
     def _check_membrane(
-        self, membrane: Membrane, images: dict[str, ImageRef], others: dict[str, list[Arena]]
+        self,
+        membrane: Membrane,
+        images: dict[str, ImageRef],
+        others: dict[str, list[tuple[Arena, bool]]],
     ) -> None:
         """A membrane's marker links, calibration points and ladders. A point
         lies in its membrane's area on its image and in no other area there
@@ -1537,7 +1576,7 @@ class Batch(_Model):
                     f"membrane {membrane.id}: calibration point at y={point.y} on {image.id}"
                     f" lies outside its membrane area {arena.id}"
                 )
-            shared = _sharing(others.get(arena.id, ()), image, x, point.y)
+            shared = _sharing(arena, others.get(arena.id, ()), image, x, point.y)
             if shared is not None:
                 raise ValueError(
                     f"membrane {membrane.id}: calibration point at y={point.y} on {image.id}"
@@ -1623,7 +1662,7 @@ class Batch(_Model):
         images: dict[str, ImageRef],
         tables: dict[str, LaneTable],
         arenas: dict[str, tuple[Membrane, Arena]],
-        others: dict[str, list[Arena]],
+        others: dict[str, list[tuple[Arena, bool]]],
         unknown_image_rows: Collection[str],
     ) -> None:
         """Each protein's name, loading controls and rows: each row on a known
@@ -1675,7 +1714,7 @@ class Batch(_Model):
         protein: Protein,
         row: Row,
         arena: Arena,
-        others: Sequence[Arena],
+        others: Sequence[tuple[Arena, bool]],
         image: ImageRef,
         lanes: int,
     ) -> None:
@@ -1696,7 +1735,7 @@ class Batch(_Model):
                     f"protein {protein.id}: the centre of {band.id}'s box lies outside its"
                     f" membrane area {arena.id}"
                 )
-            shared = _sharing(others, image, (x0 + x1) / 2, (y0 + y1) / 2)
+            shared = _sharing(arena, others, image, (x0 + x1) / 2, (y0 + y1) / 2)
             if shared is not None:
                 raise ValueError(
                     f"protein {protein.id}: the centre of {band.id}'s box lies in membrane"
@@ -1722,7 +1761,7 @@ class Batch(_Model):
                     f" {lane_number(record.lane_index)} lies outside its membrane area"
                     f" {arena.id}"
                 )
-            shared = _sharing(others, image, cx, cy)
+            shared = _sharing(arena, others, image, cx, cy)
             if shared is not None:
                 raise ValueError(
                     f"protein {protein.id}: the not-detected region in lane"

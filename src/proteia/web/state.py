@@ -78,11 +78,12 @@ from pydantic import JsonValue
 
 from proteia.core import mwrow
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
-from proteia.core.model import Arena, Batch, ImageKind, ImageRef, Membrane, Project, Protein
+from proteia.core.model import Arena, Batch, ImageRef, Membrane, Project, Protein
 from proteia.core.operations import (
-    area_removal,
+    AreaScope,
+    area_removals,
     calibration_fit,
-    marker_adoption,
+    marker_adoptions,
     unassessed_images,
 )
 from proteia.core.project import lane_anchors, lane_positions
@@ -183,12 +184,13 @@ def _membrane(batch: Batch, membrane: Membrane) -> JsonValue:
     }
 
 
-def _arena(batch: Batch, membrane: Membrane, arena: Arena) -> JsonValue:
+def _arena(batch: Batch, membrane: Membrane, arena: Arena, scope: AreaScope) -> JsonValue:
     """A membrane area as the page draws it (#243): its outline before its
     turn (null: the whole image), its angle and source, and its ``corners``
     (top left, top right, bottom right, bottom left, turned) and ``bounds``
     (the whole pixels they span) from the model's geometry, so the page
-    draws what the server checks."""
+    draws what the server checks; and what removing it would take
+    (``scope``: :func:`_removal`)."""
     image = batch.find_image(arena.image_id)
     outline = arena.outline
     return {
@@ -200,14 +202,13 @@ def _arena(batch: Batch, membrane: Membrane, arena: Arena) -> JsonValue:
         "source": arena.source.value,
         "corners": [[x, y] for x, y in arena.corners(image)],
         "bounds": list(arena.bounds(image)),
-        "removal": _removal(batch, arena),
+        "removal": _removal(scope),
     }
 
 
-def _removal(batch: Batch, arena: Arena) -> JsonValue:
+def _removal(scope: AreaScope) -> JsonValue:
     """What removing an area would take, as the removal takes it
     (:func:`~proteia.core.operations.area_removal`): for its confirmation."""
-    scope = area_removal(batch, arena.id)
     return {
         "arena_ids": list(scope.arena_ids),
         "image_ids": list(scope.image_ids),
@@ -216,23 +217,6 @@ def _removal(batch: Batch, arena: Arena) -> JsonValue:
         "records": scope.records,
         "marks": scope.marks,
         "membrane_goes": scope.membrane_goes,
-    }
-
-
-def _link_areas(batch: Batch, image: ImageRef) -> JsonValue:
-    """For a chemiluminescence image, each image of its membranes it may take
-    as its marker (a visible-light marker or merged image), with which image
-    a link would make take the other's membrane areas
-    (:func:`~proteia.core.operations.marker_adoption`: ``marker``, ``image``,
-    or null when they hold the same areas); {} for any other image."""
-    if image.kind is not ImageKind.CHEMILUMINESCENCE:
-        return {}
-    shown = {m.id for m in batch.membranes_on(image.id)}
-    return {
-        other.id: marker_adoption(batch, image.id, other.id)
-        for other in batch.iter_images()
-        if other.kind in (ImageKind.VISIBLE_MARKER, ImageKind.MERGED)
-        and not shown.isdisjoint(m.id for m in batch.membranes_on(other.id))
     }
 
 
@@ -257,13 +241,22 @@ def project_state(
     ``action`` (null when there is none)."""
     undo, redo = session.history_steps
     batch = project.batch
-    on = {image.id: batch.arenas_on(image.id) for image in batch.iter_images()}
+    on: dict[str, list[tuple[Membrane, Arena]]] = {image.id: [] for image in batch.iter_images()}
+    for membrane in batch.membranes:
+        for arena in batch.arenas_of(membrane):
+            on[arena.image_id].append((membrane, arena))
+    # For a chemiluminescence image, each image of its membranes it may take
+    # as its marker, with which image a link would make take the other's
+    # areas (``marker``, ``image``, or null when they hold the same areas);
+    # {} for any other image. Built once, as every area's removal scope is.
+    links = marker_adoptions(batch)
+    scopes = area_removals(batch)
     images: list[JsonValue] = [
         {
             "id": image.id,
             "membrane_id": on[image.id][0][0].id,  # its first area's
             "arena_ids": [arena.id for _, arena in on[image.id]],
-            "link_areas": _link_areas(batch, image),
+            "link_areas": links.get(image.id, {}),
             "original_name": image.original_name,
             "kind": image.kind.value,
             "polarity": image.polarity.value,
@@ -357,7 +350,7 @@ def project_state(
         "reference_condition": batch.reference_condition,
         "images": images,
         "arenas": [
-            _arena(batch, membrane, arena)
+            _arena(batch, membrane, arena, scopes[arena.id])
             for membrane in batch.membranes
             for arena in batch.arenas_of(membrane)
         ],
