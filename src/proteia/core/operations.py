@@ -1881,6 +1881,14 @@ def import_image(
     ``arena_id``). ``kind`` and ``polarity`` are required (the model has no
     silent default).
 
+    The image takes the id ``next_id`` gives, unless a file in ``images/`` holds
+    it or another version of the project in its folder names it (#101): then
+    the first after it that none does
+    (:meth:`~proteia.core.session.ProjectSession.image_number`), so an import
+    never takes the file of a version changed outside Proteia. A project whose
+    folder was removed or moved outside Proteia refuses it before anything is
+    stored (``PROJECT_REMOVED``): storing would make the folder again.
+
     A file of printing inks, CMYK or other, is refused (``CMYK_IMAGE``, #207;
     :func:`_refuse_inks`): the message names it and says to save it as RGB or
     grayscale (an uncompressed TIFF, for a copy of more than 8 bits or with
@@ -1946,20 +1954,21 @@ def import_image(
             f"{original_name!r} is not a supported image type ({', '.join(IMAGE_SUFFIXES)})",
         )
 
+    folder = session.folder
+    refuse_removed(session)  # a store would make the folder again
     # An orphan may hold the id this import gets (an import that was never saved).
     session._remove_orphans()
-    image_id = f"img-{session.project.next_id}"  # the id the change below will take
+    number = session.image_number()  # past the files kept for other versions (#101)
+    image_id = f"img-{number}"  # the id the change below will take
     try:
-        stored = storage.store_image(
-            session.folder, image_id, original_name, source, max_bytes=max_bytes
-        )
+        stored = storage.store_image(folder, image_id, original_name, source, max_bytes=max_bytes)
     except storage.ImageTooLargeError as exc:
         raise OperationError(ErrorCode.IMAGE_TOO_LARGE, str(exc)) from exc
     except FileExistsError as exc:
         raise OperationError(
             ErrorCode.LEFTOVER_FILE,
-            f"a leftover file for {image_id} in images/ could not be deleted;"
-            " close the program holding it and try again",
+            "another program put a file in the project's images folder where Proteia was"
+            " storing this image; import it again",
             ids=(image_id,),
         ) from exc
     except ValueError as exc:
@@ -2011,6 +2020,7 @@ def import_image(
         )
 
         def change(draft: Project) -> tuple[str, str, str | None]:
+            draft.next_id = max(draft.next_id, number)  # past the ids other versions keep
             if draft.new_id("img") != image_id:  # the lock makes this impossible
                 raise RuntimeError(f"image id {image_id} changed while the file was stored")
             batch = draft.batch
@@ -2067,6 +2077,21 @@ def import_image(
                 path.unlink(missing_ok=True)
         raise
     return image_id
+
+
+def refuse_removed(session: ProjectSession) -> None:
+    """Refuse an import into a project whose folder was removed or moved outside
+    Proteia (``PROJECT_REMOVED``, #101; :func:`~proteia.core.storage.project_removed`),
+    before anything is stored or spooled there: it would make the folder again.
+    The message names the project by its folder's name and says what to do."""
+    folder = session.folder
+    if storage.project_removed(session.project, folder):
+        raise OperationError(
+            ErrorCode.PROJECT_REMOVED,
+            f"{folder.name!r} is no longer in the projects folder as it was (its folder, or its"
+            " project.json and an image file, were removed or moved outside Proteia), so"
+            " nothing was imported; put the folder back as it was, or open another project",
+        )
 
 
 # Why an import refuses a file of printing inks (#207), by its ink set; the

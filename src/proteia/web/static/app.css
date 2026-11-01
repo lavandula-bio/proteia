@@ -400,6 +400,19 @@ button:disabled {
   font-weight: 600;
 }
 
+/* A change outside Proteia (#101): marked by its border, not by a hue alone. */
+.outside-change {
+  margin: 1rem 0 0;
+  padding: 0.5rem 0.6rem;
+  border: 2px solid var(--warn);
+  border-radius: 4px;
+}
+
+.outside-change p {
+  margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
+}
+
 .box-size {
   display: flex;
   flex-wrap: wrap;
