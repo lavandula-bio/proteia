@@ -1611,6 +1611,143 @@ def test_the_original_colours_switch_is_a_toggle_button_the_keyboard_reaches():
     assert parser.by_id["view-colours-state"]["role"] == "status"
 
 
+def test_a_colour_image_offers_the_channel_it_is_measured_on():
+    # #206: under the polarity, before the marker image, "Measured on" offers
+    # the channels of the image shown in a fixed order. It is hidden until the
+    # state offers a channel for that image, and the line under it says who
+    # chose it (a screen reader hears it with the choice).
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    panel = _markup(html, '<div id="image-controls"', '<button id="remove-image"')
+    places = [
+        panel.index(f'id="{name}"')
+        for name in ("polarity", "channel-field", "channel", "channel-why", "marker-field")
+    ]
+    assert places == sorted(places)
+    parser = _Tags()
+    parser.feed(html)
+    assert "hidden" in parser.by_id["channel-field"] and "hidden" in parser.by_id["channel-why"]
+    assert parser.by_id["channel"]["aria-describedby"] == "channel-why"
+    field = _markup(panel, '<label id="channel-field"', "</label>")
+    assert re.search(r'<label id="channel-field"[^>]*>\s*Measured on\s*<select', field)
+    controls = _Controls()
+    controls.feed(field + "</label>")
+    assert [(tag, fields["id"], labelled) for tag, fields, labelled in controls.controls] == [
+        ("select", "channel", True)
+    ]
+    assert controls.options["channel"] == [
+        ("red", False, False),
+        ("green", False, False),
+        ("blue", False, False),
+        ("mean", False, False),
+    ]
+    words = re.findall(r"<option [^>]*>([^<]*)</option>", field)
+    assert words == ["Red channel", "Green channel", "Blue channel", "Mean of red, green and blue"]
+
+
+def test_the_page_shows_the_channel_the_state_offers():
+    # Shown only where the state offers a channel for the image (channel.offered:
+    # not for a gray image, whose channel is null, a marker or a CMYK image),
+    # with the server's words; the select shows the channel last chosen on this
+    # page while its change has no answer yet, else the one measured.
+    _, render = _function(_code("app.js"), "function renderChannel(")
+    assert "image.channel && image.channel.offered" in render
+    assert '$("channel-field").hidden = !offered' in render
+    assert "image.channel.words" in render
+    assert "wantedChannel(image.id) || image.channel.measured" in render
+    _, wanted = _function(_code("app.js"), "function wantedChannel(")
+    assert "c.imageId === imageId && c.opening === opening" in wanted
+    _, images = _function(_code("app.js"), "function renderImages(")
+    assert "renderChannel(image)" in images
+
+
+def test_channel_changes_are_sent_one_after_another_in_the_order_made():
+    # A change runs in the app's edit queue (the protein panel's, as the lane
+    # table's edits do), after the box edits in flight: so two changes reach
+    # the server in the order chosen, each once the one before has its answer,
+    # and a box placed or an undo asked for after it waits for it; none is
+    # sent once another project is asked for. A change of the same image still
+    # waiting to be sent, with no edit made since, sends the newer channel
+    # instead (an arrow key changes a closed select once per key). When its
+    # entry goes (answered, refused or not run), the select shows the state
+    # shown again, which may be newer than its answer; a refusal of an image
+    # no longer in the project reads the project again.
+    script = _code("app.js")
+    _, change = _function(script, "function sendChannel(")
+    queued = change.index("proteinPanel.queueEdit(")
+    assert change.index("const after = pending();") < queued
+    sent = change.index(
+        'return await send("PUT", `/api/images/${imageId}/channel`, { channel: asked.channel })'
+    )
+    assert queued < change.index("asked.sent = true;") < sent < change.index("{ after },")
+    assert sent < change.index("await reportChannel(error, imageId)")
+    assert "asked.run.then(answered, answered);" in change
+    assert "if (current()) {" in change
+    merged = change[: change.index("const asked = {")]
+    for condition in (
+        "!waiting.sent",
+        "proteinPanel.queue === waiting.tail",
+        "[...inFlight].every((edit) => waiting.made.has(edit))",
+    ):
+        assert condition in merged
+    assert "waiting.channel = channel;" in merged and "return waiting.run;" in merged
+    assert "asked.tail = proteinPanel.queue;" in change
+    assert "renderChannel(" in change[change.index("const answered = () => {") :]
+    listener = script[script.index('$("channel").addEventListener("change"') :].split("\n});", 1)[0]
+    assert "sendChannel(state.imageId, event.target.value)" in listener
+    _, refused = _function(script, "function reportChannel(")
+    assert 'if (error.code === "unknown_id") {\n    await reread()' in refused
+
+
+def test_the_grey_preview_is_kept_under_the_channel_it_shows():
+    # The page keeps each image's grey preview with the channel it shows: the
+    # one the server names (its header), once answered. One of another channel
+    # than the state shown measures is never drawn (the select and its line
+    # name the state's): it is dropped, and fetched again if it was asked for
+    # before that state, else the project is read again (the server measures
+    # another channel now). A preview dropped before its answer has its
+    # request aborted; one dropped while the view draws it is closed once the
+    # view draws another or is blanked.
+    script = _code("app.js")
+    assert f'const CHANNEL_HEADER = "{api.CHANNEL_HEADER}";' in script
+    _, fetched = _function(script, "function bitmapOf(")
+    assert "response.headers.get(CHANNEL_HEADER)" in fetched
+    assert "{ signal: held.controller.signal }" in fetched
+    _, select = _function(script, "function select(")
+    assert "fetched.get(grey).shows.channel !== measuredOf(image)" in select
+    assert "forgetGrey(previews)" in select
+    _, view = _function(script, "function renderView(")
+    mismatch = view.index("if (shows && shows.channel !== measuredOf(image)) {")
+    drawn = view.index("drawing(bitmap);")
+    caught_up = view.index("catchUp(image);", mismatch)
+    assert mismatch < caught_up < view.index("return;", mismatch) < drawn
+    _, catch_up = _function(script, "async function catchUp(")
+    assert "applyAnswer(answer);" in catch_up and 'label: "Show again"' in catch_up
+    assert "if (saidElsewhere(error)) {" in catch_up
+    blank = view.index("view.setImage(null, 0, 0);")
+    assert blank < view.index("drawing(null);") < mismatch
+    _, forget = _function(script, "function forgetPreview(")
+    assert "held.controller.abort();" in forget and "release(held.bitmap);" in forget
+    _, release = _function(script, "function release(")
+    assert "bitmap === drawnBitmap" in release and "retired.add(bitmap);" in release
+    _, drawing = _function(script, "function drawing(")
+    assert "old.close();" in drawing
+    _, measured = _function(script, "function measuredOf(")
+    assert 'image.channel ? image.channel.measured : "mean"' in measured
+    _, said = _function(script, "function sayColours(")
+    assert "measuredOf(image)" in said
+    # "Asked for before the state shown" is of both the opening and the
+    # revision (a revision number repeats across openings).
+    _, now = _function(script, "function shownNow(")
+    assert "at.open_id === shown.open_id && at.revision === shown.revision" in now
+    assert "if (!shownNow(shows.at)) {" in view
+    _, held = _function(script, "function bitmapOf(")
+    assert "open_id: state.answered.open_id, revision: state.answered.revision" in held
+    # Another project shown: the view blanked counts as drawing nothing, so
+    # the old project's bitmap it drew is closed.
+    _, opened = _function(script, "function showOpened(")
+    assert "  view.setImage(null, 0, 0);\n  drawing(null);" in opened
+
+
 def _object_keys(script: str, name: str) -> set[str]:
     """The keys of the object literal ``const <name> = {...};`` in a script."""
     body = script[script.index(f"const {name} = {{") :].split("\n};", 1)[0]

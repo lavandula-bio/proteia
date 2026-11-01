@@ -111,7 +111,10 @@ add, so undo takes them back one at a time. The add answers ``placement``
 
 ``GET /api/images/{image_id}/preview`` serves an image as the view draws it: its
 gray analysis array, which the nets are measured on, or, with
-``?colour=original``, its stored file in its own colours, for display only.
+``?colour=original``, its stored file in its own colours, for display only. A
+gray one names the channel its pixels are of in its ``Proteia-Channel`` header
+(:data:`CHANNEL_HEADER`, #206): ``red``, ``green``, ``blue`` or ``mean``, as
+drawn, which may be a channel chosen after the request was sent.
 
 ``POST /api/projects/sample`` creates the sample project, set up on the
 synthetic sample blot up to the row boxes (:mod:`proteia.web.sample_project`),
@@ -293,6 +296,8 @@ _log = logging.getLogger(__name__)
 
 # The request header that names the opening of a project a page shows (its open id).
 OPENING_HEADER: Final = "Proteia-Opening"
+# The channel a gray preview's pixels are of (#206): the page keeps it under it.
+CHANNEL_HEADER: Final = "Proteia-Channel"
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
@@ -1093,7 +1098,9 @@ class Workspace:
         given in the open project's answers, or no longer kept."""
         return self._charts.svg(key)
 
-    def preview(self, session: ProjectSession, image_id: str, *, original: bool = False) -> bytes:
+    def preview(
+        self, session: ProjectSession, image_id: str, *, original: bool = False
+    ) -> tuple[bytes, Channel | None]:
         """The image's preview PNG: of its gray analysis array, or, with
         ``original``, of its stored file in its own colours
         (:func:`~proteia.web.state.original_png`) if the file has colour to
@@ -1103,14 +1110,16 @@ class Workspace:
         few previews shown are kept, gray and colour alike: a gray one under
         the channel it is of (#206), as the committed project measured the
         image when its pixels were read; one in the original colours under no
-        channel, since it shows the file whatever is measured."""
+        channel, since it shows the file whatever is measured. With it, the
+        channel it is kept under: the one a gray preview's pixels are of, or
+        None for one in the original colours."""
         image = session.project.batch.find_image(image_id)
         original = original and has_colour(session, image)
         key = _preview_key(image, original)
         with self._lock:
             if key in self._previews:
                 self._previews.move_to_end(key)
-                return self._previews[key]
+                return self._previews[key], key[2]
         if original:
             data = original_png(session.colour_pixels(image_id))
         else:
@@ -1131,7 +1140,7 @@ class Workspace:
             self._previews[key] = data
             while len(self._previews) > _PREVIEWS_KEPT:
                 self._previews.popitem(last=False)
-        return data
+        return data, key[2]
 
 
 # --- Request bodies ---
@@ -2234,9 +2243,11 @@ def image_preview(
     its stored file in the file's own colours, for display only (the gray one
     for a file without colour to show: ``colour`` in the project state says
     which have it). Either is read after the stored file's SHA-256 is checked:
-    ``image_file_changed`` or ``unreadable_image`` (422) otherwise."""
-    data = workspace.preview(session, image_id, original=colour == "original")
-    return Response(data, media_type="image/png")
+    ``image_file_changed`` or ``unreadable_image`` (422) otherwise. A gray one
+    names the channel its pixels are of (:data:`CHANNEL_HEADER`)."""
+    data, channel = workspace.preview(session, image_id, original=colour == "original")
+    headers = {} if channel is None else {CHANNEL_HEADER: channel.value}
+    return Response(data, media_type="image/png", headers=headers)
 
 
 @router.get("/charts/{key}.svg", dependencies=[Depends(_open_session, scope="function")])

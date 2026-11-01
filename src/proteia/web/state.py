@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import io
 import statistics
+from typing import Final
 
 import numpy as np
 from PIL import Image
@@ -295,21 +296,35 @@ def project_state(
     }
 
 
+# The line under the page's "Measured on" (#206), by who chose the channel
+# (its ChannelSource value): no one (None), or the user.
+_CHANNEL_WORDS: Final[dict[str | None, str]] = {
+    None: (
+        "No channel chosen: measured on the mean of its red, green and blue. Choose the"
+        " channel that holds its bands to measure it there (its boxes are measured again)."
+    ),
+    "chosen": "Chosen by you.",
+}
+
+
 def _channel(image: ImageRef) -> JsonValue:
     """What a colour image (one whose red, green and blue differ) is measured
     on (#206): the channel (``measured``: ``red``, ``green``, ``blue`` or
     ``mean``), who chose it (``source``: ``chosen``, or null with no choice:
-    the mean, as before #206) and whether one can be chosen for it
-    (``offered``: not for a visible-light marker image or an image converted
-    from CMYK, which :func:`~proteia.core.operations.set_channel` refuses);
-    null for a gray image, which has one channel."""
+    the mean, as before #206), whether one can be chosen for it (``offered``:
+    not for a visible-light marker image or an image converted from CMYK,
+    which :func:`~proteia.core.operations.set_channel` refuses) and the line
+    the page shows under its choice where it is offered (``words``, else
+    null); null for a gray image, which has one channel."""
     blocker = image.channel_blocker
     if blocker == "gray":
         return None
+    source = None if image.channel is None else image.channel.source.value
     return {
         "measured": image.measured_channel.value,
-        "source": None if image.channel is None else image.channel.source.value,
+        "source": source,
         "offered": blocker is None,
+        "words": _CHANNEL_WORDS[source] if blocker is None else None,
     }
 
 

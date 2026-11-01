@@ -464,11 +464,30 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
     def channel_of(answer: dict, image: str):
         return next(i for i in answer["project"]["images"] if i["id"] == image)["channel"]
 
+    def shows(image: str, query: str = "") -> str | None:
+        # The channel a preview answered names: what its gray pixels are of (#206).
+        status, headers, _ = fetch(client, f"/api/images/{image}/preview{query}")
+        assert status == 200
+        return headers.get("proteia-channel")
+
     assert channel_of(uploaded, image_id) is None
-    assert channel_of(uploaded, tinted) == {"measured": "mean", "source": None, "offered": True}
+    unchosen = channel_of(uploaded, tinted)
+    assert {k: unchosen[k] for k in ("measured", "source", "offered")} == {
+        "measured": "mean",
+        "source": None,
+        "offered": True,
+    }
+    assert (shows(tinted), shows(image_id), shows(tinted, "?colour=original")) == (
+        "mean",
+        "mean",  # a gray image is its own values: the mean
+        None,  # the file's own colours, whatever is measured
+    )
     path = f"/api/images/{tinted}/channel"
     answer = client.ok("PUT", path, {"channel": "blue"})
-    assert channel_of(answer, tinted) == {"measured": "blue", "source": "chosen", "offered": True}
+    chosen = {"measured": "blue", "source": "chosen", "offered": True, "words": "Chosen by you."}
+    assert channel_of(answer, tinted) == chosen
+    assert shows(tinted) == "blue"
+    assert shows(image_id, "?colour=original") == "mean"  # a gray file answers its gray preview
     revision = answer["project"]["revision"]
     assert revision == uploaded["project"]["revision"] + 1
     assert answer["results"]["revision"] == revision
@@ -485,6 +504,11 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
     state = client.ok("GET", "/api/project")
     assert state["project"]["revision"] == revision  # no refusal changed anything
     assert channel_of(state, tinted)["measured"] == "blue"
+    undone = client.ok("POST", "/api/undo")
+    assert channel_of(undone, tinted)["measured"] == "mean"
+    assert shows(tinted) == "mean"
+    client.ok("POST", "/api/redo")
+    assert shows(tinted) == "blue"
 
 
 # --- Original colours (#57) ---
@@ -616,15 +640,15 @@ def test_original_colours_are_kept_with_the_last_previews_shown(tmp_path, monkey
         return colour_pixels(self, image_id)
 
     monkeypatch.setattr(type(session), "colour_pixels", counting)
-    colour = workspace.preview(session, image_id, original=True)
-    assert workspace.preview(session, image_id, original=True) == colour
+    colour = workspace.preview(session, image_id, original=True)[0]
+    assert workspace.preview(session, image_id, original=True)[0] == colour
     assert reads == [image_id]  # read once, then kept
 
     monkeypatch.setattr(api, "_PREVIEWS_KEPT", 1)
     # The gray one is another preview: kept in place of the colour one, the last shown.
-    assert workspace.preview(session, image_id) != colour
+    assert workspace.preview(session, image_id)[0] != colour
     assert image_id not in session._pixels  # neither holds the image in memory
-    assert workspace.preview(session, image_id, original=True) == colour
+    assert workspace.preview(session, image_id, original=True)[0] == colour
     assert reads == [image_id, image_id]
 
 
@@ -1166,7 +1190,7 @@ def test_a_preview_does_not_keep_the_full_image_in_memory(tmp_path):
             session, stream, "a.tif", kind="chemiluminescence", polarity="dark_on_light"
         )
     session._pixels.clear()  # as if the image had not been worked on in this session
-    assert workspace.preview(session, image_id).startswith(b"\x89PNG")
+    assert workspace.preview(session, image_id)[0].startswith(b"\x89PNG")
     assert image_id not in session._pixels
 
 
