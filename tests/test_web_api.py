@@ -456,7 +456,8 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
     # #206: the route over operations.set_channel, and the state it answers.
     image_id, _ = ready(client, tmp_path)  # gray
     gray = synthetic_blot((H, W), [(LANE_X[0], ROW, 5.0, 3.0, 30000.0)])
-    colour = write_tiff(tmp_path / "colour.tif", np.dstack([gray, gray, gray // 2]))
+    # Red and green alike, blue a quarter: the import picks red, first on a tie.
+    colour = write_tiff(tmp_path / "colour.tif", np.dstack([gray, gray, gray // 4]))
     status, uploaded = upload(client, colour.read_bytes(), "GFP α.tif")
     assert status == 201, uploaded
     tinted = uploaded["image_id"]
@@ -471,14 +472,14 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
         return headers.get("proteia-channel")
 
     assert channel_of(uploaded, image_id) is None
-    unchosen = channel_of(uploaded, tinted)
-    assert {k: unchosen[k] for k in ("measured", "source", "offered")} == {
-        "measured": "mean",
-        "source": None,
+    picked = channel_of(uploaded, tinted)
+    assert {k: picked[k] for k in ("measured", "source", "offered")} == {
+        "measured": "red",
+        "source": "picked",
         "offered": True,
     }
     assert (shows(tinted), shows(image_id), shows(tinted, "?colour=original")) == (
-        "mean",
+        "red",
         "mean",  # a gray image is its own values: the mean
         None,  # the file's own colours, whatever is measured
     )
@@ -505,8 +506,8 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
     assert state["project"]["revision"] == revision  # no refusal changed anything
     assert channel_of(state, tinted)["measured"] == "blue"
     undone = client.ok("POST", "/api/undo")
-    assert channel_of(undone, tinted)["measured"] == "mean"
-    assert shows(tinted) == "mean"
+    assert channel_of(undone, tinted)["measured"] == "red"
+    assert shows(tinted) == "red"
     client.ok("POST", "/api/redo")
     assert shows(tinted) == "blue"
 

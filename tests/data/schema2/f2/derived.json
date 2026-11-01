@@ -19,7 +19,84 @@
    "membrane_id": "mem-4"
   }
  ],
- "fresh_changes": [],
+ "fresh_changes": [
+  [
+   "$.batch.membranes[1].images[0]",
+   {
+    "background": 193.66666666666666,
+    "bit_depth": 8,
+    "file": "img-3.png",
+    "height": 80,
+    "id": "img-3",
+    "import_warnings": [
+     {
+      "code": "color_channels_differ",
+      "message": "The red, green and blue channels differ; they were averaged into one gray channel, so over-exposure cannot be checked."
+     }
+    ],
+    "kind": "chemiluminescence",
+    "marker_image_id": null,
+    "original_name": "C colour α.png",
+    "polarity": "dark_on_light",
+    "sha256": "5eb4924e01e6bdcb025023d25f8c0b45af304d3cc16daeb36eff9a67954e24da",
+    "width": 120
+   },
+   {
+    "background": 193.66666666666666,
+    "bit_depth": 8,
+    "channel": {
+     "apart": [0.0, 0.0, 0.0],
+     "channel": "mean",
+     "masses": [4.801537979166667, 4.5729405, 4.305253124999999],
+     "rule": 1,
+     "source": "picked"
+    },
+    "file": "img-3.png",
+    "height": 80,
+    "id": "img-3",
+    "import_warnings": [
+     {
+      "code": "color_channels_differ",
+      "message": "The red, green and blue channels differ; they were averaged into one gray channel, so over-exposure cannot be checked."
+     }
+    ],
+    "kind": "chemiluminescence",
+    "marker_image_id": null,
+    "original_name": "C colour α.png",
+    "polarity": "dark_on_light",
+    "sha256": "5eb4924e01e6bdcb025023d25f8c0b45af304d3cc16daeb36eff9a67954e24da",
+    "width": 120
+   }
+  ],
+  [
+   "$.log[2].params",
+   {
+    "image_id": "img-3",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-4",
+    "new_membrane": true,
+    "original_name": "C colour α.png",
+    "polarity": "dark_on_light",
+    "sha256": "5eb4924e01e6bdcb025023d25f8c0b45af304d3cc16daeb36eff9a67954e24da"
+   },
+   {
+    "channel": {
+     "apart": [0.0, 0.0, 0.0],
+     "channel": "mean",
+     "masses": [4.801537979166667, 4.5729405, 4.305253124999999],
+     "rule": 1,
+     "source": "picked"
+    },
+    "image_id": "img-3",
+    "kind": "chemiluminescence",
+    "membrane_id": "mem-4",
+    "new_membrane": true,
+    "original_name": "C colour α.png",
+    "polarity": "dark_on_light",
+    "sha256": "5eb4924e01e6bdcb025023d25f8c0b45af304d3cc16daeb36eff9a67954e24da"
+   }
+  ]
+ ],
  "history_issues": [],
  "lane_tables": [
   {
@@ -111,6 +188,15 @@
    "label": null,
    "notices": [
     {
+     "code": "colour_channel",
+     "conditions": [],
+     "image_ids": ["img-3"],
+     "lane_indices": [],
+     "level": "info",
+     "message": "'C colour α.png' is measured on the mean of its red, green and blue, as Proteia measured colour images before it chose a channel; choose a channel for it under Images to measure it there (its boxes are measured again)",
+     "protein_ids": ["prot-12", "prot-19"]
+    },
+    {
      "code": "possibly_clipped",
      "conditions": [],
      "image_ids": [],
@@ -134,7 +220,7 @@
      "image_ids": [],
      "lane_indices": [0, 1, 2, 3, 4, 5],
      "level": "warning",
-     "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it",
+     "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it; choose the channel that holds its bands for its image to check it there",
      "protein_ids": ["prot-12"]
     },
     {
@@ -143,7 +229,7 @@
      "image_ids": [],
      "lane_indices": [0, 1, 2, 3, 4, 5],
      "level": "warning",
-     "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate",
+     "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate; choose the channel that holds its bands for its image to check it there",
      "protein_ids": ["prot-19"]
     },
     {
@@ -223,6 +309,15 @@
   "method": "mean",
   "notices": [
    {
+    "code": "colour_channel",
+    "conditions": [],
+    "image_ids": ["img-3"],
+    "lane_indices": [],
+    "level": "info",
+    "message": "'C colour α.png' is measured on the mean of its red, green and blue, as Proteia measured colour images before it chose a channel; choose a channel for it under Images to measure it there (its boxes are measured again)",
+    "protein_ids": ["prot-12", "prot-19"]
+   },
+   {
     "code": "possibly_clipped",
     "conditions": [],
     "image_ids": [],
@@ -246,7 +341,7 @@
     "image_ids": [],
     "lane_indices": [0, 1, 2, 3, 4, 5],
     "level": "warning",
-    "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it",
+    "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it; choose the channel that holds its bands for its image to check it there",
     "protein_ids": ["prot-12"]
    },
    {
@@ -255,7 +350,7 @@
     "image_ids": [],
     "lane_indices": [0, 1, 2, 3, 4, 5],
     "level": "warning",
-    "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate",
+    "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate; choose the channel that holds its bands for its image to check it there",
     "protein_ids": ["prot-19"]
    },
    {

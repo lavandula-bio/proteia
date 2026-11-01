@@ -1659,6 +1659,11 @@ UNDER = "if it is over-exposed there, its net is an under-estimate"
 RETAKE = "check the imager's original capture, or shorten the exposure and image the membrane again"
 
 
+# The next step of clipping_not_checked on a lossless colour image measured on
+# the mean (#206).
+CHOOSE = "; choose the channel that holds its bands for its image to check it there"
+
+
 def _image(image_id: str, bit_depth: int | None, *warnings: dict) -> Callable[[Project], None]:
     def edit(draft: Project) -> None:
         image = draft.batch.find_image(image_id)
@@ -1681,24 +1686,31 @@ def _unchecked(res: results.Results) -> list[results.Notice]:
 
 
 @pytest.mark.parametrize(
-    ("bit_depth", "warnings", "because"),
+    ("bit_depth", "warnings", "because", "step"),
     [
-        (8, [LOSSY], "lossy (JPEG-type) compression"),
-        (16, [COLOR], "color channels averaged into gray"),
-        (None, [UNKNOWN], "an unknown bit depth"),
-        (None, [], "an unknown bit depth"),  # not recorded: no limit to check against
-        (8, [LOSSY, COLOR], "lossy (JPEG-type) compression and color channels averaged into gray"),
-        (None, [LOSSY], "lossy (JPEG-type) compression and an unknown bit depth"),
+        (8, [LOSSY], "lossy (JPEG-type) compression", ""),
+        # Lossless colour on the mean: one channel would be checked exactly (#206).
+        (16, [COLOR], "color channels averaged into gray", CHOOSE),
+        (None, [UNKNOWN], "an unknown bit depth", ""),
+        (None, [], "an unknown bit depth", ""),  # not recorded: no limit to check against
+        (
+            8,
+            [LOSSY, COLOR],
+            "lossy (JPEG-type) compression and color channels averaged into gray",
+            "",
+        ),
+        (None, [LOSSY], "lossy (JPEG-type) compression and an unknown bit depth", ""),
         (
             8,
             [COLOR, LOSSY, CMYK],
             "lossy (JPEG-type) compression and CMYK converted to RGB and color channels"
             " averaged into gray",
+            "",
         ),
     ],
 )
 def test_a_band_not_checked_for_over_exposure_is_reported_with_the_reason(
-    bit_depth, warnings, because
+    bit_depth, warnings, because, step
 ):
     # Every band checked but β-catenin's in lanes 0 and 3 (excluded), on an
     # image the check cannot trust; where its range is known, they were
@@ -1717,7 +1729,7 @@ def test_a_band_not_checked_for_over_exposure_is_reported_with_the_reason(
             level=Level.WARNING,
             message=(
                 f"'β-catenin' was not checked for over-exposure in lane 1: its image has"
-                f" {because}, so saturated pixels cannot be counted; {UNDER}"
+                f" {because}, so saturated pixels cannot be counted; {UNDER}{step}"
             ),
             protein_ids=("prot-7",),
             lane_indices=(0,),

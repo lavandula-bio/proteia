@@ -418,8 +418,9 @@ UNTRUSTED_WARNINGS: Final = frozenset({"lossy_format", "color_channels_differ", 
 class Channel(StrEnum):
     """What an image is measured on (#206): one channel of its file as read, or
     the unweighted mean of its red, green and blue, as ImageJ converts colour by
-    default. A gray image, and a colour image no channel was chosen for, are
-    measured on the mean (a gray image's own values)."""
+    default. A gray image, and a colour image imported before Proteia picked a
+    channel and none chosen for since, are measured on the mean (a gray image's
+    own values)."""
 
     RED = "red"
     GREEN = "green"
@@ -430,14 +431,43 @@ class Channel(StrEnum):
 class ChannelSource(StrEnum):
     """Who chose the channel an image is measured on."""
 
+    # Proteia's channel rule (proteia.core.channelrule), on import or a polarity change.
+    PICKED = "picked"
     CHOSEN = "chosen"  # the user (operations.set_channel)
 
 
+# A value for each of red, green and blue, in that order.
+PerChannel = tuple[NonNegative, NonNegative, NonNegative]
+
+
 class ChannelChoice(_Model):
-    """The channel a colour image is measured on, and who chose it (#206)."""
+    """The channel a colour image is measured on, who chose it (#206), and the
+    evidence the channel rule measured for it: the rule's version (``rule``),
+    each channel's band mass (``masses``) and its mass apart from the rule's
+    pick (``apart``), at the image's polarity
+    (:func:`~proteia.core.imaging.channel_masses`). The page and the results
+    word the choice from these alone (:mod:`proteia.core.channelrule`). The
+    evidence is all there or all None: None for a choice saved before the rule
+    measured any (the user's, by a build of #206's first part), or of pixels
+    with no known bit depth. A pick always holds it. Each None is left out of
+    the saved form."""
 
     channel: Channel
     source: ChannelSource
+    rule: int | None = Field(default=None, ge=1, exclude_if=lambda v: v is None)
+    masses: PerChannel | None = Field(default=None, exclude_if=lambda v: v is None)
+    apart: PerChannel | None = Field(default=None, exclude_if=lambda v: v is None)
+
+    @model_validator(mode="after")
+    def _check_evidence(self) -> ChannelChoice:
+        held = [value is not None for value in (self.rule, self.masses, self.apart)]
+        if any(held) and not all(held):
+            raise ValueError("a channel choice holds its rule, masses and apart together, or none")
+        if self.source is ChannelSource.PICKED and not all(held):
+            raise ValueError(
+                "a channel the rule picked holds the rule, masses and apart it measured"
+            )
+        return self
 
 
 def limit_distrusted_by(
@@ -554,10 +584,12 @@ class ImageRef(_Model):
     # takes the median of its own pixels for those two instead, #243).
     background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
-    # #206: the channel it is measured on; None = the mean of its red, green and
-    # blue (Channel.MEAN), as for a gray image and every image imported before.
-    # Left out of the saved form while None, so a project without a choice keeps
-    # its bytes and hash (see "Canonical form" in storage).
+    # #206: the channel it is measured on, picked on import for a colour image
+    # whose channels differ (but a visible-light marker); None = the mean of its
+    # red, green and blue (Channel.MEAN), as for a gray image and every image
+    # imported before Proteia picked a channel. Left out of the saved form while
+    # None, so a project without a choice keeps its bytes and hash (see
+    # "Canonical form" in storage).
     channel: ChannelChoice | None = Field(default=None, exclude_if=lambda v: v is None)
 
     @property
@@ -585,6 +617,17 @@ class ImageRef(_Model):
         """The bit depth its near-limit check runs at, or None where the exact
         one runs or no limit is known (:func:`possible_clipping_depth`)."""
         return possible_clipping_depth(self.bit_depth, self.import_warnings, self.measured_channel)
+
+    @property
+    def exact_on_a_channel(self) -> bool:
+        """Whether its exact over-exposure check runs, or would run, once it is
+        measured on one of its colour channels (#206): an image a channel may
+        be chosen for (:attr:`channel_blocker` None) whose file is lossless and
+        of known depth."""
+        return (
+            self.channel_blocker is None
+            and clipping_depth(self.bit_depth, self.import_warnings, Channel.GREEN) is not None
+        )
 
     @property
     def over_exposure_check(self) -> OverExposureCheck:
@@ -640,7 +683,8 @@ class ImageRef(_Model):
 
     @model_validator(mode="after")
     def _check_channel(self) -> ImageRef:
-        # A choice is made only where operations.set_channel takes one.
+        # A choice is made only where operations.set_channel takes one (and
+        # import_image picks one).
         if self.channel is not None:
             blocker = self.channel_blocker
             if blocker is not None:

@@ -66,6 +66,7 @@ from proteia.core.model import (
     BoxPadding,
     BoxSize,
     CalibrationPointSource,
+    Channel,
     FitMethod,
     ImageKind,
     LadderSide,
@@ -3375,7 +3376,8 @@ def test_an_animation_imported_before_reads_and_measures_as_before(tmp_path, nam
     reopened = ops.open_project(s.folder, autosave=save_to_folder, clock=FakeClock())
     image = reopened.project.batch.find_image(image_id)
     decoded = skimage_io.imread(storage.image_path(reopened.folder, image))
-    expected = quantify.to_grayscale(decoded).astype(np.float64)
+    # On the channel the import picked for it, if it is colour (#206).
+    expected = quantify.to_grayscale(decoded, image.measured_channel).astype(np.float64)
     np.testing.assert_array_equal(reopened.pixels(image_id), expected)
     np.testing.assert_array_equal(reopened.colour_pixels(image_id), decoded)
     if image.width >= 160:  # room for the blot's boxes
@@ -3484,8 +3486,13 @@ def test_a_single_image_tiff_named_otherwise_keeps_the_reader_its_suffix_picks(
     )
     copy = tmp_path / f"copy{suffix}"
     copy.write_bytes(data)
-    by_suffix = quantify.to_grayscale(skimage_io.imread(copy)).astype(np.float64)
-    np.testing.assert_array_equal(s.pixels(image_id), by_suffix)
+    decoded = skimage_io.imread(copy)
+    # Measured on the channel the import picked for it, if it is colour (#206).
+    channel = s.project.batch.find_image(image_id).measured_channel
+    measured = quantify.to_grayscale(decoded, channel).astype(np.float64)
+    np.testing.assert_array_equal(s.pixels(image_id), measured)
+    # What each reader gives, on the mean of the colours it reads.
+    by_suffix = quantify.to_grayscale(decoded).astype(np.float64)
     as_tif = tmp_path / "copy.tif"
     as_tif.write_bytes(data)
     try:
@@ -6481,6 +6488,8 @@ def test_images_whose_limit_cannot_be_trusted_are_not_checked(tmp_path, name, pi
         skio.imsave(source, gray8, check_contrast=False)
     with source.open("rb") as f:
         image = ops.import_image(s, f, name, kind=CHEMI, polarity=DARK)
+    if pixels == "rgb":  # #206 picks red here: measured on the mean, as chosen
+        ops.set_channel(s, image, Channel.MEAN)
     ops.set_lanes(s, [LaneInput("c0")])
     protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
     band = ops.place_box(s, protein, lane_x(0), LANE_ROW, lane_index=0, grow=False)
@@ -6732,11 +6741,15 @@ def test_a_single_colour_export_hides_its_saturation_from_the_grey_mean(tmp_path
     # A known limit: a light-on-dark export in one colour (a green lookup
     # table) saturates its green channel alone, so the grey mean it is assessed
     # on stays at a third of the range. Its bands are assessed with no sign of
-    # it (False), and every one is still reported as not checked.
+    # it (False), and every one is still reported as not checked. Since #206
+    # that holds of such an image imported before Proteia picked its channel:
+    # one imported now is measured on green and checked there exactly.
     s = session_on(tmp_path)
     green = 255 - possible_gray8()
     zeros = np.zeros_like(green)
-    image = import_blot(s, np.stack([zeros, green, zeros], axis=-1), "green blot.tif", LIGHT)
+    rgb = np.stack([zeros, green, zeros], axis=-1)
+    with mock.patch.object(ops, "_picked", lambda read, kind, polarity: None):
+        image = import_blot(s, rgb, "green blot.tif", LIGHT)
     _, band_ids = six_boxes(s, image)
     assert np.count_nonzero(green == 255) > 60
     assert flags(s, band_ids) == ([None] * 6, [False] * 6)
@@ -6744,6 +6757,9 @@ def test_a_single_colour_export_hides_its_saturation_from_the_grey_mean(tmp_path
     assert NoticeCode.POSSIBLY_CLIPPED not in {n.code for n in res.notices}
     [unchecked] = [n for n in res.notices if n.code is NoticeCode.CLIPPING_NOT_CHECKED]
     assert unchecked.lane_indices == tuple(range(6))
+    imported = import_blot(s, rgb, "green blot µ.tif", LIGHT)
+    picked = s.project.batch.find_image(imported)
+    assert (picked.measured_channel, picked.over_exposure_check) == (Channel.GREEN, "exact")
 
 
 REQUANTIFY_HINT = (

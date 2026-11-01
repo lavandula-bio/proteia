@@ -65,6 +65,9 @@ from typing import ClassVar, Final, Literal, NamedTuple
 
 import numpy as np
 import tifffile
+from scipy import ndimage
+
+from proteia.core import channelrule
 
 # Read here too, and by callers of imaging (tools, readings with no image record).
 from proteia.core.model import UNTRUSTED_WARNINGS as UNTRUSTED_WARNINGS
@@ -1057,6 +1060,132 @@ def channels_differ(pixels: np.ndarray) -> bool:
         return False
     red = pixels[..., 0]
     return not (np.array_equal(red, pixels[..., 1]) and np.array_equal(red, pixels[..., 2]))
+
+
+# Pixels per pass of the channel rule's whole-image counts: numpy counts in
+# 8-byte integers, so one pass over the whole image would hold 8 bytes per pixel.
+_PASS_PIXELS: Final = 1 << 18
+_EIGHT_CONNECTED: Final = np.ones((3, 3), dtype=bool)
+
+
+def _passes(shape: tuple[int, ...]) -> list[slice]:
+    """Row slices of an image of ``shape`` covering about :data:`_PASS_PIXELS`
+    pixels each."""
+    rows = max(1, _PASS_PIXELS // max(1, shape[1]))
+    return [slice(start, start + rows) for start in range(0, shape[0], rows)]
+
+
+def _median_of_counts(counts: np.ndarray) -> float:
+    """The median of the integers 0, 1, 2, ... held ``counts`` times each, as
+    numpy's median gives it (the mean of the two middle values of an even
+    count); exact."""
+    total = int(counts.sum())
+    held = np.cumsum(counts)
+    low = int(np.searchsorted(held, (total - 1) // 2, side="right"))
+    high = int(np.searchsorted(held, total // 2, side="right"))
+    return (low + high) / 2
+
+
+def _channel_cut(values: np.ndarray, top: int, dark_on_light: bool) -> float:
+    """A channel's cut (:mod:`~proteia.core.channelrule`, step 2): the median
+    of its signal-up values plus CUT_SIGMAS sigmas, from a histogram of its
+    integer values (the top's minus each, for dark bands on a light
+    background, is the histogram reversed)."""
+    counts = np.zeros(top + 1, dtype=np.int64)
+    for rows in _passes(values.shape):
+        counts += np.bincount(values[rows].ravel(), minlength=top + 1)
+    if dark_on_light:
+        counts = counts[::-1]
+    median = _median_of_counts(counts)
+    # |value - median| doubled is an integer, whether the median is one or a half.
+    doubled = np.abs(2 * np.arange(top + 1, dtype=np.int64) - round(2 * median))
+    deviations = np.zeros(int(doubled.max()) + 1, dtype=np.int64)
+    np.add.at(deviations, doubled, counts)
+    sigma = max(channelrule.MAD_SIGMA * (_median_of_counts(deviations) / 2), channelrule.MIN_SIGMA)
+    return median + channelrule.CUT_SIGMAS * sigma
+
+
+def _height(values: np.ndarray, where: np.ndarray, top: int, cut: float, dark: bool) -> float:
+    """The summed height above ``cut`` of the signal-up values of a channel's
+    pixels ``where`` is set: integers summed exactly, one float step."""
+    total = count = 0
+    for rows in _passes(values.shape):
+        taken = where[rows]
+        count += int(np.count_nonzero(taken))
+        total += int(values[rows][taken].sum(dtype=np.int64))
+    signal = count * top - total if dark else total
+    return signal - count * cut
+
+
+def _kept_regions(values: np.ndarray, top: int, cut: float, dark: bool) -> np.ndarray | None:
+    """The pixels of a channel's kept regions (step 3), or None if it has none:
+    8-connected pixels whose signal-up value is above ``cut`` (below the top's
+    minus it, for dark bands), in regions of MIN_REGION pixels or more."""
+    above = (values < top - cut) if dark else (values > cut)
+    labels, found = ndimage.label(above, structure=_EIGHT_CONNECTED)
+    del above
+    if not found:
+        return None
+    sizes = np.zeros(found + 1, dtype=np.int64)
+    for rows in _passes(labels.shape):
+        sizes += np.bincount(labels[rows].ravel(), minlength=found + 1)
+    keep = sizes >= channelrule.MIN_REGION
+    keep[0] = False  # the background of the labels
+    if not keep.any():
+        return None
+    kept = np.empty(labels.shape, dtype=bool)
+    for rows in _passes(labels.shape):
+        kept[rows] = keep[labels[rows]]
+    return kept
+
+
+def channel_masses(
+    pixels: np.ndarray, bit_depth: int, *, dark_on_light: bool
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """The evidence of the channel rule (:mod:`~proteia.core.channelrule`,
+    steps 1 to 4 and 8) on colour pixels as read (channels last; an alpha
+    channel is not read) of ``bit_depth`` (8 or 16) at a polarity: each of
+    red, green and blue's band mass, and its mass apart from the rule's pick,
+    as a share of the pick's (0 for the pick and for a mean pick).
+
+    One channel at a time, with no copy of the pixels: the histogram and the
+    regions' sizes are counted a band of rows at a time, and a channel's kept
+    regions are held as bits until the pick is known, so the extra memory is
+    about 5 bytes per pixel at most (the labels of one channel's regions)."""
+    top = 2**bit_depth - 1
+    area = pixels.shape[0] * pixels.shape[1]
+    masses: list[float] = []
+    cuts: list[float] = []
+    packed: list[np.ndarray | None] = []
+    for index in range(3):
+        values = pixels[..., index]
+        cut = _channel_cut(values, top, dark_on_light)
+        kept = _kept_regions(values, top, cut, dark_on_light)
+        cuts.append(cut)
+        if kept is None:
+            masses.append(0.0)
+            packed.append(None)
+            continue
+        masses.append(_height(values, kept, top, cut, dark_on_light) / area)
+        packed.append(np.packbits(kept, axis=1))
+        del kept
+    picked = channelrule.pick(masses)
+    apart = [0.0, 0.0, 0.0]
+    if picked is not Channel.MEAN:
+        at = channelrule.COLOURS.index(picked)
+        width = pixels.shape[1]
+        near = ndimage.binary_dilation(
+            np.unpackbits(packed[at], axis=1, count=width).view(bool),
+            structure=_EIGHT_CONNECTED,
+            iterations=channelrule.APART_GAP,
+        )
+        for index, bits in enumerate(packed):
+            if index == at or bits is None:
+                continue
+            far = np.unpackbits(bits, axis=1, count=width).view(bool) & ~near
+            height = _height(pixels[..., index], far, top, cuts[index], dark_on_light)
+            apart[index] = height / area / masses[at]
+    return (masses[0], masses[1], masses[2]), (apart[0], apart[1], apart[2])
 
 
 def to_analysis_array(

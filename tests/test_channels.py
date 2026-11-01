@@ -8,13 +8,16 @@ route, the state the page reads and the previews.
 The images are synthetic: bands in the green channel alone, light on dark as a
 fluorescence scan, or dark on a light membrane, with or without one lane
 saturated in green and a share of green's signal in red. Every import here
-stores no choice, as before #206: the image is measured on the mean of its
-red, green and blue until a channel is chosen for it.
+stores no choice, as before Proteia picked a channel on import (an image of a
+project saved then): the image is measured on the mean of its red, green and
+blue until a channel is chosen for it. The channel rule's picks, on import and
+on a polarity change, are tested in test_channel_rule.py.
 """
 
 import contextlib
 import threading
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -153,11 +156,18 @@ def import_pixels(
     polarity: Polarity = LIGHT,
     *,
     kind: ImageKind = CHEMI,
+    picked: bool = False,
     **options,
 ) -> str:
+    """``pixels`` written to a file and imported; with ``picked``, as Proteia
+    imports now, which picks a colour image's channel; else as it did before
+    then (the image of a project saved before), with no choice."""
     source = write(s.folder.parent / "sources" / name, pixels, **options)
     with source.open("rb") as f:
-        return ops.import_image(s, f, name, kind=kind, polarity=polarity)
+        if picked:
+            return ops.import_image(s, f, name, kind=kind, polarity=polarity)
+        with mock.patch.object(ops, "_picked", lambda read, kind, polarity: None):
+            return ops.import_image(s, f, name, kind=kind, polarity=polarity)
 
 
 def six_boxes(s: ops.ProjectSession, image_id: str, name: str = "GFP α") -> tuple[str, list[str]]:
@@ -174,6 +184,12 @@ def six_boxes(s: ops.ProjectSession, image_id: str, name: str = "GFP α") -> tup
 
 def stored(s: ops.ProjectSession, image_id: str) -> ImageRef:
     return s.project.batch.find_image(image_id)
+
+
+def made(choice: ChannelChoice | None) -> tuple[Channel, ChannelSource] | None:
+    """Which channel a choice is of and who made it (its evidence aside, which
+    test_channel_rule.py checks)."""
+    return None if choice is None else (choice.channel, choice.source)
 
 
 def bands_on(s: ops.ProjectSession, image_id: str) -> list:
@@ -233,7 +249,7 @@ def image_doc(**fields) -> dict:
 
 def test_the_channels_and_sources_are_the_file_format():
     assert [c.value for c in Channel] == ["red", "green", "blue", "mean"]
-    assert [s.value for s in ChannelSource] == ["chosen"]
+    assert [s.value for s in ChannelSource] == ["picked", "chosen"]
 
 
 def test_a_choice_is_left_out_of_the_file_while_there_is_none():
@@ -626,7 +642,7 @@ def test_set_channel_measures_every_band_on_the_image_on_that_channel(tmp_path):
     assert np.array_equal(s._pixels[image], green)
     assert s._pixels[other] is other_pixels
     after = stored(s, image)
-    assert after.channel == ChannelChoice(channel=GREEN, source=ChannelSource.CHOSEN)
+    assert made(after.channel) == (GREEN, ChannelSource.CHOSEN)
     assert after.background == float(np.median(green))
     nets = [band.net for _, band in bands_on(s, image)]
     assert nets == expected_nets(s, image, green)
@@ -670,7 +686,7 @@ def test_set_channel_measures_every_band_on_the_image_on_that_channel(tmp_path):
     assert s.project.log[-1].params["from"] == "green"
     ops.set_channel(s, image, MEAN)
     back = stored(s, image)
-    assert back.channel == ChannelChoice(channel=MEAN, source=ChannelSource.CHOSEN)
+    assert made(back.channel) == (MEAN, ChannelSource.CHOSEN)
     assert back.background == before.background
     assert [band.net for _, band in bands_on(s, image)] == expected_nets(s, image, mean)
     assert flags(s, gfp) == [(None, False)] * 6  # the mean's near-limit check again
@@ -1091,7 +1107,7 @@ def test_a_polarity_change_keeps_the_chosen_channel(tmp_path):
     ops.set_channel(s, image, GREEN)
     ops.set_polarity(s, image, LIGHT)
     after = stored(s, image)
-    assert after.channel == ChannelChoice(channel=GREEN, source=ChannelSource.CHOSEN)
+    assert made(after.channel) == (GREEN, ChannelSource.CHOSEN)
     assert after.background == float(np.median(rgb[..., 1]))
     assert [b.net for b in boxes_of(s, protein).bands] == expected_nets(s, image, rgb[..., 1])
     assert flags(s, protein) == [(False, None)] * 6
@@ -1099,7 +1115,10 @@ def test_a_polarity_change_keeps_the_chosen_channel(tmp_path):
         "image_id": image,
         "polarity": "light_on_dark",
         "dropped_undetected": [],
+        # The choice as stored after it: the evidence measured at the new polarity.
+        "channel": after.channel.model_dump(mode="json"),
     }
+    assert after.channel.masses == imaging.channel_masses(rgb, 8, dark_on_light=False)[0]
     assert_nets_current(s)
 
 
@@ -1266,8 +1285,12 @@ def test_a_chosen_channel_is_saved_and_read_back(tmp_path):
     protein, _ = six_boxes(s, image)
     ops.set_channel(s, image, BLUE)
     images = _images((s.folder / storage.PROJECT_FILE).read_bytes())
-    assert images[0]["channel"] == {"channel": "blue", "source": "chosen"}
+    # With the evidence the channel rule measured for it on the way (it had none).
+    saved = images[0]["channel"]
+    assert sorted(saved) == ["apart", "channel", "masses", "rule", "source"]
+    assert (saved["channel"], saved["source"], saved["rule"]) == ("blue", "chosen", 1)
     reopened = ops.open_project(s.folder, autosave=None)
+    assert reopened.project.batch.find_image(image).channel == stored(s, image).channel
     assert stored(reopened, image).measured_channel is BLUE
     assert np.array_equal(reopened.pixels(image), rgb[..., 2])
     assert_nets_current(reopened)
@@ -1312,7 +1335,7 @@ def test_the_record_says_what_each_image_is_measured_on(tmp_path):
     # the settings say already; nothing changes.
     ops.set_channel(s, tif, GREEN)
     ops.set_channel(s, tif, MEAN)
-    assert stored(s, tif).channel == ChannelChoice(channel=MEAN, source=ChannelSource.CHOSEN)
+    assert made(stored(s, tif).channel) == (MEAN, ChannelSource.CHOSEN)
     assert recorded() == plain
 
     # One channel beside a chosen mean, an unchosen colour image and a gray one.
@@ -1553,15 +1576,22 @@ def _polarity_twice(s, image, protein):
 
 
 def _polarity_unreadable(s, image, protein):
-    # No band, and the file gone: the polarity changes and only looks_processed
-    # may go (the warnings are not read from the file).
+    # No band, and the file gone: a polarity change measures the channels of an
+    # image with a choice again, from its file, so it is refused and nothing
+    # changes; with the file back, the polarity changes.
     ops.clear_boxes(s, protein)
     path = storage.image_path(s.folder, stored(s, image))
     data = path.read_bytes()
     reopened = ops.open_project(s.folder, autosave=save_to_folder)
     path.unlink()
-    ops.set_polarity(reopened, image, DARK)
+    before = reopened.project
+    with pytest.raises(OperationError) as refused:
+        ops.set_polarity(reopened, image, DARK)
+    assert refused.value.code is ErrorCode.IMAGE_FILE_CHANGED
+    assert reopened.project is before
     path.write_bytes(data)
+    ops.set_polarity(reopened, image, DARK)
+    assert stored(reopened, image).polarity is DARK
     return reopened
 
 
@@ -1629,13 +1659,18 @@ def test_a_chosen_channel_keeps_its_basis_through_every_rebuild(tmp_path, path):
 
 
 def test_the_page_has_words_for_whoever_chose_a_channel():
-    # The line under "Measured on" is looked up by who chose the channel: no
-    # one, or each ChannelSource. A member without words would fail the
-    # project state of every image it chose for.
-    from proteia.web import state as web_state
+    # The line under "Measured on" comes from the channel rule's module: words
+    # for no one, and for each ChannelSource on each kind of channel. A member
+    # without words would fail the project state of every image it chose for.
+    from proteia.core import channelrule
 
-    assert set(web_state._CHANNEL_WORDS) == {None, *(source.value for source in ChannelSource)}
-    assert all(web_state._CHANNEL_WORDS.values())
+    evidence = {"rule": 1, "masses": (0.0, 2.0, 0.1), "apart": (0.0, 0.0, 0.0)}
+    lines = {channelrule.line(None)}
+    for source in ChannelSource:
+        for channel in (GREEN, MEAN):
+            choice = ChannelChoice(channel=channel, source=source, **evidence)
+            lines.add(channelrule.line(choice))
+    assert all(lines) and len(lines) == 4  # none; picked green; picked mean; chosen
 
 
 def test_the_state_says_what_each_image_is_measured_on(tmp_path):
