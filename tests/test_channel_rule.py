@@ -18,11 +18,12 @@ instead (the widest range, the most mass without the region filter, the best
 signal to noise, the fewest saturated pixels, the mean alone, the largest
 spread, weighted luminance) picks another on at least one of them.
 
-The tests in the groups marked so pin a choice still pending: a colour image
-whose three channels all hold its bands (every channel's mass at least half
-the largest, painted saturation included) is measured on their mean, and a
-second colour of a two-colour file is measured on a copy of the image imported
-again.
+Two groups pin one setting each, and change with it: the all-carry threshold
+(``all_carry`` of the rule's version: a colour image whose three channels all
+hold its bands, every channel's mass at least half the largest, painted
+saturation included, is measured on their mean), and the way a second colour
+of a two-colour file is measured (on a copy of the image imported again, as
+the channel_signal_elsewhere warning says).
 """
 
 import io
@@ -355,8 +356,9 @@ SCENES = {
     "thin green bands": (thin, "GGGGG"),
 }
 # Images whose three channels all hold their bands: a gray blot saved as a
-# colour JPEG, tinted, and merged with a coloured ladder. These pin a choice
-# still pending (the mean once every channel holds half the largest mass).
+# colour JPEG, tinted, and merged with a coloured ladder. Their picks follow
+# the all-carry threshold (the mean once every channel holds half the largest
+# mass): changing it changes them.
 ALL_CARRY_SCENES = {
     "gray saved as a colour JPEG": (
         lambda seed: Scene(gray_in_colour(seed, (1.0, 1.0, 1.0), 1), fmt="jpg", polarity=DARK),
@@ -463,8 +465,8 @@ def test_each_image_picks_the_channel_that_holds_its_bands(measured):
 
 
 class TestWhenEveryChannelCarries:
-    # These pin a choice still pending: the mean once every channel holds at
-    # least half the largest band mass.
+    # These pin the all-carry threshold (all_carry: the mean once every channel
+    # holds at least half the largest band mass); changing it changes them.
 
     def test_an_image_whose_three_channels_hold_its_bands_is_measured_on_their_mean(self, measured):
         assert _picks(measured, ALL_CARRY_SCENES) == {
@@ -512,9 +514,7 @@ class TestWhenEveryChannelCarries:
         # Lossless, so the exact check would run on one channel: said.
         [unchecked] = [n for n in notices(s) if n.code == "clipping_not_checked"]
         assert unchecked.protein_ids == (protein,)
-        assert unchecked.message.endswith(
-            "; choose the channel that holds its bands for its image to check it there"
-        )
+        assert unchecked.message.endswith(CHOOSE)
 
 
 def test_the_masses_of_one_colour_lie_in_that_channel(measured):
@@ -602,15 +602,16 @@ def test_each_other_rule_weighed_picks_another_channel_somewhere(measured, rule)
 @pytest.mark.parametrize(
     ("patch", "row"),
     [
-        ({"MIN_REGION": 1}, "red specks of 3 px"),  # the region filter takes dust out
-        ({"ALL_CARRY": 2.0}, "gray saved as a colour JPEG"),  # the mean where all carry
+        ({"min_region": 1}, "red specks of 3 px"),  # the region filter takes dust out
+        ({"all_carry": 2.0}, "gray saved as a colour JPEG"),  # the mean where all carry
     ],
 )
 def test_the_rule_without_one_of_its_steps_picks_wrong(tmp_path, patch, row):
     from proteia.core import channelrule
 
     make, must = {**SCENES, **ALL_CARRY_SCENES}[row]
-    with mock.patch.multiple(channelrule, **patch):
+    degraded = channelrule.VERSIONS[channelrule.VERSION]._replace(**patch)
+    with mock.patch.dict(channelrule.VERSIONS, {channelrule.VERSION: degraded}):
         got = "".join(
             LETTERS[channelrule.pick(evidence(make(seed), tmp_path)[0])] for seed in SEEDS
         )
@@ -688,6 +689,43 @@ def test_the_masses_are_counted_alike_in_bands_of_rows(monkeypatch):
     assert whole[0][1][0] > 0.4  # red's target lies apart from green's
 
 
+def _wide_background_red(bridge: int) -> np.ndarray:
+    """A 60 x 80 16-bit image whose red has the median 10000 and the median
+    deviation 5000, so its cut is 10000 + 3 x 1.4826 x 5000 = 32239.0 exactly;
+    two 3 x 5 blocks at 40000 (15 pixels each, too few alone) one pixel apart,
+    that pixel at ``bridge``; green and blue flat."""
+    h, w = 60, 80
+    blocks = [(y, x) for y in range(10, 13) for x in (*range(5, 10), *range(11, 16))]
+    cells = {*blocks, (11, 10)}
+    values = np.array([10000] * 1488 + [5000] * 960 + [15000] * 960 + [25000] * (1392 - 31))
+    np.random.default_rng(3).shuffle(values)
+    red = np.zeros((h, w), dtype=np.uint16)
+    rest = [(y, x) for y in range(h) for x in range(w) if (y, x) not in cells]
+    for (y, x), value in zip(rest, values, strict=True):
+        red[y, x] = value
+    for y, x in blocks:
+        red[y, x] = 40000
+    red[11, 10] = bridge
+    flat_green, flat_blue = np.full((h, w), 3000, np.uint16), np.full((h, w), 3001, np.uint16)
+    return np.stack([red, flat_green, flat_blue], axis=-1)
+
+
+def test_a_pixel_exactly_at_the_cut_is_not_above_it():
+    # Only pixels above the cut make regions: at the cut, the bridge leaves two
+    # regions of 15 pixels, dust; one level above it, one region of 31.
+    at, above = _wide_background_red(32239), _wide_background_red(32240)
+    red = at[..., 0].astype(np.int64)
+    assert np.median(red) == 10000 and np.median(np.abs(red - 10000)) == 5000
+
+    def masses(rgb: np.ndarray, dark: bool) -> tuple[float, float, float]:
+        pixels = 65535 - rgb if dark else rgb  # dark bands on a light background: inverted
+        return imaging.channel_masses(pixels, 16, dark_on_light=dark)[0]
+
+    for dark in (False, True):
+        assert masses(at, dark) == (0.0, 0.0, 0.0)
+        assert masses(above, dark) == ((30 * 40000 + 32240 - 31 * 32239.0) / 4800, 0.0, 0.0)
+
+
 # --- The rule's decision and words ---
 
 
@@ -700,6 +738,32 @@ def test_the_rule_picks_the_largest_mass_red_first_on_a_tie():
     assert channelrule.pick((0.0, 2.0, 2.0)) is GREEN
     assert channelrule.pick((1.0, 0.0, 3.0)) is BLUE
     assert channelrule.pick([0.2, 0.0, 3.0]) is BLUE  # any sequence of three
+
+
+def test_a_stored_choice_is_read_with_the_constants_of_its_version():
+    # A choice keeps the version of the rule that made it, and is read with
+    # that version's constants, whatever version this build measures with: a
+    # later rule changes no saved note. Version 1: a mean pick here (every
+    # channel holds half the largest mass or more), so no other signal.
+    from proteia.core import channelrule
+
+    masses, none = (1.0, 0.6, 0.55), (0.0, 0.0, 0.0)
+    saved = ChannelChoice(channel=GREEN, source=CHOSEN, rule=1, masses=masses, apart=none)
+    assert channelrule.signal_channels(saved) == ()
+    later = channelrule.VERSIONS[1]._replace(all_carry=0.8)
+    with (
+        mock.patch.dict(channelrule.VERSIONS, {2: later}),
+        mock.patch.object(channelrule, "VERSION", 2),
+    ):
+        assert channelrule.signal_channels(saved) == ()
+        now = ChannelChoice(channel=RED, source=PICKED, rule=2, masses=masses, apart=none)
+        assert channelrule.signal_channels(now) == (RED,)
+        assert channelrule.pick(masses) is RED  # this build measures with version 2
+        assert channelrule.pick(masses, 1) is MEAN
+        assert (channelrule.settings()["rule"], channelrule.settings()["all_carry"]) == (2, 0.8)
+    # A version this build does not know (a later build's): nothing is told.
+    unknown = ChannelChoice(channel=GREEN, source=CHOSEN, rule=9, masses=masses, apart=none)
+    assert channelrule.signal_channels(unknown) == ()
 
 
 def _choice(channel, source=PICKED, masses=(0.0, 2.0, 0.0), apart=(0.0, 0.0, 0.0)):
@@ -741,8 +805,9 @@ def test_the_page_line_says_who_chose_the_channel_and_why():
         "Picked by Proteia: all three channels hold its bands."
     )
     assert channelrule.line(_choice(MEAN, masses=(0.0, 0.0, 0.0))) == (
-        "Picked by Proteia: no channel held bands above its background. Choose the channel that"
-        " holds its bands to measure it there (its boxes are measured again)."
+        "Picked by Proteia: no channel held bands above its background. Check its polarity"
+        " (Bands are), or choose the channel that holds its bands to measure it there (its"
+        " boxes are measured again)."
     )
     assert channelrule.line(_choice(RED, CHOSEN)) == "Chosen by you."
     assert channelrule.line(ChannelChoice(channel=MEAN, source=CHOSEN)) == "Chosen by you."
@@ -753,7 +818,11 @@ def test_the_page_line_says_who_chose_the_channel_and_why():
 
 
 IMAGEJ = " To compare with ImageJ, measure the same channel (Image > Color > Split Channels)"
-CHOOSE = "; choose the channel that holds its bands for its image to check it there"
+CHOOSE = (
+    "; choose the channel that holds its bands for its image to check it there (if the imager"
+    " marked saturated pixels in a colour, the channel in which those marks look like the"
+    " strongest part of the band)"
+)
 
 
 def test_the_note_says_what_an_image_is_measured_on():
@@ -780,8 +849,9 @@ def test_the_note_says_what_an_image_is_measured_on():
     )
     assert channelrule.note(_choice(MEAN, masses=(0.0, 0.0, 0.0)), name) == (
         "'GFP α.png' is measured on the mean of its red, green and blue: no channel held bands"
-        " above its background when Proteia picked its channel; if its bands are of one colour,"
-        " choose that channel for it under Images"
+        " above its background when Proteia picked its channel; check that its polarity (Bands"
+        " are, under Images) matches its bands, or, if its bands are of one colour, choose that"
+        " channel for it under Images"
     )
     assert channelrule.note(None, name) == (
         "'GFP α.png' is measured on the mean of its red, green and blue, as Proteia measured"
@@ -791,8 +861,9 @@ def test_the_note_says_what_an_image_is_measured_on():
 
 
 class TestASecondColourOnACopy:
-    # These pin a choice still pending: a second colour of a two-colour file
-    # is measured on a copy of the image, imported again into the project.
+    # These pin how a second colour of a two-colour file is measured: on a
+    # copy of the image, imported again into the project, as the
+    # channel_signal_elsewhere warning says; changing that wording changes them.
 
     def test_the_warning_names_the_channel_and_the_way_to_measure_it(self):
         from proteia.core import channelrule
@@ -1042,27 +1113,55 @@ def test_a_band_saturated_in_the_channel_picked_is_flagged_and_named(tmp_path, m
     )
 
 
+def _flag_on_the_mean(tmp_path: Path, name: str, seed: int) -> str:
+    """Lane 4's flag on a painted export as imported (measured on the mean,
+    which the all-carry group pins): ``C`` clipped, ``p`` possibly clipped,
+    ``.`` neither."""
+    s = session_on(tmp_path / f"{seed}")
+    scene = PAINTED[name](seed)
+    image = import_scene(s, scene, f"painted µ.{scene.fmt}")
+    band = protein_bands(s, boxes(s, image, "β-actin", ROW_A))[SATURATED_LANE]
+    return "C" if band.clipped else "p" if band.possibly_clipped else "."
+
+
+# Lane 4's flag on each painted export as imported, seed by seed: what the
+# near-limit check of the mean sees of saturation painted in a colour.
+PAINTED_FLAGS = {
+    "PNG light on dark, a tenth painted red": "ppppp",
+    "PNG dark on light, 1% painted blue": "....p",
+    "JPEG light on dark, a tenth painted green": ".....",
+    "JPEG dark on light, a tenth painted green": ".....",
+}
+
+
+@pytest.mark.parametrize("name", list(PAINTED_FLAGS))
+def test_painted_saturation_on_the_mean_is_flagged_as_measured(tmp_path, name):
+    flags = "".join(_flag_on_the_mean(tmp_path, name, seed) for seed in SEEDS)
+    assert flags == PAINTED_FLAGS[name]
+
+
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "a known limit: an export that paints its saturated pixels in a colour is measured on"
-        " the mean, where a painted pixel is a third of the limit, so the lane is not flagged;"
-        " measured on a channel that keeps the saturated pixels at the limit, it is"
+        " the mean, where a painted pixel is a third of the limit, so the lane may go"
+        " unflagged; measured on a channel that keeps the saturated pixels at the limit, it is"
     ),
 )
 @pytest.mark.parametrize(
-    "name", ["JPEG light on dark, a tenth painted green", "PNG dark on light, 1% painted blue"]
+    ("name", "seed"),
+    [
+        (name, seed)
+        for name, flags in PAINTED_FLAGS.items()
+        for seed, flag in zip(SEEDS, flags, strict=True)
+        if flag == "."
+    ],
 )
-def test_a_lane_whose_saturated_pixels_the_imager_painted_in_a_colour_is_flagged(tmp_path, name):
-    flagged = []
-    for seed in SEEDS:
-        s = session_on(tmp_path / str(seed))
-        scene = PAINTED[name](seed)
-        image = import_scene(s, scene, f"painted µ.{scene.fmt}")
-        protein = boxes(s, image, "β-actin", ROW_A)
-        band = protein_bands(s, protein)[SATURATED_LANE]
-        flagged.append(bool(band.clipped or band.possibly_clipped))
-    assert flagged == [True] * 5
+def test_a_lane_whose_saturated_pixels_the_imager_painted_in_a_colour_is_flagged(
+    tmp_path, name, seed
+):
+    assert _flag_on_the_mean(tmp_path, name, seed) != "."
 
 
 @pytest.mark.parametrize(
@@ -1070,6 +1169,7 @@ def test_a_lane_whose_saturated_pixels_the_imager_painted_in_a_colour_is_flagged
     [
         ("JPEG light on dark, a tenth painted green", GREEN),  # painted at 255 in green
         ("PNG dark on light, 1% painted blue", RED),  # red stays at 0 under blue paint
+        ("JPEG dark on light, a tenth painted green", RED),  # so does red under green
     ],
 )
 def test_measured_on_a_channel_that_keeps_painted_saturation_the_lane_is_flagged(
@@ -1087,6 +1187,42 @@ def test_measured_on_a_channel_that_keeps_painted_saturation_the_lane_is_flagged
         assert [bool(b.clipped or b.possibly_clipped) for b in bands] == [
             False, False, False, True, False, False
         ]  # fmt: skip
+
+
+def _as_n3_says(pixels: np.ndarray, dark: bool) -> Channel:
+    """The channel ``clipping_not_checked`` tells the user to choose on an
+    image whose imager marked its saturated pixels in a colour: the one in
+    which those marks (the pixels whose red, green and blue differ, on a gray
+    blot) look like the strongest part of the band in lane 4."""
+    rgb = pixels[..., :3].astype(np.int64)
+    marks = (rgb[..., 0] != rgb[..., 1]) | (rgb[..., 1] != rgb[..., 2])
+    x, y = int(LANE_X[SATURATED_LANE]), int(ROW_A)
+    box = np.zeros(marks.shape, dtype=bool)
+    box[y - BOX.height // 2 : y + BOX.height // 2, x - BOX.width // 2 : x + BOX.width // 2] = True
+    assert marks[box].any() and not marks[~box].any()
+    for index, channel in enumerate((RED, GREEN, BLUE)):
+        marked, band = rgb[..., index][box & marks], rgb[..., index][box & ~marks]
+        if (marked.max() <= band.min()) if dark else (marked.min() >= band.max()):
+            return channel
+    raise AssertionError("no channel shows the marks as the strongest part of the band")
+
+
+@pytest.mark.parametrize("name", [name for name in PAINTED if name.startswith("PNG")])
+def test_following_the_next_step_on_a_painted_export_checks_the_marked_lane(tmp_path, name):
+    # On a lossless colour image measured on the mean, clipping_not_checked
+    # says to choose a channel to check it exactly. The channel that holds its
+    # bands is any of the three on a painted export, and the two where a mark
+    # reads 0 against the band hide its saturation: the step says which one.
+    for seed in SEEDS:
+        s = session_on(tmp_path / str(seed))
+        scene = PAINTED[name](seed)
+        image = import_scene(s, scene, "painted µ.png")
+        protein = boxes(s, image, "β-actin", ROW_A)
+        [unchecked] = [n for n in notices(s) if n.code == "clipping_not_checked"]
+        assert unchecked.message.endswith(CHOOSE)
+        ops.set_channel(s, image, _as_n3_says(read_pixels(s, image), scene.polarity is DARK))
+        flagged = [band.clipped for band in protein_bands(s, protein)]
+        assert flagged == [False, False, False, True, False, False]
 
 
 def test_the_clipped_notice_of_a_gray_image_is_as_before():
@@ -1138,7 +1274,10 @@ def test_a_polarity_change_picks_the_channel_again(tmp_path):
     image = import_scene(s, scene, "GFP α.png")
     assert stored(s, image).measured_channel is MEAN
     protein = boxes(s, image, "GFP α", ROW_A)
-    ops.set_polarity(s, image, LIGHT)
+    # Its note says what to check first: its polarity, which is wrong here.
+    [note] = messages(s, "colour_channel")
+    assert "; check that its polarity (Bands are, under Images) matches its bands, or," in note
+    ops.set_polarity(s, image, LIGHT)  # as the note says
     found = stored(s, image)
     pixels = read_pixels(s, image)
     masses, apart = imaging.channel_masses(pixels, 8, dark_on_light=False)
@@ -1195,6 +1334,28 @@ def test_a_polarity_change_reads_the_file_once_and_keeps_the_array_it_made(tmp_p
     assert nets(s, protein) == expected(s, image, np.asarray(green), protein)
 
 
+def test_a_polarity_change_of_an_uncached_image_reads_its_file_once(tmp_path, monkeypatch):
+    # After the project is opened, nothing is cached: the read that measures
+    # the channels again also gives the array its bands are measured on.
+    s = session_on(tmp_path, save_to_folder)
+    tinted = import_scene(s, ALL_CARRY_SCENES["tinted gray"][0](1), "tinted µ.png")
+    green = import_scene(s, one_colour(1, 1), "GFP α.png")
+    a, b = boxes(s, tinted, "a", ROW_A), boxes(s, green, "b", ROW_A)
+    ops.set_channel(s, green, RED)  # chosen: it stays
+    s.save()
+    reopened = ops.open_project(s.folder, autosave=save_to_folder)
+    reads = _counting_reads(monkeypatch)
+    ops.set_polarity(reopened, tinted, LIGHT)  # all three channels still hold the bands
+    assert stored(reopened, tinted).measured_channel is MEAN
+    ops.set_polarity(reopened, green, DARK)
+    assert reads == [stored(reopened, tinted).file, stored(reopened, green).file]
+    for image, protein, plane in (
+        (tinted, a, read_pixels(reopened, tinted)[..., :3].mean(axis=-1)),
+        (green, b, read_pixels(reopened, green)[..., 0].astype(np.float64)),
+    ):
+        assert nets(reopened, protein) == expected(reopened, image, plane, protein)
+
+
 def test_a_float_colour_image_imported_before_224_is_chosen_without_evidence(tmp_path):
     # Pixels of no known bit depth have no range to measure the masses in: the
     # import stored no choice then, and a choice now holds no evidence.
@@ -1228,20 +1389,78 @@ def test_a_polarity_change_keeps_a_chosen_channel_and_measures_its_evidence_agai
     assert (after.masses, after.apart) == (masses, apart) != (before.masses, before.apart)
 
 
-def test_a_polarity_change_of_a_picked_image_with_its_file_gone_is_refused(tmp_path):
-    s = session_on(tmp_path)
-    image = import_scene(s, one_colour(1, 1), "GFP α.png")
+@pytest.mark.parametrize("how", ["missing", "changed"])
+@pytest.mark.parametrize("which", ["picked, no band", "gray, with bands"])
+def test_a_polarity_change_with_its_file_gone_names_it_and_the_way_back(tmp_path, how, which):
+    # A polarity change reads the image's file: a channel picked or chosen is
+    # measured again from it, and bands are measured again on it. While it is
+    # missing or changed the change is refused, naming the image as imported,
+    # the file to put back and the step after; following them, it is made.
+    s = session_on(tmp_path, save_to_folder)
+    if which == "gray, with bands":
+        image = import_scene(s, gray_as_rgb(1), "gray µ.png")
+        boxes(s, image, "β-actin", ROW_A)
+    else:
+        image = import_scene(s, one_colour(1, 1), "GFP α.png")
+    s.save()
+    s = ops.open_project(s.folder, autosave=save_to_folder)  # nothing read yet
+    original = tmp_path / "the original"
     path = storage.image_path(s.folder, stored(s, image))
-    data = path.read_bytes()
-    path.unlink()
+    original.write_bytes(path.read_bytes())
+    if how == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"0" + original.read_bytes()[1:])
+    polarity = LIGHT if stored(s, image).polarity is DARK else DARK
     before = s.project
     with pytest.raises(OperationError) as refused:
-        ops.set_polarity(s, image, DARK)
-    assert refused.value.code is ErrorCode.IMAGE_FILE_CHANGED
+        ops.set_polarity(s, image, polarity)
+    assert (refused.value.code, refused.value.ids) == (ErrorCode.IMAGE_FILE_CHANGED, (image,))
+    name, file = repr(stored(s, image).original_name), stored(s, image).file
+    assert str(refused.value) == (
+        f"{name} cannot change polarity: its file in the project's images folder, {file}, is"
+        " missing or was changed outside Proteia, and a polarity change reads it; put the"
+        f" original file back there as {file}, then change the polarity again"
+    )
     assert s.project is before
-    path.write_bytes(data)  # as the refusal's next step: the file back
-    ops.set_polarity(s, image, DARK)
-    assert stored(s, image).measured_channel is MEAN  # nothing above the background dark on light
+    # As it says: the original file back in the images folder, under that name.
+    (s.folder / "images" / file).write_bytes(original.read_bytes())
+    ops.set_polarity(s, image, polarity)
+    assert stored(s, image).polarity is polarity
+
+
+@pytest.mark.parametrize("which", ["picked, no band", "gray, with bands"])
+def test_a_polarity_change_of_an_unreadable_file_is_refused_in_reading_s_words(
+    tmp_path, monkeypatch, which
+):
+    # A file that is there with its bytes but cannot be decoded is refused as
+    # every read of an imported image is (UNREADABLE_IMAGE, the image named as
+    # imported); the words about putting a missing file back do not apply.
+    import proteia.core.session as session_module
+
+    s = session_on(tmp_path, save_to_folder)
+    if which == "gray, with bands":
+        image = import_scene(s, gray_as_rgb(1), "gray µ.png")
+        boxes(s, image, "β-actin", ROW_A)
+    else:
+        image = import_scene(s, one_colour(1, 1), "GFP α.png")
+    s.save()
+    s = ops.open_project(s.folder, autosave=save_to_folder)  # nothing read yet
+    polarity = LIGHT if stored(s, image).polarity is DARK else DARK
+    before = s.project
+
+    def damaged(path):
+        raise ValueError("a damaged file")
+
+    with monkeypatch.context() as m:
+        m.setattr(imaging, "read_file", damaged)
+        m.setattr(session_module, "read_file", damaged)
+        with pytest.raises(OperationError) as refused:
+            ops.set_polarity(s, image, polarity)
+    assert refused.value.code is ErrorCode.UNREADABLE_IMAGE
+    assert repr(stored(s, image).original_name) in str(refused.value)
+    assert "cannot change polarity" not in str(refused.value)
+    assert s.project is before
 
 
 def test_an_older_colour_image_changes_polarity_with_its_file_gone(tmp_path):
@@ -1333,15 +1552,9 @@ def test_choosing_a_channel_for_an_older_image_measures_its_evidence_on_one_read
     with mock.patch.object(ops, "_picked", lambda read, kind, polarity: None):
         image = import_scene(s, two_targets(2, AMPS, tuple(2 * a for a in AMPS)), "two µ.png")
     protein = boxes(s, image, "β-catenin", ROW_B)
-    reads = []
-    real = imaging.read_file
-    monkeypatch.setattr(imaging, "read_file", lambda path: reads.append(path) or real(path))
-    import proteia.core.session as session_module
-
-    monkeypatch.setattr(session_module, "read_file", imaging.read_file)
+    reads = _counting_reads(monkeypatch)
     ops.set_channel(s, image, GREEN)
     assert len(reads) == 1
-    monkeypatch.undo()
     pixels = read_pixels(s, image)
     masses, apart = imaging.channel_masses(pixels, 8, dark_on_light=False)
     assert stored(s, image).channel == ChannelChoice(
@@ -1477,8 +1690,7 @@ def test_an_older_colour_image_s_note_says_it_is_measured_as_before(tmp_path):
     assert unchecked.message == (
         "'GFP α' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has"
         " color channels averaged into gray, so saturated pixels cannot be counted; if it is"
-        " over-exposed there, its net is an under-estimate; choose the channel that holds its"
-        " bands for its image to check it there"
+        " over-exposed there, its net is an under-estimate" + CHOOSE
     )
 
 
@@ -1589,7 +1801,7 @@ def test_the_golden_colour_project_opens_as_before_and_says_so():
 def test_the_rule_on_a_large_image_stays_within_its_time_and_memory(tmp_path):
     # 2000 x 3000 16-bit RGB: measured at about 0.23 s and 30.2 MB traced
     # beyond the pixels (most of it one channel's region labels); bounded here
-    # with margin for slower machines.
+    # with margin for slower machines, on the faster of two calls.
     rng = np.random.default_rng(7)
     h, w = 2000, 3000
     yy, xx = np.mgrid[0:h, 0:w]
@@ -1605,14 +1817,16 @@ def test_the_rule_on_a_large_image_stays_within_its_time_and_memory(tmp_path):
     del field, channels
     for dark in (False, True):
         image = 65535 - pixels if dark else pixels
-        start = time.perf_counter()
-        masses, _ = imaging.channel_masses(image, 16, dark_on_light=dark)
-        took = time.perf_counter() - start
+        took = []
+        for _ in range(2):
+            start = time.perf_counter()
+            masses = imaging.channel_masses(image, 16, dark_on_light=dark)[0]
+            took.append(time.perf_counter() - start)
         tracemalloc.start()
         before, _ = tracemalloc.get_traced_memory()
         imaging.channel_masses(image, 16, dark_on_light=dark)
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         assert masses[1] > masses[0] > 0 and masses[2] == 0.0
-        assert took < 2.0
+        assert min(took) < 1.0
         assert peak - before < 40 * 2**20

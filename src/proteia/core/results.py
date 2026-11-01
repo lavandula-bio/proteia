@@ -1351,8 +1351,9 @@ def _clipping_not_checked(
     either, although its image's range is known (:func:`_unassessed`: measured
     before #112), it says to requantify. Where the exact check would run on one
     of its image's channels, on a lossless colour image measured on the mean
-    (:attr:`~proteia.core.model.ImageRef.exact_on_a_channel`), it says to
-    choose the one that holds its bands (#206)."""
+    (:attr:`~proteia.core.model.ImageRef.exact_on_a_channel`), it says which
+    one to choose, in the channel rule's words
+    (:data:`~proteia.core.channelrule.TO_CHECK`, #206)."""
     unchecked = tuple(
         i
         for i, band in enumerate(bands)
@@ -1372,7 +1373,7 @@ def _clipping_not_checked(
         )
     channel = ""
     if image.measured_channel is model.Channel.MEAN and image.exact_on_a_channel:
-        channel = "; choose the channel that holds its bands for its image to check it there"
+        channel = f"; {channelrule.TO_CHECK}"
     note(
         NoticeCode.CLIPPING_NOT_CHECKED,
         f"{protein.name!r} was not checked for over-exposure in {lanes_phrase(unchecked)}"

@@ -2468,11 +2468,20 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     the rule picked is picked again, and if that is another channel the image
     is measured on it, with its median, as a channel change measures it
     (:func:`set_channel`); a channel the user chose stays, with the evidence
-    measured again. Its file must then be read, as for an image with bands: a
-    missing or changed one is refused as reading it is
-    (``IMAGE_FILE_CHANGED``, ``UNREADABLE_IMAGE``), and nothing changes. The
-    log entry names such an image's choice as stored after the change
-    (``channel``); an image with no choice logs none, as before.
+    measured again. One read of the file serves both: the evidence and the
+    array its bands are measured on, which the session then keeps. The
+    choice's evidence cannot be dropped instead, for a chosen channel either:
+    nothing would measure it again, and a second target's warning would be
+    lost with no word.
+
+    The file is read for an image with a choice or with bands: while it is
+    missing, changed or of another size the change is refused
+    (``IMAGE_FILE_CHANGED``, :data:`_POLARITY_FILE`: the image as imported, the
+    file to put back in the images folder and the step after) and nothing
+    changes; a damaged one, or one read in a way this version no longer
+    reads, as reading it is refused (``UNREADABLE_IMAGE``). The log entry names
+    such an image's choice as stored after the change (``channel``); an image
+    with no choice logs none, as before.
     """
     polarity = _member(Polarity, polarity, "polarity")
     batch = session.project.batch
@@ -2484,20 +2493,19 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
     channel = image.measured_channel
     array = None
     if choice is not None:
-        pixels = session.file_pixels(image_id)
+        pixels = _read_for_polarity(image, lambda: session.file_pixels(image_id))
         found = _evidence(pixels, polarity)
         if found is not None:
             picked, evidence = found
             if choice.source is ChannelSource.PICKED:
                 channel = picked
             choice = ChannelChoice(channel=channel, source=choice.source, **evidence)
-            if channel is not image.measured_channel or not bands:
-                array = to_analysis_array(pixels, channel=channel)[0]
+            array = to_analysis_array(pixels, channel=channel)[0]
             if channel is not image.measured_channel:
                 background = estimate_background(array)
-                kept = {image_id: array} if bands else None
+            kept = {image_id: array} if bands else None
     if array is None and bands:
-        array = session.pixels(image_id)
+        array = _read_for_polarity(image, lambda: session.pixels(image_id))
     warnings = _processed_again(
         session, image, array, polarity=polarity, channel=channel, background=background
     )
@@ -2524,6 +2532,28 @@ def set_polarity(session: ProjectSession, image_id: str, polarity: Polarity) -> 
         return logged
 
     _apply(session, "set_polarity", change, params, add_pixels=kept)
+
+
+# A polarity change refused while the image's stored file is missing, changed
+# or of another size (IMAGE_FILE_CHANGED): the image named as imported, and
+# the stored file named, the one name under which putting the file back works.
+_POLARITY_FILE: Final = (
+    "{name} cannot change polarity: its file in the project's images folder, {file}, is missing"
+    " or was changed outside Proteia, and a polarity change reads it; put the original file"
+    " back there as {file}, then change the polarity again"
+)
+
+
+def _read_for_polarity[T](image: ImageRef, read: Callable[[], T]) -> T:
+    """``read()`` of the image's stored file for a polarity change, its
+    ``IMAGE_FILE_CHANGED`` refusal said in :data:`_POLARITY_FILE`'s words."""
+    try:
+        return read()
+    except OperationError as exc:
+        if exc.code is not ErrorCode.IMAGE_FILE_CHANGED:
+            raise
+        message = _POLARITY_FILE.format(name=repr(image.original_name), file=image.file)
+        raise OperationError(ErrorCode.IMAGE_FILE_CHANGED, message, ids=(image.id,)) from exc
 
 
 def _measure_again(
@@ -2564,11 +2594,13 @@ def _processed_again(
     (:func:`~proteia.core.imaging.assess_processed`), from its analysis array
     on that channel (``array``; None, for the channel it is measured on only,
     reads it now without keeping it, since an image with no band has no other
-    use for it) and its file's header. An image whose
-    file cannot be read loses a ``looks_processed`` assessed for the old
+    use for it) and its file's header. An image whose file cannot be read here
+    (one with no band and no channel choice, whose array :func:`set_polarity`
+    does not need; for any other it has the array, or refuses the change while
+    the file cannot be read) loses a ``looks_processed`` assessed for the old
     polarity, which would name the wrong limit, and keeps its other warnings:
-    with no band to re-quantify, its polarity changes as before #127, and every
-    analysis of it is refused until the file is back."""
+    its polarity changes as before #127, and every analysis of it is refused
+    until the file is back."""
     try:
         if array is None:
             array = session.pixels(image.id, keep=False)

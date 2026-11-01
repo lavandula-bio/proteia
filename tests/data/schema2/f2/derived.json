@@ -220,7 +220,7 @@
      "image_ids": [],
      "lane_indices": [0, 1, 2, 3, 4, 5],
      "level": "warning",
-     "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it; choose the channel that holds its bands for its image to check it there",
+     "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it; choose the channel that holds its bands for its image to check it there (if the imager marked saturated pixels in a colour, the channel in which those marks look like the strongest part of the band)",
      "protein_ids": ["prot-12"]
     },
     {
@@ -229,7 +229,7 @@
      "image_ids": [],
      "lane_indices": [0, 1, 2, 3, 4, 5],
      "level": "warning",
-     "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate; choose the channel that holds its bands for its image to check it there",
+     "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate; choose the channel that holds its bands for its image to check it there (if the imager marked saturated pixels in a colour, the channel in which those marks look like the strongest part of the band)",
      "protein_ids": ["prot-19"]
     },
     {
@@ -341,7 +341,7 @@
     "image_ids": [],
     "lane_indices": [0, 1, 2, 3, 4, 5],
     "level": "warning",
-    "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it; choose the channel that holds its bands for its image to check it there",
+    "message": "'α-tubulin' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate, which biases every value normalized to it; choose the channel that holds its bands for its image to check it there (if the imager marked saturated pixels in a colour, the channel in which those marks look like the strongest part of the band)",
     "protein_ids": ["prot-12"]
    },
    {
@@ -350,7 +350,7 @@
     "image_ids": [],
     "lane_indices": [0, 1, 2, 3, 4, 5],
     "level": "warning",
-    "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate; choose the channel that holds its bands for its image to check it there",
+    "message": "'p53 µ' was not checked for over-exposure in lanes 1, 2, 3, 4, 5, 6: its image has color channels averaged into gray, so saturated pixels cannot be counted; if it is over-exposed there, its net is an under-estimate; choose the channel that holds its bands for its image to check it there (if the imager marked saturated pixels in a colour, the channel in which those marks look like the strongest part of the band)",
     "protein_ids": ["prot-19"]
    },
    {

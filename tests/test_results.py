@@ -1661,7 +1661,11 @@ RETAKE = "check the imager's original capture, or shorten the exposure and image
 
 # The next step of clipping_not_checked on a lossless colour image measured on
 # the mean (#206).
-CHOOSE = "; choose the channel that holds its bands for its image to check it there"
+CHOOSE = (
+    "; choose the channel that holds its bands for its image to check it there (if the imager"
+    " marked saturated pixels in a colour, the channel in which those marks look like the"
+    " strongest part of the band)"
+)
 
 
 def _image(image_id: str, bit_depth: int | None, *warnings: dict) -> Callable[[Project], None]:

@@ -270,8 +270,8 @@ def test_settings_are_the_code_constants():
             "values": "gray: the mean of red, green and blue for colour",
         },
         # How a colour image's channel is picked (#206): the channel rule, version
-        # 1. Its all_carry (0.5) pins a choice still pending (the mean once every
-        # channel holds at least half the largest mass).
+        # 1, with its all-carry threshold (0.5: the mean once every channel holds
+        # at least half the largest mass), which test_channel_rule.py pins too.
         "channel": {
             "rule": 1,
             "picks_for": (

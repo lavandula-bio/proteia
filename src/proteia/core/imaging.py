@@ -1086,11 +1086,13 @@ def _median_of_counts(counts: np.ndarray) -> float:
     return (low + high) / 2
 
 
-def _channel_cut(values: np.ndarray, top: int, dark_on_light: bool) -> float:
+def _channel_cut(
+    values: np.ndarray, top: int, dark_on_light: bool, rule: channelrule.Constants
+) -> float:
     """A channel's cut (:mod:`~proteia.core.channelrule`, step 2): the median
-    of its signal-up values plus CUT_SIGMAS sigmas, from a histogram of its
-    integer values (the top's minus each, for dark bands on a light
-    background, is the histogram reversed)."""
+    of its signal-up values plus the ``rule``'s ``cut_sigmas`` sigmas, from a
+    histogram of its integer values (the top's minus each, for dark bands on a
+    light background, is the histogram reversed)."""
     counts = np.zeros(top + 1, dtype=np.int64)
     for rows in _passes(values.shape):
         counts += np.bincount(values[rows].ravel(), minlength=top + 1)
@@ -1101,8 +1103,8 @@ def _channel_cut(values: np.ndarray, top: int, dark_on_light: bool) -> float:
     doubled = np.abs(2 * np.arange(top + 1, dtype=np.int64) - round(2 * median))
     deviations = np.zeros(int(doubled.max()) + 1, dtype=np.int64)
     np.add.at(deviations, doubled, counts)
-    sigma = max(channelrule.MAD_SIGMA * (_median_of_counts(deviations) / 2), channelrule.MIN_SIGMA)
-    return median + channelrule.CUT_SIGMAS * sigma
+    sigma = max(rule.mad_sigma * (_median_of_counts(deviations) / 2), rule.min_sigma)
+    return median + rule.cut_sigmas * sigma
 
 
 def _height(values: np.ndarray, where: np.ndarray, top: int, cut: float, dark: bool) -> float:
@@ -1117,10 +1119,12 @@ def _height(values: np.ndarray, where: np.ndarray, top: int, cut: float, dark: b
     return signal - count * cut
 
 
-def _kept_regions(values: np.ndarray, top: int, cut: float, dark: bool) -> np.ndarray | None:
+def _kept_regions(
+    values: np.ndarray, top: int, cut: float, dark: bool, min_region: int
+) -> np.ndarray | None:
     """The pixels of a channel's kept regions (step 3), or None if it has none:
     8-connected pixels whose signal-up value is above ``cut`` (below the top's
-    minus it, for dark bands), in regions of MIN_REGION pixels or more."""
+    minus it, for dark bands), in regions of ``min_region`` pixels or more."""
     above = (values < top - cut) if dark else (values > cut)
     labels, found = ndimage.label(above, structure=_EIGHT_CONNECTED)
     del above
@@ -1129,7 +1133,7 @@ def _kept_regions(values: np.ndarray, top: int, cut: float, dark: bool) -> np.nd
     sizes = np.zeros(found + 1, dtype=np.int64)
     for rows in _passes(labels.shape):
         sizes += np.bincount(labels[rows].ravel(), minlength=found + 1)
-    keep = sizes >= channelrule.MIN_REGION
+    keep = sizes >= min_region
     keep[0] = False  # the background of the labels
     if not keep.any():
         return None
@@ -1146,12 +1150,15 @@ def channel_masses(
     steps 1 to 4 and 8) on colour pixels as read (channels last; an alpha
     channel is not read) of ``bit_depth`` (8 or 16) at a polarity: each of
     red, green and blue's band mass, and its mass apart from the rule's pick,
-    as a share of the pick's (0 for the pick and for a mean pick).
+    as a share of the pick's (0 for the pick and for a mean pick); with the
+    constants of the version this build measures with
+    (:data:`~proteia.core.channelrule.VERSION`).
 
     One channel at a time, with no copy of the pixels: the histogram and the
     regions' sizes are counted a band of rows at a time, and a channel's kept
     regions are held as bits until the pick is known, so the extra memory is
     about 5 bytes per pixel at most (the labels of one channel's regions)."""
+    rule = channelrule.constants()
     top = 2**bit_depth - 1
     area = pixels.shape[0] * pixels.shape[1]
     masses: list[float] = []
@@ -1159,8 +1166,8 @@ def channel_masses(
     packed: list[np.ndarray | None] = []
     for index in range(3):
         values = pixels[..., index]
-        cut = _channel_cut(values, top, dark_on_light)
-        kept = _kept_regions(values, top, cut, dark_on_light)
+        cut = _channel_cut(values, top, dark_on_light, rule)
+        kept = _kept_regions(values, top, cut, dark_on_light, rule.min_region)
         cuts.append(cut)
         if kept is None:
             masses.append(0.0)
@@ -1177,7 +1184,7 @@ def channel_masses(
         near = ndimage.binary_dilation(
             np.unpackbits(packed[at], axis=1, count=width).view(bool),
             structure=_EIGHT_CONNECTED,
-            iterations=channelrule.APART_GAP,
+            iterations=rule.apart_gap,
         )
         for index, bits in enumerate(packed):
             if index == at or bits is None:
