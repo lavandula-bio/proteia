@@ -18,8 +18,9 @@ import numpy as np
 import pytest
 
 from conftest import make_project, synthetic_blot
+from proteia.core import ladders, storage
 from proteia.core import operations as ops
-from proteia.core import storage
+from proteia.core import session as session_module
 from proteia.core.model import (
     Arena,
     ArenaSource,
@@ -35,7 +36,13 @@ from proteia.core.operations import ErrorCode, LaneInput, OperationError, RingCo
 from proteia.core.project import lane_anchors
 from proteia.core.results import compute_results
 from proteia.core.storage import content_hash
-from test_operations import assert_mw_current, assert_nets_current, import_blot, session_on
+from test_operations import (
+    assert_mw_current,
+    assert_nets_current,
+    import_blot,
+    plant,
+    session_on,
+)
 
 STRIPS = "two strips µ.tif"
 CHEMI_MARKER = CalibrationPointSource.CHEMILUMINESCENCE_MARKER
@@ -48,6 +55,12 @@ CUT_STEP = (
     " its edges, its fourth edge across the area with each protein's boxes all on one side of"
     " it, and the far side becomes a new membrane's area with what lies there; or move or"
     " remove them first"
+)
+# The next step of the same refusal for an outline that cuts its area: what
+# lies past the cut with the rest of its row inside stays.
+CUT_DRAWN = (
+    ", and a cut takes each row to one side whole; draw its edge across the area past"
+    " them, or move or remove them first"
 )
 
 
@@ -240,7 +253,7 @@ def test_an_outline_that_strands_boxes_names_them(tmp_path):
     )
     assert str(error) == (
         "the new outline would leave the boxes of 'GAPDH' in lanes 2, 3 and the 100 kDa ladder"
-        f" mark on {STRIPS!r} outside membrane 1's area" + CUT_STEP
+        f" mark on {STRIPS!r} outside membrane 1's area" + CUT_DRAWN
     )
     assert error.ids == ("arena-4", bands[1], bands[2])
     assert error.detail["band_ids"] == bands[1:]
@@ -437,7 +450,7 @@ def test_a_cut_needs_each_row_on_one_side(tmp_path):
     )
     assert str(error) == (
         "the new outline would leave the box of 'β-actin' in lane 2 outside membrane 1's area"
-        + CUT_STEP
+        + CUT_DRAWN
     )
     assert error.detail["band_ids"] == [lower]
     # Across the lanes, every row lies on both sides: nothing to hand over.
@@ -446,7 +459,7 @@ def test_a_cut_needs_each_row_on_one_side(tmp_path):
     )
     assert str(error) == (
         "the new outline would leave the box of 'GAPDH' in lane 3 and the box of 'p53 µ' in lane 3"
-        " outside membrane 1's area" + CUT_STEP
+        " outside membrane 1's area" + CUT_DRAWN
     )
     # A turned outline cuts nothing, and the step is not offered.
     error = refused(
@@ -472,6 +485,7 @@ def test_a_cut_reaches_the_linked_marker_and_its_ladder(tmp_path):
         s, two_strips(), "M marker.tif", kind=ImageKind.VISIBLE_MARKER, membrane_id=membrane
     )
     ops.set_marker_image(s, exposure, marker)
+    ops.set_ladder(s, membrane, PRESET)
     gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, exposure)
     p53 = ops.add_protein(s, "p53 µ", Role.TARGET, exposure, loading_control_ids=[gapdh])
     box_all(s, p53, 24)
@@ -507,6 +521,7 @@ def test_a_cut_reaches_the_linked_marker_and_its_ladder(tmp_path):
     assert change.rest_arena_ids == (area_on(s, exposure, 2), area_on(s, marker, 2))
     assert [(p.y, p.mw) for p in first.calibration.points] == [(10.0, 250.0), (40.0, 100.0)]
     assert [(p.y, p.mw) for p in second.calibration.points] == [(90.0, 25.0)]
+    assert ladder_of(s, second.id) == ladder_of(s, first.id) != (None, [])
     assert (change.moved_proteins, change.moved_points) == ((gapdh,), 1)
     assert change.curves_changed == (exposure, marker)  # membrane 1's curve, one mark less
     assert change.handed_off == (
@@ -774,10 +789,16 @@ def test_box_on_area_edge(tmp_path):
     refused(
         lambda: ops.place_box(s, bottom, 100, 49, lane_index=1, grow=False), ErrorCode.OUT_OF_ARENA
     )
-    # A click on the shared edge lies in both areas (each holds its edge).
-    refused(
+    # A click on the edge the two areas share belongs to the earlier
+    # membrane's area, the top strip's: the bottom strip's protein is refused.
+    error = refused(
         lambda: ops.place_box(s, bottom, 100, 50, lane_index=1, grow=False),
         ErrorCode.IN_TWO_ARENAS,
+    )
+    assert str(error) == (
+        f"(100, 50) lies on the edge membrane 1's and membrane 2's areas share on {STRIPS!r},"
+        " which belongs to membrane 1's area; place it inside membrane 2's area, past that"
+        " edge, or redraw the areas"
     )
     ops.place_box(s, bottom, 100, 51, lane_index=1, grow=False)  # centred at 51.5
 
@@ -1516,12 +1537,15 @@ def test_split_strip_without_ladder_is_told():
                 lost.append(band.id)
     assert lost
     [told] = ops._mw_lost(before, after)
+    # mem-1 has two register groups (the pair, a reprobe): the pair is named.
     assert told == {
         "membrane_id": "mem-1",
         "membrane": 1,
+        "image_ids": ["img-2", "img-3"],
         "bands": len(lost),
-        "message": f"Membrane 1 has fewer than 2 ladder marks: {len(lost)} bands lost their"
-        " apparent MW; mark its ladder to read them again",
+        "message": "Membrane 1 has fewer than 2 ladder marks on 'β-actin 10 µM.tif' and"
+        f" 'marker α.png': {len(lost)} bands lost their apparent MW; mark its ladder there to"
+        " read them again",
     }
     assert ops._mw_lost(before, before) == ()
     # With two marks left, a band's MW lost (outside the range) is no split's.
@@ -2035,5 +2059,184 @@ def test_a_window_on_its_area_s_edges_is_read_as_stored(tmp_path, monkeypatch):
         raise AssertionError("a median worked out again")
 
     monkeypatch.setattr(ops, "estimate_background", no_median)
+    monkeypatch.setattr(session_module, "estimate_background", no_median)
     shown = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60), calibration=True)
     assert np.allclose(shown[50:60, :], ref.background, atol=1)
+
+
+# --- Review round 3 ---
+
+PRESET = "pageruler_plus/tris_glycine"
+
+
+def ladder_of(s, membrane_id: str) -> tuple:
+    [calibration] = [m.calibration for m in s.project.batch.membranes if m.id == membrane_id]
+    return calibration.ladder, list(calibration.ladder_kda)
+
+
+def marked_middle(tmp_path: Path):
+    """:func:`marker_project` linked, PageRuler Plus chosen for membrane 2
+    (mem-5, the middle third), two of its marks on the marker."""
+    s, exposure, marker = marker_project(tmp_path)
+    ops.set_marker_image(s, exposure, marker)
+    ops.set_ladder(s, "mem-5", PRESET)
+    middle = area_on(s, marker, 2)
+    for y, kda in ((40.0, 100.0), (60.0, 70.0)):
+        ops.add_calibration_point(s, middle, y, kda, STRIP_EDGE, x=5.0, snap=False)
+    return s, exposure, marker
+
+
+def test_a_new_membrane_given_an_area_takes_its_ladder(tmp_path):
+    s, exposure, marker = marked_middle(tmp_path)
+    moved = ops.assign_arena(s, area_on(s, exposure, 2), None)
+    assert moved.moved_points == 2
+    assert ladder_of(s, moved.membrane_id) == (PRESET, list(ladders.preset(PRESET).kda))
+
+
+def test_an_area_with_marks_joins_a_membrane_of_its_ladder_only(tmp_path):
+    s, exposure, marker = marked_middle(tmp_path)
+    other = import_blot(s, two_strips(), "D.tif")
+    target = s.project.batch.membranes_on(other)[0].id
+    preset = ladders.preset(PRESET)
+    error = refused(
+        lambda: ops.assign_arena(s, area_on(s, exposure, 2), target), ErrorCode.INVALID_INPUT
+    )
+    assert str(error) == (
+        "the 2 ladder marks on membrane 2's area would join membrane 4, whose ladder is not"
+        f" chosen, while membrane 2's is {preset.product} ({preset.system}); choose the same"
+        " ladder for both membranes first, or remove the marks from this area"
+    )
+    # An area without marks joins it whatever its ladder; with the same
+    # ladder, one with marks too.
+    ops.set_ladder(s, "mem-7", PRESET)
+    ops.assign_arena(s, area_on(s, exposure, 3), target)
+    ops.undo(s)
+    ops.set_ladder(s, target, PRESET)
+    moved = ops.assign_arena(s, area_on(s, exposure, 2), target)
+    assert (moved.membrane_id, moved.moved_points) == (target, 2)
+
+
+def test_what_lies_on_the_cut_stays_with_the_outline_drawn(tmp_path):
+    # A box, a not-detected record and a mark across the whole width, each
+    # centred on the cut line: the edge two areas share belongs to the
+    # earlier membrane's area, as the cut reads them, so they stay.
+    from proteia.core.model import CalibrationPoint, Region, UndetectedBand
+
+    s, image, p53, gapdh = two_rows(tmp_path)
+    actin = ops.add_protein(
+        s, "β-actin", Role.TARGET, image, box_size=ops.BoxSize(width=10, height=6)
+    )
+    ops.place_box(s, actin, 194, 50, lane_index=2, grow=False)  # centred at (194, 50)
+
+    def on_the_line(draft: Project) -> None:
+        own = draft.batch.boxes_of(draft.batch.find_protein(actin))
+        own.undetected = [
+            UndetectedBand(
+                lane_index=1,
+                reason="below_detection_limit",
+                snr=1.0,
+                threshold=6.0,
+                region=Region(x0=90, y0=47, x1=110, y1=53),
+                source="row_box",
+            )
+        ]
+        draft.batch.membranes[0].calibration.points.append(
+            CalibrationPoint(image_id=image, y=50.0, mw=100.0, source=STRIP_EDGE)
+        )
+
+    plant(s, on_the_line)
+    change = ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
+    assert (change.moved_proteins, change.moved_points) == ((gapdh,), 0)
+    batch = s.project.batch
+    assert batch.arena_id_of(batch.find_protein(actin)) == "arena-4"
+    assert [p.y for p in batch.membranes[0].calibration.points] == [50.0]
+
+
+def test_a_membrane_s_group_left_without_a_ladder_is_told(tmp_path):
+    # Membrane 1 on a marker-linked pair (marks on the marker) and on an
+    # exposure of its own (two strip-edge marks there): the cut leaves the
+    # pair one mark, so p53's bands there lose their MW, though the membrane
+    # keeps three marks in all.
+    s = session_on(tmp_path)
+    exposure = import_blot(s, two_strips(), "E.tif")
+    ops.set_lanes(s, [LaneInput("a"), LaneInput("b"), LaneInput("c")])
+    membrane = s.project.batch.membrane_of(exposure).id
+    marker = import_blot(
+        s, two_strips(), "M marker.tif", kind=ImageKind.VISIBLE_MARKER, membrane_id=membrane
+    )
+    ops.set_marker_image(s, exposure, marker)
+    alone = import_blot(s, two_strips(), "F.tif", membrane_id=membrane)
+    for y, kda in ((10.0, 250.0), (90.0, 25.0)):
+        ops.add_calibration_point(s, alone, y, kda, STRIP_EDGE, x=5.0, snap=False)
+    for y, kda in ((10.0, 250.0), (60.0, 70.0), (90.0, 25.0)):
+        ops.add_calibration_point(s, marker, y, kda, STRIP_EDGE, x=5.0, snap=False)
+    gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, exposure)
+    p53 = ops.add_protein(s, "p53 µ", Role.TARGET, exposure, loading_control_ids=[gapdh])
+    box_all(s, p53, 24)
+    box_all(s, gapdh, 76)
+    change = ops.edit_arena(s, area_on(s, exposure), outline=(0, 0, 200, 50))
+    assert change.moved_points == 2
+    assert [lost["membrane"] for lost in change.mw_lost] == [1]
+    [lost] = change.mw_lost
+    assert (lost["bands"], lost["image_ids"]) == (3, [exposure, marker])
+    assert lost["message"] == (
+        "Membrane 1 has fewer than 2 ladder marks on 'E.tif' and 'M marker.tif': 3 bands lost"
+        " their apparent MW; mark its ladder there to read them again"
+    )
+    assert_mw_current(s)
+
+
+def test_removal_scopes_and_link_directions_are_built_once_per_state(tmp_path):
+    # Built for every area and every image at once, they are what each one
+    # alone gives, on images linked through one marker.
+    s, images, proteins = linked_pair_project(tmp_path)
+    batch = s.project.batch
+    scopes = ops.area_removals(batch)
+    assert scopes == {
+        arena.id: ops.area_removal(batch, arena.id)
+        for membrane in batch.membranes
+        for arena in batch.arenas_of(membrane)
+    }
+    third = import_blot(s, two_strips(), "exposure 3.tif", membrane_id="mem-2")
+    batch = s.project.batch
+    directions = ops.marker_adoptions(batch)
+    assert directions[third] == {images[1]: "image"}
+    for image_id, by_marker in directions.items():
+        for marker_id, direction in by_marker.items():
+            assert direction == ops.marker_adoption(batch, image_id, marker_id)
+
+
+def test_a_ladder_read_works_its_median_out_once_per_operation(tmp_path, monkeypatch):
+    from proteia.core.model import Channel
+    from proteia.core.quantify import estimate_background
+    from test_channels import H, W, colour_blot, import_pixels
+
+    s = session_on(tmp_path)
+    rgb = colour_blot(16)
+    rgb[..., 0] += 20000
+    image = import_pixels(s, rgb, "GFP µ.tif")
+    ops.set_channel(s, image, Channel.GREEN)
+    area = area_on(s, image)
+    ops.edit_arena(s, area, outline=(0, 0, W, H // 2))
+    ops.add_arena(s, image, (0, H // 2, W, H))
+    ref = s.project.batch.find_image(image)
+    arena = s.project.batch.find_arena(area)[1]
+    worked: list[float] = []
+
+    def counted(array):
+        worked.append(estimate_background(array))
+        return worked[-1]
+
+    monkeypatch.setattr(session_module, "estimate_background", counted)
+    monkeypatch.setattr(ops, "estimate_background", counted)
+    # A window inside the area masks nothing: no median.
+    ops._detector_pixels(s, ref, arena, (0, 0, W, H // 4), calibration=True)
+    assert worked == []
+    # Within one operation, once; the next operation works it out again.
+    with s.transaction():
+        ops._detector_pixels(s, ref, arena, (0, 0, W, H), calibration=True)
+        ops._detector_pixels(s, ref, arena, (0, 10, W, H), calibration=True)
+    assert len(worked) == 1
+    with s.transaction():
+        ops._detector_pixels(s, ref, arena, (0, 0, W, H), calibration=True)
+    assert len(worked) == 2

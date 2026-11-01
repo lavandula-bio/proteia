@@ -11158,6 +11158,7 @@ MW_WRITERS = frozenset(
         "remove_calibration_point",
         "clear_calibration",
         "set_ladder_points",
+        "add_arena",
         "assign_arena",
         "edit_arena",
         "remove_arena",
@@ -11165,10 +11166,11 @@ MW_WRITERS = frozenset(
 )
 MW_NEUTRAL = frozenset(
     {
-        "add_arena",
         "add_protein",
         "area_removal",
+        "area_removals",
         "marker_adoption",
+        "marker_adoptions",
         "calibration_fit",
         "clear_boxes",
         "compute",
@@ -11280,7 +11282,9 @@ def test_mw_current_after_each_operation(tmp_path):
     step("edit_arena", lambda: ops.edit_arena(s, area, outline=(0, 0, CAL_W, 85)))
     assert len(s.project.batch.membranes) == 2
     assert all(band.apparent_mw is not None for band in boxes_of(s, c.protein).bands)
-    corner = ops.add_arena(s, c.blot, (0, 0, 20, 20)).arena_ids[0]
+    made: list[str] = []
+    step("add_arena", lambda: made.extend(ops.add_arena(s, c.blot, (0, 0, 20, 20)).arena_ids))
+    corner = made[0]
     step("remove_arena", lambda: ops.remove_arena(s, corner))
     step("remove_image", lambda: ops.remove_image(s, c.marker))
     assert ran == MW_WRITERS

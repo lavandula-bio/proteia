@@ -1394,30 +1394,32 @@ def _second_membrane(doc: dict, image_id: str, outline: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    ("own", "other", "apart"),
+    ("own", "other", "into"),
     [
-        pytest.param((0, 0, 70, 150), (70, 0, 340, 150), ("x0", 71), id="right"),
-        pytest.param((30, 0, 340, 150), (0, 0, 30, 150), ("x1", 29), id="left"),
-        pytest.param((0, 0, 340, 107), (0, 107, 340, 150), ("y0", 108), id="below"),
-        pytest.param((0, 107, 340, 150), (0, 0, 340, 107), ("y1", 106), id="above"),
+        pytest.param((0, 0, 70, 150), (70, 0, 340, 150), ("x0", 69), id="right"),
+        pytest.param((30, 0, 340, 150), (0, 0, 30, 150), ("x1", 31), id="left"),
+        pytest.param((0, 0, 340, 107), (0, 107, 340, 150), ("y0", 106), id="below"),
+        pytest.param((0, 107, 340, 150), (0, 0, 340, 107), ("y1", 108), id="above"),
     ],
 )
-def test_a_box_in_two_areas_is_invalid(own, other, apart):
+def test_a_box_in_two_areas_is_invalid(own, other, into):
     # GAPDH's boxes on img-4 are centred at (30, 107) and (70, 107). Its area
-    # ends where another starts, on a row or a column of those centres: the
-    # box on that edge is in both. A pixel apart, it is in one.
+    # (membrane 1's) ends where a later membrane's starts, on a row or a
+    # column of those centres: the box on that shared edge belongs to the
+    # earlier membrane's area, its own. A pixel into it, the other area holds
+    # the box too.
     corners = ("x0", "y0", "x1", "y1")
     doc = _v3()
     _arena(doc, "arena-22")["outline"] = dict(zip(corners, own, strict=True))
     _second_membrane(doc, "img-4", dict(zip(corners, other, strict=True)))
+    project_from_json(_encode(doc))
+    corner, value = into
+    _arena(doc, "arena-28")["outline"][corner] = value
     assert re.search(
         r"protein prot-9: the centre of band-1[78]'s box lies in membrane areas arena-22 and"
         r" arena-28",
         _refusal(doc),
     )
-    corner, value = apart
-    _arena(doc, "arena-28")["outline"][corner] = value
-    project_from_json(_encode(doc))
 
 
 def test_a_record_in_two_areas_is_invalid():
