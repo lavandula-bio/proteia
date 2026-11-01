@@ -313,6 +313,11 @@ CUTS = [
     ((0, 0, 100, 100), 0.0, (150, 0, 200, 50), 0.0, None),  # beside it, not across it
     ((-20, 0, 220, 50), 0.0, (0, 0, 120, 50), 0.0, (120, 0, 200, 50)),  # as it lies in the image
     ((0, 0, 200, 50), 2.0, (0, 0, 200, 30), 0.0, None),  # a turned area
+    # Beside the area, touching one of its sides from outside: no cut.
+    ((0, 0, 100, 100), 0.0, (100, 0, 200, 100), 0.0, None),
+    ((0, 0, 100, 100), 0.0, (-100, 0, 0, 100), 0.0, None),
+    ((0, 0, 100, 100), 0.0, (0, 100, 100, 200), 0.0, None),
+    ((0, 0, 100, 100), 0.0, (0, -100, 100, 0), 0.0, None),
 ]
 
 
@@ -385,6 +390,39 @@ def test_an_area_cut_in_two_gives_the_far_side_a_new_membrane(tmp_path):
     assert content_hash(s.project) == content_hash(before)
     ops.redo(s)
     assert content_hash(s.project) == content_hash(cut)
+
+
+@pytest.mark.parametrize(
+    ("outline", "turn", "offered"),
+    [
+        (None, 3.0, True),  # a whole image's recorded angle turns nothing
+        ((0, 0, 200, 100), 0.0, True),  # drawn, not turned
+        ((0, 0, 200, 100), 2.0, False),  # drawn and turned: no line cuts it
+    ],
+)
+def test_the_cut_is_offered_where_one_can_be_drawn(tmp_path, outline, turn, offered):
+    s, image, p53, gapdh = two_rows(tmp_path)
+    ops.edit_arena(s, "arena-4", outline=outline, angle_deg=turn)
+    error = refused(
+        lambda: ops.edit_arena(s, "arena-4", outline=(10, 5, 190, 45), angle_deg=0.0),
+        ErrorCode.ARENA_IN_USE,
+    )
+    assert str(error).endswith(CUT_STEP) is offered
+    if offered:  # and taken
+        change = ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50), angle_deg=0.0)
+        assert change.moved_proteins == (gapdh,)
+
+
+def test_a_box_just_past_the_cut_goes_with_the_far_side(tmp_path):
+    # A box centred half a pixel below the cut, at the far end of it, where
+    # an outline turned by even 1° would still hold it, goes with GAPDH.
+    s, image, p53, gapdh = two_rows(tmp_path)
+    actin = ops.add_protein(
+        s, "β-actin", Role.TARGET, image, box_size=ops.BoxSize(width=10, height=5)
+    )
+    ops.place_box(s, actin, 194, 50, lane_index=2, grow=False)  # centre (194, 50.5)
+    change = ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 50))
+    assert change.moved_proteins == (gapdh, actin)
 
 
 def test_a_cut_needs_each_row_on_one_side(tmp_path):
@@ -1025,6 +1063,21 @@ def test_marker_file_three_membranes(tmp_path):
     ops.undo(s)
     ops.undo(s)
     assert s.project.batch.arenas_on(marker)[0][1].outline is None  # back to before the link
+
+
+def test_a_link_that_strands_boxes_offers_no_cut(tmp_path):
+    # A second exposure taking the group's areas through a marker link leaves
+    # its boxes outside membrane 1's: nothing was drawn, so no cut is offered.
+    s, exposure, marker = marker_project(tmp_path)
+    ops.set_marker_image(s, exposure, marker)
+    second = import_blot(s, two_strips(), "exposure 2.tif", membrane_id="mem-2")
+    p53 = ops.add_protein(s, "p53", Role.TARGET, arena_id=area_on(s, second))
+    box_all(s, p53, 76)
+    error = refused(lambda: ops.set_marker_image(s, second, marker), ErrorCode.ARENA_IN_USE)
+    assert str(error) == (
+        "the new outline would leave the boxes of 'p53' in lanes 1, 2, 3 outside membrane 1's"
+        " area; draw the outline around them, or move or remove them first"
+    )
 
 
 def test_marker_adoption_refusals(tmp_path):

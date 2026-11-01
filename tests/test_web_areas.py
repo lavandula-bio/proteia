@@ -137,11 +137,9 @@ def test_a_cut_answers_what_went_to_the_new_membrane(client, tmp_path):
     assert [p["arena_id"] for p in project["proteins"]] == ["arena-4", *second["arena_ids"]]
     # An edit that leaves no row outside hands nothing over.
     answer = client.ok("PUT", "/api/arenas/arena-4", {"outline": [0, 0, 200, 49]})
-    assert (answer["handed_off"], answer["rest_membrane_id"], answer["moved_proteins"]) == (
-        None,
-        None,
-        [],
-    )
+    nothing = (None, None, [], [], 0)
+    keys = ("handed_off", "rest_membrane_id", "rest_arena_ids", "moved_proteins", "moved_points")
+    assert tuple(answer[key] for key in keys) == nothing
 
 
 def test_an_unknown_area_answers_404_then_the_state(client, tmp_path):
