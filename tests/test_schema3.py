@@ -1393,18 +1393,30 @@ def _second_membrane(doc: dict, image_id: str, outline: dict) -> None:
     doc["batch"]["images"] = images  # the image is listed already
 
 
-def test_a_box_in_two_areas_is_invalid():
+@pytest.mark.parametrize(
+    ("own", "other", "apart"),
+    [
+        pytest.param((0, 0, 70, 150), (70, 0, 340, 150), ("x0", 71), id="right"),
+        pytest.param((30, 0, 340, 150), (0, 0, 30, 150), ("x1", 29), id="left"),
+        pytest.param((0, 0, 340, 107), (0, 107, 340, 150), ("y0", 108), id="below"),
+        pytest.param((0, 107, 340, 150), (0, 0, 340, 107), ("y1", 106), id="above"),
+    ],
+)
+def test_a_box_in_two_areas_is_invalid(own, other, apart):
     # GAPDH's boxes on img-4 are centred at (30, 107) and (70, 107). Its area
-    # ends at x 70 and another starts there: the box on that edge is in both.
+    # ends where another starts, on a row or a column of those centres: the
+    # box on that edge is in both. A pixel apart, it is in one.
+    corners = ("x0", "y0", "x1", "y1")
     doc = _v3()
-    _arena(doc, "arena-22")["outline"] = {"x0": 0, "y0": 0, "x1": 70, "y1": 150}
-    _second_membrane(doc, "img-4", {"x0": 70, "y0": 0, "x1": 340, "y1": 150})
+    _arena(doc, "arena-22")["outline"] = dict(zip(corners, own, strict=True))
+    _second_membrane(doc, "img-4", dict(zip(corners, other, strict=True)))
     assert re.search(
         r"protein prot-9: the centre of band-1[78]'s box lies in membrane areas arena-22 and"
         r" arena-28",
         _refusal(doc),
     )
-    _arena(doc, "arena-28")["outline"]["x0"] = 71
+    corner, value = apart
+    _arena(doc, "arena-28")["outline"][corner] = value
     project_from_json(_encode(doc))
 
 
