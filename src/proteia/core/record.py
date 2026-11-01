@@ -48,7 +48,7 @@ import importlib.metadata
 import itertools
 import platform
 from collections.abc import Mapping
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -63,13 +63,25 @@ _RESTORING_ACTIONS: Final = frozenset({"undo", "redo"})
 # The libraries core computes or decodes pixels with, by distribution name.
 _DISTRIBUTIONS: Final = ("numpy", "scipy", "scikit-image", "pillow", "tifffile")
 _TIMESTAMP = TypeAdapter(Timestamp)
-# How detect_row_boxes chooses detect_row's saturated_at for an image (#121).
+# How detect_row_boxes chooses detect_row's saturated_at for an image (#121),
+# naming the images that get the near-limit check: _NEAR_LIMIT_IMAGES, or, in a
+# project where an image is measured on a chosen channel (#206), those
+# measured_on says.
 _SATURATED_AT: Final = (
     "quantify.saturation_level: the detector limit where the exact over-exposure"
     " check runs (clipped_pixels_threshold), else that limit moved in by"
-    " possibly_clipped's near_limit_levels (a lossy, colour or CMYK-converted"
-    " image); none for an image of unknown bit depth (float), and then no band"
-    " is called hollow (hollow_band)"
+    " possibly_clipped's near_limit_levels ({images}); none for an image of"
+    " unknown bit depth (float), and then no band is called hollow (hollow_band)"
+)
+_NEAR_LIMIT_IMAGES: Final = "a lossy, colour or CMYK-converted image"
+_NEAR_LIMIT_CHOSEN: Final = "each image whose check measured_on names near_limit"
+# What the over-exposure checks read: an image's analysis values, which for
+# colour are the mean of red, green and blue unless a channel is chosen for it
+# (#206); then measured_on names each image's channel and check.
+_CHECKED_VALUES: Final = "gray: the mean of red, green and blue for colour"
+_CHECKED_VALUES_CHOSEN: Final = (
+    f"{_CHECKED_VALUES}, or the one channel chosen for an image: measured_on names each"
+    " image's channel and the over-exposure check its bands get (exact, near_limit or none)"
 )
 
 
@@ -105,13 +117,16 @@ def settings() -> dict[str, JsonValue]:
             "max_height": None,
         },
         "clipped_pixels_threshold": quantify.CLIPPED_PIXELS_THRESHOLD,
-        # Where that check cannot run: a lossy, colour or CMYK-converted image
-        # of known bit depth (#112, quantify.is_possibly_clipped).
+        # Where that check cannot run: a lossy or CMYK-converted image, or a
+        # colour one measured on the mean, of known bit depth (#112,
+        # quantify.is_possibly_clipped). The values both checks read are the
+        # image's analysis values; a record of a project where a channel is
+        # chosen for an image says so, and names each image's (build_record).
         "possibly_clipped": {
             "min_pixels": quantify.POSSIBLY_CLIPPED_PIXELS,
             "near_limit_levels": quantify.NEAR_LIMIT_LEVELS,
             "levels": "on an 8-bit scale, scaled to the image's range",
-            "values": "gray: the mean of red, green and blue for colour",
+            "values": _CHECKED_VALUES,
         },
         "lane_table_decimals": export.LANE_TABLE_DECIMALS,
         "lane_table_ratio_decimals": export.LANE_TABLE_RATIO_DECIMALS,
@@ -122,7 +137,10 @@ def settings() -> dict[str, JsonValue]:
         # and its default size rule; the image gives the rest (its background,
         # polarity, the lanes' direction) and the saturation level, chosen as
         # "saturated_at" says. Each commit's log entry keeps the level it used.
-        "detect_row": {**rowdetect.settings(), "saturated_at": _SATURATED_AT},
+        "detect_row": {
+            **rowdetect.settings(),
+            "saturated_at": _SATURATED_AT.format(images=_NEAR_LIMIT_IMAGES),
+        },
         # How molecular weights are calibrated and checked (#58), how a row is
         # placed by its MW, and the version of the ladder presets this build
         # offers (a calibration stores the MWs it used).
@@ -148,6 +166,30 @@ def settings() -> dict[str, JsonValue]:
             "log_base": "e",
             "auto_rule": analyze.AUTO_RULE_VERSION,
             "tests": sorted(analyze.TESTS),
+        },
+    }
+
+
+def project_settings(project: Project) -> dict[str, JsonValue]:
+    """:func:`settings` as they apply to ``project``: with the method its stored
+    nets used (``background_method``), and, once a channel is chosen for one of
+    its images (#206), what the over-exposure checks read there: the values
+    text says so, ``measured_on`` names each image's channel and the check its
+    bands get (``exact``, ``near_limit`` or ``none``), and ``saturated_at``
+    points there. Without a choice they are :func:`settings` word for word."""
+    found = {**settings(), "background_method": project.background_method}
+    images = list(project.batch.iter_images())
+    if all(image.channel is None for image in images):
+        return found
+    clipped = cast(dict[str, JsonValue], found["possibly_clipped"])
+    row = cast(dict[str, JsonValue], found["detect_row"])
+    return {
+        **found,
+        "possibly_clipped": {**clipped, "values": _CHECKED_VALUES_CHOSEN},
+        "detect_row": {**row, "saturated_at": _SATURATED_AT.format(images=_NEAR_LIMIT_CHOSEN)},
+        "measured_on": {
+            image.id: {"channel": image.measured_channel.value, "check": image.over_exposure_check}
+            for image in images
         },
     }
 
@@ -312,8 +354,9 @@ def build_record(
         "exported_at": _TIMESTAMP.validate_python(exported_at, strict=True),
         "software": software_versions(),
         # The method the stored nets used: ring_median_v1 (settings()["background"])
-        # or, until the project is requantified, the legacy global_median.
-        "settings": {**settings(), "background_method": project.background_method},
+        # or, until the project is requantified, the legacy global_median; and
+        # what each image is measured on, once a channel is chosen (#206).
+        "settings": project_settings(project),
         "content": content,
         "content_hash": digest,
         "log": [entry.model_dump(mode="json") for entry in project.log],

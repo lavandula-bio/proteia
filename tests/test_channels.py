@@ -22,8 +22,8 @@ import tifffile
 from PIL import Image
 from pydantic import ValidationError
 
-from conftest import FakeClock, write_tiff
-from proteia.core import imaging, results, storage
+from conftest import MEMBRANE_LEVEL, FakeClock, write_tiff
+from proteia.core import imaging, record, results, storage
 from proteia.core import operations as ops
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.model import (
@@ -35,6 +35,7 @@ from proteia.core.model import (
     ImageKind,
     ImageRef,
     ImageWarning,
+    LadderSide,
     Polarity,
     Project,
     ProposalSource,
@@ -49,12 +50,21 @@ from proteia.core.session import save_to_folder
 from proteia.web import api
 from proteia.web.state import preview_png, project_state
 from test_operations import (
+    CAL_H,
+    CAL_KDA,
+    CAL_LEFT_X,
+    CAL_W,
+    MARKER_BAND,
     Recorder,
     _before_207,
     _record,
     _record_json,
     assert_nets_current,
     boxes_of,
+    cal_blot,
+    cal_marker,
+    cal_y,
+    noisy16,
     plant,
     plant_records,
     session_on,
@@ -70,10 +80,20 @@ ROW = 30
 LANES = (25, 60, 95, 130, 165, 200)
 SATURATED = 3  # the lane saturated in green: lane 4
 BOX = BoxSize(width=20, height=12)
-NEUTRAL = (
-    "The red, green and blue channels differ; the image is measured on one of them"
-    " or on their mean, as its channel says."
+# The import's color_channels_differ message, and what the page shows instead
+# while one channel is measured.
+AVERAGED = (
+    "The red, green and blue channels differ; they were averaged into one gray"
+    " channel, so over-exposure cannot be checked."
 )
+ON_GREEN = "The red, green and blue channels differ; the image is measured on its green channel."
+
+
+def shown(s: ops.ProjectSession, image_id: str) -> list[tuple[str, str]]:
+    """The image's warnings as the page shows them: (code, message)."""
+    state = project_state("p", s, s.project, open_id=1)
+    image = next(i for i in state["images"] if i["id"] == image_id)
+    return [(w["code"], w["message"]) for w in image["warnings"]]
 
 
 def _bands(amplitudes) -> np.ndarray:
@@ -350,6 +370,61 @@ def test_the_clipping_depths_on_a_channel():
         assert imaging.possible_clipping_depth(None, differ, channel) is None
 
 
+def test_an_image_decides_its_own_over_exposure_checks():
+    # One place reads the image's bit depth, warnings and measured channel.
+    def image(warnings, channel=None, bit_depth=8):
+        fields = {"import_warnings": warnings, "bit_depth": bit_depth}
+        if channel is not None:
+            fields["channel"] = {"channel": channel, "source": "chosen"}
+        return ImageRef.model_validate(image_doc(**fields))
+
+    differ = {"code": "color_channels_differ", "message": "d"}
+    lossy = {"code": "lossy_format", "message": "l"}
+    cases = [
+        # warnings, channel, bit depth -> (distrusted by, exact depth, near depth)
+        ([differ], None, 8, (["color_channels_differ"], None, 8)),
+        ([differ], "mean", 16, (["color_channels_differ"], None, 16)),
+        ([differ], "green", 8, ([], 8, None)),
+        ([differ], "blue", 16, ([], 16, None)),
+        ([lossy, differ], "red", 8, (["lossy_format"], None, 8)),
+        ([differ, lossy], None, 8, (["color_channels_differ", "lossy_format"], None, 8)),
+        ([differ], "green", None, ([], None, None)),
+        ([], None, 16, ([], 16, None)),
+    ]
+    for warnings, channel, depth, expected in cases:
+        one = image(warnings, channel, depth)
+        got = (one.limit_distrusted, one.exact_check_depth, one.near_check_depth)
+        assert got == expected, (warnings, channel, depth)
+        assert one.over_exposure_check == (
+            "exact" if expected[1] is not None else "near_limit" if expected[2] else "none"
+        )
+
+
+def test_no_caller_reads_an_image_s_trust_around_it():
+    # The functions that take raw warnings are for readings that have no image
+    # record yet (an import, a polarity or channel change's new warnings) and
+    # for tools; an image record's own trust is read through its properties, so
+    # that no caller can leave its measured channel out.
+    import ast
+
+    raw = {"clipping_depth", "possible_clipping_depth", "limit_distrusted_by"}
+    found = []
+    for path in sorted((Path(__file__).resolve().parents[1] / "src" / "proteia").rglob("*.py")):
+        if path.name == "model.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name in raw and any(
+                isinstance(arg, ast.Attribute) and arg.attr == "import_warnings"
+                for arg in node.args
+            ):
+                found.append(f"{path.name}:{node.lineno}")
+    assert found == []
+
+
 def test_the_results_name_what_distrusts_the_channel_measured():
     # A lossy colour image measured on one channel: only its compression keeps
     # the exact check off; measured on the mean, its colours averaged too.
@@ -436,6 +511,14 @@ def test_to_grayscale_takes_the_channel_asked_for():
                 to_grayscale(pixels, channel)
     with pytest.raises(ValueError, match="unsupported image layout"):
         to_grayscale(np.zeros((2, 2, 5)), GREEN)
+
+
+@pytest.mark.parametrize("given", ["green", "mean", "purple", "", 1, Channel])
+def test_to_grayscale_refuses_what_is_not_a_channel(given):
+    # Never the mean in silence for a value that names no channel.
+    for pixels in (np.zeros((2, 3, 3), dtype=np.uint8), np.zeros((2, 3), dtype=np.uint8)):
+        with pytest.raises(TypeError, match="^channel must be a Channel or None, not "):
+            to_grayscale(pixels, given)
 
 
 def test_channels_differ():
@@ -562,8 +645,8 @@ def test_set_channel_measures_every_band_on_the_image_on_that_channel(tmp_path):
     assert flags(s, gfp) == [(False, None)] * 6  # the exact check runs on one channel
     assert [b.bands_found for b in boxes_of(s, gfp).bands] == [None] * 6
     assert boxes_of(s, tubulin).undetected == []
-    assert [w.code for w in after.import_warnings] == ["color_channels_differ"]
-    assert after.import_warnings[0].message == NEUTRAL
+    assert after.import_warnings == before.import_warnings  # stored as imported
+    assert shown(s, image) == [("color_channels_differ", ON_GREEN)]
     entry = s.project.log[-1]
     assert (entry.action, entry.params) == (
         "set_channel",
@@ -590,7 +673,8 @@ def test_set_channel_measures_every_band_on_the_image_on_that_channel(tmp_path):
     assert back.background == before.background
     assert [band.net for _, band in bands_on(s, image)] == expected_nets(s, image, mean)
     assert flags(s, gfp) == [(None, False)] * 6  # the mean's near-limit check again
-    assert back.import_warnings[0].message == NEUTRAL
+    assert back.import_warnings == before.import_warnings
+    assert shown(s, image) == [("color_channels_differ", AVERAGED)]  # true again
     assert_nets_current(s)
 
 
@@ -674,7 +758,7 @@ def test_an_image_with_no_band_takes_the_channel_with_its_median_and_warnings(tm
     after = stored(s, image)
     assert after.measured_channel is BLUE
     assert after.background == float(np.median(rgb[..., 2]))
-    assert after.import_warnings == [ImageWarning(code="color_channels_differ", message=NEUTRAL)]
+    assert after.import_warnings == [ImageWarning(code="color_channels_differ", message=AVERAGED)]
     assert s.project.log[-1].params == {
         "image_id": image,
         "channel": "blue",
@@ -682,6 +766,39 @@ def test_an_image_with_no_band_takes_the_channel_with_its_median_and_warnings(tm
         "dropped_undetected": [],
     }
     assert s.autosave.actions == ["import_image", "set_channel"]
+    # No band needs its pixels: read, not kept, as a polarity change reads them.
+    assert image not in s._pixels
+    protein, _ = six_boxes(s, image)
+    ops.set_channel(s, image, GREEN)  # with bands: kept for the next edit
+    assert np.array_equal(s._pixels[image], rgb[..., 1])
+
+
+def test_the_page_shows_the_colour_warning_for_the_channel_measured(tmp_path):
+    # The stored warning stays as imported; the page reads it for the channel
+    # measured, so choosing the mean again shows the import's words again.
+    s = session_on(tmp_path)
+    image = import_pixels(s, colour_blot(crosstalk=0.2), "GFP µ.tif")
+    imported = stored(s, image).import_warnings
+    assert shown(s, image) == [("color_channels_differ", AVERAGED)]
+    ops.set_channel(s, image, GREEN)
+    assert shown(s, image) == [("color_channels_differ", ON_GREEN)]
+    ops.set_channel(s, image, RED)
+    assert shown(s, image) == [
+        (
+            "color_channels_differ",
+            "The red, green and blue channels differ; the image is measured on its red channel.",
+        )
+    ]
+    ops.set_channel(s, image, MEAN)
+    assert shown(s, image) == [("color_channels_differ", AVERAGED)]
+    assert stored(s, image).import_warnings == imported
+    # Other warnings are shown as stored.
+    jpeg = import_pixels(s, colour_blot(crosstalk=0.2), "GFP β.jpg", quality=95)
+    ops.set_channel(s, jpeg, GREEN)
+    codes = [code for code, _ in shown(s, jpeg)]
+    assert codes == ["lossy_format", "color_channels_differ"]
+    assert shown(s, jpeg)[0][1] == stored(s, jpeg).import_warnings[0].message
+    assert shown(s, jpeg)[1][1] == ON_GREEN
 
 
 def test_the_looks_processed_warning_is_assessed_on_the_chosen_channel(tmp_path):
@@ -1115,6 +1232,120 @@ def test_a_chosen_channel_is_saved_and_read_back(tmp_path):
     assert stored(reopened, image).measured_channel is BLUE
     assert np.array_equal(reopened.pixels(image), rgb[..., 2])
     assert_nets_current(reopened)
+
+
+# --- The reproducibility record ---
+
+EXPORTED_AT = "2026-11-01T12:00:00.000Z"
+
+
+def test_the_record_says_what_each_image_is_measured_on(tmp_path):
+    s = session_on(tmp_path)
+    tif = import_pixels(s, colour_blot(), "GFP µ.tif")
+    jpg = import_pixels(s, colour_blot(), "RFP β.jpg", quality=95)
+    gray = import_pixels(s, colour_blot()[..., 1], "gray α.tif")
+
+    def recorded() -> dict:
+        return record.build_record(s.project, exported_at=EXPORTED_AT, files={})["settings"]
+
+    # No choice: the settings as before, word for word.
+    plain = {**record.settings(), "background_method": "ring_median_v1"}
+    assert recorded() == plain
+    assert plain["possibly_clipped"]["values"] == (
+        "gray: the mean of red, green and blue for colour"
+    )
+    assert "(a lossy, colour or CMYK-converted image)" in plain["detect_row"]["saturated_at"]
+    assert "measured_on" not in plain
+
+    ops.set_channel(s, tif, GREEN)
+    ops.set_channel(s, jpg, RED)
+    got = recorded()
+    assert got["possibly_clipped"]["values"] == (
+        "gray: the mean of red, green and blue for colour, or the one channel chosen for an"
+        " image: measured_on names each image's channel and the over-exposure check its bands"
+        " get (exact, near_limit or none)"
+    )
+    assert got["detect_row"]["saturated_at"] == plain["detect_row"]["saturated_at"].replace(
+        "(a lossy, colour or CMYK-converted image)",
+        "(each image whose check measured_on names near_limit)",
+    )
+    assert got["measured_on"] == {
+        tif: {"channel": "green", "check": "exact"},
+        jpg: {"channel": "red", "check": "near_limit"},
+        gray: {"channel": "mean", "check": "exact"},
+    }
+    # Every other setting as without a choice.
+    for key in ("possibly_clipped", "detect_row"):
+        assert {k: v for k, v in got[key].items() if k not in ("values", "saturated_at")} == {
+            k: v for k, v in plain[key].items() if k not in ("values", "saturated_at")
+        }
+    assert {
+        k: v for k, v in got.items() if k not in ("possibly_clipped", "detect_row", "measured_on")
+    } == {k: v for k, v in plain.items() if k not in ("possibly_clipped", "detect_row")}
+    ops.set_channel(s, tif, MEAN)  # chosen, on the mean: its colour averaged
+    assert recorded()["measured_on"][tif] == {"channel": "mean", "check": "near_limit"}
+
+
+# --- Ladder work reads the mean, whatever channel the protein is measured on ---
+
+
+def ladder_and_protein() -> np.ndarray:
+    """A merged 16-bit image: the two ladders in red, one row of protein bands
+    in green, blue a flat membrane."""
+    flat = noisy16(np.full((CAL_H, CAL_W), MEMBRANE_LEVEL), 60)
+    return np.dstack([cal_marker(), cal_blot(), flat])
+
+
+def ladder_work(s: ops.ProjectSession, image: str) -> dict:
+    """Every ladder read and write on the image's left ladder: a proposal, a
+    snap of four ticks, a point marked and dragged with snapping, and the
+    proposal applied as a ruler; what each gave."""
+    x = CAL_LEFT_X
+    proposal = ops.propose_ladder(s, image, x, LadderSide.LEFT)
+    ticks = [cal_y(kda, x) + 1.4 for kda in CAL_KDA[:4]]
+    snaps = ops.snap_ladder(s, image, x, ticks)
+    ops.add_calibration_point(s, image, cal_y(130, x) + 1.2, 130, MARKER_BAND, x=x, snap=True)
+    added = s.project.log[-1].params
+    ops.edit_calibration_point(s, image, 130, y=cal_y(130, x) - 1.3, snap=True)
+    edited = s.project.log[-1].params
+    found = [
+        (tick["y"], tick["mw"]) for tick in ops.proposal_json(proposal)["ticks"] if tick["found"]
+    ]
+    ops.set_ladder_points(s, image, LadderSide.LEFT, found, x=x, found_at=x)
+    applied = s.project.log[-1].params
+    membrane = s.project.batch.membrane_of(image)
+    return {
+        "proposal": ops.proposal_json(proposal),
+        "snaps": snaps,
+        "added": added,
+        "edited": edited,
+        "applied": applied,
+        "points": [p.model_dump(mode="json") for p in membrane.calibration.points],
+    }
+
+
+def test_ladder_work_reads_the_mean_whatever_channel_is_measured(tmp_path):
+    def session(name: str, channel: Channel | None) -> tuple[ops.ProjectSession, str]:
+        s = session_on(tmp_path / name)
+        image = import_pixels(s, ladder_and_protein(), "merged µ.tif", DARK, kind=MERGED)
+        ops.set_ladder(s, s.project.batch.membrane_of(image).id, "pageruler_plus/tris_glycine")
+        if channel is not None:
+            before = ops.proposal_json(ops.propose_ladder(s, image, CAL_LEFT_X, LadderSide.LEFT))
+            ops.set_channel(s, image, channel)
+            after = ops.proposal_json(ops.propose_ladder(s, image, CAL_LEFT_X, LadderSide.LEFT))
+            assert after == before
+        return s, image
+
+    mean_session, mean_image = session("mean", None)
+    green_session, green_image = session("green", GREEN)
+    assert mean_image == green_image
+    expected = ladder_work(mean_session, mean_image)
+    assert expected["proposal"]["ticks"] and expected["points"]  # the ladder is found
+    assert all(snapped for _, snapped in expected["snaps"])
+    assert ladder_work(green_session, green_image) == expected
+    # The protein is measured on green all the while.
+    assert stored(green_session, green_image).measured_channel is GREEN
+    assert np.array_equal(green_session.pixels(green_image), cal_blot().astype(np.float64))
 
 
 # --- The state the page reads ---

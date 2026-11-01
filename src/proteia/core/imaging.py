@@ -62,8 +62,11 @@ from typing import Final, Literal, NamedTuple
 import numpy as np
 import tifffile
 
-from proteia.core.model import UNTRUSTED_WARNINGS as UNTRUSTED_WARNINGS  # read here too
-from proteia.core.model import Channel, ImageWarning, limit_distrusted_by
+# Read here too, and by callers of imaging (tools, readings with no image record).
+from proteia.core.model import UNTRUSTED_WARNINGS as UNTRUSTED_WARNINGS
+from proteia.core.model import Channel, ImageWarning
+from proteia.core.model import clipping_depth as clipping_depth
+from proteia.core.model import possible_clipping_depth as possible_clipping_depth
 from proteia.core.quantify import near_limit_tolerance, to_grayscale
 
 TIFF_SUFFIXES = (".tif", ".tiff")
@@ -144,16 +147,10 @@ _CMYK_CHANNELS_DIFFER = (
     "The red, green and blue channels converted from the file's CMYK differ; they were"
     " averaged into one gray channel, so over-exposure cannot be checked."
 )
-# The color_channels_differ message of an image a channel was chosen for
-# (operations.set_channel, #206), true whatever channel it is measured on: the
-# results say per image whether over-exposure can be checked there.
-CHANNELS_DIFFER_MEASURED = (
-    "The red, green and blue channels differ; the image is measured on one of them or on"
-    " their mean, as its channel says."
-)
 # The warnings that make clipping_depth distrust a known bit depth (and so let
 # possible_clipping_depth assess it) are model.UNTRUSTED_WARNINGS, which says
-# why; model.limit_distrusted_by says which of them distrust a channel.
+# why; model.limit_distrusted_by says which of them distrust a channel. Both
+# depths are the model's (an image record reads its own), read here too.
 
 
 def _warning(code: str, **fields: str) -> ImageWarning:
@@ -1054,52 +1051,6 @@ def from_pixels(
     return LoadedImage(
         array=array, pixels=pixels, bit_depth=depth, warnings=warnings, palette=palette
     )
-
-
-def clipping_depth(
-    bit_depth: int | None, warnings: Iterable[ImageWarning], channel: Channel | None = None
-) -> int | None:
-    """The bit depth whose detector limit the over-exposure check may trust, or
-    None, for an image with the import ``warnings`` measured on ``channel``
-    (None: the mean, as for every image before #206).
-
-    None when the depth is unknown (float data), when lossy compression moved
-    saturated pixels off the limit (``lossy_format``), when color was averaged
-    into gray (``color_channels_differ`` on the mean): a channel saturated alone
-    never brings the mean to the limit, or when the colours were converted from
-    CMYK (``cmyk_converted``): its values are inks turned into approximate
-    colours, not detector counts, and a profile may keep black off 0
-    (:func:`~proteia.core.model.limit_distrusted_by`). One colour channel of a
-    lossless file is checked at the file's limit. A 12- or 14-bit camera
-    writing a 16-bit file is checked against the container limit, so its
-    saturation goes unseen (a known limit).
-    """
-    if bit_depth is None or limit_distrusted_by(warnings, channel):
-        return None
-    return bit_depth
-
-
-def possible_clipping_depth(
-    bit_depth: int | None, warnings: Iterable[ImageWarning], channel: Channel | None = None
-) -> int | None:
-    """The bit depth the "possibly over-exposed" check (#112,
-    :func:`~proteia.core.quantify.is_possibly_clipped`) measures against, or None.
-
-    It runs where the exact check cannot (:func:`clipping_depth` is None) but the
-    range is known: a lossy, colour or CMYK-converted image of 8- or 16-bit
-    pixels. Its limit is that of the pixels as read: 0, or 255 or 65535 for a
-    light-on-dark image; for a CMYK file, that of the red, green and blue it was
-    converted to, which have the inks' bit depth. A file converted through its
-    ICC profile may bring black back well above 0 (a gray ramp made with the
-    relative intent and black point compensation through SWOP press CMYK comes
-    back at about 19), which hides its saturation from this check too (a known
-    limit). An unknown bit depth has no limit to measure against, so neither
-    check runs. One colour channel of a lossy file is assessed on that channel
-    (``channel``, as for :func:`clipping_depth`).
-    """
-    if bit_depth is None or clipping_depth(bit_depth, warnings, channel) is not None:
-        return None
-    return bit_depth
 
 
 def load_image(path: str | os.PathLike[str], *, channel: Channel | None = None) -> LoadedImage:

@@ -104,8 +104,11 @@ def to_grayscale(image: np.ndarray, channel: Channel | None = None) -> np.ndarra
     blue, which matches ImageJ's default conversion; alpha is ignored. Gray plus
     alpha (2 channels) keeps the gray channel. With ``channel`` red, green or
     blue (#206), colour becomes that channel alone, as read; gray has no such
-    channel (``ValueError``). None and ``Channel.MEAN`` reduce as above.
+    channel (``ValueError``). None and ``Channel.MEAN`` reduce as above;
+    anything else is refused (``TypeError``), never read as the mean.
     """
+    if channel is not None and not isinstance(channel, Channel):
+        raise TypeError(f"channel must be a Channel or None, not {channel!r}")
     index = None if channel is None else _CHANNEL_INDEX.get(channel)
     if image.ndim == 2 or (image.ndim == 3 and image.shape[-1] == 2):
         if index is not None:

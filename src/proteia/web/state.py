@@ -210,9 +210,11 @@ def project_state(
             "bit_depth": image.bit_depth,
             "colour": has_colour(session, image),
             "channel": _channel(image),
+            # As shown: a colour image's color_channels_differ says the channel
+            # it is measured on (#206).
             "warnings": [
                 {"code": warning.code, "message": warning.message}
-                for warning in image.import_warnings
+                for warning in image.shown_warnings
             ],
         }
         for membrane in batch.membranes

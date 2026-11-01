@@ -480,6 +480,20 @@ class ProjectSession:
                 self._pixels[image_id] = array
             return array
 
+    def calibration_pixels(self, image_id: str) -> np.ndarray:
+        """The image's read-only analysis array on the mean of its red, green
+        and blue, whatever channel it is measured on (#206), for the
+        molecular-weight calibration: a ladder is found and snapped on the
+        mean, as before #206, so a channel chosen for a protein never changes
+        ladder work. The cached array (:meth:`pixels`) when the image is
+        measured on the mean; else read and checked now, and not kept. Raises
+        as :meth:`pixels` does."""
+        with self.lock:
+            image = self._project.batch.find_image(image_id)
+            if image.measured_channel is Channel.MEAN:
+                return self.pixels(image_id)
+            return self._read_array(image, Channel.MEAN)
+
     def channel_array(self, image_id: str, channel: Channel) -> np.ndarray:
         """The image's read-only analysis array of ``channel`` (#206), read and
         checked as :meth:`pixels` reads it, with the same errors, and never

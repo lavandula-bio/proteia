@@ -179,7 +179,6 @@ from proteia.core.export import (
 )
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.imaging import (
-    CHANNELS_DIFFER_MEASURED,
     SEVERAL_IMAGES,
     SINGLE_IMAGE_ONLY,
     Inks,
@@ -188,12 +187,10 @@ from proteia.core.imaging import (
     PixelType,
     assess_processed,
     check_misnamed_tiff,
-    clipping_depth,
     declared_pixel_type,
     ink_set,
     load_pixels,
     pixel_type,
-    possible_clipping_depth,
     read_file,
     reads_as_palette,
 )
@@ -239,7 +236,6 @@ from proteia.core.model import (
     in_words,
     lane_number,
     lanes_phrase,
-    limit_distrusted_by,
     overlaps,
 )
 from proteia.core.names import (
@@ -703,10 +699,9 @@ def _apply[T](
 def _unchecked_why(image: ImageRef) -> str:
     """Why over-exposure cannot be checked on ``image``, on the channel it is
     measured on, and what runs instead."""
-    channel = image.measured_channel
-    codes = limit_distrusted_by(image.import_warnings, channel)
+    codes = image.limit_distrusted
     why = ", ".join(codes) if codes else "unknown bit depth"
-    if possible_clipping_depth(image.bit_depth, image.import_warnings, channel) is not None:
+    if image.near_check_depth is not None:
         return f"{why}; assessed near the detector limit instead"
     return f"{why}; not assessed either"
 
@@ -872,9 +867,7 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
             fallback=image.background,
         )
         clamp = RING_CLAMP
-    channel = image.measured_channel
-    depth = clipping_depth(image.bit_depth, image.import_warnings, channel)
-    near_depth = possible_clipping_depth(image.bit_depth, image.import_warnings, channel)
+    depth, near_depth = image.exact_check_depth, image.near_check_depth
     for (size, band), background in zip(placed, found, strict=True):
         band.net = net_signal(
             array, band.box, size, background.level, dark_on_light=dark_on_light, clamp=clamp
@@ -1758,7 +1751,7 @@ def _log_import(session: ProjectSession, image_id: str) -> None:
             warning.code,
             warning.message,
         )
-    if clipping_depth(image.bit_depth, image.import_warnings, image.measured_channel) is None:
+    if image.exact_check_depth is None:
         _log.info(
             "in %r: over-exposure cannot be checked on %s (%s)",
             name,
@@ -1980,12 +1973,16 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
     """Measure a colour image on one of its channels, red, green or blue, or
     on the mean of the three (#206), chosen by the user: every band on it is
     re-quantified on that channel's analysis array, which the session then
-    caches, and its over-exposure checks run there (one colour channel of a
+    caches if a band is on it (else it is read and not kept, as on a polarity
+    change), and its over-exposure checks run there (one colour channel of a
     lossless file is checked at the file's limit). Its median (``background``)
-    is the new array's; its ``looks_processed`` warning is assessed again on
-    it; its ``color_channels_differ`` message is rewritten to say that it is
-    measured as its channel says. Its band counts (#58) and the not-detected
-    records of its proteins go, as on a polarity change (:func:`set_polarity`).
+    is the new array's, and its ``looks_processed`` warning is assessed again
+    on it; its other import warnings stay as imported (the page shows its
+    ``color_channels_differ`` for the channel it is measured on:
+    :attr:`~proteia.core.model.ImageRef.shown_warnings`). Its band counts (#58)
+    and the not-detected records of its proteins go, as on a polarity change
+    (:func:`set_polarity`). Ladder work on it reads the mean whatever channel
+    is chosen (:meth:`~proteia.core.session.ProjectSession.calibration_pixels`).
 
     Refused (``INVALID_INPUT``, nothing changed) for an image with one gray
     channel, a visible-light marker image (its ladder is of several colours)
@@ -2009,14 +2006,10 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
         return
     array = session.channel_array(image_id, channel)
     background = estimate_background(array)
-    warnings = [
-        ImageWarning(code=w.code, message=CHANNELS_DIFFER_MEASURED)
-        if w.code == "color_channels_differ"
-        else w
-        for w in _processed_again(
-            session, image, array, polarity=image.polarity, channel=channel, background=background
-        )
-    ]
+    warnings = _processed_again(
+        session, image, array, polarity=image.polarity, channel=channel, background=background
+    )
+    kept = {image_id: array} if _bands_on(session.project.batch, image_id) else None
 
     def change(draft: Project) -> list[dict[str, JsonValue]]:
         drafted = draft.batch.find_image(image_id)
@@ -2035,7 +2028,7 @@ def set_channel(session: ProjectSession, image_id: str, channel: Channel) -> Non
             "from": left.value,
             "dropped_undetected": dropped,
         },
-        add_pixels={image_id: array},
+        add_pixels=kept,
     )
 
 
@@ -2308,7 +2301,7 @@ def _snapped(
     if point.x is None:  # unreachable: snapping asks for the point's x first
         raise RuntimeError("a calibration point without x cannot be snapped")
     return mwcal.refine_point(
-        session.pixels(image.id),
+        session.calibration_pixels(image.id),
         point.x,
         point.y,
         source=point.source,
@@ -2830,7 +2823,7 @@ def _proposal(
                 (ladder.curve for ladder in fitted.ladders if ladder.side is LadderSide.LEFT), None
             )
     return mwcal.find_ladder(
-        session.pixels(image.id),
+        session.calibration_pixels(image.id),
         x,
         kda=calibration.ladder_kda,
         reference_kda=reference,
@@ -2905,7 +2898,7 @@ def snap_ladder(
         _within_image(image, x=None, y=y)
     if not given:
         return ()
-    array = session.pixels(image.id)
+    array = session.calibration_pixels(image.id)
     source = _band_source(image)
     snapped = []
     for index, y in enumerate(given):
@@ -2959,7 +2952,7 @@ def _placed(
     if not applied:
         return []
     batch = session.project.batch
-    array = session.pixels(image.id)
+    array = session.calibration_pixels(image.id)
     source = _band_source(image)
     peaks = [] if proposal is None else [t.y for t in proposal.ticks if t.found]
     peaks += [] if proposal is None else list(proposal.extra)
@@ -2974,7 +2967,7 @@ def _placed(
         # only its own image, so it is not refused for that one: a point it
         # cannot check is not taken as snapped.
         try:
-            pixels = session.pixels(old.image_id)
+            pixels = session.calibration_pixels(old.image_id)
         except OperationError:
             return False
         return mwcal.is_snap_position(
@@ -5001,10 +4994,9 @@ def _place_row(
     # Pixels saturated as the over-exposure checks count them, on the channel
     # measured: a hollow band is reported as over-exposed, not as two bands
     # (#121). None for an image of unknown bit depth: no band is then hollow.
-    channel = image.measured_channel
     saturated_at = saturation_level(
-        clipping_depth(image.bit_depth, image.import_warnings, channel),
-        possible_clipping_depth(image.bit_depth, image.import_warnings, channel),
+        image.exact_check_depth,
+        image.near_check_depth,
         dark_on_light=image.polarity.dark_on_light,
     )
     try:
@@ -5570,8 +5562,7 @@ def unassessed_images(batch: Batch) -> list[str]:
     return [
         image.id
         for image in batch.iter_images()
-        if possible_clipping_depth(image.bit_depth, image.import_warnings, image.measured_channel)
-        is not None
+        if image.near_check_depth is not None
         and any(
             band.possibly_clipped is None
             for protein in batch.proteins_on(image.id)

@@ -247,9 +247,8 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 fallback=image.background,
             )
             clamp = RING_CLAMP
-        channel = image.measured_channel  # what the session's pixels are of (#206)
-        depth = clipping_depth(image.bit_depth, image.import_warnings, channel)
-        near_depth = possible_clipping_depth(image.bit_depth, image.import_warnings, channel)
+        # On the channel the session's pixels are of (#206).
+        depth, near_depth = image.exact_check_depth, image.near_check_depth
         for (protein, band), background in zip(placed, found, strict=True):
             size = protein.box_size
             net = net_signal(

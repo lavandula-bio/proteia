@@ -1280,13 +1280,13 @@ def _unassessed(image: model.ImageRef, band: model.Band | None) -> bool:
     :func:`~proteia.core.imaging.possible_clipping_depth` assesses, as
     :func:`~proteia.core.operations.unassessed_images` names it (a project
     saved before #112). Its warnings are read for the channel it is measured
-    on (:func:`~proteia.core.model.limit_distrusted_by`)."""
+    on (:attr:`~proteia.core.model.ImageRef.limit_distrusted`)."""
     return (
         band is not None
         and band.clipped is None
         and band.possibly_clipped is None
         and image.bit_depth is not None
-        and bool(model.limit_distrusted_by(image.import_warnings, image.measured_channel))
+        and bool(image.limit_distrusted)
     )
 
 
@@ -1294,9 +1294,9 @@ def _unchecked_reasons(image: model.ImageRef) -> str:
     """Why the clipping check cannot run on an image, as
     :func:`~proteia.core.imaging.clipping_depth` decides it: its import warnings
     that distrust the channel it is measured on
-    (:func:`~proteia.core.model.limit_distrusted_by`) and an unknown bit depth,
+    (:attr:`~proteia.core.model.ImageRef.limit_distrusted`) and an unknown bit depth,
     joined by "and"; empty with none."""
-    codes = set(model.limit_distrusted_by(image.import_warnings, image.measured_channel))
+    codes = set(image.limit_distrusted)
     reasons = [text for code, text in _UNCHECKED_WARNINGS.items() if code in codes]
     if image.bit_depth is None:
         reasons.append("an unknown bit depth")
