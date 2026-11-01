@@ -1611,6 +1611,95 @@ def test_the_original_colours_switch_is_a_toggle_button_the_keyboard_reaches():
     assert parser.by_id["view-colours-state"]["role"] == "status"
 
 
+def test_a_colour_image_offers_the_channel_it_is_measured_on():
+    # #206: under the polarity, before the marker image, "Measured on" offers
+    # the channels of the image shown in a fixed order. It is hidden until the
+    # state offers a channel for that image, and the line under it says who
+    # chose it (a screen reader hears it with the choice).
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    panel = _markup(html, '<div id="image-controls"', '<button id="remove-image"')
+    places = [
+        panel.index(f'id="{name}"')
+        for name in ("polarity", "channel-field", "channel", "channel-why", "marker-field")
+    ]
+    assert places == sorted(places)
+    parser = _Tags()
+    parser.feed(html)
+    assert "hidden" in parser.by_id["channel-field"] and "hidden" in parser.by_id["channel-why"]
+    assert parser.by_id["channel"]["aria-describedby"] == "channel-why"
+    field = _markup(panel, '<label id="channel-field"', "</label>")
+    assert re.search(r'<label id="channel-field"[^>]*>\s*Measured on\s*<select', field)
+    controls = _Controls()
+    controls.feed(field + "</label>")
+    assert [(tag, fields["id"], labelled) for tag, fields, labelled in controls.controls] == [
+        ("select", "channel", True)
+    ]
+    assert controls.options["channel"] == [
+        ("red", False, False),
+        ("green", False, False),
+        ("blue", False, False),
+        ("mean", False, False),
+    ]
+    words = re.findall(r"<option [^>]*>([^<]*)</option>", field)
+    assert words == ["Red channel", "Green channel", "Blue channel", "Mean of red, green and blue"]
+
+
+def test_the_page_shows_the_channel_the_state_offers():
+    # Shown only where the state offers a channel for the image (channel.offered:
+    # not for a gray image, whose channel is null, a marker or a CMYK image),
+    # with the server's words; the select shows the channel last chosen on this
+    # page while its change has no answer yet, else the one measured.
+    _, render = _function(_code("app.js"), "function renderChannel(")
+    assert "image.channel && image.channel.offered" in render
+    assert '$("channel-field").hidden = !offered' in render
+    assert "image.channel.words" in render
+    assert "wantedChannel(image.id) || image.channel.measured" in render
+    _, wanted = _function(_code("app.js"), "function wantedChannel(")
+    assert "c.imageId === imageId && c.opening === opening" in wanted
+    _, images = _function(_code("app.js"), "function renderImages(")
+    assert "renderChannel(image)" in images
+
+
+def test_channel_changes_are_sent_one_after_another_in_the_order_made():
+    # A change runs in the app's edit queue (the protein panel's, as the lane
+    # table's edits do), after the box edits in flight: so two changes reach
+    # the server in the order chosen, each once the one before has its answer,
+    # and a box placed or an undo asked for after it waits for it; none is
+    # sent once another project is asked for. A refusal shows the state again
+    # (the select goes back to the channel measured) before it is said.
+    script = _code("app.js")
+    _, change = _function(script, "function sendChannel(")
+    queued = change.index("proteinPanel.queueEdit(")
+    assert change.index("const after = pending();") < queued
+    sent = change.index('return await send("PUT", `/api/images/${imageId}/channel`, { channel })')
+    assert queued < sent < change.index("{ after },")
+    assert sent < change.index("answered();") < change.index("await reportChannel(error, imageId)")
+    assert "if (current()) {" in change
+    listener = script[script.index('$("channel").addEventListener("change"') :].split("\n});", 1)[0]
+    assert "sendChannel(state.imageId, event.target.value)" in listener
+    _, refused = _function(script, "function reportChannel(")
+    assert "render()" in refused
+
+
+def test_the_grey_preview_is_kept_under_the_channel_it_shows():
+    # The page keeps each image's grey preview with the channel it shows: the
+    # one the server names (its header), once answered. A preview of another
+    # channel than the state shown measures is dropped and fetched again, so
+    # after a channel change, its undo or redo, or one made in another tab, the
+    # view draws the channel measured.
+    script = _code("app.js")
+    assert f'const CHANNEL_HEADER = "{api.CHANNEL_HEADER}";' in script
+    _, fetched = _function(script, "function bitmapOf(")
+    assert "response.headers.get(CHANNEL_HEADER)" in fetched
+    _, select = _function(script, "function select(")
+    assert "greyOf.get(previews.grey).channel !== measuredOf(image)" in select
+    assert "forgetGrey(previews)" in select
+    _, view = _function(script, "function renderView(")
+    assert "shows.channel !== measuredOf(image)" in view and "shows.at !==" in view
+    _, measured = _function(script, "function measuredOf(")
+    assert 'image.channel ? image.channel.measured : "mean"' in measured
+
+
 def _object_keys(script: str, name: str) -> set[str]:
     """The keys of the object literal ``const <name> = {...};`` in a script."""
     body = script[script.index(f"const {name} = {{") :].split("\n};", 1)[0]

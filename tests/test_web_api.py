@@ -428,11 +428,30 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
     def channel_of(answer: dict, image: str):
         return next(i for i in answer["project"]["images"] if i["id"] == image)["channel"]
 
+    def shows(image: str, query: str = "") -> str | None:
+        # The channel a preview answered names: what its gray pixels are of (#206).
+        status, headers, _ = fetch(client, f"/api/images/{image}/preview{query}")
+        assert status == 200
+        return headers.get("proteia-channel")
+
     assert channel_of(uploaded, image_id) is None
-    assert channel_of(uploaded, tinted) == {"measured": "mean", "source": None, "offered": True}
+    unchosen = channel_of(uploaded, tinted)
+    assert {k: unchosen[k] for k in ("measured", "source", "offered")} == {
+        "measured": "mean",
+        "source": None,
+        "offered": True,
+    }
+    assert (shows(tinted), shows(image_id), shows(tinted, "?colour=original")) == (
+        "mean",
+        "mean",  # a gray image is its own values: the mean
+        None,  # the file's own colours, whatever is measured
+    )
     path = f"/api/images/{tinted}/channel"
     answer = client.ok("PUT", path, {"channel": "blue"})
-    assert channel_of(answer, tinted) == {"measured": "blue", "source": "chosen", "offered": True}
+    chosen = {"measured": "blue", "source": "chosen", "offered": True, "words": "Chosen by you."}
+    assert channel_of(answer, tinted) == chosen
+    assert shows(tinted) == "blue"
+    assert shows(image_id, "?colour=original") == "mean"  # a gray file answers its gray preview
     revision = answer["project"]["revision"]
     assert revision == uploaded["project"]["revision"] + 1
     assert answer["results"]["revision"] == revision
@@ -449,6 +468,11 @@ def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
     state = client.ok("GET", "/api/project")
     assert state["project"]["revision"] == revision  # no refusal changed anything
     assert channel_of(state, tinted)["measured"] == "blue"
+    undone = client.ok("POST", "/api/undo")
+    assert channel_of(undone, tinted)["measured"] == "mean"
+    assert shows(tinted) == "mean"
+    client.ok("POST", "/api/redo")
+    assert shows(tinted) == "blue"
 
 
 # --- Original colours (#57) ---

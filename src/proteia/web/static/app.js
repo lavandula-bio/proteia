@@ -35,6 +35,10 @@ const NEEDS_LAUNCH =
 // does not show (projectChanged).
 const OPENING_HEADER = "Proteia-Opening";
 const PROJECT_CHANGED = "project_changed";
+// A grey preview names the channel its pixels are of in this header (#206),
+// which may be one chosen after it was asked for: the page keeps it under that
+// channel (bitmapOf).
+const CHANNEL_HEADER = "Proteia-Channel";
 
 // The launcher puts the token in the URL fragment, which the browser never sends
 // to a server. Keep it for this tab only and remove it from the address bar.
@@ -1322,6 +1326,15 @@ function select() {
       forgetBitmap(id);
     }
   }
+  // A grey preview of another channel than the image is measured on now (a
+  // channel changed here or in another tab, an undo or redo of it) is fetched
+  // again when shown (#206).
+  for (const image of images) {
+    const previews = state.bitmaps.get(image.id);
+    if (previews && previews.grey && greyOf.get(previews.grey).channel !== measuredOf(image)) {
+      forgetGrey(previews);
+    }
+  }
 }
 
 function laneName(project, index) {
@@ -1411,7 +1424,22 @@ function renderImages(project, image) {
       warnings.append(item);
     }
   }
+  renderChannel(image);
   renderMembranes(project);
+}
+
+// "Measured on" (#206), where the state offers a channel for the image shown:
+// the channel last chosen for it on this page while that change has no answer
+// yet (so a render meanwhile does not show the one before), else the one it is
+// measured on; and the server's line saying who chose it.
+function renderChannel(image) {
+  const offered = Boolean(image && image.channel && image.channel.offered);
+  $("channel-field").hidden = !offered;
+  $("channel-why").hidden = !offered;
+  if (offered) {
+    $("channel").value = wantedChannel(image.id) || image.channel.measured;
+    $("channel-why").textContent = image.channel.words;
+  }
 }
 
 let membranesOpening = null; // the open id the Membrane choice was made in
@@ -1622,15 +1650,44 @@ function renderHint(project, image) {
 // original colours (the server answers the grey one for a file without colour).
 const PREVIEW_QUERY = { grey: "", original: "?colour=original" };
 
+// What each grey preview shows (#206), by the Promise bitmapOf gives:
+// {channel, at}. `channel` is the one its pixels are of, as the server names
+// it once it has answered; until then, the one its image was measured on in
+// the state shown when it was asked for, whose revision is `at`.
+const greyOf = new WeakMap();
+
+// The bitmap the view was last given to draw: it is never closed (a closed
+// bitmap cannot be drawn), even when its image is measured on another channel
+// now, until the view draws another.
+let drawnBitmap = null;
+
+// The channel an image is measured on (#206): a gray image's own values are
+// the mean.
+function measuredOf(image) {
+  return image.channel ? image.channel.measured : "mean";
+}
+
+// Drop an image's grey preview: closed, unless the view draws it still (then
+// it goes once the view draws another and nothing holds it).
+function forgetGrey(previews) {
+  const pending = previews.grey;
+  delete previews.grey;
+  pending.then((bitmap) => bitmap !== drawnBitmap && bitmap.close()).catch(() => {});
+}
+
 // One fetch per preview, shared by every render that waits for it.
-function bitmapOf(imageId, colours) {
-  if (!state.bitmaps.has(imageId)) {
-    state.bitmaps.set(imageId, {});
+function bitmapOf(image, colours) {
+  if (!state.bitmaps.has(image.id)) {
+    state.bitmaps.set(image.id, {});
   }
-  const previews = state.bitmaps.get(imageId);
+  const previews = state.bitmaps.get(image.id);
   if (!previews[colours]) {
-    const pending = request("GET", `/api/images/${imageId}/preview${PREVIEW_QUERY[colours]}`)
-      .then((response) => response.blob())
+    const shows = { channel: measuredOf(image), at: state.answered.revision };
+    const pending = request("GET", `/api/images/${image.id}/preview${PREVIEW_QUERY[colours]}`)
+      .then((response) => {
+        shows.channel = response.headers.get(CHANNEL_HEADER) || shows.channel;
+        return response.blob();
+      })
       .then((blob) => createImageBitmap(blob));
     pending.catch(() => {
       if (previews[colours] === pending) {
@@ -1638,6 +1695,9 @@ function bitmapOf(imageId, colours) {
       }
     });
     previews[colours] = pending;
+    if (colours === "grey") {
+      greyOf.set(pending, shows);
+    }
   }
   return previews[colours];
 }
@@ -1678,10 +1738,18 @@ $("original-colours").addEventListener("click", () => toggleColours());
 
 function sayColours(image, colours) {
   const name = isolate(image.original_name);
+  // Which grey, for a file whose red, green and blue differ (#206); a palette
+  // TIFF's grey is its indices.
+  const measured = image.channel && image.channel.measured;
+  const grey = !measured
+    ? ""
+    : measured === "mean"
+      ? " (the mean of its red, green and blue)"
+      : ` (its ${measured} channel)`;
   $("view-colours-state").textContent =
     colours === "original"
       ? `${name} in its original colours, for display only`
-      : `${name} as the grey analysis image, which the nets are measured on`;
+      : `${name} as the grey analysis image${grey}, which the nets are measured on`;
 }
 
 let renderGeneration = 0;
@@ -1755,10 +1823,24 @@ function renderView(project) {
     // view never shows, nor takes a click on, a box the server no longer has.
     view.setOverlay(boxes, ghosts, state.boxId, marks);
   }
-  bitmapOf(image.id, colours)
+  const pending = bitmapOf(image, colours);
+  pending
     .then((bitmap) => {
       if (generation !== renderGeneration) {
         return; // a later render owns the view
+      }
+      const shows = greyOf.get(pending);
+      if (shows && shows.channel !== measuredOf(image) && shows.at !== state.answered.revision) {
+        // Of another channel, and asked for before the state shown: it may be
+        // older than it (the channel changed and back since). Asked for again.
+        // One asked for in this state is newer (another tab changed the
+        // channel): drawn, and dropped at the answer that says otherwise.
+        const previews = state.bitmaps.get(image.id);
+        if (previews && previews.grey === pending) {
+          forgetGrey(previews);
+        }
+        renderView(state.project);
+        return;
       }
       if (state.shownImageId === image.id) {
         view.setBitmap(bitmap); // this image, maybe in other colours: the zoom stays
@@ -1767,6 +1849,7 @@ function renderView(project) {
         view.setOverlay(boxes, ghosts, state.boxId, marks);
         state.shownImageId = image.id;
       }
+      drawnBitmap = bitmap;
       const switched = switchedColours === image.id;
       switchedColours = null;
       if (switched) {
@@ -2305,6 +2388,90 @@ $("polarity").addEventListener("change", (event) => {
     () => render(),
   );
 });
+
+// The channel an image is measured on (#206): the changes chosen on this page
+// that have no answer yet, oldest first: {imageId, channel, opening}. The
+// select shows the last one of the image shown (renderChannel).
+const channelsAsked = [];
+
+// The channel last chosen on this page for `imageId` of the project shown, while
+// a change of it waits for its answer; else null.
+function wantedChannel(imageId) {
+  const opening = shownOpening();
+  const asked = channelsAsked.findLast((c) => c.imageId === imageId && c.opening === opening);
+  return asked ? asked.channel : null;
+}
+
+// Measure `imageId` on `channel`, in the app's edit queue (the protein panel's,
+// as the lane table's edits are): once the edits made before it have their
+// answers, the boxes in flight too, so two changes reach the server in the
+// order chosen and the last one is the one measured (the select is not
+// disabled meanwhile: the keyboard would lose it); a box placed, or an undo
+// asked for, after it waits for it. Not sent once another project is asked for
+// or shown. A refusal is said (reportChannel). Gives the answer, or null.
+function sendChannel(imageId, channel) {
+  const asked = { imageId, channel, opening: shownOpening() };
+  channelsAsked.push(asked);
+  const answered = () => {
+    const at = channelsAsked.indexOf(asked);
+    if (at >= 0) {
+      channelsAsked.splice(at, 1);
+    }
+  };
+  const after = pending();
+  const run = proteinPanel.queueEdit(
+    async (current) => {
+      try {
+        return await send("PUT", `/api/images/${imageId}/channel`, { channel });
+      } catch (error) {
+        answered(); // the select shows the state again
+        if (current()) {
+          await reportChannel(error, imageId);
+        }
+        return null;
+      }
+    },
+    { after },
+  );
+  run.then(answered, answered); // not run: another project was asked for
+  return run;
+}
+
+// A refused channel change changes nothing: said in the status line, the
+// image by its file name (the server's words name a missing or changed file,
+// and an image no longer in the project, by its id), and the state shown
+// again, so the select shows the channel measured. An image gone (removed in
+// another tab, or by an undo there) is read again: if that hides the select
+// the keyboard was on, it goes to the image shown in the list.
+async function reportChannel(error, imageId) {
+  const image = state.project.images.find((i) => i.id === imageId);
+  const name = image ? isolate(image.original_name) : "the image";
+  const had = document.activeElement === $("channel");
+  if (!saidElsewhere(error)) {
+    let why = sentence(error.message);
+    if (error.code === "unknown_id") {
+      why = sentence(`${name} is no longer in the project.`);
+    } else if (error.code === "image_file_changed") {
+      why =
+        `The file of ${name} is missing from the project's images folder or was changed` +
+        " outside Proteia. Put the original file back, then choose the channel again.";
+    }
+    showStatus(`Channel not changed: ${why}`);
+  }
+  if (error.code === "unknown_id") {
+    await reread().catch(() => {});
+  }
+  render();
+  if (had && $("channel-field").hidden) {
+    const chosen = $("images").querySelector('button[aria-pressed="true"]');
+    (chosen || $("import-kind")).focus();
+  }
+}
+
+$("channel").addEventListener("change", (event) => {
+  sendChannel(state.imageId, event.target.value);
+});
+
 $("remove-image").addEventListener("click", () => {
   const image = state.project.images.find((i) => i.id === state.imageId);
   if (image && window.confirm(`Remove ${isolate(image.original_name)} and its boxes?`)) {
