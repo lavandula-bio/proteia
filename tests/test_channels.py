@@ -22,9 +22,10 @@ import tifffile
 from PIL import Image
 from pydantic import ValidationError
 
-from conftest import MEMBRANE_LEVEL, FakeClock, write_tiff
+from conftest import MEMBRANE_LEVEL, FakeClock, synthetic_blot, write_tiff
 from proteia.core import imaging, record, results, storage
 from proteia.core import operations as ops
+from proteia.core import session as session_module
 from proteia.core.grow import NOISE_K, REL_THRESHOLD, grow_box
 from proteia.core.model import (
     UNTRUSTED_WARNINGS,
@@ -1239,11 +1240,23 @@ def test_a_chosen_channel_is_saved_and_read_back(tmp_path):
 EXPORTED_AT = "2026-11-01T12:00:00.000Z"
 
 
+ONE_CHANNEL_VALUES = (
+    "gray: the mean of red, green and blue for colour, except on an image measured on one"
+    " of its channels (red, green or blue), whose values are that channel's: measured_on"
+    " names each image's channel and the over-exposure check its bands get (exact,"
+    " near_limit or none)"
+)
+
+
 def test_the_record_says_what_each_image_is_measured_on(tmp_path):
+    # The settings describe what each image is measured on, whoever chose it:
+    # an image on the mean is described as the mean, a choice of it included.
     s = session_on(tmp_path)
     tif = import_pixels(s, colour_blot(), "GFP µ.tif")
     jpg = import_pixels(s, colour_blot(), "RFP β.jpg", quality=95)
     gray = import_pixels(s, colour_blot()[..., 1], "gray α.tif")
+    other = import_pixels(s, colour_blot(seed=2), "unchosen γ.tif")
+    float_rgb = import_pixels(s, colour_blot(seed=3), "float δ.png")
 
     def recorded() -> dict:
         return record.build_record(s.project, exported_at=EXPORTED_AT, files={})["settings"]
@@ -1257,22 +1270,33 @@ def test_the_record_says_what_each_image_is_measured_on(tmp_path):
     assert "(a lossy, colour or CMYK-converted image)" in plain["detect_row"]["saturated_at"]
     assert "measured_on" not in plain
 
+    # A chosen mean alone: every colour image is measured on the mean, which
+    # the settings say already; nothing changes.
     ops.set_channel(s, tif, GREEN)
+    ops.set_channel(s, tif, MEAN)
+    assert stored(s, tif).channel == ChannelChoice(channel=MEAN, source=ChannelSource.CHOSEN)
+    assert recorded() == plain
+
+    # One channel beside a chosen mean, an unchosen colour image and a gray one.
     ops.set_channel(s, jpg, RED)
+
+    def unknown_depth(draft: Project) -> None:  # as an image imported before #224
+        draft.batch.find_image(float_rgb).bit_depth = None
+
+    plant(s, unknown_depth)
+    ops.set_channel(s, float_rgb, BLUE)
     got = recorded()
-    assert got["possibly_clipped"]["values"] == (
-        "gray: the mean of red, green and blue for colour, or the one channel chosen for an"
-        " image: measured_on names each image's channel and the over-exposure check its bands"
-        " get (exact, near_limit or none)"
-    )
+    assert got["possibly_clipped"]["values"] == ONE_CHANNEL_VALUES
     assert got["detect_row"]["saturated_at"] == plain["detect_row"]["saturated_at"].replace(
         "(a lossy, colour or CMYK-converted image)",
         "(each image whose check measured_on names near_limit)",
     )
     assert got["measured_on"] == {
-        tif: {"channel": "green", "check": "exact"},
-        jpg: {"channel": "red", "check": "near_limit"},
+        tif: {"channel": "mean", "check": "near_limit"},  # the user's mean
+        jpg: {"channel": "red", "check": "near_limit"},  # lossy
         gray: {"channel": "mean", "check": "exact"},
+        other: {"channel": "mean", "check": "near_limit"},
+        float_rgb: {"channel": "blue", "check": "none"},
     }
     # Every other setting as without a choice.
     for key in ("possibly_clipped", "detect_row"):
@@ -1282,8 +1306,13 @@ def test_the_record_says_what_each_image_is_measured_on(tmp_path):
     assert {
         k: v for k, v in got.items() if k not in ("possibly_clipped", "detect_row", "measured_on")
     } == {k: v for k, v in plain.items() if k not in ("possibly_clipped", "detect_row")}
-    ops.set_channel(s, tif, MEAN)  # chosen, on the mean: its colour averaged
-    assert recorded()["measured_on"][tif] == {"channel": "mean", "check": "near_limit"}
+    # A lossless colour image on green: the exact check.
+    ops.set_channel(s, tif, GREEN)
+    assert recorded()["measured_on"][tif] == {"channel": "green", "check": "exact"}
+    # Back to the mean everywhere: as without a choice again.
+    for image in (tif, jpg, float_rgb):
+        ops.set_channel(s, image, MEAN)
+    assert recorded() == plain
 
 
 # --- Ladder work reads the mean, whatever channel the protein is measured on ---
@@ -1362,6 +1391,200 @@ def test_ladder_work_takes_the_cached_mean_and_keeps_no_other(tmp_path):
     again = reopened.calibration_pixels(image)
     assert np.array_equal(again, mean) and again is not mean and not again.flags.writeable
     assert reopened._pixels[image] is green  # the measured channel's array stays cached
+
+
+TWELVE_KDA = (300, 250, 200, 150, 120, 100, 80, 60, 50, 40, 30, 20)
+
+
+def _counting_reads(monkeypatch) -> list:
+    """The channel of every analysis array the session reads from a stored file."""
+    calls: list = []
+    real = session_module.load_image
+
+    def counting(path, *, channel=None):
+        calls.append(channel)
+        return real(path, channel=channel)
+
+    monkeypatch.setattr(session_module, "load_image", counting)
+    return calls
+
+
+def test_an_operation_reads_the_mean_of_a_chosen_image_once(tmp_path, monkeypatch):
+    # A ruler of 12 points applied again over its own points judges each
+    # replaced point where it was snapped: one read of the stored file, not one
+    # per point, and none kept once the operation is over.
+    ys = [10.0 + 15.0 * i for i in range(len(TWELVE_KDA))]
+    ladder = synthetic_blot((CAL_H, CAL_W), [(CAL_LEFT_X, y, 10.0, 2.0, 20000.0) for y in ys])
+    flat = noisy16(np.full((CAL_H, CAL_W), MEMBRANE_LEVEL), 61)
+    rgb = np.dstack([noisy16(ladder, 62), cal_blot(), flat])
+    s = session_on(tmp_path)
+    image = import_pixels(s, rgb, "merged µ.tif", DARK, kind=MERGED)
+    ops.set_ladder(s, s.project.batch.membrane_of(image).id, "twelve µ", kda=list(TWELVE_KDA))
+    ops.set_channel(s, image, GREEN)
+    calls = _counting_reads(monkeypatch)
+    points = [(y + 1.3, kda) for y, kda in zip(ys, TWELVE_KDA, strict=True)]  # off the bands
+    ops.set_ladder_points(s, image, LadderSide.LEFT, points, x=CAL_LEFT_X)
+    assert calls == [MEAN]
+    calls.clear()
+    # The ruler a pixel to the right: each point replaces the one at its y.
+    ops.set_ladder_points(s, image, LadderSide.LEFT, points, x=CAL_LEFT_X + 1)
+    applied = s.project.log[-1].params
+    assert len(applied["removed"]) == 12 and len(applied["points"]) == 12
+    assert calls == [MEAN]
+    calls.clear()
+    ops.snap_ladder(s, image, CAL_LEFT_X, ys)  # another operation: read again
+    assert calls == [MEAN]
+    assert s._calibration_reads is None  # nothing kept between operations
+
+
+def test_the_mean_read_in_an_operation_lasts_until_it_ends(tmp_path, monkeypatch):
+    s = session_on(tmp_path)
+    image = import_pixels(s, ladder_and_protein(), "merged µ.tif", DARK, kind=MERGED)
+    ops.set_channel(s, image, GREEN)
+    calls = _counting_reads(monkeypatch)
+
+    def reads(action) -> int:
+        calls.clear()
+        action()
+        return len(calls)
+
+    def nested() -> None:
+        with s.transaction():
+            first = s.calibration_pixels(image)
+            with s.transaction():  # an operation inside another
+                assert s.calibration_pixels(image) is first
+            assert s.calibration_pixels(image) is first
+
+    def across_a_commit() -> None:  # what was read before a commit goes with it
+        with s.transaction():
+            s.calibration_pixels(image)
+            plant(s, lambda draft: None)
+            s.calibration_pixels(image)
+            s.calibration_pixels(image)
+
+    def refused() -> None:
+        with pytest.raises(OperationError), s.transaction():
+            s.calibration_pixels(image)
+            raise OperationError(ErrorCode.INVALID_INPUT, "refused")
+
+    def outside() -> None:  # outside any operation: read each time, not kept
+        s.calibration_pixels(image)
+        s.calibration_pixels(image)
+
+    assert (reads(nested), reads(across_a_commit), reads(refused), reads(outside)) == (1, 2, 1, 2)
+    assert s._calibration_reads is None and set(calls) == {MEAN}
+    # Measured on the mean: the session's cached array, read once in all.
+    ops.set_channel(s, image, MEAN)
+    calls.clear()
+    with s.transaction():
+        s.calibration_pixels(image)
+    s.calibration_pixels(image)
+    assert calls == [MEAN]
+
+
+# --- Every operation that rebuilds an image's warnings keeps its colour ---
+
+
+def _chosen(tmp_path: Path, name: str = "p") -> tuple[ops.ProjectSession, str, str]:
+    """A saved project with a lossless colour image measured on green, six boxes
+    on it, and a gray image beside it."""
+    s = session_on(tmp_path / name, save_to_folder)
+    image = import_pixels(s, colour_blot(crosstalk=0.1), "GFP µ.tif")
+    import_pixels(s, colour_blot()[..., 1], "gray α.tif")
+    protein, _ = six_boxes(s, image)
+    ops.set_channel(s, image, GREEN)
+    return s, image, protein
+
+
+def _reopens_on_green(s: ops.ProjectSession, image: str, channel: Channel = GREEN) -> None:
+    """The image keeps its colour warning and its choice, and the saved project
+    opens with them."""
+    codes = [w.code for w in stored(s, image).import_warnings]
+    assert "color_channels_differ" in codes
+    assert stored(s, image).measured_channel is channel
+    s.save()
+    reopened = ops.open_project(s.folder, autosave=None)
+    assert stored(reopened, image).measured_channel is channel
+    assert "color_channels_differ" in [w.code for w in stored(reopened, image).import_warnings]
+    assert_nets_current(reopened)
+
+
+def _polarity_twice(s, image, protein):
+    ops.set_polarity(s, image, DARK)
+    ops.set_polarity(s, image, LIGHT)
+
+
+def _polarity_unreadable(s, image, protein):
+    # No band, and the file gone: the polarity changes and only looks_processed
+    # may go (the warnings are not read from the file).
+    ops.clear_boxes(s, protein)
+    path = storage.image_path(s.folder, stored(s, image))
+    data = path.read_bytes()
+    reopened = ops.open_project(s.folder, autosave=save_to_folder)
+    path.unlink()
+    ops.set_polarity(reopened, image, DARK)
+    path.write_bytes(data)
+    return reopened
+
+
+def _channel_round(s, image, protein):
+    ops.set_channel(s, image, RED)
+    ops.set_channel(s, image, MEAN)
+    ops.set_channel(s, image, GREEN)
+
+
+def _requantify(s, image, protein):
+    from conftest import as_legacy
+
+    s._commit(as_legacy(s.project), action="plant", params={})
+    assert ops.requantify(s) == (image,)
+
+
+def _undo_redo(s, image, protein):
+    ops.set_polarity(s, image, DARK)
+    ops.set_channel(s, image, RED)
+    for _ in range(3):
+        ops.undo(s)  # back past the channel change to the green choice and before it
+    for _ in range(3):
+        ops.redo(s)
+    ops.undo(s)
+    ops.undo(s)  # green, light on dark
+
+
+def _box_edits(s, image, protein):
+    band = boxes_of(s, protein).bands[0]
+    x0, y0, x1, y1 = band.box.rect(BOX)
+    ops.move_box(s, band.id, (x0 + 1, y0, x1 + 1, y1))
+    ops.remove_box(s, band.id)
+    ops.place_box(s, protein, LANES[0], ROW, lane_index=0, grow=True)
+
+
+def _reload(s, image, protein):
+    s.save()
+    reread = ops.open_project(s.folder, autosave=None)
+    project_file = s.folder / storage.PROJECT_FILE
+    project_file.write_bytes(project_file.read_bytes().replace(b'"chosen"', b'"chosen" '))
+    assert reread.reload()  # read again, as when replaced outside Proteia
+    return reread
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        _polarity_twice,
+        _polarity_unreadable,
+        _channel_round,
+        _requantify,
+        _undo_redo,
+        _box_edits,
+        _reload,
+    ],
+    ids=lambda f: f.__name__.strip("_"),
+)
+def test_a_chosen_channel_keeps_its_basis_through_every_rebuild(tmp_path, path):
+    s, image, protein = _chosen(tmp_path)
+    s = path(s, image, protein) or s
+    _reopens_on_green(s, image)
 
 
 # --- The state the page reads ---

@@ -54,7 +54,7 @@ from pydantic import JsonValue, TypeAdapter
 
 import proteia
 from proteia.core import analyze, export, grow, ladders, mwcal, mwrow, quantify, rowdetect, storage
-from proteia.core.model import LogEntry, Project, Timestamp, lane_number
+from proteia.core.model import Channel, LogEntry, Project, Timestamp, lane_number
 from proteia.core.results import Results, mw_check_settings
 
 RECORD_FORMAT: Final = 1
@@ -65,7 +65,7 @@ _DISTRIBUTIONS: Final = ("numpy", "scipy", "scikit-image", "pillow", "tifffile")
 _TIMESTAMP = TypeAdapter(Timestamp)
 # How detect_row_boxes chooses detect_row's saturated_at for an image (#121),
 # naming the images that get the near-limit check: _NEAR_LIMIT_IMAGES, or, in a
-# project where an image is measured on a chosen channel (#206), those
+# project where an image is measured on one of its channels (#206), those
 # measured_on says.
 _SATURATED_AT: Final = (
     "quantify.saturation_level: the detector limit where the exact over-exposure"
@@ -76,12 +76,13 @@ _SATURATED_AT: Final = (
 _NEAR_LIMIT_IMAGES: Final = "a lossy, colour or CMYK-converted image"
 _NEAR_LIMIT_CHOSEN: Final = "each image whose check measured_on names near_limit"
 # What the over-exposure checks read: an image's analysis values, which for
-# colour are the mean of red, green and blue unless a channel is chosen for it
-# (#206); then measured_on names each image's channel and check.
+# colour are the mean of red, green and blue unless the image is measured on one
+# of its channels (#206); then measured_on names each image's channel and check.
 _CHECKED_VALUES: Final = "gray: the mean of red, green and blue for colour"
 _CHECKED_VALUES_CHOSEN: Final = (
-    f"{_CHECKED_VALUES}, or the one channel chosen for an image: measured_on names each"
-    " image's channel and the over-exposure check its bands get (exact, near_limit or none)"
+    f"{_CHECKED_VALUES}, except on an image measured on one of its channels (red, green or"
+    " blue), whose values are that channel's: measured_on names each image's channel and the"
+    " over-exposure check its bands get (exact, near_limit or none)"
 )
 
 
@@ -120,8 +121,9 @@ def settings() -> dict[str, JsonValue]:
         # Where that check cannot run: a lossy or CMYK-converted image, or a
         # colour one measured on the mean, of known bit depth (#112,
         # quantify.is_possibly_clipped). The values both checks read are the
-        # image's analysis values; a record of a project where a channel is
-        # chosen for an image says so, and names each image's (build_record).
+        # image's analysis values; a record of a project where an image is
+        # measured on one of its channels says so, and names each image's
+        # (project_settings).
         "possibly_clipped": {
             "min_pixels": quantify.POSSIBLY_CLIPPED_PIXELS,
             "near_limit_levels": quantify.NEAR_LIMIT_LEVELS,
@@ -172,14 +174,17 @@ def settings() -> dict[str, JsonValue]:
 
 def project_settings(project: Project) -> dict[str, JsonValue]:
     """:func:`settings` as they apply to ``project``: with the method its stored
-    nets used (``background_method``), and, once a channel is chosen for one of
-    its images (#206), what the over-exposure checks read there: the values
-    text says so, ``measured_on`` names each image's channel and the check its
-    bands get (``exact``, ``near_limit`` or ``none``), and ``saturated_at``
-    points there. Without a choice they are :func:`settings` word for word."""
+    nets used (``background_method``), and, once one of its images is measured
+    on one of its channels (#206), what the over-exposure checks read: the
+    values text says so, ``measured_on`` names each image's channel and the
+    check its bands get (``exact``, ``near_limit`` or ``none``), and
+    ``saturated_at`` points there. They describe what each image is measured
+    on, not who chose it: while every image is on the mean (no choice, or the
+    user's choice of it) they are :func:`settings` word for word, which say
+    that already."""
     found = {**settings(), "background_method": project.background_method}
     images = list(project.batch.iter_images())
-    if all(image.channel is None for image in images):
+    if all(image.measured_channel is Channel.MEAN for image in images):
         return found
     clipped = cast(dict[str, JsonValue], found["possibly_clipped"])
     row = cast(dict[str, JsonValue], found["detect_row"])
@@ -355,7 +360,8 @@ def build_record(
         "software": software_versions(),
         # The method the stored nets used: ring_median_v1 (settings()["background"])
         # or, until the project is requantified, the legacy global_median; and
-        # what each image is measured on, once a channel is chosen (#206).
+        # what each image is measured on, once one is measured on one of its
+        # channels (#206).
         "settings": project_settings(project),
         "content": content,
         "content_hash": digest,

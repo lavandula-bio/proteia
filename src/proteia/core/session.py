@@ -395,6 +395,10 @@ class ProjectSession:
         self.save_error: Exception | None = None
         self.last_action: str | None = None
         self._pixels: dict[str, np.ndarray] = {}
+        # Within an operation (transaction), the mean arrays read for ladder
+        # work on images measured on another channel, by image id; None
+        # between operations, so none is kept (calibration_pixels).
+        self._calibration_reads: dict[str, np.ndarray] | None = None
         # (image id, SHA-256) -> how its stored file holds colour (file_colours).
         self._file_colours: dict[tuple[str, str], FileColours | None] = {}
         # (image id, SHA-256) -> what its stored file's header says of reading it
@@ -486,13 +490,21 @@ class ProjectSession:
         molecular-weight calibration: a ladder is found and snapped on the
         mean, as before #206, so a channel chosen for a protein never changes
         ladder work. The cached array (:meth:`pixels`) when the image is
-        measured on the mean; else read and checked now, and not kept. Raises
-        as :meth:`pixels` does."""
+        measured on the mean; else read and checked once per operation
+        (:meth:`transaction`), however many points it judges there, and not
+        kept after it; outside an operation, read each time. Raises as
+        :meth:`pixels` does."""
         with self.lock:
             image = self._project.batch.find_image(image_id)
             if image.measured_channel is Channel.MEAN:
                 return self.pixels(image_id)
-            return self._read_array(image, Channel.MEAN)
+            reads = self._calibration_reads
+            if reads is not None and image_id in reads:
+                return reads[image_id]
+            array = self._read_array(image, Channel.MEAN)
+            if reads is not None:
+                reads[image_id] = array
+            return array
 
     def channel_array(self, image_id: str, channel: Channel) -> np.ndarray:
         """The image's read-only analysis array of ``channel`` (#206), read and
@@ -707,6 +719,8 @@ class ProjectSession:
                 self._pixels[image_id] = array
             for image_id in evict:
                 self._pixels.pop(image_id, None)
+            if self._calibration_reads:  # read for the project before this commit
+                self._calibration_reads.clear()
             # The history moves with the commit, before the hook saves (and so
             # deletes the files no state references any more).
             if move is _Move.PUSH:
@@ -744,15 +758,24 @@ class ProjectSession:
     def transaction(self) -> Iterator[None]:
         """Run one operation under the lock. If it is refused (``OperationError``
         or ``LookupError``) before anything was committed, the pixel cache is put
-        back as it was, even if the operation read pixels first."""
+        back as it was, even if the operation read pixels first. The mean
+        arrays its ladder work read (:meth:`calibration_pixels`) go when it
+        ends, however it ends; an operation run inside another keeps them for
+        the outer one."""
         with self.lock:
             project, cached = self._project, dict(self._pixels)
+            outermost = self._calibration_reads is None
+            if outermost:
+                self._calibration_reads = {}
             try:
                 yield
             except (OperationError, LookupError):
                 if self._project is project:
                     self._pixels = cached
                 raise
+            finally:
+                if outermost:
+                    self._calibration_reads = None
 
     def _opening_state(self) -> _State:
         """The committed project as the state the session's history begins with.
