@@ -504,7 +504,7 @@ class ArenaSource(StrEnum):
 MAX_ARENA_ANGLE: Final = 45.0
 # How far outside its outline a point may lie and still count as inside, in
 # pixels: what turning the outline's edges may round away.
-_ON_EDGE: Final = 1e-9
+ON_EDGE: Final = 1e-9
 
 
 class Arena(_Model):
@@ -597,7 +597,7 @@ class AreaFrame:
         """Whether ``(x, y)`` lies in the turned outline, its edge included
         (to a billionth of a pixel)."""
         u, v = self.along(x, y)
-        return abs(u) <= self.half_width + _ON_EDGE and abs(v) <= self.half_height + _ON_EDGE
+        return abs(u) <= self.half_width + ON_EDGE and abs(v) <= self.half_height + ON_EDGE
 
 
 class LaneTable(_Model):
@@ -1012,12 +1012,6 @@ class Batch(_Model):
             raise ValueError(f"image {image_id} holds {len(found)} membranes' areas")
         return found[0]
 
-    def areas_at(self, image_id: str, x: float, y: float) -> list[tuple[Membrane, Arena]]:
-        """The membrane areas on an image holding the point ``(x, y)``, each
-        with its membrane, in membrane order (:meth:`Arena.contains`)."""
-        image = self.find_image(image_id)
-        return [(m, a) for m, a in self.arenas_on(image_id) if a.contains(image, x, y)]
-
     def membrane_number(self, membrane: Membrane) -> int:
         """A membrane's number as the user reads it: its place in the batch,
         from 1 (a removal renumbers the later ones)."""
@@ -1179,7 +1173,8 @@ class Batch(_Model):
         whole image: each has its outline (a whole-image area would hold every
         point of the others). Gives, per area, the other areas of its image
         whose bounds meet its own, the only ones that can share a point with it
-        (:meth:`Arena.bounds`, widened by a pixel for the edge's tolerance).
+        (:meth:`Arena.bounds`: whole pixels past its corners, so past the
+        edge's tolerance too).
         The areas of an image listed ``twice`` are left to the id check."""
         on: dict[str, list[Arena]] = {}
         for membrane in self.membranes:
@@ -1204,10 +1199,10 @@ class Batch(_Model):
                     other
                     for other in arenas
                     if other is not arena
-                    and bounds[other.id][0] <= x1 + 1
-                    and x0 - 1 <= bounds[other.id][2]
-                    and bounds[other.id][1] <= y1 + 1
-                    and y0 - 1 <= bounds[other.id][3]
+                    and bounds[other.id][0] <= x1
+                    and x0 <= bounds[other.id][2]
+                    and bounds[other.id][1] <= y1
+                    and y0 <= bounds[other.id][3]
                 ]
         return others
 

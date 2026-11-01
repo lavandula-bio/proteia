@@ -221,6 +221,7 @@ from proteia.core.model import (
     LEGACY_BACKGROUND_METHOD,
     LOCAL_BACKGROUND_METHOD,
     MAX_ARENA_ANGLE,
+    ON_EDGE,
     OUTLINE_LIMIT,
     Arena,
     ArenaSource,
@@ -914,8 +915,6 @@ def _quantify_image(draft: Project, image_id: str, array: np.ndarray) -> None:
         for protein, row in batch.rows_on(image_id)
         if batch.boxes_of(protein).bands
     ]
-    if not rows:
-        return
     contexts: dict[RingContext, list[tuple[str, Protein]]] = {}
     for row_id, protein in rows:
         contexts.setdefault(_ring_context(batch, image_id, row_id), []).append((row_id, protein))
@@ -1016,8 +1015,8 @@ def _inside_mask(area: Arena, image: ImageRef, window: Rect) -> np.ndarray:
     dx, dy = xs[None, :] - frame.cx, ys[:, None] - frame.cy
     u = dx * frame.cos + dy * frame.sin
     v = dy * frame.cos - dx * frame.sin
-    edge = 1e-9  # as the model's: a centre on the turned edge is inside
-    return (np.abs(u) <= frame.half_width + edge) & (np.abs(v) <= frame.half_height + edge)
+    # As the model reads it: a centre on the turned edge is inside.
+    return (np.abs(u) <= frame.half_width + ON_EDGE) & (np.abs(v) <= frame.half_height + ON_EDGE)
 
 
 def _masked(array: np.ndarray, image: ImageRef, area: Arena, window: Rect) -> np.ndarray:
@@ -1032,9 +1031,9 @@ def _masked(array: np.ndarray, image: ImageRef, area: Arena, window: Rect) -> np
     x0, y0 = max(0, window[0]), max(0, window[1])
     x1, y1 = min(image.width, window[2]), min(image.height, window[3])
     masked = array.copy()
-    if x1 > x0 and y1 > y0:
-        outside = ~_inside_mask(area, image, (x0, y0, x1, y1))
-        masked[y0:y1, x0:x1][outside] = image.background
+    # A window off the image is empty: nothing to mask.
+    outside = ~_inside_mask(area, image, (x0, y0, max(x0, x1), max(y0, y1)))
+    masked[y0:y1, x0:x1][outside] = image.background
     return masked
 
 
@@ -2457,9 +2456,7 @@ def _areas_refusal(batch: Batch, image_ids: Iterable[str]) -> OperationError | N
 
 def _rings(batch: Batch, image_id: str) -> dict[str, RingContext]:
     """Each boxed row's ring context on an image (:func:`_ring_context`); {}
-    for an image the batch does not hold."""
-    if all(image.id != image_id for image in batch.iter_images()):
-        return {}
+    for an image without one (or one the batch does not hold)."""
     return {
         row.id: _ring_context(batch, image_id, row.id)
         for protein, row in batch.rows_on(image_id)
