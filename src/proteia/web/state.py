@@ -78,8 +78,13 @@ from pydantic import JsonValue
 
 from proteia.core import mwrow
 from proteia.core.imaging import TIFF_SUFFIXES, display_rgb, preview
-from proteia.core.model import Arena, Batch, ImageRef, Membrane, Project, Protein
-from proteia.core.operations import calibration_fit, unassessed_images
+from proteia.core.model import Arena, Batch, ImageKind, ImageRef, Membrane, Project, Protein
+from proteia.core.operations import (
+    area_removal,
+    calibration_fit,
+    marker_adoption,
+    unassessed_images,
+)
 from proteia.core.project import lane_anchors, lane_positions
 from proteia.core.session import HistoryStep, ProjectSession
 
@@ -195,6 +200,39 @@ def _arena(batch: Batch, membrane: Membrane, arena: Arena) -> JsonValue:
         "source": arena.source.value,
         "corners": [[x, y] for x, y in arena.corners(image)],
         "bounds": list(arena.bounds(image)),
+        "removal": _removal(batch, arena),
+    }
+
+
+def _removal(batch: Batch, arena: Arena) -> JsonValue:
+    """What removing an area would take, as the removal takes it
+    (:func:`~proteia.core.operations.area_removal`): for its confirmation."""
+    scope = area_removal(batch, arena.id)
+    return {
+        "arena_ids": list(scope.arena_ids),
+        "image_ids": list(scope.image_ids),
+        "protein_ids": list(scope.protein_ids),
+        "boxes": scope.boxes,
+        "records": scope.records,
+        "marks": scope.marks,
+        "membrane_goes": scope.membrane_goes,
+    }
+
+
+def _link_areas(batch: Batch, image: ImageRef) -> JsonValue:
+    """For a chemiluminescence image, each image of its membranes it may take
+    as its marker (a visible-light marker or merged image), with which image
+    a link would make take the other's membrane areas
+    (:func:`~proteia.core.operations.marker_adoption`: ``marker``, ``image``,
+    or null when they hold the same areas); {} for any other image."""
+    if image.kind is not ImageKind.CHEMILUMINESCENCE:
+        return {}
+    shown = {m.id for m in batch.membranes_on(image.id)}
+    return {
+        other.id: marker_adoption(batch, image.id, other.id)
+        for other in batch.iter_images()
+        if other.kind in (ImageKind.VISIBLE_MARKER, ImageKind.MERGED)
+        and not shown.isdisjoint(m.id for m in batch.membranes_on(other.id))
     }
 
 
@@ -225,6 +263,7 @@ def project_state(
             "id": image.id,
             "membrane_id": on[image.id][0][0].id,  # its first area's
             "arena_ids": [arena.id for _, arena in on[image.id]],
+            "link_areas": _link_areas(batch, image),
             "original_name": image.original_name,
             "kind": image.kind.value,
             "polarity": image.polarity.value,
