@@ -1348,6 +1348,22 @@ def test_ladder_work_reads_the_mean_whatever_channel_is_measured(tmp_path):
     assert np.array_equal(green_session.pixels(green_image), cal_blot().astype(np.float64))
 
 
+def test_ladder_work_takes_the_cached_mean_and_keeps_no_other(tmp_path):
+    s = session_on(tmp_path, save_to_folder)
+    rgb = ladder_and_protein()
+    image = import_pixels(s, rgb, "merged µ.tif", DARK, kind=MERGED)
+    reopened = ops.open_project(s.folder, autosave=None)  # nothing cached
+    mean = reopened.calibration_pixels(image)
+    assert reopened._pixels[image] is mean  # measured on the mean: the cache's array
+    assert reopened.calibration_pixels(image) is mean
+    assert np.array_equal(mean, rgb.mean(axis=-1)) and not mean.flags.writeable
+    ops.set_channel(reopened, image, GREEN)
+    green = reopened.pixels(image)
+    again = reopened.calibration_pixels(image)
+    assert np.array_equal(again, mean) and again is not mean and not again.flags.writeable
+    assert reopened._pixels[image] is green  # the measured channel's array stays cached
+
+
 # --- The state the page reads ---
 
 
