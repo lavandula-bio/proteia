@@ -1398,6 +1398,21 @@ def test_the_preview_shows_the_channel_measured(tmp_path):
     assert original not in (mean, green)  # the file's own colours, whatever is measured
 
 
+def test_an_original_colours_preview_is_kept_whatever_channel_is_measured(tmp_path, monkeypatch):
+    workspace, session = _workspace(tmp_path)
+    image = import_pixels(session, colour_blot(crosstalk=0.4), "GFP µ.tif")
+    first = workspace.preview(session, image, original=True)
+
+    def read_again(image_id: str) -> np.ndarray:
+        raise AssertionError("the original colours were read again")
+
+    monkeypatch.setattr(session, "colour_pixels", read_again)
+    ops.set_channel(session, image, GREEN)
+    assert workspace.preview(session, image, original=True) is first
+    ops.undo(session)
+    assert workspace.preview(session, image, original=True) is first
+
+
 def test_a_preview_is_kept_under_the_channel_it_was_drawn_from(tmp_path, monkeypatch):
     # A preview drawn while a channel change commits is kept under the channel
     # its pixels are of, so that after undo the mean's preview is the mean's.

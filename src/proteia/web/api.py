@@ -273,6 +273,7 @@ from proteia.core.model import (
     BoxSize,
     Channel,
     ImageKind,
+    ImageRef,
     LadderSide,
     Membrane,
     Polarity,
@@ -295,6 +296,16 @@ OPENING_HEADER: Final = "Proteia-Opening"
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
+# A kept preview's key: (image id, SHA-256, the channel a gray one is of, or
+# None for one in the original colours, whether it is in them).
+_PreviewKey = tuple[str, str, Channel | None, bool]
+
+
+def _preview_key(image: ImageRef, original: bool) -> _PreviewKey:
+    """What a preview of ``image`` is kept under (:meth:`Workspace.preview`)."""
+    return (image.id, image.sha256, None if original else image.measured_channel, original)
+
+
 # How long a reopen waits for an operation running on the open session before
 # answering it without reading its project.json again.
 REOPEN_WAIT_S: Final = 5.0
@@ -555,9 +566,8 @@ class Workspace:
         self._reopening: ProjectSession | None = None
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
-        # (image id, SHA-256, measured channel, original colours) -> preview PNG,
-        # least recently shown first.
-        self._previews: OrderedDict[tuple[str, str, Channel, bool], bytes] = OrderedDict()
+        # _preview_key -> preview PNG, least recently shown first.
+        self._previews: OrderedDict[_PreviewKey, bytes] = OrderedDict()
         self._charts = ChartStore()
 
     def current(self, opening: int | None = None) -> ProjectSession:
@@ -1083,12 +1093,13 @@ class Workspace:
         show (:func:`~proteia.web.state.has_colour`; a CMYK file's are its
         colours converted to red, green and blue); otherwise it answers the
         gray one: a gray file's original colours are its gray levels. The last
-        few previews shown are kept, gray and colour alike, each under the
-        channel the gray one is of (#206), as the committed project measured
-        the image when its pixels were read."""
+        few previews shown are kept, gray and colour alike: a gray one under
+        the channel it is of (#206), as the committed project measured the
+        image when its pixels were read; one in the original colours under no
+        channel, since it shows the file whatever is measured."""
         image = session.project.batch.find_image(image_id)
         original = original and has_colour(session, image)
-        key = (image_id, image.sha256, image.measured_channel, original)
+        key = _preview_key(image, original)
         with self._lock:
             if key in self._previews:
                 self._previews.move_to_end(key)
@@ -1102,7 +1113,7 @@ class Workspace:
             with session.lock:
                 image = session.project.batch.find_image(image_id)
                 array = session.pixels(image_id, keep=False)
-            key = (image_id, image.sha256, image.measured_channel, original)
+            key = _preview_key(image, original)
             data = preview_png(array)
         with self._lock:
             self._previews[key] = data
