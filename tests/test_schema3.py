@@ -1375,3 +1375,58 @@ def test_a_marker_kind_is_refused_a_row(tmp_path):
     with pytest.raises(ops.OperationError) as info:
         ops.add_protein(s, "β-catenin", Role.TARGET, marker)
     assert info.value.code is ops.ErrorCode.MARKER_IMAGE
+
+
+def _second_membrane(doc: dict, image_id: str, outline: dict) -> None:
+    """Add membrane mem-27 with one area, arena-28, on ``image_id``."""
+    doc["next_id"] = 29
+    doc["batch"]["membranes"].append(
+        {
+            "id": "mem-27",
+            "lane_table_id": "lt-19",
+            "arenas": [
+                {"id": "arena-28", "image_id": image_id, "outline": outline, "source": "manual"}
+            ],
+        }
+    )
+    images = doc["batch"]["images"]
+    doc["batch"]["images"] = images  # the image is listed already
+
+
+def test_a_box_in_two_areas_is_invalid():
+    # GAPDH's boxes on img-4 are centred at (30, 107) and (70, 107). Its area
+    # ends at x 70 and another starts there: the box on that edge is in both.
+    doc = _v3()
+    _arena(doc, "arena-22")["outline"] = {"x0": 0, "y0": 0, "x1": 70, "y1": 150}
+    _second_membrane(doc, "img-4", {"x0": 70, "y0": 0, "x1": 340, "y1": 150})
+    assert re.search(
+        r"protein prot-9: the centre of band-1[78]'s box lies in membrane areas arena-22 and"
+        r" arena-28",
+        _refusal(doc),
+    )
+    _arena(doc, "arena-28")["outline"]["x0"] = 71
+    project_from_json(_encode(doc))
+
+
+def test_a_record_in_two_areas_is_invalid():
+    # GAPDH's record in lane 4 on img-4 is centred at (153, 107).
+    doc = _v3(undetected_doc())
+    _arena(doc, "arena-22")["outline"] = {"x0": 0, "y0": 0, "x1": 340, "y1": 150}
+    _second_membrane(doc, "img-4", {"x0": 140, "y0": 100, "x1": 170, "y1": 140})
+    for band in _protein(doc, "prot-9")["rows"][0]["bands"]:
+        assert band["box"]["x"] + 12 < 140  # its boxes lie left of the second area
+    assert (
+        "protein prot-9: the not-detected region in lane 4 lies in membrane areas arena-22 and"
+        " arena-28" in _refusal(doc)
+    )
+
+
+def test_a_calibration_point_in_two_areas_is_invalid():
+    # mem-5's strip edges on img-6 at y 0 and 100, read at the outline's middle (x 100).
+    doc = _v3()
+    _arena(doc, "arena-23")["outline"] = {"x0": 0, "y0": 0, "x1": 200, "y1": 100}
+    _second_membrane(doc, "img-6", {"x0": 50, "y0": 80, "x1": 150, "y1": 120})
+    assert (
+        "membrane mem-5: calibration point at y=100.0 on img-6 lies in membrane areas arena-23"
+        " and arena-28" in _refusal(doc)
+    )

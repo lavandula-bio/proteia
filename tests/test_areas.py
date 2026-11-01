@@ -637,6 +637,40 @@ def test_whole_image_only_while_alone(tmp_path):
 # --- Removing an area, and the membranes' numbers ---
 
 
+def test_outline_and_area_inputs_are_checked(tmp_path):
+    s, image = one_image(tmp_path)
+    for bad in ((0, 0, 10), "0,0,10,10", (0, 0, 10, 10.5), (0, 0, True, 10)):
+        refused(lambda bad=bad: ops.edit_arena(s, "arena-4", outline=bad), ErrorCode.INVALID_INPUT)
+    refused(lambda: ops.add_arena(s, image, None), ErrorCode.INVALID_INPUT)
+    for far in ((-1_000_001, 0, 10, 10), (0, 0, 10, 1_000_001)):
+        error = refused(
+            lambda far=far: ops.edit_arena(s, "arena-4", outline=far), ErrorCode.INVALID_INPUT
+        )
+        assert str(error) == "an outline reaches at most 1000000 px from the image's corner"
+    ops.edit_arena(s, "arena-4", outline=(-999_800, 0, 1_000_000, 100))  # centre (100, 50)
+    error = refused(lambda: ops.edit_arena(s, 4, angle_deg=1.0), ErrorCode.INVALID_INPUT)
+    assert str(error) == "a membrane area id must be text, not 4"
+    with pytest.raises(UnknownIdError):
+        ops.add_arena(s, "img-99", (0, 0, 10, 10))
+
+
+def test_removing_one_area_refits_the_membrane(tmp_path):
+    # Membrane 1 on two images: its marks on the image whose area goes go
+    # too, and it is refitted from what is left.
+    s, image = one_image(tmp_path)
+    other = import_blot(s, two_strips(), "second.tif", membrane_id="mem-2")
+    ops.edit_arena(s, area_on(s, other), outline=(0, 0, 200, 50))
+    ops.add_arena(s, other, (0, 50, 200, 100))
+    ops.add_calibration_point(s, area_on(s, other), 10.0, 100.0, STRIP_EDGE, x=5.0, snap=False)
+    removal = ops.remove_arena(s, area_on(s, other))
+    assert removal.cascade.unfitted_membranes == ("mem-2",)
+    assert removal.renumbered is None
+    batch = s.project.batch
+    assert [a.image_id for a in batch.membranes[0].arenas] == [image]
+    assert batch.membranes[0].calibration.points == []
+    assert [i.id for i in batch.iter_images()] == [image, other]
+
+
 def test_remove_area_cascade(tmp_path):
     s, image, top, bottom = split(tmp_path)
     gapdh = ops.add_protein(s, "GAPDH", Role.LOADING_CONTROL, arena_id="arena-6")
@@ -1211,6 +1245,13 @@ def test_split_strip_without_ladder_is_told():
         " apparent MW; mark its ladder to read them again",
     }
     assert ops._mw_lost(before, before) == ()
+    # With two marks left, a band's MW lost (outside the range) is no split's.
+    kept = before.model_copy(deep=True)
+    for protein in kept.proteins:
+        for band in kept.boxes_of(protein).bands:
+            band.apparent_mw = None
+    assert len(kept.membranes[0].calibration.points) >= 2
+    assert all(told["membrane_id"] != "mem-1" for told in ops._mw_lost(before, kept))
 
 
 def test_row_on_marker_area(tmp_path):
@@ -1278,7 +1319,12 @@ def test_every_export_maps_the_membrane_labels(tmp_path):
     bundle = ops.export_bundle(s, formats=[])
     readme = (bundle.folder / "README.txt").read_text(encoding="utf-8").splitlines()
     start = readme.index("Membranes")
-    assert readme[start + 1 : start + 3] == ["---------", ""]
+    assert readme[start + 1 : start + 5] == [
+        "---------",
+        "",
+        "Each membrane's label, its place in the project when this was exported, and",
+        "where it lies on each of its images, in image pixels from the top left.",
+    ]
     mapped = readme[readme.index("Membrane 1", start) :]
     assert mapped[:6] == [
         "Membrane 1",
@@ -1288,7 +1334,148 @@ def test_every_export_maps_the_membrane_labels(tmp_path):
         "Membrane 3",
         f"    {STRIPS}: the rectangle (150, 0)-(200, 100)",
     ]
+    # A long file name is kept whole on its line, hyphens and all.
+    long_name = "-".join(["a-long-file-name"] * 6) + ".tif"
+    lone = session_on(tmp_path / "long")
+    import_blot(lone, two_strips(), long_name)
+    ops.set_lanes(lone, [LaneInput("vehicle")])
+    lines = (ops.export_bundle(lone, formats=[]).folder / "README.txt").read_text("utf-8")
+    assert f"    {long_name}:" in lines.splitlines()
     # An image of one membrane: the whole image.
     lone, _ = one_image(tmp_path / "lone")
     lines = (ops.export_bundle(lone, formats=[]).folder / "README.txt").read_text("utf-8")
     assert lines.splitlines()[-2:] == ["Membrane 1", f"    {STRIPS}: the whole image"]
+
+
+def test_area_lookups_refuse_what_is_not_there(tmp_path):
+    s, image, _, _ = split(tmp_path)
+    batch = s.project.batch
+    with pytest.raises(ValueError, match="holds 2 membranes' areas"):
+        batch.membrane_of(image)
+    with pytest.raises(UnknownIdError):
+        batch.membrane_of("img-99")
+    stranger = batch.membranes[0].model_copy(update={"id": "mem-99"})
+    with pytest.raises(UnknownIdError):
+        batch.membrane_number(stranger)
+    with pytest.raises(UnknownIdError, match="membrane mem-2 has no area on 'img-99'"):
+        batch.area_on(batch.membranes[0], "img-99")
+    assert [m.id for m in batch.membranes_on(image)] == ["mem-2", "mem-5"]
+    assert [row.arena_id for _, row in batch.rows_on(image)] == ["arena-4", "arena-6"]
+
+
+def test_a_lane_is_proposed_from_the_boxes_of_the_area(tmp_path):
+    s, image, top, bottom = split(tmp_path)
+    ops.place_box(s, top, 40, 24, lane_index=0, grow=False)
+    ops.place_box(s, top, 100, 24, lane_index=1, grow=False)
+    # The bottom strip has no lane spacing of its own yet.
+    error = refused(lambda: ops.place_box(s, bottom, 160, 76, grow=False), ErrorCode.LANE_REQUIRED)
+    assert str(error) == (
+        "choose the lane: position proposes one only once boxes in two lanes of membrane 2's"
+        " area show the lane spacing"
+    )
+
+
+def test_a_box_moved_into_two_areas_is_refused(tmp_path):
+    s, image = one_image(tmp_path)
+    ops.edit_arena(s, "arena-4", outline=(0, 0, 200, 60))
+    ops.add_arena(s, image, (0, 40, 200, 100))
+    protein = ops.add_protein(s, "p53", Role.TARGET, arena_id="arena-6")
+    band = ops.place_box(s, protein, 100, 76, lane_index=1, grow=False)
+    rect = s.project.batch.find_band(band)[1].box.rect(
+        s.project.batch.boxes_of(s.project.batch.find_protein(protein)).box_size
+    )
+    up = (rect[0], rect[1] - 26, rect[2], rect[3] - 26)
+    error = refused(lambda: ops.move_box(s, band, up), ErrorCode.IN_TWO_ARENAS)
+    assert "lies inside both membrane 1's and membrane 2's areas" in str(error)
+
+
+def test_a_kept_box_the_row_resizes_out_of_its_area_is_refused(tmp_path, monkeypatch):
+    # The row keeps a box placed by hand and resizes it; were that box to
+    # come out of the area (as the image's edge may shift it), the row is
+    # refused as a move there would be.
+    s, image, top, _ = split(tmp_path)
+    band = ops.place_box(s, top, 40, 24, lane_index=0, grow=False)
+    rect = s.project.batch.find_band(band)[1].box.rect(
+        s.project.batch.boxes_of(s.project.batch.find_protein(top)).box_size
+    )
+    ops.move_box(s, band, (rect[0] + 1, rect[1], rect[2] + 1, rect[3]))  # edited: kept
+    grow = ops.boxes.grow_to_fit_all
+
+    def shifted(old, *args, **kwargs):
+        size, resized, rects = grow(old, *args, **kwargs)
+        return size, [(x0, y0 + 40, x1, y1 + 40) for x0, y0, x1, y1 in resized], rects
+
+    monkeypatch.setattr(ops.boxes, "grow_to_fit_all", shifted)
+    error = refused(lambda: ops.detect_row_boxes(s, top, (10, 12, 190, 38)), ErrorCode.OUT_OF_ARENA)
+    assert "the box's centre would lie outside membrane 1's area" in str(error)
+
+
+def test_an_area_operation_reaches_every_linked_image(tmp_path):
+    # E and E2 linked to one marker M: an edit on E2 redraws the area on M
+    # and, through M, on E.
+    s, exposure, marker = marker_project(tmp_path)
+    ops.set_marker_image(s, exposure, marker)
+    second = import_blot(s, two_strips(), "exposure 2.tif", membrane_id="mem-2")
+    ops.set_marker_image(s, second, marker)
+    change = ops.edit_arena(s, area_on(s, second), outline=(0, 0, 200, 30))
+    assert len(change.arena_ids) == 3
+    batch = s.project.batch
+    for image_id in (exposure, marker, second):
+        assert batch.area_on(batch.membranes[0], image_id).outline == Outline(
+            x0=0, y0=0, x1=200, y1=30
+        )
+
+
+def test_a_mark_across_the_width_is_read_on_the_outline_middle(tmp_path):
+    # A mark saved without its x (before marks kept it), on an area over the
+    # image's right part: read at the outline's middle (x 175), inside.
+    from proteia.core.model import CalibrationPoint
+
+    s, image = one_image(tmp_path)
+    ops.edit_arena(s, "arena-4", outline=(150, 0, 200, 100))
+    point = CalibrationPoint(image_id=image, y=20.0, mw=100.0, source="strip_edge")
+
+    def keep(draft: Project) -> None:
+        draft.batch.membranes[0].calibration.points.append(point)
+
+    from test_operations import plant
+
+    plant(s, keep)
+    ops.edit_arena(s, "arena-4", outline=(150, 0, 200, 99))
+    assert s.project.batch.find_arena("arena-4")[1].outline.y1 == 99
+
+
+def test_a_whole_image_area_masks_nothing():
+    whole = Arena(id="arena-1", image_id="img-2", source="whole_image")
+    ref = make_project().batch.find_image("img-2")
+    assert ops._inside_mask(whole, ref, (0, 0, 7, 3)).tolist() == [[True] * 7] * 3
+
+
+def test_another_ring_rule_is_applied_by_the_area_operations(tmp_path, monkeypatch):
+    # The ring rule swapped (one that reads only the row's own area): an
+    # outline edit then changes what the rings read, and the image is
+    # measured again by the rule in force.
+    s, image, areas, _ = nine_strips(tmp_path)
+    under_a = nets(s)
+    monkeypatch.setattr(ops, "_ring_context", rings_read_own_area_only)
+    y = strip_y(1)
+    ops.edit_arena(s, areas[1], outline=(0, y - 5, 200, y + 5))
+    fresh, _ = apply_change(s.project, lambda d: ops._quantify_image(d, image, s.pixels(image)))
+    assert fresh.batch == s.project.batch
+    assert nets(s) != under_a
+    monkeypatch.setattr(ops, "_ring_context", rings_leave_out_own_area_only)
+    other, _ = apply_change(s.project, lambda d: ops._quantify_image(d, image, s.pixels(image)))
+    assert {b.id: b.net for p in other.batch.proteins for b in p.rows[0].bands} != nets(s)
+
+
+def test_removing_an_area_measures_the_others_again(tmp_path):
+    # The rings of strips 1 and 3 left out strip 2's boxes; with them gone
+    # they read there, and their nets are measured again.
+    s, image, areas, proteins = nine_strips(tmp_path)
+    before = nets(s)
+    removal = ops.remove_arena(s, areas[1])
+    assert removal.remeasured
+    assert_nets_current(s)
+    after = nets(s)
+    moved = {band for band in after if after[band] != before[band]}
+    assert {band for band, _, _ in removal.remeasured} == moved
