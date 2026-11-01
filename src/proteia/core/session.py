@@ -88,6 +88,7 @@ from proteia.core.imaging import (
     converts_cmyk,
     file_colours,
     load_image,
+    named_refusal,
     read_colours,
 )
 from proteia.core.model import (
@@ -404,6 +405,9 @@ class ProjectSession:
         # (image id, SHA-256) -> what its stored file's header says of reading it
         # (outdated_reading): whether it converts CMYK, or what is refused in it.
         self._headers: dict[tuple[str, str], bool | str] = {}
+        # (image id, SHA-256) of the stored files whose reading this session
+        # refused: what the library said is logged once per file (_read_checked).
+        self._refusals_logged: set[tuple[str, str]] = set()
         # Names in images/ that the project.json on disk references: never orphans.
         self._saved_files = frozenset(saved_files)
         # The undo history: the states committed in this session, oldest first,
@@ -523,13 +527,13 @@ class ProjectSession:
 
     def _analysis_array(self, image: ImageRef, path: Path, channel: Channel) -> np.ndarray:
         """The analysis array of the image's stored file on ``channel``
-        (:func:`load_image`), refused (``ValueError``) while its stored numbers
-        come from a reading this version no longer makes
-        (:meth:`outdated_reading`): boxes measured now would mix the two
-        readings."""
+        (:func:`load_image`), refused (``UNREADABLE_IMAGE``, in the words of
+        :meth:`outdated_reading`, which name the image and say what to do)
+        while its stored numbers come from a reading this version no longer
+        makes: boxes measured now would mix the two readings."""
         why = self.outdated_reading(image)
         if why is not None:
-            raise ValueError(why)
+            raise OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image.id,))
         return load_image(path, channel=channel).array
 
     def colour_pixels(self, image_id: str) -> np.ndarray:
@@ -596,7 +600,13 @@ class ProjectSession:
         recorded SHA-256; its first two dimensions must be the recorded height
         and width. A colour space reading refuses is refused with what that
         means for the image (:meth:`outdated_reading`), which names it as it was
-        imported. Called with the lock held."""
+        imported. Every other refusal of reading it names it as imported too,
+        never by its stored copy (:func:`~proteia.core.imaging.named_refusal`,
+        #234), and says what is wrong without a remedy: the image is in the
+        project already, and importing its file again would lose its boxes.
+        What the library said is logged at the first refusal of the stored
+        file (image id and SHA-256) in the session only, as every view and
+        measure reads it again. Called with the lock held."""
         image_id = image.id
         path = storage.image_path(self._folder, image)
         if not path.is_file():
@@ -605,11 +615,20 @@ class ProjectSession:
                 f"the stored file of image {image_id} is missing",
                 ids=(image_id,),
             )
+
+        def refused(exc: ValueError | OSError, why: str | None = None) -> OperationError:
+            if why is None:
+                key = (image_id, image.sha256)
+                log = key not in self._refusals_logged
+                self._refusals_logged.add(key)
+                why = named_refusal(exc, image.original_name, path, remedy=False, log=log)
+            return OperationError(ErrorCode.UNREADABLE_IMAGE, why, ids=(image_id,))
+
         try:
             with path.open("rb") as f:
                 digest = hashlib.file_digest(f, "sha256").hexdigest()
         except OSError as exc:
-            raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
+            raise refused(exc) from exc
         if digest != image.sha256:
             raise OperationError(
                 ErrorCode.IMAGE_FILE_CHANGED,
@@ -618,11 +637,11 @@ class ProjectSession:
             )
         try:
             pixels = read(path)
-        except UnsupportedColourSpaceError as exc:
-            message = self.outdated_reading(image) or str(exc)
-            raise OperationError(ErrorCode.UNREADABLE_IMAGE, message, ids=(image_id,)) from exc
+        except OperationError:  # the read's own refusal, in its words (an outdated reading)
+            raise
         except (ValueError, OSError) as exc:
-            raise OperationError(ErrorCode.UNREADABLE_IMAGE, str(exc), ids=(image_id,)) from exc
+            colour_space = isinstance(exc, UnsupportedColourSpaceError)
+            raise refused(exc, self.outdated_reading(image) if colour_space else None) from exc
         if pixels.shape[:2] != (image.height, image.width):
             raise OperationError(
                 ErrorCode.IMAGE_FILE_CHANGED,

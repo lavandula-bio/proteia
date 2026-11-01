@@ -28,6 +28,9 @@ same words; since #220 the import's refusal names the file as the user chose
 it (:meth:`NotSingleImageError.refusal`).
 A TIFF in any other colour space that is not gray, RGB or a palette (CIELAB,
 YCbCr, ...) is refused with the colour space's name rather than read wrong.
+Reading's own refusals of a file (:class:`ReadingRefusal`) say what is wrong
+apart from the file's name, so that an import names the file as the user
+chose it, not its stored copy (#234).
 
 ``bit_depth`` is the container depth of unsigned integer data (8 or 16, in
 either byte order), which sets the detector limit for the over-exposure check.
@@ -52,12 +55,13 @@ For display only, :func:`read_colours` reads a file in its own colours, and
 from __future__ import annotations
 
 import io
+import logging
 import os
 import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Final, Literal, NamedTuple
+from pathlib import Path, PurePath
+from typing import ClassVar, Final, Literal, NamedTuple
 
 import numpy as np
 import tifffile
@@ -68,6 +72,8 @@ from proteia.core.model import Channel, ImageWarning
 from proteia.core.model import clipping_depth as clipping_depth
 from proteia.core.model import possible_clipping_depth as possible_clipping_depth
 from proteia.core.quantify import near_limit_tolerance, to_grayscale
+
+_log = logging.getLogger(__name__)
 
 TIFF_SUFFIXES = (".tif", ".tiff")
 LOSSY_SUFFIXES = (".jpg", ".jpeg", ".jpe", ".jfif")
@@ -252,57 +258,197 @@ SEVERAL_IMAGES: Final = (
 SINGLE_IMAGE_ONLY: Final = "only a single image can be quantified"
 
 
-class NotSingleImageError(ValueError):
+class ReadingRefusal(ValueError):
+    """Why reading refuses a file, apart from the file's name: what is wrong
+    with it (``problem``) and what to do (``remedy``, the class's
+    :attr:`REMEDY` unless given; empty if nothing can be said). The message
+    names the file read (``name``), as an image's stored copy is named;
+    :meth:`refusal` gives it for another name, so that an import names the
+    file as the user chose it, never its stored copy (#220, #234), and
+    without the remedy for an image already in a project, which importing
+    the file again would replace with its boxes lost."""
+
+    REMEDY: ClassVar[str] = ""
+
+    def __init__(self, name: str, problem: str, remedy: str | None = None) -> None:
+        self.name = name
+        self.problem = problem
+        self.remedy = type(self).REMEDY if remedy is None else remedy
+        super().__init__(self._as_read())
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # Rebuilt from what it was made of, not from its message.
+        return type(self), (self.name, self.problem, self.remedy), self.__dict__
+
+    def _as_read(self) -> str:
+        """The message: the refusal of the file read, as it is named."""
+        return f"{self.name}: {self._words(remedy=True)}"
+
+    def _separator(self) -> str:
+        """What joins the problem and the remedy."""
+        return "; "
+
+    def _words(self, *, remedy: bool) -> str:
+        if remedy and self.remedy:
+            return f"{self.problem}{self._separator()}{self.remedy}"
+        return self.problem
+
+    def refusal(self, name: str, *, remedy: bool = True) -> str:
+        """The refusal of the file named ``name``: why reading refuses it,
+        and what to do unless not ``remedy``."""
+        return f"cannot read {name!r}: {self._words(remedy=remedy)}"
+
+
+# What a refusal of a TIFF of no image, and of several, says it holds and
+# what to do, by whether it holds no image (NotSingleImageError).
+_NOT_SINGLE: Final = {
+    True: (
+        "holds no image, so there is nothing to quantify",
+        "export the image again from the program that made it, as a TIFF or PNG file, and"
+        " import that file",
+    ),
+    False: (
+        f"holds {SEVERAL_IMAGES}, which Proteia does not import: {SINGLE_IMAGE_ONLY}",
+        "save one of its images as its own file and import it again",
+    ),
+}
+
+
+class NotSingleImageError(ReadingRefusal):
     """A TIFF that is not the single image reading takes (:func:`_single_image`):
     a stack, a multi-channel composite, images of several sizes, or none
     (``no_image``). ``inks`` are the printing inks among its images
     (:func:`_inks_of`), None if there are none, so that an import, which
-    refuses inks (#207), can name both problems. The message names the file
-    read (``name``); :meth:`refusal` gives it for another name, so that an
-    import names the file as the user chose it, not its stored copy (#220)."""
+    refuses inks (#207), can name both problems. The message is the refusal
+    of the file read (``name``); :meth:`refusal` gives it for another name,
+    so that an import names the file as the user chose it, not its stored
+    copy (#220)."""
 
     def __init__(self, name: str, inks: Inks | None, no_image: bool) -> None:
-        self.name = name
         self.inks = inks
         self.no_image = no_image
-        super().__init__(self.refusal(name))
+        super().__init__(name, *_NOT_SINGLE[no_image])
 
     def __reduce__(self) -> tuple[object, ...]:
         # Rebuilt from what it was made of, not from its message (pickle and
         # copy would otherwise call it with the message alone).
         return type(self), (self.name, self.inks, self.no_image), self.__dict__
 
-    def refusal(self, name: str) -> str:
+    def _as_read(self) -> str:
+        return self.refusal(self.name)
+
+    def _separator(self) -> str:
+        return ": " if self.no_image else "; "
+
+    def refusal(self, name: str, *, remedy: bool = True) -> str:
         """The refusal of the file named ``name``: what it holds, in plain
-        words, and a next step that imports an image: save one of its images
-        as its own file; of a file of no image, export the image again."""
-        if self.no_image:
-            return (
-                f"{name!r} holds no image, so there is nothing to quantify: export the image"
-                " again from the program that made it, as a TIFF or PNG file, and import that"
-                " file"
-            )
-        return (
-            f"{name!r} holds {SEVERAL_IMAGES}, which Proteia does not import:"
-            f" {SINGLE_IMAGE_ONLY}; save one of its images as its own file and import it again"
+        words, and a next step that imports an image unless not ``remedy``:
+        save one of its images as its own file; of a file of no image,
+        export the image again."""
+        return f"{name!r} {self._words(remedy=remedy)}"
+
+
+# What reading says of a file a library could not read (one Pillow cannot
+# tell the format of too), with the kind of the library's error, and what
+# to do; of one over Pillow's size limit, which is no damage (tifffile reads
+# an uncompressed TIFF of any size); and of one it ran out of stack reading,
+# no damage either, whose image saved again is read.
+_DAMAGED: Final = "it is damaged or not an image Proteia can read ({})"
+_SAVE_AGAIN: Final = "save the image again as a TIFF, PNG or JPEG file and import that"
+_TOO_MANY_PIXELS: Final = (
+    "it has more pixels than Proteia reads from a file of this kind",
+    "save the image as an uncompressed TIFF and import that",
+)
+_OUT_OF_STACK: Final = ("Proteia ran out of stack reading it", _SAVE_AGAIN)
+
+
+class _OutOfMemory(ReadingRefusal):
+    """Reading ran out of memory: no damage of the file. Closing other
+    programs may let it read the file, which an image already in the project
+    is told; an import is told of a smaller copy too, of a very large file."""
+
+    REMEDY = (
+        "or, if the file is very large, save a smaller copy (such as one cropped to the blot)"
+        " and import that"
+    )
+
+    def _separator(self) -> str:
+        return ", "
+
+
+_OUT_OF_MEMORY: Final = "Proteia ran out of memory reading it; close other programs and try again"
+
+
+def _kind(error: BaseException) -> str:
+    """How a refusal names the kind of a library's error: its class's name,
+    with its module's where the name is not a class's (``struct.error``)."""
+    kind = type(error)
+    name = kind.__qualname__
+    return name if name[:1].isupper() else f"{kind.__module__}.{name}"
+
+
+def _unreadable(name: str, error: BaseException) -> ReadingRefusal:
+    """Reading's refusal of the file named ``name`` that it could not read,
+    with ``error`` (to be raised from it), in Proteia's words only, as a
+    library's may name the stored copy: running out of memory or of stack
+    (numpy's own MemoryError too), too many pixels for Pillow, or else a
+    file damaged or not an image Proteia can read, with the error's kind."""
+    from PIL import Image
+
+    if isinstance(error, MemoryError):
+        return _OutOfMemory(name, _OUT_OF_MEMORY)
+    if isinstance(error, RecursionError):
+        return ReadingRefusal(name, *_OUT_OF_STACK)
+    if isinstance(error, Image.DecompressionBombError):
+        return ReadingRefusal(name, *_TOO_MANY_PIXELS)
+    return ReadingRefusal(name, _DAMAGED.format(_kind(error)), _SAVE_AGAIN)
+
+
+def named_refusal(
+    exc: ValueError | OSError,
+    name: str,
+    stored: PurePath,
+    *,
+    remedy: bool = True,
+    log: bool = True,
+) -> str:
+    """Why reading refused the file named ``name`` (as the user chose it),
+    whose stored copy is at ``stored``, in Proteia's words only (#234):
+    reading's own refusal for that name (:class:`ReadingRefusal`, with its
+    remedy unless not ``remedy``); an error of the system's (one with an
+    errno or a file name) by its reason, which names no path; any other
+    error of a library's as a file damaged or not an image Proteia can read,
+    with the error's kind. A library's words may name the stored copy, so no
+    refusal holds them: unless not ``log``, they are logged, with the stored
+    copy's path, for diagnosis."""
+    library = exc.__cause__ if isinstance(exc, ReadingRefusal) else exc
+    if log and library is not None and not isinstance(library, ReadingRefusal):
+        _log.info(
+            "reading %s (offered as %r) failed: %s: %s", stored, name, _kind(library), library
         )
+    if isinstance(exc, ReadingRefusal):
+        return exc.refusal(name, remedy=remedy)
+    if isinstance(exc, OSError) and (exc.errno is not None or exc.filename is not None):
+        return f"cannot read {name!r}: {exc.strerror or type(exc).__name__}"
+    return _unreadable(name, exc).refusal(name, remedy=remedy)
 
 
 def _image_series(tif: tifffile.TiffFile, name: str) -> Sequence[tifffile.TiffPageSeries]:
-    """A TIFF's image series, refused (``ValueError``) if it holds none."""
+    """A TIFF's image series, refused (:class:`NotSingleImageError`, as
+    reading refuses it) if it holds none."""
     series = tif.series
     if not series:
-        raise ValueError(f"{name}: holds no image")
+        raise NotSingleImageError(name, None, no_image=True)
     return series
 
 
 def _first_page(tif: tifffile.TiffFile, name: str) -> tifffile.TiffPage:
     """A TIFF's first page, read when the file is opened; refused
-    (``ValueError``) if it has none."""
+    (:class:`NotSingleImageError`, as reading refuses it) if it has none."""
     try:
         return tif.pages.first
     except IndexError:
-        raise ValueError(f"{name}: holds no image") from None
+        raise NotSingleImageError(name, None, no_image=True) from None
 
 
 def _inks_of(series: Sequence[tifffile.TiffPageSeries]) -> Inks | None:
@@ -337,15 +483,13 @@ def _uncompressed_copy(page: tifffile.TiffPage) -> bool:
     )
 
 
-class UnsupportedColourSpaceError(ValueError):
+class UnsupportedColourSpaceError(ReadingRefusal):
     """A file whose pixels are in a colour space Proteia does not read: a TIFF
     that is not gray, RGB, a palette or CMYK (CIELAB, YCbCr, ...), or a
     separated TIFF whose inks are not 8- or 16-bit CMYK. ``problem`` says what
     the file holds without naming it, for a message that names it otherwise."""
 
-    def __init__(self, name: str, problem: str) -> None:
-        super().__init__(f"{name}: {problem}; save the image as a gray or RGB TIFF")
-        self.problem = problem
+    REMEDY = "save the image as a gray or RGB TIFF"
 
 
 def _holds_cmyk(page: tifffile.TiffPage, name: str) -> bool:
@@ -484,11 +628,13 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
     """
     from PIL import Image
 
-    refusal = (
-        f"{path.name}: {declared.codec} compression of this"
-        f" {'x'.join(map(str, declared.shape))} {declared.dtype}"
-        f" {declared.photometric.name} image cannot be decoded by this installation;"
-        " save the image as an uncompressed TIFF"
+    uncompressed = "save the image as an uncompressed TIFF"
+    refusal = ReadingRefusal(
+        path.name,
+        f"{declared.codec} compression of this {'x'.join(map(str, declared.shape))}"
+        f" {declared.dtype} {declared.photometric.name} image cannot be decoded by this"
+        " installation",
+        uncompressed,
     )
     # One unassociated alpha sample after 8-bit colours.
     alpha = (
@@ -507,7 +653,7 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
     )
     cmyk = declared.photometric is tifffile.PHOTOMETRIC.SEPARATED and declared.samples == 4
     if not (gray or color or cmyk):
-        raise ValueError(refusal)
+        raise refusal
     try:
         with warnings.catch_warnings():
             # Local files the user chose: Pillow's size guard is for untrusted input.
@@ -515,16 +661,19 @@ def _read_tiff_with_pillow(path: Path, declared: _Declared) -> np.ndarray:
             with Image.open(path) as image:
                 pixels = np.asarray(image)
     except Image.DecompressionBombError as exc:
-        raise ValueError(
-            f"{path.name}: this compressed TIFF has more pixels than the compressed-TIFF"
-            " reader accepts; save the image as an uncompressed TIFF"
+        raise ReadingRefusal(
+            path.name,
+            "this compressed TIFF has more pixels than the compressed-TIFF reader accepts",
+            uncompressed,
         ) from exc
+    except (MemoryError, RecursionError) as exc:  # no compression it cannot decode
+        raise _unreadable(path.name, exc) from exc
     except Exception as exc:  # Pillow's decoder errors are not all OSError
-        raise ValueError(refusal) from exc
+        raise refusal from exc
     if not pixels.dtype.isnative:  # e.g. a big-endian ("MM") 16-bit file
         pixels = pixels.astype(pixels.dtype.newbyteorder("="))
     if pixels.shape != declared.shape or pixels.dtype != declared.dtype.newbyteorder("="):
-        raise ValueError(refusal)
+        raise refusal
     return pixels
 
 
@@ -556,7 +705,9 @@ def read_file(path: str | os.PathLike[str]) -> FilePixels:
     palette PNG; a palette TIFF reads as its indices); every failure to read it
     becomes a ``ValueError`` or ``OSError``, and so does a layout other than a
     single image. Its pixels are not yet converted to the analysis array, so
-    that an import can refuse their type first (#224)."""
+    that an import can refuse their type first (#224). Its own refusals are
+    :class:`ReadingRefusal`, which an import gives for the name the file was
+    chosen under (#234)."""
     path = Path(path)
     try:
         if path.suffix.lower() in TIFF_SUFFIXES:
@@ -568,7 +719,7 @@ def read_file(path: str | os.PathLike[str]) -> FilePixels:
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, SyntaxError from Pillow, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
     _check_layout(pixels, path.name)
     return FilePixels(pixels, lossy, cmyk, palette)
 
@@ -579,7 +730,12 @@ _PALETTE_MODES = frozenset({"P", "PA"})
 
 def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
     """The pixels of a file that is not a TIFF, how its CMYK was converted, and
-    whether it is a palette image (its pixels are the palette's colours).
+    whether it is a palette image (its pixels are the palette's colours). A
+    file Pillow cannot tell the format of is refused (:class:`ReadingRefusal`)
+    as a damaged one is, with what to do (#234), not in Pillow's words, which
+    name it by its full path. An animation reads as scikit-image gives it, as before
+    #234, so that an image imported so reads as it did; an import refuses it
+    first (:func:`check_frames`).
 
     A CMYK JPEG is decoded by Pillow, which reads an Adobe JPEG's inverted inks
     the right way up, and converted with the ICC profile it embeds, if any;
@@ -587,12 +743,16 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
     the file's byte order, as Pillow reads it, and has its bit depth in either
     (:func:`bit_depth_of`).
     """
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 
     with warnings.catch_warnings():
         # Local files the user chose: Pillow's size guard is for untrusted input.
         warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-        with Image.open(path) as image:
+        try:
+            opened = Image.open(path)
+        except UnidentifiedImageError as exc:
+            raise _unreadable(path.name, exc) from exc
+        with opened as image:
             palette = image.mode in _PALETTE_MODES
             if image.mode == "CMYK":
                 inks, profile = np.asarray(image), image.info.get("icc_profile")
@@ -604,6 +764,67 @@ def _read_other(path: Path) -> tuple[np.ndarray, str | None, bool]:
         return io.imread(path), None, palette
     rgb, how = _cmyk_to_rgb(inks, profile)
     return rgb, how, False
+
+
+# Why an import refuses a file of several frames, and what to do (#234).
+_SEVERAL_FRAMES: Final = (
+    f"it holds more than one frame (such as an animated image), and {SINGLE_IMAGE_ONLY}",
+    "save one frame as its own file and import it again",
+)
+
+
+# The formats, as Pillow names them, whose files can hold several frames
+# that scikit-image reads stacked: an animated PNG, a GIF, a WebP. Not a
+# JPEG of several pictures (MPO), whose extra pictures are no frames of it
+# (a phone's preview or depth map, a stereo pair): it reads as its first
+# picture, as before #234. A TIFF named otherwise is counted for its images
+# before (check_misnamed_tiff).
+_FRAME_FORMATS: Final = frozenset({"PNG", "GIF", "WEBP"})
+
+
+def check_frames(path: str | os.PathLike[str]) -> None:
+    """Refuse (:class:`ReadingRefusal`) a file Pillow reads as an animation
+    of several frames, a PNG, GIF or WebP (:data:`_FRAME_FORMATS`) whatever
+    its suffix, which an import would take as one wrong image (#234):
+    scikit-image reads the frames stacked first, which frames 2 to 4 pixels
+    wide pass for the channels of one image, and 3 or 4 frames of any width
+    it moves to the channels; an animated WebP it reads as its first frame.
+
+    An import calls it before reading; reading does not, so that an image
+    imported so before reads as it did. A TIFF named .tif or .tiff is not
+    looked at (reading counts its images); a file Pillow cannot open or tell
+    this of is left to reading, which says why.
+    """
+    path = Path(path)
+    if path.suffix.lower() in TIFF_SUFFIXES:
+        return
+    from PIL import Image
+
+    try:
+        with warnings.catch_warnings():
+            # Local files the user chose: Pillow's size guard is for untrusted input.
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                animated = image.format in _FRAME_FORMATS and _animated(image)
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:  # Pillow's errors of a damaged file are not all OSError
+        return
+    if animated:
+        raise ReadingRefusal(path.name, *_SEVERAL_FRAMES)
+
+
+def _animated(image: object) -> bool:
+    """Whether Pillow says an opened image is an animation (``is_animated``,
+    which stops at a second frame); False if it cannot tell: a check that
+    fails says nothing of the pixels, read as before #234. Running out of
+    memory or of stack is no answer."""
+    try:
+        return bool(getattr(image, "is_animated", False))
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:  # Pillow's errors of a damaged file are not all OSError
+        return False
 
 
 def converts_cmyk(path: str | os.PathLike[str]) -> bool:
@@ -622,7 +843,7 @@ def converts_cmyk(path: str | os.PathLike[str]) -> bool:
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
 
 
 InkSet = Literal["cmyk", "other"]
@@ -681,7 +902,7 @@ def check_misnamed_tiff(path: str | os.PathLike[str]) -> None:
         # fall back to the suffix's reader, which takes the first image only.
         raise
     except Exception as exc:  # a damaged file: struct.error, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
 
 
 def ink_set(path: str | os.PathLike[str]) -> Inks | None:
@@ -719,7 +940,7 @@ def ink_set(path: str | os.PathLike[str]) -> Inks | None:
         # must not carry on without the ink check (as #217 and #224).
         raise
     except Exception as exc:  # a damaged file: struct.error, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
 
 
 def reads_as_palette(path: str | os.PathLike[str]) -> bool:
@@ -735,7 +956,7 @@ def reads_as_palette(path: str | os.PathLike[str]) -> bool:
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
 
 
 def _pillow_mode(path: Path) -> str:
@@ -750,9 +971,11 @@ def _pillow_mode(path: Path) -> str:
 
 
 def _check_layout(pixels: np.ndarray, name: str) -> None:
+    """Refuse (:class:`ReadingRefusal`) pixels that are not a single 2-D
+    image (gray, or 2 to 4 channels last), of a file named ``name``."""
     if pixels.ndim == 2 or (pixels.ndim == 3 and pixels.shape[-1] in (2, 3, 4)):
         return
-    raise ValueError(f"{name}: unsupported image layout {pixels.shape}")
+    raise ReadingRefusal(name, f"unsupported image layout {pixels.shape}")
 
 
 def channels_differ(pixels: np.ndarray) -> bool:
@@ -774,8 +997,8 @@ def to_analysis_array(
     (:func:`~proteia.core.quantify.to_grayscale`; None, the mean); the
     warnings are the pixels', whatever the channel.
 
-    Refuses NaN or infinite pixels: they would make the background and every
-    net signal meaningless.
+    Refuses (:class:`ReadingRefusal`) NaN or infinite pixels: they would make
+    the background and every net signal meaningless.
     """
     _check_layout(pixels, "image")
     warnings: list[ImageWarning] = []
@@ -787,7 +1010,7 @@ def to_analysis_array(
         )
     array = to_grayscale(pixels, channel).astype(np.float64)
     if not np.isfinite(array).all():
-        raise ValueError("image has NaN or infinite pixel values")
+        raise ReadingRefusal("image", "it has NaN or infinite pixel values")
     return array, warnings
 
 
@@ -873,7 +1096,7 @@ def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
         # must not take the file by the reader its suffix picks (as #217).
         raise
     except Exception as exc:  # a damaged file: struct.error, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
     if dtype is not None:
         if _depth_of(dtype) is not None:
             return None
@@ -881,9 +1104,9 @@ def declared_pixel_type(path: str | os.PathLike[str]) -> PixelType | None:
     else:
         kind = _SAMPLE_KINDS.get(sampleformat)
         if kind is None:  # untyped (VOID), complex or unknown samples of such a width
-            raise ValueError(
-                f"{path.name}: not a readable image"
-                f" ({bits}-bit samples of format {int(sampleformat)})"
+            raise ReadingRefusal(
+                path.name,
+                f"not a readable image ({bits}-bit samples of format {int(sampleformat)})",
             )
     # Reading takes these colour spaces, converting CMYK (whose inks an import
     # refuses first, #207); it refuses any other.
@@ -1165,7 +1388,7 @@ def file_colours(path: str | os.PathLike[str]) -> FileColours | None:
     except (ValueError, OSError):
         raise
     except Exception as exc:  # a damaged file: struct.error, Pillow's size limit, ...
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
     return "rgb" if mode in _RGB_MODES else None
 
 
@@ -1184,7 +1407,7 @@ def read_colours(path: str | os.PathLike[str]) -> np.ndarray:
     except (ValueError, OSError):
         raise
     except Exception as exc:
-        raise ValueError(f"{path.name}: not a readable image ({exc})") from exc
+        raise _unreadable(path.name, exc) from exc
     if photometric != tifffile.PHOTOMETRIC.PALETTE or colormap is None:
         return pixels
     # A TIFF colour map is 16-bit: its high byte is the 8-bit level.

@@ -24,8 +24,11 @@ gives a session predictable log times.
 :func:`assert_strict_json` checks that a model's JSON is strict and loses nothing.
 """
 
+import functools
 import hashlib
+import inspect
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,6 +38,7 @@ import pytest
 import tifffile
 from pydantic import BaseModel
 
+from proteia.core import imaging, operations
 from proteia.core.model import Project, apply_change
 from proteia.core.storage import image_path, migrate
 
@@ -70,6 +74,90 @@ def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
     state = tmp_path_factory.mktemp("user-state")
     monkeypatch.setenv("LOCALAPPDATA", str(state))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
+
+
+# The name of an image's stored copy in images/ (img-1.tif), whatever the case.
+_STORED_COPY = re.compile(r"img-\d+\.(?:tiff?|png|jpe?g)", re.IGNORECASE)
+# The start of a Windows path (C:\ or C:/), as written or escaped in a repr.
+_DRIVE = re.compile(r"\b[A-Za-z]:[\\/]")
+
+
+def stored_copy_or_path_in(message: str, original_name: str, folder: Path) -> bool:
+    """Whether ``message``, an import's refusal of a file offered as
+    ``original_name`` into the project at ``folder``, names an image's
+    stored copy (``img-1.tif``) or shows a local path: the project folder,
+    the folder it is in, or any Windows path (#234). The offered name itself
+    may hold anything."""
+    rest = message.replace(repr(original_name), "").replace(original_name, "")
+    if _STORED_COPY.search(rest) or _DRIVE.search(rest):
+        return True
+    paths = {folder, folder.resolve(), folder.parent, folder.resolve().parent}
+    forms = {form for path in paths for form in (str(path), repr(str(path))[1:-1])}
+    return any(form in rest for form in forms)
+
+
+_IMPORT_IMAGE = inspect.signature(operations.import_image)
+
+
+# Words of the libraries that read a file (tifffile, Pillow, scikit-image),
+# which no refusal holds (#234): their errors are logged instead.
+_LIBRARY_WORDS = (
+    "header=",
+    "cannot identify image file",
+    "unpack requires",
+    "image file is truncated",
+    "broken data stream",
+    "failed to read",
+    "suspicious number of tags",
+    "corrupted IFD",
+    "not a TIFF file",
+    "decompression bomb",
+    "can not be opened",
+)
+
+
+def library_words_in(error: operations.OperationError) -> bool:
+    """Whether the refusal ``error`` holds a library's words: any of
+    :data:`_LIBRARY_WORDS`; or, of a refusal of reading the file, the words
+    of an error of its cause chain that is not Proteia's own (a system
+    error's reason alone may stay, which names no path)."""
+    message = str(error)
+    if any(words in message for words in _LIBRARY_WORDS):
+        return True
+    if error.code is not operations.ErrorCode.UNREADABLE_IMAGE:
+        return False  # storing the file, in Proteia's words (an empty file)
+    cause = error.__cause__
+    while cause is not None:
+        own = isinstance(cause, operations.OperationError | imaging.ReadingRefusal)
+        if not own and str(cause) and str(cause) in message:
+            return True
+        cause = cause.__cause__
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _import_refusals_name_the_file_as_chosen(monkeypatch):
+    """No import refusal that any test meets names the image's stored copy,
+    shows a local path or holds a library's words (#234), whatever else the
+    test checks: each refusal of :func:`~proteia.core.operations.import_image`
+    is checked as it is raised."""
+    real = operations.import_image
+
+    @functools.wraps(real)
+    def import_image(*args, **kwargs):
+        try:
+            return real(*args, **kwargs)
+        except operations.OperationError as exc:
+            call = _IMPORT_IMAGE.bind(*args, **kwargs)
+            name = call.arguments["original_name"]
+            folder = getattr(call.arguments["session"], "folder", None)
+            if isinstance(name, str) and folder is not None:
+                where = stored_copy_or_path_in(str(exc), name, folder)
+                assert not where, f"an import refusal names a stored copy or a path: {exc}"
+            assert not library_words_in(exc), f"an import refusal holds a library's words: {exc}"
+            raise
+
+    monkeypatch.setattr(operations, "import_image", import_image)
 
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
