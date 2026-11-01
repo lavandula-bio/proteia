@@ -271,7 +271,9 @@ from proteia.core.analyze import ReduceMethod
 from proteia.core.export import DEFAULT_CHART_FORMATS
 from proteia.core.model import (
     BoxSize,
+    Channel,
     ImageKind,
+    ImageRef,
     LadderSide,
     Membrane,
     Polarity,
@@ -294,6 +296,23 @@ OPENING_HEADER: Final = "Proteia-Opening"
 MAX_UPLOAD_BYTES: Final = 512 * 1024 * 1024
 _WRITE_BYTES: Final = 1024 * 1024  # an upload is written to disk in pieces this large
 _PREVIEWS_KEPT: Final = 8
+# A kept preview's key: (image id, SHA-256, the channel a gray one is of, or
+# None for one in the original colours, whether it is in them).
+_PreviewKey = tuple[str, str, Channel | None, bool]
+
+
+def _preview_key(image: ImageRef, original: bool) -> _PreviewKey:
+    """What a preview of ``image`` is kept under (:meth:`Workspace.preview`)."""
+    return (image.id, image.sha256, None if original else image.measured_channel, original)
+
+
+def _gray_of(kept: _PreviewKey, key: _PreviewKey) -> bool:
+    """Whether ``kept`` is a gray preview of the image ``key`` names, of any
+    channel: the one kept under ``key`` replaces it (it is stored only where
+    ``key`` was not kept, so the others are of other channels)."""
+    return kept[3] is False and kept[:2] == key[:2]
+
+
 # How long a reopen waits for an operation running on the open session before
 # answering it without reading its project.json again.
 REOPEN_WAIT_S: Final = 5.0
@@ -554,8 +573,8 @@ class Workspace:
         self._reopening: ProjectSession | None = None
         self._settings = ResultSettings()
         self._results: tuple[_ResultsKey, Results] | None = None
-        # (image id, SHA-256, original colours) -> preview PNG, least recently shown first.
-        self._previews: OrderedDict[tuple[str, str, bool], bytes] = OrderedDict()
+        # _preview_key -> preview PNG, least recently shown first.
+        self._previews: OrderedDict[_PreviewKey, bytes] = OrderedDict()
         self._charts = ChartStore()
 
     def current(self, opening: int | None = None) -> ProjectSession:
@@ -1081,10 +1100,13 @@ class Workspace:
         show (:func:`~proteia.web.state.has_colour`; a CMYK file's are its
         colours converted to red, green and blue); otherwise it answers the
         gray one: a gray file's original colours are its gray levels. The last
-        few previews shown are kept, gray and colour alike."""
+        few previews shown are kept, gray and colour alike: a gray one under
+        the channel it is of (#206), as the committed project measured the
+        image when its pixels were read; one in the original colours under no
+        channel, since it shows the file whatever is measured."""
         image = session.project.batch.find_image(image_id)
         original = original and has_colour(session, image)
-        key = (image_id, image.sha256, original)
+        key = _preview_key(image, original)
         with self._lock:
             if key in self._previews:
                 self._previews.move_to_end(key)
@@ -1092,8 +1114,20 @@ class Workspace:
         if original:
             data = original_png(session.colour_pixels(image_id))
         else:
-            data = preview_png(session.pixels(image_id, keep=False))
+            # The array and the channel it is of, read together under the lock
+            # every commit takes: the preview is kept under the channel it
+            # shows, even if another was chosen since the key above was made.
+            with session.lock:
+                image = session.project.batch.find_image(image_id)
+                array = session.pixels(image_id, keep=False)
+            key = _preview_key(image, original)
+            data = preview_png(array)
         with self._lock:
+            if not original:
+                # The image's gray previews of other channels: it is measured on
+                # this one now, so they do not push other images' out.
+                for other in [k for k in self._previews if _gray_of(k, key)]:
+                    del self._previews[other]
             self._previews[key] = data
             while len(self._previews) > _PREVIEWS_KEPT:
                 self._previews.popitem(last=False)
@@ -1171,6 +1205,10 @@ class NameBody(_Body):
 
 class PolarityBody(_Body):
     polarity: str
+
+
+class ChannelBody(_Body):
+    channel: str
 
 
 class LaneBody(_Body):
@@ -1985,6 +2023,18 @@ def set_polarity(
     image_id: str, body: PolarityBody, session: OpenSession, workspace: WorkspaceDep
 ) -> dict[str, Any]:
     ops.set_polarity(session, image_id, body.polarity)
+    return _answer(workspace, session)
+
+
+@router.put("/images/{image_id}/channel")
+def set_channel(
+    image_id: str, body: ChannelBody, session: OpenSession, workspace: WorkspaceDep
+) -> dict[str, Any]:
+    """Measure a colour image on ``channel``: ``red``, ``green``, ``blue`` or
+    ``mean`` (:func:`~proteia.core.operations.set_channel`, #206); the state's
+    ``channel`` of each image says what it is measured on and whether one can
+    be chosen."""
+    ops.set_channel(session, image_id, body.channel)
     return _answer(workspace, session)
 
 

@@ -646,7 +646,7 @@ def test_bands_a_row_finds_outside_its_area_are_refused(tmp_path, monkeypatch):
     # Were the row to read the whole image, lane 3's band, in membrane 2's
     # area, would be found: refused, naming its lane.
     s, image, protein = side_by_side(tmp_path)
-    monkeypatch.setattr(ops, "_shown", lambda array, image, area, window: array)
+    monkeypatch.setattr(ops, "_shown", lambda array, image, area, window, background: array)
     error = refused(
         lambda: ops.detect_row_boxes(s, protein, (10, 12, 190, 38)), ErrorCode.OUT_OF_ARENA
     )
@@ -1162,7 +1162,7 @@ def test_rotated_strips_row_drag_refuses_neighbour_bands(tmp_path, monkeypatch):
     assert_nets_current(s)
     ops.undo(s)
     # Degraded: clipped to the bounds only, the row takes strip 2's bands.
-    monkeypatch.setattr(ops, "_shown", lambda array, image, area, window: array)
+    monkeypatch.setattr(ops, "_shown", lambda array, image, area, window, background: array)
     with pytest.raises(OperationError) as info:
         ops.detect_row_boxes(s, a, bounds)
     assert info.value.code in (ErrorCode.ROW_OFF_LINE, ErrorCode.OUT_OF_ARENA)
@@ -1203,14 +1203,15 @@ def test_mask_matches_contains():
             assert bool(mask[r, c]) == area.contains(ref, c + 0.5, r + 0.5), (angle, c, r)
     whole = Arena(id="arena-1", image_id="img-2", source="whole_image")
     array = np.arange(60, dtype=np.uint16).reshape(6, 10)
-    assert ops._shown(array, ref, whole, (0, 0, 10, 6)) is array
+    level = lambda: ref.background  # noqa: E731
+    assert ops._shown(array, ref, whole, (0, 0, 10, 6), level) is array
     drawn = Arena(
         id="arena-1",
         image_id="img-2",
         outline=Outline(x0=2, y0=1, x1=6, y1=4),
         source="manual",
     )
-    masked = ops._shown(array, ref, drawn, (0, 0, 10, 6))
+    masked = ops._shown(array, ref, drawn, (0, 0, 10, 6), level)
     assert masked is not array and np.array_equal(array, np.arange(60).reshape(6, 10))
     inside = ops._inside_mask(drawn, ref, (0, 0, 10, 6))
     assert np.array_equal(masked[inside], array[inside])
@@ -1218,7 +1219,7 @@ def test_mask_matches_contains():
         masked[~inside], ref.background, atol=1
     )
     # Only the window is read: the rest is never filled.
-    part = ops._shown(array, ref, drawn, (0, 0, 3, 6))
+    part = ops._shown(array, ref, drawn, (0, 0, 3, 6), level)
     assert np.array_equal(part[:, :3], masked[:, :3])
     assert not part[:, 3:].any()
 
@@ -1813,7 +1814,7 @@ def test_a_seed_click_grows_within_its_area(tmp_path, monkeypatch):
     ops.undo(s)
     # Degraded: grown over the stored pixels, the box takes strip 2's band too.
     monkeypatch.setattr(
-        ops, "_detector_pixels", lambda s_, image, area, window: s_.pixels(image.id)
+        ops, "_detector_pixels", lambda s_, image, area, window, **_: s_.pixels(image.id)
     )
     try:
         band = ops.place_box(s, protein, 250, 70, lane_index=0, grow=True)
@@ -1877,10 +1878,10 @@ def test_every_detector_reads_through_the_area_accessor(tmp_path, monkeypatch):
         assert any(np.shares_memory(array, shown) for shown in produced), name
 
 
-def full_copy(session, image, area, window):
+def full_copy(session, image, area, window, *, calibration=False):
     """What the area accessor gave before it copied only the window: the
     whole image copied, the window masked."""
-    array = session.pixels(image.id)
+    array = session.calibration_pixels(image.id) if calibration else session.pixels(image.id)
     if area.outline is None:
         return array
     x0, y0 = max(0, window[0]), max(0, window[1])
@@ -1931,3 +1932,33 @@ def test_a_window_inside_its_area_is_read_as_stored(tmp_path):
     shown = ops._detector_pixels(s, batch.find_image(image), arena, (40, 15, 1060, 125))
     assert shown is not stored
     assert not shown[200:, :].any()  # past the window: never read, never filled
+
+
+def test_a_ladder_on_a_chosen_channel_reads_the_mean_off_its_area(tmp_path):
+    # A colour image measured on green (#206), split in two: a row reads
+    # green, a ladder the mean of the colours, each with that array's own
+    # median off the area. Red's background is raised, so the two differ.
+    from proteia.core.model import Channel
+    from proteia.core.quantify import estimate_background
+    from test_channels import H, W, colour_blot, import_pixels
+
+    s = session_on(tmp_path)
+    rgb = colour_blot(16)
+    rgb[..., 0] += 20000
+    image = import_pixels(s, rgb, "GFP µ.tif")
+    ops.set_channel(s, image, Channel.GREEN)
+    area = area_on(s, image)
+    ops.edit_arena(s, area, outline=(0, 0, W, H // 2))
+    ops.add_arena(s, image, (0, H // 2, W, H))
+    ref = s.project.batch.find_image(image)
+    arena = s.project.batch.find_arena(area)[1]
+    window = (0, 0, W, H)
+    off = ~ops._inside_mask(arena, ref, window)
+    measured = ops._detector_pixels(s, ref, arena, window)
+    ladder = ops._detector_pixels(s, ref, arena, window, calibration=True)
+    assert np.array_equal(measured[~off], s.pixels(image)[~off])
+    assert np.array_equal(ladder[~off], s.calibration_pixels(image)[~off])
+    mean_level = estimate_background(s.calibration_pixels(image))
+    assert abs(mean_level - ref.background) > 5000
+    assert np.allclose(measured[off], ref.background, atol=1)
+    assert np.allclose(ladder[off], mean_level, atol=1)

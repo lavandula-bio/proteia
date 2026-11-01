@@ -250,8 +250,8 @@ def assert_nets_current(session: ProjectSession, *, only: Sequence[str] | None =
                 fallback=image.background,
             )
             clamp = RING_CLAMP
-        depth = clipping_depth(image.bit_depth, image.import_warnings)
-        near_depth = possible_clipping_depth(image.bit_depth, image.import_warnings)
+        # On the channel the session's pixels are of (#206).
+        depth, near_depth = image.exact_check_depth, image.near_check_depth
         for (protein, band), background in zip(placed, found, strict=True):
             size = protein.box_size
             net = net_signal(
@@ -2982,7 +2982,7 @@ def test_a_colour_space_refused_where_the_header_cannot_tell_names_the_image_as_
     def no_header(path):
         raise ValueError("cut short")
 
-    def lab(path):
+    def lab(path, *, channel=None):  # as the session reads it: on the measured channel
         raise imaging.UnsupportedColourSpaceError(
             Path(path).name,
             "its pixels are stored in the CIELAB colour space, which Proteia does not convert"
@@ -11140,7 +11140,8 @@ def calibrated(tmp_path: Path, hook=None, *, sides=(LEFT, RIGHT)) -> Calibrated:
 # The operations that can change an apparent MW or a membrane's fit, each of
 # which calls the one writer (_refresh_mw). Every other function of
 # ops.__all__ reads, or changes nothing an MW or a fit depends on: a box removed
-# takes its MW along, and a lane, a name, a polarity or a record is not read.
+# takes its MW along, and a lane, a name, a polarity, a channel or a record is
+# not read.
 MW_WRITERS = frozenset(
     {
         "place_box",
@@ -11187,6 +11188,7 @@ MW_NEUTRAL = frozenset(
         "requantify",
         "save",
         "set_box_lane",
+        "set_channel",
         "set_lanes",
         "set_polarity",
         "set_reference_condition",

@@ -416,6 +416,41 @@ def test_images_can_be_switched_repolarized_and_removed(client, tmp_path):
     assert client.refused("GET", f"/api/images/{image_id}/preview")[:2] == (404, "unknown_id")
 
 
+def test_a_colour_image_can_be_measured_on_one_channel(client, tmp_path):
+    # #206: the route over operations.set_channel, and the state it answers.
+    image_id, _ = ready(client, tmp_path)  # gray
+    gray = synthetic_blot((H, W), [(LANE_X[0], ROW, 5.0, 3.0, 30000.0)])
+    colour = write_tiff(tmp_path / "colour.tif", np.dstack([gray, gray, gray // 2]))
+    status, uploaded = upload(client, colour.read_bytes(), "GFP α.tif")
+    assert status == 201, uploaded
+    tinted = uploaded["image_id"]
+
+    def channel_of(answer: dict, image: str):
+        return next(i for i in answer["project"]["images"] if i["id"] == image)["channel"]
+
+    assert channel_of(uploaded, image_id) is None
+    assert channel_of(uploaded, tinted) == {"measured": "mean", "source": None, "offered": True}
+    path = f"/api/images/{tinted}/channel"
+    answer = client.ok("PUT", path, {"channel": "blue"})
+    assert channel_of(answer, tinted) == {"measured": "blue", "source": "chosen", "offered": True}
+    revision = answer["project"]["revision"]
+    assert revision == uploaded["project"]["revision"] + 1
+    assert answer["results"]["revision"] == revision
+    again = client.ok("PUT", path, {"channel": "blue"})  # the channel measured: no change
+    assert again["project"]["revision"] == revision
+
+    assert client.refused("PUT", path, {"channel": "purple"}) == (422, "invalid_input", [])
+    refused = client.refused("PUT", f"/api/images/{image_id}/channel", {"channel": "red"})
+    assert refused == (422, "invalid_input", [image_id])
+    missing = client.refused("PUT", "/api/images/img-99/channel", {"channel": "red"})
+    assert missing[:2] == (404, "unknown_id")
+    for body in ({}, {"channel": "red", "polarity": "dark_on_light"}, {"channel": 1}, None):
+        assert client.refused("PUT", path, body)[:2] == (422, "invalid_input"), body
+    state = client.ok("GET", "/api/project")
+    assert state["project"]["revision"] == revision  # no refusal changed anything
+    assert channel_of(state, tinted)["measured"] == "blue"
+
+
 # --- Original colours (#57) ---
 
 PONCEAU = "Ponceau S α.png"  # alpha
@@ -1510,6 +1545,12 @@ def test_every_project_answer_carries_its_results(client, tmp_path):
     _, second = upload(client, blot_bytes(tmp_path), name="second.tif")
     answers["PUT /api/images/{image_id}/polarity"] = client.ok(
         "PUT", f"/api/images/{image_id}/polarity", {"polarity": "light_on_dark"}
+    )
+    gray = synthetic_blot((H, W), [(LANE_X[0], ROW, 5.0, 3.0, 30000.0)])
+    colour = np.dstack([gray, gray, gray // 2])  # its channels differ (#206)
+    _, tinted = upload(client, write_tiff(tmp_path / "tinted.tif", colour).read_bytes(), "t.tif")
+    answers["PUT /api/images/{image_id}/channel"] = client.ok(
+        "PUT", f"/api/images/{tinted['image_id']}/channel", {"channel": "green"}
     )
     lanes = [{"condition": "vehicle"}, {"condition": "10 µM"}, {"condition": "10 µM"}]
     answers["PUT /api/lanes"] = client.ok("PUT", "/api/lanes", {"lanes": lanes})

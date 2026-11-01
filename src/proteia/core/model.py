@@ -393,6 +393,145 @@ class ImageWarning(_Model):
     message: Annotated[str, StringConstraints(min_length=1)]
 
 
+# The import warnings that make the over-exposure check distrust an image's
+# known bit depth (proteia.core.imaging.clipping_depth), and so let the
+# near-limit check assess it instead. results names each in its
+# clipping_not_checked and possibly_clipped notices (_UNCHECKED_WARNINGS, kept
+# in step by a test), so a code added here needs a reason there. They live in
+# the model, as limit_distrusted_by does, so that results reads them without
+# loading the image readers.
+# looks_processed is not one of them (#127). Levelling a figure's background to
+# white moves the background onto a limit, not the bands, and on a lossless file
+# the exact check still counts the band pixels the file holds at the limit (a
+# lossy, colour or CMYK file is distrusted by its own warning already). The
+# warning is a heuristic that also fires on some raw images (a dark background
+# the imager cut at zero, a marker photo's white membrane), whose exact check it
+# would weaken. A known limit: a palette reduced to few colours can move a
+# saturated core a level or two off the limit, which the exact check then
+# misses; the warning says that over-exposure may be hidden.
+UNTRUSTED_WARNINGS: Final = frozenset({"lossy_format", "color_channels_differ", "cmyk_converted"})
+
+
+class Channel(StrEnum):
+    """What an image is measured on (#206): one channel of its file as read, or
+    the unweighted mean of its red, green and blue, as ImageJ converts colour by
+    default. A gray image, and a colour image no channel was chosen for, are
+    measured on the mean (a gray image's own values)."""
+
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+    MEAN = "mean"
+
+
+class ChannelSource(StrEnum):
+    """Who chose the channel an image is measured on."""
+
+    CHOSEN = "chosen"  # the user (operations.set_channel)
+
+
+class ChannelChoice(_Model):
+    """The channel a colour image is measured on, and who chose it (#206)."""
+
+    channel: Channel
+    source: ChannelSource
+
+
+def limit_distrusted_by(
+    warnings: Iterable[ImageWarning], channel: Channel | None = None
+) -> list[str]:
+    """The codes of the import ``warnings`` that make the over-exposure check
+    distrust an image's detector limit when it is measured on ``channel``
+    (None: the mean), in their order: those of :data:`UNTRUSTED_WARNINGS`,
+    except ``color_channels_differ`` for one colour channel. A channel
+    saturated alone never brings the mean of differing channels to the limit,
+    but it reaches the limit itself; compression and a CMYK conversion move the
+    values of every channel."""
+    one_channel = channel is not None and channel is not Channel.MEAN
+    return [
+        warning.code
+        for warning in warnings
+        if warning.code in UNTRUSTED_WARNINGS
+        and not (one_channel and warning.code == "color_channels_differ")
+    ]
+
+
+def clipping_depth(
+    bit_depth: int | None, warnings: Iterable[ImageWarning], channel: Channel | None = None
+) -> int | None:
+    """The bit depth whose detector limit the over-exposure check may trust, or
+    None, for a reading with the import ``warnings`` measured on ``channel``
+    (None: the mean, as for every image before #206). An image record reads
+    its own (:attr:`ImageRef.exact_check_depth`); this takes the raw values for
+    a reading with no record yet (an import, the warnings a polarity or channel
+    change assesses) and for tools.
+
+    None when the depth is unknown (float data), when lossy compression moved
+    saturated pixels off the limit (``lossy_format``), when color was averaged
+    into gray (``color_channels_differ`` on the mean): a channel saturated alone
+    never brings the mean to the limit, or when the colours were converted from
+    CMYK (``cmyk_converted``): its values are inks turned into approximate
+    colours, not detector counts, and a profile may keep black off 0
+    (:func:`limit_distrusted_by`). One colour channel of a lossless file is
+    checked at the file's limit. A 12- or 14-bit camera writing a 16-bit file is
+    checked against the container limit, so its saturation goes unseen (a known
+    limit).
+    """
+    if bit_depth is None or limit_distrusted_by(warnings, channel):
+        return None
+    return bit_depth
+
+
+def possible_clipping_depth(
+    bit_depth: int | None, warnings: Iterable[ImageWarning], channel: Channel | None = None
+) -> int | None:
+    """The bit depth the "possibly over-exposed" check (#112,
+    :func:`~proteia.core.quantify.is_possibly_clipped`) measures against, or
+    None; an image record reads its own (:attr:`ImageRef.near_check_depth`).
+
+    It runs where the exact check cannot (:func:`clipping_depth` is None) but the
+    range is known: a lossy or CMYK-converted image, or a colour image measured
+    on the mean, of 8- or 16-bit pixels; one colour channel of a lossy file is
+    assessed on that channel. Its limit is that of the pixels as read: 0, or 255
+    or 65535 for a light-on-dark image; for a CMYK file, that of the red, green
+    and blue it was converted to, which have the inks' bit depth. A file
+    converted through its ICC profile may bring black back well above 0 (a gray
+    ramp made with the relative intent and black point compensation through
+    SWOP press CMYK comes back at about 19), which hides its saturation from
+    this check too (a known limit). An unknown bit depth has no limit to
+    measure against, so neither check runs.
+    """
+    if bit_depth is None or clipping_depth(bit_depth, warnings, channel) is not None:
+        return None
+    return bit_depth
+
+
+# Which over-exposure check an image's bands get (ImageRef.over_exposure_check):
+# the exact one at the detector limit, the one near it, or none (unknown depth).
+OverExposureCheck = Literal["exact", "near_limit", "none"]
+# The color_channels_differ message as shown while an image is measured on one
+# of its channels (ImageRef.shown_warnings); the stored one stays as imported,
+# which is true of the mean.
+_MEASURED_ON_CHANNEL: Final = (
+    "The red, green and blue channels differ; the image is measured on its {channel} channel."
+)
+
+
+# Why no channel can be chosen for an image (ImageRef.channel_blocker): its
+# red, green and blue are equal (or it is gray), it is a visible-light marker,
+# whose ladder is of several colours, or its colours were converted from CMYK.
+ChannelBlocker = Literal["gray", "marker", "cmyk"]
+_CHANNEL_BLOCKED: Final[dict[ChannelBlocker, str]] = {
+    "gray": "a channel is chosen only for an image whose red, green and blue differ",
+    "marker": (
+        "a visible-light marker image is measured on the mean of its colours, never on one channel"
+    ),
+    "cmyk": (
+        "an image converted from CMYK is measured on the mean of its colours, never on one channel"
+    ),
+}
+
+
 class ImageRef(_Model):
     """One image of a membrane; its pixels live in ``images/<file>`` in the project folder."""
 
@@ -410,6 +549,74 @@ class ImageRef(_Model):
     # grow seed threshold, the image-mode fallback and the legacy background.
     background: Finite
     import_warnings: list[ImageWarning] = Field(default_factory=list)
+    # #206: the channel it is measured on; None = the mean of its red, green and
+    # blue (Channel.MEAN), as for a gray image and every image imported before.
+    # Left out of the saved form while None, so a project without a choice keeps
+    # its bytes and hash (see "Canonical form" in storage).
+    channel: ChannelChoice | None = Field(default=None, exclude_if=lambda v: v is None)
+
+    @property
+    def measured_channel(self) -> Channel:
+        """The channel the image is measured on: its choice's, else the mean."""
+        return Channel.MEAN if self.channel is None else self.channel.channel
+
+    # The image's over-exposure checks, from its bit depth, import warnings and
+    # measured channel: the one place an image record's trust is read.
+
+    @property
+    def limit_distrusted(self) -> list[str]:
+        """The codes of its import warnings that distrust its detector limit,
+        on the channel it is measured on (:func:`limit_distrusted_by`)."""
+        return limit_distrusted_by(self.import_warnings, self.measured_channel)
+
+    @property
+    def exact_check_depth(self) -> int | None:
+        """The bit depth its exact over-exposure check runs at, or None
+        (:func:`clipping_depth`)."""
+        return clipping_depth(self.bit_depth, self.import_warnings, self.measured_channel)
+
+    @property
+    def near_check_depth(self) -> int | None:
+        """The bit depth its near-limit check runs at, or None where the exact
+        one runs or no limit is known (:func:`possible_clipping_depth`)."""
+        return possible_clipping_depth(self.bit_depth, self.import_warnings, self.measured_channel)
+
+    @property
+    def over_exposure_check(self) -> OverExposureCheck:
+        """Which check its bands get: ``exact``, ``near_limit`` or ``none``."""
+        if self.exact_check_depth is not None:
+            return "exact"
+        return "none" if self.near_check_depth is None else "near_limit"
+
+    @property
+    def shown_warnings(self) -> list[ImageWarning]:
+        """Its import warnings as they are shown: as stored, except that while it
+        is measured on one colour channel its ``color_channels_differ`` says
+        which, as the stored message, written for the mean, would not."""
+        channel = self.measured_channel
+        if channel is Channel.MEAN:
+            return list(self.import_warnings)
+        return [
+            ImageWarning(code=w.code, message=_MEASURED_ON_CHANNEL.format(channel=channel))
+            if w.code == "color_channels_differ"
+            else w
+            for w in self.import_warnings
+        ]
+
+    @property
+    def channel_blocker(self) -> ChannelBlocker | None:
+        """Why no channel can be chosen for the image, or None if one can, the
+        first that holds: ``"gray"``, its import recorded no
+        ``color_channels_differ``; ``"marker"``, it is a visible-light marker;
+        ``"cmyk"``, its colours were converted from CMYK (``cmyk_converted``)."""
+        codes = {warning.code for warning in self.import_warnings}
+        if "color_channels_differ" not in codes:
+            return "gray"
+        if self.kind is ImageKind.VISIBLE_MARKER:
+            return "marker"
+        if "cmyk_converted" in codes:
+            return "cmyk"
+        return None
 
     @model_validator(mode="after")
     def _check_file_and_marker(self) -> ImageRef:
@@ -424,6 +631,15 @@ class ImageRef(_Model):
                 )
             if self.marker_image_id == self.id:
                 raise ValueError(f"image {self.id}: an image cannot be its own marker image")
+        return self
+
+    @model_validator(mode="after")
+    def _check_channel(self) -> ImageRef:
+        # A choice is made only where operations.set_channel takes one.
+        if self.channel is not None:
+            blocker = self.channel_blocker
+            if blocker is not None:
+                raise ValueError(f"image {self.id}: {_CHANNEL_BLOCKED[blocker]}")
         return self
 
 
