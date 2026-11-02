@@ -3246,6 +3246,27 @@ def test_a_drawn_area_s_median_is_worked_out_once_per_operation(tmp_path, monkey
     assert worked == [area] * 3
 
 
+def test_a_commit_drops_the_medians_worked_out_before_it(tmp_path):
+    # As the mean arrays a ladder read (#206), the area medians a row or a
+    # seed click took are kept within an operation only: a commit inside it
+    # drops those worked out for the project before it, and its end the rest.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    drawn_strips(s, image)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+    assert s._area_medians is None
+    with s.transaction():
+        ops._area_level(s, ref, arena)
+        assert len(s._area_medians) == 1
+        ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])  # a commit
+        assert s._area_medians == {}
+        ops._area_level(s, ref, arena)
+        assert len(s._area_medians) == 1
+    assert s._area_medians is None
+
+
 def test_an_unturned_area_s_median_reads_no_mask(tmp_path, monkeypatch):
     # Every pixel of an unturned outline's bounds lies inside it, past the
     # image's edge too: its median is of them all, with no mask worked out,
