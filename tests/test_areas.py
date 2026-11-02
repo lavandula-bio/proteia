@@ -21,6 +21,7 @@ import pytest
 from conftest import guards_in_place, make_project, synthetic_blot
 from proteia.core import ladders, storage
 from proteia.core import operations as ops
+from proteia.core import session as session_module
 from proteia.core.model import (
     Arena,
     ArenaSource,
@@ -2546,17 +2547,16 @@ def test_every_detector_reads_through_the_area_accessor(tmp_path, monkeypatch):
 
 def full_copy(session, image, area, window, *, calibration=False):
     """What the area accessor gave before it copied only the window: the
-    whole image copied, the window masked, at the median of the array's
-    pixels in the area (#254)."""
+    whole image copied, the window masked: for a row or a seed click at the
+    median of the pixels in the area (#254), for a ladder at the image's."""
     array = session.calibration_pixels(image.id) if calibration else session.pixels(image.id)
     if area.outline is None:
         return array
     x0, y0 = max(0, window[0]), max(0, window[1])
     x1, y1 = min(image.width, window[2]), min(image.height, window[3])
     masked = array.copy()
-    level = float(
-        np.median(array[ops._inside_mask(area, image, (0, 0, image.width, image.height))])
-    )
+    inside = ops._inside_mask(area, image, (0, 0, image.width, image.height))
+    level = image.background if calibration else float(np.median(array[inside]))
     if x1 > x0 and y1 > y0:
         masked[y0:y1, x0:x1][~ops._inside_mask(area, image, (x0, y0, x1, y1))] = level
     return masked
@@ -2621,10 +2621,12 @@ def test_a_window_inside_its_area_is_read_as_stored(tmp_path):
 
 def test_a_ladder_on_a_chosen_channel_reads_the_mean_off_its_area(tmp_path):
     # A colour image measured on green (#206), split in two: a row reads
-    # green, a ladder the mean of the colours, each past the outline at that
-    # array's own median over the area (#254). Red's background is raised, so
-    # the two differ.
+    # green, past the outline at green's median over the area (#254); a
+    # ladder the mean of the colours, past it at the mean's median over the
+    # whole image, as before #254. Red's background is raised, so the levels
+    # differ.
     from proteia.core.model import Channel
+    from proteia.core.quantify import estimate_background
     from test_channels import H, W, colour_blot, import_pixels
 
     s = session_on(tmp_path)
@@ -2644,10 +2646,11 @@ def test_a_ladder_on_a_chosen_channel_reads_the_mean_off_its_area(tmp_path):
     assert np.array_equal(measured[~off], s.pixels(image)[~off])
     assert np.array_equal(ladder[~off], s.calibration_pixels(image)[~off])
     green_level = float(np.median(s.pixels(image)[~off]))
-    mean_level = float(np.median(s.calibration_pixels(image)[~off]))
+    mean_level = estimate_background(s.calibration_pixels(image))
     assert abs(mean_level - green_level) > 5000
+    assert abs(green_level - ref.background) > 1
     assert (measured[off] == green_level).all()
-    assert (ladder[off] == mean_level).all()
+    assert np.allclose(ladder[off], mean_level, atol=1)
 
 
 def test_a_window_on_its_area_s_edges_is_read_as_stored(tmp_path, monkeypatch):
@@ -2661,26 +2664,26 @@ def test_a_window_on_its_area_s_edges_is_read_as_stored(tmp_path, monkeypatch):
     # pixels' too, so nothing is masked; one row more, and the window is.
     assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 50)) is stored
     assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 51)) is not stored
-    # Off the area, a ladder read of an image measured on the mean takes the
-    # area's median that a row's read takes (#254), the same array's: within
-    # an operation, worked out for the one and not again for the other.
+    # Off the area, a row's read takes the area's median (#254); a ladder
+    # read of an image measured on the mean takes the median stored with the
+    # image, as before #254, and works no median out. With the stored median
+    # planted apart from the pixels' (50000), the two differ.
 
     def no_median(*args):
-        raise AssertionError("a median worked out again")
+        raise AssertionError("a median worked out for a ladder read")
 
-    def planted(draft: Project) -> None:  # the stored median apart from the pixels' (50000)
+    def planted(draft: Project) -> None:
         draft.batch.find_image(image).background = 49000.0
 
     plant(s, planted)
     ref = s.project.batch.find_image(image)
-    level = float(np.median(stored[:50]))
-    with s.transaction():
-        row = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60))
-        with monkeypatch.context() as patch:
-            patch.setattr(ops, "estimate_background", no_median)
-            shown = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60), calibration=True)
-    assert (row[50:60, :] == level).all() and (shown[50:60, :] == level).all()
-    assert level != ref.background
+    row = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60))
+    with monkeypatch.context() as patch:
+        patch.setattr(ops, "estimate_background", no_median)
+        patch.setattr(session_module, "estimate_background", no_median)
+        shown = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60), calibration=True)
+    assert (row[50:60, :] == float(np.median(stored[:50]))).all()
+    assert (shown[50:60, :] == 49000.0).all()
 
 
 # --- Review round 3 ---
@@ -2842,10 +2845,11 @@ def test_a_ladder_read_works_its_median_out_once_per_operation(tmp_path, monkeyp
     arena = s.project.batch.find_arena(area)[1]
     worked: list[float] = []
 
-    def counted(array, inside=None):
-        worked.append(estimate_background(array, inside))
+    def counted(array):
+        worked.append(estimate_background(array))
         return worked[-1]
 
+    monkeypatch.setattr(session_module, "estimate_background", counted)
     monkeypatch.setattr(ops, "estimate_background", counted)
     # A window inside the area masks nothing: no median.
     ops._detector_pixels(s, ref, arena, (0, 0, W, H // 4), calibration=True)
@@ -3023,8 +3027,7 @@ def test_a_strip_drawn_is_detected_as_the_strip_cut_out(tmp_path):
     # strip's. The whole image's median lies between the strips: taken for
     # their membrane, it made each row warn of an uneven background, the
     # light strip's bands too faint to grow from a click and the dark
-    # strip's grow over its whole area, and a tick near the light strip's
-    # edge snap to the outline.
+    # strip's grow over its whole area.
     pixels = two_level_strips()
     s = session_on(tmp_path)
     image = import_blot(s, pixels, "two levels µ.tif")
@@ -3043,21 +3046,21 @@ def test_a_strip_drawn_is_detected_as_the_strip_cut_out(tmp_path):
         assert [t - y0 for t, _ in drawn] == pytest.approx([t for t, _ in cropped], abs=1e-9)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a detector window reaching past a drawn outline reads the area's median there,"
-    " flat, where the strip cut out ends: a tick within 12 px of the outline may snap to the"
-    " noise beside it (#254 follow-up: read only inside the area's bounds)",
-)
-def test_a_tick_beside_the_outline_snaps_as_on_the_strip_cut_out(tmp_path):
-    # A ruler tick 6 px inside the light strip's outline, no band within
-    # its window: on the strip cut out nothing stands out there (the tick is
-    # kept); on the drawn area its window reads six rows of the area's
-    # median past the outline, whose steps of 0 lower the noise it measures.
+def test_a_ladder_reads_past_a_drawn_outline_at_the_image_s_median(tmp_path):
+    # A ladder's reads keep the whole image's median past a drawn outline
+    # (#254): the area's own there, flat where the strip cut out would end,
+    # lowers the noise a tick's window measures, so a ruler tick 6 px inside
+    # the light strip's outline, no band in its window, snapped to the noise
+    # beside the outline (to y 38.46). At the image's median it is kept, as
+    # on the strip cut out.
     pixels = two_level_strips()
     s = session_on(tmp_path)
     image = import_blot(s, pixels, "two levels µ.tif")
     drawn_strips(s, image)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+    shown = ops._detector_pixels(s, ref, arena, (90, 30, 110, 60), calibration=True)
+    assert (shown[50:60, 90:110] == 14070.0).all()
     cut = import_blot(s, pixels[:50], "cut µ.tif")
     ops.add_protein(s, "cut", Role.TARGET, cut)
     assert ops.snap_ladder(s, cut, 100.0, [44.0]) == ((44.0, False),)
@@ -3096,11 +3099,11 @@ def test_a_tight_or_turned_outline_is_detected_as_its_pixels_cut_out(tmp_path):
 
 
 def test_each_detector_on_a_drawn_area_takes_its_median(tmp_path, monkeypatch):
-    # The four places a detector takes the membrane's level, each the median
-    # of its area's pixels (worked out here from the strip's own), not the
-    # image's (14070): what a row and a seed click read past the outline,
-    # what a ladder's reads do, the level a seed click grows from, and the
-    # level a row's detector takes where a fitted plane is off the membrane.
+    # The three places a row and a seed click take the membrane's level, each
+    # the median of its area's pixels (worked out here from the strip's own),
+    # not the image's (14070): what they read past the outline, the level a
+    # seed click grows from, and the level a row's detector takes where a
+    # fitted plane is off the membrane. A ladder's reads keep the image's.
     pixels = two_level_strips()
     s = session_on(tmp_path)
     image = import_blot(s, pixels, "two levels µ.tif")
@@ -3129,9 +3132,9 @@ def test_each_detector_on_a_drawn_area_takes_its_median(tmp_path, monkeypatch):
         ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image, number))[1]
         off = ~ops._inside_mask(arena, ref, window)
         assert off[:y0].all() and off[y1:].all() and not off[y0:y1].any()
-        for calibration in (False, True):
+        for calibration, past in ((False, level), (True, 14070.0)):
             shown = ops._detector_pixels(s, ref, arena, window, calibration=calibration)
-            assert (shown[off] == level).all()
+            assert (shown[off] == past).all()
             assert np.array_equal(shown[~off], pixels[~off])
 
 
@@ -3140,7 +3143,8 @@ def test_a_colour_strip_is_detected_on_its_channel_at_that_channel_s_median(tmp_
     # and a seed click read green, past the outline at green's median over
     # the area, and place what they place on the strip cut out and measured
     # on green; a ladder's reads take the mean of the colours, past it at the
-    # mean's median over the area. Red is raised, so the two medians differ.
+    # mean's median over the whole image, as before #254. Red is raised, so
+    # the levels differ.
     from proteia.core.model import Channel
     from test_channels import import_pixels
 
@@ -3151,22 +3155,22 @@ def test_a_colour_strip_is_detected_on_its_channel_at_that_channel_s_median(tmp_
     ops.set_channel(s, image, Channel.GREEN)
     proteins = drawn_strips(s, image)
     window = (0, 0, 200, 100)
+    mean = float(np.median(rgb.astype(np.float64).mean(axis=-1)))
     for number, (protein, (y0, y1, y)) in enumerate(zip(proteins, LEVEL_STRIPS, strict=True), 1):
         batch = s.project.batch
         ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image, number))[1]
         off = ~ops._inside_mask(arena, ref, window)
-        mean = rgb[y0:y1].astype(np.float64).mean(axis=-1)
         measured = ops._detector_pixels(s, ref, arena, window)
         ladder = ops._detector_pixels(s, ref, arena, window, calibration=True)
         assert (measured[off] == float(np.median(green[y0:y1]))).all()
-        assert np.allclose(ladder[off], float(np.median(mean)), rtol=0, atol=1e-9)
-        assert abs(float(np.median(mean)) - float(np.median(green[y0:y1]))) > 1000
-        # Within one operation each array keeps its own median.
+        assert np.allclose(ladder[off], mean, rtol=0, atol=1e-9)
+        assert abs(mean - float(np.median(green[y0:y1]))) > 1000
+        # Within one operation each keeps its own.
         with s.transaction():
             level = ops._area_level(s, ref, arena)
             ladder = ops._detector_pixels(s, ref, arena, window, calibration=True)
         assert level == float(np.median(green[y0:y1]))
-        assert np.allclose(ladder[off], float(np.median(mean)), rtol=0, atol=1e-9)
+        assert np.allclose(ladder[off], mean, rtol=0, atol=1e-9)
         cut = import_pixels(s, rgb[y0:y1], f"cut {y0} µ.tif", DARK)
         ops.set_channel(s, cut, Channel.GREEN)
         alone = ops.add_protein(s, f"cut {y0}", Role.TARGET, cut)
@@ -3204,9 +3208,9 @@ def test_a_drawn_area_s_median_is_worked_out_once_per_operation(tmp_path, monkey
     # However many of its reads look past an outline, an operation works out
     # the area's median once: a seed click on a turned strip (its growth and
     # what it reads past the outline), a row whose box crosses the outline,
-    # a ruler snapped at two ticks; and the reads of one operation, a row's
-    # and a ladder's, of an image measured on the mean of its colours, which
-    # both read. An area over the whole image works none out.
+    # and two reads of a row's in one operation. A ruler's ticks work none
+    # out (a ladder reads past the outline at the image's median), nor does
+    # an area over the whole image.
     pixels = two_level_strips()
     s = session_on(tmp_path)
     image = import_blot(s, pixels, "two levels µ.tif")
@@ -3226,20 +3230,20 @@ def test_a_drawn_area_s_median_is_worked_out_once_per_operation(tmp_path, monkey
     ops.detect_row_boxes(s, top, (10, 10, 190, 52))
     assert worked == [area] * 2
     ops.snap_ladder(s, area, 100.0, [22.0, 44.0])
-    assert worked == [area] * 3
+    assert worked == [area] * 2
     batch = s.project.batch
     ref, arena = batch.find_image(image), batch.find_arena(area)[1]
     with s.transaction():
         for calibration in (False, True, False):
             ops._detector_pixels(s, ref, arena, (0, 0, 200, 100), calibration=calibration)
-    assert worked == [area] * 4
+    assert worked == [area] * 3
     # A whole-image area: none.
     whole = import_blot(s, pixels[:50], "one level µ.tif")
     alone = ops.add_protein(s, "cut", Role.TARGET, whole)
     ops.place_box(s, alone, 100, 24, lane_index=1, grow=True)
     ops.detect_row_boxes(s, alone, STRIP_ROW)
     ops.snap_ladder(s, whole, 100.0, [22.0, 44.0])
-    assert worked == [area] * 4
+    assert worked == [area] * 3
 
 
 def test_an_unturned_area_s_median_reads_no_mask(tmp_path, monkeypatch):

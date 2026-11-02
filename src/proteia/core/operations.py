@@ -81,8 +81,8 @@ record and a calibration point belong to the one area holding its centre, so
 the operations that place or move them refuse one outside its area
 (``OUT_OF_ARENA``) or in two (``IN_TWO_ARENAS``). A row is detected on a copy
 of the pixels in which its area alone shows (:func:`_detector_pixels`), and a
-row, a seed click and a ladder's reads take a drawn area's own median for its
-membrane (:func:`_area_level`, #254), as on the image cut out there; lanes are
+row and a seed click take a drawn area's own median for its membrane
+(:func:`_area_level`, #254), as on the image cut out there; lanes are
 proposed and rows checked from the boxes of the same area, or of the image
 while the area holds none (:func:`~proteia.core.project.lane_anchors`), and
 redrawing an area to cut it in two hands the rows past the cut to a new
@@ -1135,26 +1135,21 @@ def _area_median(
 
 def _area_level(session: ProjectSession, image: ImageRef, area: Arena) -> float:
     """The level a row and a seed click take for the membrane of ``area`` on
-    ``image`` (#254), on the channel the image is measured on: on a drawn
-    outline, the median of the area's pixels (:func:`_drawn_median`), the
-    level the image cut out there would store, so a strip is detected as the
-    same strip cropped and imported; on an area over the whole image, the
-    image's stored median (``ImageRef.background``), reading no pixel, as
-    before #254, so an image of one membrane is detected as it was."""
+    ``image`` (#254), on the channel the image is measured on, and read past
+    its outline: on a drawn outline, the median of the area's pixels
+    (:func:`_area_median`), the level the image cut out there would store, so
+    a strip is detected as the same strip cropped and imported, worked out
+    once per operation however many reads take it
+    (:meth:`~proteia.core.session.ProjectSession.area_background`); on an
+    area over the whole image, the image's stored median
+    (``ImageRef.background``), reading no pixel, as before #254, so an image
+    of one membrane is detected as it was."""
     if area.outline is None:
         return image.background
-    return _drawn_median(session, image, area, session.pixels(image.id), image.measured_channel)
-
-
-def _drawn_median(
-    session: ProjectSession, image: ImageRef, area: Arena, array: np.ndarray, channel: Channel
-) -> float:
-    """The median of ``array`` (``image``'s analysis array of ``channel``)
-    over a drawn ``area`` (:func:`_area_median`), worked out once per
-    operation (:meth:`~proteia.core.session.ProjectSession.area_background`),
-    however many reads take it (#254)."""
+    array = session.pixels(image.id)
     return session.area_background(
-        (image.id, area_key(area), channel), lambda: _area_median(area, image, array)
+        (image.id, area_key(area), image.measured_channel),
+        lambda: _area_median(area, image, array),
     )
 
 
@@ -1169,16 +1164,28 @@ def _detector_pixels(
     """The pixels a detector reads in ``window`` of ``image`` for the
     membrane ``area``: the one way every detector reads them (a row, a seed
     click, a ladder search, a snap; :func:`_shown`), so that each reads the
-    area alone, every pixel past a drawn outline at the median of the array
-    read over the area (:func:`_drawn_median`, asked for only when a pixel is
-    masked), the level the image cut out there would store (#254). A row and
-    a seed click read the channel the image is measured on; a ladder's reads
-    (``calibration``) the mean of its colours, as every molecular-weight read
-    does (#206). Quantification reads the stored pixels instead."""
-    channel = Channel.MEAN if calibration else image.measured_channel
-    array = session.calibration_pixels(image.id) if calibration else session.pixels(image.id)
+    area alone, every pixel past a drawn outline at a level asked for only
+    when a pixel is masked. A row and a seed click read the channel the image
+    is measured on, past the outline at the area's own median
+    (:func:`_area_level`, #254), the level the image cut out there would
+    store. A ladder's reads (``calibration``) read the mean of its colours,
+    as every molecular-weight read does (#206), past the outline at the
+    mean's median over the whole image
+    (:meth:`~proteia.core.session.ProjectSession.calibration_background`),
+    as before #254: the area's own median there, flat beside the outline
+    where the strip cut out would end, made a tick near the outline, or a
+    ladder's search down its lane, find peaks there more often (#254).
+    Quantification reads the stored pixels instead."""
+    if not calibration:
+        return _shown(
+            session.pixels(image.id), image, area, window, lambda: _area_level(session, image, area)
+        )
     return _shown(
-        array, image, area, window, lambda: _drawn_median(session, image, area, array, channel)
+        session.calibration_pixels(image.id),
+        image,
+        area,
+        window,
+        lambda: session.calibration_background(image.id),
     )
 
 

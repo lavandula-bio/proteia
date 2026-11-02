@@ -135,6 +135,7 @@ from proteia.core.model import (
     Project,
     format_timestamp,
 )
+from proteia.core.quantify import estimate_background
 
 _log = logging.getLogger(__name__)
 
@@ -711,9 +712,12 @@ class ProjectSession:
         # work on images measured on another channel, by image id; None
         # between operations, so none is kept (calibration_pixels).
         self._calibration_reads: dict[str, np.ndarray] | None = None
-        # The medians of drawn membrane areas that detectors read past their
-        # outlines (area_background, #254), by the key its caller gives; kept
-        # and dropped with the mean arrays.
+        # Their medians, worked out when a ladder read masks a pixel with one
+        # (calibration_background); kept and dropped with them.
+        self._calibration_medians: dict[str, float] | None = None
+        # The medians of drawn membrane areas that a row and a seed click read
+        # past their outlines (area_background, #254), by the key its caller
+        # gives; kept and dropped with the mean arrays.
         self._area_medians: dict[Hashable, float] | None = None
         # (image id, SHA-256) -> how its stored file holds colour (file_colours).
         self._file_colours: dict[tuple[str, str], FileColours | None] = {}
@@ -833,14 +837,32 @@ class ProjectSession:
                 reads[image_id] = array
             return array
 
+    def calibration_background(self, image_id: str) -> float:
+        """The median of the image's mean array (:meth:`calibration_pixels`),
+        which a ladder read takes off its membrane area: the stored
+        ``background`` when the image is measured on the mean; else worked out
+        once per operation, as its array is read, and not kept after it
+        (outside an operation, each time). Raises as :meth:`pixels` does."""
+        with self.lock:
+            image = self._project.batch.find_image(image_id)
+            if image.measured_channel is Channel.MEAN:
+                return image.background
+            medians = self._calibration_medians
+            if medians is not None and image_id in medians:
+                return medians[image_id]
+            level = estimate_background(self.calibration_pixels(image_id))
+            if medians is not None:
+                medians[image_id] = level
+            return level
+
     def area_background(self, key: Hashable, work_out: Callable[[], float]) -> float:
-        """The median of a drawn membrane area that detectors read past its
-        outline and a row and a seed click take for its membrane (#254,
-        :func:`~proteia.core.operations._drawn_median`): ``work_out()``, kept
-        under ``key``, which names the image, the area as drawn and the array
-        read, until the operation commits or ends (:meth:`transaction`),
-        however many reads take it, and not kept after it; outside an
-        operation, worked out each time."""
+        """The median of a drawn membrane area that a row and a seed click
+        read past its outline and take for its membrane (#254,
+        :func:`~proteia.core.operations._area_level`): ``work_out()``, kept
+        under ``key``, which names the image, the area as drawn and the
+        channel read, until the operation commits or ends
+        (:meth:`transaction`), however many reads take it, and not kept after
+        it; outside an operation, worked out each time."""
         with self.lock:
             medians = self._area_medians
             if medians is not None and key in medians:
@@ -1253,6 +1275,8 @@ class ProjectSession:
                 self._pixels.pop(image_id, None)
             if self._calibration_reads:  # read for the project before this commit
                 self._calibration_reads.clear()
+            if self._calibration_medians:
+                self._calibration_medians.clear()
             if self._area_medians:
                 self._area_medians.clear()
             # The history moves with the commit, before the hook saves (and so
@@ -1294,14 +1318,15 @@ class ProjectSession:
         or ``LookupError``) before anything was committed, the pixel cache is put
         back as it was, even if the operation read pixels first. The mean
         arrays its ladder work read (:meth:`calibration_pixels`), and the
-        medians of drawn areas its detectors took (:meth:`area_background`),
-        go when it ends, however it ends; an operation run inside another
-        keeps them for the outer one."""
+        medians of drawn areas its rows and seed clicks took
+        (:meth:`area_background`), go when it ends, however it ends; an
+        operation run inside another keeps them for the outer one."""
         with self.lock:
             project, cached = self._project, dict(self._pixels)
             outermost = self._calibration_reads is None
             if outermost:
                 self._calibration_reads = {}
+                self._calibration_medians = {}
                 self._area_medians = {}
             try:
                 yield
@@ -1312,6 +1337,7 @@ class ProjectSession:
             finally:
                 if outermost:
                     self._calibration_reads = None
+                    self._calibration_medians = None
                     self._area_medians = None
 
     def _opening_state(self) -> _State:
