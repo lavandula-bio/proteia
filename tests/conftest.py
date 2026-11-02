@@ -22,6 +22,11 @@ Image helpers for tests that read real pixels: :func:`write_tiff`,
 write without imagecodecs) and :func:`synthetic_blot`. :class:`FakeClock`
 gives a session predictable log times.
 :func:`assert_strict_json` checks that a model's JSON is strict and loses nothing.
+
+Autouse guards keep every test off the user's desktop (its browser, the one
+Windows names for web links, and its state folder) and check every refusal of
+reading a file; :func:`guards_in_place` tells whether they are all in place,
+and no test may end without them (#250).
 """
 
 import functools
@@ -43,6 +48,12 @@ from proteia.core import imaging, operations
 from proteia.core.model import Project, apply_change
 from proteia.core.session import ProjectSession
 from proteia.core.storage import image_path, migrate
+from proteia.web import browser
+
+# pytest's own plugin for running a pytest of its own (part of pytest): the
+# check that no test ends with the guards taken back is run on a test that
+# does (test_desktop_guard).
+pytest_plugins = ("pytester",)
 
 
 class _NoBrowser:
@@ -54,28 +65,59 @@ class _NoBrowser:
     open_new = open_new_tab = open
 
 
+# The name of the browser that fails the test: the only one webbrowser tries.
+_NO_BROWSER = "proteia-test-guard"
+# How a launch on Windows reaches the browser Windows names for web links
+# (#251), as Proteia defines them: asking the shell (the user's registry) and
+# starting that browser. The guard puts its own in their place.
+DESKTOP_CALLS = {"_http_handler": browser._http_handler, "_start": browser._start}
+
+
+def _no_shell_question():
+    raise AssertionError("a test asked Windows for the browser it names for http")
+
+
+def _no_browser_start(program, line):
+    raise AssertionError(f"a test tried to start the browser Windows names for http: {line!r}")
+
+
+# The variables launch.state_dir finds the state folder by (Windows, elsewhere).
+_STATE_VARIABLES = ("LOCALAPPDATA", "XDG_STATE_HOME")
+# The folder pytest makes this run's temporary folders in, as the guard of the
+# state folder found it: a state folder in it is a test's own (guards_in_place).
+_temporary_base: Path | None = None
+
+
 @pytest.fixture(autouse=True)
 def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
     """No test opens the user's browser or writes the user's state folder.
 
-    ``launch.start`` takes ``webbrowser.open`` as its default opener, bound when
-    the module loads, so the default browser is replaced where
+    ``launch.start`` takes :func:`~proteia.web.browser.open_page` as its
+    default opener, bound when the module loads. On Windows it asks the shell
+    which browser it names for http and starts it: both are replaced where it
+    looks them up (``browser._http_handler``, ``browser._start``) by ones that
+    fail the test. Elsewhere, and on Windows when that fails, it opens the page
+    with ``webbrowser.open``, so the default browser is replaced where
     ``webbrowser.open`` looks it up: its order of browsers holds only one that
     fails the test. A browser named by its command (``webbrowser.get(command)``,
     as the packaging checks use) is still read as before. The state folder
     (``launch.state_dir``) follows ``LOCALAPPDATA`` on Windows and
     ``XDG_STATE_HOME`` elsewhere: both point at a folder of the test's own. A
     test that needs a browser passes its own opener; one that sets either
-    variable itself still does."""
+    variable itself still does, to a folder of its own in pytest's temporary
+    folders (:func:`guards_in_place` takes any other for the guard gone)."""
+    global _temporary_base
     import webbrowser
 
-    guard = "proteia-test-guard"
-    browsers = {**getattr(webbrowser, "_browsers", {}), guard: [None, _NoBrowser()]}
+    browsers = {**getattr(webbrowser, "_browsers", {}), _NO_BROWSER: [None, _NoBrowser()]}
     monkeypatch.setattr(webbrowser, "_browsers", browsers)
-    monkeypatch.setattr(webbrowser, "_tryorder", [guard])
+    monkeypatch.setattr(webbrowser, "_tryorder", [_NO_BROWSER])
+    monkeypatch.setattr(browser, "_http_handler", _no_shell_question)
+    monkeypatch.setattr(browser, "_start", _no_browser_start)
     state = tmp_path_factory.mktemp("user-state")
-    monkeypatch.setenv("LOCALAPPDATA", str(state))
-    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    _temporary_base = tmp_path_factory.getbasetemp().resolve()
+    for name in _STATE_VARIABLES:
+        monkeypatch.setenv(name, str(state))
 
 
 # The name of an image's stored copy in images/ (img-1.tif), whatever the case.
@@ -100,6 +142,10 @@ def stored_copy_or_path_in(message: str, original_name: str, folder: Path) -> bo
 
 
 _IMPORT_IMAGE = inspect.signature(operations.import_image)
+# The import and the session's reads as Proteia defines them, with no refusal
+# check: what monkeypatch.undo() puts back (guards_in_place). Not told by a
+# __wrapped__: the import has one of its own (its lock).
+_UNCHECKED = {"import": operations.import_image, "read": ProjectSession._read_checked}
 
 
 # Words of the libraries that read a file (tifffile, Pillow, scikit-image),
@@ -185,21 +231,88 @@ def _import_refusals_name_the_file_as_chosen(monkeypatch):
     monkeypatch.setattr(ProjectSession, "_read_checked", read_checked)
 
 
+def _a_tests_own(folder: str | None) -> bool:
+    """Whether ``folder`` is in the folder pytest makes this run's temporary
+    folders in (never the user's own state folder): an absolute path (an
+    empty or relative one would be taken from the working folder, and Linux
+    reads no relative one), and there wherever a link in it leads."""
+    base = _temporary_base
+    if folder is None or base is None or not os.path.isabs(folder):
+        return False
+    return Path(folder).resolve().is_relative_to(base)
+
+
 def guards_in_place() -> bool:
     """Whether the guards of the autouse fixtures above are all in place, as
     a test that takes its own patches back checks it took back only its own
-    (``monkeypatch.undo()`` takes these back too): the refusal checks wrap
-    the import and the session's reads, the browser that fails the test is
-    the only one, and the state folder is the test's own."""
+    (``monkeypatch.undo()`` takes these back too), and as every test must end
+    (:func:`_guards_stay_in_place`): the import and the session's reads are
+    not back to Proteia's own, unchecked (the refusal checks wrap them, or a
+    test's own patch over those does), the browser that fails the test is
+    the only one, the shell is not asked for the browser it names for http
+    nor that browser started as Proteia does (the guard's stand-ins, or a
+    test's own, are there), and the state folder is a test's own (the
+    guard's, or one a test set itself in pytest's temporary folders)."""
     import webbrowser
 
-    state = [os.environ.get(name, "") for name in ("LOCALAPPDATA", "XDG_STATE_HOME")]
     return (
-        hasattr(operations.import_image, "__wrapped__")
-        and hasattr(ProjectSession._read_checked, "__wrapped__")
-        and getattr(webbrowser, "_tryorder", None) == ["proteia-test-guard"]
-        and all(Path(folder).name.startswith("user-state") for folder in state)
+        operations.import_image is not _UNCHECKED["import"]
+        and ProjectSession._read_checked is not _UNCHECKED["read"]
+        and getattr(webbrowser, "_tryorder", None) == [_NO_BROWSER]
+        and all(getattr(browser, name) is not own for name, own in DESKTOP_CALLS.items())
+        and all(_a_tests_own(os.environ.get(name)) for name in _STATE_VARIABLES)
     )
+
+
+class GuardsTakenBack(AssertionError):
+    """A test ended with the guards of the autouse fixtures above taken back."""
+
+
+# The fixture below asks for monkeypatch and for both guards (which ask for
+# monkeypatch too). pytest sets up a conftest's autouse fixtures in the order
+# of their names, which would put it first: it would then finish after
+# monkeypatch took everything back, so every test would fail it, and a guard
+# that failed to set up would read as one taken back. Asked for, they are set
+# up before it and finish after it.
+@pytest.fixture(autouse=True)
+def _guards_stay_in_place(
+    monkeypatch, _keep_tests_off_the_desktop, _import_refusals_name_the_file_as_chosen
+):
+    """Every test ends with the guards above in place (#250).
+    ``monkeypatch.undo()`` takes them back with the test's own patches, and
+    whatever the test does after it runs unguarded; a test takes back only
+    its own, with ``monkeypatch.context()``. Checked after the test and its
+    own fixtures, before ``monkeypatch`` takes everything back: the test's
+    teardown fails, whether the test passed or failed (an expected failure's
+    too: see :func:`pytest_runtest_makereport`)."""
+    yield
+    if not guards_in_place():
+        raise GuardsTakenBack(
+            "the test ended with the guards of conftest.py taken back (monkeypatch.undo()"
+            " takes them back too): take back only the test's own patches, with"
+            " monkeypatch.context()"
+        )
+
+
+def _guards_taken_back(error: BaseException) -> bool:
+    """Whether ``error``, raised at a test's teardown, is (or, as pytest
+    groups the errors of two finalizers, holds) :class:`GuardsTakenBack`."""
+    if isinstance(error, BaseExceptionGroup):
+        return error.subgroup(GuardsTakenBack) is not None
+    return isinstance(error, GuardsTakenBack)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    """pytest takes an error in the teardown of a test expected to fail
+    (``xfail``) for the failure expected; one of :func:`_guards_stay_in_place`
+    is an error still, alone or with others."""
+    report = yield
+    if call.when == "teardown" and call.excinfo and _guards_taken_back(call.excinfo.value):
+        report.outcome = "failed"
+        if hasattr(report, "wasxfail"):
+            del report.wasxfail
+    return report
 
 
 MEMBRANE_LEVEL = 50000.0  # the flat membrane of synthetic_blot, in 16-bit units
