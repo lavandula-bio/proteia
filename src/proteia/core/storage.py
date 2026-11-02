@@ -8,6 +8,11 @@ types). A project folder, which may have any name, holds::
     project.schema2.json            project.json as it was before a migration from schema 2
                                     rewrote it (keep_backup; numbered if taken:
                                     project.schema2 (2).json; schema1 for schema 1)
+    project.conflict 2026-11-01 1532.json
+                                    project.json as a save of the open project found
+                                    it, changed outside Proteia, kept byte for byte
+                                    before Proteia saved its own (#101:
+                                    keep_conflict_copy; numbered if taken)
     images/img-2.tif                byte-identical copies of the imported files, named by id
     exports/                        created by save_project, for exported results:
     exports/lane-table.csv          the per-lane table
@@ -23,8 +28,16 @@ an image is stored before the model references it, and a file is deleted only
 after a saved ``project.json`` no longer references it. An orphan image can hold
 an id that a failed or unsaved import gave back, so importing removes
 :func:`orphan_files` before storing a new image: all but those the session
-keeps (:class:`~proteia.core.session.ProjectSession`), none of which holds the
-id the import takes.
+keeps (:class:`~proteia.core.session.ProjectSession`), whose ids the import
+skips.
+
+An open project is saved only over the ``project.json`` its session last
+read or wrote (#101): one changed outside Proteia since (a synced or restored
+copy) is first kept, as it was, in a conflict copy beside it
+(:func:`keep_conflict_copy`); one holding the same document in other bytes is
+taken for it (:func:`read_version`). The other versions in a project folder
+(:func:`is_version`: the conflict copies, and any other ``.json`` file there)
+keep every image file their text names (:func:`named_images`).
 
 Canonical form. ``project.json`` is ``json.dumps`` of the re-validated model's
 JSON-mode dump with sorted keys, ``indent=1``, ``ensure_ascii=False`` and
@@ -87,8 +100,11 @@ reproduced outside Python.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import copy
+import errno
+import functools
 import hashlib
 import json
 import os
@@ -117,12 +133,16 @@ from proteia.core.model import (
     OriginalName,
     Project,
     format_timestamp,
+    local_minute,
     revalidate,
 )
 
 PROJECT_FILE: Final = "project.json"
 # project.schema<N>.json: a project.json of schema N kept before its migration.
 BACKUP_PREFIX: Final = "project.schema"
+# project.conflict <local date and time>.json: a project.json changed outside
+# Proteia, kept as it was before a save went over it (#101).
+CONFLICT_PREFIX: Final = "project.conflict"
 IMAGES_DIR: Final = "images"
 EXPORTS_DIR: Final = "exports"
 # Top-level keys left out of the content hash: bookkeeping and history, not content.
@@ -189,6 +209,71 @@ class MissingImageError(ProjectError):
     def __init__(self, image_ids: list[str]) -> None:
         super().__init__(f"missing image files for {', '.join(image_ids)}")
         self.image_ids = list(image_ids)
+
+
+class ProjectRemovedError(ProjectError):
+    """The open project is no longer in its folder: the folder was removed or
+    moved outside Proteia, or both its ``project.json`` and one of its image
+    files are gone (:func:`project_removed`). A save does not make it again
+    (#101); the message names the project by its folder's name and says what
+    to do."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"{name!r} is no longer in the projects folder as it was (its folder, or its"
+            " project.json and an image file, were removed or moved outside Proteia), so"
+            " Proteia did not save it again; to keep this change, put the folder back as it"
+            " was: opening another project or quitting drops it"
+        )
+
+
+class ChangedAgainError(ProjectError):
+    """``project.json`` changed once more between a save's check of it and its
+    replace (:func:`write_project_file`), so the save wrote nothing over it."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"{name!r} was changed outside Proteia again while Proteia saved it, so Proteia did"
+            " not save over it; it saves this change, keeping that version too, at your next"
+            " change or when you quit"
+        )
+
+
+class CopyNotKeptError(OSError):
+    """A ``project.json`` changed outside Proteia could not be kept in a conflict
+    copy (:func:`keep_conflict_copy`; the ``OSError`` is ``__cause__``), so the
+    save wrote nothing over it. The message names the project by its folder's
+    name, never its path, and says why."""
+
+    def __init__(self, name: str, exc: OSError) -> None:
+        super().__init__(
+            f"{name!r} was changed outside Proteia after Proteia last opened or saved it, and"
+            f" Proteia could not keep that version in a copy ({_why(exc)}), so it did not save"
+            " over it; this change is kept here and saved, with the copy, at your next change"
+            " once the folder can take it"
+        )
+
+
+class ProjectFileUnreadError(OSError):
+    """``project.json`` could not be read to check whether it changed outside
+    Proteia (another program holds it past the retries, a folder in its place,
+    access denied), so a save wrote nothing over it. The message names the
+    project by its folder's name and says what to do; the ``OSError``, with
+    its path, is ``__cause__``, for the log only."""
+
+    def __init__(self, name: str, exc: OSError) -> None:
+        super().__init__(
+            f"Proteia could not read the project.json of {name!r} to check whether it was"
+            f" changed outside Proteia ({_why(exc)}), so it did not save over it; this change"
+            " is kept here: close the program that holds the file (or put project.json back"
+            " as a file), then make any change"
+        )
+
+
+def _why(exc: OSError) -> str:
+    """Why ``exc`` happened, in words, without the path it names: its system
+    message (``strerror``), or its type's name where it has none."""
+    return exc.strerror or type(exc).__name__
 
 
 class BackupError(OSError):
@@ -722,10 +807,34 @@ def _missing_images(project: Project, folder: str | os.PathLike[str]) -> list[st
     ]
 
 
-def _replace(src: Path, dst: Path) -> None:
-    """``Path.replace``, retried while Windows reports a sharing violation."""
+def check_images(project: Project, folder: str | os.PathLike[str]) -> None:
+    """:class:`MissingImageError` if an image file ``project`` references is not
+    in ``folder``'s ``images/``."""
+    missing = _missing_images(project, folder)
+    if missing:
+        raise MissingImageError(missing)
+
+
+def project_removed(project: Project, folder: str | os.PathLike[str]) -> bool:
+    """Whether the open ``project`` is no longer in ``folder``
+    (:class:`ProjectRemovedError`): the folder is gone (removed, moved, or on a
+    drive no longer there), or both its ``project.json`` and an image file of
+    ``project`` are: as when the folder was removed and an export made its
+    ``exports/`` again. A ``project.json`` removed alone is not: the folder
+    still holds the project's images, and saving writes it again."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return True
+    return not (folder / PROJECT_FILE).exists() and bool(_missing_images(project, folder))
+
+
+def _replace(src: Path, dst: Path, check: Callable[[], None] | None = None) -> None:
+    """``Path.replace``, retried while Windows reports a sharing violation;
+    ``check`` runs right before each try, and what it raises propagates."""
     delay = REPLACE_DELAY
     for attempt in range(REPLACE_ATTEMPTS):
+        if check is not None:
+            check()
         try:
             src.replace(dst)
             return
@@ -782,22 +891,33 @@ def name_fits(folder: Path, name: str) -> bool:
     Windows, whose absolute path must hold at most :data:`PATH_LIMIT` UTF-16
     code units (a character outside the Basic Multilingual Plane counts two).
     """
-    temp = f".{name}.{'x' * 8}.tmp"
-    if len(temp.encode("utf-8", "surrogatepass")) > NAME_LIMIT_BYTES:
+    return _fits(folder, f".{name}.{'x' * 8}.tmp")
+
+
+def _fits(folder: Path, name: str) -> bool:
+    """Whether a file named ``name`` written into ``folder`` stays within the
+    file system's length limits: at most :data:`NAME_LIMIT_BYTES` UTF-8 bytes in
+    its name and, on Windows, at most :data:`PATH_LIMIT` UTF-16 code units in its
+    absolute path (a character outside the Basic Multilingual Plane counts two)."""
+    if len(name.encode("utf-8", "surrogatepass")) > NAME_LIMIT_BYTES:
         return False
     if PATH_LIMIT is None:
         return True
-    path = os.path.join(os.path.abspath(folder), temp)
+    path = os.path.join(os.path.abspath(folder), name)
     return len(path.encode("utf-16-le", "surrogatepass")) // 2 <= PATH_LIMIT
 
 
-def write_atomic(path: Path, data: bytes, *, private: bool = False) -> None:
+def write_atomic(
+    path: Path, data: bytes, *, private: bool = False, check: Callable[[], None] | None = None
+) -> None:
     """Replace ``path`` with ``data`` so a reader sees either the old or the new bytes.
 
     The folder must exist. A ``PermissionError`` that outlasts the retries (a
     reader holding the file on Windows) propagates and leaves the old file intact.
     ``private`` makes the file owner-only (0600 on POSIX) whatever the old one's
-    mode; on Windows the folder's permissions apply either way.
+    mode; on Windows the folder's permissions apply either way. ``check`` runs
+    once the new bytes are durable, right before each try to replace the old
+    file: what it raises propagates, and leaves the old file intact too.
     """
     mode = None if private else _file_mode(path)
     fd, tmp = _temp_file(path.parent, path.name, ".tmp")
@@ -809,11 +929,82 @@ def write_atomic(path: Path, data: bytes, *, private: bool = False) -> None:
             os.fsync(f.fileno())
         if mode is not None:
             tmp.chmod(mode)
-        _replace(tmp, path)
+        _replace(tmp, path, check)
         _fsync_dir(path.parent)
     finally:
         with contextlib.suppress(OSError):  # already gone after a successful replace
             tmp.unlink(missing_ok=True)
+
+
+def _read_retrying(path: Path) -> bytes:
+    """The bytes of the file ``path``, the read retried while Windows reports a
+    sharing violation (a ``PermissionError``: a reader such as an antivirus or a
+    sync client holding the file), with the doubling delay of :func:`_replace`,
+    :data:`REPLACE_ATTEMPTS` reads in all. A ``PermissionError`` of what is no
+    file (a folder in its place) is not retried, nor is any other ``OSError``."""
+    delay = REPLACE_DELAY
+    attempt = 1
+    while True:
+        try:
+            return path.read_bytes()
+        except PermissionError:
+            if attempt >= REPLACE_ATTEMPTS or not path.is_file():
+                raise
+        time.sleep(delay)
+        delay *= 2
+        attempt += 1
+
+
+def read_project_file(folder: str | os.PathLike[str]) -> bytes | None:
+    """The bytes of ``folder``'s ``project.json`` as they are now, or None if
+    there is none (the folder too may be gone, or be a file now); read as
+    :func:`_read_retrying` reads, so a reader holding it for a moment fails
+    nothing. Any other ``OSError`` raises :class:`ProjectFileUnreadError`
+    (its ``__cause__``, which names the path): what it holds is then unknown."""
+    path = Path(folder) / PROJECT_FILE
+    try:
+        return _read_retrying(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise ProjectFileUnreadError(path.parent.name, exc) from exc
+
+
+def _unchanged(path: Path, expect: str | None) -> None:
+    """:class:`ChangedAgainError` unless the file ``path`` holds bytes whose
+    SHA-256 is ``expect``, or, with ``expect`` None, there is none; a file
+    that cannot be read raises :class:`ProjectFileUnreadError`."""
+    try:
+        data = _read_retrying(path)
+    except FileNotFoundError:
+        if expect is None:
+            return
+        raise ChangedAgainError(path.parent.name) from None
+    except OSError as exc:
+        raise ProjectFileUnreadError(path.parent.name, exc) from exc
+    if expect is None or hashlib.sha256(data).hexdigest() != expect:
+        raise ChangedAgainError(path.parent.name)
+
+
+def write_project_file(
+    folder: str | os.PathLike[str], data: bytes, *, expect: str | None, create: bool = False
+) -> None:
+    """Write ``data`` as ``folder``'s ``project.json`` (:func:`write_atomic`),
+    only over the file whose bytes have the SHA-256 ``expect``, or, with
+    ``expect`` None, over no file: checked once the new bytes are durable,
+    right before each try of the replace (:class:`ChangedAgainError`, the old
+    file left as it is). A write landing in the instant between that check and
+    the rename is not seen: no file system offers a rename that compares first.
+    ``images/`` and ``exports/`` are made in the folder; the folder itself only
+    with ``create`` (a new project), so a removed folder is never made again (a
+    ``FileNotFoundError`` then). Never copies or deletes images."""
+    folder = Path(folder)
+    if create:
+        folder.mkdir(parents=True, exist_ok=True)
+    for directory in (folder / IMAGES_DIR, folder / EXPORTS_DIR):
+        directory.mkdir(exist_ok=True)
+    path = folder / PROJECT_FILE
+    write_atomic(path, data, check=functools.partial(_unchanged, path, expect))
 
 
 def save_project(project: Project, folder: str | os.PathLike[str]) -> Path:
@@ -823,12 +1014,11 @@ def save_project(project: Project, folder: str | os.PathLike[str]) -> Path:
     written) and refuses, before creating anything, when an image file is missing.
     Creates the folder, ``images/`` and ``exports/``; never copies or deletes images.
     A ``PermissionError`` that outlasts the retries propagates and leaves the
-    previous ``project.json`` intact.
+    previous ``project.json`` intact. Writes over whatever ``project.json``
+    holds: an open project's session saves through :func:`write_project_file`.
     """
     data = project_to_json(project)
-    missing = _missing_images(project, folder)
-    if missing:
-        raise MissingImageError(missing)
+    check_images(project, folder)
     folder = Path(folder)
     for directory in (folder, folder / IMAGES_DIR, folder / EXPORTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
@@ -860,6 +1050,7 @@ def read_project(
     require_images: bool = True,
     clock: Callable[[], datetime] = _utc_now,
     backup: bool = False,
+    data: bytes | None = None,
 ) -> tuple[Project, bool]:
     """:func:`load_project`, and whether the project was migrated: then
     ``project.json``, of an older schema, does not hold it (nor its ``migrate``
@@ -870,9 +1061,14 @@ def read_project(
     (:func:`keep_backup`), which its ``migrate`` entry names (its ``backup``
     param): what opening a project does before it saves the migration. A
     backup that cannot be written raises :class:`BackupError`; a missing image
-    file raises before it is written. Nothing else is written."""
+    file raises before it is written. Nothing else is written.
+
+    ``data``: the bytes of ``project.json``, read already, for a caller that
+    must know which bytes the project came from (a session, which saves only
+    over them, #101); None reads them here."""
     folder = Path(folder)
-    data = (folder / PROJECT_FILE).read_bytes()
+    if data is None:
+        data = (folder / PROJECT_FILE).read_bytes()
     try:
         project, found = _parse(data)
     except TooManyIdsError as exc:  # named by its folder, as the user knows it
@@ -925,14 +1121,13 @@ def keep_backup(folder: str | os.PathLike[str], data: bytes, schema: int) -> str
         while True:
             name = backup_name(schema, number)
             path = folder / name
-            if _write_new(path, data, mode) or _holds(path, data):
+            if _write_new(path, data, mode) or holds(path, data):
                 return name
             number += 1
     except OSError as exc:
-        why = exc.strerror or type(exc).__name__
         raise BackupError(
             f"{folder.name!r} was saved by an older Proteia (schema {schema}), and a copy"
-            f" of its {PROJECT_FILE} could not be kept before updating it ({why});"
+            f" of its {PROJECT_FILE} could not be kept before updating it ({_why(exc)});"
             " nothing was changed"
         ) from exc
 
@@ -966,7 +1161,7 @@ def _write_new(path: Path, data: bytes, mode: int | None = None) -> bool:
     return True
 
 
-def _holds(path: Path, data: bytes) -> bool:
+def holds(path: Path, data: bytes) -> bool:
     """Whether ``path`` is a file that holds ``data`` (False if it cannot be read)."""
     try:
         return path.is_file() and path.stat().st_size == len(data) and path.read_bytes() == data
@@ -993,11 +1188,193 @@ def backup_references(folder: str | os.PathLike[str]) -> frozenset[str] | None:
     try:
         for path in Path(folder).iterdir():
             if is_backup(path.name) and path.is_file():
-                data = path.read_bytes()
-                names.update(match.decode("ascii") for match in _IMAGE_NAME.findall(data))
+                names.update(image_names(path.read_bytes()))
     except OSError:
         return None
     return frozenset(names)
+
+
+def image_names(data: bytes) -> frozenset[str]:
+    """The stored image files (``img-N`` and an image suffix, in the case found)
+    that ``data`` names anywhere, whatever it is."""
+    return frozenset(match.decode("ascii") for match in _IMAGE_NAME.findall(data))
+
+
+# How much of a file named_images reads at a time, and how much of the end of one
+# read it keeps for the next, so that a name across the two is found whole.
+_SCAN_CHUNK: Final = 1 << 20
+_SCAN_OVERLAP: Final = 64  # more than the longest name a project holds (img-, 10 digits, .tiff)
+
+
+# A stored image's name in text: _IMAGE_NAME's rule, for a version's decoded text.
+_IMAGE_TEXT = re.compile(_IMAGE_NAME.pattern.decode("ascii"), re.IGNORECASE)
+
+
+def _encoding_of(head: bytes) -> str:
+    """The encoding a version's text is in, by its first four bytes ``head``,
+    as JSON is read (:func:`json.detect_encoding`): the byte-order mark of
+    UTF-8, UTF-16 or UTF-32; without one, where its NUL bytes are (an editor
+    or a sync tool may write a project.json so); else UTF-8."""
+    return json.detect_encoding(head)
+
+
+def _decoded(text: str) -> str:
+    """``text`` as decoded, or ``ValueError`` when it holds a NUL: no JSON
+    does, so it was read in another encoding than its own (what it names is
+    then unknown)."""
+    if "\x00" in text:
+        raise ValueError("NUL in text: not read in its own encoding")
+    return text
+
+
+def version_names(data: bytes) -> frozenset[str]:
+    """The stored image files that ``data``, the bytes of a version of the
+    project (another ``project.json``), names anywhere in its text, read in its
+    encoding (:func:`_encoding_of`). ``ValueError`` (``UnicodeDecodeError``
+    among them) for bytes that are not that encoding, or text that holds a
+    NUL: what they name is then unknown."""
+    text = _decoded(data.decode(_encoding_of(data[:4])))
+    return frozenset(_IMAGE_TEXT.findall(text))
+
+
+def named_images(path: Path) -> frozenset[str]:
+    """:func:`version_names` of the file ``path``, read a part at a time, so
+    that memory stays bounded whatever its size. An ``OSError`` and a
+    ``ValueError`` propagate."""
+    names: set[str] = set()
+    tail = ""
+    with path.open("rb") as f:
+        chunk = f.read(4)
+        decoder = codecs.getincrementaldecoder(_encoding_of(chunk))("strict")
+        while True:
+            text = tail + _decoded(decoder.decode(chunk, final=not chunk))
+            # A name that ends where this part does may go on in the next
+            # (img-3.tif, then f): it is read again there, in the overlap.
+            names.update(
+                found.group()
+                for found in _IMAGE_TEXT.finditer(text)
+                if not chunk or found.end() < len(text)
+            )
+            if not chunk:
+                return frozenset(names)
+            tail = text[-_SCAN_OVERLAP:]
+            chunk = f.read(_SCAN_CHUNK)
+
+
+def is_version(name: str) -> bool:
+    """Whether a file named ``name`` directly in a project folder may hold a
+    version of the project, whose image files are then never deleted as
+    orphans (#101): any ``.json`` file there, in any case, other than
+    ``project.json`` and the backups (:func:`is_backup`, which keep their own
+    rule): Proteia's conflict copies, a sync service's own conflict copy
+    (``project-LAB-PC.json``), a copy the user renamed (``project mine.json``)."""
+    lower = name.lower()
+    return lower.endswith(".json") and lower != PROJECT_FILE and not is_backup(name)
+
+
+def is_conflict_copy(name: str) -> bool:
+    """Whether a file named ``name`` in a project folder is taken for a conflict
+    copy Proteia kept (``project.conflict*.json``, in any case)."""
+    lower = name.lower()
+    return lower.startswith(CONFLICT_PREFIX) and lower.endswith(".json")
+
+
+def conflict_copies(folder: str | os.PathLike[str]) -> tuple[str, ...]:
+    """The names of the conflict copies in ``folder`` (:func:`is_conflict_copy`,
+    files only), newest first by name, as their names give the local time and
+    then the number (:func:`conflict_name`); none when the folder cannot be
+    listed."""
+    try:
+        paths = list(Path(folder).iterdir())
+    except OSError:
+        return ()
+    names = (path.name for path in paths if is_conflict_copy(path.name) and path.is_file())
+    return tuple(sorted(names, key=_copy_order, reverse=True))
+
+
+# A conflict copy's name: its stem, then " (N)" when numbered, then ".json".
+_NUMBERED = re.compile(r"(.*?)(?: \(([0-9]+)\))?\.json", re.IGNORECASE)
+
+
+def _copy_order(name: str) -> tuple[str, int]:
+    """Where a conflict copy's name sorts: by its stem (the local time), then
+    its number (1 when it has none)."""
+    found = _NUMBERED.fullmatch(name)
+    if found is None:  # never: is_conflict_copy takes only names that end in .json
+        return name.lower(), 1
+    return found[1].lower(), int(found[2] or 1)
+
+
+def conflict_name(moment: datetime, number: int = 1, *, short: bool = False) -> str:
+    """The name of the ``number``-th conflict copy kept at ``moment``:
+    ``project.conflict 2026-11-01 1532.json`` (the local date and time to the
+    minute, as an export folder's, :func:`~proteia.core.model.local_minute`),
+    then ``project.conflict 2026-11-01 1532 (2).json`` and so on; ``short``,
+    for a folder whose path leaves too little room: ``project.conflict.json``,
+    ``project.conflict (2).json``, no longer than the temp file of a save of
+    ``project.json``."""
+    stem = CONFLICT_PREFIX if short else f"{CONFLICT_PREFIX} {local_minute(moment)}"
+    return f"{stem}.json" if number == 1 else f"{stem} ({number}).json"
+
+
+def keep_conflict_copy(folder: str | os.PathLike[str], data: bytes, moment: datetime) -> str:
+    """Keep ``data``, the bytes of ``folder``'s ``project.json`` found changed
+    outside Proteia, in a new file beside it before a save goes over it (#101);
+    return its name.
+
+    The copy is the first :func:`conflict_name` at ``moment`` that nothing has
+    (a file or a folder, in any case where the file system ignores it), written
+    as it was read (a BOM, CRLF or a newer schema included) and made durable
+    before this returns: a file is never replaced, and ``project.json`` never
+    goes before its copy is on disk. Where the dated name would not fit the
+    file system's length limits, the short names are taken. An ``OSError``
+    raises :class:`CopyNotKeptError` and leaves no file behind (one it began to
+    write is removed)."""
+    folder = Path(folder)
+    mode = _file_mode(folder / PROJECT_FILE)  # the copy is as readable as the original
+    number, short = 1, False
+    try:
+        while True:
+            name = conflict_name(moment, number, short=short)
+            if not _fits(folder, name):
+                if short:
+                    raise OSError(errno.ENAMETOOLONG, "the project folder's path is too long")
+                number, short = 1, True
+                continue
+            if _write_new(folder / name, data, mode):
+                return name
+            number += 1
+    except OSError as exc:
+        raise CopyNotKeptError(folder.name, exc) from exc
+
+
+@dataclass(frozen=True)
+class Version:
+    """What the bytes of a ``project.json`` changed outside Proteia hold
+    (:func:`read_version`): the project, if they read as one (migrated, as
+    opening would, without the ``migrate`` entry), with the SHA-256 of its
+    canonical form (:func:`project_to_json`), which equal documents share
+    whatever their bytes (#229); or None, and ``newer``, the schema of a file
+    that a newer Proteia saved (None for anything else that does not read as
+    a project)."""
+
+    project: Project | None
+    canonical: str | None
+    newer: int | None = None
+
+
+def read_version(data: bytes) -> Version:
+    """:class:`Version` of ``data``. Never raises for what ``data`` holds."""
+    try:
+        project, _ = _parse(data)
+    except SchemaVersionError as exc:
+        found = exc.found
+        newer = found if type(found) is int and found > SCHEMA_VERSION else None
+        return Version(None, None, newer)
+    except ProjectError:
+        return Version(None, None)
+    canonical = hashlib.sha256(project_to_json(project)).hexdigest()
+    return Version(project, canonical)
 
 
 def store_image(
@@ -1065,9 +1442,10 @@ def orphan_files(project: Project, folder: str | os.PathLike[str]) -> list[Path]
     ``.part``/``.tmp`` files, and images whose id the project may hand out again.
     Others are the files of images removed or undone in the open session, which
     it keeps while its undo history can bring them back, files the saved
-    ``project.json`` still references, or files with an id below ``next_id``
+    ``project.json`` still references, files with an id below ``next_id``
     that a backup of an older ``project.json`` names
-    (:func:`backup_references`). The session deletes
+    (:func:`backup_references`), or files another version of the project names
+    (:func:`is_version`, :func:`named_images`). The session deletes
     only the rest, before an import and after a save
     (:class:`~proteia.core.session.ProjectSession`).
     """

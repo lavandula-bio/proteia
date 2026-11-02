@@ -230,7 +230,9 @@ The hand-off routes add: ``stopping``, ``too_many_pending``, ``file_claimed``,
 listed now) 409, ``handoff_not_found`` 404, and ``nothing_imported`` 422
 (``detail.refused``: each file and why). ``unsaved_changes`` carries
 ``detail.created`` when a switch created its project but then could not save
-the one open, which stays open.
+the one open, which stays open. A project whose folder was removed or moved
+outside Proteia is never made again: a switch and a quit go on, dropping its
+changes not saved, which the log says (#101).
 """
 
 from __future__ import annotations
@@ -246,7 +248,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
@@ -285,7 +287,7 @@ from proteia.core.model import (
 from proteia.core.plotspec import ErrorType, PlotSpec
 from proteia.core.results import Results
 from proteia.core.session import Clock, ErrorCode, OperationError, ProjectSession, utc_now
-from proteia.core.storage import ProjectError
+from proteia.core.storage import ProjectError, ProjectRemovedError
 from proteia.web import cloudsync, diagnostics, handoff, logs, projects, sample_project
 from proteia.web.charts import ChartStore
 from proteia.web.handoff import HandoffView, Inbox, Refusal
@@ -423,6 +425,37 @@ def _reason(exc: OSError) -> str:
 def _not_saved(exc: Exception) -> UnsavedChangesError:
     """The open project could not be saved (``exc``), and nothing was made."""
     return UnsavedChangesError(f"the open project could not be saved: {exc}")
+
+
+# Why a project closed by a switch kept changes it could not save: its folder
+# was removed or moved outside Proteia (ProjectRemovedError), in the page's words.
+REMOVED_WHY: Final = (
+    "its folder, or its project.json and an image file, were removed or moved outside Proteia"
+)
+# How many closed openings the workspace remembers for a page that follows (closed).
+CLOSED_KEPT: Final = 16
+
+
+def _dropped(session: ProjectSession, *, extra: Mapping[str, Any] | None = None) -> None:
+    """Log that ``session``, closed, had changes not saved because its folder
+    was removed or moved outside Proteia, which no save makes again (#101)."""
+    if session.dirty and isinstance(session.save_error, ProjectRemovedError):
+        _log.warning(
+            "closed %r with changes not saved: %s", session.folder.name, REMOVED_WHY, extra=extra
+        )
+
+
+def _closed(session: ProjectSession, open_id: int) -> dict[str, Any]:
+    """What a page that follows a switch is told of the opening ``open_id`` of
+    ``session`` that the switch closed (#101): its project's name, whether its
+    changes were all saved, and, if not, why, in words with no path
+    (:data:`REMOVED_WHY`, or that its last save failed, which the log says)."""
+    saved = not session.dirty
+    why = None
+    if not saved:
+        removed = isinstance(session.save_error, ProjectRemovedError)
+        why = REMOVED_WHY if removed else "Proteia could not save them"
+    return {"open_id": open_id, "name": session.folder.name, "saved": saved, "why": why}
 
 
 class UploadTooLargeError(ValueError):
@@ -581,6 +614,8 @@ class Workspace:
         # _preview_key -> preview PNG, least recently shown first.
         self._previews: OrderedDict[_PreviewKey, bytes] = OrderedDict()
         self._charts = ChartStore()
+        # The openings switches closed, by open id, oldest first (closed).
+        self._closed: OrderedDict[int, dict[str, Any]] = OrderedDict()
 
     def current(self, opening: int | None = None) -> ProjectSession:
         """The open project's session; with ``opening``, only if that is its open
@@ -741,17 +776,29 @@ class Workspace:
 
     @staticmethod
     def _save(session: ProjectSession) -> None:
+        """Save ``session``; :class:`UnsavedChangesError` if that fails, except
+        when its folder was removed or moved outside Proteia
+        (:class:`~proteia.core.storage.ProjectRemovedError`): it is never made
+        again, so its changes cannot be saved and do not hold up a switch or a
+        quit (#101); they are dropped when it closes (:func:`_dropped`)."""
         try:
             session.save()
+        except ProjectRemovedError:
+            return
         except (OSError, ProjectError) as exc:
             raise _not_saved(exc) from exc
 
-    def flush(self) -> None:
+    def flush(self) -> str | None:
         """Save the open project if it has unsaved changes (an autosave failed);
-        :class:`UnsavedChangesError` if that fails again."""
+        :class:`UnsavedChangesError` if that fails again, unless its folder was
+        removed or moved outside Proteia (:meth:`_save`): then what closing it
+        drops, in words, for the launcher to say as it stops; else None."""
         session = self._peek()
         if session is not None and session.dirty:
             self._save(session)
+            if isinstance(session.save_error, ProjectRemovedError):
+                return f"{session.folder.name!r} was closed with changes not saved: {REMOVED_WHY}"
+        return None
 
     def _switch(
         self,
@@ -784,7 +831,11 @@ class Workspace:
         Opening the open project never switches (:meth:`open`), but a project
         created where the open one's folder was removed outside Proteia does.
         Saving, opening and closing run outside the lock readers take. Called
-        with the switch lock held."""
+        with the switch lock held.
+
+        The old one's folder removed or moved outside Proteia
+        (:class:`~proteia.core.storage.ProjectRemovedError`) holds up nothing:
+        its changes not saved are dropped as it closes, and logged so (#101)."""
         old = self._peek()
         if old is not None and old.dirty:
             self._save(old)
@@ -800,6 +851,8 @@ class Workspace:
                 if old.dirty:
                     try:
                         old.save()
+                    except ProjectRemovedError:
+                        pass  # never made again: dropped as it closes
                     except (OSError, ProjectError) as exc:
                         session.close(remove_files=False)
                         if created is None:
@@ -815,11 +868,27 @@ class Workspace:
         if old.dirty and not shared:
             try:
                 old.save()
+            except ProjectRemovedError:
+                pass  # said by _dropped
             except (OSError, ProjectError) as exc:
                 _log.warning(
                     "%r was closed with changes that could not be saved: %s", old.folder.name, exc
                 )
+        _dropped(old)
+        with self._lock:  # for a page that follows: whether it was saved (closed)
+            closed = _closed(old, self._open_ids[old])
+            self._closed[closed["open_id"]] = closed
+            while len(self._closed) > CLOSED_KEPT:
+                self._closed.popitem(last=False)
         return session
+
+    def closed(self) -> list[dict[str, Any]]:
+        """The openings switches closed, the last :data:`CLOSED_KEPT`, oldest
+        first: each one's open id, project name, whether its changes were all
+        saved and why not (#101), for a page that follows another tab's
+        switch to say what became of the project it showed."""
+        with self._lock:
+            return list(self._closed.values())
 
     def _opened(self, session: ProjectSession) -> None:
         """Make ``session`` the open one, under the next open id."""
@@ -845,6 +914,7 @@ class Workspace:
             session = self._peek()
             if session is not None:
                 session.close()
+                _dropped(session, extra=logs.FILE_ONLY)  # the launcher says it (flush)
         self.inbox.close()
 
     def create(self, name: object) -> ProjectSession:
@@ -1919,7 +1989,10 @@ def open_project(body: NameBody, workspace: WorkspaceDep) -> dict[str, Any]:
 
 @router.get("/project")
 def get_project(session: OpenSession, workspace: WorkspaceDep) -> dict[str, Any]:
-    return _answer(workspace, session)
+    """The open project's state and results, and ``closed``: the openings
+    switches closed (:meth:`Workspace.closed`), for a page that follows
+    another tab's switch to say whether the project it showed was saved."""
+    return _answer(workspace, session, closed=workspace.closed())
 
 
 def _export_folder(project: Path, folder: str) -> Path:
@@ -1986,6 +2059,8 @@ async def import_image(
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
         raise UploadTooLargeError(f"an image may have at most {MAX_UPLOAD_BYTES} bytes")
+    # Not into a project folder removed outside Proteia: the spool needs it (#101).
+    ops.refuse_removed(checked)
     # Spooled to a temporary file on the project's drive (not the system drive),
     # never held in memory whole; import_image then copies it into images/.
     with tempfile.TemporaryFile(dir=checked.folder) as spool:

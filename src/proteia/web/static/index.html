@@ -38,9 +38,21 @@
 </header>
 
 <p id="status" class="status" role="status">Connecting to Proteia…</p>
+<!-- The notice of a change outside Proteia (#101), for a screen reader: a live
+  region always there, its text set once the notice is shown (app.js
+  renderOutsideChange), so each new notice is read once. -->
+<p id="outside-change-said" class="sr-only" role="status"></p>
 
 <main id="workspace" class="workspace" hidden>
   <aside class="panel">
+    <!-- What changed in the project's files outside Proteia (#101): the state's
+      outside_change, in the server's words, until dismissed for this opening
+      and notice (app.js renderOutsideChange). In the panel, so the view never
+      moves; a screen reader hears it from outside-change-said. -->
+    <div id="outside-change" class="outside-change" hidden>
+      <p id="outside-change-text"></p>
+      <button id="outside-change-dismiss" type="button">Dismiss</button>
+    </div>
     <section>
       <h2>Images</h2>
       <ul id="images" class="choices"></ul>

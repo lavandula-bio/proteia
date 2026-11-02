@@ -58,7 +58,7 @@ from proteia.core.analyze import (
     TestScale,
     registered_test,
 )
-from proteia.core.model import Batch, lane_number
+from proteia.core.model import Batch, lane_number, local_minute
 from proteia.core.names import name_key
 from proteia.core.plotspec import PlotSpec, ValueKind
 from proteia.core.results import Level, Notice, Results, SeriesResult
@@ -424,7 +424,7 @@ def bundle_folder_name(moment: datetime) -> str:
     abroad, a project shared across zones). Provisional (#53): local time is
     the time people look for; UTC would always sort, but reads as another time.
     """
-    return moment.astimezone().strftime("%Y-%m-%d %H%M")
+    return local_minute(moment)
 
 
 def _labelled(stem: str, label: str | None) -> str:

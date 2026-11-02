@@ -69,6 +69,18 @@ array) and its ``fit`` (:meth:`~proteia.core.operations.CalibrationFit.as_json`,
 null without a curve). Each protein's ``predicted_row`` is where its row is
 predicted by its expected MW (:func:`_predicted_row`), and before it has a box,
 its missing lanes' y follows it.
+
+``saved`` says whether ``project.json`` holds the project, and ``save_error``
+is the last failed save's message (null after a successful one).
+``outside_change`` is what the page says of changes made to the project's
+files outside Proteia (#101), null for none: ``message`` (a ``project.json``
+changed outside Proteia that a save kept in a conflict copy, which it names
+with the time, before saving its own; one removed and written again; or the
+conflict copies the folder held when the project was opened or read again),
+``event``, which notice it is (a page keys a dismissal by it, so a second
+notice in the same words still shows; 0 for the copies found), and
+``copies``, those copies' file names, newest first
+(:attr:`~proteia.core.session.ProjectSession.outside_change`).
 """
 
 from __future__ import annotations
@@ -365,6 +377,7 @@ def project_state(
         "proteins": proteins,
         "saved": not session.dirty,
         "save_error": None if session.save_error is None else str(session.save_error),
+        "outside_change": session.outside_change,
     }
 
 

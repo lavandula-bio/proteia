@@ -12,6 +12,15 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   memory (``dirty`` stays True, ``save_error`` holds the exception) and the
   previous ``project.json`` on disk (the write is atomic); the next change, or an
   explicit :meth:`ProjectSession.save`, tries again.
+* A save goes only over the ``project.json`` the session last read or wrote
+  (its *base*, by the SHA-256 of its bytes), or one holding the same document
+  in other bytes (a BOM, CRLF, other key order: #229). One changed outside
+  Proteia since (a synced or restored copy) is first kept, as it was, in a
+  conflict copy beside it (:func:`~proteia.core.storage.keep_conflict_copy`);
+  then the session's version is saved as usual (#101), and
+  :attr:`ProjectSession.outside_change` says so for the page. A removed
+  ``project.json`` is written again (and said); a removed project folder is
+  never made again (:class:`~proteia.core.storage.ProjectRemovedError`).
 * Every committed change appends one :class:`~proteia.core.model.LogEntry` at
   that single commit point, in the same project object, so one save writes the
   change and its entry together; refusals and no-ops append nothing. Times come
@@ -45,13 +54,19 @@ works on; create one with :func:`new_project` or :func:`open_project`.
   disk does not reference them, no state in the undo history does, no backup
   of an older ``project.json`` names them with an id below ``next_id``
   (:func:`~proteia.core.storage.backup_references`; while one cannot be read,
-  it is taken to name every such file), and they carry Proteia's ``img-N``
+  it is taken to name every such file), no other version of the project in
+  its folder (:func:`~proteia.core.storage.is_version`: a conflict copy, any
+  other ``.json`` file there), nor a ``project.json`` changed outside
+  Proteia, names them, whatever their id (while one cannot be read, or the
+  file is missing, no image file is deleted), and they carry Proteia's ``img-N``
   name: a saved project never points at a missing file, an undo never needs
   one, a restored backup finds its images even if a migration lost one (they
   hold ids below ``next_id``, which a migration keeps and the project only
-  raises, so no backup keeps the file of the id an import takes next), and a
-  stray user file is never deleted. So a removed or undone image's file stays
-  while the history can bring it back, and goes at the first save or import
+  raises, so no backup keeps the file of the id an import takes next), every
+  version keeps its images (an import skips the ids whose files are kept:
+  :meth:`ProjectSession.image_number`), and a stray user file is never
+  deleted. So a removed or undone image's file stays while the history can
+  bring it back, and goes at the first save or import
   after no state references it: once the undo limit drops the last such state,
   a new change clears the redo that held it, or the session is closed or
   reloads; or else at the next session's first save.
@@ -63,6 +78,7 @@ clients (e.g. to map onto HTTP statuses).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -76,6 +92,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import Final, Literal
 
 import numpy as np
@@ -182,7 +199,12 @@ class ErrorCode(StrEnum):
     # the file system's path limit (Windows' 259 characters, long paths off).
     PATH_TOO_LONG = "path_too_long"
     FOLDER_NOT_EMPTY = "folder_not_empty"
-    LEFTOVER_FILE = "leftover_file"  # an orphan holding the next image id could not be deleted
+    # A file appeared at the image id an import took, between its check and the
+    # store (an import skips the ids of files it finds: ProjectSession.image_number).
+    LEFTOVER_FILE = "leftover_file"
+    # The open project's folder was removed or moved outside Proteia
+    # (storage.project_removed): an import stores nothing then (#101).
+    PROJECT_REMOVED = "project_removed"
     NOTHING_TO_UNDO = "nothing_to_undo"
     NOTHING_TO_REDO = "nothing_to_redo"
     # Molecular-weight calibration (#58). A calibration point would be out of
@@ -398,6 +420,226 @@ def _outdated_reading(image: ImageRef, header: bool | str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _Base:
+    """The ``project.json`` a session last read or wrote (#101): the SHA-256 of
+    its bytes, and how many entries of the committed log it holds. For the
+    #229 comparison, the SHA-256 of its canonical form (:func:`storage.project_to_json`)
+    once known: the bytes themselves after a write; after a read, computed
+    from ``parsed``, the project those very bytes hold, when a save first
+    meets other bytes; never for a file of an older schema (the save right
+    after its migration goes over the same bytes)."""
+
+    sha256: str
+    log: int
+    canonical: str | None = None
+    parsed: Project | None = None
+
+
+def _written(data: bytes, project: Project) -> _Base:
+    """The base a write of ``project`` as ``data`` leaves."""
+    digest = hashlib.sha256(data).hexdigest()
+    return _Base(sha256=digest, log=len(project.log), canonical=digest)
+
+
+def _read(data: bytes, project: Project, *, migrated: bool) -> _Base:
+    """The base a read of ``data`` as ``project`` leaves (``migrated``: from an
+    older schema, so ``project`` holds a ``migrate`` entry the file does not)."""
+    digest = hashlib.sha256(data).hexdigest()
+    if migrated:
+        return _Base(sha256=digest, log=len(project.log) - 1)
+    return _Base(sha256=digest, log=len(project.log), parsed=project)
+
+
+class Lineage(Enum):
+    """How a ``project.json`` found changed outside Proteia relates to the
+    session's base (the file it last read or wrote) by their logs (#101):
+    :func:`divergence`."""
+
+    EXTENDS_BASE = "extends_base"  # its log is the base's, with entries after it
+    SAME_LOG = "same_log"  # its log is the base's: changed outside the log (by hand)
+    BEHIND_BASE = "behind_base"  # its log ends inside the base's: an older copy
+    FORK = "fork"  # it shares the start of the base's log, then goes its own way
+    UNRELATED = "unrelated"  # no first entry in common
+
+
+@dataclass(frozen=True)
+class Divergence:
+    """Where a version changed outside Proteia and the session's version part,
+    computed once by :func:`divergence` for the notice and :func:`resolve`:
+    the log entries they share from the start (``common``), those only the
+    other one has (``theirs``), those only the session's has (``ours``), and
+    the time of the last entry only the other one has (``their_last``, in the
+    log's form; None when it has none)."""
+
+    lineage: Lineage
+    common: int
+    theirs: int
+    ours: int
+    their_last: str | None
+
+
+def divergence(ours: Sequence[LogEntry], base: int, theirs: Sequence[LogEntry]) -> Divergence:
+    """How the log ``theirs`` of a version changed outside Proteia relates to
+    the session's log ``ours``, whose first ``base`` entries are the base's."""
+    common = 0
+    for mine, other in zip(ours, theirs, strict=False):
+        if mine != other:
+            break
+        common += 1
+    if common >= base:
+        lineage = Lineage.EXTENDS_BASE if len(theirs) > base else Lineage.SAME_LOG
+    elif common == len(theirs):
+        lineage = Lineage.BEHIND_BASE
+    elif common == 0:
+        lineage = Lineage.UNRELATED
+    else:
+        lineage = Lineage.FORK
+    return Divergence(
+        lineage=lineage,
+        common=common,
+        theirs=len(theirs) - common,
+        ours=len(ours) - common,
+        their_last=theirs[-1].time if len(theirs) > common else None,
+    )
+
+
+class Resolution(Enum):
+    """What a save does with a ``project.json`` changed outside Proteia (#101):
+    which version goes into the conflict copy and what the session does then.
+    Only the two that make sense exist."""
+
+    # Keep the file as found in a conflict copy beside it, then save over it:
+    # the maintainer's 2026-11-01 choice, and the only one a save carries out.
+    SET_ASIDE_OUTSIDE = "set_aside_outside"
+    # Keep the session's version in the copy, then take the file on disk as the
+    # project (an option for two versions that forked): not carried out; see resolve.
+    SET_ASIDE_SESSION = "set_aside_session"
+
+
+SET_ASIDE_OUTSIDE: Final = Resolution.SET_ASIDE_OUTSIDE
+
+
+def resolve(divergence: Divergence | None) -> Resolution:
+    """What a save does when ``project.json`` changed outside Proteia: the one
+    place that chooses it. ``divergence`` is None for a file that does not
+    read as a project. Today always :data:`SET_ASIDE_OUTSIDE`.
+
+    It isolates the choice, not its carrying out: :meth:`ProjectSession._write`
+    carries out ``SET_ASIDE_OUTSIDE`` only, and raises for any other. Another
+    rule (``SET_ASIDE_SESSION`` at a fork, ``Lineage.FORK``; making the change
+    again on a version that only extends the base) also needs the write
+    itself changed (the session's bytes into the copy, the file read again
+    with :meth:`ProjectSession._read_again` from inside the autosave, which
+    the end of :meth:`ProjectSession.save` must then not undo), a new opening
+    for the page (the workspace's open id), the page's showing of it, and the
+    notices' words."""
+    return SET_ASIDE_OUTSIDE
+
+
+def _local(time: str | datetime) -> tuple[str, str]:
+    """A log time (or an aware moment) as the page gives it: the local date and
+    the local hour and minute, ``("2026-11-01", "15:32")``."""
+    moment = datetime.fromisoformat(time) if isinstance(time, str) else time
+    local = moment.astimezone()
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
+def _changes(count: int) -> str:
+    return f"{count} change" if count == 1 else f"{count} changes"
+
+
+# The step that takes a version Proteia set aside back, in its notices: it
+# works with one project only, and where file name extensions are hidden.
+_GO_ON = (
+    "To go on from {which} instead: quit Proteia, then in the project's folder rename"
+    " project.json to project mine.json and {copy} to project.json (where file name"
+    " extensions are hidden they show without .json: type project mine and project),"
+    " then start Proteia and open {name!r}."
+)
+
+
+def _set_aside_notice(
+    name: str, copy: str, moment: datetime, version: storage.Version, split: Divergence | None
+) -> str:
+    """What the page says of a ``project.json`` changed outside Proteia that a
+    save kept in the conflict copy ``copy`` at ``moment`` (#101)."""
+    day, hour = _local(moment)
+    said = (
+        f"{name!r} was changed outside Proteia after Proteia last opened or saved it."
+        f" Proteia kept that version as {copy!r} in the project's folder, set aside on {day}"
+        f" at {hour}, and saves its own in its place."
+    )
+    if version.newer is not None:
+        return (
+            f"{said} It was saved by a newer Proteia (schema {version.newer}): to go on from"
+            " it, use that version of Proteia."
+        )
+    if split is None:
+        return f"{said} It does not read as a project, so Proteia cannot open it."
+    if split.their_last is not None:
+        last_day, last_hour = _local(split.their_last)
+        counts = (
+            f"That version has {_changes(split.theirs)} this one does not, the last on"
+            f" {last_day} at {last_hour}, and this one has {split.ours} it does not."
+        )
+    else:
+        counts = (
+            "That version's log has no change this one does not, so it is older or was"
+            f" edited by hand; this one has {_changes(split.ours)} it does not."
+        )
+    go_on = _GO_ON.format(which="that version", copy="the copy", name=name)
+    return f"{said} {counts} {go_on}"
+
+
+def _outside_summary(version: storage.Version, split: Divergence | None) -> str:
+    """What the session log says of a version changed outside Proteia that a
+    save kept in a conflict copy."""
+    if version.newer is not None:
+        return f"it was saved by a newer Proteia, schema {version.newer}"
+    if split is None:
+        return "it does not read as a project"
+    return (
+        f"{split.lineage.value}: that version has {_changes(split.theirs)} this one does not,"
+        f" this one {split.ours}"
+    )
+
+
+def _rewritten_notice(name: str) -> str:
+    """What the page says of a ``project.json`` removed outside Proteia that a
+    save wrote again (#101)."""
+    return (
+        f"The project.json of {name!r} was removed outside Proteia after Proteia last opened"
+        " or saved it, so Proteia wrote it again."
+    )
+
+
+def _found_notice(name: str, copies: Sequence[str]) -> str:
+    """What the page says of the conflict copies found in the folder when the
+    project was opened or read again (#101), newest first."""
+    shown = [repr(copy) for copy in copies[:3]]
+    if len(copies) > 3:
+        listed = f"{', '.join(shown)} and {len(copies) - 3} more"
+    elif len(shown) > 1:
+        listed = f"{', '.join(shown[:-1])} and {shown[-1]}"
+    else:
+        listed = shown[0]
+    if len(copies) == 1:
+        held, kept = "1 version", "Proteia never deletes it; once you delete it, this notice goes."
+        go_on = _GO_ON.format(which="it", copy="the copy", name=name)
+    else:
+        held = f"{len(copies)} versions"
+        kept = (
+            "Proteia never deletes them; once you delete those you do not need, this notice"
+            " goes with the last."
+        )
+        go_on = _GO_ON.format(which="one", copy="that copy", name=name)
+    return (
+        f"The folder of {name!r} holds {held} of the project that Proteia set aside when it was"
+        f" changed outside Proteia: {listed}. {kept} {go_on}"
+    )
+
+
 class ProjectSession:
     """One open project folder. Create it with :func:`new_project` or :func:`open_project`.
 
@@ -406,7 +648,8 @@ class ProjectSession:
     ``project.json``; ``save_error`` is the last failed save (None after a
     successful one); ``last_action`` names the last committed operation.
     ``clock`` gives the time of each log entry and export. :attr:`undo_step` and
-    :attr:`redo_step` name what undo and redo would do.
+    :attr:`redo_step` name what undo and redo would do. :attr:`outside_change`
+    says what changed in the project's files outside Proteia (#101).
     """
 
     def __init__(
@@ -416,10 +659,33 @@ class ProjectSession:
         *,
         autosave: AutosaveHook | None,
         saved_files: Iterable[str],
+        base: _Base,
         clock: Clock = utc_now,
     ) -> None:
         self._project = project
         self._folder = Path(folder)
+        # The project.json this session last read or wrote: a save goes only
+        # over it, or over the same document in other bytes (#101, #229).
+        self._base = base
+        # The conflict copy this session last kept: its name, the SHA-256 of the
+        # bytes it holds and when it was kept, so a save that meets the same
+        # bytes again (one that failed after the copy) keeps no second one.
+        self._copy: tuple[str, str, datetime] | None = None
+        # What the page says of this opening's last change outside Proteia
+        # (its event number and words: _say), and the conflict copies this
+        # opening kept, newest first; replaced whole, so outside_change reads
+        # them without the lock. _events counts the notices of the session.
+        self._said: tuple[int, str] | None = None
+        self._events = 0
+        self._kept: tuple[str, ...] = ()
+        # The conflict copies in the folder when it was opened or read again.
+        self._found: tuple[str, ...] = ()
+        # The image names each version file in the folder holds, by its name,
+        # with the size, modification time and file id they were read at.
+        self._versions: dict[str, tuple[tuple[int, int, int], frozenset[str]]] = {}
+        # The files whose names kept every image file from a cleanup, logged
+        # once each in this session (_named_by_versions).
+        self._unknown_said: set[str] = set()
         self.autosave = autosave
         self.clock = clock
         self.lock = threading.RLock()
@@ -726,22 +992,146 @@ class ProjectSession:
             )
         return pixels
 
+    @property
+    def outside_change(self) -> dict[str, JsonValue] | None:
+        """What the page says of changes made to the project's files outside
+        Proteia (#101), or None: ``message``, the notice of this opening's
+        last one (a ``project.json`` kept in a conflict copy, said as the copy
+        is made, or one written again), else of the conflict copies the folder
+        held when the project was opened or read again; ``event``, which of
+        them it is (the session counts its notices from 1; 0 for the copies
+        found), so a page that dismissed one shows the next even in the same
+        words; ``copies``, the conflict copies this opening kept, else those
+        found, newest first. Read without the lock, as ``save_error`` is."""
+        said, kept, found = self._said, self._kept, self._found
+        if said is None:
+            if not found:
+                return None
+            said = (0, _found_notice(self._folder.name, found))
+        event, message = said
+        return {"event": event, "message": message, "copies": list(kept or found)}
+
+    def _say(self, message: str) -> None:
+        """Make ``message`` this opening's notice of a change outside Proteia,
+        as its next event (:attr:`outside_change`). Called with the lock held."""
+        self._events += 1
+        self._said = (self._events, message)
+
     def save(self) -> Path:
         """Write ``project.json`` now and return its path; then delete the orphans
         no saved project references. ``OSError`` and ``ProjectError`` are recorded
-        in ``save_error`` and re-raised."""
+        in ``save_error`` and re-raised.
+
+        Only over the session's base (the file it last read or wrote), or one
+        holding the same document in other bytes (#229); first a file changed
+        outside Proteia is kept in a conflict copy (#101, :meth:`_write`)."""
         with self.lock:
             project = self._project
             try:
-                path = storage.save_project(project, self._folder)
+                self._write(project)
             except (OSError, storage.ProjectError) as exc:
+                if isinstance(exc, storage.ProjectFileUnreadError):  # its path: the log only
+                    _log.warning("in %r: %s", self._folder.name, exc.__cause__)
                 self.save_error = exc
                 raise
             self._saved_files = _referenced_files(project)
             self.dirty = False
             self.save_error = None
             self._remove_orphans()
-            return path
+            return self._folder / storage.PROJECT_FILE
+
+    def _write(self, project: Project) -> None:
+        """Write ``project`` as the folder's ``project.json``, never over a file
+        changed outside Proteia without keeping it. Called with the lock held.
+
+        The file is read first (:func:`~proteia.core.storage.read_project_file`).
+        Its bytes the base's, or the same document in other bytes (a BOM, CRLF,
+        other key order or spacing; or what is about to be written), it is
+        written over as usual. Other bytes are kept, as they are, in a conflict
+        copy beside it (:func:`~proteia.core.storage.keep_conflict_copy`; none
+        again for the same bytes while the copy kept last still holds them),
+        then written over, and :attr:`outside_change` says so. A missing file
+        is written again, and said, while the folder holds the project's
+        images; with the folder gone (or an image missing too) nothing is
+        made again (:class:`~proteia.core.storage.ProjectRemovedError`).
+        Missing image files refuse as before (``MissingImageError``); a file
+        that cannot be read refuses with the ``OSError``, a copy that cannot be
+        written with :class:`~proteia.core.storage.CopyNotKeptError`, and a file
+        changed again before the replace with
+        :class:`~proteia.core.storage.ChangedAgainError`: nothing is written over
+        it. The base becomes the bytes written."""
+        folder, name = self._folder, self._folder.name
+        data = storage.project_to_json(project)
+        found = storage.read_project_file(folder)
+        outside: tuple[bytes, str, storage.Version] | None = None
+        if found is None:
+            if storage.project_removed(project, folder):
+                raise storage.ProjectRemovedError(name)
+            expect = None
+        else:
+            expect = hashlib.sha256(found).hexdigest()
+            if expect != self._base.sha256:
+                version = storage.read_version(found)
+                same = (self._base_canonical(), hashlib.sha256(data).hexdigest())
+                if version.canonical is not None and version.canonical in same:
+                    _log.info(
+                        "in %r: its project.json was rewritten outside Proteia with the same"
+                        " content; saved over it as usual",
+                        name,
+                    )
+                else:
+                    outside = (found, expect, version)
+        storage.check_images(project, folder)
+        if outside is not None:
+            found_bytes, digest, version = outside
+            split = None
+            if version.project is not None:
+                split = divergence(project.log, self._base.log, version.project.log)
+            resolution = resolve(split)
+            if resolution is not SET_ASIDE_OUTSIDE:  # never: the only resolution built (#101)
+                raise NotImplementedError(f"no save for {resolution}")
+            made = self._keep_copy(found_bytes, digest)
+            if made is not None:  # said as it is made, whether the save goes through or not
+                copy, moment = made
+                self._say(_set_aside_notice(name, copy, moment, version, split))
+                _log.warning(
+                    "in %r: its project.json was changed outside Proteia; kept that version as"
+                    " %r and saves Proteia's (%s)",
+                    name,
+                    copy,
+                    _outside_summary(version, split),
+                )
+        storage.write_project_file(folder, data, expect=expect)
+        self._base = _written(data, project)
+        if found is None:
+            self._say(_rewritten_notice(name))
+            _log.warning(
+                "in %r: its project.json was removed outside Proteia; wrote it again", name
+            )
+
+    def _base_canonical(self) -> str | None:
+        """The SHA-256 of the base's canonical form (:class:`_Base`), computed
+        once, when first asked. Called with the lock held."""
+        base = self._base
+        if base.canonical is None and base.parsed is not None:
+            canonical = hashlib.sha256(storage.project_to_json(base.parsed)).hexdigest()
+            base = self._base = dataclasses.replace(base, canonical=canonical, parsed=None)
+        return base.canonical
+
+    def _keep_copy(self, data: bytes, digest: str) -> tuple[str, datetime] | None:
+        """Keep ``data`` (SHA-256 ``digest``), the ``project.json`` found
+        changed outside Proteia, in a new conflict copy: its name and when it
+        was kept (from the session clock). None when the copy this session
+        kept last still holds them: kept already, and said. Called with the
+        lock held."""
+        kept = self._copy
+        if kept is not None and kept[1] == digest and storage.holds(self._folder / kept[0], data):
+            return None
+        moment = self.clock()
+        copy = storage.keep_conflict_copy(self._folder, data, moment)
+        self._copy = (copy, digest, moment)
+        self._kept = (copy, *self._kept)
+        return copy, moment
 
     def _commit(
         self,
@@ -980,6 +1370,11 @@ class ProjectSession:
         be kept: :class:`~proteia.core.storage.BackupError`) and the
         :class:`~proteia.core.storage.ProjectError` family propagate, with the
         session as it was.
+
+        Read again, the file is the session's base (#101): what this opening
+        said of changes outside Proteia (:attr:`outside_change`) is over, and
+        the conflict copies the folder holds now are said instead. Not read,
+        the opening goes on as it was.
         """
         with self.lock:
             if self.dirty:
@@ -987,18 +1382,35 @@ class ProjectSession:
             saved = (self._folder / storage.PROJECT_FILE).read_bytes()
             if saved == storage.project_to_json(self._project):
                 return False
-            project, migrated = storage.read_project(self._folder, clock=self.clock, backup=True)
-            self._project = project
-            self._saved_files = _referenced_files(project)
-            self._pixels = {}
-            self._states, self._cursor = [], -1
-            self._steps = (None, None)
-            self.last_action = None
-            _log_opened(self._folder, project, again=True)
-            if migrated:
-                _log_migrated(self._folder, project.log[-1])
-                self._changed("migrate")
+            self._read_again(saved)
             return True
+
+    def _read_again(self, saved: bytes) -> None:
+        """Take ``saved``, the bytes of ``project.json`` now, as the project, as
+        :func:`open_project` reads them (a file of an older schema is migrated
+        and saved, once kept in a backup): its base (#101), with no cached
+        pixels, no undo history, and nothing said yet of changes outside
+        Proteia but the conflict copies the folder holds. Whatever the session
+        held is dropped, saved or not; the caller decides it may be. The
+        ``OSError`` and :class:`~proteia.core.storage.ProjectError` of reading
+        it propagate, with the session as it was. Called with the lock held."""
+        project, migrated = storage.read_project(
+            self._folder, clock=self.clock, backup=True, data=saved
+        )
+        self._project = project
+        self._base = _read(saved, project, migrated=migrated)
+        self._copy, self._said, self._kept = None, None, ()
+        self._saved_files = _referenced_files(project)
+        self._pixels = {}
+        self._states, self._cursor = [], -1
+        self._steps = (None, None)
+        self.dirty, self.save_error = False, None
+        self.last_action = None
+        _log_opened(self._folder, project, again=True)
+        self._found = _found_copies(self._folder)
+        if migrated:
+            _log_migrated(self._folder, project.log[-1])
+            self._changed("migrate")
 
     def close(self, *, remove_files: bool = True) -> None:
         """Forget the undo history, then delete the files only it kept (best
@@ -1023,8 +1435,16 @@ class ProjectSession:
     def _remove_orphans(self) -> None:
         """Delete unreferenced Proteia files in ``images/`` that neither the saved
         ``project.json``, nor a state in the undo history, nor a backup of an
-        older ``project.json`` references (best effort: a file held open on
-        Windows stays). Names compare ignoring case, as Windows does.
+        older ``project.json``, nor another version of the project references
+        (best effort: a file held open on Windows stays). Names compare
+        ignoring case, as Windows does.
+
+        Another version (#101, :meth:`_named_by_versions`) keeps every image
+        file its text names, whatever its id: a conflict copy, any other
+        ``.json`` file in the folder, and ``project.json`` itself while it is
+        not the session's base (changed outside Proteia and not yet kept in a
+        copy). While one of them cannot be read, or ``project.json`` is
+        missing, no image file is deleted (only temp files).
 
         A backup keeps only an image file whose id is below ``next_id``: a
         backup's images hold no other id (a migration keeps ``next_id``, and the
@@ -1039,6 +1459,13 @@ class ProjectSession:
             for path in storage.orphan_files(self._project, self._folder)
             if path.name.lower() not in keep and _ORPHAN_NAME.match(path.name)
         ]
+        if not orphans:  # the versions are read only then: most saves leave no orphan
+            return
+        versions = self._named_by_versions()
+        if versions is None:  # what they name is unknown: temp files only
+            orphans = [path for path in orphans if not _IMAGE_FILE.match(path.name)]
+        else:
+            orphans = [path for path in orphans if path.name.lower() not in versions]
         next_id = self._project.next_id
         below = [
             path
@@ -1055,6 +1482,124 @@ class ProjectSession:
                 with contextlib.suppress(OSError):
                     path.unlink()
 
+    def _named_by_versions(self) -> frozenset[str] | None:
+        """The image files (lowercase names) that the other versions of the
+        project in its folder name anywhere in their text (:meth:`_versions_name`),
+        or None when what one of them names is unknown: for a cleanup, which
+        then deletes no image file, and logs which file keeps them, once a
+        session for each. Called with the lock held."""
+        names, unknown = self._versions_name()
+        for name, why in unknown:
+            if name not in self._unknown_said:
+                self._unknown_said.add(name)
+                _log.warning(
+                    "in %r: image files no longer used are kept, not deleted, while what %r"
+                    " names is unknown (%s)",
+                    self._folder.name,
+                    name,
+                    why,
+                )
+        return None if unknown else names
+
+    def _versions_name(self) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+        """The image files (lowercase names) that the other versions of the
+        project in its folder name anywhere in their text (#101), and the files
+        whose names are unknown, each with why (none when that is all of
+        them): every version file
+        (:func:`~proteia.core.storage.is_version`), each read once while its
+        size, modification time and file id stay the same, and ``project.json``
+        itself while it is not the session's base. Not all when the folder
+        cannot be listed, a version cannot be read (held, a path too long for
+        Windows, text not in its encoding), or ``project.json`` is missing or
+        cannot be read; the names of those read are given all the same.
+        Called with the lock held."""
+        names: set[str] = set()
+        unknown: list[tuple[str, str]] = []
+        try:
+            found = storage.read_project_file(self._folder)
+        except OSError:
+            found = None
+            unknown.append((storage.PROJECT_FILE, _UNREAD))
+        else:
+            if found is None:
+                unknown.append((storage.PROJECT_FILE, "it is missing"))
+        if found is not None and hashlib.sha256(found).hexdigest() != self._base.sha256:
+            try:
+                names.update(storage.version_names(found))
+            except ValueError:
+                unknown.append((storage.PROJECT_FILE, _NOT_TEXT))
+        try:
+            paths = list(self._folder.iterdir())
+        except OSError:
+            paths = []
+            unknown.append((self._folder.name, "the folder cannot be listed"))
+        for path in paths:
+            if storage.is_version(path.name):
+                try:
+                    names.update(self._version_names(path))
+                except OSError:
+                    unknown.append((path.name, _UNREAD))
+                except ValueError:
+                    unknown.append((path.name, _NOT_TEXT))
+        return frozenset(name.lower() for name in names), tuple(unknown)
+
+    def _version_names(self, path: Path) -> frozenset[str]:
+        """The image names the version file ``path`` holds
+        (:func:`~proteia.core.storage.named_images`; none for a folder), kept
+        by its name and read again once its size, modification time or file id
+        changed. An ``OSError`` (one that cannot be looked at, as a path past
+        Windows' limit, too) and a ``UnicodeDecodeError`` propagate."""
+        stat = path.stat()
+        if not S_ISREG(stat.st_mode):
+            return frozenset()  # a folder of that name holds no version
+        key = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+        cached = self._versions.get(path.name)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        names = storage.named_images(path)
+        self._versions[path.name] = (key, names)
+        return names
+
+    def image_number(self) -> int:
+        """The number of the id an image imported now takes: the first from
+        ``next_id`` on that no file in ``images/`` holds (an image of another
+        version, or one cleanup could not delete) and that no other version of
+        the project names (:meth:`_versions_name`, those it could read when it
+        could not read them all: an image that the version's computer stored,
+        which has not arrived yet), whatever the suffix and case (#101). Called
+        with the lock held."""
+        held: set[int] = set()
+        try:
+            names = [path.name for path in (self._folder / storage.IMAGES_DIR).iterdir()]
+        except OSError:
+            names = []
+        for name in (*names, *self._versions_name()[0]):
+            if match := _IMAGE_FILE.match(name):
+                held.add(int(match[1]))
+        number = self._project.next_id
+        while number in held:
+            number += 1
+        return number
+
+
+# Why what a version names is unknown (ProjectSession._versions_name).
+_UNREAD: Final = "it cannot be read, or looked at"
+_NOT_TEXT: Final = "it is not text in an encoding Proteia reads"
+
+
+def _found_copies(folder: Path) -> tuple[str, ...]:
+    """The conflict copies in ``folder`` as a project is opened or read again,
+    logged when there are any (#101)."""
+    found = storage.conflict_copies(folder)
+    if found:
+        _log.info(
+            "in %r: %d versions Proteia set aside when it was changed outside Proteia: %s",
+            folder.name,
+            len(found),
+            ", ".join(repr(name) for name in found),
+        )
+    return found
+
 
 def save_to_folder(session: ProjectSession) -> None:
     """The default autosave hook: save the project into its folder."""
@@ -1070,15 +1615,17 @@ def new_project(
     """Create an empty project in ``folder`` and open it.
 
     ``folder`` must not exist or must be an empty directory (orphan cleanup deletes
-    files in ``images/``); otherwise ``FOLDER_NOT_EMPTY``. ``project.json``,
-    ``images/`` and ``exports/`` are written at once; an ``OSError`` propagates.
-    The log starts with one ``new_project`` entry.
+    files in ``images/``); otherwise ``FOLDER_NOT_EMPTY``, and so if another
+    program writes a ``project.json`` there meanwhile, which is left as it is
+    (#101). ``project.json``, ``images/`` and ``exports/`` are written at once;
+    an ``OSError`` propagates. The log starts with one ``new_project`` entry.
     """
     path = Path(folder)
+    not_empty = OperationError(
+        ErrorCode.FOLDER_NOT_EMPTY, f"{path} exists and is not an empty folder"
+    )
     if path.exists() and (not path.is_dir() or any(path.iterdir())):
-        raise OperationError(
-            ErrorCode.FOLDER_NOT_EMPTY, f"{path} exists and is not an empty folder"
-        )
+        raise not_empty
     created = _entry(
         seq=1,
         action="new_project",
@@ -1087,9 +1634,15 @@ def new_project(
         clock=clock,
     )
     project = Project(log=(created,))
-    storage.save_project(project, path)
+    data = storage.project_to_json(project)
+    try:
+        storage.write_project_file(path, data, expect=None, create=True)
+    except storage.ChangedAgainError as exc:
+        raise not_empty from exc
     _log_entry(path, created)
-    return ProjectSession(project, path, autosave=autosave, saved_files=(), clock=clock)
+    return ProjectSession(
+        project, path, autosave=autosave, saved_files=(), base=_written(data, project), clock=clock
+    )
 
 
 def open_project(
@@ -1113,12 +1666,23 @@ def open_project(
     (:class:`~proteia.core.storage.BackupError`, an ``OSError``), and nothing is
     written. A record exported before any edit then cites the log
     ``project.json`` holds. The undo history begins from the migrated state.
+
+    The bytes read are the session's base, which a save goes over (#101); the
+    conflict copies the folder holds are said (:attr:`ProjectSession.outside_change`)
+    and logged.
     """
-    project, migrated = storage.read_project(folder, clock=clock, backup=True)
+    data = (Path(folder) / storage.PROJECT_FILE).read_bytes()
+    project, migrated = storage.read_project(folder, clock=clock, backup=True, data=data)
     session = ProjectSession(
-        project, folder, autosave=autosave, saved_files=_referenced_files(project), clock=clock
+        project,
+        folder,
+        autosave=autosave,
+        saved_files=_referenced_files(project),
+        base=_read(data, project, migrated=migrated),
+        clock=clock,
     )
     _log_opened(session.folder, project)
+    session._found = _found_copies(session.folder)
     if migrated:
         with session.lock:
             _log_migrated(session.folder, project.log[-1])

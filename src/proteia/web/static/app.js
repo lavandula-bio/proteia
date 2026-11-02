@@ -760,7 +760,7 @@ function followOpening({ refused = null, note = null } = {}) {
       showOpened(answer);
       showStatus(
         [
-          followedText(before, answer.project, follow.refused),
+          followedText(before, answer.project, follow.refused, answer.closed),
           ...follow.notes,
           areaPanel.takeDiscarded(),
         ]
@@ -776,16 +776,40 @@ function followOpening({ refused = null, note = null } = {}) {
   return follow.done;
 }
 
-// Why the page now shows `project` in place of `before`, and what the
-// requests `refused` did not do (keys of NOT_DONE).
-function followedText(before, project, refused) {
+// Why the page now shows `project` in place of `before`, what became of
+// `before` (`closed`: the openings switches closed, as the server answered
+// them), and what the requests `refused` did not do (keys of NOT_DONE).
+// Opened again under the same name (another tab, or a project made where
+// its folder was removed), only changes not saved are said.
+function followedText(before, project, refused, closed) {
   const now = isolate(project.name);
+  const entry = closedEntry(before, closed);
+  const lost = entry && !entry.saved ? closedText(before, closed) : null;
   const why =
     project.name === before.name
       ? `${now} was opened again, in another tab or after a change outside Proteia;` +
         " it is shown as it is now."
-      : `Proteia now shows ${now}, opened in another tab; ${isolate(before.name)} is saved.`;
-  return [why, ...[...refused].map((kind) => NOT_DONE[kind])].join(" ");
+      : `Proteia now shows ${now}, opened in another tab; ${closedText(before, closed)}`;
+  const said = project.name === before.name && lost ? [why, lost] : [why];
+  return [...said, ...[...refused].map((kind) => NOT_DONE[kind])].join(" ");
+}
+
+// The record of the opening `before` showed, as the switch that closed it
+// answered it (#101), or undefined when there is none (closed long ago).
+function closedEntry(before, closed) {
+  return (closed || []).find((item) => item.open_id === before.open_id);
+}
+
+// What became of the project `before` showed, as the switch that closed its
+// opening recorded it (#101): saved, or closed with changes not saved and why.
+// Unrecorded (closed long ago), only that it was closed.
+function closedText(before, closed) {
+  const name = isolate(before.name);
+  const entry = closedEntry(before, closed);
+  if (!entry) {
+    return `${name} was closed.`;
+  }
+  return entry.saved ? `${name} is saved.` : `${name} was closed with changes not saved: ${entry.why}.`;
 }
 
 let checking = null; // the check under way (checkOpening), or null
@@ -1402,6 +1426,62 @@ function imageNames(ids) {
     .map((image) => isolate(image.original_name));
 }
 
+// --- Changes made outside Proteia (#101) ---
+
+// The notice dismissed on this page, and the one a screen reader was last
+// given: {open_id, event}, or null. A notice is one event of one opening
+// (outside_change.event), so the next shows even in the same words.
+let dismissedOutside = null;
+let saidOutside = null;
+
+// Whether `seen` is the notice `change` of the opening shown in `project`.
+function sameNotice(seen, project, change) {
+  return seen !== null && seen.open_id === project.open_id && seen.event === change.event;
+}
+
+// Show what the state says of changes made to the project's files outside
+// Proteia (its outside_change: a project.json kept in a conflict copy, or
+// written again, or the copies its folder holds), in the server's words, at
+// the top of the panel, unless that notice of this opening was dismissed.
+// Drawn from every state shown, so no way of showing a project misses it.
+// The live region, always there, gets the words of each new notice once the
+// notice is shown, so a screen reader reads it once, and is emptied while no
+// notice is shown, so none is left to read in it. A notice that appears,
+// or whose words change, pushes down what the panel holds below it: the
+// control in the panel that has the focus (the one just edited) is kept in
+// the window, the panel scrolled the least that shows it.
+function renderOutsideChange(project) {
+  const change = project.outside_change;
+  const shown = change !== null && !sameNotice(dismissedOutside, project, change);
+  const notice = $("outside-change");
+  const text = shown ? change.message : "";
+  const moved = shown && (notice.hidden || $("outside-change-text").textContent !== text);
+  $("outside-change-text").textContent = text;
+  notice.hidden = !shown;
+  const focused = document.activeElement;
+  if (moved && focused && focused !== document.body && notice.parentElement.contains(focused)) {
+    focused.scrollIntoView({ block: "nearest" });
+  }
+  if (shown && !sameNotice(saidOutside, project, change)) {
+    saidOutside = { open_id: project.open_id, event: change.event };
+    $("outside-change-said").textContent = change.message;
+  } else if (!shown) {
+    $("outside-change-said").textContent = "";
+  }
+}
+
+// Dismiss hides the notice for this opening; the button goes with it, so the
+// keyboard goes to Projects…, which every project shown has.
+$("outside-change-dismiss").addEventListener("click", () => {
+  const project = state.project;
+  if (project && project.outside_change) {
+    dismissedOutside = { open_id: project.open_id, event: project.outside_change.event };
+  }
+  $("outside-change").hidden = true;
+  $("outside-change-said").textContent = "";
+  $("switch-project").focus();
+});
+
 function render() {
   $("lane-picker").hidden = true; // its question was about the state before
   const project = state.project;
@@ -1419,6 +1499,7 @@ function render() {
   $("project-name").textContent = project.name;
   $("project-name").title = project.name; // whole, when the header cuts it short
   renderHistory(project.history);
+  renderOutsideChange(project);
   $("save-state").textContent = project.save_error
     ? `Not saved: ${project.save_error}`
     : project.saved
