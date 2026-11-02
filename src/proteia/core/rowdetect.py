@@ -4,7 +4,8 @@
 The user drags a box over one protein's row and the lane table says how many
 lanes it spans; :func:`detect_row` proposes one box per lane, all of one shared
 size, or reports the lane empty. Pure and GUI-independent: it reads a 2-D
-analysis array (never writes it) and the image's stored background, and returns
+analysis array (never writes it) and the membrane's stored level (the image's
+background, or a drawn membrane area's median), and returns
 a :class:`RowDetection`. Committing boxes to a project is the operation's job.
 
 Contract:
@@ -22,9 +23,10 @@ Contract:
   shifts every rect by exactly ``(dx, dy)``.
 * Deterministic: no randomness, and the robust fits use a fixed-stride subsample.
 * Polarity is applied once. Detection measures its own local background (a
-  plane over the row's band-free pixels); the stored background is only
-  compared with it (``bg_offset``), never subtracted, so a stored net keeps
-  ``image.background``.
+  plane over the row's band-free pixels); the membrane's stored level (the
+  image's background, or on a drawn membrane area that area's median, #254)
+  is only compared with it (``bg_offset``), never subtracted from a stored
+  net.
 * When the bands do not show which lane each is in, the result carries a
   refusing flag (:data:`REFUSING_FLAGS`) and the caller must propose nothing.
 
@@ -316,8 +318,8 @@ class RowDetectError(ValueError):
     * ``invalid_row``: ``n_lanes`` not a positive int, or the row not four
       ints with ``x0 < x1`` and ``y0 < y1``;
     * ``invalid_image``: the image is at fault: the array not 2-D, the row
-      holding non-finite pixel values, or ``background`` (the image's) not a
-      finite real number;
+      holding non-finite pixel values, or ``background`` (the membrane's
+      stored level) not a finite real number;
     * ``row_outside_image``: nothing of the row is left after clipping it to
       the image;
     * ``row_too_small``: the clipped row is narrower than :data:`MIN_BOX` px per
@@ -2948,8 +2950,10 @@ def detect_row(
     shared size, or None for an empty lane (see the module docstring).
 
     ``gray`` is the 2-D analysis array (``session.pixels``); it is read, never
-    written. ``background`` is the image's stored background: it only stands in
-    for a fitted plane that is off the membrane, and sets ``bg_offset``.
+    written. ``background`` is the membrane's stored level, the image's
+    background (on a drawn membrane area, the caller gives that area's own
+    median, #254): it only stands in for a fitted plane that is off the
+    membrane, and sets ``bg_offset``.
     ``size_rule`` is one of :data:`SIZE_RULES`, for tests and evaluation;
     callers that commit boxes use the default :data:`SIZE_RULE`.
     ``right_to_left`` numbers the lanes from the box's right end, for an image

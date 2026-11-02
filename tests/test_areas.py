@@ -2547,15 +2547,18 @@ def test_every_detector_reads_through_the_area_accessor(tmp_path, monkeypatch):
 
 def full_copy(session, image, area, window, *, calibration=False):
     """What the area accessor gave before it copied only the window: the
-    whole image copied, the window masked."""
+    whole image copied, the window masked: for a row or a seed click at the
+    median of the pixels in the area (#254), for a ladder at the image's."""
     array = session.calibration_pixels(image.id) if calibration else session.pixels(image.id)
     if area.outline is None:
         return array
     x0, y0 = max(0, window[0]), max(0, window[1])
     x1, y1 = min(image.width, window[2]), min(image.height, window[3])
     masked = array.copy()
+    inside = ops._inside_mask(area, image, (0, 0, image.width, image.height))
+    level = image.background if calibration else float(np.median(array[inside]))
     if x1 > x0 and y1 > y0:
-        masked[y0:y1, x0:x1][~ops._inside_mask(area, image, (x0, y0, x1, y1))] = image.background
+        masked[y0:y1, x0:x1][~ops._inside_mask(area, image, (x0, y0, x1, y1))] = level
     return masked
 
 
@@ -2618,8 +2621,10 @@ def test_a_window_inside_its_area_is_read_as_stored(tmp_path):
 
 def test_a_ladder_on_a_chosen_channel_reads_the_mean_off_its_area(tmp_path):
     # A colour image measured on green (#206), split in two: a row reads
-    # green, a ladder the mean of the colours, each with that array's own
-    # median off the area. Red's background is raised, so the two differ.
+    # green, past the outline at green's median over the area (#254); a
+    # ladder the mean of the colours, past it at the mean's median over the
+    # whole image, as before #254. Red's background is raised, so the levels
+    # differ.
     from proteia.core.model import Channel
     from proteia.core.quantify import estimate_background
     from test_channels import H, W, colour_blot, import_pixels
@@ -2640,9 +2645,11 @@ def test_a_ladder_on_a_chosen_channel_reads_the_mean_off_its_area(tmp_path):
     ladder = ops._detector_pixels(s, ref, arena, window, calibration=True)
     assert np.array_equal(measured[~off], s.pixels(image)[~off])
     assert np.array_equal(ladder[~off], s.calibration_pixels(image)[~off])
+    green_level = float(np.median(s.pixels(image)[~off]))
     mean_level = estimate_background(s.calibration_pixels(image))
-    assert abs(mean_level - ref.background) > 5000
-    assert np.allclose(measured[off], ref.background, atol=1)
+    assert abs(mean_level - green_level) > 5000
+    assert abs(green_level - ref.background) > 1
+    assert (measured[off] == green_level).all()
     assert np.allclose(ladder[off], mean_level, atol=1)
 
 
@@ -2657,16 +2664,26 @@ def test_a_window_on_its_area_s_edges_is_read_as_stored(tmp_path, monkeypatch):
     # pixels' too, so nothing is masked; one row more, and the window is.
     assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 50)) is stored
     assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 51)) is not stored
-    # A ladder read of an image measured on the mean takes the stored
-    # median off the area: no median is worked out again.
+    # Off the area, a row's read takes the area's median (#254); a ladder
+    # read of an image measured on the mean takes the median stored with the
+    # image, as before #254, and works no median out. With the stored median
+    # planted apart from the pixels' (50000), the two differ.
 
-    def no_median(array):
-        raise AssertionError("a median worked out again")
+    def no_median(*args):
+        raise AssertionError("a median worked out for a ladder read")
 
-    monkeypatch.setattr(ops, "estimate_background", no_median)
-    monkeypatch.setattr(session_module, "estimate_background", no_median)
-    shown = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60), calibration=True)
-    assert np.allclose(shown[50:60, :], ref.background, atol=1)
+    def planted(draft: Project) -> None:
+        draft.batch.find_image(image).background = 49000.0
+
+    plant(s, planted)
+    ref = s.project.batch.find_image(image)
+    row = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60))
+    with monkeypatch.context() as patch:
+        patch.setattr(ops, "estimate_background", no_median)
+        patch.setattr(session_module, "estimate_background", no_median)
+        shown = ops._detector_pixels(s, ref, arena, (0, 0, 200, 60), calibration=True)
+    assert (row[50:60, :] == float(np.median(stored[:50]))).all()
+    assert (shown[50:60, :] == 49000.0).all()
 
 
 # --- Review round 3 ---
@@ -2921,3 +2938,546 @@ def test_what_a_drawn_area_s_rings_may_not_read(tmp_path):
         arena = batch.find_arena(arena_id)[1]
         whole = ~ops._inside_mask(arena, ref, (0, 0, ref.width, ref.height))
         assert np.array_equal(ops._outside(arena, ref), whole), arena_id
+
+
+# --- The membrane level a detector takes on a drawn area (#254) ---
+
+# The strips of two_level_strips: (first row, end row, row of its bands).
+LEVEL_STRIPS = ((0, 50, 24), (50, 100, 76))
+STRIP_ROW = (10, 12, 190, 38)  # a row box over a strip's bands, in the strip's own rows
+
+
+def two_level_strips(seed: int = 5) -> np.ndarray:
+    """200x100: two strips of three lanes cut from blots of very different
+    membrane levels and scanned side by side: rows 0-49 at 40000, a band
+    20000 deep at y 24 in each lane; rows 50-99 at 8000, bands 5000 deep at
+    y 76; normal noise of SD 100. Every pixel is even, so every median of
+    them is a whole number. The whole image's median (14070) lies between
+    the strips."""
+    y, x = np.mgrid[0:100, 0:200].astype(float)
+    image = np.where(y < 50, 40000.0, 8000.0)
+    for cy, depth in ((24, 20000.0), (76, 5000.0)):
+        for cx in LANE_X:
+            image -= depth * np.exp(-(((x - cx) / 8.0) ** 2) - ((y - cy) / 3.0) ** 2)
+    image += np.random.default_rng(seed).normal(0.0, 100.0, image.shape)
+    return (2 * np.round(image / 2)).astype(np.uint16)
+
+
+def drawn_strips(s, image: str) -> tuple[str, str]:
+    """Three lanes declared and each strip of a two-level image the drawn area
+    of a membrane of its own (y 0-50 and 50-100), with a target on each: the
+    two targets, top first."""
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    ops.edit_arena(s, area_on(s, image), outline=(0, 0, 200, 50))
+    ops.add_arena(s, image, (0, 50, 200, 100))
+    top = ops.add_protein(s, "β-catenin", Role.TARGET, arena_id=area_on(s, image))
+    bottom = ops.add_protein(s, "p53 µ", Role.TARGET, arena_id=area_on(s, image, 2))
+    return top, bottom
+
+
+def moved(rect, dx: int, dy: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = rect
+    return x0 + dx, y0 + dy, x1 + dx, y1 + dy
+
+
+def row_outcome(s, protein: str, row) -> tuple[tuple[str, ...], dict]:
+    """A row dragged over ``row`` for a protein: the detector's flags and each
+    lane's box, the drag then taken back."""
+    from test_operations import rects_by_lane
+
+    placed = ops.detect_row_boxes(s, protein, row)
+    found = rects_by_lane(s, protein)
+    ops.undo(s)
+    return placed.flags, found
+
+
+def seed_outcome(s, protein: str, x: int, y: int, lane: int):
+    """A seed click in a lane: the box it grows, the click then taken back; or
+    the refusal's code."""
+    from test_operations import rects_by_lane
+
+    try:
+        ops.place_box(s, protein, x, y, lane_index=lane, grow=True)
+    except OperationError as exc:
+        return exc.code
+    rect = rects_by_lane(s, protein)[lane]
+    ops.undo(s)
+    return rect
+
+
+def detected_alike(s, drawn: str, alone: str, row, bands, dx: int, dy: int) -> None:
+    """A row over ``row`` and a seed click on each of ``bands`` (``(x, y)`` per
+    lane) place on the protein ``drawn`` what they place on ``alone``, whose
+    image is the pixels of ``drawn``'s area cut out at ``(dx, dy)``."""
+    flags, found = row_outcome(s, drawn, row)
+    assert "background_mismatch" not in flags
+    shifted = {lane: moved(rect, -dx, -dy) for lane, rect in found.items()}
+    assert (flags, shifted) == row_outcome(s, alone, moved(row, -dx, -dy))
+    for lane, (x, y) in enumerate(bands):
+        grown = seed_outcome(s, drawn, x, y, lane)
+        assert isinstance(grown, tuple) and grown[3] - grown[1] < 15, grown  # the band alone
+        assert moved(grown, -dx, -dy) == seed_outcome(s, alone, x - dx, y - dy, lane)
+
+
+def test_a_strip_drawn_is_detected_as_the_strip_cut_out(tmp_path):
+    # Drawing an outline is cutting the image there (#243), for the
+    # detectors too: on each of two strips of very different membrane
+    # levels, a row, a seed click and a ruler's snap place what they place
+    # on the strip cropped and imported alone, whose stored median is the
+    # strip's. The whole image's median lies between the strips: taken for
+    # their membrane, it made each row warn of an uneven background, the
+    # light strip's bands too faint to grow from a click and the dark
+    # strip's grow over its whole area.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    proteins = drawn_strips(s, image)
+    assert s.project.batch.find_image(image).background == 14070.0
+    for number, (protein, (y0, y1, y)) in enumerate(zip(proteins, LEVEL_STRIPS, strict=True), 1):
+        cut = import_blot(s, pixels[y0:y1], f"cut {y0} µ.tif")
+        alone = ops.add_protein(s, f"cut {y0}", Role.TARGET, cut)
+        assert s.project.batch.find_image(cut).background == float(np.median(pixels[y0:y1]))
+        bands = [(x, y) for x in LANE_X]
+        detected_alike(s, protein, alone, moved(STRIP_ROW, 0, y0), bands, 0, y0)
+        # A ruler's tick on the band.
+        drawn = ops.snap_ladder(s, area_on(s, image, number), 100.0, [y - 2.0])
+        cropped = ops.snap_ladder(s, cut, 100.0, [y - y0 - 2.0])
+        assert [found for _, found in drawn] == [found for _, found in cropped] == [True]
+        assert [t - y0 for t, _ in drawn] == pytest.approx([t for t, _ in cropped], abs=1e-9)
+
+
+def test_a_ladder_reads_past_a_drawn_outline_at_the_image_s_median(tmp_path):
+    # A ladder's reads keep the whole image's median past a drawn outline
+    # (#254): the area's own there, flat where the strip cut out would end,
+    # lowers the noise a tick's window measures, so a ruler tick 6 px inside
+    # the light strip's outline, no band in its window, snapped to the noise
+    # beside the outline (to y 38.46). At the image's median it is kept, as
+    # on the strip cut out.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    drawn_strips(s, image)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+    shown = ops._detector_pixels(s, ref, arena, (90, 30, 110, 60), calibration=True)
+    assert (shown[50:60, 90:110] == 14070.0).all()
+    cut = import_blot(s, pixels[:50], "cut µ.tif")
+    ops.add_protein(s, "cut", Role.TARGET, cut)
+    assert ops.snap_ladder(s, cut, 100.0, [44.0]) == ((44.0, False),)
+    assert ops.snap_ladder(s, area_on(s, image), 100.0, [44.0]) == ((44.0, False),)
+
+
+def test_a_tight_or_turned_outline_is_detected_as_its_pixels_cut_out(tmp_path):
+    # An outline drawn tight to a row of bands, and one turned by 3 degrees
+    # whose bounds reach the next strip: a row inside the outline and a seed
+    # click on each band place what they place on the outline's pixels cut
+    # out, the bounds of the turned one with each pixel outside it at the
+    # area's median, which the cut-out image then stores as its own.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    area = area_on(s, image)
+    for name, outline, angle, row in (
+        ("tight", (0, 16, 200, 33), 0.0, (10, 16, 190, 33)),
+        ("turned", (0, 4, 200, 46), 3.0, STRIP_ROW),
+    ):
+        ops.edit_arena(s, area, outline=outline, angle_deg=angle)
+        drawn = ops.add_protein(s, f"{name} β", Role.TARGET, arena_id=area)
+        batch = s.project.batch
+        ref, arena = batch.find_image(image), batch.find_arena(area)[1]
+        x0, y0, x1, y1 = ops._bounds_on(arena, ref)
+        inside = ops._inside_mask(arena, ref, (x0, y0, x1, y1))
+        assert inside.all() == (angle == 0.0)
+        cut_out = pixels[y0:y1, x0:x1].copy()
+        level = float(np.median(cut_out[inside]))
+        cut_out[~inside] = level  # a whole number: every pixel is even
+        cut = import_blot(s, cut_out, f"cut {name} µ.tif")
+        assert s.project.batch.find_image(cut).background == level
+        alone = ops.add_protein(s, f"cut {name}", Role.TARGET, cut)
+        detected_alike(s, drawn, alone, row, [(x, 24) for x in LANE_X], x0, y0)
+
+
+def test_each_detector_on_a_drawn_area_takes_its_median(tmp_path, monkeypatch):
+    # The three places a row and a seed click take the membrane's level, each
+    # the median of its area's pixels (worked out here from the strip's own),
+    # not the image's (14070): what they read past the outline, the level a
+    # seed click grows from, and the level a row's detector takes where a
+    # fitted plane is off the membrane. A ladder's reads keep the image's.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    proteins = drawn_strips(s, image)
+    taken: list[tuple[str, float]] = []
+    grow_box, detect_row = ops.grow_box, ops.rowdetect.detect_row
+
+    def grown(gray, seed, background, **kwargs):
+        taken.append(("seed", background))
+        return grow_box(gray, seed, background, **kwargs)
+
+    def row(gray, given, n, *, background, **kwargs):
+        taken.append(("row", background))
+        return detect_row(gray, given, n, background=background, **kwargs)
+
+    monkeypatch.setattr(ops, "grow_box", grown)
+    monkeypatch.setattr(ops.rowdetect, "detect_row", row)
+    window = (0, 0, 200, 100)  # crosses each outline
+    for number, (protein, (y0, y1, y)) in enumerate(zip(proteins, LEVEL_STRIPS, strict=True), 1):
+        level = float(np.median(pixels[y0:y1]))
+        taken.clear()
+        ops.place_box(s, protein, 100, y, lane_index=1, grow=True)
+        ops.detect_row_boxes(s, protein, moved(STRIP_ROW, 0, y0))
+        assert taken == [("seed", level), ("row", level)]
+        batch = s.project.batch
+        ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image, number))[1]
+        off = ~ops._inside_mask(arena, ref, window)
+        assert off[:y0].all() and off[y1:].all() and not off[y0:y1].any()
+        for calibration, past in ((False, level), (True, 14070.0)):
+            shown = ops._detector_pixels(s, ref, arena, window, calibration=calibration)
+            assert (shown[off] == past).all()
+            assert np.array_equal(shown[~off], pixels[~off])
+
+
+def test_a_colour_strip_is_detected_on_its_channel_at_that_channel_s_median(tmp_path):
+    # A colour image measured on green (#206), each strip a drawn area: a row
+    # and a seed click read green, past the outline at green's median over
+    # the area, and place what they place on the strip cut out and measured
+    # on green; a ladder's reads take the mean of the colours, past it at the
+    # mean's median over the whole image, as before #254. Red is raised, so
+    # the levels differ.
+    from proteia.core.model import Channel
+    from test_channels import import_pixels
+
+    green = two_level_strips()
+    rgb = np.dstack([green // 2 + 20000, green, np.full_like(green, 1000)])
+    s = session_on(tmp_path)
+    image = import_pixels(s, rgb, "two levels µ.tif", DARK)
+    ops.set_channel(s, image, Channel.GREEN)
+    proteins = drawn_strips(s, image)
+    window = (0, 0, 200, 100)
+    mean = float(np.median(rgb.astype(np.float64).mean(axis=-1)))
+    for number, (protein, (y0, y1, y)) in enumerate(zip(proteins, LEVEL_STRIPS, strict=True), 1):
+        batch = s.project.batch
+        ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image, number))[1]
+        off = ~ops._inside_mask(arena, ref, window)
+        measured = ops._detector_pixels(s, ref, arena, window)
+        ladder = ops._detector_pixels(s, ref, arena, window, calibration=True)
+        assert (measured[off] == float(np.median(green[y0:y1]))).all()
+        assert np.allclose(ladder[off], mean, rtol=0, atol=1e-9)
+        assert abs(mean - float(np.median(green[y0:y1]))) > 1000
+        # Within one operation each keeps its own.
+        with s.transaction():
+            level = ops._area_level(s, ref, arena)
+            ladder = ops._detector_pixels(s, ref, arena, window, calibration=True)
+        assert level == float(np.median(green[y0:y1]))
+        assert np.allclose(ladder[off], mean, rtol=0, atol=1e-9)
+        cut = import_pixels(s, rgb[y0:y1], f"cut {y0} µ.tif", DARK)
+        ops.set_channel(s, cut, Channel.GREEN)
+        alone = ops.add_protein(s, f"cut {y0}", Role.TARGET, cut)
+        bands = [(x, y) for x in LANE_X]
+        detected_alike(s, protein, alone, moved(STRIP_ROW, 0, y0), bands, 0, y0)
+
+
+def test_a_row_placed_by_its_mw_takes_its_area_s_median(tmp_path, monkeypatch):
+    # A row placed by its expected MW (#58) shares the row's commit: its
+    # detector takes the drawn area's median, here above the image's (51935),
+    # which the darker margins outside the outline pull down.
+    from test_mw_row import add, blot_pixels, calibrated
+
+    pixels = np.array(blot_pixels())
+    pixels[:30] = 10000
+    pixels[490:] = 10000
+    b = calibrated(tmp_path, pixels=pixels)
+    ops.edit_arena(b.session, area_on(b.session, b.blot), outline=(0, 30, 1330, 490))
+    protein = add(b)
+    taken: list[float] = []
+    along = ops.rowdetect.detect_row_along
+
+    def spy(gray, given, n, *, background, **kwargs):
+        taken.append(background)
+        return along(gray, given, n, background=background, **kwargs)
+
+    monkeypatch.setattr(ops.rowdetect, "detect_row_along", spy)
+    ops.detect_mw_row(b.session, protein)
+    level = float(np.median(pixels[30:490]))
+    assert taken == [level]
+    assert level > b.session.project.batch.find_image(b.blot).background
+
+
+def test_a_drawn_area_s_median_is_worked_out_once_per_operation(tmp_path, monkeypatch):
+    # However many of its reads look past an outline, an operation works out
+    # the area's median once: a seed click on a turned strip (its growth and
+    # what it reads past the outline), a row whose box crosses the outline,
+    # and two reads of a row's in one operation. A ruler's ticks work none
+    # out (a ladder reads past the outline at the image's median), nor does
+    # an area over the whole image.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    top, _ = drawn_strips(s, image)
+    area = area_on(s, image)
+    ops.edit_arena(s, area, angle_deg=2.0)
+    worked: list[str] = []
+    real = ops._area_median
+
+    def counted(arena, *args, **kwargs):
+        worked.append(arena.id)
+        return real(arena, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "_area_median", counted)
+    ops.place_box(s, top, 100, 24, lane_index=1, grow=True)
+    assert worked == [area]
+    ops.detect_row_boxes(s, top, (10, 10, 190, 52))
+    assert worked == [area] * 2
+    ops.snap_ladder(s, area, 100.0, [22.0, 44.0])
+    assert worked == [area] * 2
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area)[1]
+    with s.transaction():
+        for calibration in (False, True, False):
+            ops._detector_pixels(s, ref, arena, (0, 0, 200, 100), calibration=calibration)
+    assert worked == [area] * 3
+    # A whole-image area: none.
+    whole = import_blot(s, pixels[:50], "one level µ.tif")
+    alone = ops.add_protein(s, "cut", Role.TARGET, whole)
+    ops.place_box(s, alone, 100, 24, lane_index=1, grow=True)
+    ops.detect_row_boxes(s, alone, STRIP_ROW)
+    ops.snap_ladder(s, whole, 100.0, [22.0, 44.0])
+    assert worked == [area] * 3
+
+
+def test_a_commit_drops_the_medians_worked_out_before_it(tmp_path):
+    # As the mean arrays a ladder read (#206), the area medians a row or a
+    # seed click took are kept within an operation only: a commit inside it
+    # drops those worked out for the project before it, and its end the rest.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    drawn_strips(s, image)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+    assert s._area_medians is None
+    with s.transaction():
+        ops._area_level(s, ref, arena)
+        assert len(s._area_medians) == 1
+        ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM")])  # a commit
+        assert s._area_medians == {}
+        ops._area_level(s, ref, arena)
+        assert len(s._area_medians) == 1
+    assert s._area_medians is None
+
+
+def test_an_unturned_area_s_median_reads_no_mask(tmp_path, monkeypatch):
+    # Every pixel of an unturned outline's bounds lies inside it, past the
+    # image's edge too: its median is of them all, with no mask worked out,
+    # as each detection on the area now works it out (#254); a turned
+    # outline's takes the mask, and the median of the pixels it holds.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    drawn_strips(s, image)
+    area = area_on(s, image)
+    masks: list[tuple] = []
+    real = ops._inside_mask
+
+    def counted(arena, ref, window):
+        masks.append(window)
+        return real(arena, ref, window)
+
+    monkeypatch.setattr(ops, "_inside_mask", counted)
+    for outline in ((0, 0, 200, 50), (-20, -10, 220, 50)):
+        ops.edit_arena(s, area, outline=outline)
+        batch = s.project.batch
+        ref, arena = batch.find_image(image), batch.find_arena(area)[1]
+        masks.clear()
+        assert ops._area_median(arena, ref, s.pixels(image)) == float(np.median(pixels[:50]))
+        assert masks == []
+    ops.edit_arena(s, area, outline=(0, 0, 200, 50), angle_deg=2.0)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area)[1]
+    held = real(arena, ref, (0, 0, 200, 100))
+    masks.clear()
+    assert ops._area_median(arena, ref, s.pixels(image)) == float(np.median(pixels[held]))
+    assert masks == [ops._bounds_on(arena, ref)]
+
+
+def test_a_whole_image_area_is_detected_with_its_stored_median(tmp_path, monkeypatch):
+    # An image of one membrane is detected as before #254: a seed click grows
+    # from, and a row's detector takes, the median stored with the image,
+    # which no pixel is read again for, even one planted apart from its
+    # pixels' (39984); and a ladder's reads take the pixels as stored.
+    s = session_on(tmp_path)
+    image = import_blot(s, two_level_strips()[:50], "one level µ.tif")
+    ops.set_lanes(s, [LaneInput("vehicle"), LaneInput("10 µM"), LaneInput("50 µM")])
+    protein = ops.add_protein(s, "β-catenin", Role.TARGET, image)
+    assert s.project.batch.find_image(image).background == 39984.0
+
+    def stored(draft: Project) -> None:
+        draft.batch.find_image(image).background = 39000.5
+
+    plant(s, stored)
+    taken: list[tuple[str, float]] = []
+    grow_box, detect_row = ops.grow_box, ops.rowdetect.detect_row
+
+    def grown(gray, seed, background, **kwargs):
+        taken.append(("seed", background))
+        return grow_box(gray, seed, background, **kwargs)
+
+    def row(gray, given, n, *, background, **kwargs):
+        taken.append(("row", background))
+        return detect_row(gray, given, n, background=background, **kwargs)
+
+    def no_median(*args, **kwargs):
+        raise AssertionError("a median worked out for a whole-image area")
+
+    monkeypatch.setattr(ops, "grow_box", grown)
+    monkeypatch.setattr(ops.rowdetect, "detect_row", row)
+    monkeypatch.setattr(ops, "estimate_background", no_median)
+    ops.place_box(s, protein, 100, 24, lane_index=1, grow=True)
+    ops.detect_row_boxes(s, protein, STRIP_ROW)
+    assert taken == [("seed", 39000.5), ("row", 39000.5)]
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+    stored_pixels = s.pixels(image)
+    assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 50), calibration=True) is stored_pixels
+
+
+def test_two_areas_in_one_operation_take_their_own_medians(tmp_path):
+    # Each drawn area's median is kept under its own name within an
+    # operation: the two strips' levels, read one after the other, are each
+    # their strip's.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    drawn_strips(s, image)
+    batch = s.project.batch
+    ref = batch.find_image(image)
+    top, bottom = (batch.find_arena(area_on(s, image, n))[1] for n in (1, 2))
+    with s.transaction():
+        levels = [ops._area_level(s, ref, top), ops._area_level(s, ref, bottom)]
+    assert levels == [float(np.median(pixels[:50])), float(np.median(pixels[50:]))]
+
+
+def test_reading_the_project_again_drops_the_medians_of_an_operation(tmp_path):
+    # A project.json read again (#101) holds other content: nothing worked out
+    # for the project before it is kept, inside an operation too.
+    from proteia.core.model import Channel
+    from test_channels import import_pixels
+
+    green = two_level_strips()
+    rgb = np.dstack([green // 2 + 20000, green, np.full_like(green, 1000)])
+    s = session_on(tmp_path)
+    image = import_pixels(s, rgb, "two levels µ.tif", DARK)
+    ops.set_channel(s, image, Channel.GREEN)
+    drawn_strips(s, image)
+    ops.save(s)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+
+    def other(draft: Project) -> None:
+        draft.batch.find_image(image).background = 1.0
+
+    edited, _ = apply_change(s.project, other)
+    with s.transaction():
+        ops._area_level(s, ref, arena)
+        ops._detector_pixels(s, ref, arena, (0, 0, 200, 100), calibration=True)
+        assert s._area_medians and s._calibration_medians and s._calibration_reads
+        (s.folder / storage.PROJECT_FILE).write_bytes(storage.project_to_json(edited))
+        assert s.reload()
+        assert (s._area_medians, s._calibration_medians, list(s._calibration_reads)) == (
+            {},
+            {},
+            [],
+        )
+
+
+# --- Refusals on an outline drawn close to the bands (#264 review) ---
+
+# Six wide bands of mixed strength on one row, at y 40 of a 220x80 membrane.
+WIDE_LANES = tuple(20 + 33 * i for i in range(6))
+# The step a refusal on a drawn area adds, as the user reads it.
+OUTLINE_STEP = (
+    "this membrane area's outline may be drawn too close to the bands, so its membrane level"
+    " is taken from them: redraw the outline with some membrane above and below the bands"
+)
+
+
+def wide_bands(seed: int = 3) -> np.ndarray:
+    """220x80 at 40000, with six bands 11 px wide (1/e) at y 40, strong and
+    weak in turn; noise of SD 100; every pixel even."""
+    y, x = np.mgrid[0:80, 0:220].astype(float)
+    image = np.full(y.shape, 40000.0)
+    depths = (20000.0, 6000.0, 20000.0, 9000.0, 20000.0, 4000.0)
+    for cx, depth in zip(WIDE_LANES, depths, strict=True):
+        image -= depth * np.exp(-(((x - cx) / 11.0) ** 2) - ((y - 40) / 3.0) ** 2)
+    image += np.random.default_rng(seed).normal(0.0, 100.0, image.shape)
+    return (2 * np.round(image / 2)).astype(np.uint16)
+
+
+def wide_bands_drawn(tmp_path: Path, outline):
+    """:func:`wide_bands` imported with six lanes, its area drawn at
+    ``outline`` with a target on it, and the pixels inside it cut out and
+    imported with a target of their own: the session, the area, the two
+    targets (drawn, cut out)."""
+    pixels = wide_bands()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "wide bands µ.tif")
+    ops.set_lanes(s, [LaneInput(f"c{i} µ") for i in range(6)])
+    area = area_on(s, image)
+    ops.edit_arena(s, area, outline=outline)
+    drawn = ops.add_protein(s, "β-catenin", Role.TARGET, arena_id=area)
+    x0, y0, x1, y1 = outline
+    cut = import_blot(s, pixels[y0:y1, x0:x1], "cut µ.tif")
+    alone = ops.add_protein(s, "cut β", Role.TARGET, cut)
+    return s, area, drawn, alone
+
+
+def test_a_row_refused_on_an_outline_close_to_the_bands_says_to_redraw_it(tmp_path):
+    # An outline drawn close to a row of wide bands: they are much of its
+    # pixels, and so pull its median, the membrane level a row takes there
+    # (#254), toward them, as the bands cut out there store it. The row is
+    # refused as on the cut-out, whose words stay as they were; on the drawn
+    # area they say why and to redraw the outline, and done as they read,
+    # the same row is placed in every lane.
+    s, area, drawn, alone = wide_bands_drawn(tmp_path, (0, 35, 220, 46))
+    words = (
+        "the row box does not show which lane each band is in; draw it over every declared"
+        " lane, empty end lanes included, or place the boxes by clicking"
+    )
+    cut = refused(
+        lambda: ops.detect_row_boxes(s, alone, (5, 0, 215, 11)), ErrorCode.ROW_LANES_UNCLEAR
+    )
+    assert str(cut) == words and "outline_step" not in cut.detail
+    error = refused(
+        lambda: ops.detect_row_boxes(s, drawn, (5, 35, 215, 46)), ErrorCode.ROW_LANES_UNCLEAR
+    )
+    assert str(error) == f"{words}; {OUTLINE_STEP}"
+    assert error.detail["outline_step"] == OUTLINE_STEP
+    assert error.detail["cause"] == cut.detail["cause"]
+    ops.edit_arena(s, area, outline=(0, 30, 220, 51))
+    assert all(ops.detect_row_boxes(s, drawn, (5, 35, 215, 46)).band_ids)
+
+
+def test_a_seed_click_refused_on_an_outline_close_to_the_bands_says_to_redraw_it(tmp_path):
+    # The same for a click on a weak band: refused as on the cut-out, whose
+    # words stay as they were, and on the drawn area with the step to redraw
+    # the outline, for the page too (detail); redrawn, the same click grows
+    # the band.
+    s, area, drawn, alone = wide_bands_drawn(tmp_path, (0, 34, 220, 47))
+    cut = refused(
+        lambda: ops.place_box(s, alone, 53, 6, lane_index=1, grow=True), ErrorCode.NO_BAND_FOUND
+    )
+    assert (str(cut), cut.detail) == ("no band found at (53, 6)", None)
+    error = refused(
+        lambda: ops.place_box(s, drawn, 53, 40, lane_index=1, grow=True), ErrorCode.NO_BAND_FOUND
+    )
+    assert (str(error), error.detail) == (
+        f"no band found at (53, 40); {OUTLINE_STEP}",
+        {"outline_step": OUTLINE_STEP},
+    )
+    ops.edit_arena(s, area, outline=(0, 30, 220, 51))
+    band = ops.place_box(s, drawn, 53, 40, lane_index=1, grow=True)
+    x0, y0, x1, y1 = s.project.batch.find_band(band)[1].box.rect(
+        s.project.batch.boxes_of(s.project.batch.find_protein(drawn)).box_size
+    )
+    assert x0 <= 53 < x1 and y0 <= 40 < y1

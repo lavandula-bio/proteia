@@ -101,7 +101,7 @@ import re
 import threading
 import zlib
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
@@ -715,6 +715,10 @@ class ProjectSession:
         # Their medians, worked out when a ladder read masks a pixel with one
         # (calibration_background); kept and dropped with them.
         self._calibration_medians: dict[str, float] | None = None
+        # The medians of drawn membrane areas that a row and a seed click read
+        # past their outlines (area_background, #254), by the key its caller
+        # gives; kept and dropped with the mean arrays.
+        self._area_medians: dict[Hashable, float] | None = None
         # (image id, SHA-256) -> how its stored file holds colour (file_colours).
         self._file_colours: dict[tuple[str, str], FileColours | None] = {}
         # (image id, SHA-256) -> what its stored file's header says of reading it
@@ -849,6 +853,23 @@ class ProjectSession:
             level = estimate_background(self.calibration_pixels(image_id))
             if medians is not None:
                 medians[image_id] = level
+            return level
+
+    def area_background(self, key: Hashable, work_out: Callable[[], float]) -> float:
+        """The median of a drawn membrane area that a row and a seed click
+        read past its outline and take for its membrane (#254,
+        :func:`~proteia.core.operations._area_level`): ``work_out()``, kept
+        under ``key``, which names the image, the area as drawn and the
+        channel read, until the operation commits or ends
+        (:meth:`transaction`), however many reads take it, and not kept after
+        it; outside an operation, worked out each time."""
+        with self.lock:
+            medians = self._area_medians
+            if medians is not None and key in medians:
+                return medians[key]
+            level = work_out()
+            if medians is not None:
+                medians[key] = level
             return level
 
     def channel_array(self, image_id: str, channel: Channel) -> np.ndarray:
@@ -1256,6 +1277,8 @@ class ProjectSession:
                 self._calibration_reads.clear()
             if self._calibration_medians:
                 self._calibration_medians.clear()
+            if self._area_medians:
+                self._area_medians.clear()
             # The history moves with the commit, before the hook saves (and so
             # deletes the files no state references any more).
             if move is _Move.PUSH:
@@ -1294,15 +1317,17 @@ class ProjectSession:
         """Run one operation under the lock. If it is refused (``OperationError``
         or ``LookupError``) before anything was committed, the pixel cache is put
         back as it was, even if the operation read pixels first. The mean
-        arrays its ladder work read (:meth:`calibration_pixels`) go when it
-        ends, however it ends; an operation run inside another keeps them for
-        the outer one."""
+        arrays its ladder work read (:meth:`calibration_pixels`), and the
+        medians of drawn areas its rows and seed clicks took
+        (:meth:`area_background`), go when it ends, however it ends; an
+        operation run inside another keeps them for the outer one."""
         with self.lock:
             project, cached = self._project, dict(self._pixels)
             outermost = self._calibration_reads is None
             if outermost:
                 self._calibration_reads = {}
                 self._calibration_medians = {}
+                self._area_medians = {}
             try:
                 yield
             except (OperationError, LookupError):
@@ -1313,6 +1338,7 @@ class ProjectSession:
                 if outermost:
                     self._calibration_reads = None
                     self._calibration_medians = None
+                    self._area_medians = None
 
     def _opening_state(self) -> _State:
         """The committed project as the state the session's history begins with.
@@ -1452,6 +1478,10 @@ class ProjectSession:
         self._saved_files = _referenced_files(project)
         self._known.update(name.lower() for name in self._saved_files)
         self._pixels = {}
+        # What an operation it may run inside read of the project before it.
+        for kept in (self._calibration_reads, self._calibration_medians, self._area_medians):
+            if kept:
+                kept.clear()
         self._states, self._cursor = [], -1
         self._steps = (None, None)
         self.dirty, self.save_error = False, None

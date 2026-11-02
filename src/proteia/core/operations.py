@@ -80,7 +80,9 @@ areas (:func:`set_marker_image` makes them equal). A box, a not-detected
 record and a calibration point belong to the one area holding its centre, so
 the operations that place or move them refuse one outside its area
 (``OUT_OF_ARENA``) or in two (``IN_TWO_ARENAS``). A row is detected on a copy
-of the pixels in which its area alone shows (:func:`_detector_pixels`), lanes are
+of the pixels in which its area alone shows (:func:`_detector_pixels`), and a
+row and a seed click take a drawn area's own median for its membrane
+(:func:`_area_level`, #254), as on the image cut out there; lanes are
 proposed and rows checked from the boxes of the same area, or of the image
 while the area holds none (:func:`~proteia.core.project.lane_anchors`), and
 redrawing an area to cut it in two hands the rows past the cut to a new
@@ -1119,10 +1121,62 @@ def _area_median(
     (:func:`~proteia.core.quantify.estimate_background`, as
     ``ImageRef.background``), so the same pixels give the same level either
     way (#243). It reads the area's bounds alone, so it costs the area's
-    size."""
+    size; where it holds every pixel of them (an outline not turned), with
+    no mask (#254: every detection on the area works it out)."""
     x0, y0, x1, y1 = window = _bounds_on(area, image)
-    inside = _inside_mask(area, image, window) if outside is None else ~outside[y0:y1, x0:x1]
+    if outside is not None:
+        inside = ~outside[y0:y1, x0:x1]
+    elif _holds_window(cast(AreaFrame, area.frame()), window):
+        inside = None
+    else:
+        inside = _inside_mask(area, image, window)
     return estimate_background(array[y0:y1, x0:x1], inside)
+
+
+def _area_level(session: ProjectSession, image: ImageRef, area: Arena) -> float:
+    """The level a row and a seed click take for the membrane of ``area`` on
+    ``image`` (#254), on the channel the image is measured on, and read past
+    its outline: on a drawn outline, the median of the area's pixels
+    (:func:`_area_median`), the level the image cut out there would store, so
+    a strip is detected as the same strip cropped and imported, worked out
+    once per operation however many reads take it
+    (:meth:`~proteia.core.session.ProjectSession.area_background`); on an
+    area over the whole image, the image's stored median
+    (``ImageRef.background``), reading no pixel, as before #254, so an image
+    of one membrane is detected as it was."""
+    if area.outline is None:
+        return image.background
+    array = session.pixels(image.id)
+    return session.area_background(
+        (image.id, area_key(area), image.measured_channel),
+        lambda: _area_median(area, image, array),
+    )
+
+
+# The step a refused seed click or row adds on a drawn membrane area (#254):
+# the membrane level there is the area's median (_area_level), which an
+# outline drawn close to the bands takes from the bands, as the image cut out
+# there would store it. Carried in the refusal's detail (``outline_step``) for
+# the page, which words a seed click's refusal its own way.
+_OUTLINE_STEP: Final = (
+    "this membrane area's outline may be drawn too close to the bands, so its membrane level"
+    " is taken from them: redraw the outline with some membrane above and below the bands"
+)
+
+
+def _on_drawn_area(refusal: OperationError, area: Arena) -> OperationError:
+    """``refusal``, of a seed click or of a row by what its detector saw, on
+    ``area``: on a drawn outline with the step to redraw it
+    (:data:`_OUTLINE_STEP`) after its own words and in its ``detail``; on an
+    area over the whole image as it is, word for word."""
+    if area.outline is None:
+        return refusal
+    return OperationError(
+        refusal.code,
+        f"{refusal}; {_OUTLINE_STEP}",
+        ids=refusal.ids,
+        detail={**(refusal.detail or {}), "outline_step": _OUTLINE_STEP},
+    )
 
 
 def _detector_pixels(
@@ -1136,14 +1190,22 @@ def _detector_pixels(
     """The pixels a detector reads in ``window`` of ``image`` for the
     membrane ``area``: the one way every detector reads them (a row, a seed
     click, a ladder search, a snap; :func:`_shown`), so that each reads the
-    area alone. A row and a seed click read the channel the image is measured
-    on; a ladder's reads (``calibration``) the mean of its colours, as every
-    molecular-weight read does (#206), off the area at the mean's own median
-    (:meth:`~proteia.core.session.ProjectSession.calibration_background`, asked
-    for only when a pixel is masked). Quantification reads the stored pixels
-    instead."""
+    area alone, every pixel past a drawn outline at a level asked for only
+    when a pixel is masked. A row and a seed click read the channel the image
+    is measured on, past the outline at the area's own median
+    (:func:`_area_level`, #254), the level the image cut out there would
+    store. A ladder's reads (``calibration``) read the mean of its colours,
+    as every molecular-weight read does (#206), past the outline at the
+    mean's median over the whole image
+    (:meth:`~proteia.core.session.ProjectSession.calibration_background`),
+    as before #254: the area's own median there, flat beside the outline
+    where the strip cut out would end, made a tick near the outline, or a
+    ladder's search down its lane, find peaks there more often (#254).
+    Quantification reads the stored pixels instead."""
     if not calibration:
-        return _shown(session.pixels(image.id), image, area, window, lambda: image.background)
+        return _shown(
+            session.pixels(image.id), image, area, window, lambda: _area_level(session, image, area)
+        )
     return _shown(
         session.calibration_pixels(image.id),
         image,
@@ -5690,7 +5752,8 @@ def place_box(
     rects = [band.box.rect(own.box_size) for band in own.bands]
     if grow:
         # The band grows within the area alone (#243): on the area's bounds,
-        # as the area shows them, which for the whole image is the image.
+        # as the area shows them, which for the whole image is the image;
+        # from the area's own level (#254), on the whole image its stored one.
         bx0, by0, bx1, by1 = arena.bounds(image)
         bx0, by0, bx1, by1 = max(0, bx0), max(0, by0), min(width, bx1), min(height, by1)
         shown = _detector_pixels(session, image, arena, (bx0, by0, bx1, by1))
@@ -5698,13 +5761,15 @@ def place_box(
         found = grow_box(
             shown[by0:by1, bx0:bx1],
             (x - bx0, y - by0),
-            image.background,
+            _area_level(session, image, arena),
             rel_threshold=REL_THRESHOLD,
             noise_k=NOISE_K,
             dark_on_light=image.polarity.dark_on_light,
         )
         if found is None:
-            raise OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})")
+            raise _on_drawn_area(
+                OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})"), arena
+            )
         grown = (found[0] + bx0, found[1] + by0, found[2] + bx0, found[3] + by0)
         try:
             size, resized, rect = boxes.grow_to_fit(
@@ -7095,9 +7160,11 @@ def _place_row(
     On a drawn membrane area (#243) the row reads only that area: the
     detector is given a copy of the pixels in which every pixel of the row,
     and of the ``reach`` rows above and below it that a row along a line may
-    read, whose centre lies outside the area is the image's stored background
+    read, whose centre lies outside the area is the area's own median
     (:func:`_detector_pixels`), so a row dragged over a turned strip finds no band of
-    the next strip; quantification still reads the pixels as stored. A row
+    the next strip; quantification still reads the pixels as stored. The
+    detector takes that median for the membrane too (:func:`_area_level`,
+    #254), where an area over the whole image gives the image's stored one. A row
     box that does not meet the area's bounds is refused before anything is
     detected, and a box the row would place (or a survivor it would resize)
     centred outside the area, or a lane's not-detected slot centred outside
@@ -7160,7 +7227,7 @@ def _place_row(
             seen,
             given,
             n,
-            background=image.background,
+            background=_area_level(session, image, arena),
             dark_on_light=image.polarity.dark_on_light,
             right_to_left=right_to_left,
             saturated_at=saturated_at,
@@ -7169,7 +7236,7 @@ def _place_row(
         ids = (image.id,) if exc.code == "invalid_image" else ()
         raise OperationError(_ROW_ERRORS[exc.code], str(exc), ids=ids) from exc
     if found.refused or found.size is None:
-        raise _row_refusal(found, max(0, given[0]), min(width, given[2]), mw)
+        raise _on_drawn_area(_row_refusal(found, max(0, given[0]), min(width, given[2]), mw), arena)
 
     # Band index 0, per lane: a box edited by hand stays, and so does one the
     # user placed where no band was found; any other gives way.

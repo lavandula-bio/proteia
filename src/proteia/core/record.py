@@ -173,7 +173,8 @@ def settings() -> dict[str, JsonValue]:
         "chart_png_dpi": export.CHART_PNG_DPI,
         # What detect_row_boxes runs: rowdetect.detect_row with these settings
         # and its default size rule; the image gives the rest (its background,
-        # polarity, the lanes' direction) and the saturation level, chosen as
+        # on a drawn membrane area that area's median, #254; its polarity, the
+        # lanes' direction) and the saturation level, chosen as
         # "saturated_at" says. Each commit's log entry keeps the level it used.
         "detect_row": {
             **rowdetect.settings(),
