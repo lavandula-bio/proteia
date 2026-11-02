@@ -1478,6 +1478,10 @@ class ProjectSession:
         self._saved_files = _referenced_files(project)
         self._known.update(name.lower() for name in self._saved_files)
         self._pixels = {}
+        # What an operation it may run inside read of the project before it.
+        for kept in (self._calibration_reads, self._calibration_medians, self._area_medians):
+            if kept:
+                kept.clear()
         self._states, self._cursor = [], -1
         self._steps = (None, None)
         self.dirty, self.save_error = False, None

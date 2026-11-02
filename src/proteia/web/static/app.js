@@ -2168,9 +2168,15 @@ async function placeBox(x, y, options, laneIndex, proteinId) {
       const retry = (lane) => placeBox(x, y, options, lane, proteinId);
       askLane(why, proteinId, retry, clientX, clientY);
     } else if (error.code === "no_band_found") {
+      // On a drawn membrane area the server says why a click on a band may
+      // find none there, and what to redraw (#254).
+      const outline = error.detail && error.detail.outline_step;
       showStatus(
-        "No band found where you clicked. Click on a band, or Shift+click to place a box" +
-          " of the protein's box size.",
+        outline
+          ? `No band found where you clicked: ${sentence(outline)} Or Shift+click to place a` +
+              " box of the protein's box size."
+          : "No band found where you clicked. Click on a band, or Shift+click to place a box" +
+              " of the protein's box size.",
       );
     } else if (error.code === "overlap") {
       showBoxRefusal(error, "Box not placed", "click again");

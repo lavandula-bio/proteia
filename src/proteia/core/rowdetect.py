@@ -23,9 +23,10 @@ Contract:
   shifts every rect by exactly ``(dx, dy)``.
 * Deterministic: no randomness, and the robust fits use a fixed-stride subsample.
 * Polarity is applied once. Detection measures its own local background (a
-  plane over the row's band-free pixels); the stored background is only
-  compared with it (``bg_offset``), never subtracted, so a stored net keeps
-  ``image.background``.
+  plane over the row's band-free pixels); the membrane's stored level (the
+  image's background, or on a drawn membrane area that area's median, #254)
+  is only compared with it (``bg_offset``), never subtracted from a stored
+  net.
 * When the bands do not show which lane each is in, the result carries a
   refusing flag (:data:`REFUSING_FLAGS`) and the caller must propose nothing.
 
@@ -317,8 +318,8 @@ class RowDetectError(ValueError):
     * ``invalid_row``: ``n_lanes`` not a positive int, or the row not four
       ints with ``x0 < x1`` and ``y0 < y1``;
     * ``invalid_image``: the image is at fault: the array not 2-D, the row
-      holding non-finite pixel values, or ``background`` (the image's) not a
-      finite real number;
+      holding non-finite pixel values, or ``background`` (the membrane's
+      stored level) not a finite real number;
     * ``row_outside_image``: nothing of the row is left after clipping it to
       the image;
     * ``row_too_small``: the clipped row is narrower than :data:`MIN_BOX` px per

@@ -1153,6 +1153,32 @@ def _area_level(session: ProjectSession, image: ImageRef, area: Arena) -> float:
     )
 
 
+# The step a refused seed click or row adds on a drawn membrane area (#254):
+# the membrane level there is the area's median (_area_level), which an
+# outline drawn close to the bands takes from the bands, as the image cut out
+# there would store it. Carried in the refusal's detail (``outline_step``) for
+# the page, which words a seed click's refusal its own way.
+_OUTLINE_STEP: Final = (
+    "this membrane area's outline may be drawn too close to the bands, so its membrane level"
+    " is taken from them: redraw the outline with some membrane above and below the bands"
+)
+
+
+def _on_drawn_area(refusal: OperationError, area: Arena) -> OperationError:
+    """``refusal``, of a seed click or of a row by what its detector saw, on
+    ``area``: on a drawn outline with the step to redraw it
+    (:data:`_OUTLINE_STEP`) after its own words and in its ``detail``; on an
+    area over the whole image as it is, word for word."""
+    if area.outline is None:
+        return refusal
+    return OperationError(
+        refusal.code,
+        f"{refusal}; {_OUTLINE_STEP}",
+        ids=refusal.ids,
+        detail={**(refusal.detail or {}), "outline_step": _OUTLINE_STEP},
+    )
+
+
 def _detector_pixels(
     session: ProjectSession,
     image: ImageRef,
@@ -5741,7 +5767,9 @@ def place_box(
             dark_on_light=image.polarity.dark_on_light,
         )
         if found is None:
-            raise OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})")
+            raise _on_drawn_area(
+                OperationError(ErrorCode.NO_BAND_FOUND, f"no band found at ({x}, {y})"), arena
+            )
         grown = (found[0] + bx0, found[1] + by0, found[2] + bx0, found[3] + by0)
         try:
             size, resized, rect = boxes.grow_to_fit(
@@ -7208,7 +7236,7 @@ def _place_row(
         ids = (image.id,) if exc.code == "invalid_image" else ()
         raise OperationError(_ROW_ERRORS[exc.code], str(exc), ids=ids) from exc
     if found.refused or found.size is None:
-        raise _row_refusal(found, max(0, given[0]), min(width, given[2]), mw)
+        raise _on_drawn_area(_row_refusal(found, max(0, given[0]), min(width, given[2]), mw), arena)
 
     # Band index 0, per lane: a box edited by hand stays, and so does one the
     # user placed where no band was found; any other gives way.

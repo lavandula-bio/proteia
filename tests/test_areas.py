@@ -3340,3 +3340,144 @@ def test_a_whole_image_area_is_detected_with_its_stored_median(tmp_path, monkeyp
     ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
     stored_pixels = s.pixels(image)
     assert ops._detector_pixels(s, ref, arena, (0, 0, 200, 50), calibration=True) is stored_pixels
+
+
+def test_two_areas_in_one_operation_take_their_own_medians(tmp_path):
+    # Each drawn area's median is kept under its own name within an
+    # operation: the two strips' levels, read one after the other, are each
+    # their strip's.
+    pixels = two_level_strips()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "two levels µ.tif")
+    drawn_strips(s, image)
+    batch = s.project.batch
+    ref = batch.find_image(image)
+    top, bottom = (batch.find_arena(area_on(s, image, n))[1] for n in (1, 2))
+    with s.transaction():
+        levels = [ops._area_level(s, ref, top), ops._area_level(s, ref, bottom)]
+    assert levels == [float(np.median(pixels[:50])), float(np.median(pixels[50:]))]
+
+
+def test_reading_the_project_again_drops_the_medians_of_an_operation(tmp_path):
+    # A project.json read again (#101) holds other content: nothing worked out
+    # for the project before it is kept, inside an operation too.
+    from proteia.core.model import Channel
+    from test_channels import import_pixels
+
+    green = two_level_strips()
+    rgb = np.dstack([green // 2 + 20000, green, np.full_like(green, 1000)])
+    s = session_on(tmp_path)
+    image = import_pixels(s, rgb, "two levels µ.tif", DARK)
+    ops.set_channel(s, image, Channel.GREEN)
+    drawn_strips(s, image)
+    ops.save(s)
+    batch = s.project.batch
+    ref, arena = batch.find_image(image), batch.find_arena(area_on(s, image))[1]
+
+    def other(draft: Project) -> None:
+        draft.batch.find_image(image).background = 1.0
+
+    edited, _ = apply_change(s.project, other)
+    with s.transaction():
+        ops._area_level(s, ref, arena)
+        ops._detector_pixels(s, ref, arena, (0, 0, 200, 100), calibration=True)
+        assert s._area_medians and s._calibration_medians and s._calibration_reads
+        (s.folder / storage.PROJECT_FILE).write_bytes(storage.project_to_json(edited))
+        assert s.reload()
+        assert (s._area_medians, s._calibration_medians, list(s._calibration_reads)) == (
+            {},
+            {},
+            [],
+        )
+
+
+# --- Refusals on an outline drawn close to the bands (#264 review) ---
+
+# Six wide bands of mixed strength on one row, at y 40 of a 220x80 membrane.
+WIDE_LANES = tuple(20 + 33 * i for i in range(6))
+# The step a refusal on a drawn area adds, as the user reads it.
+OUTLINE_STEP = (
+    "this membrane area's outline may be drawn too close to the bands, so its membrane level"
+    " is taken from them: redraw the outline with some membrane above and below the bands"
+)
+
+
+def wide_bands(seed: int = 3) -> np.ndarray:
+    """220x80 at 40000, with six bands 11 px wide (1/e) at y 40, strong and
+    weak in turn; noise of SD 100; every pixel even."""
+    y, x = np.mgrid[0:80, 0:220].astype(float)
+    image = np.full(y.shape, 40000.0)
+    depths = (20000.0, 6000.0, 20000.0, 9000.0, 20000.0, 4000.0)
+    for cx, depth in zip(WIDE_LANES, depths, strict=True):
+        image -= depth * np.exp(-(((x - cx) / 11.0) ** 2) - ((y - 40) / 3.0) ** 2)
+    image += np.random.default_rng(seed).normal(0.0, 100.0, image.shape)
+    return (2 * np.round(image / 2)).astype(np.uint16)
+
+
+def wide_bands_drawn(tmp_path: Path, outline):
+    """:func:`wide_bands` imported with six lanes, its area drawn at
+    ``outline`` with a target on it, and the pixels inside it cut out and
+    imported with a target of their own: the session, the area, the two
+    targets (drawn, cut out)."""
+    pixels = wide_bands()
+    s = session_on(tmp_path)
+    image = import_blot(s, pixels, "wide bands µ.tif")
+    ops.set_lanes(s, [LaneInput(f"c{i} µ") for i in range(6)])
+    area = area_on(s, image)
+    ops.edit_arena(s, area, outline=outline)
+    drawn = ops.add_protein(s, "β-catenin", Role.TARGET, arena_id=area)
+    x0, y0, x1, y1 = outline
+    cut = import_blot(s, pixels[y0:y1, x0:x1], "cut µ.tif")
+    alone = ops.add_protein(s, "cut β", Role.TARGET, cut)
+    return s, area, drawn, alone
+
+
+def test_a_row_refused_on_an_outline_close_to_the_bands_says_to_redraw_it(tmp_path):
+    # An outline drawn close to a row of wide bands: they are much of its
+    # pixels, and so pull its median, the membrane level a row takes there
+    # (#254), toward them, as the bands cut out there store it. The row is
+    # refused as on the cut-out, whose words stay as they were; on the drawn
+    # area they say why and to redraw the outline, and done as they read,
+    # the same row is placed in every lane.
+    s, area, drawn, alone = wide_bands_drawn(tmp_path, (0, 35, 220, 46))
+    words = (
+        "the row box does not show which lane each band is in; draw it over every declared"
+        " lane, empty end lanes included, or place the boxes by clicking"
+    )
+    cut = refused(
+        lambda: ops.detect_row_boxes(s, alone, (5, 0, 215, 11)), ErrorCode.ROW_LANES_UNCLEAR
+    )
+    assert str(cut) == words and "outline_step" not in cut.detail
+    error = refused(
+        lambda: ops.detect_row_boxes(s, drawn, (5, 35, 215, 46)), ErrorCode.ROW_LANES_UNCLEAR
+    )
+    assert str(error) == f"{words}; {OUTLINE_STEP}"
+    assert error.detail["outline_step"] == OUTLINE_STEP
+    assert error.detail["cause"] == cut.detail["cause"]
+    ops.edit_arena(s, area, outline=(0, 30, 220, 51))
+    assert all(ops.detect_row_boxes(s, drawn, (5, 35, 215, 46)).band_ids)
+
+
+def test_a_seed_click_refused_on_an_outline_close_to_the_bands_says_to_redraw_it(tmp_path):
+    # The same for a click on a weak band: refused as on the cut-out, whose
+    # words stay as they were, and on the drawn area with the step to redraw
+    # the outline, for the page too (detail); redrawn, the same click grows
+    # the band.
+    s, area, drawn, alone = wide_bands_drawn(tmp_path, (0, 34, 220, 47))
+    cut = refused(
+        lambda: ops.place_box(s, alone, 53, 6, lane_index=1, grow=True), ErrorCode.NO_BAND_FOUND
+    )
+    assert (str(cut), cut.detail) == ("no band found at (53, 6)", None)
+    error = refused(
+        lambda: ops.place_box(s, drawn, 53, 40, lane_index=1, grow=True), ErrorCode.NO_BAND_FOUND
+    )
+    assert (str(error), error.detail) == (
+        f"no band found at (53, 40); {OUTLINE_STEP}",
+        {"outline_step": OUTLINE_STEP},
+    )
+    ops.edit_arena(s, area, outline=(0, 30, 220, 51))
+    band = ops.place_box(s, drawn, 53, 40, lane_index=1, grow=True)
+    x0, y0, x1, y1 = s.project.batch.find_band(band)[1].box.rect(
+        s.project.batch.boxes_of(s.project.batch.find_protein(drawn)).box_size
+    )
+    assert x0 <= 53 < x1 and y0 <= 40 < y1
