@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The third-party notices of the Windows bundle (ADR 0003).
 
-``python notices.py BUNDLE --version VERSION [--out FILE] [--inno-license FILE]``
-writes ``BUNDLE/THIRD_PARTY_NOTICES.txt`` (or ``FILE``): what the bundle holds
-besides Proteia ``VERSION``, and every license text it needs:
+``python notices.py BUNDLE --version VERSION --manifest MANIFEST [--out FILE]
+[--inno-license FILE]`` writes ``BUNDLE/THIRD_PARTY_NOTICES.txt`` (or ``FILE``):
+what the bundle holds besides Proteia ``VERSION``, and every license text it
+needs:
 
 1. the Python runtime: the interpreter's own ``LICENSE.txt`` (the PSF license,
    the conditions for the Microsoft Distributable Code in a Windows build, and
@@ -11,7 +12,8 @@ besides Proteia ``VERSION``, and every license text it needs:
    (``licenses/cpython-X.Y-incorporated.txt``, with OpenSSL, expat, libffi, zlib
    and libmpdec) and liblzma (``licenses/xz-liblzma.txt``);
 2. the Visual C++ runtime DLLs, wherever they are in the bundle, each with where
-   it came from (the Python build or a package's wheel), under a pointer to
+   it came from (the Python build or a package's wheel, as the spec classified it
+   in ``MANIFEST``, its ``bundle-manifest.json``), under a pointer to
    Microsoft's terms for redistributing them;
 3. every Python package, from the metadata the spec copied into the bundle:
    name, version, license and every license file it carries (NumPy's, SciPy's
@@ -25,9 +27,9 @@ runtime and the packages it describes are that environment's. It audits the
 bundle first and exits 1, writing nothing, when an entry of ``_internal`` is
 accounted for by no package's ``RECORD``, the standard library or a runtime,
 when a package carries no license text (every file shipped needs a notice), or
-when a Visual C++ runtime file is neither the Python build's nor a package's own
-copy: one from the build machine's System32, which Microsoft lets only Visual
-Studio licensees redistribute, is never shipped (#54).
+when the spec did not classify a Visual C++ runtime file as the Python build's
+or a package's own copy: one from the build machine's System32, which Microsoft
+lets only Visual Studio licensees redistribute, is never shipped (#54).
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
-import os
+import json
 import platform
 import re
 import sys
@@ -183,78 +185,67 @@ def vc_runtime_files(root: Path) -> list[str]:
     ``msvcp140-<hash>.dll``), as ``bundle.VC_RUNTIME_COPIES`` names them."""
     return sorted(
         path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_file() and bundle.VC_RUNTIME_COPIES.match(path.name)
+        for path in root.rglob("*.dll", case_sensitive=False)
+        if path.is_file() and bundle.is_vc_runtime_copy(path.name)
     )
 
 
-def _same_file_in(folder: Path, file: Path) -> bool:
-    """Whether ``folder`` holds a file of ``file``'s name (in any case) with the
-    same bytes."""
-    try:
-        twin = next((p for p in folder.iterdir() if p.name.lower() == file.name.lower()), None)
-    except OSError:
-        return False
-    return twin is not None and twin.is_file() and twin.read_bytes() == file.read_bytes()
-
-
 class VcSource(NamedTuple):
-    """A Visual C++ runtime file in the bundle and where it came from."""
+    """A Visual C++ runtime file the bundle carries and where it came from."""
 
     name: str  # its path from the bundle folder
-    kind: str  # "wheel", "python", "system" or "unknown"
+    kind: bundle.VcKind  # the Python build's, or a package's wheel's
     text: str  # where it came from, as the notices say it
 
 
-# The kinds of source whose copies the bundle carries: a package's wheel and the
-# Python build. A file from System32, or of unknown source, is refused (#54).
-CARRIED_KINDS = frozenset({"wheel", "python"})
-
-
 def vc_runtime_sources(
-    root: Path,
-    files: Sequence[str],
-    packages: Sequence[Package],
-    python_dir: Path,
-    system_dir: Path,
-) -> list[VcSource]:
-    """Each of the Visual C++ runtime ``files`` (paths from ``root``) with where
-    it came from: a package's wheel (a folder of the package in ``_internal``),
-    the Python build (the same bytes in ``python_dir``, the interpreter's
-    folder), or the build machine's ``system_dir`` (System32, which the Visual
-    C++ Redistributable installs into and PyInstaller copies from)."""
-    owners = {name: p for p in packages for name in p.top_level}
-    sources = []
+    files: Sequence[str], classified: Sequence[bundle.VcRuntime], packages: Sequence[Package]
+) -> tuple[list[VcSource], list[str]]:
+    """Each of the Visual C++ runtime ``files`` (paths from the bundle folder) with
+    where it came from, as the spec classified it (``classified``, from the bundle
+    manifest): the Python build, or the wheel of the package whose ``RECORD``
+    lists the folder it came from. And why each other one cannot be covered: the
+    spec found it elsewhere (System32, which the Visual C++ Redistributable
+    installs into), did not classify it, or no package lists its folder (#54)."""
+    by_path = {vc.path.lower(): vc for vc in classified}
+    owners = {name.lower(): p for p in packages for name in p.top_level}
+    sources, problems = [], []
     for name in files:
-        parts = PurePosixPath(name).parts
-        owner = owners.get(parts[1]) if len(parts) > 2 and parts[0] == CONTENTS else None
-        if owner is not None:
-            kind, text = "wheel", f"from the {owner.name} {owner.version} wheel (section 3)"
-        elif _same_file_in(python_dir, root / name):
-            kind, text = "python", "from the Python runtime's Windows build (section 1)"
-        elif _same_file_in(system_dir, root / name):
-            kind, text = (
-                "system",
-                (
-                    "from the build machine's System32 folder, where the Visual C++"
-                    " Redistributable installs it; the Python build does not include it"
-                ),
+        vc = by_path.get(name.lower())
+        folder = (vc.folder or "").lower() if vc is not None else ""
+        if vc is None:
+            why = "the spec did not classify it"
+        elif vc.kind is bundle.VcKind.PYTHON:
+            text = "from the Python runtime's Windows build (section 1)"
+            sources.append(VcSource(name, vc.kind, text))
+            continue
+        elif vc.kind is bundle.VcKind.WHEEL and folder in owners:
+            owner = owners[folder]
+            text = f"from the {owner.name} {owner.version} wheel (section 3)"
+            sources.append(VcSource(name, vc.kind, text))
+            continue
+        elif vc.kind is bundle.VcKind.WHEEL:
+            why = (
+                f"from the package folder {vc.folder}, which no package's RECORD in the"
+                " bundle lists"
             )
         else:
-            kind, text = "unknown", "source not identified"
-        sources.append(VcSource(name, kind, text))
-    return sources
+            why = f"from {vc.source}, which is neither the Python build's folder nor a package's"
+        problems.append(
+            f"{name}: {why}; the bundle carries only the Python runtime's and the packages'"
+            " own copies of the Visual C++ runtime (#54)"
+        )
+    return sources, problems
 
 
-def foreign_vc_runtime(vc_files: Sequence[VcSource]) -> list[str]:
-    """The Visual C++ runtime files (as :func:`vc_runtime_sources` gives them)
-    that are neither the Python build's nor a package's own copy, each with why."""
-    return [
-        f"{entry.name}: {entry.text}; the bundle carries only the Python runtime's and the"
-        " packages' own copies of the Visual C++ runtime (#54)"
-        for entry in vc_files
-        if entry.kind not in CARRIED_KINDS
-    ]
+def read_manifest(path: Path) -> list[bundle.VcRuntime]:
+    """The classification of the Visual C++ runtime files that the bundle
+    manifest at ``path`` (the spec's ``bundle-manifest.json``) records;
+    ``NoticesError`` when it cannot be read."""
+    try:
+        return bundle.read_vc_runtime(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise NoticesError(f"the bundle manifest {path} cannot be read: {exc}") from exc
 
 
 def font_notes(contents: Path) -> tuple[list[str], list[tuple[str, str]]]:
@@ -475,18 +466,19 @@ def render(
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def generate(root: Path, proteia_version: str, inno_license: Path | None = None) -> str:
+def generate(
+    root: Path, proteia_version: str, manifest: Path, inno_license: Path | None = None
+) -> str:
     """The notices of the bundle folder ``root`` (``Proteia.exe`` and
-    ``_internal``), after its audit; ``NoticesError`` lists what failed it."""
+    ``_internal``) that the spec described in ``manifest``, after its audit;
+    ``NoticesError`` lists what failed it."""
     if inno_license is not None and not inno_license.is_file():
         raise NoticesError(f"Inno Setup's license was not found at {inno_license}")
+    classified = read_manifest(manifest)
     contents = root / CONTENTS
     packages = read_packages(contents)
-    system_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-    vc_files = vc_runtime_sources(
-        root, vc_runtime_files(root), packages, Path(sys.base_prefix), system_dir
-    )
-    problems = audit(contents, packages, sys.stdlib_module_names) + foreign_vc_runtime(vc_files)
+    vc_files, foreign = vc_runtime_sources(vc_runtime_files(root), classified, packages)
+    problems = audit(contents, packages, sys.stdlib_module_names) + foreign
     if problems:
         raise NoticesError("the bundle cannot be covered:\n  " + "\n  ".join(problems))
     return render(
@@ -505,11 +497,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("bundle", type=Path, help="the bundle folder (Proteia.exe, _internal)")
     parser.add_argument("--version", required=True, help="Proteia's version")
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="the spec's bundle-manifest.json, which classifies the Visual C++ runtime files",
+    )
     parser.add_argument("--out", type=Path, help=f"where to write (default: BUNDLE/{NOTICES_FILE})")
     parser.add_argument("--inno-license", type=Path, help="Inno Setup's license.txt")
     args = parser.parse_args(argv)
     try:
-        text = generate(args.bundle, args.version, args.inno_license)
+        text = generate(args.bundle, args.version, args.manifest, args.inno_license)
     except NoticesError as exc:
         print(f"notices: {exc}", file=sys.stderr)
         return 1

@@ -19,6 +19,10 @@ writes it to files only the current user can read, in the same folder:
   ``http://127.0.0.1:<port>/#token=<token>``. The launcher opens this file, not
   the URL, and the token rides in the URL fragment, which the browser never sends
   to a server. The page keeps it for its tab and sends it in a request header.
+  On Windows the file goes to the browser Windows names for web links (http),
+  not through the ``.html`` file association, which may be a program that never
+  follows the redirect (:mod:`proteia.web.browser`, #251). When it may not have
+  reached a browser, the console says why and which file to open by hand.
 
 Both files are removed as soon as the server begins to stop (Quit on the page,
 Ctrl+C, or a termination signal), before it closes its listening socket, and
@@ -100,7 +104,6 @@ import socket
 import sys
 import threading
 import time
-import webbrowser
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -112,8 +115,9 @@ import uvicorn
 
 import proteia
 from proteia.core.storage import write_atomic
-from proteia.web import cli, logs, projects
+from proteia.web import browser, cli, logs, projects
 from proteia.web.api import UnsavedChangesError, Workspace
+from proteia.web.browser import NotOpened
 from proteia.web.cli import CommandLine, ImageFile, RefusedPath
 from proteia.web.handoff import INCOMING_DIR
 from proteia.web.server import APP_ID, HANDOFF, HOST, TOKEN_PATTERN, create_app
@@ -151,7 +155,11 @@ _STOP_SIGNALS: Final = tuple(
     getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGBREAK") if hasattr(signal, name)
 )
 
-Opener = Callable[[str], object]  # webbrowser.open's shape: takes a URL
+# Takes the redirect page's file: URI (webbrowser.open's shape); answers a
+# NotOpened if the page may not have reached a browser (browser.open_page).
+Opener = Callable[[str], object]
+# The console's words for the file to open by hand.
+_BY_HAND: Final = "If no browser window opens, open this file in a browser:"
 
 _log = logging.getLogger(__name__)
 
@@ -163,12 +171,16 @@ class NotRespondingError(RuntimeError):
 class HandoffError(RuntimeError):
     """The running instance answered, but a launch's files were not handed to
     it: it is an older version that takes none (it was ``opened`` in the browser
-    all the same), it is stopping, or the connection failed. Files already
-    uploaded expire there, unoffered."""
+    all the same, ``unopened`` if the page may not have reached one), it is
+    stopping, or the connection failed. Files already uploaded expire there,
+    unoffered."""
 
-    def __init__(self, message: str, *, opened: bool = False) -> None:
+    def __init__(
+        self, message: str, *, opened: bool = False, unopened: NotOpened | None = None
+    ) -> None:
         super().__init__(message)
         self.opened = opened
+        self.unopened = unopened
 
 
 @dataclass(frozen=True)
@@ -178,12 +190,14 @@ class Opened:
     they joined the images another launch handed off a moment ago, whose tab
     shows them, so no tab was opened; ``waiting``: the files in that hand-off
     now. ``refused``: the paths not taken, by the command line's checks or by
-    the running instance."""
+    the running instance. ``unopened``: why the page it opened may not have
+    reached a browser (:func:`open_in_browser`), if it may not."""
 
     files: tuple[ImageFile, ...] = ()
     refused: tuple[RefusedPath, ...] = ()
     merged: bool = False
     waiting: int = 0
+    unopened: NotOpened | None = None
 
 
 def state_dir() -> Path:
@@ -297,12 +311,17 @@ def _redirect_page(url: str) -> bytes:
     ).encode()
 
 
-def open_in_browser(folder: Path, port: int, token: str, opener: Opener) -> Path:
-    """Write the redirect page for ``port`` and ``token`` and open it; return its path."""
+def open_in_browser(folder: Path, port: int, token: str, opener: Opener) -> NotOpened | None:
+    """Write the redirect page for ``port`` and ``token`` and open it with
+    ``opener``: what the opener said if the page may not have reached a
+    browser (also in the session log, whose words name no folder), else None."""
     path = folder / REDIRECT_FILE
     write_atomic(path, _redirect_page(app_url(port, token)), private=True)
-    opener(path.as_uri())
-    return path
+    said = opener(path.as_uri())
+    if not isinstance(said, NotOpened):
+        return None
+    _log.warning("the page may not have reached a browser: %s", said.reason, extra=logs.FILE_ONLY)
+    return said
 
 
 def bind_loopback() -> socket.socket:
@@ -406,6 +425,8 @@ class Instance:
         self.server = _server(app, on_exit=self._remove_files)
         self.taken = 0  # the files its own command line handed to the page (take)
         self.unread: tuple[RefusedPath, ...] = ()  # those it could no longer read (take)
+        # Why its page may not have reached a browser, if it may not (start).
+        self.unopened: NotOpened | None = None
 
     def take(self, command_line: CommandLine) -> None:
         """Hand the paths named on this process's own command line to its page,
@@ -526,14 +547,14 @@ def _hand_off(
     joined a hand-off another launch made a moment ago (it opened one), nor when
     the hand-off fails (:class:`HandoffError`)."""
     if not command_line.paths:
-        open_in_browser(folder, info.port, info.token, opener)
-        return Opened()
+        return Opened(unopened=open_in_browser(folder, info.port, info.token, opener))
     if status.get("handoff") != HANDOFF:
-        open_in_browser(folder, info.port, info.token, opener)
+        unopened = open_in_browser(folder, info.port, info.token, opener)
         which = "an older" if "handoff" not in status else "another"
         raise HandoffError(
             f"The running Proteia is {which} version and cannot take files; quit it and try again.",
             opened=True,
+            unopened=unopened,
         )
     sent: list[ImageFile] = []
     file_ids: list[str] = []
@@ -556,14 +577,14 @@ def _hand_off(
     if code != 201:
         raise HandoffError(f"Proteia did not take the files: {_message(code, answer)}")
     merged = answer.get("merged") is True
-    if not merged:
-        open_in_browser(folder, info.port, info.token, opener)
+    unopened = None if merged else open_in_browser(folder, info.port, info.token, opener)
     waiting = answer.get("files")
     return Opened(
         files=tuple(sent),
         refused=tuple(refused),
         merged=merged,
         waiting=waiting if type(waiting) is int else len(sent),
+        unopened=unopened,
     )
 
 
@@ -695,7 +716,7 @@ def _message(code: int, answer: dict[str, Any]) -> str:
 def start(
     *,
     folder: Path | None = None,
-    opener: Opener = webbrowser.open,
+    opener: Opener = browser.open_page,
     wait: float = STARTUP_WAIT,
     workspace: Workspace | None = None,
     command_line: CommandLine | None = None,
@@ -734,7 +755,7 @@ def start(
         info = {"pid": os.getpid(), "port": instance.port, "token": instance.token}
         write_atomic(folder / INSTANCE_FILE, json.dumps(info).encode("utf-8"), private=True)
         instance.take(command_line)
-        open_in_browser(folder, instance.port, instance.token, opener)
+        instance.unopened = open_in_browser(folder, instance.port, instance.token, opener)
     except BaseException:
         if instance is None:
             lock.release()
@@ -815,7 +836,8 @@ def _run(command_line: CommandLine) -> int:
         return 1
     except HandoffError as exc:
         if exc.opened:
-            print("Proteia is already running; it has been opened in your browser.")
+            _say_already_running(exc.unopened)
+            _print_unopened(exc.unopened)
         _log.error("%s", exc, extra=logs.FILE_ONLY)
         print(exc, file=sys.stderr)
         _print_refused(command_line.refused)
@@ -838,14 +860,32 @@ def _opened(opened: Opened) -> int:
             print(f"Added {names} to the images waiting there: choose how to import them.")
     else:
         _log.info("Proteia is already running; it has been opened in the browser")
-        print("Proteia is already running; it has been opened in your browser.")
+        _say_already_running(opened.unopened)
         if opened.files:
             _log.info("handed %d images to it", len(opened.files))
             print(f"{_images(len(opened.files))} waiting there: choose how to import them.")
     if opened.refused:
         _log.info("%d paths not taken", len(opened.refused))
     _print_refused(opened.refused)
+    _print_unopened(opened.unopened)
     return 3 if opened.refused else 0
+
+
+def _say_already_running(unopened: NotOpened | None) -> None:
+    """The first words of a launch that opened the running instance: that it
+    is open in the browser, unless its page may not have reached one."""
+    if unopened is None:
+        print("Proteia is already running; it has been opened in your browser.")
+    else:
+        print("Proteia is already running.")
+
+
+def _print_unopened(unopened: NotOpened | None) -> None:
+    """Why the page may not have reached a browser, and the file to open by
+    hand, if it may not."""
+    if unopened is not None:
+        print(unopened.reason)
+        print(f"{_BY_HAND} {unopened.page}")
 
 
 def _serve(instance: Instance, command_line: CommandLine) -> int:
@@ -855,11 +895,17 @@ def _serve(instance: Instance, command_line: CommandLine) -> int:
         _log.info("handed %d images to the page", instance.taken)
     if instance.unread:
         _log.info("%d paths not taken (unreadable)", len(instance.unread))
-    print(f"Proteia is running at http://{HOST}:{instance.port}/ and opens in your browser.")
+    running = f"Proteia is running at http://{HOST}:{instance.port}/"
+    if instance.unopened is None:
+        print(f"{running} and opens in your browser.")
+    else:
+        print(f"{running}.")
     if instance.taken:
         print(f"{_images(instance.taken)} waiting there: choose how to import them.")
     _print_refused((*command_line.refused, *instance.unread))
-    print(f"If no browser window opens, open this file in a browser: {instance.redirect_path}")
+    if instance.unopened is None:
+        print(f"{_BY_HAND} {instance.redirect_path}")
+    _print_unopened(instance.unopened)
     print("To quit, use Quit on the page, or press Ctrl+C here.")
     with contextlib.suppress(KeyboardInterrupt):  # a Ctrl+C before serving begins
         instance.serve()
