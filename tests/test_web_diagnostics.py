@@ -532,11 +532,11 @@ def test_with_changes_not_saved_its_images_are_also_those_project_json_names(
     folder = client.root / PROJECT
     saved = (folder / storage.PROJECT_FILE).read_bytes()
 
-    def full(project, folder):
+    def full(folder, data, *, expect, create=False):
         raise OSError(28, "No space left on device")
 
     with monkeypatch.context() as patch:  # only this patch is taken back below
-        patch.setattr(storage, "save_project", full)
+        patch.setattr(storage, "write_project_file", full)  # how a session saves (#101)
         client.ok("DELETE", f"/api/images/{ids[1]}")
         status, answer = upload(client, blot_bytes(tmp_path), name="third.tif")
         assert status == 201, answer

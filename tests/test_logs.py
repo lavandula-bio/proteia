@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -546,20 +547,30 @@ def test_an_error_that_stops_the_app_is_logged_in_the_file_only(tmp_path, monkey
     assert capsys.readouterr().err == ""  # Python prints it as the app exits
 
 
+def _no_replace(patch: pytest.MonkeyPatch) -> None:
+    """Make every replace of project.json fail, as while another program holds
+    it on Windows: the save's error names the file whole, as the OS gives it."""
+    real = storage.os.replace
+
+    def held(src, dst, **kwargs):
+        if Path(dst).name == storage.PROJECT_FILE:
+            raise PermissionError(13, "held by another process", str(dst))
+        return real(src, dst, **kwargs)
+
+    patch.setattr(storage.os, "replace", held)
+
+
 def test_unsaved_changes_at_the_stop_reach_the_log_and_the_console_once(
     log, client, monkeypatch, capsys
 ):
     monkeypatch.setattr(storage, "REPLACE_DELAY", 0)
     client.ok("POST", "/api/projects", {"name": "Blot"})
-    project_file = log.root / "Blot" / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # no save can replace it
+    _no_replace(monkeypatch)  # no save can replace project.json
     client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
     capsys.readouterr()
     client.instance.stop()
     client.thread.join(10)
     assert not client.thread.is_alive()
-    project_file.rmdir()
 
     (stopped,) = log.messages("WARNING")[1:]  # after the autosave's
     assert stopped.startswith("Proteia stopped, but the open project could not be saved: ")
@@ -613,6 +624,33 @@ def test_a_throttle_admits_its_limit_each_period_and_counts_the_rest():
     assert logs.shorten("abcd", 3) == "abc... (1 more characters)"
 
 
+def test_changes_dropped_with_a_removed_folder_at_the_stop_are_said_once(
+    log, client, tmp_path, capsys
+):
+    # Its folder removed outside Proteia (#101): never made again, so the stop
+    # goes on, and says what it dropped, as it says a failed save.
+    client.ok("POST", "/api/projects", {"name": "Blot"})
+    status, _ = client.call(
+        "POST",
+        "/api/images?name=a.tif&kind=chemiluminescence&polarity=dark_on_light",
+        raw=tiff_bytes(tmp_path),
+    )
+    assert status == 201
+    shutil.rmtree(log.root / "Blot")
+    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
+    capsys.readouterr()
+    client.instance.stop()
+    client.thread.join(10)
+    assert not client.thread.is_alive()
+    said = (
+        "Proteia stopped, but 'Blot' was closed with changes not saved: its folder, or its"
+        " project.json and an image file, were removed or moved outside Proteia"
+    )
+    err = capsys.readouterr().err
+    assert err.count("Proteia stopped, but ") == 1 and f"{said}\n" in err
+    assert log.messages("WARNING")[-1] == said
+
+
 # --- What never reaches it ---
 
 
@@ -621,10 +659,9 @@ def test_no_full_project_path_reaches_the_log(log, client, monkeypatch, capsys):
     client.ok("POST", "/api/projects", {"name": "Blot µ"})
     folder = log.root / "Blot µ"
     project_file = folder / storage.PROJECT_FILE
-    project_file.unlink()
-    project_file.mkdir()  # the autosave cannot replace it
-    client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
-    project_file.rmdir()
+    with monkeypatch.context() as patch:
+        _no_replace(patch)  # the autosave cannot replace it
+        client.ok("PUT", "/api/lanes", {"lanes": [{"condition": "vehicle"}]})
     # The console shows the warning as before: its message alone, the path whole.
     (shown,) = capsys.readouterr().err.splitlines()
     assert shown.startswith("autosave after set_lanes failed; the change is kept in memory:")
