@@ -1681,6 +1681,32 @@ def test_a_choice_saved_before_the_rule_measured_any_opens_as_it_was(tmp_path):
     assert stored(reopened, image).channel.rule == 1
 
 
+def test_a_project_read_again_keeps_each_image_s_channel_choice(tmp_path):
+    # project.json saved by another session on the folder, then read again
+    # (reload): each image's choice is the file's, with the evidence it was
+    # made on, and its bands are measured on that channel, read from its file,
+    # never on an array cached before.
+    s = session_on(tmp_path, save_to_folder)
+    two = import_scene(s, two_targets(2, AMPS, tuple(2 * a for a in AMPS)), "two µ.png")
+    gfp = import_scene(s, one_colour(1, 1), "GFP α.png")
+    ops.set_channel(s, gfp, RED)
+    protein = boxes(s, gfp, "GFP", ROW_A)  # measured on red, cached
+    other = ops.open_project(s.folder, autosave=save_to_folder)
+    ops.set_channel(other, gfp, BLUE)  # saved there
+    assert s.reload()
+    assert stored(s, two).channel == stored(other, two).channel
+    assert stored(s, two).channel.source is PICKED
+    assert stored(s, two).channel.channel is GREEN
+    assert stored(s, two).channel.rule == 1
+    assert stored(s, gfp).channel == stored(other, gfp).channel
+    assert stored(s, gfp).channel.channel is BLUE
+    assert stored(s, gfp).channel.masses is not None
+    ops.set_polarity(s, gfp, DARK)  # the channel kept: its bands measured again
+    assert nets(s, protein) == expected(s, gfp, read_pixels(s, gfp)[..., 2], protein)
+    b = boxes(s, two, "β-catenin", ROW_B)
+    assert nets(s, b) == expected(s, two, read_pixels(s, two)[..., 1], b)
+
+
 # --- The notes ---
 
 
