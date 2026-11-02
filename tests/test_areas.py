@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import make_project, synthetic_blot
+from conftest import guards_in_place, make_project, synthetic_blot
 from proteia.core import ladders, storage
 from proteia.core import operations as ops
 from proteia.core import session as session_module
@@ -2576,16 +2576,31 @@ def detections(folder: Path) -> list:
 
 def test_detector_pixels_equal_a_full_copy(tmp_path, monkeypatch):
     windowed = detections(tmp_path / "windowed")
-    monkeypatch.setattr(ops, "_detector_pixels", full_copy)
-    assert detections(tmp_path / "copied") == windowed
-    # A band its strip's outline cuts, grown from a click (the full copy
-    # still in force), then by the accessor that copies only the window.
-    t, _, protein = touching_strips(tmp_path / "touching")
+    # #259 review: the reads of the full copy are counted, so that the test
+    # fails if the accessor is compared with itself (no full copy read) or
+    # the full copy is still read once its patch is taken back.
+    copies = []
+
+    def copied(*args, **kwargs):
+        copies.append(None)
+        return full_copy(*args, **kwargs)
+
+    with monkeypatch.context() as patch:  # only this patch is taken back below
+        patch.setattr(ops, "_detector_pixels", copied)
+        assert detections(tmp_path / "copied") == windowed
+        detected = len(copies)
+        assert detected
+        # A band its strip's outline cuts, grown from a click (the full copy
+        # still in force), then by the accessor that copies only the window.
+        t, _, protein = touching_strips(tmp_path / "touching")
+        band = ops.place_box(t, protein, 250, 70, lane_index=0, grow=True)
+        grown = t.project.batch.find_band(band)[1].box
+        assert len(copies) > detected
+        ops.undo(t)
+    assert guards_in_place()
+    read = len(copies)
     band = ops.place_box(t, protein, 250, 70, lane_index=0, grow=True)
-    grown = t.project.batch.find_band(band)[1].box
-    ops.undo(t)
-    monkeypatch.undo()
-    band = ops.place_box(t, protein, 250, 70, lane_index=0, grow=True)
+    assert len(copies) == read  # the full copy is no longer read
     assert t.project.batch.find_band(band)[1].box == grown
 
 

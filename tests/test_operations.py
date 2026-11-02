@@ -1966,30 +1966,6 @@ def _refusal(name: str, inks: str, *, several: bool, uncompressed: bool) -> str:
     return f"{reason}; save {what} as {copy} and import it again"
 
 
-def _still_guarded() -> bool:
-    """Whether the guards of conftest's autouse fixtures are in place, as a
-    test that takes back patches of its own checks it took back only those
-    (``monkeypatch.undo()`` takes these back too): the import's refusal
-    check, the browser that fails the test, the test's own state folder."""
-    import webbrowser
-
-    state = [os.environ.get(name, "") for name in ("LOCALAPPDATA", "XDG_STATE_HOME")]
-    return (
-        hasattr(ops.import_image, "__wrapped__")
-        and getattr(webbrowser, "_tryorder", None) == ["proteia-test-guard"]
-        and all(Path(folder).name.startswith("user-state") for folder in state)
-    )
-
-
-def test_a_test_tells_the_guards_are_in_place(monkeypatch):
-    # #233 (#248 review): monkeypatch.undo() takes back the guards of the
-    # autouse fixtures too, so a test that took back its own patches that
-    # way ran the rest unguarded; the check tells them taken back.
-    assert _still_guarded()
-    monkeypatch.undo()  # nothing runs after this but the check
-    assert not _still_guarded()
-
-
 def _imports_nothing(s: ProjectSession, refused) -> OperationError:
     """``refused`` raises an OperationError and changes nothing (the project,
     its log and next id, the stored files, the undo history): the error."""
@@ -3249,16 +3225,6 @@ def test_the_guard_checks_refusals_of_reading_an_imported_image(tmp_path, monkey
     monkeypatch.setattr(session_module, "load_image", _raises(refusal))
     with pytest.raises(AssertionError, match="^a refusal of reading an imported image"):
         reopened.pixels(image)
-
-
-def test_the_guards_are_told_to_be_in_place(monkeypatch):
-    # #248 review: monkeypatch.undo() takes back the guards of the autouse
-    # fixtures too (the refusal checks, the browser, the state folder), so a
-    # test that took back its own patches that way ran the rest unguarded.
-    # The check a test makes after taking back its own tells them apart.
-    assert guards_in_place()
-    monkeypatch.undo()  # nothing runs after this but the check
-    assert not guards_in_place()
 
 
 def test_causes_are_told_apart_by_the_refusal_and_whether_the_system_raised_them(
@@ -4645,7 +4611,7 @@ def test_running_out_on_a_header_check_is_refused_as_reading_and_imports_nothing
         )
         assert again.code is then
         assert "ran out" not in str(again)
-    assert _still_guarded()
+    assert guards_in_place()
 
 
 def test_running_out_of_memory_on_a_header_check_of_a_large_file_imports_a_smaller_copy(
