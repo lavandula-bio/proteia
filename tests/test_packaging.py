@@ -1967,6 +1967,7 @@ def test_the_launch_check_reads_the_session_log_the_launcher_writes(tmp_path, mo
         redirect_path = state / launch.REDIRECT_FILE
         taken = 0
         unread = ()
+        unopened = None  # the browser took the page
 
         def serve(self) -> None:
             pass

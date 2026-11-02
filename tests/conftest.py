@@ -23,9 +23,10 @@ write without imagecodecs) and :func:`synthetic_blot`. :class:`FakeClock`
 gives a session predictable log times.
 :func:`assert_strict_json` checks that a model's JSON is strict and loses nothing.
 
-Autouse guards keep every test off the user's desktop (its browser and its
-state folder) and check every refusal of reading a file; :func:`guards_in_place`
-tells whether they are all in place, and no test may end without them (#250).
+Autouse guards keep every test off the user's desktop (its browser, the one
+Windows names for web links, and its state folder) and check every refusal of
+reading a file; :func:`guards_in_place` tells whether they are all in place,
+and no test may end without them (#250).
 """
 
 import functools
@@ -47,6 +48,7 @@ from proteia.core import imaging, operations
 from proteia.core.model import Project, apply_change
 from proteia.core.session import ProjectSession
 from proteia.core.storage import image_path, migrate
+from proteia.web import browser
 
 # pytest's own plugin for running a pytest of its own (part of pytest): the
 # check that no test ends with the guards taken back is run on a test that
@@ -65,6 +67,20 @@ class _NoBrowser:
 
 # The name of the browser that fails the test: the only one webbrowser tries.
 _NO_BROWSER = "proteia-test-guard"
+# How a launch on Windows reaches the browser Windows names for web links
+# (#251), as Proteia defines them: asking the shell (the user's registry) and
+# starting that browser. The guard puts its own in their place.
+DESKTOP_CALLS = {"_http_handler": browser._http_handler, "_start": browser._start}
+
+
+def _no_shell_question():
+    raise AssertionError("a test asked Windows for the browser it names for http")
+
+
+def _no_browser_start(program, line):
+    raise AssertionError(f"a test tried to start the browser Windows names for http: {line!r}")
+
+
 # The variables launch.state_dir finds the state folder by (Windows, elsewhere).
 _STATE_VARIABLES = ("LOCALAPPDATA", "XDG_STATE_HOME")
 # The folder pytest makes this run's temporary folders in, as the guard of the
@@ -76,8 +92,12 @@ _temporary_base: Path | None = None
 def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
     """No test opens the user's browser or writes the user's state folder.
 
-    ``launch.start`` takes ``webbrowser.open`` as its default opener, bound when
-    the module loads, so the default browser is replaced where
+    ``launch.start`` takes :func:`~proteia.web.browser.open_page` as its
+    default opener, bound when the module loads. On Windows it asks the shell
+    which browser it names for http and starts it: both are replaced where it
+    looks them up (``browser._http_handler``, ``browser._start``) by ones that
+    fail the test. Elsewhere, and on Windows when that fails, it opens the page
+    with ``webbrowser.open``, so the default browser is replaced where
     ``webbrowser.open`` looks it up: its order of browsers holds only one that
     fails the test. A browser named by its command (``webbrowser.get(command)``,
     as the packaging checks use) is still read as before. The state folder
@@ -92,6 +112,8 @@ def _keep_tests_off_the_desktop(monkeypatch, tmp_path_factory):
     browsers = {**getattr(webbrowser, "_browsers", {}), _NO_BROWSER: [None, _NoBrowser()]}
     monkeypatch.setattr(webbrowser, "_browsers", browsers)
     monkeypatch.setattr(webbrowser, "_tryorder", [_NO_BROWSER])
+    monkeypatch.setattr(browser, "_http_handler", _no_shell_question)
+    monkeypatch.setattr(browser, "_start", _no_browser_start)
     state = tmp_path_factory.mktemp("user-state")
     _temporary_base = tmp_path_factory.getbasetemp().resolve()
     for name in _STATE_VARIABLES:
@@ -227,14 +249,17 @@ def guards_in_place() -> bool:
     (:func:`_guards_stay_in_place`): the import and the session's reads are
     not back to Proteia's own, unchecked (the refusal checks wrap them, or a
     test's own patch over those does), the browser that fails the test is
-    the only one, and the state folder is a test's own (the guard's, or one
-    a test set itself in pytest's temporary folders)."""
+    the only one, the shell is not asked for the browser it names for http
+    nor that browser started as Proteia does (the guard's stand-ins, or a
+    test's own, are there), and the state folder is a test's own (the
+    guard's, or one a test set itself in pytest's temporary folders)."""
     import webbrowser
 
     return (
         operations.import_image is not _UNCHECKED["import"]
         and ProjectSession._read_checked is not _UNCHECKED["read"]
         and getattr(webbrowser, "_tryorder", None) == [_NO_BROWSER]
+        and all(getattr(browser, name) is not own for name, own in DESKTOP_CALLS.items())
         and all(_a_tests_own(os.environ.get(name)) for name in _STATE_VARIABLES)
     )
 
