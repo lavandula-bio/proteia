@@ -2073,8 +2073,10 @@ def import_image(
         # _commit can raise before committing (a bad clock or params) or after
         # (a hook bug): keep the file only if the committed project uses it.
         if all(image.id != image_id for image in session.project.batch.iter_images()):
-            with contextlib.suppress(OSError):
+            try:
                 path.unlink(missing_ok=True)
+            except OSError:  # held (an antivirus scanning it): the session's to delete
+                session._known.add(path.name.lower())  # at its next cleanup (#101)
         raise
     return image_id
 

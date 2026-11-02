@@ -28,8 +28,8 @@ an image is stored before the model references it, and a file is deleted only
 after a saved ``project.json`` no longer references it. An orphan image can hold
 an id that a failed or unsaved import gave back, so importing removes
 :func:`orphan_files` before storing a new image: all but those the session
-keeps (:class:`~proteia.core.session.ProjectSession`), whose ids the import
-skips.
+keeps or never knew (:class:`~proteia.core.session.ProjectSession`), whose ids
+the import skips.
 
 An open project is saved only over the ``project.json`` its session last
 read or wrote (#101): one changed outside Proteia since (a synced or restored
