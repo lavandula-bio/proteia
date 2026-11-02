@@ -4,7 +4,8 @@
 The user drags a box over one protein's row and the lane table says how many
 lanes it spans; :func:`detect_row` proposes one box per lane, all of one shared
 size, or reports the lane empty. Pure and GUI-independent: it reads a 2-D
-analysis array (never writes it) and the image's stored background, and returns
+analysis array (never writes it) and the membrane's stored level (the image's
+background, or a drawn membrane area's median), and returns
 a :class:`RowDetection`. Committing boxes to a project is the operation's job.
 
 Contract:
@@ -2948,8 +2949,10 @@ def detect_row(
     shared size, or None for an empty lane (see the module docstring).
 
     ``gray`` is the 2-D analysis array (``session.pixels``); it is read, never
-    written. ``background`` is the image's stored background: it only stands in
-    for a fitted plane that is off the membrane, and sets ``bg_offset``.
+    written. ``background`` is the membrane's stored level, the image's
+    background (on a drawn membrane area, the caller gives that area's own
+    median, #254): it only stands in for a fitted plane that is off the
+    membrane, and sets ``bg_offset``.
     ``size_rule`` is one of :data:`SIZE_RULES`, for tests and evaluation;
     callers that commit boxes use the default :data:`SIZE_RULE`.
     ``right_to_left`` numbers the lanes from the box's right end, for an image

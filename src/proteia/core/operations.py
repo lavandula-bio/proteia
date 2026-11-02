@@ -80,7 +80,9 @@ areas (:func:`set_marker_image` makes them equal). A box, a not-detected
 record and a calibration point belong to the one area holding its centre, so
 the operations that place or move them refuse one outside its area
 (``OUT_OF_ARENA``) or in two (``IN_TWO_ARENAS``). A row is detected on a copy
-of the pixels in which its area alone shows (:func:`_detector_pixels`), lanes are
+of the pixels in which its area alone shows (:func:`_detector_pixels`), and a
+row, a seed click and a ladder's reads take a drawn area's own median for its
+membrane (:func:`_area_level`, #254), as on the image cut out there; lanes are
 proposed and rows checked from the boxes of the same area, or of the image
 while the area holds none (:func:`~proteia.core.project.lane_anchors`), and
 redrawing an area to cut it in two hands the rows past the cut to a new
@@ -1119,10 +1121,41 @@ def _area_median(
     (:func:`~proteia.core.quantify.estimate_background`, as
     ``ImageRef.background``), so the same pixels give the same level either
     way (#243). It reads the area's bounds alone, so it costs the area's
-    size."""
+    size; where it holds every pixel of them (an outline not turned), with
+    no mask (#254: every detection on the area works it out)."""
     x0, y0, x1, y1 = window = _bounds_on(area, image)
-    inside = _inside_mask(area, image, window) if outside is None else ~outside[y0:y1, x0:x1]
+    if outside is not None:
+        inside = ~outside[y0:y1, x0:x1]
+    elif _holds_window(cast(AreaFrame, area.frame()), window):
+        inside = None
+    else:
+        inside = _inside_mask(area, image, window)
     return estimate_background(array[y0:y1, x0:x1], inside)
+
+
+def _area_level(session: ProjectSession, image: ImageRef, area: Arena) -> float:
+    """The level a row and a seed click take for the membrane of ``area`` on
+    ``image`` (#254), on the channel the image is measured on: on a drawn
+    outline, the median of the area's pixels (:func:`_drawn_median`), the
+    level the image cut out there would store, so a strip is detected as the
+    same strip cropped and imported; on an area over the whole image, the
+    image's stored median (``ImageRef.background``), reading no pixel, as
+    before #254, so an image of one membrane is detected as it was."""
+    if area.outline is None:
+        return image.background
+    return _drawn_median(session, image, area, session.pixels(image.id), image.measured_channel)
+
+
+def _drawn_median(
+    session: ProjectSession, image: ImageRef, area: Arena, array: np.ndarray, channel: Channel
+) -> float:
+    """The median of ``array`` (``image``'s analysis array of ``channel``)
+    over a drawn ``area`` (:func:`_area_median`), worked out once per
+    operation (:meth:`~proteia.core.session.ProjectSession.area_background`),
+    however many reads take it (#254)."""
+    return session.area_background(
+        (image.id, area_key(area), channel), lambda: _area_median(area, image, array)
+    )
 
 
 def _detector_pixels(
@@ -1136,20 +1169,16 @@ def _detector_pixels(
     """The pixels a detector reads in ``window`` of ``image`` for the
     membrane ``area``: the one way every detector reads them (a row, a seed
     click, a ladder search, a snap; :func:`_shown`), so that each reads the
-    area alone. A row and a seed click read the channel the image is measured
-    on; a ladder's reads (``calibration``) the mean of its colours, as every
-    molecular-weight read does (#206), off the area at the mean's own median
-    (:meth:`~proteia.core.session.ProjectSession.calibration_background`, asked
-    for only when a pixel is masked). Quantification reads the stored pixels
-    instead."""
-    if not calibration:
-        return _shown(session.pixels(image.id), image, area, window, lambda: image.background)
+    area alone, every pixel past a drawn outline at the median of the array
+    read over the area (:func:`_drawn_median`, asked for only when a pixel is
+    masked), the level the image cut out there would store (#254). A row and
+    a seed click read the channel the image is measured on; a ladder's reads
+    (``calibration``) the mean of its colours, as every molecular-weight read
+    does (#206). Quantification reads the stored pixels instead."""
+    channel = Channel.MEAN if calibration else image.measured_channel
+    array = session.calibration_pixels(image.id) if calibration else session.pixels(image.id)
     return _shown(
-        session.calibration_pixels(image.id),
-        image,
-        area,
-        window,
-        lambda: session.calibration_background(image.id),
+        array, image, area, window, lambda: _drawn_median(session, image, area, array, channel)
     )
 
 
@@ -5690,7 +5719,8 @@ def place_box(
     rects = [band.box.rect(own.box_size) for band in own.bands]
     if grow:
         # The band grows within the area alone (#243): on the area's bounds,
-        # as the area shows them, which for the whole image is the image.
+        # as the area shows them, which for the whole image is the image;
+        # from the area's own level (#254), on the whole image its stored one.
         bx0, by0, bx1, by1 = arena.bounds(image)
         bx0, by0, bx1, by1 = max(0, bx0), max(0, by0), min(width, bx1), min(height, by1)
         shown = _detector_pixels(session, image, arena, (bx0, by0, bx1, by1))
@@ -5698,7 +5728,7 @@ def place_box(
         found = grow_box(
             shown[by0:by1, bx0:bx1],
             (x - bx0, y - by0),
-            image.background,
+            _area_level(session, image, arena),
             rel_threshold=REL_THRESHOLD,
             noise_k=NOISE_K,
             dark_on_light=image.polarity.dark_on_light,
@@ -7095,9 +7125,11 @@ def _place_row(
     On a drawn membrane area (#243) the row reads only that area: the
     detector is given a copy of the pixels in which every pixel of the row,
     and of the ``reach`` rows above and below it that a row along a line may
-    read, whose centre lies outside the area is the image's stored background
+    read, whose centre lies outside the area is the area's own median
     (:func:`_detector_pixels`), so a row dragged over a turned strip finds no band of
-    the next strip; quantification still reads the pixels as stored. A row
+    the next strip; quantification still reads the pixels as stored. The
+    detector takes that median for the membrane too (:func:`_area_level`,
+    #254), where an area over the whole image gives the image's stored one. A row
     box that does not meet the area's bounds is refused before anything is
     detected, and a box the row would place (or a survivor it would resize)
     centred outside the area, or a lane's not-detected slot centred outside
@@ -7160,7 +7192,7 @@ def _place_row(
             seen,
             given,
             n,
-            background=image.background,
+            background=_area_level(session, image, arena),
             dark_on_light=image.polarity.dark_on_light,
             right_to_left=right_to_left,
             saturated_at=saturated_at,
