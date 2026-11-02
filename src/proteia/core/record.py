@@ -53,7 +53,18 @@ from typing import Any, Final, cast
 from pydantic import JsonValue, TypeAdapter
 
 import proteia
-from proteia.core import analyze, export, grow, ladders, mwcal, mwrow, quantify, rowdetect, storage
+from proteia.core import (
+    analyze,
+    channelrule,
+    export,
+    grow,
+    ladders,
+    mwcal,
+    mwrow,
+    quantify,
+    rowdetect,
+    storage,
+)
 from proteia.core.model import (
     LEGACY_BACKGROUND_METHOD,
     Channel,
@@ -153,6 +164,8 @@ def settings() -> dict[str, JsonValue]:
             "levels": "on an 8-bit scale, scaled to the image's range",
             "values": _CHECKED_VALUES,
         },
+        # How a colour image's channel is picked (#206): the channel rule.
+        "channel": channelrule.settings(),
         "lane_table_decimals": export.LANE_TABLE_DECIMALS,
         "lane_table_ratio_decimals": export.LANE_TABLE_RATIO_DECIMALS,
         # The number the lane table gives the lane of stored index 0 (0 before #53).

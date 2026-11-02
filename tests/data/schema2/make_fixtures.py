@@ -546,7 +546,12 @@ def _lane(lane: Lane) -> dict[str, Any]:
 
 
 def _image(image: ImageRef) -> dict[str, Any]:
+    # The channel a colour image is measured on (#206), only where the image
+    # has a choice: the frozen images have none, so they read as they were
+    # written, and a fresh build's pick shows in its fresh_changes.
+    channel = {} if image.channel is None else {"channel": image.channel.model_dump(mode="json")}
     return {
+        **channel,
         "id": image.id,
         "file": image.file,
         "original_name": image.original_name,

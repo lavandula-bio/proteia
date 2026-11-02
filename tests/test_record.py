@@ -269,6 +269,40 @@ def test_settings_are_the_code_constants():
             "levels": "on an 8-bit scale, scaled to the image's range",
             "values": "gray: the mean of red, green and blue for colour",
         },
+        # How a colour image's channel is picked (#206): the channel rule, version
+        # 1, with its all-carry threshold (0.5: the mean once every channel holds
+        # at least half the largest mass), which test_channel_rule.py pins too.
+        "channel": {
+            "rule": 1,
+            "picks_for": (
+                "a colour image whose red, green and blue differ, on import and on a polarity"
+                " change; not a visible-light marker image, nor an image converted from CMYK"
+            ),
+            "values": (
+                "each of red, green and blue as read: the pixel for light bands on a dark"
+                " background, the detector's top minus the pixel for dark bands on a light one"
+            ),
+            "cut": "median + cut_sigmas * max(mad_sigma * median absolute deviation, min_sigma)",
+            "cut_sigmas": 3.0,
+            "mad_sigma": 1.4826,
+            "min_sigma": 0.5,
+            "regions": "8-connected pixels above the cut, of min_region_pixels pixels or more",
+            "min_region_pixels": 16,
+            "mass": "the regions' summed height above the cut, per pixel of the image",
+            "mean": (
+                "when no channel has a mass above 0, or every channel's mass is at least"
+                " all_carry of the largest"
+            ),
+            "all_carry": 0.5,
+            "else": "the channel of the largest mass; on a tie, the first of red, green, blue",
+            "apart": (
+                "each other channel's mass in regions more than apart_gap_pixels (8-connected)"
+                " from the pick's regions, as a share of the pick's mass; a share of apart_share"
+                " or more is signal the image's channel does not measure"
+            ),
+            "apart_gap_pixels": 2,
+            "apart_share": 0.1,
+        },
         "lane_table_decimals": LANE_TABLE_DECIMALS,
         "lane_table_ratio_decimals": LANE_TABLE_RATIO_DECIMALS,
         "lane_table_first_lane": 1,  # the lane column numbers lanes as the app does
