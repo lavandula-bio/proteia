@@ -27,6 +27,9 @@ CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 BRAVE = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 FIREFOX = r"C:\Program Files\Mozilla Firefox\firefox.exe"
 IE = r"C:\Program Files\Internet Explorer\iexplore.exe"
+UNQUOTED = r"C:\Program Files\Some Browser\BROWSER.EXE"
+RUNDLL32 = r"C:\Windows\System32\rundll32.exe"
+URL_DLL = r"C:\Windows\System32\url.dll"
 
 # A redirect page in a profile folder whose name holds spaces and µ α β, as
 # the launcher hands it over (Path.as_uri), spelled out.
@@ -34,7 +37,10 @@ PAGE = PureWindowsPath(r"C:\Users\µ α β\AppData\Local\Proteia\open-proteia.ht
 URI = "file:///C:/Users/%C2%B5%20%CE%B1%20%CE%B2/AppData/Local/Proteia/open-proteia.html"
 
 AS_FILE = "so the page was opened as a file instead, which may not reach a browser."
-NO_HANDLER = f"Windows names no browser for web links (http), {AS_FILE}"
+# What Proteia knows when the shell names it no .exe to start (#262 review):
+# no handler, a packaged (Store) app, a missing program, access denied, a DLL.
+NO_PROGRAM = "Proteia found no program it could start for web links (http)"
+NO_HANDLER = f"{NO_PROGRAM}, {AS_FILE}"
 
 
 class NotABrowser:
@@ -55,7 +61,7 @@ class Starts:
     """Stands in for the start of a program: records the program and the
     command line, or raises ``error``."""
 
-    def __init__(self, error: OSError | None = None) -> None:
+    def __init__(self, error: BaseException | None = None) -> None:
         self.error = error
         self.calls: list[tuple[str, str]] = []
 
@@ -102,6 +108,9 @@ def test_the_page_uri_holds_no_space_quote_or_backslash():
         pytest.param(CHROME, f'"{CHROME}" -- "%1"', f'"{CHROME}" -- "{URI}"', id="older-chrome"),
         pytest.param(IE, f'"{IE}" %1', f'"{IE}" {URI}', id="unquoted"),
         pytest.param(EDGE, f'"{EDGE}" "%1"', f'"{EDGE}" "{URI}"', id="system-default"),
+        # An unquoted program path with spaces: the shell's program is the
+        # one started, not the command's first word ("C:\Program").
+        pytest.param(UNQUOTED, f'{UNQUOTED} -url "%1"', f'{UNQUOTED} -url "{URI}"', id="spaces"),
     ],
 )
 def test_on_windows_the_page_goes_to_the_browser_named_for_http(program, command, line):
@@ -126,6 +135,8 @@ def test_on_windows_the_page_goes_to_the_browser_named_for_http(program, command
     ("command", "line"),
     [
         pytest.param("b.exe %1", "b.exe page", id="1"),
+        pytest.param("b.exe %0", "b.exe page", id="0"),
+        pytest.param('b.exe "%0" %2', 'b.exe "page" ', id="0-and-others"),
         pytest.param("b.exe %L", "b.exe page", id="L"),
         pytest.param("b.exe %l", "b.exe page", id="l"),
         pytest.param('b.exe "%1" %*', 'b.exe "page" ', id="star-dropped"),
@@ -188,10 +199,126 @@ def test_when_the_page_cannot_be_opened_as_a_file_either_the_reason_says_so(tmp_
         fallback=NotABrowser(took=False),
     )  # fmt: skip
     assert opened == NotOpened(
-        page,
-        "Windows names no browser for web links (http),"
-        " and the page could not be opened as a file either.",
+        page, f"{NO_PROGRAM}, and the page could not be opened as a file either."
     )
+
+
+# What the shell answers (#262 review, read-only on Windows 11): a packaged
+# (Store) app as the http default, or a program that is gone, gives no
+# command or no program; a command run through rundll32 names its DLL.
+CO_E_APPNOTFOUND = 0x800401F5 - 2**32
+E_ACCESSDENIED = 0x80070005 - 2**32
+WITH_CHROME = {1: f'"{CHROME}" --single-argument %1', 2: CHROME}
+
+
+@pytest.mark.parametrize(
+    "named",
+    [
+        pytest.param(lambda: browser.handler_named_by(Shell({})), id="store-app"),
+        pytest.param(
+            lambda: browser.handler_named_by(Shell(WITH_CHROME, {(2, 1): CO_E_APPNOTFOUND})),
+            id="program-gone",
+        ),
+        pytest.param(
+            lambda: browser.handler_named_by(Shell(WITH_CHROME, {(2, 1): E_ACCESSDENIED})),
+            id="access-denied",
+        ),
+        pytest.param(
+            lambda: Handler(URL_DLL, f'"{RUNDLL32}" {URL_DLL},FileProtocolHandler %1'),
+            id="rundll32",
+        ),
+        pytest.param(lambda: Handler(r"C:\Tools\browser", r"C:\Tools\browser %1"), id="no-suffix"),
+        pytest.param(lambda: Handler(r"C:\Tools\open.cmd", r"C:\Tools\open.cmd %1"), id="cmd"),
+    ],
+)
+def test_with_no_program_proteia_can_start_the_reason_says_only_that(tmp_path, named):
+    # #262 review m1, m2: Proteia cannot tell these apart, and none is "no
+    # browser"; it starts only an .exe (a DLL is never called the browser).
+    page = tmp_path / REDIRECT_FILE
+    starts, association = Starts(), NotABrowser()
+    opened = browser.open_page(
+        page.as_uri(), windows=True, environ={}, handler=named, start=starts,
+        fallback=association,
+    )  # fmt: skip
+    assert opened == NotOpened(page, NO_HANDLER)
+    assert starts.calls == [] and association.uris == [page.as_uri()]
+
+
+@pytest.mark.parametrize(
+    ("handler", "error", "why"),
+    [
+        pytest.param(
+            Handler(CHROME, f'"{CHROME}" --single-argument %1'),
+            None,
+            "Proteia could not ask Windows which program opens web links (http) (RuntimeError)",
+            id="lookup",
+        ),
+        pytest.param(
+            Handler(CHROME, f'"{CHROME}" --single-argument %1'),
+            ValueError("embedded null character"),
+            "The browser Windows names for web links (http), chrome.exe, could not be started"
+            " (ValueError)",
+            id="start",
+        ),
+    ],
+)
+def test_an_unexpected_failure_of_the_lookup_or_the_start_falls_back(tmp_path, handler, error, why):
+    # #262 review n1: a failure of either only degrades the launch; its type
+    # names it (its text might hold a path).
+    page = tmp_path / REDIRECT_FILE
+    association = NotABrowser()
+
+    def lookup() -> Handler:
+        if error is None:
+            raise RuntimeError(r"C:\Users\someone\secret")
+        return handler
+
+    opened = browser.open_page(
+        page.as_uri(), windows=True, environ={}, handler=lookup, start=Starts(error),
+        fallback=association,
+    )  # fmt: skip
+    assert opened == NotOpened(page, f"{why}, {AS_FILE}")
+    assert association.uris == [page.as_uri()]
+
+
+@pytest.mark.parametrize("where", ["lookup", "start"])
+def test_an_assertion_is_never_taken_for_the_system_s_answer(tmp_path, where):
+    # A failed assertion is a broken invariant, or a test's guard (conftest):
+    # it goes on up, and the page is not opened some other way.
+    association = NotABrowser()
+
+    def lookup() -> Handler:
+        if where == "lookup":
+            raise AssertionError("guard")
+        return Handler(CHROME, f'"{CHROME}" --single-argument %1')
+
+    with pytest.raises(AssertionError, match="^guard$"):
+        browser.open_page(
+            (tmp_path / REDIRECT_FILE).as_uri(), windows=True, environ={}, handler=lookup,
+            start=Starts(AssertionError("guard")), fallback=association,
+        )  # fmt: skip
+    assert association.uris == []
+
+
+@pytest.mark.parametrize(
+    ("handler", "said"),
+    [
+        pytest.param(None, "asked Windows for the browser", id="lookup"),
+        pytest.param(
+            lambda: Handler(CHROME, CHROME_COMMAND), "tried to start the browser", id="start"
+        ),
+    ],
+)
+def test_the_desktop_guard_still_stops_a_test_that_would_reach_the_browser(tmp_path, handler, said):
+    # conftest's stand-ins for the shell lookup and the start: their
+    # AssertionError still stops the test, with a fallback of its own too.
+    association = NotABrowser()
+    with pytest.raises(AssertionError, match=said):
+        browser.open_page(
+            (tmp_path / REDIRECT_FILE).as_uri(), windows=True, environ={}, handler=handler,
+            fallback=association,
+        )  # fmt: skip
+    assert association.uris == []
 
 
 def test_a_browser_that_cannot_be_started_is_named_without_its_path(tmp_path):

@@ -4,8 +4,9 @@
 On Windows the page goes to the browser Windows names for web links (http): the
 program and the command of the ``open`` verb the shell finds for the ``http``
 protocol (``AssocQueryStringW``), which is the user's choice of default browser
-(else the system's). That command runs with the page's ``file:`` URI in place of
-its ``%1``, as the shell runs it with a web address. Opening the file itself, as
+(else the system's). Proteia starts that program itself, an ``.exe`` only, with
+the command's arguments and the page's ``file:`` URI in place of its ``%1``, as
+the shell puts a web address there. Opening the file itself, as
 ``webbrowser.open`` does on Windows, goes through the ``.html`` file association
 instead, which may be an editor or another program that never follows the
 page's redirect to Proteia's address.
@@ -19,10 +20,13 @@ command quotes its ``%1`` or not. (Chromium-based browsers take all that follows
 ``webbrowser.open`` opens the page instead, as before #251: on other systems;
 when ``BROWSER`` names a browser, an explicit choice that ``webbrowser`` tries
 first (the packaging checks name one there that only records the address); and
-when Windows names no browser for http, its command has no place for the page,
-or it cannot be started. In those last cases, and whenever ``webbrowser.open``
-fails, :func:`open_page` answers :class:`NotOpened`: the console then says why,
-and which file to open by hand.
+when Proteia finds no program it can start for http (none, a packaged app such
+as a Microsoft Store browser, whose command the shell does not give, a program
+that is gone or cannot be read, or a command that runs a DLL through
+rundll32), the command has no place for the page, or the program cannot be
+started. In those last cases, and whenever ``webbrowser.open`` fails,
+:func:`open_page` answers :class:`NotOpened`: the console then says why, and
+which file to open by hand.
 """
 
 from __future__ import annotations
@@ -66,9 +70,9 @@ _ASSOCSTR_COMMAND: Final = 1
 _ASSOCSTR_EXECUTABLE: Final = 2
 _S_OK: Final = 0
 _S_FALSE: Final = 1  # no buffer given: the size is told
-# The shell's insert sequences in a command: %1 and %L stand for the item
+# The shell's insert sequences in a command: %1, %0 and %L stand for the item
 # opened (here the page), %* and %2 to %9 for further arguments (none here).
-_INSERT: Final = re.compile(r"%([1Ll*2-9])")
+_INSERT: Final = re.compile(r"%([01Ll*2-9])")
 
 Query = Callable[..., int]  # AssocQueryStringW's shape: an HRESULT
 
@@ -97,21 +101,9 @@ def open_page(
         if fallback(uri):
             return True
         return NotOpened(Path.from_uri(uri), "No web browser could be started for the page.")
-    found = handler()
-    if found is None:
-        why = "Windows names no browser for web links (http)"
-    else:
-        named = f"The browser Windows names for web links (http), {_name(found.program)},"
-        line = command_line(found.command, uri)
-        if line is None:
-            why = f"{named} cannot be given the page"
-        else:
-            try:
-                start(found.program, line)
-            except OSError as exc:
-                why = f"{named} could not be started ({cli.reason(exc)})"
-            else:
-                return True
+    why = _start_named_browser(uri, handler, start)
+    if why is None:
+        return True
     if fallback(uri):
         did = "so the page was opened as a file instead, which may not reach a browser"
     else:
@@ -119,16 +111,51 @@ def open_page(
     return NotOpened(Path.from_uri(uri), f"{why}, {did}.")
 
 
+def _start_named_browser(
+    uri: str, handler: Callable[[], Handler | None], start: Callable[[str, str], object]
+) -> str | None:
+    """Start the browser Windows names for http (``handler``) with the page at
+    ``uri``: None once started, else why not, for the console. A failure of
+    the lookup or the start only degrades the launch, and is named by its
+    type (its text might hold a path); a failed assertion, a broken invariant
+    or a test's guard, is never taken for the system's answer."""
+    try:
+        found = handler()
+    except AssertionError:
+        raise
+    except Exception as exc:
+        return f"Proteia could not ask Windows which program opens web links (http) ({_what(exc)})"
+    if found is None or PureWindowsPath(found.program).suffix.lower() != ".exe":
+        return "Proteia found no program it could start for web links (http)"
+    named = f"The browser Windows names for web links (http), {_name(found.program)},"
+    line = command_line(found.command, uri)
+    if line is None:
+        return f"{named} cannot be given the page"
+    try:
+        start(found.program, line)
+    except AssertionError:
+        raise
+    except Exception as exc:
+        return f"{named} could not be started ({_what(exc)})"
+    return None
+
+
+def _what(exc: Exception) -> str:
+    """What failed, without a path: the system's reason for an OSError, else
+    the exception's type."""
+    return cli.reason(exc) if isinstance(exc, OSError) else type(exc).__name__
+
+
 def command_line(command: str, uri: str) -> str | None:
-    """``command`` with ``uri`` in place of each ``%1`` or ``%L``, as the shell
-    puts the item it opens there, and no further arguments (``%*``, ``%2`` to
-    ``%9``); None if it has no place for ``uri``. One pass: ``uri`` is never
-    read for insert sequences."""
+    """``command`` with ``uri`` in place of each ``%1``, ``%0`` or ``%L``, as
+    the shell puts the item it opens there, and no further arguments (``%*``,
+    ``%2`` to ``%9``); None if it has no place for ``uri``. One pass: ``uri``
+    is never read for insert sequences."""
     placed = False
 
     def insert(match: re.Match[str]) -> str:
         nonlocal placed
-        item = match.group(1) in "1Ll"
+        item = match.group(1) in "01Ll"
         placed = placed or item
         return uri if item else ""
 

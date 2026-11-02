@@ -374,8 +374,8 @@ def test_main_prints_a_non_ascii_path_to_a_narrow_console(state, monkeypatch):
 
 # Why the page may not have reached a browser (#251), as browser.open_page says it.
 MISSED = (
-    "Windows names no browser for web links (http), so the page was opened as a file"
-    " instead, which may not reach a browser."
+    "Proteia found no program it could start for web links (http), so the page was opened"
+    " as a file instead, which may not reach a browser."
 )
 BY_HAND = "If no browser window opens, open this file in a browser:"
 
@@ -844,7 +844,7 @@ def test_an_older_running_proteia_is_opened_and_handed_nothing(
 
 class Misses(Opener):
     """An opener whose browser may not have taken the page, as
-    browser.open_page says it when Windows names no browser for http."""
+    browser.open_page says it when it finds no program to start for http."""
 
     def __call__(self, url: str) -> NotOpened:
         super().__call__(url)
